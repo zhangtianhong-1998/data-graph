@@ -1,0 +1,77 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "status": {
+      "default": "COMPLETED",
+      "enum": [
+        "COMPLETED",
+        "COMPLETED_WITH_GAPS",
+        "PARTIAL",
+        "FAILED"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "rules_published": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Rules Published",
+      "type": "array"
+    },
+    "rules_skipped": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Rules Skipped",
+      "type": "array"
+    },
+    "issues": {
+      "items": {
+        "additionalProperties": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            }
+          ]
+        },
+        "type": "object"
+      },
+      "title": "Issues",
+      "type": "array"
+    },
+    "counts": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "number"
+          }
+        ]
+      },
+      "title": "Counts",
+      "type": "object"
+    },
+    "validation": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Validation",
+      "type": "object"
+    }
+  },
+  "required": [
+    "run_id"
+  ],
+  "title": "RunReport",
+  "type": "object"
+}

@@ -1,0 +1,698 @@
+{
+  "$defs": {
+    "AttributeSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "single_valued": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Single Valued",
+          "type": "object"
+        },
+        "multi_valued": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Multi Valued",
+          "type": "object"
+        },
+        "excluded": {
+          "items": {
+            "$ref": "#/$defs/ExcludedColumn"
+          },
+          "title": "Excluded",
+          "type": "array"
+        }
+      },
+      "title": "AttributeSpec",
+      "type": "object"
+    },
+    "Coverage": {
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "default": "full",
+          "enum": [
+            "full",
+            "partition",
+            "sampled"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "partitions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Partitions",
+          "type": "array"
+        },
+        "rows_scanned": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rows Scanned"
+        },
+        "entities": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Entities"
+        },
+        "consistent": {
+          "default": false,
+          "title": "Consistent",
+          "type": "boolean"
+        }
+      },
+      "title": "Coverage",
+      "type": "object"
+    },
+    "Dependencies": {
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "default": "",
+          "title": "Schema",
+          "type": "string"
+        },
+        "documents": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Documents",
+          "type": "array"
+        },
+        "identity_policy": {
+          "default": "identity_v1",
+          "title": "Identity Policy",
+          "type": "string"
+        },
+        "operator_version": {
+          "default": "1",
+          "title": "Operator Version",
+          "type": "string"
+        }
+      },
+      "title": "Dependencies",
+      "type": "object"
+    },
+    "ExcludedColumn": {
+      "additionalProperties": false,
+      "properties": {
+        "column": {
+          "title": "Column",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "reason"
+      ],
+      "title": "ExcludedColumn",
+      "type": "object"
+    },
+    "HierarchySpec": {
+      "additionalProperties": false,
+      "properties": {
+        "levels": {
+          "items": {
+            "$ref": "#/$defs/LevelSpec"
+          },
+          "title": "Levels",
+          "type": "array"
+        },
+        "parent_column": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent Column"
+        },
+        "taxonomy": {
+          "default": "",
+          "title": "Taxonomy",
+          "type": "string"
+        },
+        "allow_dag": {
+          "default": false,
+          "title": "Allow Dag",
+          "type": "boolean"
+        },
+        "fill_semantics_confirmed": {
+          "default": false,
+          "title": "Fill Semantics Confirmed",
+          "type": "boolean"
+        },
+        "order_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Order Evidence",
+          "type": "array"
+        },
+        "gap_policy": {
+          "const": "split",
+          "default": "split",
+          "title": "Gap Policy",
+          "type": "string"
+        }
+      },
+      "title": "HierarchySpec",
+      "type": "object"
+    },
+    "IdentitySpec": {
+      "additionalProperties": false,
+      "properties": {
+        "key_columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Key Columns",
+          "type": "array"
+        },
+        "entity_kind": {
+          "default": "ReportItem",
+          "title": "Entity Kind",
+          "type": "string"
+        },
+        "semantic_resolution": {
+          "default": "source_scoped",
+          "enum": [
+            "source_scoped",
+            "verified_definition_registry"
+          ],
+          "title": "Semantic Resolution",
+          "type": "string"
+        },
+        "semantic_key_columns": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Semantic Key Columns",
+          "type": "array"
+        },
+        "semantic_namespace": {
+          "default": "",
+          "title": "Semantic Namespace",
+          "type": "string"
+        },
+        "level_policy": {
+          "default": "not_applicable",
+          "enum": [
+            "not_applicable",
+            "code_with_fill_merge",
+            "level_qualified"
+          ],
+          "title": "Level Policy",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key_columns"
+      ],
+      "title": "IdentitySpec",
+      "type": "object"
+    },
+    "LevelSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "exclusiveMinimum": 0,
+          "title": "Level",
+          "type": "integer"
+        },
+        "code": {
+          "title": "Code",
+          "type": "string"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "aliases": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Aliases",
+          "type": "array"
+        }
+      },
+      "required": [
+        "level",
+        "code"
+      ],
+      "title": "LevelSpec",
+      "type": "object"
+    },
+    "OperatorSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "title": "Op",
+          "type": "string"
+        },
+        "args": {
+          "additionalProperties": true,
+          "title": "Args",
+          "type": "object"
+        },
+        "output": {
+          "default": "",
+          "title": "Output",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "title": "OperatorSpec",
+      "type": "object"
+    },
+    "RelationSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "source_rule_id": {
+          "title": "Source Rule Id",
+          "type": "string"
+        },
+        "target_rule_id": {
+          "title": "Target Rule Id",
+          "type": "string"
+        },
+        "source_columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Source Columns",
+          "type": "array"
+        },
+        "target_columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Target Columns",
+          "type": "array"
+        },
+        "relation": {
+          "default": "verified_reference",
+          "title": "Relation",
+          "type": "string"
+        },
+        "qualifiers": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Qualifiers",
+          "type": "object"
+        },
+        "source_json_array_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 1,
+          "title": "Source Json Array Columns",
+          "type": "array"
+        },
+        "target_json_array_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 1,
+          "title": "Target Json Array Columns",
+          "type": "array"
+        },
+        "max_array_elements": {
+          "default": 256,
+          "exclusiveMinimum": 0,
+          "maximum": 4096,
+          "title": "Max Array Elements",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source_rule_id",
+        "target_rule_id",
+        "source_columns",
+        "target_columns"
+      ],
+      "title": "RelationSpec",
+      "type": "object"
+    },
+    "RuleBudget": {
+      "additionalProperties": false,
+      "properties": {
+        "max_db_cu": {
+          "default": 40,
+          "exclusiveMinimum": 0,
+          "title": "Max Db Cu",
+          "type": "number"
+        },
+        "max_rows_returned": {
+          "default": 20000,
+          "exclusiveMinimum": 0,
+          "title": "Max Rows Returned",
+          "type": "integer"
+        },
+        "max_seconds": {
+          "default": 120,
+          "exclusiveMinimum": 0,
+          "title": "Max Seconds",
+          "type": "number"
+        }
+      },
+      "title": "RuleBudget",
+      "type": "object"
+    },
+    "RuleEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "hypothesis": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hypothesis"
+        },
+        "document": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Document",
+          "type": "array"
+        },
+        "probe_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Probe Refs",
+          "type": "array"
+        },
+        "semantic_basis": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Semantic Basis",
+          "type": "array"
+        }
+      },
+      "title": "RuleEvidence",
+      "type": "object"
+    },
+    "ScopeSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "namespaces": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Namespaces",
+          "type": "array"
+        },
+        "predicate": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Predicate"
+        },
+        "partition_by": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Partition By",
+          "type": "array"
+        }
+      },
+      "title": "ScopeSpec",
+      "type": "object"
+    },
+    "SourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "schema": {
+          "default": "public",
+          "title": "Schema",
+          "type": "string"
+        },
+        "table": {
+          "title": "Table",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "table"
+      ],
+      "title": "SourceRef",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "rule_id": {
+      "title": "Rule Id",
+      "type": "string"
+    },
+    "revision": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Revision",
+      "type": "integer"
+    },
+    "kind": {
+      "enum": [
+        "column_group_entity",
+        "wide_hierarchy",
+        "long_hierarchy",
+        "reference"
+      ],
+      "title": "Kind",
+      "type": "string"
+    },
+    "goal_refs": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Goal Refs",
+      "type": "array"
+    },
+    "source": {
+      "$ref": "#/$defs/SourceRef"
+    },
+    "scope": {
+      "$ref": "#/$defs/ScopeSpec"
+    },
+    "identity": {
+      "$ref": "#/$defs/IdentitySpec"
+    },
+    "attributes": {
+      "$ref": "#/$defs/AttributeSpec"
+    },
+    "hierarchy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HierarchySpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "relation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RelationSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "normalization": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "title": "Normalization",
+      "type": "object"
+    },
+    "operators": {
+      "items": {
+        "$ref": "#/$defs/OperatorSpec"
+      },
+      "title": "Operators",
+      "type": "array"
+    },
+    "required_capabilities": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Required Capabilities",
+      "type": "array"
+    },
+    "dependencies": {
+      "$ref": "#/$defs/Dependencies"
+    },
+    "status": {
+      "default": "draft",
+      "enum": [
+        "draft",
+        "validated",
+        "canary_checked",
+        "published",
+        "deprecated",
+        "rolled_back"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "validation_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Validation Ref"
+    },
+    "coverage": {
+      "$ref": "#/$defs/Coverage"
+    },
+    "evidence": {
+      "$ref": "#/$defs/RuleEvidence"
+    },
+    "budget": {
+      "$ref": "#/$defs/RuleBudget"
+    },
+    "publish": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "title": "Publish",
+      "type": "object"
+    },
+    "stale_when": {
+      "additionalProperties": {
+        "type": "boolean"
+      },
+      "title": "Stale When",
+      "type": "object"
+    },
+    "errors": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Errors",
+      "type": "object"
+    }
+  },
+  "required": [
+    "rule_id",
+    "kind",
+    "source",
+    "identity"
+  ],
+  "title": "RuleSpec",
+  "type": "object"
+}

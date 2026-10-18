@@ -1,0 +1,44 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "product": {
+      "default": "unknown",
+      "title": "Product",
+      "type": "string"
+    },
+    "version": {
+      "default": "unknown",
+      "title": "Version",
+      "type": "string"
+    },
+    "driver": {
+      "default": "unknown",
+      "title": "Driver",
+      "type": "string"
+    },
+    "capabilities": {
+      "additionalProperties": {
+        "enum": [
+          "verified",
+          "unsupported",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "title": "Capabilities",
+      "type": "object"
+    },
+    "consistent_snapshot": {
+      "default": false,
+      "title": "Consistent Snapshot",
+      "type": "boolean"
+    },
+    "actual_database_verified": {
+      "default": false,
+      "title": "Actual Database Verified",
+      "type": "boolean"
+    }
+  },
+  "title": "CapabilityManifest",
+  "type": "object"
+}

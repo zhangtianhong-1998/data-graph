@@ -1,0 +1,477 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LightGraph snapshot 1.0",
+  "type": "object",
+  "properties": {
+    "format_version": {
+      "const": "1.0"
+    },
+    "isolation_domain": {
+      "type": "string"
+    },
+    "scopes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "facts": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "fact_kind": {
+                "const": "NodeExistence"
+              },
+              "payload": {
+                "type": "object",
+                "properties": {
+                  "entity_id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "AnalysisMethod",
+                      "AnalysisQuestion",
+                      "BusinessConcept",
+                      "Column",
+                      "ColumnGroup",
+                      "Database",
+                      "Dimension",
+                      "DimensionMember",
+                      "Document",
+                      "DocumentSection",
+                      "GraphFact",
+                      "Measure",
+                      "Metric",
+                      "ReportItem",
+                      "Rule",
+                      "Schema",
+                      "SemanticSlot",
+                      "Table",
+                      "Workbook",
+                      "Worksheet"
+                    ]
+                  },
+                  "layer": {
+                    "enum": [
+                      "business",
+                      "metadata",
+                      "provenance"
+                    ]
+                  }
+                },
+                "required": [
+                  "entity_id",
+                  "kind",
+                  "layer"
+                ],
+                "additionalProperties": false
+              },
+              "status": {
+                "enum": [
+                  "accepted",
+                  "candidate",
+                  "unresolved"
+                ]
+              },
+              "support_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "id",
+              "fact_kind",
+              "payload",
+              "status",
+              "support_ids"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "fact_kind": {
+                "const": "PropertyValue"
+              },
+              "payload": {
+                "type": "object",
+                "properties": {
+                  "entity_id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "enum": [
+                      "aggregation",
+                      "alias",
+                      "business_code",
+                      "caliber",
+                      "column",
+                      "column_position",
+                      "comment",
+                      "coverage",
+                      "data_type",
+                      "definition",
+                      "description",
+                      "dimension",
+                      "document_ref",
+                      "domain",
+                      "english_name",
+                      "formula",
+                      "frequency",
+                      "granularity",
+                      "kind",
+                      "label",
+                      "level",
+                      "level_no",
+                      "modality",
+                      "name",
+                      "normalization",
+                      "nullable",
+                      "period",
+                      "primary_key",
+                      "qualified_name",
+                      "revision",
+                      "role",
+                      "rule_ref",
+                      "schema",
+                      "scope",
+                      "section_ref",
+                      "semantic_namespace",
+                      "source_ref",
+                      "table",
+                      "target_kind",
+                      "taxonomy",
+                      "technical_status",
+                      "unit"
+                    ]
+                  },
+                  "value": {
+                    "type": [
+                      "string",
+                      "number",
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "qualifiers": {
+                    "type": "object",
+                    "propertyNames": {
+                      "enum": [
+                        "allow_dag",
+                        "caliber",
+                        "condition",
+                        "coverage",
+                        "document_ref",
+                        "formula",
+                        "granularity",
+                        "level",
+                        "modality",
+                        "namespace",
+                        "normalization",
+                        "period",
+                        "relation_group",
+                        "role",
+                        "semantic_basis",
+                        "source_level",
+                        "target_level",
+                        "taxonomy",
+                        "technical_status",
+                        "unit",
+                        "valid_period"
+                      ]
+                    },
+                    "additionalProperties": {
+                      "type": [
+                        "string",
+                        "number",
+                        "boolean",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "entity_id",
+                  "name",
+                  "value",
+                  "qualifiers"
+                ],
+                "additionalProperties": false
+              },
+              "status": {
+                "enum": [
+                  "accepted",
+                  "candidate",
+                  "unresolved"
+                ]
+              },
+              "support_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "id",
+              "fact_kind",
+              "payload",
+              "status",
+              "support_ids"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "fact_kind": {
+                "const": "Edge"
+              },
+              "payload": {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string"
+                  },
+                  "relation": {
+                    "enum": [
+                      "analyzes",
+                      "declared_fk",
+                      "defined_by",
+                      "documented_by",
+                      "expresses_role",
+                      "has_schema",
+                      "has_section",
+                      "has_sheet",
+                      "has_table",
+                      "maps_to_concept",
+                      "member_of",
+                      "member_of_group",
+                      "parent_of",
+                      "same_attribute_role",
+                      "same_entity",
+                      "sheet_has_column",
+                      "supported_by_rule",
+                      "table_has_column",
+                      "technical_link",
+                      "uses_measure",
+                      "value_overlap",
+                      "verified_reference"
+                    ]
+                  },
+                  "target": {
+                    "type": "string"
+                  },
+                  "qualifiers": {
+                    "type": "object",
+                    "propertyNames": {
+                      "enum": [
+                        "allow_dag",
+                        "caliber",
+                        "condition",
+                        "coverage",
+                        "document_ref",
+                        "formula",
+                        "granularity",
+                        "level",
+                        "modality",
+                        "namespace",
+                        "normalization",
+                        "period",
+                        "relation_group",
+                        "role",
+                        "semantic_basis",
+                        "source_level",
+                        "target_level",
+                        "taxonomy",
+                        "technical_status",
+                        "unit",
+                        "valid_period"
+                      ]
+                    },
+                    "additionalProperties": {
+                      "type": [
+                        "string",
+                        "number",
+                        "boolean",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "source",
+                  "relation",
+                  "target",
+                  "qualifiers"
+                ],
+                "additionalProperties": false
+              },
+              "status": {
+                "enum": [
+                  "accepted",
+                  "candidate",
+                  "unresolved"
+                ]
+              },
+              "support_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "id",
+              "fact_kind",
+              "payload",
+              "status",
+              "support_ids"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "fact_kind": {
+                "const": "DocumentClaim"
+              },
+              "payload": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "subject": {
+                    "type": "string"
+                  },
+                  "predicate": {
+                    "type": "string"
+                  },
+                  "object": {
+                    "type": [
+                      "string",
+                      "number",
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "modality": {
+                    "enum": [
+                      "asserted",
+                      "possible",
+                      "recommended",
+                      "conditional",
+                      "negated"
+                    ]
+                  },
+                  "conditions": {
+                    "type": "object",
+                    "maxProperties": 16,
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": [
+                  "id",
+                  "subject",
+                  "predicate",
+                  "object",
+                  "modality",
+                  "conditions"
+                ],
+                "additionalProperties": false
+              },
+              "status": {
+                "enum": [
+                  "accepted",
+                  "candidate",
+                  "unresolved"
+                ]
+              },
+              "support_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "id",
+              "fact_kind",
+              "payload",
+              "status",
+              "support_ids"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "supports": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "publications": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "historical": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "format_version",
+    "isolation_domain",
+    "scopes",
+    "nodes",
+    "edges",
+    "claims",
+    "facts",
+    "supports",
+    "publications",
+    "historical"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,15 @@
+# Same uploaded files as run.yaml. No prewritten RuleSpec is supplied here.
+isolation_domain: customer_discovery
+sources:
+  - id: excel
+    kind: excel_workbook
+    path: sample/input.xlsx
+documents:
+  - sample/data_description.md
+  - sample/analysis.md
+output_dir: ../runs/discovery
+scopes: [A, B, public]
+document_scopes: [A, B]
+model:
+  mode: disabled
+max_db_queries: 240

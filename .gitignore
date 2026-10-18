@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.DS_Store
+runs/
+build/
+dist/
+examples/sample/
+.env
+
+# Local credentials, source data, and historical working notes
+.env.*
+!.env.example
+*.pem
+*.key
+*.sqlite
+*.sqlite-*
+*.db
+.design_backups/
+research/
+gauss-capabilities.json

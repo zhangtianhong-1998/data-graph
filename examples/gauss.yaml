@@ -1,0 +1,24 @@
+isolation_domain: customer
+sources:
+  - id: gauss
+    kind: gauss_database
+    dsn_env: LIGHTGRAPH_GAUSS_DSN
+    # Generate from the project root with:
+    # lightgraph connect-check examples/gauss.yaml --verify-runtime --output gauss-capabilities.json
+    # Paths below are relative to this YAML file. connect-check ignores an old manifest.
+    capability_manifest: ../gauss-capabilities.json
+    allowed_tables: [finance.report_item, finance.report_tree]
+    allowed_columns:
+      finance.report_item: [tenant_id, item_code, item_name, item_en_name, definition]
+      finance.report_tree: [tenant_id, l1_code, l1_name, l2_code, l2_name, l3_code, l3_name]
+documents: []
+rules: []
+output_dir: ../runs/gauss
+scopes: [public]
+# Set true only after checking application, SDK/proxy/APM, swap, temp and crash-dump retention.
+deployment_retention_verified: false
+model:
+  mode: disabled
+  base_url: ''
+  model: ''
+  api_key_env: LIGHTGRAPH_API_KEY

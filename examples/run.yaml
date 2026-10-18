@@ -1,0 +1,20 @@
+# Run `lightgraph sample examples/sample` for a complete synthetic input package.
+isolation_domain: customer_demo
+sources:
+  - id: excel
+    kind: excel_workbook
+    path: sample/input.xlsx
+documents:
+  - sample/data_description.md
+  - sample/analysis.md
+rules:
+  - sample/rules.yaml
+output_dir: ../runs/example
+scopes: [A, B, public]
+document_scopes: [A, B]
+model:
+  mode: disabled
+limits:
+  max_result_rows: 20000
+  max_batch_rows: 5000
+  max_batch_bytes: 65536

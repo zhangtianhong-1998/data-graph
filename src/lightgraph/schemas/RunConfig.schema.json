@@ -1,0 +1,343 @@
+{
+  "$defs": {
+    "ExtractionGoal": {
+      "additionalProperties": false,
+      "properties": {
+        "goal_id": {
+          "default": "analysis_knowledge",
+          "title": "Goal Id",
+          "type": "string"
+        },
+        "entity_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Entity Kinds",
+          "type": "array"
+        },
+        "relation_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Relation Kinds",
+          "type": "array"
+        },
+        "source_scope": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Source Scope",
+          "type": "array"
+        },
+        "excluded_columns": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Excluded Columns",
+          "type": "array"
+        },
+        "observation_values": {
+          "default": false,
+          "title": "Observation Values",
+          "type": "boolean"
+        }
+      },
+      "title": "ExtractionGoal",
+      "type": "object"
+    },
+    "ModelConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "default": "disabled",
+          "enum": [
+            "disabled",
+            "metadata_only",
+            "in_environment",
+            "approved_external"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "base_url": {
+          "default": "",
+          "title": "Base Url",
+          "type": "string"
+        },
+        "model": {
+          "default": "",
+          "title": "Model",
+          "type": "string"
+        },
+        "api_key_env": {
+          "default": "LIGHTGRAPH_API_KEY",
+          "title": "Api Key Env",
+          "type": "string"
+        },
+        "max_calls": {
+          "default": 40,
+          "minimum": 0,
+          "title": "Max Calls",
+          "type": "integer"
+        },
+        "max_tokens": {
+          "default": 120000,
+          "minimum": 0,
+          "title": "Max Tokens",
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "default": 60,
+          "exclusiveMinimum": 0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        }
+      },
+      "title": "ModelConfig",
+      "type": "object"
+    },
+    "QueryLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "max_batch_rows": {
+          "default": 5000,
+          "exclusiveMinimum": 0,
+          "title": "Max Batch Rows",
+          "type": "integer"
+        },
+        "max_batch_bytes": {
+          "default": 65536,
+          "exclusiveMinimum": 0,
+          "title": "Max Batch Bytes",
+          "type": "integer"
+        },
+        "max_result_rows": {
+          "default": 20000,
+          "exclusiveMinimum": 0,
+          "title": "Max Result Rows",
+          "type": "integer"
+        },
+        "max_result_bytes": {
+          "default": 16777216,
+          "exclusiveMinimum": 0,
+          "title": "Max Result Bytes",
+          "type": "integer"
+        },
+        "timeout_ms": {
+          "default": 60000,
+          "exclusiveMinimum": 0,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "title": "QueryLimits",
+      "type": "object"
+    },
+    "SourceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "excel_workbook",
+            "gauss_database"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "dsn_env": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dsn Env"
+        },
+        "allowed_tables": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Tables",
+          "type": "array"
+        },
+        "allowed_columns": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allowed Columns"
+        },
+        "capability_manifest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Capability Manifest"
+        },
+        "include_hidden": {
+          "default": false,
+          "title": "Include Hidden",
+          "type": "boolean"
+        },
+        "header_row": {
+          "default": 1,
+          "minimum": 1,
+          "title": "Header Row",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "kind"
+      ],
+      "title": "SourceConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "isolation_domain": {
+      "default": "default",
+      "title": "Isolation Domain",
+      "type": "string"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/SourceConfig"
+      },
+      "title": "Sources",
+      "type": "array"
+    },
+    "documents": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Documents",
+      "type": "array"
+    },
+    "rules": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Rules",
+      "type": "array"
+    },
+    "goal": {
+      "$ref": "#/$defs/ExtractionGoal"
+    },
+    "limits": {
+      "$ref": "#/$defs/QueryLimits"
+    },
+    "model": {
+      "$ref": "#/$defs/ModelConfig"
+    },
+    "output_dir": {
+      "default": "runs/default",
+      "title": "Output Dir",
+      "type": "string"
+    },
+    "scopes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Scopes",
+      "type": "array"
+    },
+    "max_working_bytes": {
+      "default": 33554432,
+      "exclusiveMinimum": 0,
+      "title": "Max Working Bytes",
+      "type": "integer"
+    },
+    "max_db_queries": {
+      "default": 240,
+      "exclusiveMinimum": 0,
+      "title": "Max Db Queries",
+      "type": "integer"
+    },
+    "max_partitions": {
+      "default": 256,
+      "maximum": 4096,
+      "minimum": 1,
+      "title": "Max Partitions",
+      "type": "integer"
+    },
+    "max_run_seconds": {
+      "default": 1800,
+      "exclusiveMinimum": 0,
+      "title": "Max Run Seconds",
+      "type": "number"
+    },
+    "deployment_retention_verified": {
+      "default": false,
+      "title": "Deployment Retention Verified",
+      "type": "boolean"
+    },
+    "rediscover": {
+      "default": false,
+      "title": "Rediscover",
+      "type": "boolean"
+    },
+    "document_scopes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Document Scopes",
+      "type": "array"
+    },
+    "removed_document_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Removed Document Ids",
+      "type": "array"
+    },
+    "removed_rule_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Removed Rule Ids",
+      "type": "array"
+    }
+  },
+  "required": [
+    "sources"
+  ],
+  "title": "RunConfig",
+  "type": "object"
+}
