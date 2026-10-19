@@ -2,11 +2,48 @@
   "$defs": {
     "ExtractionGoal": {
       "additionalProperties": false,
+      "description": "Operator intent and output scope; these never grant source permissions.",
       "properties": {
         "goal_id": {
           "default": "analysis_knowledge",
           "title": "Goal Id",
           "type": "string"
+        },
+        "purpose": {
+          "default": "构建业务分析所需的实体和关系，避免展开逐笔业务观测。",
+          "maxLength": 4000,
+          "title": "Purpose",
+          "type": "string"
+        },
+        "include": {
+          "items": {
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Include",
+          "type": "array"
+        },
+        "exclude": {
+          "items": {
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Exclude",
+          "type": "array"
+        },
+        "discovery_guidance": {
+          "items": {
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Discovery Guidance",
+          "type": "array"
         },
         "entity_kinds": {
           "items": {
@@ -34,6 +71,13 @@
             "type": "string"
           },
           "title": "Excluded Columns",
+          "type": "array"
+        },
+        "evidence_only_columns": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Only Columns",
           "type": "array"
         },
         "observation_values": {
@@ -84,6 +128,20 @@
           "default": 120000,
           "minimum": 0,
           "title": "Max Tokens",
+          "type": "integer"
+        },
+        "max_discovery_steps": {
+          "default": 8,
+          "maximum": 32,
+          "minimum": 1,
+          "title": "Max Discovery Steps",
+          "type": "integer"
+        },
+        "max_tool_calls": {
+          "default": 16,
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Max Tool Calls",
           "type": "integer"
         },
         "timeout_seconds": {

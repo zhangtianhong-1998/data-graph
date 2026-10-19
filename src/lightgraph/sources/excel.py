@@ -10,7 +10,7 @@ from xml.etree import ElementTree as ET
 import openpyxl
 from lightgraph.contracts import TableSpec, ColumnSpec, QueryLimits
 from lightgraph.errors import LightGraphError
-from lightgraph.query import QueryCompiler
+from lightgraph.query import QueryCompiler, SQLGuard
 from lightgraph.query.compiler import ident
 from lightgraph.query.predicate import ScopeConjunction
 from .memory import MemorySource
@@ -163,6 +163,27 @@ class ExcelSource(MemorySource):
             # incomplete projection could wrongly retract previously known facts.
             raise LightGraphError("formula_cache_missing_in_projection")
         yield from super().project(table,columns,predicate,distinct,limit)
+
+    def execute(self, query, *, row_limit=None):
+        """Missing formula caches remain unknown through every SQL entry point.
+
+        The normal catalog guard validates first. Removing unavailable columns
+        from a second catalog then catches their use in SELECT, filters, aliases,
+        nested queries and joins without guessing references from SQL text.
+        """
+        if self._pending_formula_columns:
+            self.compiler.guard.validate(query.sql, query.parameters)
+            tables = self.describe()
+            for table in tables:
+                missing = self._pending_formula_columns.get(table.qualified_name, set())
+                table.columns = [column for column in table.columns if column.name not in missing]
+            try:
+                SQLGuard(tables, dialect="sqlite").validate(query.sql, query.parameters)
+            except LightGraphError as exc:
+                if exc.code == "unauthorized_column":
+                    raise LightGraphError("formula_cache_missing_in_projection") from None
+                raise
+        yield from super().execute(query, row_limit=row_limit)
 
     @staticmethod
     def _hidden_positions(path, ws, include_hidden):

@@ -10,6 +10,8 @@ from .rules import RuleEngine
 from .metadata import publish_metadata
 from .runtime.retention import write_report,write_rules,atomic_text
 
+DISCOVERY_WORKFLOW_VERSION='goal_tools/1'
+
 
 def load_rules(paths):
     result=[]
@@ -30,6 +32,7 @@ def make_model(config):
     from .discovery.budget import BudgetAllocator,Cost
     client=StructuredModelClient(ModelConfig(base_url=config.model.base_url,model=config.model.model,
         api_key_env=config.model.api_key_env,timeout_seconds=config.model.timeout_seconds,
+        max_discovery_steps=config.model.max_discovery_steps,max_tool_calls=config.model.max_tool_calls,
         allow_source_samples=config.model.mode in ("in_environment","approved_external")),
         BudgetAllocator(Cost(db_cu=config.max_db_queries,llm_calls=config.model.max_calls,
             llm_tokens=config.model.max_tokens,memory_bytes=config.max_working_bytes,seconds=config.max_run_seconds)))
@@ -112,11 +115,22 @@ def _latest(rules):
 
 
 def _goal_violation(rule,goal,projected):
-    if goal.source_scope and rule.source.table not in goal.source_scope and rule.source.schema_name+'.'+rule.source.table not in goal.source_scope:
+    from .discovery.goal import source_in_goal, column_is_excluded, column_is_evidence_only
+    if not source_in_goal(goal,rule.source):
         return 'outside_source_goal'
-    if any(c in goal.excluded_columns or f'{rule.source.table}.{c}' in goal.excluded_columns
-           or f'{rule.source.schema_name}.{rule.source.table}.{c}' in goal.excluded_columns for c in projected):
+    if any(column_is_excluded(goal,rule.source,c) for c in projected):
         return 'excluded_column_projected'
+    def predicate_columns(value):
+        if not isinstance(value,dict):return []
+        if 'not' in value:return predicate_columns(value['not'])
+        if any(key in value for key in ('all','any','and')):
+            return [c for key in ('all','any','and') for part in value.get(key,[]) for c in predicate_columns(part)]
+        if 'column' in value:return [value['column']]
+        return list(value)
+    if any(column_is_excluded(goal,rule.source,c) for c in predicate_columns(rule.scope.predicate)):
+        return 'excluded_column_queried'
+    if any(column_is_evidence_only(goal,rule.source,c) for c in projected):
+        return 'evidence_only_column_projected'
     if rule.identity.entity_kind not in goal.entity_kinds:return 'outside_extraction_goal'
     if rule.relation and rule.relation.relation not in goal.relation_kinds:return 'outside_relation_goal'
     if rule.kind in ('wide_hierarchy','long_hierarchy') and 'parent_of' not in goal.relation_kinds:return 'outside_relation_goal'
@@ -139,6 +153,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
     store=GraphStore(':memory:' if discover_only else output/'graph.sqlite')
     prepared=[]
     auto=rules is None
+    discovery_mode='agent_tools' if callable(getattr(model,'explore',None)) else 'deterministic'
     allrules=list(rules or [])
     document_versions={d.document_id+'@'+d.revision for d in documents}
     try:
@@ -156,11 +171,28 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             model.budget.tighten_deadline(budget.deadline)
         budget.check_time()
         tables=[t for a in adapters for t in a.describe()]
-        rules_by_source={t.source_id:a for a in adapters for t in a.describe()}
+        from .sources.scoped import GoalScopedSource
+        scoped_adapters=[GoalScopedSource(a,config.goal) for a in adapters]
+        rules_by_source={t.source_id:a for a in scoped_adapters for t in a.describe()}
         # Invalidate stale dependent metadata edges before replacing a catalogue.
         table_map={(t.source_id,t.schema_name,t.name):t for t in tables}
         old_catalog={sid:store.current_versions('catalog:'+sid) for sid in rules_by_source}
         old_rules=store.get_rules()
+        # A changed objective makes the old interpretation stale even if the
+        # model now returns no replacement. Keep history, never expose old facts
+        # as current results for the new goal or silently reuse them next run.
+        if auto:
+            changed_goals={sid for sid in rules_by_source
+                if (marker:=store.current_versions('discovery:'+sid))
+                and (marker.get('goal')!=digest(config.goal.model_dump())
+                     or marker.get('workflow')!=DISCOVERY_WORKFLOW_VERSION
+                     or marker.get('mode')!=discovery_mode)}
+            for rule in old_rules:
+                if rule.source.source_id in changed_goals:
+                    store.invalidate_rule(rule.rule_id,'discovery_goal_or_workflow_changed')
+            if changed_goals:
+                store.invalidate_rule('metadata-alignments','discovery_goal_or_workflow_changed')
+                report.counts['goal_invalidated_rules']=sum(r.source.source_id in changed_goals for r in old_rules)
         goal_engine=RuleEngine(store,isolation_domain=config.isolation_domain)
         for r in old_rules:
             violation=_goal_violation(r,config.goal,goal_engine.columns(r))
@@ -194,7 +226,9 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         need_discovery.update(r.source.source_id for r in old_rules if not set(r.dependencies.documents)<=document_versions)
         for sid in rules_by_source:
             marker=store.current_versions('discovery:'+sid)
-            if marker and marker.get('goal')!=digest(config.goal.model_dump()):need_discovery.add(sid)
+            if marker and (marker.get('goal')!=digest(config.goal.model_dump())
+                           or marker.get('workflow')!=DISCOVERY_WORKFLOW_VERSION
+                           or marker.get('mode')!=discovery_mode):need_discovery.add(sid)
         if auto:
             from .discovery.cache import validate_cached_patterns
             for sid,adapter in rules_by_source.items():
@@ -250,7 +284,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             for sid in need_discovery:
                 endpoint_ids={r.rule_id for r in prepared_rules if r.kind!='reference' and r.source.source_id==sid}
                 endpoints=[r for r in _latest(store.get_rules()) if r.rule_id in endpoint_ids]
-                result=discover_references(rules_by_source[sid],endpoints,documents=list(documents),model=model)
+                result=discover_references(rules_by_source[sid],endpoints,documents=list(documents),model=model,goal=config.goal)
                 _issues(report,result.issues)
                 existing={r.rule_id:r for r in _latest(store.get_rules(include_stale=True))}
                 for rule in result.rules:
@@ -270,7 +304,8 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 report.rules_published=[r.rule_id for r in prepared_rules]
                 if auto:
                     for sid in need_discovery:
-                        marker=store.begin_publication('discovery:'+sid,1,'all',{'goal':digest(config.goal.model_dump())})
+                        marker=store.begin_publication('discovery:'+sid,1,'all',{'goal':digest(config.goal.model_dump()),
+                            'workflow':DISCOVERY_WORKFLOW_VERSION,'mode':discovery_mode})
                         store.publish_partition(PartitionCompletion(publication_id=marker,complete=True,consistent=True,dependencies_valid=True))
             except LightGraphError as exc:
                 for pub in prepared:store.abort(pub)
@@ -283,7 +318,8 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             # Keep unmodeled tables visible on every run without recalling a model.
             mapped={(r.source.source_id,r.source.schema_name,r.source.table) for r in _latest(store.get_rules())}
             for table in tables:
-                if config.goal.source_scope and table.name not in config.goal.source_scope and table.qualified_name not in config.goal.source_scope:continue
+                from .discovery.goal import source_in_goal
+                if not source_in_goal(config.goal,table):continue
                 if (table.source_id,table.schema_name,table.name) not in mapped:
                     issue={'code':'no_confirmable_entity_group','table':table.qualified_name}
                     if not any(i.get('code')==issue['code'] and i.get('table')==issue['table'] for i in report.issues):
@@ -300,7 +336,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             export_graph(store,output,scopes=set(config.scopes),domain=config.isolation_domain)
         report.validation['incremental_mode']='complete_projection_reconciliation'
         if report.issues and report.status=='COMPLETED':
-            partial_tokens=('budget','timeout','truncated','unavailable','permission','incomplete','unverified','formula_cache_missing','execution_failed','dependency_rule_failed')
+            partial_tokens=('budget','exhausted','timeout','truncated','unavailable','permission','incomplete','unverified','formula_cache_missing','execution_failed','dependency_rule_failed')
             report.status='PARTIAL' if any(any(t in str(i.get('code','')) for t in partial_tokens) for i in report.issues) else 'COMPLETED_WITH_GAPS'
     except (LightGraphError,KeyboardInterrupt) as exc:
         for pub in prepared:

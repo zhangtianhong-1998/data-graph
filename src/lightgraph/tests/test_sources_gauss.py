@@ -62,6 +62,49 @@ def test_driver_parameters_server_cursor_and_snapshot_lifetime():
         source.cancel();assert db.cancelled
     assert db.closed
 
+
+def test_gauss_decimal_aggregate_counts_preserve_zero_and_generic_rows_stay_text():
+    from decimal import Decimal
+
+    class DecimalCursor(Cursor):
+        def execute(self, sql, parameters=None):
+            super().execute(sql, parameters)
+            if not self.name:
+                return
+            if "distinct_tuples" in sql:
+                self.description = [(name,) for name in ("distinct_tuples", "rows", "duplicate_groups", "max_duplicate", "null_key_rows")]
+                self.result = [(2, Decimal("3"), 1, 2, Decimal("0"))]
+            elif "violating_groups" in sql:
+                self.description = [(name,) for name in ("x_groups", "violating_groups", "excess_values", "max_values_per_x", "all_null_groups", "mixed_null_groups", "null_attribute_rows")]
+                self.result = [(2, 0, Decimal("0"), 1, 0, 0, Decimal("0"))]
+            elif "raw_count" in sql:
+                self.description = [("raw_count",)]
+                self.result = [(Decimal("2"),)]
+
+    class DecimalConnection(Connection):
+        def cursor(self, name=None):
+            return DecimalCursor(self, name)
+
+    with GaussSource("secret", allowed_tables=["public.items"], connect_factory=lambda _: DecimalConnection(),
+        verified_capabilities={"product":"openGauss", "version":"6.0.0", "driver":"psycopg_dbapi",
+                               "capabilities":{"statement_timeout":"verified","query_cancel":"verified"}}) as source:
+        table = source.describe()[0]
+        check = source.check_fd(table, ["code"], ["name"])
+        assert check["null_key_rows"] == 0 and type(check["null_key_rows"]) is int
+        assert check["excess_values"] == 0 and not check["null_attribute_rows"]
+        group = source.probe("profile_column_group", table, {"columns": ["code"]})
+        assert group["rows"] == 3 and type(group["rows"]) is int
+        query = source.compiler.finish("SELECT COUNT(*) AS raw_count FROM public.items", {}, "select")
+        rows = []
+        for batch in source.execute(query):
+            with batch:
+                rows.extend(batch.rows())
+        assert rows == [("2",)]
+        before = source.stats.queries
+        with pytest.raises(LightGraphError, match="unregistered_aggregate_operator"):
+            source._aggregate(query)
+        assert source.stats.queries == before
+
 def test_connect_error_is_redacted():
     def fail(_): raise RuntimeError("password and BUSINESS_VALUE")
     with pytest.raises(LightGraphError) as caught:

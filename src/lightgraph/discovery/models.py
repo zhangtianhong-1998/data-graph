@@ -2,11 +2,12 @@
 from __future__ import annotations
 from typing import Annotated, Literal, Union
 from pydantic import Field, model_validator
-from lightgraph.contracts import StrictModel, RuleSpec, SourceRef, digest
+from lightgraph.contracts import StrictModel, RuleSpec, SourceRef, TableSpec, digest
 
 Role = Literal['identity_code','namespace','label','alias','semantic_attribute','display_order',
                'level_position','fact_value','relation_endpoint','discriminator','audit','unknown']
-Task = Literal['T1_table_discovery','T2_cross_table','T3_hierarchy','T4_document','T5_revision']
+Task = Literal['T0_discovery','T1_table_discovery','T2_cross_table','T3_hierarchy','T4_document','T5_revision']
+SemanticProperty = Literal['label','alias','english_name','description','definition','unit','formula']
 
 class Member(StrictModel):
     column_id: str
@@ -14,6 +15,7 @@ class Member(StrictModel):
     in_identity: bool = False
     multi_value: bool = False
     exclude_from_projection: bool = False
+    property_name: SemanticProperty | None = None
     @model_validator(mode='after')
     def guard(self):
         if self.role in ('display_order','audit','fact_value') and self.in_identity:
@@ -29,12 +31,15 @@ class KeyAttributes(StrictModel):
     single_valued: list[str] = Field(default_factory=list)
     multi_valued: list[str] = Field(default_factory=list)
     display_only: list[str] = Field(default_factory=list)
+    # Issued column ID -> registered property, never guessed from a field suffix.
+    property_names: dict[str, SemanticProperty] = Field(default_factory=dict)
 
 class EntityKey(StrictModel):
     group_id: str
     entity_kind_hint: str
     key_columns: list[str] = Field(min_length=1, max_length=16)
     attributes: KeyAttributes
+    namespace_columns: list[str] = Field(default_factory=list, max_length=16)
     level_policy: Literal['not_applicable','level_qualified','code_with_fill_merge'] = 'not_applicable'
     normalization: Literal['identity'] = 'identity'
     @model_validator(mode='after')
@@ -59,24 +64,39 @@ class WideHierarchy(StrictModel):
     cycle_policy: Literal['reject_affected_edges'] = 'reject_affected_edges'
     code_relation: Literal['unknown','strict_prefix','set_inclusion'] = 'unknown'
     ordering_evidence: list[str] = Field(default_factory=list)
+    namespace_columns: list[str] = Field(default_factory=list, max_length=16)
     @model_validator(mode='after')
     def guard(self):
         if len({l.position for l in self.levels}) != len(self.levels): raise ValueError('duplicate_hierarchy_position')
         return self
 
+class LongHierarchy(StrictModel):
+    group_id: str
+    entity_kind_hint: str = 'DimensionMember'
+    key_column: str
+    parent_column: str
+    label_column: str | None = None
+    alias_columns: list[str] = Field(default_factory=list,max_length=2)
+    namespace_columns: list[str] = Field(default_factory=list,max_length=16)
+    ordering_evidence: list[str] = Field(default_factory=list,max_length=16)
+
 class Reference(StrictModel):
-    source_columns: list[str] = Field(min_length=1,max_length=16)
+    source_entity: str | None = Field(default=None,description='Verified source entity rule ID from entity_bindings.')
+    source_columns: list[str] = Field(min_length=1,max_length=16,description='Issued column IDs on the CURRENT table, ordered to match source_entity key_columns.')
     target_entity: str
-    target_columns: list[str] = Field(min_length=1,max_length=16)
+    target_columns: list[str] = Field(min_length=1,max_length=16,description='Issued foreign-key column IDs on the CURRENT table, ordered to match target_entity key_columns. Do not use remote-table IDs.')
     direction: Literal['source_to_target'] = 'source_to_target'
     cardinality_hint: Literal['n_to_1','1_to_1','unknown'] = 'unknown'
     condition_ref: str | None = None
     polymorphic_by: str | None = None
     require_full_coverage: bool = False
     normalization: Literal['identity'] = 'identity'
+    relation_kind: Literal['verified_reference','uses_measure','member_of'] = 'verified_reference'
     @model_validator(mode='after')
     def guard(self):
-        if len(self.source_columns) != len(self.target_columns): raise ValueError('reference_arity_mismatch')
+        # Each endpoint matches its own registered key, whose arity can differ.
+        if len(set(self.source_columns))!=len(self.source_columns) or len(set(self.target_columns))!=len(self.target_columns):
+            raise ValueError('duplicate_reference_column')
         return self
 
 class DiscriminatorPartition(StrictModel):
@@ -117,6 +137,9 @@ class EntityKeyProposal(ProposalBase):
 class HierarchyProposal(ProposalBase):
     kind: Literal['wide_hierarchy']
     claim: WideHierarchy
+class LongHierarchyProposal(ProposalBase):
+    kind: Literal['long_hierarchy']
+    claim: LongHierarchy
 class ReferenceProposal(ProposalBase):
     kind: Literal['reference']
     claim: Reference
@@ -126,7 +149,7 @@ class DiscriminatorProposal(ProposalBase):
 class ExclusionProposal(ProposalBase):
     kind: Literal['exclusion']
     claim: Exclusion
-Proposal = Annotated[Union[ColumnGroupProposal,EntityKeyProposal,HierarchyProposal,ReferenceProposal,
+Proposal = Annotated[Union[ColumnGroupProposal,EntityKeyProposal,HierarchyProposal,LongHierarchyProposal,ReferenceProposal,
                            DiscriminatorProposal,ExclusionProposal],Field(discriminator='kind')]
 class ProposalBatch(StrictModel):
     packet_version: Literal['1.0'] = '1.0'
@@ -137,9 +160,10 @@ class ProposalBatch(StrictModel):
     notes: str = Field(default='',max_length=600)
     @model_validator(mode='after')
     def guard(self):
-        allowed = {'T1_table_discovery': {'column_group','entity_key','exclusion'},
-                   'T2_cross_table': {'reference','discriminator'}, 'T3_hierarchy': {'wide_hierarchy'},
-                   'T4_document': set(), 'T5_revision': {'column_group','entity_key','exclusion','reference','discriminator','wide_hierarchy'}}
+        allowed = {'T0_discovery': {'column_group','entity_key','exclusion','wide_hierarchy','long_hierarchy'},
+                   'T1_table_discovery': {'column_group','entity_key','exclusion'},
+                   'T2_cross_table': {'reference','discriminator'}, 'T3_hierarchy': {'wide_hierarchy','long_hierarchy'},
+                   'T4_document': set(), 'T5_revision': {'column_group','entity_key','exclusion','reference','discriminator','wide_hierarchy','long_hierarchy'}}
         if self.abstain and self.proposals: raise ValueError('abstain_with_proposals')
         if any(p.kind not in allowed[self.task] for p in self.proposals): raise ValueError('task_kind_forbidden')
         return self
@@ -217,13 +241,19 @@ class PacketBudget(StrictModel):
     max_hypotheses: int = Field(default=6,gt=0,le=6)
     max_probe_requests: int = Field(default=4,gt=0,le=6)
     max_rationale_chars: int = Field(default=600,gt=0,le=600)
+class EntityBinding(StrictModel):
+    rule_id: str
+    source: SourceRef
+    entity_kind: str
+    key_columns: list[str]
+
 class TaskPacket(StrictModel):
     packet_version: Literal['1.0'] = '1.0'
     task: Task
     scope: SourceRef | None = None
     goal: dict = Field(default_factory=dict)
     metadata_digest: MetadataDigest = Field(default_factory=MetadataDigest)
-    probe_digest: list[PacketProbe] = Field(default_factory=list,max_length=32)
+    probe_digest: list[PacketProbe] = Field(default_factory=list,max_length=96)
     strata_samples: list[PacketStratum] = Field(default_factory=list,max_length=8)
     document_snippets: list[PacketDocument] = Field(default_factory=list,max_length=32)
     known_conflicts: list[PacketConflict] = Field(default_factory=list,max_length=32)
@@ -232,6 +262,10 @@ class TaskPacket(StrictModel):
     authorized_selectors: list[str] = Field(default_factory=list,max_length=64)
     revision_of: str | None = None
     allowed_revision_codes: list[str] = Field(default_factory=list,max_length=32)
+    revision_candidate: RuleSpec | None = None
+    # Schema only. Query rows and tool transcripts never enter a stored packet.
+    catalog: list[TableSpec] = Field(default_factory=list,max_length=64)
+    entity_bindings: list[EntityBinding] = Field(default_factory=list,max_length=64)
     @model_validator(mode='after')
     def bounds(self):
         from lightgraph.contracts import canonical,ExtractionGoal

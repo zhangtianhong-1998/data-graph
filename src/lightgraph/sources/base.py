@@ -2,12 +2,39 @@
 from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import math
 import time
 from typing import Any, Iterable, Iterator
 from lightgraph.contracts import QueryLimits, TableSpec
 from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler, ValidatedQuery
+
+
+COUNT_AGGREGATE_OPERATORS = frozenset({"profile_column", "profile_column_group", "check_fd",
+    "check_reference", "check_value_domain", "path_probe", "compare_attribute_role"})
+
+
+def aggregate_count(value: Any) -> int | None:
+    """Normalize only compiler-owned nonnegative count/length fields.
+
+    Gauss SUM(bigint) may return Decimal, which cursor_batches preserves as text.
+    Counts must regain their integer semantics here: the string "0" is otherwise
+    truthy during FD/reference validation. Raw source projections never call this.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, (int, float, str, Decimal)) or isinstance(value, bool):
+        raise LightGraphError("invalid_aggregate_shape")
+    if len(str(value)) > 128:
+        raise LightGraphError("invalid_aggregate_shape")
+    try:
+        number = Decimal(str(value))
+        if not number.is_finite() or number < 0 or number.adjusted() > 38 or number != number.to_integral_value():
+            raise LightGraphError("invalid_aggregate_shape")
+        return int(number)
+    except (InvalidOperation, ValueError):
+        raise LightGraphError("invalid_aggregate_shape") from None
 
 
 def row_bytes(row: tuple) -> int:
@@ -79,13 +106,15 @@ class SourceAdapter:
     def project(self, table: TableSpec, columns: list[str], predicate: dict | None = None, distinct: bool = True, limit: int | None = None) -> Iterator[EphemeralBatch]:
         cap = min(limit or self.limits.max_result_rows, self.limits.max_result_rows)
         yield from self.execute(self.compiler.projection(table, columns, predicate=predicate, distinct=distinct, limit=cap), row_limit=cap)
-    def _aggregate(self, query: ValidatedQuery) -> dict[str, int | float | None]:
+    def _aggregate(self, query: ValidatedQuery) -> dict[str, int | None]:
+        if query.operator not in COUNT_AGGREGATE_OPERATORS:
+            raise LightGraphError("unregistered_aggregate_operator")
         result = None
         for batch in self.execute(query):
             with batch:
                 for row in batch:
                     if result is not None: raise LightGraphError("invalid_aggregate_shape")
-                    result = dict(zip(batch.columns, row))
+                    result = {name: aggregate_count(value) for name, value in zip(batch.columns, row)}
         return result or {}
     def profile(self, table: TableSpec, columns: list[str] | None = None, predicate=None) -> dict:
         with self.snapshot():

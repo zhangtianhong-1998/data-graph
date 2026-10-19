@@ -25,7 +25,7 @@
 | 编号 | 决策 | 原因 |
 | --- | --- | --- |
 | D01 | 新建独立 `lightgraph` 主流程，从两个旧项目拆算子复用 | 避免继承报表包、本地全量导入与本体类型推导 |
-| D02 | 数据源统一走 `SourceAdapter`；模型只调用注册过的探查算子 | SQL 安全、方言、成本、取消统一管理 |
+| D02 | 数据源统一走 `SourceAdapter`；模型通过注册工具提交探查请求或只读 SQL | 工具内部统一校验 SQL、权限、成本与取消 |
 | D03 | 模型提出结构假设，程序用查询找反例并验证 | 少量样本证明不了全表规律；命名不能代替语义 |
 | D04 | 实体投影与关系投影分开，按目标粒度做联合 DISTINCT | 去掉事实重复，同时保留关系两端的真实配对 |
 | D05 | 语义身份与来源绑定、引用范围分离 | 同一指标跨范围共享；同名不同口径不误合并 |
@@ -262,7 +262,7 @@ CapabilityManifest:
 
 ### 4.2 五层约束
 
-1. **模板化算子。** 模型调用 `profile_column`、`check_fd`、`distinct_projection` 等工具，参数只允许目录列名、字面值列表、阈值、枚举策略；不接收 SQL 文本，不接收任意表名。
+1. **统一查询工具。** 模型可调用统计、函数依赖等结构化探查工具，也可向只读 SQL 工具提交查询和绑定参数。两类工具共用强制执行的 SQL 检查；表列必须属于授权目录。不安全查询整体拒绝，不通过删词或自动改写绕过检查。事务控制和图谱发布不开放给模型。
 2. **严格 AST 校验。** 解析完整 SQL，必须恰好一条查询语句；递归检查 CTE、子查询、表达式、函数、表引用、锁子句、导出子句。解析失败、未知语法、自动修复都拒绝。
 3. **数据库权限与会话。** 专用最小权限账号；只读事务由连接器初始化并确认；对象白名单与列授权在连接器侧再校验一次；结果存储用另一个账号。
 4. **资源约束。** 执行前检查允许对象、关联规模、投影基数估计；执行时限制时间、并发、返回行数、字节数、内存与取消超时。`LIMIT` 只能限制返回，不能限制聚合、JOIN、DISTINCT 的计算量。
@@ -270,7 +270,7 @@ CapabilityManifest:
 
 ### 4.3 AST 允许与拒绝
 
-默认允许：编译器产生的单条 `SELECT`、只读 `WITH`、`UNION ALL`、聚合、过滤、`GROUP BY`、`DISTINCT`、受限 `JOIN`、固定深度层级展开模板、`EXPLAIN`（只读计划，不含 `ANALYZE`）。
+设计允许范围：通过严格校验的单条 `SELECT`、只读 `WITH`、`UNION ALL`、聚合、过滤、`GROUP BY`、`DISTINCT`、受限 `JOIN`、固定深度层级展开模板。查询可以由编译器产生，也可以由发现 Agent 经工具提交；具体开放形状以工具和连接器的已验证白名单为准。`EXPLAIN`（不含 `ANALYZE`）可作为受控成本探针，未验证前不开放给 Agent。
 
 必须拒绝：
 
@@ -318,21 +318,21 @@ route2 的统计 SQL 结构可以复用，但不能直接搬：`profiling.py:28-
 
 ```yaml
 goal_id: operating_analysis
-include:
-  entity_kinds: [Metric, Measure, Dimension, DimensionMember, ReportItem, AnalysisMethod]
-  relation_kinds: [parent_of, member_of, uses_measure, analyzes, defined_by, verified_reference]
-exclude:
-  observation_values: true
-  entity_kinds: [Transaction, Order, DailyObservation]
-source_scope: [source_001.finance]
-knowledge_documents: [doc_001, doc_002]
-unknown_semantics: preserve_candidate
-budget_profile: pilot                    # 映射到三池预算
+purpose: 构建经营分析所需的指标、度量和维度图谱
+include: [指标定义与计算依赖, 维度成员与上下级关系]
+exclude: [每笔交易记录, 具体业务观测值]
+discovery_guidance: [根据证据判断列组, 规则验证后对关键列去重]
+entity_kinds: [Metric, Measure, Dimension, DimensionMember, ReportItem, BusinessConcept]
+relation_kinds: [parent_of, member_of, uses_measure, verified_reference]
+source_scope: []                         # 可选：表、schema 或来源范围
+excluded_columns: []                     # 可选：禁止查询的列
+evidence_only_columns: []                # 可选：可探查但不输出值的列
+observation_values: false
 ```
 
-这是抽取目标配置，不是客户表名到类型的手写映射。系统自动产生映射规则，规则要可读、可验证、可撤销。用户已有确认映射时，作为 `created_by=user` 的提示进入发现流程，仍接受数据验证。
+目标在首次发现调用前进入 Agent 的系统上下文，并贯穿探查、规则生成和输出校验。文字字段表达业务方向，类型、来源和列范围由程序检查。目标不能扩张连接器权限；来源中的元数据、样本与 Markdown 仍是待核查证据。数字列的元数据可以表示指标定义，排除观测值不能直接排除所有数值列。每个候选列区分输出用途、仅辅助理解或本次无关。系统自动产生映射规则，规则要可读、可验证、可撤销；用户已有映射也仍须验证。
 
-目标变更生成新版本；不同目标不共用上一目标的投影结果。
+目标全部字段参与发现依赖摘要；变更后重新发现，不复用上一目标的规则为当前目标提供覆盖证明。知识文档、数据库预算与模型预算在运行配置的对应字段提供，不混入目标权限。2026-10-19 的工具循环、配置与边界见 [发现 Agent 更新](AGENT_DISCOVERY_UPDATE.md)。
 
 ### 5.2 DataUnderstanding
 

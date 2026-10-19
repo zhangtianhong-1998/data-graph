@@ -100,7 +100,25 @@ class SQLGuard:
                         raise LightGraphError("unauthorized_object")
                     # Type checks apply to referenced columns below. An unrelated
                     # custom-type column must not disable safe text projections.
-            for column in scope.columns:
+            columns = list(scope.columns)
+            checked_ids = {id(column) for column in columns}
+            for column in scope.find_all(exp.Column):
+                if id(column) in checked_ids:
+                    continue
+                # sqlglot's optimizer view omits unqualified HAVING columns and
+                # apparent output aliases inside ORDER/DISTINCT expressions.
+                # Those expressions can bind physical input columns instead;
+                # authorization must inspect them even when optimization does
+                # not. Only a bare ORDER BY output alias is safely resolved by
+                # the already-authorized projection. HAVING aliases must repeat
+                # their expression (or use an outer SELECT) in this SQL subset.
+                parent = column.parent
+                bare_order_alias = (not column.table and column.name in scope.expression.named_selects
+                    and isinstance(parent, exp.Ordered) and parent.this is column
+                    and isinstance(parent.parent, exp.Order) and parent.parent.parent is scope.expression)
+                if not bare_order_alias:
+                    columns.append(column)
+            for column in columns:
                 if column.is_star:
                     raise LightGraphError("wildcard_projection_forbidden")
                 matches = []

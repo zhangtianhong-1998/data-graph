@@ -2,7 +2,7 @@
 from __future__ import annotations
 import hashlib
 import json
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Scalar = str | int | float | bool | None
@@ -69,11 +69,19 @@ class QueryLimits(StrictModel):
     timeout_ms: int = Field(default=60000, gt=0)
 
 class ExtractionGoal(StrictModel):
+    """Operator intent and output scope; these never grant source permissions."""
     goal_id: str = "analysis_knowledge"
+    purpose: str = Field(default="构建业务分析所需的实体和关系，避免展开逐笔业务观测。", max_length=4000)
+    include: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=16)
+    exclude: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=16)
+    discovery_guidance: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=16)
     entity_kinds: list[str] = Field(default_factory=lambda: ["Metric", "Measure", "Dimension", "DimensionMember", "ReportItem", "BusinessConcept"])
     relation_kinds: list[str] = Field(default_factory=lambda: ["parent_of", "member_of", "uses_measure", "verified_reference"])
     source_scope: list[str] = Field(default_factory=list)
     excluded_columns: list[str] = Field(default_factory=list)
+    # Unlike excluded_columns, these can be read to test a hypothesis but their
+    # values must not become entity identities, properties or relationship ends.
+    evidence_only_columns: list[str] = Field(default_factory=list)
     observation_values: bool = False
 
 class ScopeSpec(StrictModel):

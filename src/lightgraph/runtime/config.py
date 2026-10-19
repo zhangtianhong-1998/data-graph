@@ -25,6 +25,8 @@ class ModelConfig(StrictModel):
     api_key_env: str = "LIGHTGRAPH_API_KEY"
     max_calls: int = Field(default=40, ge=0)
     max_tokens: int = Field(default=120000, ge=0)
+    max_discovery_steps: int = Field(default=8, ge=1, le=32)
+    max_tool_calls: int = Field(default=16, ge=1, le=64)
     timeout_seconds: float = Field(default=60, gt=0)
 
 class RunConfig(StrictModel):

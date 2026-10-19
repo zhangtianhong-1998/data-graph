@@ -47,12 +47,15 @@ def _kind(prefix,table,goal,documents=()):
     return 'BusinessConcept' if 'BusinessConcept' in goal.entity_kinds else 'ReportItem' if 'ReportItem' in goal.entity_kinds else None
 
 def _groups(table,goal):
+    from .goal import column_is_excluded, column_is_evidence_only
     groups=defaultdict(lambda: {'code':None,'label':None,'aliases':[],'sort':[]})
     excluded=[]; scopes=[]; semantic={}
     for c in table.columns:
         name=c.name
-        if name in goal.excluded_columns or f'{table.qualified_name}.{name}' in goal.excluded_columns or SENSITIVE.search(name):
+        if column_is_excluded(goal,table,name) or SENSITIVE.search(name):
             excluded.append(ExcludedColumn(column=name,reason='sensitive_or_excluded'));continue
+        if column_is_evidence_only(goal,table,name):
+            excluded.append(ExcludedColumn(column=name,reason='evidence_only'));continue
         if SCOPE.fullmatch(name): scopes.append(name);continue
         if AUDIT.search(name): excluded.append(ExcludedColumn(column=name,reason='audit_metadata'));continue
         if SORT.search(name):
@@ -108,13 +111,16 @@ def _understanding(table,rows,roles,documents):
 
 
 def _packet(table,goal,rows,documents,task,understanding):
+    from .goal import column_is_excluded
     columns=[{'id':_column_id(table,c.name),'name':c.name,'type':c.data_type,'comment':c.comment,
-              'observed':understanding.columns[i].observed_counts} for i,c in enumerate(table.columns) if not SENSITIVE.search(c.name)]
+              'observed':understanding.columns[i].observed_counts} for i,c in enumerate(table.columns)
+              if not SENSITIVE.search(c.name) and not column_is_excluded(goal,table,c.name)]
+    allowed_names={c['name'] for c in columns}
     safe_rows=[]
     for row in rows:
         record={}
         for name,value in row.items():
-            if SENSITIVE.search(name):continue
+            if name not in allowed_names:continue
             # Do not silently truncate an identifier and then permit its use as evidence.
             if isinstance(value,str) and (len(value.encode())>200 or re.search(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|(?:^|\s)(?:\+?\d[ -]?){11,18}(?:$|\s)',value)): continue
             record[_column_id(table,name)]=value
@@ -159,6 +165,25 @@ def _document_evidence(documents,table,pattern):
 
 def _compile_model(batch,table,goal,documents,excluded):
     lookup={_column_id(table,c.name):c.name for c in table.columns}
+    from .goal import column_is_excluded, column_is_evidence_only
+    # Name patterns are fallback hints only. Explicit model roles and operator
+    # exclusions determine projection on the Agent path.
+    excluded=list(excluded)
+    for c in table.columns:
+        if column_is_excluded(goal,table,c.name) or column_is_evidence_only(goal,table,c.name):
+            excluded.append(ExcludedColumn(column=c.name,reason='outside_output_goal'))
+    for p in batch.proposals:
+        if p.kind=='exclusion':
+            excluded.extend(ExcludedColumn(column=lookup[e.column_id],reason=e.reason)
+                            for e in p.claim.exclusions if 'projection' in e.affects)
+        elif p.kind=='column_group':
+            excluded.extend(ExcludedColumn(column=lookup[m.column_id],reason=m.role)
+                for m in p.claim.members if m.exclude_from_projection or m.role in ('display_order','audit')
+                or (m.role=='fact_value' and not goal.observation_values))
+    excluded=list({e.column:e for e in excluded}.values())
+    excluded_names={e.column for e in excluded}
+    identity_excluded={lookup[e.column_id] for p in batch.proposals if p.kind=='exclusion'
+                       for e in p.claim.exclusions if 'identity' in e.affects}
     results=[]
     for proposal in batch.proposals:
         claim=proposal.claim
@@ -167,40 +192,85 @@ def _compile_model(batch,table,goal,documents,excluded):
             keys=[lookup[m.column_id] for m in claim.members if m.in_identity and m.role=='identity_code']
             namespaces=[lookup[m.column_id] for m in claim.members if m.role=='namespace']
             if not keys:continue
-            labels=[lookup[m.column_id] for m in claim.members if m.role=='label']
-            aliases=[lookup[m.column_id] for m in claim.members if m.role=='alias']
+            if (excluded_names|identity_excluded) & set(keys+namespaces):raise LightGraphError('excluded_column_in_identity')
+            labels=[lookup[m.column_id] for m in claim.members if m.role=='label' and lookup[m.column_id] not in excluded_names]
+            aliases=[m for m in claim.members if m.role=='alias' and lookup[m.column_id] not in excluded_names]
             if len(labels)>1:raise LightGraphError('ambiguous_primary_label')
+            single={'label':labels[0]} if labels else {}
+            multi={}
+            for index,member in enumerate(aliases):
+                if index>=2:raise LightGraphError('too_many_alias_columns')
+                name=member.property_name or ('alias','english_name')[index]
+                if name not in ('alias','english_name') or name in multi:raise LightGraphError('ambiguous_alias_property')
+                multi[name]=lookup[member.column_id]
+            for member in claim.members:
+                if member.role!='semantic_attribute' or lookup[member.column_id] in excluded_names:continue
+                if member.property_name not in ('description','definition','unit','formula'):
+                    raise LightGraphError('unregistered_attribute_semantics')
+                if member.property_name in single or member.property_name in multi:raise LightGraphError('ambiguous_primary_attribute')
+                (multi if member.multi_value else single)[member.property_name]=lookup[member.column_id]
             results.append(RuleSpec(rule_id='rule_'+digest(table.source_id,table.qualified_name,'model_group',keys)[:24],kind='column_group_entity',
                 goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=namespaces),
                 identity=IdentitySpec(key_columns=list(dict.fromkeys(namespaces+keys)),entity_kind=claim.entity_kind_hint),
-                attributes=AttributeSpec(single_valued={'label':labels[0]} if labels else {},
-                    multi_valued={key:name for key,name in zip(('alias','english_name'),aliases)},excluded=excluded),
+                attributes=AttributeSpec(single_valued=single,
+                    multi_valued=multi,excluded=excluded),
                 dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in documents})),
                 coverage=Coverage(scope='sampled'),evidence=RuleEvidence(semantic_basis=['model_column_group_candidate'])))
         elif proposal.kind=='entity_key':
             if claim.entity_kind_hint not in goal.entity_kinds:continue
             single=[lookup[c] for c in claim.attributes.single_valued]
-            if len(single)>1 and any(c not in SEMANTIC and not NAME.match(c) for c in single):
+            explicit={lookup[c]:name for c,name in claim.attributes.property_names.items()}
+            if len(single)>1 and any(c not in explicit and c not in SEMANTIC and not NAME.match(c) for c in single):
                 raise LightGraphError('unregistered_attribute_semantics')
             single_map={}
             for column in single:
-                property_name=SEMANTIC.get(column,'label')
+                property_name=explicit.get(column,SEMANTIC.get(column,'label'))
                 if property_name in single_map:raise LightGraphError('ambiguous_primary_attribute')
                 single_map[property_name]=column
             multi=[lookup[c] for c in claim.attributes.multi_valued]
             keys=[lookup[c] for c in claim.key_columns]
-            namespaces=[c for c in keys if SCOPE.fullmatch(c)]
+            if identity_excluded & set(keys):raise LightGraphError('excluded_column_in_identity')
+            namespaces=[lookup[c] for c in claim.namespace_columns]
+            if not set(namespaces)<=set(keys):raise LightGraphError('namespace_not_in_identity')
+            if set(keys+single+multi)&excluded_names:raise LightGraphError('excluded_column_projected')
+            if len(multi)>2:raise LightGraphError('too_many_alias_columns')
+            multi_map={}
+            for index,column in enumerate(multi):
+                property_name=explicit.get(column,('alias','english_name')[index])
+                if property_name in single_map or property_name in multi_map:raise LightGraphError('ambiguous_primary_attribute')
+                multi_map[property_name]=column
             results.append(RuleSpec(rule_id='rule_'+digest(table.source_id,table.qualified_name,'model_key',keys)[:24],kind='column_group_entity',
                 goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=namespaces),
                 identity=IdentitySpec(key_columns=keys,entity_kind=claim.entity_kind_hint),
                 attributes=AttributeSpec(single_valued=single_map,
-                    multi_valued={key:c for key,c in zip(('alias','english_name'),multi)},excluded=excluded),
-                dependencies=Dependencies(schema=_table_hash(table)),coverage=Coverage(scope='sampled'),
+                    multi_valued=multi_map,excluded=excluded),
+                dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in documents})),coverage=Coverage(scope='sampled'),
                 evidence=RuleEvidence(semantic_basis=['model_entity_key_candidate'])))
+        elif proposal.kind=='long_hierarchy':
+            if claim.entity_kind_hint not in goal.entity_kinds:continue
+            scopes=[lookup[c] for c in claim.namespace_columns]
+            key,parent=lookup[claim.key_column],lookup[claim.parent_column]
+            label=lookup.get(claim.label_column)
+            aliases=[lookup[c] for c in claim.alias_columns]
+            if set(scopes+[key])&identity_excluded:raise LightGraphError('excluded_column_in_identity')
+            if set(scopes+[key,parent]+([label] if label else [])+aliases)&excluded_names:
+                raise LightGraphError('excluded_column_projected')
+            order=_document_evidence(documents,table,r'父|parent')
+            results.append(RuleSpec(rule_id='rule_'+digest(table.source_id,table.qualified_name,'model_parent',scopes,key,parent)[:24],
+                kind='long_hierarchy',goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=scopes),
+                identity=IdentitySpec(key_columns=scopes+[key],entity_kind=claim.entity_kind_hint),
+                attributes=AttributeSpec(single_valued={'label':label} if label else {},
+                    multi_valued=dict(zip(('alias','english_name'),aliases)),excluded=excluded),
+                hierarchy=HierarchySpec(parent_column=parent,taxonomy=table.qualified_name,order_evidence=order),
+                dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in documents})),
+                coverage=Coverage(scope='sampled'),evidence=RuleEvidence(semantic_basis=order)))
         elif proposal.kind=='wide_hierarchy':
             if claim.entity_kind_hint not in goal.entity_kinds:continue
             levels=[LevelSpec(level=l.position,code=lookup[l.key],label=lookup.get(l.label),aliases=[lookup[l.alias]] if l.alias else []) for l in claim.levels]
-            scopes=[c.name for c in table.columns if SCOPE.fullmatch(c.name)]
+            scopes=[lookup[c] for c in claim.namespace_columns]
+            if identity_excluded & set(scopes+[l.code for l in levels]):raise LightGraphError('excluded_column_in_identity')
+            if set(scopes+[c for l in levels for c in [l.code,l.label,*l.aliases] if c])&excluded_names:
+                raise LightGraphError('excluded_column_projected')
             order=_document_evidence(documents,table,r'父.{0,12}子|层级顺序|parent.{0,20}child')
             fill=_document_evidence(documents,table,r'重复.{0,20}填充|填充.{0,20}合并|repeated.{0,20}fill')
             results.append(RuleSpec(rule_id='rule_'+digest(table.source_id,table.qualified_name,'model_hierarchy',[l.code for l in levels])[:24],
@@ -220,12 +290,15 @@ def discover(adapter,goal: ExtractionGoal | None=None,documents=None,model=None,
     seed deterministic proposals; optional T1/T3 model tasks interpret ambiguities.
     Every RuleSpec remains draft. Only a complete execution validator can publish.
     """
+    if model is not None and callable(getattr(model,'explore',None)):
+        from .workflow import discover_with_agent
+        return discover_with_agent(adapter,goal,documents,model,budget)
     goal=goal or ExtractionGoal();budget=budget or (model.budget if model else BudgetAllocator())
     corpus=documents if isinstance(documents,DocumentCorpus) else DocumentCorpus(documents or [])
     result=DiscoveryResult();tables=adapter.describe();used_tables=[]
+    from .goal import source_in_goal
     for table in tables:
-        if goal.source_scope and not any(s in (table.source_id,table.schema_name,table.qualified_name,
-            f'{table.source_id}.{table.schema_name}',f'{table.source_id}.{table.qualified_name}') for s in goal.source_scope):continue
+        if not source_in_goal(goal,table):continue
         used_tables.append(table)
         reservation='validate_'+digest(table.source_id,table.qualified_name)[:16]
         try:
@@ -278,7 +351,7 @@ def discover(adapter,goal: ExtractionGoal | None=None,documents=None,model=None,
                 if rule:
                     # Parent-column declarations need document support; the name is
                     # a proposal and full cycle/parent checks remain mandatory.
-                    parent_candidates=[c.name for c in table.columns if re.fullmatch(r'parent_(code|id)|父(?:编码|编号)',c.name,re.I)]
+                    parent_candidates=[c.name for c in table.columns if c.name not in excluded_names and re.fullmatch(r'parent_(code|id)|父(?:编码|编号)',c.name,re.I)]
                     order=_document_evidence(docs,table,r'父|parent')
                     if len(parent_candidates)==1 and order:
                         rule.hierarchy=HierarchySpec(parent_column=parent_candidates[0],taxonomy=table.qualified_name,order_evidence=order);rule.kind='long_hierarchy'
@@ -412,7 +485,7 @@ def revise_after_counterexample(model,packet:dict,hypothesis:Hypothesis,countere
     return revised,proposals
 
 
-def discover_references(adapter,validated_rules,documents=None,model=None,budget=None,*,max_candidates=32) -> DiscoveryResult:
+def discover_references(adapter,validated_rules,documents=None,model=None,budget=None,*,max_candidates=32,goal=None) -> DiscoveryResult:
     """Reference discovery joins already verified entity bindings, never all columns.
 
     Structural coverage and document semantics are separate. Exact column-family
@@ -420,6 +493,25 @@ def discover_references(adapter,validated_rules,documents=None,model=None,budget
     Tables with two recognized endpoints may emit documented mapping relations.
     Undocumented overlap remains an unresolved candidate, never business truth.
     """
+    if model is not None and callable(getattr(model,'explore',None)):
+        from .workflow import discover_references_with_agent
+        result=discover_references_with_agent(adapter,validated_rules,documents,model,budget,goal,max_candidates)
+        # Preserve the existing independently documented JSON/selector rules.
+        # Agent proposals cannot invent selector constants; this deterministic
+        # verifier still requires a scoped declaration and complete key checks.
+        if not any(i.get('status')=='deferred' for i in result.issues):
+            from .references import discover_complex_references
+            from lightgraph.sources.scoped import GoalScopedSource
+            active_budget=budget or model.budget
+            corpus=documents if isinstance(documents,DocumentCorpus) else DocumentCorpus(documents or [])
+            remaining=max_candidates-int(result.stats.get('reference_candidates',0))
+            if remaining>0:
+                scoped=GoalScopedSource(adapter,goal or ExtractionGoal())
+                try:extra=discover_complex_references(scoped,validated_rules,corpus,active_budget,max_candidates=remaining)
+                finally:scoped.close()
+                result.rules.extend(extra.rules);result.issues.extend(extra.issues);result.stats.update(extra.stats)
+                result.stats['rules_proposed']=len(result.rules);result.budget=active_budget.snapshot()
+        return result
     budget=budget or (model.budget if model else BudgetAllocator())
     corpus=documents if isinstance(documents,DocumentCorpus) else DocumentCorpus(documents or [])
     result=DiscoveryResult();tables=adapter.describe()

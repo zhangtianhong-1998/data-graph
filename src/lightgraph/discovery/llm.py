@@ -2,10 +2,10 @@
 from __future__ import annotations
 import json
 import os
-from typing import TypeVar
+from typing import Callable, TypeVar
 from urllib.parse import urlparse
 import httpx
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from lightgraph.contracts import StrictModel, canonical
 from lightgraph.errors import LightGraphError, BudgetExceeded
 from .budget import BudgetAllocator, Cost
@@ -31,6 +31,8 @@ class ModelConfig(StrictModel):
     max_output_tokens: int = 4096
     retries: int = 1
     allow_source_samples: bool = False
+    max_discovery_steps: int = Field(default=8,ge=1,le=32)
+    max_tool_calls: int = Field(default=16,ge=1,le=64)
     @classmethod
     def from_env(cls):
         return cls(base_url=os.environ.get('LIGHTGRAPH_BASE_URL','https://api.openai.com/v1'),
@@ -66,13 +68,20 @@ class StructuredModelClient:
         if not self.config.allow_source_samples and task != 'T4_document':
             packet={**packet,'strata_samples':[]}
         content = canonical({'task':task,'input':packet,'output_schema':response_model.model_json_schema()})
+        messages=[{'role':'system','content':SYSTEM}, {'role':'user','content':content}]
+        return self._request(messages,lambda message:response_model.model_validate(json.loads(message['content'])))
+
+    def _request(self, messages: list[dict], parse_message: Callable[[dict],T],
+                 tool_specs: list[dict] | None = None, *, tool_choice: str = 'auto') -> T:
+        """One bounded provider turn. Only counters survive the call, never messages."""
+        content = canonical({'messages':messages,'tools':tool_specs or []})
         if len(content.encode()) > self.config.max_prompt_bytes:
             raise LightGraphError('model_packet_too_large')
         key = os.environ.get(self.config.api_key_env)
         if not key:
             raise LightGraphError('model_api_key_missing')
         # The token estimate is deliberately conservative and fully reserves output.
-        estimate = len(content.encode()) + self.config.max_output_tokens + len(SYSTEM.encode())
+        estimate = len(content.encode()) + self.config.max_output_tokens
         last_code = 'model_failed'
         for attempt in range(self.config.retries + 1):
             reserved = f'model_call_{id(self)}_{self.usage["calls"]}'
@@ -80,15 +89,18 @@ class StructuredModelClient:
             self.budget.reserve(reserved,cost)
             counted = False
             request_started = False
+            raw = bytearray()
+            payload = envelope = value = None
             try:
                 self.budget.admit(cost,reserved)
                 # Charge the call immediately: transport failures can still incur cost.
                 self.budget.charge(Cost(llm_calls=1),reserved)
                 self.usage['calls'] += 1
-                payload = {'model':self.config.model,'messages':[
-                    {'role':'system','content':SYSTEM}, {'role':'user','content':content}],
+                payload = {'model':self.config.model,'messages':messages,
                     'response_format':{'type':'json_object'},
                     'max_tokens':self.config.max_output_tokens,'temperature':0}
+                if tool_specs:
+                    payload.update(tools=tool_specs,tool_choice=tool_choice,parallel_tool_calls=False)
                 with httpx.Client(transport=self.transport, timeout=self.config.timeout_seconds,
                                   follow_redirects=False, trust_env=False) as client:
                     timeout = min(self.config.timeout_seconds,self.budget.remaining_seconds())
@@ -102,7 +114,6 @@ class StructuredModelClient:
                         if response.status_code != 200:
                             last_code = 'model_rate_limited' if response.status_code == 429 else 'model_http_error'
                             raise LightGraphError(last_code,retryable=response.status_code in (429,500,502,503,504))
-                        raw = bytearray()
                         for chunk in response.iter_bytes():
                             self.budget.check_deadline()
                             if len(raw)+len(chunk)>self.config.max_response_bytes:
@@ -120,8 +131,7 @@ class StructuredModelClient:
                 choice = envelope['choices'][0]
                 if choice.get('finish_reason') == 'length':
                     raise LightGraphError('model_response_truncated')
-                value = json.loads(choice['message']['content'])
-                result = response_model.model_validate(value)
+                result = parse_message(choice['message'])
                 self.budget.check_deadline()
                 return result
             except BudgetExceeded:
@@ -145,7 +155,17 @@ class StructuredModelClient:
                         self.budget.charge(Cost(llm_tokens=estimate),reserved)
                 finally:
                     self.budget.release(reserved)
+                    raw.clear()
+                    payload = envelope = value = None
         raise LightGraphError(last_code) from None
+
+    def explore(self, packet: dict, tool_executor, *, max_steps: int | None = None,
+                max_tool_calls: int | None = None) -> ProposalBatch:
+        """Run the bounded tool/observation loop without retaining its transcript."""
+        from .agent import explore
+        return explore(self,packet,tool_executor,
+            max_steps=self.config.max_discovery_steps if max_steps is None else max_steps,
+            max_tool_calls=self.config.max_tool_calls if max_tool_calls is None else max_tool_calls)
 
     def propose(self, packet: dict) -> ProposalBatch:
         try:
@@ -175,13 +195,18 @@ def validate_proposal_references(batch: ProposalBatch, packet: dict) -> None:
         if p.kind == 'column_group':
             require([m.column_id for m in c.members],columns,'unauthorized_column_reference')
         elif p.kind == 'entity_key':
-            require(c.key_columns+c.attributes.single_valued+c.attributes.multi_valued+c.attributes.display_only,columns,'unauthorized_column_reference')
+            require(c.key_columns+c.namespace_columns+c.attributes.single_valued+c.attributes.multi_valued+c.attributes.display_only+list(c.attributes.property_names),columns,'unauthorized_column_reference')
+            if set(c.attributes.property_names)-set(c.attributes.single_valued+c.attributes.multi_valued):
+                raise LightGraphError('unbound_attribute_property')
         elif p.kind == 'wide_hierarchy':
-            require([v for l in c.levels for v in (l.key,l.label,l.alias,l.display_order)],columns,'unauthorized_column_reference')
+            require(c.namespace_columns+[v for l in c.levels for v in (l.key,l.label,l.alias,l.display_order)],columns,'unauthorized_column_reference')
+            require(c.ordering_evidence,evidence,'dangling_order_evidence')
+        elif p.kind == 'long_hierarchy':
+            require([c.key_column,c.parent_column,c.label_column]+c.alias_columns+c.namespace_columns,columns,'unauthorized_column_reference')
             require(c.ordering_evidence,evidence,'dangling_order_evidence')
         elif p.kind == 'reference':
             require(c.source_columns+c.target_columns+[c.polymorphic_by],columns,'unauthorized_column_reference')
-            require([c.target_entity],entities,'unverified_entity_reference')
+            require([c.source_entity,c.target_entity],entities,'unverified_entity_reference')
             require([c.condition_ref],selectors,'unauthorized_selector_reference')
         elif p.kind == 'discriminator':
             require([c.discriminating_column]+[x.source_value_column for x in c.partitions],columns,'unauthorized_column_reference')
