@@ -318,6 +318,10 @@ class GraphStore:
                 if rule and rule[0] != "valid":
                     raise StoreError("rule_dependencies_stale")
             self._validate_endpoints(self._prospective_publications(publications))
+            from ..identity.migration import plan_identity_migration, record_identity_migration
+            migration=plan_identity_migration(self,[p["publication_id"] for p in publications])
+            if migration:
+                record_identity_migration(self,migration)
             results = []
             for pub, completion in zip(publications, completions):
                 if pub["state"] != "published":
@@ -343,6 +347,12 @@ class GraphStore:
 
     def _validate_endpoints(self, publication_ids: list[str]) -> None:
         rows = self._fact_rows(publication_ids)
+        # Validate the replacement together with all surviving heads. A cycle
+        # can span rules, so checking each incoming rule in isolation is unsafe.
+        from ..rules.topology import validate_hierarchy_rows
+        validate_hierarchy_rows(rows, rules=self.get_rules(include_stale=True))
+        from ..identity.migration import validate_identity_domain_rows
+        validate_identity_domain_rows(self,rows)
         nodes = {}
         accepted_nodes = set()
         for row in rows:
@@ -486,7 +496,7 @@ class GraphStore:
                     node["conflicts"].append({"property": "label", "values": values})
             else:
                 node["properties"][name] = values[0] if len(values) == 1 else values
-                if len(values) > 1 and name not in {"business_code", "english_name", "level", "level_no"}:
+                if len(values) > 1 and name not in {"business_code", "english_name", "level", "level_no", "source_position"}:
                     node["conflicts"].append({"property": name, "values": values})
         edges, claims = [], []
         for fact in facts.values():
@@ -503,6 +513,11 @@ class GraphStore:
                 "claims": sorted(claims, key=lambda c: c["id"]),
                 "facts": [facts[fid] for fid in sorted(retained)],
                 "supports": sorted((s for s in supports.values() if s["fact_id"] in retained), key=lambda s: (s["id"], s["publication_id"]))}
+
+    def hierarchy_view(self, scopes, definition, *, domain="default", publication_id=None):
+        """Read a rooted projection without changing identities or parent facts."""
+        from ..rules.views import rooted_view
+        return rooted_view(self, scopes, definition, domain=domain, publication_id=publication_id)
 
     def search(self, text: str, scopes: set[str], domain: str = "default") -> list[dict[str, Any]]:
         view = self.view(scopes, domain)

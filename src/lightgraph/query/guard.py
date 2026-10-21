@@ -5,6 +5,7 @@ syntax and custom functions fail closed; catalog types must be trusted built-ins
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Iterable
 import sqlglot
 from sqlglot import exp
@@ -14,6 +15,20 @@ from lightgraph.errors import LightGraphError
 
 SAFE_TYPES = frozenset({"text", "varchar", "character varying", "character", "char", "nvarchar", "string", "integer", "int", "int2", "int4", "int8", "smallint", "bigint", "numeric", "decimal", "real", "double precision", "float", "float4", "float8", "boolean", "bool", "date", "timestamp", "timestamp without time zone", "timestamp with time zone", "timestamptz", "time", "blob", "bytea"})
 SAFE_NODES = frozenset({"Select", "Union", "Intersect", "Subquery", "Table", "TableAlias", "Identifier", "Column", "Star", "From", "Join", "Where", "Group", "Having", "Order", "Ordered", "Limit", "Offset", "Distinct", "Alias", "Paren", "And", "Or", "Not", "EQ", "NEQ", "GT", "GTE", "LT", "LTE", "Is", "In", "Between", "Null", "Boolean", "Literal", "Placeholder", "Parameter", "Case", "If", "Count", "Sum", "Min", "Max", "Length", "Coalesce", "Abs", "Cast", "DataType", "DataTypeParam", "Add", "Sub", "Mul", "Div", "Neg", "With", "CTE", "Exists", "D Pipe".replace(" ", ""), "DPipe", "Tuple", "Filter", "Like", "Escape"})
+
+
+@lru_cache(maxsize=16)
+def _strict_parser_type(parser_type):
+    """Reject SQLGlot's command fallback before it logs the source SQL.
+
+    ErrorLevel.RAISE controls parse errors, but not unsupported-command warnings.
+    A per-dialect subclass avoids changing process-wide logging or parser state.
+    """
+    class StrictParser(parser_type):
+        def _warn_unsupported(self):
+            raise ValueError("unsupported_sql")
+
+    return StrictParser
 
 @dataclass(frozen=True, repr=False)
 class ValidatedQuery:
@@ -34,7 +49,11 @@ class SQLGuard:
 
     def validate(self, sql: str, parameters: dict[str, Any] | None = None, *, operator: str = "select", result_columns: Iterable[str] = ()) -> ValidatedQuery:
         try:
-            statements = sqlglot.parse(sql, read=self.dialect, error_level=sqlglot.ErrorLevel.RAISE)
+            dialect = sqlglot.Dialect.get_or_raise(self.dialect)
+            parser = _strict_parser_type(dialect.parser_class)(
+                dialect=dialect, error_level=sqlglot.ErrorLevel.RAISE,
+            )
+            statements = parser.parse(dialect.tokenize(sql), sql)
             if len(statements) != 1 or not isinstance(statements[0], (exp.Select, exp.Union, exp.Intersect)):
                 raise ValueError
             tree = statements[0]

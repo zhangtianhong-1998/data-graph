@@ -41,7 +41,7 @@ def _ask(model, packet, tools):
 
 def _issue(result, table, code, *, count=None):
     entry={'table':table.qualified_name,'code':code,
-           'status':'deferred' if any(token in code for token in ('budget','limit','exhausted')) else 'unresolved'}
+           'status':'deferred' if any(token in code for token in ('budget','limit','exhausted','too_large')) else 'unresolved'}
     if count is not None: entry['count']=count
     result.issues.append(entry)
 
@@ -106,7 +106,33 @@ def _verify_fd(adapter, table, rule, budget):
     finally: budget.release(reservation)
 
 
-def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=None):
+def _bounded_catalog_window(table, tables, packet, model, tool_specs):
+    """Keep the task table and fit optional catalog entries into the real prompt."""
+    from lightgraph.context import initial_agent_prompt_bytes, STAGE_SUBTASKS
+    candidates=[table]+[t for t in tables
+        if (t.source_id,t.qualified_name)!=(table.source_id,table.qualified_name)][:63]
+    limit=getattr(model.config,'max_prompt_bytes',65536)
+    def candidate(size):
+        return {**packet,
+            'catalog':[t.model_dump(mode='json',by_alias=True) for t in candidates[:size]],
+            'subtask':STAGE_SUBTASKS[packet['task']]+(
+                f' Catalog coverage: {size} of {len(tables)} authorized tables are visible '
+                'in this call; the task table is included. Unlisted tables have not been examined.')}
+    selected=candidate(1)
+    if initial_agent_prompt_bytes(selected,tool_specs)>limit:
+        raise LightGraphError('model_packet_too_large')
+    low,high=1,len(candidates)
+    while low<high:
+        middle=(low+high+1)//2
+        trial=candidate(middle)
+        if initial_agent_prompt_bytes(trial,tool_specs)<=limit:
+            low=middle
+            selected=trial
+        else:high=middle-1
+    return candidates[:low],selected
+
+
+def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=None, *, table_refs=None):
     from .engine import _source, _packet, _understanding, _table_hash, _column_id
     from .tools import ToolExecutor
     goal=goal or ExtractionGoal()
@@ -114,11 +140,17 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
     corpus=documents if isinstance(documents,DocumentCorpus) else DocumentCorpus(documents or [])
     result=DiscoveryResult()
     tables=_catalog(adapter,goal)
+    if corpus._catalog is None:
+        corpus.bind_catalog(adapter.describe())
     originals={t.qualified_name:t for t in adapter.describe()}
-    if len(tables)>64:
-        result.issues.append({'code':'catalog_table_limit','status':'partial'})
-        tables=tables[:64]
+    # Bound each model packet, not the source work list. Otherwise a requested
+    # table after the first page can never be explored, even on a retry.
+    catalog_size=len(tables)
+    window_coverage=[]
     for table in tables:
+        if table_refs is not None and not any(key in table_refs for key in (
+            table.qualified_name,table.source_id+'.'+table.qualified_name,
+            (table.source_id,table.schema_name,table.name))):continue
         original=originals[table.qualified_name]
         docs=corpus.context_for(_source(table),table.column_names)
         understanding=_understanding(table,[],{},docs)
@@ -131,10 +163,16 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             budget.reserve(reservation,Cost(db_cu=2))
             if len(table.columns)>256: raise LightGraphError('catalog_column_limit')
             packet=_packet(table,goal,[],docs,'T0_discovery',understanding)
-            packet['catalog']=[t.model_dump(mode='json',by_alias=True) for t in tables]
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
-                allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=tables)
+                allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=[table])
+            window,packet=_bounded_catalog_window(table,tables,packet,model,tools.tool_specs())
+            window_coverage.append(len(window))
+            tools.close()
+            tools=ToolExecutor(adapter,goal,budget,documents=corpus,
+                allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=window)
             batch=_ask(model,packet,tools)
+            docs=tools.context_documents()
+            understanding.document_refs=sorted({d['doc_id']+'@'+d['revision'] for d in docs})
             budget.release(reservation)
             if batch.abstain: _issue(result,table,'model_abstained')
             rules=_compile(batch,original,goal,docs,result)
@@ -153,8 +191,10 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
                         'revision_of':rule.rule_id,'revision_candidate':rule.model_dump(mode='json',by_alias=True),
                         'allowed_revision_codes':['fd_violation']}
                     tools=ToolExecutor(adapter,goal,budget,documents=corpus,
-                        allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=tables)
-                    fixed=_compile(_ask(model,revision,tools),original,goal,docs,result)
+                        allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=window)
+                    revised_batch=_ask(model,revision,tools)
+                    docs=tools.context_documents()
+                    fixed=_compile(revised_batch,original,goal,docs,result)
                     accepted=[]
                     for replacement in fixed:
                         added=set(replacement.identity.key_columns)-set(rule.identity.key_columns)
@@ -187,7 +227,12 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
         finally:
             if tools is not None: tools.close()
             budget.release(reservation)
-    result.stats={'tables_considered':len(tables),'rules_proposed':len(result.rules),
+    result.stats={'tables_considered':len(result.understandings),'catalog_tables':catalog_size,
+        'catalog_window_limit':64,'catalog_windows':len(window_coverage),
+        'catalog_window_min':min(window_coverage,default=0),
+        'catalog_window_max':max(window_coverage,default=0),
+        'catalog_windows_partial':sum(size<catalog_size for size in window_coverage),
+        'rules_proposed':len(result.rules),
         'model_calls':model.usage['calls'],'discovery_mode':'agent_tools',
         'semantic_validation':'requires_rule_engine','coverage':'discovery_only'}
     result.budget=budget.snapshot()
@@ -195,13 +240,19 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
 
 
 def discover_references_with_agent(adapter, validated_rules, documents=None, model=None,
-                                   budget=None, goal=None, max_candidates=32):
+                                   budget=None, goal=None, max_candidates=32,
+                                   source_adapters=None, table_refs=None):
     """Resolve differently named local endpoint columns to verified entity keys."""
     from .engine import _source, _packet, _understanding, _table_hash, _column_id, _document_evidence
     from .tools import ToolExecutor
     goal=goal or ExtractionGoal();budget=budget or model.budget
     corpus=documents if isinstance(documents,DocumentCorpus) else DocumentCorpus(documents or [])
+    source_adapters=dict(source_adapters or {t.source_id:adapter for t in adapter.describe()})
     tables=_catalog(adapter,goal);originals={t.qualified_name:t for t in adapter.describe()}
+    all_tables=[t for source in source_adapters.values() for t in source.describe()]
+    corpus.bind_catalog(all_tables)
+    remote_originals={(t.source_id,t.schema_name,t.name):t for t in all_tables}
+    tool_tables=[t for source in source_adapters.values() for t in _catalog(source,goal)]
     approved={r.rule_id:r for r in validated_rules if r.status in ('validated','canary_checked','published')
               and r.validation_ref and r.kind=='column_group_entity' and source_in_goal(goal,r.source)}
     result=DiscoveryResult()
@@ -210,18 +261,52 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
         result.issues.append({'code':'reference_catalog_limit','status':'partial'});return result
     count=0
     for table in tables:
+        if table_refs is not None and not any(key in table_refs for key in (
+            table.qualified_name,table.source_id+'.'+table.qualified_name,
+            (table.source_id,table.schema_name,table.name))):continue
         tools=None
         docs=corpus.context_for(_source(table),table.column_names)
         try:
             if count>=max_candidates:raise LightGraphError('reference_candidate_limit')
             packet=_packet(table,goal,[],docs,'T2_cross_table',_understanding(table,[],{},docs))
-            packet['catalog']=[t.model_dump(mode='json',by_alias=True) for t in tables]
+            if len(tool_tables)>64:raise LightGraphError('reference_catalog_limit')
+            packet['catalog']=[t.model_dump(mode='json',by_alias=True) for t in tool_tables]
             packet['authorized_entities']=list(approved)
             packet['entity_bindings']=[{'rule_id':r.rule_id,'source':r.source.model_dump(by_alias=True),
                 'entity_kind':r.identity.entity_kind,'key_columns':r.identity.key_columns} for r in approved.values()]
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
-                allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=tables)
+                allow_source_samples=getattr(model.config,'allow_source_samples',False),
+                allowed_tables=tool_tables,source_adapters=source_adapters)
             batch=_ask(model,packet,tools)
+            docs=tools.context_documents()
+            # A final proposal can name an endpoint without using a read tool.
+            # Backend verification is a read too: first let the model reconsider
+            # with every endpoint's applicable context, before querying it.
+            authorized_tables={(t.source_id,t.schema_name,t.name):t for t in tool_tables}
+            for context_round in range(3):
+                involved={(ref['source_id'],ref.get('schema','public'),ref['table'])
+                          for ref in tools.context_tables()}
+                for proposal in batch.proposals:
+                    if proposal.kind!='reference':continue
+                    for endpoint in (proposal.claim.source_entity,proposal.claim.target_entity):
+                        binding=approved.get(endpoint)
+                        if binding:
+                            involved.add((binding.source.source_id,binding.source.schema_name,binding.source.table))
+                needed=corpus.contexts_for([authorized_tables[key] for key in sorted(involved)
+                                           if key in authorized_tables])
+                def section_keys(sections):
+                    return {(d['doc_id'],d['revision'],d['section_id']) for d in sections}
+                if section_keys(needed)<=section_keys(docs):break
+                if context_round==2:raise LightGraphError('endpoint_context_revision_limit')
+                packet={**packet,'document_snippets':needed,
+                        'context_tables':[_source(authorized_tables[key]).model_dump(mode='json',by_alias=True)
+                                          for key in sorted(involved) if key in authorized_tables],
+                        'subtask':'依据新增的端点表说明重新判断关系；不满足说明中的条件时撤回提案。'}
+                tools=ToolExecutor(adapter,goal,budget,documents=corpus,
+                    allow_source_samples=getattr(model.config,'allow_source_samples',False),
+                    allowed_tables=tool_tables,source_adapters=source_adapters)
+                batch=_ask(model,packet,tools)
+                docs=tools.context_documents()
             lookup={_column_id(table,c.name):c.name for c in table.columns}
             for proposal in batch.proposals:
                 if proposal.kind!='reference':
@@ -242,12 +327,24 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                     if claim.condition_ref or claim.polymorphic_by:raise LightGraphError('reference_condition_requires_registered_selector')
                     if claim.relation_kind not in goal.relation_kinds:raise LightGraphError('outside_relation_goal')
                     for binding,columns in ((source,local),(target,remote)):
-                        destination=originals.get(binding.source.schema_name+'.'+binding.source.table)
-                        if destination is None or binding.source.source_id!=table.source_id:raise LightGraphError('unavailable_reference_target')
+                        destination=remote_originals.get((binding.source.source_id,binding.source.schema_name,binding.source.table))
+                        target_adapter=source_adapters.get(binding.source.source_id)
+                        if destination is None or target_adapter is None:raise LightGraphError('unavailable_reference_target')
                         if len(columns)!=len(binding.identity.key_columns):raise LightGraphError('reference_arity_mismatch')
-                        budget.admit(Cost(db_cu=1))
-                        try:check=adapter.check_reference(originals[table.qualified_name],columns,destination,binding.identity.key_columns)
-                        finally:budget.charge(Cost(db_cu=1))
+                        cross_source=binding.source.source_id!=table.source_id
+                        cost=Cost(db_cu=6 if cross_source else 1)
+                        budget.admit(cost)
+                        try:
+                            if cross_source:
+                                from lightgraph.cross_source import check_cross_source_reference
+                                check=check_cross_source_reference(adapter,originals[table.qualified_name],columns,
+                                    target_adapter,destination,binding.identity.key_columns,
+                                    max_working_bytes=budget.limits.memory_bytes)
+                                if not check['complete'] or not check['consistent']:
+                                    raise LightGraphError('cross_source_reference_incomplete')
+                            else:
+                                check=adapter.check_reference(originals[table.qualified_name],columns,destination,binding.identity.key_columns)
+                        finally:budget.charge(cost)
                         if any(check.get(k,0) for k in ('unmatched','null_refs','ambiguous')):raise LightGraphError('reference_missing')
                     # Overlap alone never promotes technical evidence to business semantics.
                     evidence=_document_evidence(docs,table,r'引用|关联|使用|映射|reference|maps? to')

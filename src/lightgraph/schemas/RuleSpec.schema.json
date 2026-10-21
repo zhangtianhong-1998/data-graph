@@ -178,6 +178,59 @@
           "default": "split",
           "title": "Gap Policy",
           "type": "string"
+        },
+        "position_semantics": {
+          "anyOf": [
+            {
+              "enum": [
+                "ordinal_slots",
+                "ordered_slots"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Position Semantics"
+        },
+        "position_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Position Evidence",
+          "type": "array"
+        },
+        "context_qualifiers": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Context Qualifiers",
+          "type": "object"
+        },
+        "semantic_levels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Semantic Levels",
+          "type": "object"
         }
       },
       "title": "HierarchySpec",
@@ -203,7 +256,8 @@
           "default": "source_scoped",
           "enum": [
             "source_scoped",
-            "verified_definition_registry"
+            "verified_definition_registry",
+            "verified_identity_domain"
           ],
           "title": "Semantic Resolution",
           "type": "string"
@@ -225,10 +279,46 @@
           "enum": [
             "not_applicable",
             "code_with_fill_merge",
-            "level_qualified"
+            "level_qualified",
+            "relative_path"
           ],
           "title": "Level Policy",
           "type": "string"
+        },
+        "identity_domain": {
+          "default": "",
+          "title": "Identity Domain",
+          "type": "string"
+        },
+        "identity_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Identity Evidence",
+          "type": "array"
+        },
+        "attribute_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Attribute Evidence",
+          "type": "array"
+        },
+        "identity_scope": {
+          "default": "namespace_local",
+          "enum": [
+            "namespace_local",
+            "domain_global"
+          ],
+          "title": "Identity Scope",
+          "type": "string"
+        },
+        "global_scope_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Global Scope Evidence",
+          "type": "array"
         }
       },
       "required": [

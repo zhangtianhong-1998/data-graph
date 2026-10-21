@@ -1,0 +1,262 @@
+{
+  "$defs": {
+    "ColumnSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "data_type": {
+          "default": "text",
+          "title": "Data Type",
+          "type": "string"
+        },
+        "comment": {
+          "default": "",
+          "title": "Comment",
+          "type": "string"
+        },
+        "nullable": {
+          "default": true,
+          "title": "Nullable",
+          "type": "boolean"
+        },
+        "primary_key": {
+          "default": false,
+          "title": "Primary Key",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "ColumnSpec",
+      "type": "object"
+    },
+    "ForeignKeySpec": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Columns",
+          "type": "array"
+        },
+        "target_schema": {
+          "title": "Target Schema",
+          "type": "string"
+        },
+        "target_table": {
+          "title": "Target Table",
+          "type": "string"
+        },
+        "target_columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Target Columns",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "columns",
+        "target_schema",
+        "target_table",
+        "target_columns"
+      ],
+      "title": "ForeignKeySpec",
+      "type": "object"
+    },
+    "SourceDescription": {
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "product": {
+          "title": "Product",
+          "type": "string"
+        },
+        "version": {
+          "default": "unknown",
+          "title": "Version",
+          "type": "string"
+        },
+        "driver": {
+          "default": "unknown",
+          "title": "Driver",
+          "type": "string"
+        },
+        "capabilities": {
+          "additionalProperties": {
+            "enum": [
+              "verified",
+              "unsupported",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "title": "Capabilities",
+          "type": "object"
+        },
+        "constraint_coverage": {
+          "additionalProperties": {
+            "enum": [
+              "read",
+              "not_declared",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "title": "Constraint Coverage",
+          "type": "object"
+        },
+        "format": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "title": "Format",
+          "type": "object"
+        },
+        "type_origin": {
+          "default": "declared",
+          "enum": [
+            "declared",
+            "parser_inferred",
+            "parser_assigned"
+          ],
+          "title": "Type Origin",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "product",
+        "constraint_coverage"
+      ],
+      "title": "SourceDescription",
+      "type": "object"
+    },
+    "TableSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "schema": {
+          "default": "public",
+          "title": "Schema",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/ColumnSpec"
+          },
+          "title": "Columns",
+          "type": "array"
+        },
+        "comment": {
+          "default": "",
+          "title": "Comment",
+          "type": "string"
+        },
+        "foreign_keys": {
+          "items": {
+            "$ref": "#/$defs/ForeignKeySpec"
+          },
+          "title": "Foreign Keys",
+          "type": "array"
+        },
+        "unique_keys": {
+          "items": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Unique Keys",
+          "type": "array"
+        }
+      },
+      "required": [
+        "source_id",
+        "name",
+        "columns"
+      ],
+      "title": "TableSpec",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "artifact": {
+      "const": "declared_metadata",
+      "default": "declared_metadata",
+      "title": "Artifact",
+      "type": "string"
+    },
+    "format_version": {
+      "const": "metadata_catalog/1",
+      "default": "metadata_catalog/1",
+      "title": "Format Version",
+      "type": "string"
+    },
+    "revision": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Revision",
+      "type": "string"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/SourceDescription"
+      },
+      "title": "Sources",
+      "type": "array"
+    },
+    "tables": {
+      "items": {
+        "$ref": "#/$defs/TableSpec"
+      },
+      "title": "Tables",
+      "type": "array"
+    }
+  },
+  "required": [
+    "revision",
+    "sources",
+    "tables"
+  ],
+  "title": "DeclaredCatalog",
+  "type": "object"
+}

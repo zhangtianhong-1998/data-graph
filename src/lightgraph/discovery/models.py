@@ -65,6 +65,20 @@ class WideHierarchy(StrictModel):
     code_relation: Literal['unknown','strict_prefix','set_inclusion'] = 'unknown'
     ordering_evidence: list[str] = Field(default_factory=list)
     namespace_columns: list[str] = Field(default_factory=list, max_length=16)
+    path_semantics: Literal["legacy", "relative_path"] = "legacy"
+    identity_domain: str = ""
+    identity_evidence: list[str] = Field(default_factory=list, max_length=16)
+    attribute_evidence: list[str] = Field(default_factory=list, max_length=16)
+    identity_scope: Literal["namespace_local", "domain_global"] = "namespace_local"
+    global_scope_evidence: list[str] = Field(default_factory=list, max_length=16)
+    taxonomy: str = ""
+    taxonomy_evidence: list[str] = Field(default_factory=list, max_length=16)
+    position_semantics: Literal["ordinal_slots", "ordered_slots"] | None = None
+    position_evidence: list[str] = Field(default_factory=list, max_length=16)
+    context_qualifiers: dict[str, str] = Field(default_factory=dict)
+    context_evidence: list[str] = Field(default_factory=list, max_length=16)
+    allow_dag: bool = False
+    dag_evidence: list[str] = Field(default_factory=list, max_length=16)
     @model_validator(mode='after')
     def guard(self):
         if len({l.position for l in self.levels}) != len(self.levels): raise ValueError('duplicate_hierarchy_position')
@@ -233,6 +247,11 @@ class PacketDocument(StrictModel):
     heading: str
     locator: str
     text: str = Field(repr=False)
+    purpose: Literal['data_description','analysis_knowledge','mixed','unresolved'] = 'data_description'
+    scope: dict = Field(default_factory=dict)
+    sources: list[SourceRef] = Field(default_factory=list)
+    read_state: Literal['complete'] = 'complete'
+    evidence_role: Literal['definition_evidence','exploration_guidance'] = 'definition_evidence'
 class PacketConflict(StrictModel):
     code: str
     count: int = Field(default=0,ge=0)
@@ -252,6 +271,9 @@ class TaskPacket(StrictModel):
     task: Task
     scope: SourceRef | None = None
     goal: dict = Field(default_factory=dict)
+    subtask: str | None = Field(default=None,max_length=2000)
+    context_tables: list[SourceRef] = Field(default_factory=list,max_length=64)
+    document_refs: list[dict] = Field(default_factory=list,max_length=128)
     metadata_digest: MetadataDigest = Field(default_factory=MetadataDigest)
     probe_digest: list[PacketProbe] = Field(default_factory=list,max_length=96)
     strata_samples: list[PacketStratum] = Field(default_factory=list,max_length=8)

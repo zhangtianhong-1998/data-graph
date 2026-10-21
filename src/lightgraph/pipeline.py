@@ -2,15 +2,63 @@
 from __future__ import annotations
 import time
 import uuid
+import json
 from pathlib import Path
 import yaml
-from .contracts import RuleSpec, RunReport, GraphFact, SupportSpec, PartitionCompletion, digest
+from .contracts import RuleSpec, RunReport, GraphFact, SupportSpec, PartitionCompletion, digest, canonical
 from .errors import LightGraphError
 from .rules import RuleEngine
 from .metadata import publish_metadata
 from .runtime.retention import write_report,write_rules,atomic_text
 
-DISCOVERY_WORKFLOW_VERSION='goal_tools/1'
+DISCOVERY_WORKFLOW_VERSION='agentscope_scoped_context/3'
+
+# These failures mean the Agent never completed an interpretation. They are not
+# permission to retry within a turn; leave the table pending for a later run.
+_AGENT_EXECUTION_FAILURES = frozenset({
+    'agent_source_tracing_forbidden', 'agent_source_persistence_forbidden',
+    'agent_tracing_forbidden', 'agent_nontext_tool_response',
+    'agent_sync_entrypoint_inside_event_loop', 'invalid_tool_schema',
+})
+
+
+def _agent_execution_failure(code):
+    return code in _AGENT_EXECUTION_FAILURES or code.startswith('model_stream_')
+
+def _context_versions(marker):
+    """Source-version values stay flat references, never arbitrary dictionaries."""
+    result={}
+    for entry in marker.get('contexts',[]):
+        try:
+            name,version=json.loads(entry)
+            if isinstance(name,str) and isinstance(version,str):result[name]=version
+        except (ValueError,TypeError):
+            continue
+    return result
+
+
+def _abort_staging(store, publications):
+    # Later reporting failures must not attempt to undo a committed publication.
+    for publication in publications:
+        try:
+            if store._publication(publication)['state'] in ('staging','ready'):store.abort(publication)
+        except LightGraphError:
+            pass
+
+
+def _deferred_tables(result, selected=()):
+    """Operational failures are retryable work, not a completed interpretation."""
+    tokens=('budget','limit','exhausted','timeout','too_large','incomplete','unavailable',
+            'permission','unauthorized','execution_failed','model_http','model_response',
+            'model_transport','model_request','model_json','model_schema','connection',
+            'model_api_key','llm_schema','llm_json')
+    failed=set()
+    for issue in result.issues:
+        if (issue.get('status') in ('deferred','partial') or
+            _agent_execution_failure(str(issue.get('code',''))) or
+            any(token in str(issue.get('code','')) for token in tokens)):
+            failed.update([issue['table']] if issue.get('table') else selected)
+    return failed
 
 
 def load_rules(paths):
@@ -27,21 +75,30 @@ def load_rules(paths):
 
 
 def make_model(config):
-    if config.model.mode=='disabled':return None
-    from .discovery.llm import StructuredModelClient,ModelConfig
-    from .discovery.budget import BudgetAllocator,Cost
-    client=StructuredModelClient(ModelConfig(base_url=config.model.base_url,model=config.model.model,
-        api_key_env=config.model.api_key_env,timeout_seconds=config.model.timeout_seconds,
-        max_discovery_steps=config.model.max_discovery_steps,max_tool_calls=config.model.max_tool_calls,
-        allow_source_samples=config.model.mode in ("in_environment","approved_external")),
-        BudgetAllocator(Cost(db_cu=config.max_db_queries,llm_calls=config.model.max_calls,
-            llm_tokens=config.model.max_tokens,memory_bytes=config.max_working_bytes,seconds=config.max_run_seconds)))
+    settings = config.resolved_model
+    if settings.mode == 'disabled':
+        return None
+    from .discovery.llm import StructuredModelClient, ModelConfig
+    from .discovery.budget import BudgetAllocator, Cost
+    client = StructuredModelClient(ModelConfig(
+        base_url=settings.base_url, model=settings.model, agent_name=config.agent_name,
+        api_key=settings.api_key, api_key_env=settings.api_key_env,
+        stream=settings.stream, stream_options_include_usage=settings.stream_options_include_usage,
+        allow_insecure_http=settings.allow_insecure_http, timeout_seconds=settings.timeout_seconds,
+        max_output_tokens=settings.max_output_tokens, max_prompt_bytes=settings.max_prompt_bytes,
+        max_response_bytes=settings.max_response_bytes, retries=settings.retries,
+        max_discovery_steps=settings.max_discovery_steps, max_tool_calls=settings.max_tool_calls,
+        allow_source_samples=settings.mode in ("in_environment", "approved_external")),
+        BudgetAllocator(Cost(db_cu=config.max_db_queries, llm_calls=settings.max_calls,
+            llm_tokens=settings.max_tokens, memory_bytes=config.max_working_bytes,
+            seconds=config.max_run_seconds)))
     return client
 
 
-def publish_documents(store,documents,domain,model=None,scopes=("public",),document_scopes=("public",),check_time=None):
+def publish_documents(store,documents,domain,model=None,scopes=("public",),document_scopes=("public",),check_time=None,goal=None):
     from .documents import extract_with_cache
     from .documents.cache import extractor_fingerprint
+    from .context import CONTEXT_SELECTION_VERSION, goal_payload
     count=0;issues=[]
     snapshot=store.view(set(scopes)&set(document_scopes),domain=domain)
     known={}
@@ -50,7 +107,8 @@ def publish_documents(store,documents,domain,model=None,scopes=("public",),docum
         if check_time:check_time()
         rid='document:'+document.document_id
         versions={'document':document.document_id+'@'+document.revision,'scopes':sorted(document_scopes),
-                  'document_extractor':extractor_fingerprint(model)}
+                  'document_extractor':extractor_fingerprint(model),
+                  'goal':digest(goal_payload(goal)), 'context_selection':CONTEXT_SELECTION_VERSION}
         if store.current_versions(rid)==versions:continue
         prior_cache=store.get_document_cache(rid)
         pub=store.begin_publication(rid,1,'all',versions)
@@ -71,7 +129,7 @@ def publish_documents(store,documents,domain,model=None,scopes=("public",),docum
                 stage('NodeExistence',{'entity_id':sid,'kind':'DocumentSection','layer':'provenance'},ref)
                 stage('PropertyValue',{'entity_id':sid,'name':'label','value':section.heading},ref)
                 stage('Edge',{'source':docid,'relation':'has_section','target':sid},ref)
-            extracted=extract_with_cache(document,model=model,known_entities=known,cached_sections=prior_cache)
+            extracted=extract_with_cache(document,model=model,known_entities=known,cached_sections=prior_cache,goal=goal)
             claims=extracted.claims
             for claim in claims:
                 conditions={str(i):v for i,v in enumerate(claim.conditions)}
@@ -152,6 +210,9 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
     started=time.monotonic()
     store=GraphStore(':memory:' if discover_only else output/'graph.sqlite')
     prepared=[]
+    understandings=[]
+    discovery_completed={}
+    documents=[d for d in documents if d.document_id not in config.removed_document_ids]
     auto=rules is None
     discovery_mode='agent_tools' if callable(getattr(model,'explore',None)) else 'deterministic'
     allrules=list(rules or [])
@@ -169,8 +230,20 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         for a in adapters:a.install_budget(budget)
         if model and hasattr(model,'budget'):
             model.budget.tighten_deadline(budget.deadline)
+            from dataclasses import replace
+            model.budget.limits=replace(model.budget.limits,
+                memory_bytes=min(model.budget.limits.memory_bytes,config.max_working_bytes))
         budget.check_time()
         tables=[t for a in adapters for t in a.describe()]
+        from .documents import DocumentCorpus
+        from .context import context_dependency_fingerprint
+        from .catalog import declared_catalog, semantic_catalog, write_catalog, read_semantic_catalog
+        corpus=DocumentCorpus(documents)
+        corpus.bind_catalog(tables)
+        declared=declared_catalog(adapters)
+        previous_semantic=read_semantic_catalog(output)
+        write_catalog(output,declared,semantic_catalog(declared,config.goal,documents=documents,
+                                                       previous=previous_semantic))
         from .sources.scoped import GoalScopedSource
         scoped_adapters=[GoalScopedSource(a,config.goal) for a in adapters]
         rules_by_source={t.source_id:a for a in scoped_adapters for t in a.describe()}
@@ -178,6 +251,23 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         table_map={(t.source_id,t.schema_name,t.name):t for t in tables}
         old_catalog={sid:store.current_versions('catalog:'+sid) for sid in rules_by_source}
         old_rules=store.get_rules()
+        from .discovery.goal import source_in_goal
+        contexts={sid:{t.qualified_name:context_dependency_fingerprint(corpus,[t],config.goal)
+                      for t in tables if t.source_id==sid and source_in_goal(config.goal,t)}
+                  for sid in rules_by_source}
+        changed_contexts={}
+        for sid in rules_by_source:
+            marker=store.current_versions('discovery:'+sid)
+            if marker:
+                old=_context_versions(marker)
+                changed_contexts[sid]={name for name,value in contexts[sid].items() if old.get(name)!=value}
+        affected_context_rules=set()
+        def invalidate(rule_id, reason):
+            affected_context_rules.update(store.invalidate_rule(rule_id,reason))
+        if auto:
+            for rule in old_rules:
+                if rule.source.schema_name+'.'+rule.source.table in changed_contexts.get(rule.source.source_id,set()):
+                    invalidate(rule.rule_id,'applicable_documents_changed')
         # A changed objective makes the old interpretation stale even if the
         # model now returns no replacement. Keep history, never expose old facts
         # as current results for the new goal or silently reuse them next run.
@@ -189,7 +279,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                      or marker.get('mode')!=discovery_mode)}
             for rule in old_rules:
                 if rule.source.source_id in changed_goals:
-                    store.invalidate_rule(rule.rule_id,'discovery_goal_or_workflow_changed')
+                    invalidate(rule.rule_id,'discovery_goal_or_workflow_changed')
             if changed_goals:
                 store.invalidate_rule('metadata-alignments','discovery_goal_or_workflow_changed')
                 report.counts['goal_invalidated_rules']=sum(r.source.source_id in changed_goals for r in old_rules)
@@ -197,30 +287,49 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         for r in old_rules:
             violation=_goal_violation(r,config.goal,goal_engine.columns(r))
             if violation:
-                store.invalidate_rule(r.rule_id,violation)
+                invalidate(r.rule_id,violation)
                 continue
             table=table_map.get((r.source.source_id,r.source.schema_name,r.source.table))
             if not table and r.source.source_id in rules_by_source:
-                store.invalidate_rule(r.rule_id,'source_object_unavailable')
+                invalidate(r.rule_id,'source_object_unavailable')
             elif table and r.dependencies.schema_ref!=RuleEngine.schema_fingerprint(table):
-                store.invalidate_rule(r.rule_id,'schema_changed')
+                invalidate(r.rule_id,'schema_changed')
             elif not set(r.dependencies.documents)<=document_versions:
-                store.invalidate_rule(r.rule_id,'document_changed')
-        if any(old_catalog[sid] and old_catalog[sid].get('schema')!=digest([t.model_dump(mode='json',by_alias=True) for t in rules_by_source[sid].describe()]) for sid in rules_by_source):
-            store.invalidate_rule('metadata-alignments','catalog_changed')
-        for adapter in adapters:
-            if not adapter.describe():report.issues.append({'code':'source_catalog_empty_unverified'})
-            report.counts['tables']=report.counts.get('tables',0)+publish_metadata(store,adapter,config.isolation_domain)
-        # Removal is explicit: an omitted input path may be a temporary outage.
-        for rid in config.removed_rule_ids:store.invalidate_rule(rid,'explicit_rule_removed')
+                invalidate(r.rule_id,'document_changed')
+        # Explicit withdrawals must also retire derived links before any new
+        # metadata publication validates the currently visible graph.
+        for rid in config.removed_rule_ids:invalidate(rid,'explicit_rule_removed')
         for did in config.removed_document_ids:
             store.invalidate_rule('document:'+did,'explicit_document_removed')
             store.invalidate_rule('document-alignment:'+did,'explicit_document_removed')
         for rule in store.get_rules():
             if any(d.split('@',1)[0] in config.removed_document_ids for d in rule.dependencies.documents):
-                store.invalidate_rule(rule.rule_id,'document_removed')
+                invalidate(rule.rule_id,'document_removed')
+        # Derived document links cannot outlive endpoints invalidated above.
+        # Rebuild these inexpensive alignments after the replacement publishes;
+        # preserve original document claims and historical publications.
+        if affected_context_rules:
+            for head in store.heads():
+                if head['valid'] and head['logical_rule_id'].startswith('document-alignment:'):
+                    store.invalidate_rule(head['logical_rule_id'],'business_dependency_changed')
+        if any(old_catalog[sid] and old_catalog[sid].get('schema')!=digest([t.model_dump(mode='json',by_alias=True) for t in rules_by_source[sid].describe()]) for sid in rules_by_source):
+            store.invalidate_rule('metadata-alignments','catalog_changed')
+        for adapter in adapters:
+            if not adapter.describe():report.issues.append({'code':'source_catalog_empty_unverified'})
+            report.counts['tables']=report.counts.get('tables',0)+publish_metadata(store,adapter,config.isolation_domain)
         cached=_latest(store.get_rules()) if auto and not config.rediscover else []
         need_discovery={sid for sid in rules_by_source if old_catalog[sid]!=store.current_versions('catalog:'+sid)}
+        discovery_tables={sid:set(contexts[sid]) for sid in need_discovery}
+        for sid,names in changed_contexts.items():
+            if names:
+                need_discovery.add(sid);discovery_tables.setdefault(sid,set()).update(names)
+        for rule in old_rules:
+            if rule.rule_id in affected_context_rules:
+                sid=rule.source.source_id
+                name=rule.source.schema_name+'.'+rule.source.table
+                if sid in contexts and name in contexts[sid]:
+                    need_discovery.add(sid)
+                    discovery_tables.setdefault(sid,set()).add(name)
         if config.rediscover:need_discovery.update(rules_by_source)
         # A dependency removed above needs discovery even if other source rules remain valid.
         need_discovery.update(r.source.source_id for r in old_rules if not set(r.dependencies.documents)<=document_versions)
@@ -228,13 +337,17 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             marker=store.current_versions('discovery:'+sid)
             if marker and (marker.get('goal')!=digest(config.goal.model_dump())
                            or marker.get('workflow')!=DISCOVERY_WORKFLOW_VERSION
-                           or marker.get('mode')!=discovery_mode):need_discovery.add(sid)
+                           or marker.get('mode')!=discovery_mode):
+                need_discovery.add(sid);discovery_tables[sid]=set(contexts[sid])
         if auto:
             from .discovery.cache import validate_cached_patterns
             for sid,adapter in rules_by_source.items():
                 review=validate_cached_patterns(adapter,[r for r in cached if r.source.source_id==sid],documents=list(documents))
                 _issues(report,review.issues)
-                if review.needs_review:need_discovery.add(sid)
+                if review.needs_review:
+                    need_discovery.add(sid)
+                    discovery_tables.setdefault(sid,set()).update(
+                        r.source.schema_name+'.'+r.source.table for r in cached if r.rule_id in review.needs_review)
             by_table={(t.source_id,t.schema_name,t.name):t for t in tables}
             for rule in cached:
                 table=by_table.get((rule.source.source_id,rule.source.schema_name,rule.source.table))
@@ -244,17 +357,35 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 else:
                     store.invalidate_rule(rule.rule_id,'dependency_changed')
                     need_discovery.add(rule.source.source_id)
+                    discovery_tables.setdefault(rule.source.source_id,set()).add(rule.source.schema_name+'.'+rule.source.table)
             for sid in rules_by_source:
-                if not any(r.source.source_id==sid for r in allrules):need_discovery.add(sid)
+                if not store.current_versions('discovery:'+sid) and (
+                    store.current_versions('discovery-attempt:'+sid) or
+                    not any(r.source.source_id==sid for r in allrules)):
+                    need_discovery.add(sid)
             for sid in need_discovery:
-                result=discover(rules_by_source[sid],config.goal,documents=list(documents),model=model)
+                selected=set(contexts[sid]) if config.rediscover else discovery_tables.get(sid,set(contexts[sid]))
+                discovery_tables[sid]=selected
+                # This is intent, not completion. It distinguishes a crashed
+                # automatic run from an existing manually supplied rule cache.
+                attempt=store.begin_publication('discovery-attempt:'+sid,1,'all',{
+                    'goal':digest(config.goal.model_dump()),'workflow':DISCOVERY_WORKFLOW_VERSION})
+                prepared.append(attempt)
+                store.publish_partition(PartitionCompletion(publication_id=attempt,
+                    complete=True,consistent=True,dependencies_valid=True))
+                result=discover(rules_by_source[sid],config.goal,documents=corpus,model=model,
+                                table_refs=selected)
+                visited={u.source.schema_name+'.'+u.source.table for u in result.understandings}
+                discovery_completed[sid]=(visited & selected)-_deferred_tables(result,selected)
                 old={r.rule_id:r for r in _latest(store.get_rules(include_stale=True))}
                 for rule in result.rules:
                     if rule.rule_id in old:rule.revision=old[rule.rule_id].revision+1
-                allrules=[r for r in allrules if r.source.source_id!=sid]+result.rules
+                allrules=[r for r in allrules if r.source.source_id!=sid
+                          or r.source.schema_name+'.'+r.source.table not in selected]+result.rules
                 _issues(report,result.issues)
                 report.counts['discovered_rules']=report.counts.get('discovered_rules',0)+len(result.rules)
                 _write_understanding(output,result.understandings)
+                understandings.extend(result.understandings)
             report.counts['reused_rules']=len([r for r in allrules if r.source.source_id not in need_discovery])
             report.validation['D']='model_run_unscored' if model and need_discovery else 'deterministic_or_reused_unscored'
         engine=RuleEngine(store,isolation_domain=config.isolation_domain,max_working_bytes=config.max_working_bytes,max_partitions=config.max_partitions)
@@ -278,13 +409,19 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     stage_rule_metadata(store,publication_id,rule,allrules+prepared_rules,config.isolation_domain)
             else:
                 failed.add(rule.rule_id);report.rules_skipped.append(rule.rule_id)
+                discovery_completed.get(rule.source.source_id,set()).discard(
+                    rule.source.schema_name+'.'+rule.source.table)
             for code in outcome.codes:report.issues.append({'rule_id':rule.rule_id,'code':code})
         for rule in allrules:execute(rule)
         if auto and need_discovery:
             for sid in need_discovery:
-                endpoint_ids={r.rule_id for r in prepared_rules if r.kind!='reference' and r.source.source_id==sid}
+                endpoint_ids={r.rule_id for r in prepared_rules if r.kind!='reference'}
                 endpoints=[r for r in _latest(store.get_rules()) if r.rule_id in endpoint_ids]
-                result=discover_references(rules_by_source[sid],endpoints,documents=list(documents),model=model,goal=config.goal)
+                result=discover_references(rules_by_source[sid],endpoints,documents=corpus,model=model,
+                    goal=config.goal,source_adapters=rules_by_source,
+                    table_refs=discovery_tables.get(sid,set(contexts[sid])))
+                discovery_completed.get(sid,set()).difference_update(
+                    _deferred_tables(result,discovery_tables.get(sid,set(contexts[sid]))))
                 _issues(report,result.issues)
                 existing={r.rule_id:r for r in _latest(store.get_rules(include_stale=True))}
                 for rule in result.rules:
@@ -292,25 +429,42 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     execute(rule)
         # One atomic visibility change for the current dependency set. If an old
         # dependent edge would dangle, the whole replacement remains unpublished.
-        if prepared:
+        business_prepared=[p for p in prepared if store._publication(p)['state'] in ('staging','ready')]
+        publish_ok=not business_prepared
+        if business_prepared:
             try:
                 # Retire derived alignments in the same transaction as replacing
                 # their possible endpoints. Original document claims stay intact.
                 for head in store.heads():
                     if head['valid'] and head['logical_rule_id'].startswith('document-alignment:'):
-                        prepared.append(store.begin_publication(head['logical_rule_id'],1,'all',{'refresh':report.run_id}))
+                        replacement=store.begin_publication(head['logical_rule_id'],1,'all',{'refresh':report.run_id})
+                        prepared.append(replacement);business_prepared.append(replacement)
                 budget.check_time()
-                store.publish_partitions([PartitionCompletion(publication_id=p,complete=True,consistent=True,dependencies_valid=True) for p in prepared])
+                store.publish_partitions([PartitionCompletion(publication_id=p,complete=True,consistent=True,dependencies_valid=True) for p in business_prepared])
                 report.rules_published=[r.rule_id for r in prepared_rules]
-                if auto:
-                    for sid in need_discovery:
-                        marker=store.begin_publication('discovery:'+sid,1,'all',{'goal':digest(config.goal.model_dump()),
-                            'workflow':DISCOVERY_WORKFLOW_VERSION,'mode':discovery_mode})
-                        store.publish_partition(PartitionCompletion(publication_id=marker,complete=True,consistent=True,dependencies_valid=True))
+                publish_ok=True
             except LightGraphError as exc:
-                for pub in prepared:store.abort(pub)
+                _abort_staging(store,prepared)
                 report.rules_skipped.extend(r.rule_id for r in prepared_rules)
                 report.issues.append({'code':exc.code});report.status='PARTIAL'
+        if auto:
+            for sid in need_discovery:
+                previous=store.current_versions('discovery:'+sid) or {}
+                matching=(previous.get('goal')==digest(config.goal.model_dump()) and
+                    previous.get('workflow')==DISCOVERY_WORKFLOW_VERSION and previous.get('mode')==discovery_mode)
+                completed_versions=_context_versions(previous) if matching else {}
+                # Do not advance failed or unvisited tables. Missing entries are
+                # retried next run even when another table published successfully.
+                for name in discovery_tables.get(sid,set(contexts[sid])):
+                    completed_versions.pop(name,None)
+                if publish_ok:
+                    completed_versions.update({name:contexts[sid][name]
+                        for name in discovery_completed.get(sid,set()) if name in contexts[sid]})
+                marker=store.begin_publication('discovery:'+sid,1,'all',{'goal':digest(config.goal.model_dump()),
+                    'workflow':DISCOVERY_WORKFLOW_VERSION,'mode':discovery_mode,
+                    'contexts':[canonical([name,value]) for name,value in sorted(completed_versions.items())]})
+                prepared.append(marker)
+                store.publish_partition(PartitionCompletion(publication_id=marker,complete=True,consistent=True,dependencies_valid=True))
         covered_tables={r.source.schema_name+'.'+r.source.table for r in prepared_rules if r.rule_id in report.rules_published}
         report.issues=[i for i in report.issues if not (i.get('code')=='no_confirmable_entity_group' and i.get('table') in covered_tables)]
         if auto:
@@ -328,26 +482,28 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             accepted=[r for r in _latest(store.get_rules()) if r.rule_id in report.rules_published]
             write_rules(output/'rules.yaml',accepted)
         else:
-            count,issues=publish_documents(store,[d for d in documents if d.document_id not in config.removed_document_ids],config.isolation_domain,model,config.scopes,config.document_scopes,check_time=budget.check_time)
+            count,issues=publish_documents(store,documents,config.isolation_domain,model,config.scopes,
+                config.document_scopes,check_time=budget.check_time,goal=config.goal)
             report.counts['document_claims']=count;report.issues.extend(issues)
             budget.check_time()
             _publish_document_alignments(store,[d for d in documents if d.document_id not in config.removed_document_ids],config)
             _publish_alignments(store,tables,config,report)
             export_graph(store,output,scopes=set(config.scopes),domain=config.isolation_domain)
+        write_catalog(output,declared,semantic_catalog(declared,config.goal,understandings,
+            _latest(store.get_rules()),documents,previous=previous_semantic))
         report.validation['incremental_mode']='complete_projection_reconciliation'
         if report.issues and report.status=='COMPLETED':
-            partial_tokens=('budget','exhausted','timeout','truncated','unavailable','permission','incomplete','unverified','formula_cache_missing','execution_failed','dependency_rule_failed')
-            report.status='PARTIAL' if any(any(t in str(i.get('code','')) for t in partial_tokens) for i in report.issues) else 'COMPLETED_WITH_GAPS'
+            partial_tokens=('budget','exhausted','timeout','truncated','unavailable','permission','incomplete','unverified','formula_cache_missing','execution_failed','dependency_rule_failed','too_large','model_http','model_response','model_transport')
+            report.status='PARTIAL' if any(
+                _agent_execution_failure(str(i.get('code',''))) or
+                any(t in str(i.get('code','')) for t in partial_tokens)
+                for i in report.issues) else 'COMPLETED_WITH_GAPS'
     except (LightGraphError,KeyboardInterrupt) as exc:
-        for pub in prepared:
-            try:store.abort(pub)
-            except Exception:pass
+        _abort_staging(store,prepared)
         code=exc.code if isinstance(exc,LightGraphError) else 'cancelled'
         report.status='PARTIAL';report.issues.append({'code':code})
     except Exception:
-        for pub in prepared:
-            try:store.abort(pub)
-            except Exception:pass
+        _abort_staging(store,prepared)
         report.status='FAILED';report.issues.append({'code':'internal_error'})
     finally:
         report.counts['elapsed_seconds']=round(time.monotonic()-started,3)

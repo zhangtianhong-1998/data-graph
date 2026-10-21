@@ -100,7 +100,9 @@ class IdentityRegistry:
     def resolve(self, *, kind: str, source_ref: str, namespace: Any,
                 business_key: Any, definition: dict[str, Any] | None = None,
                 isolation_domain: str = "default", definition_version: str = "",
-                shared_verified: bool = False, semantic_namespace: str = "") -> IdentityResolution:
+                shared_verified: bool = False, semantic_namespace: str = "",
+                identity_domain: str = "", verified_key: Any = None,
+                identity_evidence: tuple[str, ...] = ()) -> IdentityResolution:
         """Resolve one accepted semantic key; definition changes create a binding revision.
 
         A changed label retains its entity ID. A changed defining attribute gets
@@ -128,6 +130,16 @@ class IdentityRegistry:
                              if identifying else definition)
         signature = digest(signature_payload) if shared_verified and (identifying or named_definition) else None
         policy = "verified_definition_registry" if shared_verified else "source_scoped"
+        if identity_domain:
+            if verified_key is None or not identity_evidence:
+                raise IdentityConflict("verified_identity_domain_evidence_required")
+            self._validate_key(verified_key)
+            semantic_namespace = "identity_domain:" + identity_domain
+            signature = digest("verified_business_key", verified_key)
+            policy = "verified_identity_domain"
+            # Attribute agreement is checked over prospective published supports,
+            # not this registry's draft history. A failed draft must not poison
+            # later valid attempts to resolve the same accepted business key.
 
         def matches(row):
             old_definition = json.loads(row[2])

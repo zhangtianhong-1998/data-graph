@@ -127,11 +127,24 @@ class RuleEngine:
                 if len(vals)>1: codes.append("fd_violation")
         if rule.identity.semantic_resolution == "verified_definition_registry" and not rule.evidence.semantic_basis:
             codes.append("identity_evidence_missing")
+        if rule.identity.semantic_resolution == "verified_identity_domain":
+            if any(row.get(column) in (None, "") for row in rows for column in rule.scope.namespaces):
+                codes.append("null_identity_namespace")
+            if rule.kind == "wide_hierarchy" and rule.identity.level_policy != "relative_path":
+                codes.append("relative_path_policy_required")
+            if (rule.attributes.single_valued or rule.attributes.multi_valued
+                    or (rule.hierarchy and any(level.label or level.aliases for level in rule.hierarchy.levels))):
+                if not rule.identity.attribute_evidence:
+                    codes.append("shared_attribute_evidence_missing")
         if rule.kind in ("wide_hierarchy", "long_hierarchy"):
             h=rule.hierarchy
             if not h.order_evidence: codes.append("level_group_ambiguous")
             if rule.kind == "wide_hierarchy" and len(h.levels)<2: codes.append("level_group_ambiguous")
             if rule.kind == "long_hierarchy" and not h.parent_column: codes.append("parent_column_missing")
+            if rule.identity.level_policy == "relative_path":
+                if not h.taxonomy: codes.append("hierarchy_taxonomy_missing")
+                if not h.position_semantics or not h.position_evidence:
+                    codes.append("hierarchy_position_semantics_missing")
         return sorted(set(codes))
 
     def execute(self, adapter, rule: RuleSpec, *, document_versions=None, defer_publish=False):
@@ -170,7 +183,9 @@ class RuleEngine:
                     raise LightGraphError("rule_revision_conflict")
             old_heads = {h["partition_id"]: h for h in self.store.heads() if h["logical_rule_id"] == rule.rule_id}
             versions = {"schema": rule.dependencies.schema_ref, "operator": rule.dependencies.operator_version,
-                        "documents": rule.dependencies.documents}
+                        "documents": rule.dependencies.documents,
+                        "identity": digest(rule.identity.model_dump()),
+                        "hierarchy": digest(rule.hierarchy.model_dump() if rule.hierarchy else None)}
             validation = ValidationRecord(validation_id="v_" + digest(rule.rule_id, rule.revision, time.time_ns())[:24],
                 rule_id=rule.rule_id, checks={"distinct_tuples": 0, "conflicts": 0},
                 coverage=Coverage(scope="full", consistent=False), status="validated", codes=[])
@@ -298,13 +313,13 @@ class RuleEngine:
         self.store.stage_fact(pub,GraphFact(isolation_domain=self.domain,fact_kind=kind,payload=payload),
                               self._support(rule,binding,scope,partition_id))
 
-    def _identity(self, rule, row, key, *, extra_definition=None):
+    def _identity(self, rule, row, key, *, extra_definition=None, binding_columns=None):
         definition={k:row.get(c) for k,c in rule.attributes.single_valued.items()
                     if k not in ("label","business_code") and row.get(c) is not None}
         if extra_definition:definition.update(extra_definition)
         if rule.identity.semantic_key_columns:
             definition["definition"] = canonical([row.get(c) for c in rule.identity.semantic_key_columns])
-        if rule.hierarchy and rule.hierarchy.taxonomy:
+        if rule.hierarchy and rule.hierarchy.taxonomy and rule.identity.semantic_resolution != "verified_identity_domain":
             definition["taxonomy"] = rule.hierarchy.taxonomy
         # Local code spaces belong to declared lookup columns, not just their
         # values. Two distinct column groups may both contain code "01". Keep
@@ -313,18 +328,32 @@ class RuleEngine:
         lookup_namespace = {
             "namespace_columns": rule.scope.namespaces,
             "namespace_values": [row.get(c) for c in rule.scope.namespaces],
-            "key_columns": rule.identity.key_columns,
+            "key_columns": binding_columns or rule.identity.key_columns,
         }
+        domain_args = {}
+        if rule.identity.semantic_resolution == "verified_identity_domain":
+            verified_scope = ([row.get(c) for c in rule.scope.namespaces]
+                if rule.identity.identity_scope == "namespace_local" else [])
+            domain_args = {"identity_domain": rule.identity.identity_domain,
+                "verified_key": [verified_scope, key[-1] if rule.identity.level_policy == "relative_path"
+                    else [row.get(c) for c in rule.identity.key_columns if c not in rule.scope.namespaces]],
+                "identity_evidence": tuple(rule.identity.identity_evidence)}
         resolution=self.store.identity.resolve(kind=rule.identity.entity_kind,
             source_ref=f"{rule.source.source_id}.{rule.source.schema_name}.{rule.source.table}",
             namespace=canonical(lookup_namespace), business_key=canonical(key),
             definition=definition,isolation_domain=self.domain,definition_version="",
             shared_verified=rule.identity.semantic_resolution=="verified_definition_registry",
-            semantic_namespace=rule.identity.semantic_namespace)
+            semantic_namespace=rule.identity.semantic_namespace, **domain_args)
         return resolution
 
-    def _emit_entity(self,pub,rule,row,key, *, label=None,aliases=None,extra_definition=None):
-        r=self._identity(rule,row,key,extra_definition=extra_definition)
+    def _emit_entity(self,pub,rule,row,key, *, label=None,aliases=None,extra_definition=None,binding_columns=None):
+        if rule.identity.semantic_resolution == "verified_identity_domain":
+            extra_definition = dict(extra_definition or {})
+            if label is not None:
+                extra_definition["label"] = label
+            elif rule.attributes.single_valued.get("label"):
+                extra_definition["label"] = row.get(rule.attributes.single_valued["label"])
+        r=self._identity(rule,row,key,extra_definition=extra_definition,binding_columns=binding_columns)
         scope=self._scope(rule,row)
         self._stage(pub,rule,r.binding_id,scope,"NodeExistence",{"entity_id":r.entity_id,"kind":rule.identity.entity_kind,"layer":"business"})
         attrs={k:row.get(col) for k,col in rule.attributes.single_valued.items()}
@@ -376,17 +405,24 @@ class RuleEngine:
         for a,b in pairs:parents[b].add(a)
         if not rule.hierarchy.allow_dag and any(len(v)>1 for v in parents.values()):return ["multiple_parent"]
         for a,b,binding,scope in records:
+            qualifiers={"taxonomy":rule.hierarchy.taxonomy, **rule.hierarchy.context_qualifiers}
             self._stage(pub,rule,binding,scope,"Edge",{"source":a,"target":b,"relation":"parent_of",
-                "qualifiers":{"taxonomy":rule.hierarchy.taxonomy}})
+                "qualifiers":qualifiers})
         return []
 
     def _wide(self,pub,rule,rows):
         ids=set();records=set();codes=[];labels=defaultdict(set)
         code_positions=defaultdict(set);fill_pairs=defaultdict(set)
         levels=sorted(rule.hierarchy.levels,key=lambda x:x.level)
+        relative = rule.identity.level_policy == "relative_path"
         for row in rows:
-            prev=None;gap=False;seen_positions={}
+            prev=None;gap=False;seen_positions={};previous_level=None;seen_entities=set()
             for index,lv in enumerate(levels):
+                if (relative and rule.hierarchy.position_semantics == "ordinal_slots"
+                        and previous_level is not None and lv.level != previous_level + 1):
+                    if prev:gap=True
+                    prev=None
+                previous_level = lv.level
                 code=row.get(lv.code)
                 if code is None or code=="":
                     if prev:gap=True
@@ -394,7 +430,7 @@ class RuleEngine:
                 key=tuple(row.get(c) for c in rule.scope.namespaces)+(code,)
                 if rule.identity.level_policy=="level_qualified":key=key[:-1]+(lv.level,code)
                 code_key=canonical(key)
-                if rule.identity.level_policy!="level_qualified":
+                if rule.identity.level_policy not in {"level_qualified", "relative_path"}:
                     code_positions[code_key].add(index)
                     if code_key in seen_positions:
                         last_position=seen_positions[code_key]
@@ -407,15 +443,27 @@ class RuleEngine:
                 labels[canonical(key)].add(canonical(label))
                 if len(labels[canonical(key)])>1:codes.append("same_code_diff_label")
                 eid,binding,scope=self._emit_entity(pub,rule,row,key,label=label,
-                    aliases=[row.get(c) for c in lv.aliases])
+                    aliases=[row.get(c) for c in lv.aliases],
+                    binding_columns=rule.scope.namespaces+[lv.code] if relative else None)
                 ids.add(eid)
+                if relative:
+                    membership={"taxonomy":rule.hierarchy.taxonomy,
+                        "source_group":f"{rule.source.source_id}.{rule.source.schema_name}.{rule.source.table}:{lv.code}",
+                        **rule.hierarchy.context_qualifiers}
+                    if lv.level in rule.hierarchy.semantic_levels:
+                        membership["semantic_level"] = rule.hierarchy.semantic_levels[lv.level]
+                    self._stage(pub,rule,binding,scope,"PropertyValue",
+                        {"entity_id":eid,"name":"source_position","value":lv.level,"qualifiers":membership})
+                    if eid in seen_entities and (not prev or prev[0] != eid):
+                        codes.append("non_contiguous_level_code")
+                    seen_entities.add(eid)
                 if gap:codes.append("gap_in_path");gap=False
                 if prev:
                     if prev[0]==eid:
                         if not rule.hierarchy.fill_semantics_confirmed:codes.append("fill_mismatch")
                     else:records.add((prev[0],eid,binding,scope))
                 prev=(eid,binding,scope)
-        if rule.identity.level_policy!="level_qualified":
+        if rule.identity.level_policy not in {"level_qualified", "relative_path"}:
             for code_key,positions in code_positions.items():
                 ordered=sorted(positions)
                 if len(ordered)>1 and any((a,b) not in fill_pairs[code_key] or b!=a+1 for a,b in zip(ordered,ordered[1:])):

@@ -1,0 +1,188 @@
+{
+  "$defs": {
+    "ColumnInterpretation": {
+      "additionalProperties": false,
+      "properties": {
+        "column": {
+          "title": "Column",
+          "type": "string"
+        },
+        "role": {
+          "default": "unknown",
+          "enum": [
+            "identity_code",
+            "namespace",
+            "label",
+            "alias",
+            "semantic_attribute",
+            "display_order",
+            "level_position",
+            "fact_value",
+            "relation_endpoint",
+            "discriminator",
+            "audit",
+            "unknown"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "comment_quality": {
+          "default": "empty",
+          "enum": [
+            "empty",
+            "echo",
+            "generic",
+            "informative"
+          ],
+          "title": "Comment Quality",
+          "type": "string"
+        },
+        "status": {
+          "default": "candidate",
+          "enum": [
+            "candidate",
+            "rule_validated"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "conflict_codes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Conflict Codes",
+          "type": "array"
+        },
+        "rule_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Rule Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "column"
+      ],
+      "title": "ColumnInterpretation",
+      "type": "object"
+    },
+    "SourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "schema": {
+          "default": "public",
+          "title": "Schema",
+          "type": "string"
+        },
+        "table": {
+          "title": "Table",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "table"
+      ],
+      "title": "SourceRef",
+      "type": "object"
+    },
+    "TableInterpretation": {
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/SourceRef"
+        },
+        "declaration_revision": {
+          "title": "Declaration Revision",
+          "type": "string"
+        },
+        "context_revision": {
+          "default": "",
+          "title": "Context Revision",
+          "type": "string"
+        },
+        "coverage": {
+          "default": "metadata_only",
+          "enum": [
+            "sampled",
+            "full",
+            "metadata_only"
+          ],
+          "title": "Coverage",
+          "type": "string"
+        },
+        "derived": {
+          "const": true,
+          "default": true,
+          "title": "Derived",
+          "type": "boolean"
+        },
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/ColumnInterpretation"
+          },
+          "title": "Columns",
+          "type": "array"
+        },
+        "document_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Document Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "source",
+        "declaration_revision",
+        "columns"
+      ],
+      "title": "TableInterpretation",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "artifact": {
+      "const": "metadata_interpretation",
+      "default": "metadata_interpretation",
+      "title": "Artifact",
+      "type": "string"
+    },
+    "revision": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Revision",
+      "type": "string"
+    },
+    "declaration_revision": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Declaration Revision",
+      "type": "string"
+    },
+    "goal_revision": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Goal Revision",
+      "type": "string"
+    },
+    "tables": {
+      "items": {
+        "$ref": "#/$defs/TableInterpretation"
+      },
+      "title": "Tables",
+      "type": "array"
+    }
+  },
+  "required": [
+    "revision",
+    "declaration_revision",
+    "goal_revision",
+    "tables"
+  ],
+  "title": "SemanticCatalog",
+  "type": "object"
+}

@@ -8,7 +8,8 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
-from lightgraph.contracts import canonical
+from lightgraph.contracts import SourceRef, canonical
+from lightgraph.context import STAGE_SUBTASKS
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from .goal import build_goal_instructions
 from .models import ProposalBatch, TaskPacket
@@ -25,8 +26,9 @@ network operations yourself. Do not ask for unbounded row dumps. Prefer bounded
 statistics and distinct key combinations. SQL LIMIT does not establish full coverage.
 Source rows and all tool observations are ephemeral; never copy them into rationale,
 notes, exception lists, output constants or rules. Use issued column/document/entity
-and probe IDs in final proposals. Cite a tool result by its probe_id, including
-newly retrieved document sections; do not invent new packet document IDs.
+and probe IDs in final proposals. Newly retrieved documents are registered with
+their exact revision and scope; cite only issued document or probe IDs.
+Analytical guidance can suggest exploration but cannot confirm business semantics.
 A tool success is not business-semantic confirmation.
 Preserve uncertainty, source scope and incomplete coverage. Output candidate rules,
 not confirmed claims. Stop when relevant structures are sufficiently supported or
@@ -110,22 +112,17 @@ def _record_probe(packet: dict, result: dict, name: str) -> None:
 
 def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
             max_tool_calls: int=16) -> ProposalBatch:
-    """Let observations change the next query; commit no graph or raw transcript.
+    """Run AgentScope ReActAgent with ephemeral memory and guarded Toolkit tools.
 
-    Native OpenAI-compatible function calls preserve provider tool-call semantics.
-    Final content remains the same ProposalBatch as single-turn callers, so model
-    transports and downstream deterministic validation share one output contract.
+    The framework owns the reasoning/acting loop. Our adapters retain domain
+    validation, query permissions, budgets and the no-source-retention boundary.
     """
+    import asyncio
+    from .agentscope_runtime import run_agent
     from .llm import validate_proposal_references
 
-    messages=[]
-    seen=set()
-    observations=[]
-    assistant_calls=[]
-    calls=[]
-    result=response=arguments=None
-    serialized=system=''
     checked={}
+    seen=set()
     try:
         if isinstance(max_steps,bool) or not 1<=max_steps<=32 or isinstance(max_tool_calls,bool) or not 1<=max_tool_calls<=64:
             raise LightGraphError('invalid_agent_limits')
@@ -135,78 +132,52 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
             raise LightGraphError('model_packet_schema_invalid') from None
         if not client.allow_source_samples:
             checked['strata_samples']=[]
+        if callable(getattr(executor,'begin_context',None)):
+            sources=checked.get('context_tables') or ([checked['scope']] if checked.get('scope') else [])
+            executor.begin_context([SourceRef.model_validate(s) for s in sources])
         system=AGENT_SYSTEM+'\n\n'+build_goal_instructions(checked.get('goal',{}))
-        messages=[{'role':'system','content':system},
-                  {'role':'user','content':canonical({'task':checked['task'],'input':checked,
-                      'output_schema':ProposalBatch.model_json_schema()})}]
-        specs=executor.tool_specs()
-        names={spec['function']['name'] for spec in specs}
-        total_calls=0
-        for step in range(max_steps):
+        system+='\nCurrent stage: '+checked['task']+'\nSubtask: '+(checked.get('subtask') or STAGE_SUBTASKS[checked['task']])
+
+        def dispatch(name: str, arguments: dict) -> dict:
+            # Toolkit performs tool-name and JSON-schema validation first.
             client.budget.check_deadline()
-            response=client._request(messages,_message,specs,
-                tool_choice='none' if total_calls>=max_tool_calls else 'auto')
-            if 'final' in response:
-                final=response['final']
-                validate_proposal_references(final,checked)
-                client.budget.check_deadline()
-                # Evidence references are allowed state. Never return observations
-                # or conversational messages to the caller.
-                packet['probe_digest']=checked['probe_digest']
-                return final
-            calls=response['calls']
-            if total_calls+len(calls)>max_tool_calls:
-                raise BudgetExceeded('discovery_tool_calls_exhausted')
-            assistant_calls=[]
-            observations=[]
-            for call in calls:
-                total_calls+=1
-                call_id=f'call_{total_calls}'
-                name=call['name']
-                assistant_calls.append({'id':call_id,'type':'function','function':call})
-                arguments=None
+            signature=hashlib.sha256(canonical([name,arguments]).encode()).hexdigest()
+            if not client.allow_source_samples and name not in ('get_metadata','search_knowledge'):
+                result={'status':'error','code':'source_samples_disabled','operator':name}
+            elif signature in seen:
+                result={'status':'error','code':'repeated_tool_call','operator':name}
+            else:
+                seen.add(signature)
                 try:
-                    arguments=json.loads(call['arguments'])
-                    if not isinstance(arguments,dict):
-                        raise ValueError('invalid_tool_arguments')
-                    signature=hashlib.sha256(canonical([name,arguments]).encode()).hexdigest()
-                except (TypeError,ValueError,json.JSONDecodeError):
-                    result={'status':'error','code':'invalid_tool_arguments','operator':name}
-                else:
-                    if name not in names:
-                        result={'status':'error','code':'unknown_tool','operator':'unknown'}
-                    elif not client.allow_source_samples and name not in ('get_metadata','search_knowledge'):
-                        result={'status':'error','code':'source_samples_disabled','operator':name}
-                    elif signature in seen:
-                        result={'status':'error','code':'repeated_tool_call','operator':name}
-                    else:
-                        seen.add(signature)
-                        try:
-                            result=executor.execute(name,arguments)
-                        except BudgetExceeded:
-                            raise
-                        except Exception:
-                            # Driver messages can contain source values or SQL.
-                            result={'status':'error','code':'tool_execution_failed','operator':name}
-                        result=_visible_result(result,name,client.allow_source_samples)
-                        _record_probe(checked,result,name)
-                client.budget.check_deadline()
-                serialized=canonical(result)
-                if len(serialized.encode())>client.config.max_response_bytes:
-                    serialized=canonical({'status':'error','code':'tool_response_too_large','operator':name})
-                observations.append({'role':'tool','tool_call_id':call_id,'content':serialized})
-            messages.append({'role':'assistant','content':None,'tool_calls':assistant_calls})
-            messages.extend(observations)
-        raise BudgetExceeded('discovery_steps_exhausted')
+                    result=executor.execute(name,arguments)
+                except BudgetExceeded:
+                    raise
+                except Exception:
+                    result={'status':'error','code':'tool_execution_failed','operator':name}
+                result=_visible_result(result,name,client.allow_source_samples)
+                _record_probe(checked,result,name)
+            client.budget.check_deadline()
+            if len(canonical(result).encode())>client.config.max_response_bytes:
+                return {'status':'error','code':'tool_response_too_large','operator':name}
+            return result
+
+        # The pipeline and database connectors are synchronous. Keep query tools
+        # on this thread (SQLite connections are thread-affine); do not silently
+        # start a worker thread when called from an unrelated event loop.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise LightGraphError('agent_sync_entrypoint_inside_event_loop')
+        final=asyncio.run(run_agent(client,checked,executor,dispatch,system,
+                                   max_steps=max_steps,max_tool_calls=max_tool_calls))
+        validate_proposal_references(final,checked)
+        client.budget.check_deadline()
+        for key in ('probe_digest','document_snippets','document_refs','context_tables'):
+            packet[key]=checked.get(key,[])
+        return final
     finally:
-        # No history on the client/executor, checkpoint, usage entry or returned
-        # object. Clearing prevents these containers from retaining rows on error.
-        messages.clear()
-        seen.clear()
-        observations.clear()
-        assistant_calls.clear()
-        calls.clear()
         checked.clear()
-        result=response=arguments=None
-        serialized=system=''
+        seen.clear()
         executor.close()

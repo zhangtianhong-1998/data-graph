@@ -1,0 +1,28 @@
+# Copy agent.example.yaml to agent.local.yaml and configure its gateway before running.
+# Same synthetic uploaded files as discovery.yaml; no prewritten RuleSpec.
+isolation_domain: customer_discovery
+sources:
+  - id: excel
+    kind: excel_workbook
+    path: sample/input.xlsx
+documents:
+  - sample/data_description.md
+  - sample/analysis.md
+output_dir: ../runs/agentscope-discovery
+scopes: [A, B, public]
+document_scopes: [A, B]
+goal:
+  purpose: 构建支持经营分析的指标、度量和维度图谱
+  include:
+    - 指标与度量的定义、计算依赖和适用维度
+    - 维度成员及其上下级关系
+  exclude:
+    - 每笔交易或每期观测记录
+    - 具体收入、成本等观测数值
+  discovery_guidance:
+    - 根据元数据、统计和说明文档发现列组，不按固定字段名决定业务含义
+    - 可以读取少量数值辅助理解，但数值列的定义与具体观测值应分开处理
+    - 规则验证后对必要列执行去重和组合分析
+  observation_values: false
+agent_config: agent.local.yaml
+max_db_queries: 240

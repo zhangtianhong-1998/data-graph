@@ -92,10 +92,32 @@ class ScopeSpec(StrictModel):
 class IdentitySpec(StrictModel):
     key_columns: list[str] = Field(min_length=1)
     entity_kind: str = "ReportItem"
-    semantic_resolution: Literal["source_scoped", "verified_definition_registry"] = "source_scoped"
+    semantic_resolution: Literal["source_scoped", "verified_definition_registry", "verified_identity_domain"] = "source_scoped"
     semantic_key_columns: list[str] = Field(default_factory=list)
     semantic_namespace: str = ""
-    level_policy: Literal["not_applicable", "code_with_fill_merge", "level_qualified"] = "not_applicable"
+    level_policy: Literal["not_applicable", "code_with_fill_merge", "level_qualified", "relative_path"] = "not_applicable"
+    identity_domain: str = ""
+    identity_evidence: list[str] = Field(default_factory=list)
+    attribute_evidence: list[str] = Field(default_factory=list)
+    identity_scope: Literal["namespace_local", "domain_global"] = "namespace_local"
+    global_scope_evidence: list[str] = Field(default_factory=list)
+    @model_validator(mode="after")
+    def validate_identity_domain(self):
+        if any(not ref.strip() for refs in (self.identity_evidence, self.attribute_evidence, self.global_scope_evidence)
+               for ref in refs):
+            raise ValueError("empty_identity_evidence_reference")
+        if self.semantic_resolution == "verified_identity_domain":
+            if not self.identity_domain.strip() or not self.identity_evidence:
+                raise ValueError("verified_identity_domain_evidence_required")
+            if self.semantic_key_columns or self.semantic_namespace:
+                raise ValueError("identity_domain_definition_policy_conflict")
+            if self.level_policy in {"level_qualified", "code_with_fill_merge"}:
+                raise ValueError("identity_domain_level_policy_conflict")
+            if self.identity_scope == "domain_global" and not self.global_scope_evidence:
+                raise ValueError("global_identity_scope_evidence_required")
+        elif self.level_policy == "relative_path":
+            raise ValueError("relative_path_requires_verified_identity_domain")
+        return self
 
 class ExcludedColumn(StrictModel):
     column: str
@@ -120,6 +142,25 @@ class HierarchySpec(StrictModel):
     fill_semantics_confirmed: bool = False
     order_evidence: list[str] = Field(default_factory=list)
     gap_policy: Literal["split"] = "split"
+    # Ordinal slots 1 and 3 imply a missing slot; ordered slots merely sort the
+    # available columns. Relative-path rules must explicitly choose one.
+    position_semantics: Literal["ordinal_slots", "ordered_slots"] | None = None
+    position_evidence: list[str] = Field(default_factory=list)
+    context_qualifiers: dict[str, Scalar] = Field(default_factory=dict)
+    semantic_levels: dict[int, str] = Field(default_factory=dict)
+    @model_validator(mode="after")
+    def validate_hierarchy_context(self):
+        if len({level.level for level in self.levels}) != len(self.levels):
+            raise ValueError("duplicate_hierarchy_position")
+        if set(self.context_qualifiers) - {"condition", "valid_period", "period", "hierarchy_version"}:
+            raise ValueError("invalid_hierarchy_context")
+        if any(value is None or value == "" for value in self.context_qualifiers.values()):
+            raise ValueError("empty_hierarchy_context")
+        if any(not ref.strip() for ref in self.position_evidence):
+            raise ValueError("empty_position_evidence_reference")
+        if set(self.semantic_levels) - {level.level for level in self.levels}:
+            raise ValueError("semantic_level_position_missing")
+        return self
 
 class RelationSpec(StrictModel):
     source_rule_id: str
@@ -195,6 +236,8 @@ class RuleSpec(StrictModel):
     def validate_shape(self):
         if self.publish.get("mode") != "staged":
             raise ValueError("publication_must_be_staged")
+        if self.identity.level_policy == "relative_path" and self.kind != "wide_hierarchy":
+            raise ValueError("relative_path_requires_wide_hierarchy")
         if self.kind in ("wide_hierarchy", "long_hierarchy") and not self.hierarchy:
             raise ValueError("hierarchy_required")
         if self.kind == "reference" and not self.relation:

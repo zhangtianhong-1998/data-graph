@@ -1,0 +1,1422 @@
+{
+  "$defs": {
+    "AttributeSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "single_valued": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Single Valued",
+          "type": "object"
+        },
+        "multi_valued": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Multi Valued",
+          "type": "object"
+        },
+        "excluded": {
+          "items": {
+            "$ref": "#/$defs/ExcludedColumn"
+          },
+          "title": "Excluded",
+          "type": "array"
+        }
+      },
+      "title": "AttributeSpec",
+      "type": "object"
+    },
+    "ColumnSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "data_type": {
+          "default": "text",
+          "title": "Data Type",
+          "type": "string"
+        },
+        "comment": {
+          "default": "",
+          "title": "Comment",
+          "type": "string"
+        },
+        "nullable": {
+          "default": true,
+          "title": "Nullable",
+          "type": "boolean"
+        },
+        "primary_key": {
+          "default": false,
+          "title": "Primary Key",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "ColumnSpec",
+      "type": "object"
+    },
+    "Coverage": {
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "default": "full",
+          "enum": [
+            "full",
+            "partition",
+            "sampled"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "partitions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Partitions",
+          "type": "array"
+        },
+        "rows_scanned": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rows Scanned"
+        },
+        "entities": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Entities"
+        },
+        "consistent": {
+          "default": false,
+          "title": "Consistent",
+          "type": "boolean"
+        }
+      },
+      "title": "Coverage",
+      "type": "object"
+    },
+    "Dependencies": {
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "default": "",
+          "title": "Schema",
+          "type": "string"
+        },
+        "documents": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Documents",
+          "type": "array"
+        },
+        "identity_policy": {
+          "default": "identity_v1",
+          "title": "Identity Policy",
+          "type": "string"
+        },
+        "operator_version": {
+          "default": "1",
+          "title": "Operator Version",
+          "type": "string"
+        }
+      },
+      "title": "Dependencies",
+      "type": "object"
+    },
+    "EntityBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "rule_id": {
+          "title": "Rule Id",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceRef"
+        },
+        "entity_kind": {
+          "title": "Entity Kind",
+          "type": "string"
+        },
+        "key_columns": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Key Columns",
+          "type": "array"
+        }
+      },
+      "required": [
+        "rule_id",
+        "source",
+        "entity_kind",
+        "key_columns"
+      ],
+      "title": "EntityBinding",
+      "type": "object"
+    },
+    "ExcludedColumn": {
+      "additionalProperties": false,
+      "properties": {
+        "column": {
+          "title": "Column",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "reason"
+      ],
+      "title": "ExcludedColumn",
+      "type": "object"
+    },
+    "ForeignKeySpec": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Columns",
+          "type": "array"
+        },
+        "target_schema": {
+          "title": "Target Schema",
+          "type": "string"
+        },
+        "target_table": {
+          "title": "Target Table",
+          "type": "string"
+        },
+        "target_columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Target Columns",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "columns",
+        "target_schema",
+        "target_table",
+        "target_columns"
+      ],
+      "title": "ForeignKeySpec",
+      "type": "object"
+    },
+    "HierarchySpec": {
+      "additionalProperties": false,
+      "properties": {
+        "levels": {
+          "items": {
+            "$ref": "#/$defs/LevelSpec"
+          },
+          "title": "Levels",
+          "type": "array"
+        },
+        "parent_column": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent Column"
+        },
+        "taxonomy": {
+          "default": "",
+          "title": "Taxonomy",
+          "type": "string"
+        },
+        "allow_dag": {
+          "default": false,
+          "title": "Allow Dag",
+          "type": "boolean"
+        },
+        "fill_semantics_confirmed": {
+          "default": false,
+          "title": "Fill Semantics Confirmed",
+          "type": "boolean"
+        },
+        "order_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Order Evidence",
+          "type": "array"
+        },
+        "gap_policy": {
+          "const": "split",
+          "default": "split",
+          "title": "Gap Policy",
+          "type": "string"
+        },
+        "position_semantics": {
+          "anyOf": [
+            {
+              "enum": [
+                "ordinal_slots",
+                "ordered_slots"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Position Semantics"
+        },
+        "position_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Position Evidence",
+          "type": "array"
+        },
+        "context_qualifiers": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Context Qualifiers",
+          "type": "object"
+        },
+        "semantic_levels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Semantic Levels",
+          "type": "object"
+        }
+      },
+      "title": "HierarchySpec",
+      "type": "object"
+    },
+    "IdentitySpec": {
+      "additionalProperties": false,
+      "properties": {
+        "key_columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Key Columns",
+          "type": "array"
+        },
+        "entity_kind": {
+          "default": "ReportItem",
+          "title": "Entity Kind",
+          "type": "string"
+        },
+        "semantic_resolution": {
+          "default": "source_scoped",
+          "enum": [
+            "source_scoped",
+            "verified_definition_registry",
+            "verified_identity_domain"
+          ],
+          "title": "Semantic Resolution",
+          "type": "string"
+        },
+        "semantic_key_columns": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Semantic Key Columns",
+          "type": "array"
+        },
+        "semantic_namespace": {
+          "default": "",
+          "title": "Semantic Namespace",
+          "type": "string"
+        },
+        "level_policy": {
+          "default": "not_applicable",
+          "enum": [
+            "not_applicable",
+            "code_with_fill_merge",
+            "level_qualified",
+            "relative_path"
+          ],
+          "title": "Level Policy",
+          "type": "string"
+        },
+        "identity_domain": {
+          "default": "",
+          "title": "Identity Domain",
+          "type": "string"
+        },
+        "identity_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Identity Evidence",
+          "type": "array"
+        },
+        "attribute_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Attribute Evidence",
+          "type": "array"
+        },
+        "identity_scope": {
+          "default": "namespace_local",
+          "enum": [
+            "namespace_local",
+            "domain_global"
+          ],
+          "title": "Identity Scope",
+          "type": "string"
+        },
+        "global_scope_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Global Scope Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "key_columns"
+      ],
+      "title": "IdentitySpec",
+      "type": "object"
+    },
+    "LevelSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "exclusiveMinimum": 0,
+          "title": "Level",
+          "type": "integer"
+        },
+        "code": {
+          "title": "Code",
+          "type": "string"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "aliases": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Aliases",
+          "type": "array"
+        }
+      },
+      "required": [
+        "level",
+        "code"
+      ],
+      "title": "LevelSpec",
+      "type": "object"
+    },
+    "MetadataDigest": {
+      "additionalProperties": false,
+      "properties": {
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/PacketColumn"
+          },
+          "maxItems": 256,
+          "title": "Columns",
+          "type": "array"
+        }
+      },
+      "title": "MetadataDigest",
+      "type": "object"
+    },
+    "OperatorSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "title": "Op",
+          "type": "string"
+        },
+        "args": {
+          "additionalProperties": true,
+          "title": "Args",
+          "type": "object"
+        },
+        "output": {
+          "default": "",
+          "title": "Output",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "title": "OperatorSpec",
+      "type": "object"
+    },
+    "PacketBudget": {
+      "additionalProperties": false,
+      "properties": {
+        "max_hypotheses": {
+          "default": 6,
+          "exclusiveMinimum": 0,
+          "maximum": 6,
+          "title": "Max Hypotheses",
+          "type": "integer"
+        },
+        "max_probe_requests": {
+          "default": 4,
+          "exclusiveMinimum": 0,
+          "maximum": 6,
+          "title": "Max Probe Requests",
+          "type": "integer"
+        },
+        "max_rationale_chars": {
+          "default": 600,
+          "exclusiveMinimum": 0,
+          "maximum": 600,
+          "title": "Max Rationale Chars",
+          "type": "integer"
+        }
+      },
+      "title": "PacketBudget",
+      "type": "object"
+    },
+    "PacketColumn": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "type": {
+          "default": "text",
+          "title": "Type",
+          "type": "string"
+        },
+        "comment": {
+          "default": "",
+          "maxLength": 4000,
+          "title": "Comment",
+          "type": "string"
+        },
+        "observed": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Observed",
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "title": "PacketColumn",
+      "type": "object"
+    },
+    "PacketConflict": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "title": "Code",
+          "type": "string"
+        },
+        "count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Count",
+          "type": "integer"
+        },
+        "probe_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Probe Id"
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "title": "PacketConflict",
+      "type": "object"
+    },
+    "PacketDocument": {
+      "additionalProperties": false,
+      "properties": {
+        "doc_id": {
+          "title": "Doc Id",
+          "type": "string"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "string"
+        },
+        "section_id": {
+          "title": "Section Id",
+          "type": "string"
+        },
+        "heading": {
+          "title": "Heading",
+          "type": "string"
+        },
+        "locator": {
+          "title": "Locator",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "purpose": {
+          "default": "data_description",
+          "enum": [
+            "data_description",
+            "analysis_knowledge",
+            "mixed",
+            "unresolved"
+          ],
+          "title": "Purpose",
+          "type": "string"
+        },
+        "scope": {
+          "additionalProperties": true,
+          "title": "Scope",
+          "type": "object"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "title": "Sources",
+          "type": "array"
+        },
+        "read_state": {
+          "const": "complete",
+          "default": "complete",
+          "title": "Read State",
+          "type": "string"
+        },
+        "evidence_role": {
+          "default": "definition_evidence",
+          "enum": [
+            "definition_evidence",
+            "exploration_guidance"
+          ],
+          "title": "Evidence Role",
+          "type": "string"
+        }
+      },
+      "required": [
+        "doc_id",
+        "revision",
+        "section_id",
+        "heading",
+        "locator",
+        "text"
+      ],
+      "title": "PacketDocument",
+      "type": "object"
+    },
+    "PacketProbe": {
+      "additionalProperties": false,
+      "properties": {
+        "probe_id": {
+          "title": "Probe Id",
+          "type": "string"
+        },
+        "operator": {
+          "title": "Operator",
+          "type": "string"
+        },
+        "aggregates": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Aggregates",
+          "type": "object"
+        }
+      },
+      "required": [
+        "probe_id",
+        "operator"
+      ],
+      "title": "PacketProbe",
+      "type": "object"
+    },
+    "PacketStratum": {
+      "additionalProperties": false,
+      "properties": {
+        "stratum": {
+          "title": "Stratum",
+          "type": "string"
+        },
+        "selection": {
+          "default": "bounded_sample",
+          "title": "Selection",
+          "type": "string"
+        },
+        "count": {
+          "anyOf": [
+            {
+              "maximum": 32,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Count"
+        },
+        "rows": {
+          "items": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object"
+          },
+          "maxItems": 32,
+          "title": "Rows",
+          "type": "array"
+        }
+      },
+      "required": [
+        "stratum"
+      ],
+      "title": "PacketStratum",
+      "type": "object"
+    },
+    "RelationSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "source_rule_id": {
+          "title": "Source Rule Id",
+          "type": "string"
+        },
+        "target_rule_id": {
+          "title": "Target Rule Id",
+          "type": "string"
+        },
+        "source_columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Source Columns",
+          "type": "array"
+        },
+        "target_columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Target Columns",
+          "type": "array"
+        },
+        "relation": {
+          "default": "verified_reference",
+          "title": "Relation",
+          "type": "string"
+        },
+        "qualifiers": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Qualifiers",
+          "type": "object"
+        },
+        "source_json_array_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 1,
+          "title": "Source Json Array Columns",
+          "type": "array"
+        },
+        "target_json_array_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 1,
+          "title": "Target Json Array Columns",
+          "type": "array"
+        },
+        "max_array_elements": {
+          "default": 256,
+          "exclusiveMinimum": 0,
+          "maximum": 4096,
+          "title": "Max Array Elements",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source_rule_id",
+        "target_rule_id",
+        "source_columns",
+        "target_columns"
+      ],
+      "title": "RelationSpec",
+      "type": "object"
+    },
+    "RuleBudget": {
+      "additionalProperties": false,
+      "properties": {
+        "max_db_cu": {
+          "default": 40,
+          "exclusiveMinimum": 0,
+          "title": "Max Db Cu",
+          "type": "number"
+        },
+        "max_rows_returned": {
+          "default": 20000,
+          "exclusiveMinimum": 0,
+          "title": "Max Rows Returned",
+          "type": "integer"
+        },
+        "max_seconds": {
+          "default": 120,
+          "exclusiveMinimum": 0,
+          "title": "Max Seconds",
+          "type": "number"
+        }
+      },
+      "title": "RuleBudget",
+      "type": "object"
+    },
+    "RuleEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "hypothesis": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hypothesis"
+        },
+        "document": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Document",
+          "type": "array"
+        },
+        "probe_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Probe Refs",
+          "type": "array"
+        },
+        "semantic_basis": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Semantic Basis",
+          "type": "array"
+        }
+      },
+      "title": "RuleEvidence",
+      "type": "object"
+    },
+    "RuleSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "rule_id": {
+          "title": "Rule Id",
+          "type": "string"
+        },
+        "revision": {
+          "default": 1,
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "kind": {
+          "enum": [
+            "column_group_entity",
+            "wide_hierarchy",
+            "long_hierarchy",
+            "reference"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "goal_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Goal Refs",
+          "type": "array"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceRef"
+        },
+        "scope": {
+          "$ref": "#/$defs/ScopeSpec"
+        },
+        "identity": {
+          "$ref": "#/$defs/IdentitySpec"
+        },
+        "attributes": {
+          "$ref": "#/$defs/AttributeSpec"
+        },
+        "hierarchy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HierarchySpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "relation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelationSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "normalization": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Normalization",
+          "type": "object"
+        },
+        "operators": {
+          "items": {
+            "$ref": "#/$defs/OperatorSpec"
+          },
+          "title": "Operators",
+          "type": "array"
+        },
+        "required_capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Capabilities",
+          "type": "array"
+        },
+        "dependencies": {
+          "$ref": "#/$defs/Dependencies"
+        },
+        "status": {
+          "default": "draft",
+          "enum": [
+            "draft",
+            "validated",
+            "canary_checked",
+            "published",
+            "deprecated",
+            "rolled_back"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "validation_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Validation Ref"
+        },
+        "coverage": {
+          "$ref": "#/$defs/Coverage"
+        },
+        "evidence": {
+          "$ref": "#/$defs/RuleEvidence"
+        },
+        "budget": {
+          "$ref": "#/$defs/RuleBudget"
+        },
+        "publish": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Publish",
+          "type": "object"
+        },
+        "stale_when": {
+          "additionalProperties": {
+            "type": "boolean"
+          },
+          "title": "Stale When",
+          "type": "object"
+        },
+        "errors": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Errors",
+          "type": "object"
+        }
+      },
+      "required": [
+        "rule_id",
+        "kind",
+        "source",
+        "identity"
+      ],
+      "title": "RuleSpec",
+      "type": "object"
+    },
+    "ScopeSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "namespaces": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Namespaces",
+          "type": "array"
+        },
+        "predicate": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Predicate"
+        },
+        "partition_by": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Partition By",
+          "type": "array"
+        }
+      },
+      "title": "ScopeSpec",
+      "type": "object"
+    },
+    "SourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "schema": {
+          "default": "public",
+          "title": "Schema",
+          "type": "string"
+        },
+        "table": {
+          "title": "Table",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "table"
+      ],
+      "title": "SourceRef",
+      "type": "object"
+    },
+    "TableSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "schema": {
+          "default": "public",
+          "title": "Schema",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/ColumnSpec"
+          },
+          "title": "Columns",
+          "type": "array"
+        },
+        "comment": {
+          "default": "",
+          "title": "Comment",
+          "type": "string"
+        },
+        "foreign_keys": {
+          "items": {
+            "$ref": "#/$defs/ForeignKeySpec"
+          },
+          "title": "Foreign Keys",
+          "type": "array"
+        },
+        "unique_keys": {
+          "items": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Unique Keys",
+          "type": "array"
+        }
+      },
+      "required": [
+        "source_id",
+        "name",
+        "columns"
+      ],
+      "title": "TableSpec",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "packet_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Packet Version",
+      "type": "string"
+    },
+    "task": {
+      "enum": [
+        "T0_discovery",
+        "T1_table_discovery",
+        "T2_cross_table",
+        "T3_hierarchy",
+        "T4_document",
+        "T5_revision"
+      ],
+      "title": "Task",
+      "type": "string"
+    },
+    "scope": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SourceRef"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "goal": {
+      "additionalProperties": true,
+      "title": "Goal",
+      "type": "object"
+    },
+    "subtask": {
+      "anyOf": [
+        {
+          "maxLength": 2000,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Subtask"
+    },
+    "context_tables": {
+      "items": {
+        "$ref": "#/$defs/SourceRef"
+      },
+      "maxItems": 64,
+      "title": "Context Tables",
+      "type": "array"
+    },
+    "document_refs": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "maxItems": 128,
+      "title": "Document Refs",
+      "type": "array"
+    },
+    "metadata_digest": {
+      "$ref": "#/$defs/MetadataDigest"
+    },
+    "probe_digest": {
+      "items": {
+        "$ref": "#/$defs/PacketProbe"
+      },
+      "maxItems": 96,
+      "title": "Probe Digest",
+      "type": "array"
+    },
+    "strata_samples": {
+      "items": {
+        "$ref": "#/$defs/PacketStratum"
+      },
+      "maxItems": 8,
+      "title": "Strata Samples",
+      "type": "array"
+    },
+    "document_snippets": {
+      "items": {
+        "$ref": "#/$defs/PacketDocument"
+      },
+      "maxItems": 32,
+      "title": "Document Snippets",
+      "type": "array"
+    },
+    "known_conflicts": {
+      "items": {
+        "$ref": "#/$defs/PacketConflict"
+      },
+      "maxItems": 32,
+      "title": "Known Conflicts",
+      "type": "array"
+    },
+    "budget": {
+      "$ref": "#/$defs/PacketBudget"
+    },
+    "authorized_entities": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 64,
+      "title": "Authorized Entities",
+      "type": "array"
+    },
+    "authorized_selectors": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 64,
+      "title": "Authorized Selectors",
+      "type": "array"
+    },
+    "revision_of": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Revision Of"
+    },
+    "allowed_revision_codes": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 32,
+      "title": "Allowed Revision Codes",
+      "type": "array"
+    },
+    "revision_candidate": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RuleSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "catalog": {
+      "items": {
+        "$ref": "#/$defs/TableSpec"
+      },
+      "maxItems": 64,
+      "title": "Catalog",
+      "type": "array"
+    },
+    "entity_bindings": {
+      "items": {
+        "$ref": "#/$defs/EntityBinding"
+      },
+      "maxItems": 64,
+      "title": "Entity Bindings",
+      "type": "array"
+    }
+  },
+  "required": [
+    "task"
+  ],
+  "title": "TaskPacket",
+  "type": "object"
+}

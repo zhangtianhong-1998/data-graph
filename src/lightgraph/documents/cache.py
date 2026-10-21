@@ -9,10 +9,11 @@ from typing import Literal, Annotated
 from pydantic import Field, model_validator
 from lightgraph.contracts import StrictModel,digest
 from lightgraph.errors import LightGraphError
+from lightgraph.context import CONTEXT_SELECTION_VERSION, STAGE_SUBTASKS, goal_payload
 from .core import (KnowledgeDocument, DocumentSection, DocumentClaim, DocumentReference,
                    ClaimAlignment, DocumentScope, Purpose, _extract_uncached)
 
-OPERATOR_VERSION='document_claim_extraction/2'
+OPERATOR_VERSION='document_claim_extraction/3'
 BoundedCondition=Annotated[str,Field(max_length=1024)]
 
 class CachedClaim(StrictModel):
@@ -38,8 +39,9 @@ class CachedSection(StrictModel):
     scope: DocumentScope
     section_hash: str = Field(pattern=r'^[0-9a-f]{64}$')
     ancestor_context_hash: str = Field(pattern=r'^[0-9a-f]{64}$')
-    operator_version: Literal['document_claim_extraction/2'] = OPERATOR_VERSION
+    operator_version: Literal['document_claim_extraction/2','document_claim_extraction/3'] = OPERATOR_VERSION
     extractor_fingerprint: str = Field(pattern=r'^[0-9a-f]{64}$')
+    context_fingerprint: str = Field(default_factory=lambda:digest('legacy_document_context'),pattern=r'^[0-9a-f]{64}$')
     complete: Literal[True] = True
     claims: list[CachedClaim] = Field(default_factory=list,max_length=32)
 
@@ -77,7 +79,7 @@ def extractor_fingerprint(model=None) -> str:
                   endpoint.rstrip('/') if isinstance(endpoint,str) else endpoint)
 
 
-def _entry_description(document,section,model):
+def _entry_description(document,section,model,goal=None,subtask=None):
     ancestors=[s for s in document.sections if len(s.heading_path)<len(section.heading_path)
                and section.heading_path[:len(s.heading_path)]==s.heading_path]
     # Whole ancestor sections conservatively cover conditions/units/exceptions;
@@ -87,13 +89,16 @@ def _entry_description(document,section,model):
     # when a sibling is removed. It is not an extraction input; heading paths are
     # already included in each section's identity.
     context_hash=digest(document.derived,document.dependency_refs,
-                        [(s.heading_path,s.content_hash) for s in ancestors])
+                        [(s.heading_path,s.content_hash,s.purpose,s.scope.model_dump() if s.scope else None) for s in ancestors])
     extractor=extractor_fingerprint(model)
-    key=digest(document.document_id,document.purpose,document.scope.model_dump(),
-               section.section_id,section.content_hash,context_hash,OPERATOR_VERSION,extractor)
+    call_context=digest(goal_payload(goal),'T4_document',subtask or STAGE_SUBTASKS['T4_document'],CONTEXT_SELECTION_VERSION)
+    purpose=section.purpose or document.purpose
+    scope=section.scope or document.scope
+    key=digest(document.document_id,purpose,scope.model_dump(),
+               section.section_id,section.content_hash,context_hash,OPERATOR_VERSION,extractor,call_context)
     return CachedSection(cache_key=key,document_id=document.document_id,section_id=section.section_id,
-        purpose=document.purpose,scope=document.scope.model_copy(deep=True),section_hash=section.content_hash,
-        ancestor_context_hash=context_hash,extractor_fingerprint=extractor)
+        purpose=purpose,scope=scope.model_copy(deep=True),section_hash=section.content_hash,
+        ancestor_context_hash=context_hash,extractor_fingerprint=extractor,context_fingerprint=call_context)
 
 
 def _restore(claim,document,section,known_entities):
@@ -106,10 +111,11 @@ def _restore(claim,document,section,known_entities):
         predicate=claim.predicate,object=claim.object,modality=claim.modality,conditions=list(claim.conditions),
         document=DocumentReference(document_id=document.document_id,revision=document.revision,
             section_id=section.section_id,locator=section.locator),alignment=alignment,
-        status='candidate',evidence_text='',scope=document.scope.model_copy(deep=True))
+        status='candidate',evidence_text='',scope=(section.scope or document.scope).model_copy(deep=True))
 
 
-def extract_with_cache(document:KnowledgeDocument,model=None,*,known_entities=None,cached_sections=None) -> ClaimExtractionResult:
+def extract_with_cache(document:KnowledgeDocument,model=None,*,known_entities=None,cached_sections=None,
+                       goal=None,subtask=None) -> ClaimExtractionResult:
     """Return a replacement cache only after every current section is complete.
 
     Reuse requires unchanged purpose, scope, local content, ancestor context and
@@ -126,7 +132,7 @@ def extract_with_cache(document:KnowledgeDocument,model=None,*,known_entities=No
     if document.purpose=='data_description':return ClaimExtractionResult(claims=[],cache=ClaimCache())
     claims=[];entries={};reused=extracted=0
     for section in document.sections:
-        description=_entry_description(document,section,model)
+        description=_entry_description(document,section,model,goal,subtask)
         existing=previous.get(description.cache_key)
         if existing is not None:
             # Recompute and compare each dependency, not just a user-supplied key.
@@ -136,11 +142,12 @@ def extract_with_cache(document:KnowledgeDocument,model=None,*,known_entities=No
             entries[description.cache_key]=existing.model_copy(deep=True)
             reused+=1
         else:
-            current=_extract_uncached(document,model,known_entities=known_entities,_section_ids={section.section_id})
+            current=_extract_uncached(document,model,known_entities=known_entities,_section_ids={section.section_id},
+                                      goal=goal,subtask=subtask)
             description.claims=[CachedClaim.from_claim(c) for c in current]
             entries[description.cache_key]=description
             extracted+=1
         claims.extend(current)
-    if not claims and document.sections:raise LightGraphError('document_extract_incomplete')
+    if not claims and document.sections and goal is None:raise LightGraphError('document_extract_incomplete')
     return ClaimExtractionResult(claims=list({c.claim_id:c for c in claims}.values()),
         cache=ClaimCache(entries=entries),reused_sections=reused,extracted_sections=extracted)

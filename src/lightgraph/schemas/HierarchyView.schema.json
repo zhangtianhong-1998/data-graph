@@ -1,0 +1,51 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "taxonomy": {
+      "minLength": 1,
+      "title": "Taxonomy",
+      "type": "string"
+    },
+    "root_entity": {
+      "minLength": 1,
+      "title": "Root Entity",
+      "type": "string"
+    },
+    "max_depth": {
+      "default": 32,
+      "maximum": 4096,
+      "minimum": 0,
+      "title": "Max Depth",
+      "type": "integer"
+    },
+    "context_qualifiers": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "title": "Context Qualifiers",
+      "type": "object"
+    }
+  },
+  "required": [
+    "taxonomy",
+    "root_entity"
+  ],
+  "title": "HierarchyView",
+  "type": "object"
+}

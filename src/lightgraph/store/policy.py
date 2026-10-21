@@ -15,7 +15,7 @@ class PersistenceViolation(LightGraphError):
 
 KINDS = {
     "business": {"Metric", "Measure", "Dimension", "DimensionMember", "ReportItem", "AnalysisMethod", "AnalysisQuestion", "BusinessConcept"},
-    "metadata": {"Database", "Schema", "Table", "Column", "ColumnGroup", "SemanticSlot", "Workbook", "Worksheet"},
+    "metadata": {"Database", "Schema", "Table", "Column", "ColumnGroup", "SemanticSlot", "Workbook", "Worksheet", "Constraint"},
     "provenance": {"Document", "DocumentSection", "Rule", "GraphFact"},
 }
 RELATION_STATES = {
@@ -28,6 +28,7 @@ RELATION_STATES = {
     "analyzes": {"candidate", "accepted"}, "defined_by": {"accepted"},
     "documented_by": {"candidate", "accepted"}, "supported_by_rule": {"accepted"},
     "has_sheet": {"accepted"}, "sheet_has_column": {"accepted"}, "has_section": {"accepted"},
+    "has_constraint": {"accepted"}, "constraint_column": {"accepted"}, "constraint_target": {"accepted"},
 }
 BUSINESS_KINDS = KINDS["business"]
 RELATION_ENDPOINT_KINDS = {
@@ -53,6 +54,9 @@ RELATION_ENDPOINT_KINDS = {
     "has_sheet": ({"Workbook"}, {"Worksheet"}),
     "sheet_has_column": ({"Worksheet"}, {"Column"}),
     "has_section": ({"Document"}, {"DocumentSection"}),
+    "has_constraint": ({"Table", "Worksheet"}, {"Constraint"}),
+    "constraint_column": ({"Constraint"}, {"Column"}),
+    "constraint_target": ({"Constraint"}, {"Column"}),
 }
 PROPERTY_NAMES = frozenset({
     "label", "alias", "english_name", "business_code", "description", "definition", "unit",
@@ -60,12 +64,13 @@ PROPERTY_NAMES = frozenset({
     "source_ref", "schema", "table", "column", "data_type", "nullable", "primary_key", "comment",
     "role", "technical_status", "coverage", "target_kind", "modality", "frequency", "domain",
     "normalization", "semantic_namespace", "aggregation", "document_ref", "section_ref",
-    "column_position", "qualified_name", "name", "kind", "scope", "rule_ref", "revision",
+    "column_position", "qualified_name", "name", "kind", "scope", "rule_ref", "revision", "source_position",
 })
 QUALIFIER_NAMES = frozenset({
     "taxonomy", "valid_period", "period", "caliber", "granularity", "unit", "level", "source_level",
     "target_level", "relation_group", "namespace", "condition", "role", "technical_status",
     "coverage", "modality", "semantic_basis", "normalization", "allow_dag", "formula", "document_ref",
+    "source_group", "semantic_level", "hierarchy_version", "column_position",
 })
 OPERATOR_ARGUMENTS = {
     "distinct_projection": {"tuple", "columns", "cap", "limit", "predicate"},

@@ -9,7 +9,8 @@ def metadata_id(domain,source,*parts):
 def publish_metadata(store,adapter,domain='default'):
     tables=adapter.describe()
     rid='catalog:'+tables[0].source_id if tables else 'catalog:empty'
-    version={'schema':digest([t.model_dump(mode='json',by_alias=True) for t in tables])}
+    version={'schema':digest([t.model_dump(mode='json',by_alias=True) for t in tables]),
+             'projection':'metadata_graph/2'}
     if store.current_versions(rid)==version:return len(tables)
     pub=store.begin_publication(rid,1,'all',version)
     excel=adapter.capabilities().product=='excel_memory'
@@ -19,6 +20,7 @@ def publish_metadata(store,adapter,domain='default'):
     def node(nid,kind,label):
         emit('NodeExistence',{'entity_id':nid,'kind':kind,'layer':'metadata'},nid)
         emit('PropertyValue',{'entity_id':nid,'name':'label','value':label},nid)
+    available={(t.qualified_name,c.name) for t in tables for c in t.columns}
     try:
         for table in tables:
             db=metadata_id(domain,table.source_id)
@@ -26,6 +28,8 @@ def publish_metadata(store,adapter,domain='default'):
             tid=metadata_id(domain,table.source_id,table.qualified_name)
             node(db,'Workbook' if excel else 'Database',table.source_id)
             node(tid,'Worksheet' if excel else 'Table',table.name)
+            if table.comment:
+                emit('PropertyValue',{'entity_id':tid,'name':'description','value':table.comment[:2000]},tid)
             if excel:emit('Edge',{'source':db,'relation':'has_sheet','target':tid},tid)
             else:
                 node(sch,'Schema',table.schema_name)
@@ -38,10 +42,31 @@ def publish_metadata(store,adapter,domain='default'):
                     emit('PropertyValue',{'entity_id':cid,'name':name,'value':value},cid)
                 if column.comment:emit('PropertyValue',{'entity_id':cid,'name':'description','value':column.comment[:2000]},cid)
                 emit('Edge',{'source':tid,'relation':'sheet_has_column' if excel else 'table_has_column','target':cid},cid)
-            for fk in table.foreign_keys:
-                for source,target in zip(fk.columns,fk.target_columns):
+            constraints=[('unique',str(index),columns,None) for index,columns in enumerate(table.unique_keys)]
+            primary=[c.name for c in table.columns if c.primary_key]
+            if primary:constraints.append(('primary_key','primary_key',primary,None))
+            constraints.extend(('foreign_key',fk.name,fk.columns,fk) for fk in table.foreign_keys)
+            for kind,name,columns,fk in constraints:
+                constraint=metadata_id(domain,table.source_id,table.qualified_name,'constraint',kind,name)
+                node(constraint,'Constraint',name)
+                emit('PropertyValue',{'entity_id':constraint,'name':'kind','value':kind},constraint)
+                emit('Edge',{'source':tid,'relation':'has_constraint','target':constraint},constraint)
+                for position,column in enumerate(columns,1):
+                    emit('Edge',{'source':constraint,'relation':'constraint_column',
+                        'target':metadata_id(domain,table.source_id,table.qualified_name,column),
+                        'qualifiers':{'column_position':position}},constraint)
+                if fk is None:continue
+                for position,(source,target) in enumerate(zip(fk.columns,fk.target_columns),1):
+                    target_table=fk.target_schema+'.'+fk.target_table
+                    # The YAML keeps the declaration even if the referenced
+                    # object lies outside this authorized graph projection.
+                    if (target_table,target) not in available:continue
+                    remote=metadata_id(domain,table.source_id,target_table,target)
+                    emit('Edge',{'source':constraint,'relation':'constraint_target','target':remote,
+                        'qualifiers':{'column_position':position}},constraint)
                     emit('Edge',{'source':metadata_id(domain,table.source_id,table.qualified_name,source),
-                        'relation':'declared_fk','target':metadata_id(domain,table.source_id,fk.target_schema+'.'+fk.target_table,target)},tid)
+                        'relation':'declared_fk','target':remote,
+                        'qualifiers':{'relation_group':constraint,'column_position':position}},tid)
         store.publish_partition(PartitionCompletion(publication_id=pub,complete=True,consistent=True,dependencies_valid=True))
     except BaseException:
         store.abort(pub);raise

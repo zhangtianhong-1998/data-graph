@@ -1,0 +1,148 @@
+{
+  "$defs": {
+    "ModelConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "default": "disabled",
+          "enum": [
+            "disabled",
+            "metadata_only",
+            "in_environment",
+            "approved_external"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "base_url": {
+          "default": "",
+          "title": "Base Url",
+          "type": "string"
+        },
+        "model": {
+          "default": "",
+          "title": "Model",
+          "type": "string"
+        },
+        "api_key": {
+          "anyOf": [
+            {
+              "format": "password",
+              "type": "string",
+              "writeOnly": true
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Api Key"
+        },
+        "api_key_env": {
+          "default": "LIGHTGRAPH_API_KEY",
+          "title": "Api Key Env",
+          "type": "string"
+        },
+        "stream": {
+          "default": false,
+          "title": "Stream",
+          "type": "boolean"
+        },
+        "stream_options_include_usage": {
+          "default": true,
+          "title": "Stream Options Include Usage",
+          "type": "boolean"
+        },
+        "allow_insecure_http": {
+          "default": false,
+          "title": "Allow Insecure Http",
+          "type": "boolean"
+        },
+        "max_calls": {
+          "default": 40,
+          "minimum": 0,
+          "title": "Max Calls",
+          "type": "integer"
+        },
+        "max_tokens": {
+          "default": 120000,
+          "minimum": 0,
+          "title": "Max Tokens",
+          "type": "integer"
+        },
+        "max_discovery_steps": {
+          "default": 8,
+          "maximum": 32,
+          "minimum": 1,
+          "title": "Max Discovery Steps",
+          "type": "integer"
+        },
+        "max_tool_calls": {
+          "default": 16,
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Max Tool Calls",
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "default": 60,
+          "exclusiveMinimum": 0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "max_output_tokens": {
+          "default": 4096,
+          "exclusiveMinimum": 0,
+          "title": "Max Output Tokens",
+          "type": "integer"
+        },
+        "max_prompt_bytes": {
+          "default": 65536,
+          "exclusiveMinimum": 0,
+          "title": "Max Prompt Bytes",
+          "type": "integer"
+        },
+        "max_response_bytes": {
+          "default": 262144,
+          "exclusiveMinimum": 0,
+          "title": "Max Response Bytes",
+          "type": "integer"
+        },
+        "retries": {
+          "default": 1,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Retries",
+          "type": "integer"
+        }
+      },
+      "title": "ModelConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Separate reusable AgentScope settings; secrets never enter dumps or repr.",
+  "properties": {
+    "framework": {
+      "const": "agentscope",
+      "default": "agentscope",
+      "title": "Framework",
+      "type": "string"
+    },
+    "name": {
+      "default": "lightgraph-discovery",
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "llm": {
+      "$ref": "#/$defs/ModelConfig"
+    }
+  },
+  "required": [
+    "llm"
+  ],
+  "title": "AgentConfig",
+  "type": "object"
+}

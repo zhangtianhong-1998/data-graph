@@ -5,9 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ict-lightgraph"
 version = "1.0.0"
-description = "Read-only, rule-driven knowledge graph extraction from Gauss, Excel and Markdown"
+description = "Read-only, rule-driven knowledge graph extraction from Gauss, Excel, CSV and Markdown"
 requires-python = ">=3.11"
-dependencies = ["pydantic>=2.10,<3", "PyYAML>=6,<7", "sqlglot>=26,<29", "openpyxl>=3.1,<4", "httpx>=0.27,<1", "psycopg[binary]>=3.2,<4"]
+dependencies = [
+  "pydantic>=2.10,<3", "PyYAML>=6,<7", "sqlglot>=26,<29",
+  "openpyxl>=3.1,<4", "httpx>=0.27,<1", "psycopg[binary]>=3.2,<4",
+  "jsonschema>=4,<5", "agentscope==1.0.21",
+  # AgentScope 1.x imports MCP 1.x APIs; current SQLAlchemy needs greenlet.
+  "mcp>=1.13,<2", "greenlet>=3,<4", "tqdm>=4.67,<5",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<9", "jsonschema>=4,<5"]

@@ -1,0 +1,1309 @@
+{
+  "$defs": {
+    "ColumnGroup": {
+      "additionalProperties": false,
+      "properties": {
+        "group_id": {
+          "title": "Group Id",
+          "type": "string"
+        },
+        "entity_kind_hint": {
+          "title": "Entity Kind Hint",
+          "type": "string"
+        },
+        "members": {
+          "items": {
+            "$ref": "#/$defs/Member"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Members",
+          "type": "array"
+        }
+      },
+      "required": [
+        "group_id",
+        "entity_kind_hint",
+        "members"
+      ],
+      "title": "ColumnGroup",
+      "type": "object"
+    },
+    "ColumnGroupProposal": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_cited": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Evidence Cited",
+          "type": "array"
+        },
+        "confidence_band": {
+          "default": "low",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Confidence Band",
+          "type": "string"
+        },
+        "rationale": {
+          "default": "",
+          "maxLength": 600,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "requested_probes": {
+          "items": {
+            "enum": [
+              "profile_column_group",
+              "check_fd",
+              "distinct_projection",
+              "check_reference",
+              "probe_level_groups",
+              "probe_path_consistency",
+              "probe_repeated_fill",
+              "detect_cycle",
+              "check_discriminator",
+              "sample_stratified",
+              "profile_columns"
+            ],
+            "type": "string"
+          },
+          "maxItems": 6,
+          "title": "Requested Probes",
+          "type": "array"
+        },
+        "kind": {
+          "const": "column_group",
+          "title": "Kind",
+          "type": "string"
+        },
+        "claim": {
+          "$ref": "#/$defs/ColumnGroup"
+        }
+      },
+      "required": [
+        "evidence_cited",
+        "kind",
+        "claim"
+      ],
+      "title": "ColumnGroupProposal",
+      "type": "object"
+    },
+    "Discriminator": {
+      "additionalProperties": false,
+      "properties": {
+        "discriminating_column": {
+          "title": "Discriminating Column",
+          "type": "string"
+        },
+        "partitions": {
+          "items": {
+            "$ref": "#/$defs/DiscriminatorPartition"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Partitions",
+          "type": "array"
+        },
+        "unpartitioned_rule_policy": {
+          "const": "reject",
+          "default": "reject",
+          "title": "Unpartitioned Rule Policy",
+          "type": "string"
+        },
+        "unknown_partition_policy": {
+          "const": "unresolved",
+          "default": "unresolved",
+          "title": "Unknown Partition Policy",
+          "type": "string"
+        }
+      },
+      "required": [
+        "discriminating_column",
+        "partitions"
+      ],
+      "title": "Discriminator",
+      "type": "object"
+    },
+    "DiscriminatorPartition": {
+      "additionalProperties": false,
+      "properties": {
+        "selector_ref": {
+          "title": "Selector Ref",
+          "type": "string"
+        },
+        "applies_to_entity": {
+          "title": "Applies To Entity",
+          "type": "string"
+        },
+        "source_value_column": {
+          "title": "Source Value Column",
+          "type": "string"
+        }
+      },
+      "required": [
+        "selector_ref",
+        "applies_to_entity",
+        "source_value_column"
+      ],
+      "title": "DiscriminatorPartition",
+      "type": "object"
+    },
+    "DiscriminatorProposal": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_cited": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Evidence Cited",
+          "type": "array"
+        },
+        "confidence_band": {
+          "default": "low",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Confidence Band",
+          "type": "string"
+        },
+        "rationale": {
+          "default": "",
+          "maxLength": 600,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "requested_probes": {
+          "items": {
+            "enum": [
+              "profile_column_group",
+              "check_fd",
+              "distinct_projection",
+              "check_reference",
+              "probe_level_groups",
+              "probe_path_consistency",
+              "probe_repeated_fill",
+              "detect_cycle",
+              "check_discriminator",
+              "sample_stratified",
+              "profile_columns"
+            ],
+            "type": "string"
+          },
+          "maxItems": 6,
+          "title": "Requested Probes",
+          "type": "array"
+        },
+        "kind": {
+          "const": "discriminator",
+          "title": "Kind",
+          "type": "string"
+        },
+        "claim": {
+          "$ref": "#/$defs/Discriminator"
+        }
+      },
+      "required": [
+        "evidence_cited",
+        "kind",
+        "claim"
+      ],
+      "title": "DiscriminatorProposal",
+      "type": "object"
+    },
+    "EntityKey": {
+      "additionalProperties": false,
+      "properties": {
+        "group_id": {
+          "title": "Group Id",
+          "type": "string"
+        },
+        "entity_kind_hint": {
+          "title": "Entity Kind Hint",
+          "type": "string"
+        },
+        "key_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Key Columns",
+          "type": "array"
+        },
+        "attributes": {
+          "$ref": "#/$defs/KeyAttributes"
+        },
+        "namespace_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Namespace Columns",
+          "type": "array"
+        },
+        "level_policy": {
+          "default": "not_applicable",
+          "enum": [
+            "not_applicable",
+            "level_qualified",
+            "code_with_fill_merge"
+          ],
+          "title": "Level Policy",
+          "type": "string"
+        },
+        "normalization": {
+          "const": "identity",
+          "default": "identity",
+          "title": "Normalization",
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_id",
+        "entity_kind_hint",
+        "key_columns",
+        "attributes"
+      ],
+      "title": "EntityKey",
+      "type": "object"
+    },
+    "EntityKeyProposal": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_cited": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Evidence Cited",
+          "type": "array"
+        },
+        "confidence_band": {
+          "default": "low",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Confidence Band",
+          "type": "string"
+        },
+        "rationale": {
+          "default": "",
+          "maxLength": 600,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "requested_probes": {
+          "items": {
+            "enum": [
+              "profile_column_group",
+              "check_fd",
+              "distinct_projection",
+              "check_reference",
+              "probe_level_groups",
+              "probe_path_consistency",
+              "probe_repeated_fill",
+              "detect_cycle",
+              "check_discriminator",
+              "sample_stratified",
+              "profile_columns"
+            ],
+            "type": "string"
+          },
+          "maxItems": 6,
+          "title": "Requested Probes",
+          "type": "array"
+        },
+        "kind": {
+          "const": "entity_key",
+          "title": "Kind",
+          "type": "string"
+        },
+        "claim": {
+          "$ref": "#/$defs/EntityKey"
+        }
+      },
+      "required": [
+        "evidence_cited",
+        "kind",
+        "claim"
+      ],
+      "title": "EntityKeyProposal",
+      "type": "object"
+    },
+    "Exclusion": {
+      "additionalProperties": false,
+      "properties": {
+        "exclusions": {
+          "items": {
+            "$ref": "#/$defs/ExclusionItem"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Exclusions",
+          "type": "array"
+        },
+        "not_excluded": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Not Excluded",
+          "type": "array"
+        },
+        "evidence_requirement": {
+          "const": "check_fd_or_display_order_probe",
+          "default": "check_fd_or_display_order_probe",
+          "title": "Evidence Requirement",
+          "type": "string"
+        }
+      },
+      "required": [
+        "exclusions"
+      ],
+      "title": "Exclusion",
+      "type": "object"
+    },
+    "ExclusionItem": {
+      "additionalProperties": false,
+      "properties": {
+        "column_id": {
+          "title": "Column Id",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "display_order",
+            "audit_metadata",
+            "observation_value",
+            "sensitive",
+            "out_of_goal"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "affects": {
+          "items": {
+            "enum": [
+              "identity",
+              "projection"
+            ],
+            "type": "string"
+          },
+          "title": "Affects",
+          "type": "array"
+        }
+      },
+      "required": [
+        "column_id",
+        "reason",
+        "affects"
+      ],
+      "title": "ExclusionItem",
+      "type": "object"
+    },
+    "ExclusionProposal": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_cited": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Evidence Cited",
+          "type": "array"
+        },
+        "confidence_band": {
+          "default": "low",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Confidence Band",
+          "type": "string"
+        },
+        "rationale": {
+          "default": "",
+          "maxLength": 600,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "requested_probes": {
+          "items": {
+            "enum": [
+              "profile_column_group",
+              "check_fd",
+              "distinct_projection",
+              "check_reference",
+              "probe_level_groups",
+              "probe_path_consistency",
+              "probe_repeated_fill",
+              "detect_cycle",
+              "check_discriminator",
+              "sample_stratified",
+              "profile_columns"
+            ],
+            "type": "string"
+          },
+          "maxItems": 6,
+          "title": "Requested Probes",
+          "type": "array"
+        },
+        "kind": {
+          "const": "exclusion",
+          "title": "Kind",
+          "type": "string"
+        },
+        "claim": {
+          "$ref": "#/$defs/Exclusion"
+        }
+      },
+      "required": [
+        "evidence_cited",
+        "kind",
+        "claim"
+      ],
+      "title": "ExclusionProposal",
+      "type": "object"
+    },
+    "HierarchyProposal": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_cited": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Evidence Cited",
+          "type": "array"
+        },
+        "confidence_band": {
+          "default": "low",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Confidence Band",
+          "type": "string"
+        },
+        "rationale": {
+          "default": "",
+          "maxLength": 600,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "requested_probes": {
+          "items": {
+            "enum": [
+              "profile_column_group",
+              "check_fd",
+              "distinct_projection",
+              "check_reference",
+              "probe_level_groups",
+              "probe_path_consistency",
+              "probe_repeated_fill",
+              "detect_cycle",
+              "check_discriminator",
+              "sample_stratified",
+              "profile_columns"
+            ],
+            "type": "string"
+          },
+          "maxItems": 6,
+          "title": "Requested Probes",
+          "type": "array"
+        },
+        "kind": {
+          "const": "wide_hierarchy",
+          "title": "Kind",
+          "type": "string"
+        },
+        "claim": {
+          "$ref": "#/$defs/WideHierarchy"
+        }
+      },
+      "required": [
+        "evidence_cited",
+        "kind",
+        "claim"
+      ],
+      "title": "HierarchyProposal",
+      "type": "object"
+    },
+    "HypothesisLevel": {
+      "additionalProperties": false,
+      "properties": {
+        "position": {
+          "exclusiveMinimum": 0,
+          "title": "Position",
+          "type": "integer"
+        },
+        "key": {
+          "title": "Key",
+          "type": "string"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "alias": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Alias"
+        },
+        "display_order": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Order"
+        }
+      },
+      "required": [
+        "position",
+        "key"
+      ],
+      "title": "HypothesisLevel",
+      "type": "object"
+    },
+    "KeyAttributes": {
+      "additionalProperties": false,
+      "properties": {
+        "single_valued": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Single Valued",
+          "type": "array"
+        },
+        "multi_valued": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Multi Valued",
+          "type": "array"
+        },
+        "display_only": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Display Only",
+          "type": "array"
+        },
+        "property_names": {
+          "additionalProperties": {
+            "enum": [
+              "label",
+              "alias",
+              "english_name",
+              "description",
+              "definition",
+              "unit",
+              "formula"
+            ],
+            "type": "string"
+          },
+          "title": "Property Names",
+          "type": "object"
+        }
+      },
+      "title": "KeyAttributes",
+      "type": "object"
+    },
+    "LongHierarchy": {
+      "additionalProperties": false,
+      "properties": {
+        "group_id": {
+          "title": "Group Id",
+          "type": "string"
+        },
+        "entity_kind_hint": {
+          "default": "DimensionMember",
+          "title": "Entity Kind Hint",
+          "type": "string"
+        },
+        "key_column": {
+          "title": "Key Column",
+          "type": "string"
+        },
+        "parent_column": {
+          "title": "Parent Column",
+          "type": "string"
+        },
+        "label_column": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label Column"
+        },
+        "alias_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 2,
+          "title": "Alias Columns",
+          "type": "array"
+        },
+        "namespace_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Namespace Columns",
+          "type": "array"
+        },
+        "ordering_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Ordering Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "group_id",
+        "key_column",
+        "parent_column"
+      ],
+      "title": "LongHierarchy",
+      "type": "object"
+    },
+    "LongHierarchyProposal": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_cited": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Evidence Cited",
+          "type": "array"
+        },
+        "confidence_band": {
+          "default": "low",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Confidence Band",
+          "type": "string"
+        },
+        "rationale": {
+          "default": "",
+          "maxLength": 600,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "requested_probes": {
+          "items": {
+            "enum": [
+              "profile_column_group",
+              "check_fd",
+              "distinct_projection",
+              "check_reference",
+              "probe_level_groups",
+              "probe_path_consistency",
+              "probe_repeated_fill",
+              "detect_cycle",
+              "check_discriminator",
+              "sample_stratified",
+              "profile_columns"
+            ],
+            "type": "string"
+          },
+          "maxItems": 6,
+          "title": "Requested Probes",
+          "type": "array"
+        },
+        "kind": {
+          "const": "long_hierarchy",
+          "title": "Kind",
+          "type": "string"
+        },
+        "claim": {
+          "$ref": "#/$defs/LongHierarchy"
+        }
+      },
+      "required": [
+        "evidence_cited",
+        "kind",
+        "claim"
+      ],
+      "title": "LongHierarchyProposal",
+      "type": "object"
+    },
+    "Member": {
+      "additionalProperties": false,
+      "properties": {
+        "column_id": {
+          "title": "Column Id",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "identity_code",
+            "namespace",
+            "label",
+            "alias",
+            "semantic_attribute",
+            "display_order",
+            "level_position",
+            "fact_value",
+            "relation_endpoint",
+            "discriminator",
+            "audit",
+            "unknown"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "in_identity": {
+          "default": false,
+          "title": "In Identity",
+          "type": "boolean"
+        },
+        "multi_value": {
+          "default": false,
+          "title": "Multi Value",
+          "type": "boolean"
+        },
+        "exclude_from_projection": {
+          "default": false,
+          "title": "Exclude From Projection",
+          "type": "boolean"
+        },
+        "property_name": {
+          "anyOf": [
+            {
+              "enum": [
+                "label",
+                "alias",
+                "english_name",
+                "description",
+                "definition",
+                "unit",
+                "formula"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Property Name"
+        }
+      },
+      "required": [
+        "column_id",
+        "role"
+      ],
+      "title": "Member",
+      "type": "object"
+    },
+    "Reference": {
+      "additionalProperties": false,
+      "properties": {
+        "source_entity": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Verified source entity rule ID from entity_bindings.",
+          "title": "Source Entity"
+        },
+        "source_columns": {
+          "description": "Issued column IDs on the CURRENT table, ordered to match source_entity key_columns.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Source Columns",
+          "type": "array"
+        },
+        "target_entity": {
+          "title": "Target Entity",
+          "type": "string"
+        },
+        "target_columns": {
+          "description": "Issued foreign-key column IDs on the CURRENT table, ordered to match target_entity key_columns. Do not use remote-table IDs.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Target Columns",
+          "type": "array"
+        },
+        "direction": {
+          "const": "source_to_target",
+          "default": "source_to_target",
+          "title": "Direction",
+          "type": "string"
+        },
+        "cardinality_hint": {
+          "default": "unknown",
+          "enum": [
+            "n_to_1",
+            "1_to_1",
+            "unknown"
+          ],
+          "title": "Cardinality Hint",
+          "type": "string"
+        },
+        "condition_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Condition Ref"
+        },
+        "polymorphic_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Polymorphic By"
+        },
+        "require_full_coverage": {
+          "default": false,
+          "title": "Require Full Coverage",
+          "type": "boolean"
+        },
+        "normalization": {
+          "const": "identity",
+          "default": "identity",
+          "title": "Normalization",
+          "type": "string"
+        },
+        "relation_kind": {
+          "default": "verified_reference",
+          "enum": [
+            "verified_reference",
+            "uses_measure",
+            "member_of"
+          ],
+          "title": "Relation Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_columns",
+        "target_entity",
+        "target_columns"
+      ],
+      "title": "Reference",
+      "type": "object"
+    },
+    "ReferenceProposal": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_cited": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Evidence Cited",
+          "type": "array"
+        },
+        "confidence_band": {
+          "default": "low",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Confidence Band",
+          "type": "string"
+        },
+        "rationale": {
+          "default": "",
+          "maxLength": 600,
+          "title": "Rationale",
+          "type": "string"
+        },
+        "requested_probes": {
+          "items": {
+            "enum": [
+              "profile_column_group",
+              "check_fd",
+              "distinct_projection",
+              "check_reference",
+              "probe_level_groups",
+              "probe_path_consistency",
+              "probe_repeated_fill",
+              "detect_cycle",
+              "check_discriminator",
+              "sample_stratified",
+              "profile_columns"
+            ],
+            "type": "string"
+          },
+          "maxItems": 6,
+          "title": "Requested Probes",
+          "type": "array"
+        },
+        "kind": {
+          "const": "reference",
+          "title": "Kind",
+          "type": "string"
+        },
+        "claim": {
+          "$ref": "#/$defs/Reference"
+        }
+      },
+      "required": [
+        "evidence_cited",
+        "kind",
+        "claim"
+      ],
+      "title": "ReferenceProposal",
+      "type": "object"
+    },
+    "WideHierarchy": {
+      "additionalProperties": false,
+      "properties": {
+        "group_id": {
+          "title": "Group Id",
+          "type": "string"
+        },
+        "entity_kind_hint": {
+          "default": "ReportItem",
+          "title": "Entity Kind Hint",
+          "type": "string"
+        },
+        "levels": {
+          "items": {
+            "$ref": "#/$defs/HypothesisLevel"
+          },
+          "maxItems": 16,
+          "minItems": 2,
+          "title": "Levels",
+          "type": "array"
+        },
+        "repeat_policy": {
+          "default": "none",
+          "enum": [
+            "none",
+            "collapse_consecutive_equal_identity"
+          ],
+          "title": "Repeat Policy",
+          "type": "string"
+        },
+        "gap_policy": {
+          "default": "split",
+          "enum": [
+            "split",
+            "unresolved"
+          ],
+          "title": "Gap Policy",
+          "type": "string"
+        },
+        "multiple_parent_policy": {
+          "const": "report_as_dag_candidate",
+          "default": "report_as_dag_candidate",
+          "title": "Multiple Parent Policy",
+          "type": "string"
+        },
+        "cycle_policy": {
+          "const": "reject_affected_edges",
+          "default": "reject_affected_edges",
+          "title": "Cycle Policy",
+          "type": "string"
+        },
+        "code_relation": {
+          "default": "unknown",
+          "enum": [
+            "unknown",
+            "strict_prefix",
+            "set_inclusion"
+          ],
+          "title": "Code Relation",
+          "type": "string"
+        },
+        "ordering_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Ordering Evidence",
+          "type": "array"
+        },
+        "namespace_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Namespace Columns",
+          "type": "array"
+        },
+        "path_semantics": {
+          "default": "legacy",
+          "enum": [
+            "legacy",
+            "relative_path"
+          ],
+          "title": "Path Semantics",
+          "type": "string"
+        },
+        "identity_domain": {
+          "default": "",
+          "title": "Identity Domain",
+          "type": "string"
+        },
+        "identity_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Identity Evidence",
+          "type": "array"
+        },
+        "attribute_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Attribute Evidence",
+          "type": "array"
+        },
+        "identity_scope": {
+          "default": "namespace_local",
+          "enum": [
+            "namespace_local",
+            "domain_global"
+          ],
+          "title": "Identity Scope",
+          "type": "string"
+        },
+        "global_scope_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Global Scope Evidence",
+          "type": "array"
+        },
+        "taxonomy": {
+          "default": "",
+          "title": "Taxonomy",
+          "type": "string"
+        },
+        "taxonomy_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Taxonomy Evidence",
+          "type": "array"
+        },
+        "position_semantics": {
+          "anyOf": [
+            {
+              "enum": [
+                "ordinal_slots",
+                "ordered_slots"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Position Semantics"
+        },
+        "position_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Position Evidence",
+          "type": "array"
+        },
+        "context_qualifiers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Context Qualifiers",
+          "type": "object"
+        },
+        "context_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Context Evidence",
+          "type": "array"
+        },
+        "allow_dag": {
+          "default": false,
+          "title": "Allow Dag",
+          "type": "boolean"
+        },
+        "dag_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Dag Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "group_id",
+        "levels"
+      ],
+      "title": "WideHierarchy",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "packet_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Packet Version",
+      "type": "string"
+    },
+    "task": {
+      "enum": [
+        "T0_discovery",
+        "T1_table_discovery",
+        "T2_cross_table",
+        "T3_hierarchy",
+        "T4_document",
+        "T5_revision"
+      ],
+      "title": "Task",
+      "type": "string"
+    },
+    "proposals": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "column_group": "#/$defs/ColumnGroupProposal",
+            "discriminator": "#/$defs/DiscriminatorProposal",
+            "entity_key": "#/$defs/EntityKeyProposal",
+            "exclusion": "#/$defs/ExclusionProposal",
+            "long_hierarchy": "#/$defs/LongHierarchyProposal",
+            "reference": "#/$defs/ReferenceProposal",
+            "wide_hierarchy": "#/$defs/HierarchyProposal"
+          },
+          "propertyName": "kind"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/ColumnGroupProposal"
+          },
+          {
+            "$ref": "#/$defs/EntityKeyProposal"
+          },
+          {
+            "$ref": "#/$defs/HierarchyProposal"
+          },
+          {
+            "$ref": "#/$defs/LongHierarchyProposal"
+          },
+          {
+            "$ref": "#/$defs/ReferenceProposal"
+          },
+          {
+            "$ref": "#/$defs/DiscriminatorProposal"
+          },
+          {
+            "$ref": "#/$defs/ExclusionProposal"
+          }
+        ]
+      },
+      "maxItems": 6,
+      "title": "Proposals",
+      "type": "array"
+    },
+    "open_questions": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 12,
+      "title": "Open Questions",
+      "type": "array"
+    },
+    "abstain": {
+      "default": false,
+      "title": "Abstain",
+      "type": "boolean"
+    },
+    "notes": {
+      "default": "",
+      "maxLength": 600,
+      "title": "Notes",
+      "type": "string"
+    }
+  },
+  "required": [
+    "task"
+  ],
+  "title": "ProposalBatch",
+  "type": "object"
+}

@@ -38,7 +38,7 @@ def _kind(prefix,table,goal,documents=()):
     for kind,pattern in checks:
         if kind in goal.entity_kinds and re.search(pattern,text,re.I): return kind
     for document in documents:
-        if table.name not in document['text']:continue
+        if not _definition_document(document, table):continue
         declaration=re.search(re.escape(table.name)+r'\s*(?:登记|表示|存储|记录|包含)([^。\n，,;；]{1,60})',document['text'])
         classification=re.search(r'(?:分类体系|实体类型|对象类型)(?:为|是|[:：])([^。\n]{1,60})',document['text'])
         local_text=declaration.group(1) if declaration else classification.group(1) if classification else document.get('heading','')
@@ -160,7 +160,76 @@ def _draft(table,group,scope,semantic,excluded,goal,documents):
 
 def _document_evidence(documents,table,pattern):
     return [d['doc_id']+'@'+d['revision']+':'+d['section_id'] for d in documents
-            if table.name in d['text'] and re.search(pattern,d['text'],re.I)]
+            if _definition_document(d, table) and re.search(pattern,d['text'],re.I)]
+
+
+def _definition_document(document, table=None):
+    applicable = (table is None or "sources" not in document
+        or any(source.get("source_id") == table.source_id
+               and source.get("schema", source.get("schema_name", "public")) == table.schema_name
+               and source.get("table") == table.name for source in document["sources"]))
+    return (applicable and document.get("evidence_role", "definition_evidence") == "definition_evidence"
+        and document.get("read_state", "complete") == "complete"
+        and not document.get("derived", False))
+
+
+def _relative_hierarchy_contract(claim, documents, scopes, levels, table):
+    """Citations must resolve to read, applicable definition text for each claim.
+
+    Relative identity is never inferred from repeated values or confidence. The
+    compiler accepts only an explicit named domain, key-sharing and property
+    authorization in registered documents. Fixed RuleSpecs use operator evidence.
+    """
+    available = {d["doc_id"]+"@"+d["revision"]+":"+d["section_id"]: d
+                 for d in documents if _definition_document(d, table)}
+
+    def cited(refs, *, token=None, pattern=None, code):
+        if not refs or any(ref not in available for ref in refs):
+            raise LightGraphError(code)
+        text = "\n".join(available[ref]["text"] for ref in refs)
+        if token is not None and (not token.strip() or token not in text):
+            raise LightGraphError(code)
+        if pattern and not re.search(pattern, text, re.I):
+            raise LightGraphError(code)
+        return text
+
+    cited(claim.identity_evidence, token=claim.identity_domain,
+        pattern=r"identity[_ ]domain|身份域", code="identity_domain_evidence_unresolved")
+    cited(claim.identity_evidence,
+        pattern=r"业务键|(?:编码|代码).{0,24}(?:唯一|同一实体|共享)|business key|(?:code|key).{0,30}(?:same entity|unique|shared)",
+        code="identity_key_semantics_unresolved")
+    cited(claim.attribute_evidence,
+        pattern=r"属性.{0,24}(?:支持|共享|授权|绑定)|(?:attribute|propert).{0,30}(?:support|shar|authoriz|bind)",
+        code="shared_attribute_evidence_missing")
+    cited(claim.taxonomy_evidence, token=claim.taxonomy,
+        pattern=r"hierarchy|taxonomy|层级体系|分类体系", code="hierarchy_taxonomy_unresolved")
+    cited(claim.position_evidence,
+        pattern=r"相对.{0,12}(?:路径|位置|层位)|relative.{0,20}(?:path|position)",
+        code="hierarchy_position_semantics_missing")
+    if claim.position_semantics == "ordinal_slots":
+        pattern=r"缺.{0,12}(?:层|槽|位置)|ordinal_slots|missing.{0,16}slot"
+    elif claim.position_semantics == "ordered_slots":
+        pattern=r"仅.{0,12}排序|ordered_slots|order.only"
+    else:
+        raise LightGraphError("hierarchy_position_semantics_missing")
+    cited(claim.position_evidence, pattern=pattern, code="hierarchy_position_semantics_missing")
+    if claim.identity_scope == "domain_global":
+        cited(claim.global_scope_evidence, pattern=r"跨租户|全局.{0,12}(?:业务键|身份)|across tenants|globally unique",
+            code="global_identity_scope_evidence_required")
+    if claim.allow_dag:
+        cited(claim.dag_evidence, token=claim.taxonomy,
+            pattern=r"允许.{0,12}多父|allow.{0,12}(?:dag|multiple parents)",
+            code="dag_evidence_missing")
+    for value in claim.context_qualifiers.values():
+        cited(claim.context_evidence, token=value, code="hierarchy_context_evidence_missing")
+    identity = IdentitySpec(key_columns=scopes+[levels[0].code], entity_kind=claim.entity_kind_hint,
+        semantic_resolution="verified_identity_domain", level_policy="relative_path",
+        identity_domain=claim.identity_domain, identity_evidence=claim.identity_evidence,
+        attribute_evidence=claim.attribute_evidence, identity_scope=claim.identity_scope,
+        global_scope_evidence=claim.global_scope_evidence)
+    return identity, dict(taxonomy=claim.taxonomy, position_semantics=claim.position_semantics,
+        position_evidence=claim.position_evidence, context_qualifiers=claim.context_qualifiers,
+        allow_dag=claim.allow_dag)
 
 
 def _compile_model(batch,table,goal,documents,excluded):
@@ -273,17 +342,26 @@ def _compile_model(batch,table,goal,documents,excluded):
                 raise LightGraphError('excluded_column_projected')
             order=_document_evidence(documents,table,r'父.{0,12}子|层级顺序|parent.{0,20}child')
             fill=_document_evidence(documents,table,r'重复.{0,20}填充|填充.{0,20}合并|repeated.{0,20}fill')
+            identity=IdentitySpec(key_columns=scopes+[levels[0].code],entity_kind=claim.entity_kind_hint,
+                level_policy='code_with_fill_merge' if fill else 'level_qualified')
+            hierarchy_fields={"taxonomy":table.qualified_name}
+            if claim.path_semantics == "relative_path":
+                identity,hierarchy_fields=_relative_hierarchy_contract(claim,documents,scopes,levels,table)
+                valid_refs={d["doc_id"]+"@"+d["revision"]+":"+d["section_id"] for d in documents if _definition_document(d, table)}
+                if not claim.ordering_evidence or not set(claim.ordering_evidence)<=valid_refs:
+                    raise LightGraphError("hierarchy_order_evidence_unresolved")
+                order=[ref for ref in claim.ordering_evidence if ref in order]
+                if not order:raise LightGraphError("hierarchy_order_evidence_unresolved")
             results.append(RuleSpec(rule_id='rule_'+digest(table.source_id,table.qualified_name,'model_hierarchy',[l.code for l in levels])[:24],
                 kind='wide_hierarchy',goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=scopes),
-                identity=IdentitySpec(key_columns=scopes+[levels[0].code],entity_kind=claim.entity_kind_hint,
-                    level_policy='code_with_fill_merge' if fill else 'level_qualified'),
-                hierarchy=HierarchySpec(levels=levels,taxonomy=table.qualified_name,fill_semantics_confirmed=bool(fill),order_evidence=order),
+                identity=identity,
+                hierarchy=HierarchySpec(levels=levels,fill_semantics_confirmed=bool(fill),order_evidence=order,**hierarchy_fields),
                 dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in documents})),
                 coverage=Coverage(scope='sampled'),evidence=RuleEvidence(semantic_basis=order)))
     return results
 
 
-def discover(adapter,goal: ExtractionGoal | None=None,documents=None,model=None,budget=None) -> DiscoveryResult:
+def discover(adapter,goal: ExtractionGoal | None=None,documents=None,model=None,budget=None, *, table_refs=None) -> DiscoveryResult:
     """Discover bounded candidates, preserving the source/semantic validation boundary.
 
     No dataset mappings are imported. Generic column families and sample shapes
@@ -292,13 +370,18 @@ def discover(adapter,goal: ExtractionGoal | None=None,documents=None,model=None,
     """
     if model is not None and callable(getattr(model,'explore',None)):
         from .workflow import discover_with_agent
-        return discover_with_agent(adapter,goal,documents,model,budget)
+        return discover_with_agent(adapter,goal,documents,model,budget,table_refs=table_refs)
     goal=goal or ExtractionGoal();budget=budget or (model.budget if model else BudgetAllocator())
     corpus=documents if isinstance(documents,DocumentCorpus) else DocumentCorpus(documents or [])
     result=DiscoveryResult();tables=adapter.describe();used_tables=[]
     from .goal import source_in_goal
     for table in tables:
         if not source_in_goal(goal,table):continue
+        if table_refs is not None and not (
+                (table.source_id,table.schema_name,table.name) in table_refs
+                or f"{table.source_id}.{table.schema_name}.{table.name}" in table_refs
+                or table.qualified_name in table_refs):
+            continue
         used_tables.append(table)
         reservation='validate_'+digest(table.source_id,table.qualified_name)[:16]
         try:
@@ -485,7 +568,8 @@ def revise_after_counterexample(model,packet:dict,hypothesis:Hypothesis,countere
     return revised,proposals
 
 
-def discover_references(adapter,validated_rules,documents=None,model=None,budget=None,*,max_candidates=32,goal=None) -> DiscoveryResult:
+def discover_references(adapter,validated_rules,documents=None,model=None,budget=None,*,max_candidates=32,goal=None,
+                        source_adapters=None,table_refs=None) -> DiscoveryResult:
     """Reference discovery joins already verified entity bindings, never all columns.
 
     Structural coverage and document semantics are separate. Exact column-family
@@ -495,7 +579,8 @@ def discover_references(adapter,validated_rules,documents=None,model=None,budget
     """
     if model is not None and callable(getattr(model,'explore',None)):
         from .workflow import discover_references_with_agent
-        result=discover_references_with_agent(adapter,validated_rules,documents,model,budget,goal,max_candidates)
+        result=discover_references_with_agent(adapter,validated_rules,documents,model,budget,goal,max_candidates,
+            source_adapters=source_adapters,table_refs=table_refs)
         # Preserve the existing independently documented JSON/selector rules.
         # Agent proposals cannot invent selector constants; this deterministic
         # verifier still requires a scoped declaration and complete key checks.

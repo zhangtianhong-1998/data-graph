@@ -4,6 +4,8 @@
 
 阅读顺序：[README](README.md) → [US](US.md) → [SDD](SDD.md) → [发现工作流](DISCOVERY_WORKFLOW.md) → 本文。SDD 是数据契约与关系注册表的唯一规范来源；本文定义实施依赖、责任与验收。
 
+2026-10-20 工作台增补：页面和服务接口见 [工作台设计](WORKBENCH_DESIGN.md)，后续前后端开发按 [WB 用户故事与 D0～D5 阶段](WORKBENCH_US.md) 执行。本文 W0～W6 是引擎规划；工作台原型不代表新增 API、后台任务或在线图查询已实现。
+
 ## 1. 实施方式
 
 以仓库根目录为交付目录，独立运行包放在 `src/lightgraph/`。此前的 ontology route2 与 xiaomeng 项目作为设计参考，不串联旧 pipeline，不迁移其源数据存储。2026-10-18 已完成代码实现和合成实验，真实数据库与模型接入另行验收。

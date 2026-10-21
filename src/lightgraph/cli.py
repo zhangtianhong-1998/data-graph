@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from .contracts import RuleSpec, RunReport, CapabilityManifest
 from .errors import LightGraphError
-from .runtime.config import RunConfig, load_config, open_sources
+from .runtime.config import AgentConfig, RunConfig, load_config, open_sources
 from .runtime.retention import atomic_text, retain_check
 
 
@@ -32,6 +32,12 @@ def parser():
         c.add_argument('--domain',default='default');c.add_argument('--include-candidates',action='store_true')
         if name=='search':c.add_argument('query')
         if name=='export':c.add_argument('output')
+    c=sub.add_parser('hierarchy-view',help='从指定实体展开层级视图，不改写实体或关系')
+    c.add_argument('store');c.add_argument('--root',required=True);c.add_argument('--taxonomy',required=True)
+    c.add_argument('--scope',action='append',default=[]);c.add_argument('--domain',default='default')
+    c.add_argument('--max-depth',type=int,default=32);c.add_argument('--publication')
+    c.add_argument('--context',action='append',default=[],metavar='KEY=VALUE',
+                   help='层级上下文，如 period=2026；支持 JSON 标量或普通文本')
     c=sub.add_parser('report');c.add_argument('path')
     c=sub.add_parser('import-graph');c.add_argument('snapshot');c.add_argument('store')
     c=sub.add_parser('validate');c.add_argument('rules',nargs='+')
@@ -151,7 +157,11 @@ def run(args):
         emit({'status':'schema_valid','rules':len(rules),'source_validation':'not_run'});return 0
     if args.command=='schema':
         out=Path(args.output);out.mkdir(parents=True,exist_ok=True)
-        for cls in (RuleSpec,RunConfig,RunReport,CapabilityManifest):
+        from .catalog import DeclaredCatalog,SemanticCatalog
+        from .rules.views import HierarchyView
+        from .discovery.models import TaskPacket,ProposalBatch
+        for cls in (RuleSpec,RunConfig,AgentConfig,RunReport,CapabilityManifest,DeclaredCatalog,
+                    SemanticCatalog,HierarchyView,TaskPacket,ProposalBatch):
             atomic_text(out/(cls.__name__+'.schema.json'),json.dumps(cls.model_json_schema(),ensure_ascii=False,indent=2))
         from .presentation.schema import snapshot_schema
         atomic_text(out/'GraphSnapshot.schema.json',json.dumps(snapshot_schema(),ensure_ascii=False,indent=2))
@@ -168,7 +178,18 @@ def run(args):
     from .store import GraphStore
     with GraphStore(args.store) as store:
         scopes=set(args.scope or ['public'])
-        if args.command=='export':
+        if args.command=='hierarchy-view':
+            from .rules.views import HierarchyView
+            qualifiers={}
+            for item in args.context:
+                key,separator,value=item.partition('=')
+                if not separator or key in qualifiers:raise LightGraphError('invalid_hierarchy_view_context')
+                try:qualifiers[key]=json.loads(value)
+                except ValueError:qualifiers[key]=value
+            definition=HierarchyView(taxonomy=args.taxonomy,root_entity=args.root,
+                max_depth=args.max_depth,context_qualifiers=qualifiers)
+            emit(store.hierarchy_view(scopes,definition,domain=args.domain,publication_id=args.publication))
+        elif args.command=='export':
             from .presentation import export_graph
             graph=export_graph(store,args.output,scopes=scopes,domain=args.domain,include_candidates=args.include_candidates)
             emit({'nodes':len(graph['nodes']),'edges':len(graph['edges']),'output':str(Path(args.output).resolve())})

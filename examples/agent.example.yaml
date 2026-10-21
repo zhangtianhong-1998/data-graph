@@ -1,0 +1,31 @@
+# Copy to agent.local.yaml; the local filename is ignored by Git.
+# In your run YAML, replace the entire model section with:
+#   agent_config: agent.local.yaml
+# The path is relative to the run YAML, not the current working directory.
+framework: agentscope
+name: lightgraph-discovery
+llm:
+  # metadata_only: no instance statistics or samples are sent to the model.
+  # in_environment: a model service within the approved data environment.
+  # approved_external: an external service explicitly approved to receive samples.
+  mode: metadata_only
+  base_url: https://your-model-gateway.example/v1
+  model: your-deployed-model
+  # A nonempty direct key takes precedence; an empty key uses api_key_env.
+  # Direct keys never enter config dumps. Prefer the environment variable.
+  api_key: ""
+  api_key_env: LIGHTGRAPH_API_KEY
+  stream: true
+  # Set false if the model gateway rejects stream_options.include_usage.
+  stream_options_include_usage: true
+  # Set true only for a trusted internal HTTP gateway; HTTPS is the default.
+  allow_insecure_http: false
+  timeout_seconds: 60
+  max_output_tokens: 4096
+  max_prompt_bytes: 65536
+  max_response_bytes: 262144
+  retries: 1
+  max_calls: 40
+  max_tokens: 120000
+  max_discovery_steps: 8
+  max_tool_calls: 16
