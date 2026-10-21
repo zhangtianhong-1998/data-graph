@@ -21,6 +21,7 @@ cryptography==50.0.2
 dashscope==1.27.8
 docstring_parser==0.18.0
 et_xmlfile==2.0.0
+fastapi==0.157.0
 filetype==1.2.0
 frozenlist==1.8.0
 googleapis-common-protos==1.75.5
@@ -68,6 +69,7 @@ pydantic_core==2.50.1
 pydantic-settings==2.16.1
 Pygments==2.21.0
 PyJWT==2.15.1
+PyMySQL==1.2.3
 pytest==8.4.2
 python-datauri==3.0.2
 python-dotenv==1.2.4

@@ -4,6 +4,7 @@ from datetime import date, datetime
 from dataclasses import dataclass, field
 import math
 from lightgraph.errors import LightGraphError
+from .dialects import normalized_type
 
 MAX_DEPTH=3
 MAX_NODES=32
@@ -97,7 +98,7 @@ def compile_predicate(table,predicate,params,*,column_sql,dialect):
         column=node['column'];op=ALIASES.get(node['op'],node['op'])
         c=column_sql(column)
         declared=next(col.data_type for col in table.columns if col.name==column)
-        datatype=declared.lower().split('(',1)[0].strip()
+        datatype=normalized_type(declared,dialect)
         if datatype=='mixed':raise LightGraphError('predicate_type_unsupported')
         if op in ('is_null','is_not_null'):
             if set(node)!={'column','op'}:raise LightGraphError('invalid_predicate')

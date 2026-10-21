@@ -24,6 +24,10 @@ def parser():
         if name=='connect-check':
             c.add_argument('--verify-runtime',action='store_true',help='执行有界超时和取消探针；请在隔离测试环境使用')
             c.add_argument('--output',help='保存类型化能力清单，不含连接信息')
+    c=sub.add_parser('serve',help='启动本地 Vue 工作台与项目 API')
+    c.add_argument('--port',type=int,default=8000)
+    c.add_argument('--workspace',help='项目文件根目录；默认仓库根目录 workspace')
+    c.add_argument('--frontend-dir',help='已构建的 Vue dist 目录')
     c=sub.add_parser('sample');c.add_argument('directory');c.add_argument('--rows',type=int,default=5000)
     c=sub.add_parser('demo');c.add_argument('--output',default='runs/demo');c.add_argument('--rows',type=int,default=5000)
     c=sub.add_parser('verify');c.add_argument('--output',default='runs/acceptance');c.add_argument('--rows',type=int,default=5000)
@@ -48,6 +52,13 @@ def parser():
 
 
 def run(args):
+    if args.command=='serve':
+        if not 1<=args.port<=65535:raise LightGraphError('invalid_port')
+        import uvicorn
+        from .web.app import create_app
+        app=create_app(args.workspace,frontend_dir=args.frontend_dir)
+        uvicorn.run(app,host='127.0.0.1',port=args.port,access_log=False)
+        return 0
     from .pipeline import run_pipeline,load_rules,make_model
     from .documents import load_documents
     if args.command=='sample':

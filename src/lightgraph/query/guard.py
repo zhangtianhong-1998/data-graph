@@ -12,6 +12,7 @@ from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 from lightgraph.contracts import TableSpec
 from lightgraph.errors import LightGraphError
+from .dialects import normalized_type
 
 SAFE_TYPES = frozenset({"text", "varchar", "character varying", "character", "char", "nvarchar", "string", "integer", "int", "int2", "int4", "int8", "smallint", "bigint", "numeric", "decimal", "real", "double precision", "float", "float4", "float8", "boolean", "bool", "date", "timestamp", "timestamp without time zone", "timestamp with time zone", "timestamptz", "time", "blob", "bytea"})
 SAFE_NODES = frozenset({"Select", "Union", "Intersect", "Subquery", "Table", "TableAlias", "Identifier", "Column", "Star", "From", "Join", "Where", "Group", "Having", "Order", "Ordered", "Limit", "Offset", "Distinct", "Alias", "Paren", "And", "Or", "Not", "EQ", "NEQ", "GT", "GTE", "LT", "LTE", "Is", "In", "Between", "Null", "Boolean", "Literal", "Placeholder", "Parameter", "Case", "If", "Count", "Sum", "Min", "Max", "Length", "Coalesce", "Abs", "Cast", "DataType", "DataTypeParam", "Add", "Sub", "Mul", "Div", "Neg", "With", "CTE", "Exists", "D Pipe".replace(" ", ""), "DPipe", "Tuple", "Filter", "Like", "Escape"})
@@ -50,15 +51,28 @@ class SQLGuard:
     def validate(self, sql: str, parameters: dict[str, Any] | None = None, *, operator: str = "select", result_columns: Iterable[str] = ()) -> ValidatedQuery:
         try:
             dialect = sqlglot.Dialect.get_or_raise(self.dialect)
+            tokens = dialect.tokenize(sql)
+            if self.dialect == "mysql":
+                # MySQL executes version comments that a generic SQL parser
+                # treats as inert text. Hints may also alter session settings.
+                for token in tokens:
+                    if (token.token_type == sqlglot.tokens.TokenType.HINT or
+                            any(comment.lstrip().upper().startswith(("!", "M!"))
+                                for comment in token.comments)):
+                        raise LightGraphError("unsafe_sql")
             parser = _strict_parser_type(dialect.parser_class)(
                 dialect=dialect, error_level=sqlglot.ErrorLevel.RAISE,
             )
-            statements = parser.parse(dialect.tokenize(sql), sql)
+            statements = parser.parse(tokens, sql)
             if len(statements) != 1 or not isinstance(statements[0], (exp.Select, exp.Union, exp.Intersect)):
                 raise ValueError
             tree = statements[0]
             for node in tree.walk():
                 if type(node).__name__ not in SAFE_NODES:
+                    raise ValueError
+                if self.dialect == "mysql" and isinstance(node, exp.Parameter):
+                    # @user variables can read/write mutable connection state;
+                    # they are not the compiler's named parameter placeholders.
                     raise ValueError
                 if isinstance(node, exp.With) and node.args.get("recursive"):
                     raise ValueError
@@ -114,6 +128,9 @@ class SQLGuard:
                 if isinstance(source, exp.Table):
                     if source.catalog:
                         raise LightGraphError("unauthorized_object")
+                    if self.dialect == "mysql" and source.db.casefold() in {
+                            "mysql", "information_schema", "performance_schema", "sys"}:
+                        raise LightGraphError("unauthorized_object")
                     name = f"{source.db}.{source.name}" if source.db else source.name
                     if name not in self.tables:
                         raise LightGraphError("unauthorized_object")
@@ -150,8 +167,10 @@ class SQLGuard:
                         # Uploaded cells may have heterogeneous primitive types.
                         # SQLite can project them without invoking a user type;
                         # comparisons are separately rejected by Predicate/1.0.
-                        declared_type = selected.data_type.lower().split("(")[0].strip() if selected else None
-                        if selected and declared_type not in SAFE_TYPES and not (self.dialect == "sqlite" and declared_type == "mixed"):
+                        declared_type = normalized_type(selected.data_type, self.dialect) if selected else None
+                        if selected and declared_type not in SAFE_TYPES and not (
+                                self.dialect == "sqlite" and declared_type == "mixed" or
+                                self.dialect == "mysql" and declared_type == "json"):
                             raise LightGraphError("untrusted_column_type")
                         matches.append(selected is not None)
                     else:

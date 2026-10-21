@@ -1,10 +1,10 @@
 # 实施与验收记录
 
-更新日期：2026-10-20。依据 `design/lightweight_graph/` 的 v1.0 架构、SDD §18 及发现 Agent 更新；源码、测试、JSON Schema 和 HTML 模板均在 `src/lightgraph/`。历史验证数字按日期保留，不代表最新代码已经完成同等范围的运行验收。
+更新日期：2026-10-21。依据 `design/lightweight_graph/` 的 v1.0 架构、SDD §18 及发现 Agent 更新；后端、测试、JSON Schema 和 HTML 模板在 `src/lightgraph/`，Vue 工作台在 `src/workbench/`。历史验证数字按日期保留，不代表最新代码已经完成同等范围的运行验收。
 
 ## 已实现的主流程
 
-1. 接收授权的 Gauss 表、Excel 工作表、CSV 与 Markdown；一次运行可以混合来源。数据库按需读取，Excel/CSV 只在内存中解析和查询；CSV 显式配置格式，保留文本编码。
+1. 接收授权的 Gauss/MySQL 表、Excel 工作表、CSV 与 Markdown；一次运行可以混合来源。数据库按需读取，Excel/CSV 只在内存中解析和查询；CSV 显式配置格式，保留文本编码。工作台保存用户上传的文件，不保存数据库查询返回的源数据。
 2. 读取授权元数据，分别输出声明与目标相关解释 YAML。每次模型调用携带抽取目标、阶段、子任务、实际涉及表与适用文档。启用模型时，由 Agent 调用受控工具探查并修订假设，最后提交结构化提案；关闭模型时保留确定性发现。元数据字段的覆盖范围以连接器实际契约为准。
 3. 将规则编译成受控操作，做联合 DISTINCT、FD、身份、层级、引用与完整性检查。可按身份键中的租户等列分区执行。
 4. 构建实体、属性、别名和关系，每项分别记录支持。定义相同且有共享依据时跨租户复用实体；同名、同单位或编码碰撞不足以合并。同表不同关键列组的相同编码保持独立；同列组跨规则可复用。
@@ -149,3 +149,23 @@ JavaScript 语法、文档本地链接与 `git diff --check` 通过。Chrome 检
 - Python 编译检查、文档新增链接检查与 `git diff --check` 通过。
 
 模型流式是 HTTP/SSE 传输能力，当前交付仍不含 Web worker、页面实时事件或异步 HTTP 取消服务。尚未调用真实模型、连接客户 Gauss，亦未证明生产语义准确率和第三方数据保留策略。详细配置与边界见 [AgentScope 接入设计](design/lightweight_graph/AGENTSCOPE_RUNTIME.md)。
+
+
+## Vue 项目工作台与 MySQL 接入（2026-10-21）
+
+本轮将静态原型替换为真实 Vue 3/TypeScript 前端和 FastAPI 项目服务，并加入与 Gauss 并存的 MySQL 适配器。实际行为分别见 [工作台实现](design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md) 与 [MySQL 接入](design/lightweight_graph/MYSQL_ADAPTER.md)。此前记录中的“无 Web 后端”只描述当时的原型版本。
+
+- 项目、上传 Excel/CSV/YAML/Markdown、配置和合格结果保存在仓库根目录 `workspace/<project_id>/`；目录自动创建，跨项目路径及符号链接拒绝。数据库查询结果、模型对话与 worker 原始日志不落入项目资产。
+- 工作台支持目标编辑、文档全局/表级绑定、数据库来源配置、元数据刷新、真实后台启动/取消、结果与元数据图。复用项目结果库进行增量；运行时锁定输入编辑，并对磁盘依赖变化报告部分完成。
+- MySQL 8.0/8.4 的 InnoDB 基础表接入独立只读连接器；支持授权目录、组合外键、方言编译、绑定参数、共享预算、超时和取消。Agent 所有实例 SQL 仍走统一守卫。Gauss 原有路径保留，允许同项目混合数据库与文件。
+- 元数据缓存跟踪来源全集、表列权限及上传文件版本。删除来源或修改权限后不能把旧目录作为当前授权目录展示。workspace 使用 POSIX 文件锁，worker 继承锁，服务崩溃后不会与旧 worker 同时发布。
+
+验证快照：
+
+- `.venv/bin/python -m pytest -q`：**809 passed in 36.41s**（Python 3.13、macOS arm64）。覆盖新 Web API、项目隔离、进程恢复、MySQL 驱动替身、SQL 方言和原有 Gauss/文件回归。
+- `npm --prefix src/workbench test`：**12 passed**；TypeScript 检查与 Vite 生产构建通过。实测 Node 26.8.1；前端依赖审计无已知漏洞。
+- 编辑安装与 `pip check` 通过。Python 编译检查及 `git diff --check` 通过。
+- 实际浏览器通过前后端创建合成项目，上传 CSV 和 Markdown、保存目的、读取元数据、绑定文档到表并启动抽取。运行完成，发布 1 条规则、2 个业务节点；元数据图 6 个节点、5 条边。报告模型调用 0 次、查询 4 次、返回 7 行；这是文件合成实验，不是数据库性能测量。
+- 服务重启后上述项目、文件、绑定和运行记录仍可读取。通过页面分别添加 MySQL、Gauss 来源并检查后端保存的类型及授权表；没有连接这两项演示配置。变更来源后元数据提示重新读取，已发布的业务图仍可查看。
+
+**尚未验证：**真实 MySQL/Gauss 的权限、TLS、超时/取消、目录兼容性、实例抽取和部署留存条件；本机 Docker 引擎未启动。没有调用真实模型。UI 目前轮询任务状态，尚未提供细粒度 Agent 事件流、多用户认证、全图分页或 Windows 服务锁。测试与合成联调不能代替这些验收。

@@ -25,3 +25,8 @@ gauss-capabilities.json
 # Local AgentScope configuration may contain a direct API key.
 agent.local.yaml
 agents.local.yaml
+
+# Project assets and generated web dependencies stay on this machine.
+/workspace/
+node_modules/
+.vite/

@@ -256,7 +256,8 @@
           "enum": [
             "excel_workbook",
             "csv_file",
-            "gauss_database"
+            "gauss_database",
+            "mysql_database"
           ],
           "title": "Kind",
           "type": "string"

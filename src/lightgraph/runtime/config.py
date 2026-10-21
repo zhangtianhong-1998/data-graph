@@ -9,7 +9,7 @@ from ..errors import LightGraphError
 
 class SourceConfig(StrictModel):
     id: str
-    kind: Literal["excel_workbook", "csv_file", "gauss_database"]
+    kind: Literal["excel_workbook", "csv_file", "gauss_database", "mysql_database"]
     path: str | None = None
     dsn_env: str | None = None
     allowed_tables: list[str] = Field(default_factory=list)
@@ -163,7 +163,7 @@ def load_config(path):
 
 
 def open_sources(config, *, metadata_only=False):
-    from ..sources import ExcelSource, CSVSource, GaussSource
+    from ..sources import ExcelSource, CSVSource, GaussSource, MySQLSource
     sources=[]
     from ..sources.budget import QueryBudget
     budget=QueryBudget(max_queries=config.max_db_queries,max_run_seconds=config.max_run_seconds)
@@ -188,13 +188,20 @@ def open_sources(config, *, metadata_only=False):
                 if not s.allowed_tables:raise LightGraphError("source_scope_missing")
                 verified=None
                 if s.capability_manifest and not metadata_only:
-                    import json
                     from ..contracts import CapabilityManifest
                     try:
-                        records=json.loads(Path(s.capability_manifest).read_text())
+                        path=Path(s.capability_manifest)
+                        if path.stat().st_size > 2*1024*1024:
+                            raise ValueError('capability_manifest_too_large')
+                        text=path.read_text(encoding='utf-8')
+                        if any(isinstance(t,(yaml.tokens.AliasToken,yaml.tokens.AnchorToken,yaml.tokens.TagToken))
+                               for t in yaml.scan(text)):
+                            raise ValueError('capability_manifest_alias_forbidden')
+                        records=yaml.safe_load(text)
                         verified=CapabilityManifest.model_validate(records[s.id])
                     except Exception:raise LightGraphError("capability_manifest_invalid") from None
-                sources.append(GaussSource(dsn,source_id=s.id,allowed_tables=s.allowed_tables,
+                adapter=MySQLSource if s.kind=='mysql_database' else GaussSource
+                sources.append(adapter(dsn,source_id=s.id,allowed_tables=s.allowed_tables,
                     allowed_columns=s.allowed_columns,limits=config.limits,verified_capabilities=verified,query_budget=budget))
         return sources
     except Exception:

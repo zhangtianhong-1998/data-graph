@@ -174,8 +174,7 @@ class SourceAdapter:
         for pred in strata:
             q = self.compiler.projection(table, columns, predicate=pred, limit=per)
             q.parameters["cap"] = per
-            from lightgraph.query.compiler import ident
-            ordered_sql = q.sql.rsplit(" LIMIT ", 1)[0] + " ORDER BY " + ", ".join(ident(c) for c in columns) + " LIMIT :cap"
+            ordered_sql = q.sql.rsplit(" LIMIT ", 1)[0] + " ORDER BY " + ", ".join(self.compiler.ident(c) for c in columns) + " LIMIT :cap"
             q = self.compiler.finish(ordered_sql, q.parameters, "sample_strata", columns)
             for batch in self.execute(q, row_limit=per):
                 with batch:

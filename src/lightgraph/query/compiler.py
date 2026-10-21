@@ -1,12 +1,46 @@
 """Compile bounded, catalog-bound operators. Values are always driver parameters."""
 from __future__ import annotations
 from typing import Any, Iterable
+import re
+import sqlglot
+from sqlglot.dialects.mysql import MySQL
 from lightgraph.contracts import TableSpec
 from lightgraph.errors import LightGraphError
 from .guard import SQLGuard, ValidatedQuery
 
-def ident(value: str) -> str:
-    return '"' + value.replace('"', '""') + '"'
+def ident(value: str, dialect: str = "postgres") -> str:
+    quote = "`" if dialect == "mysql" else '"'
+    return quote + value.replace(quote, quote + quote) + quote
+
+
+def mysql_driver_sql(query: ValidatedQuery) -> str:
+    """Render named binds for PyMySQL without interpolating source values.
+
+    MySQL's SQLGlot generator retains ``:name``. Converting an entire SQL string
+    with a regex would mistake identifiers or literals for bind parameters.
+    This generator changes only placeholder AST nodes and escapes percent signs
+    in data-bearing SQL tokens for PyMySQL's pyformat protocol.
+    """
+    class DriverGenerator(MySQL.Generator):
+        def placeholder_sql(self, expression):
+            name = expression.name
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) or name not in query.parameters:
+                raise LightGraphError("unsafe_sql")
+            return "%(" + name + ")s"
+
+        def identifier_sql(self, expression):
+            return super().identifier_sql(expression).replace("%", "%%")
+
+        def literal_sql(self, expression):
+            return super().literal_sql(expression).replace("%", "%%")
+
+    try:
+        tree = sqlglot.parse_one(query.sql, read="mysql")
+        return DriverGenerator(dialect="mysql", identify=True, comments=False).generate(tree)
+    except LightGraphError:
+        raise
+    except Exception:
+        raise LightGraphError("unsafe_sql") from None
 
 class QueryCompiler:
     def __init__(self, tables: Iterable[TableSpec], *, dialect: str = "postgres"):
@@ -14,11 +48,14 @@ class QueryCompiler:
         self.guard = SQLGuard(self.tables.values(), dialect=dialect)
         self.dialect = dialect
 
+    def ident(self, value: str) -> str:
+        return ident(value, self.dialect)
+
     def table(self, table: TableSpec) -> str:
         stored = self.tables.get(table.qualified_name)
         if stored is None or stored.source_id != table.source_id:
             raise LightGraphError("unauthorized_object")
-        return f"{ident(table.schema_name)}.{ident(table.name)}"
+        return f"{self.ident(table.schema_name)}.{self.ident(table.name)}"
 
     def columns(self, table: TableSpec, columns: Iterable[str], alias: str | None = None) -> list[str]:
         self.table(table)
@@ -27,7 +64,7 @@ class QueryCompiler:
             raise LightGraphError("invalid_column_selection")
         if not set(columns) <= set(self.tables[table.qualified_name].column_names):
             raise LightGraphError("unauthorized_column")
-        return [(ident(alias) + "." if alias else "") + ident(c) for c in columns]
+        return [(self.ident(alias) + "." if alias else "") + self.ident(c) for c in columns]
 
     def predicate(self, table: TableSpec, predicate: dict | None, params: dict[str, Any]) -> str:
         from .predicate import compile_predicate
@@ -37,7 +74,13 @@ class QueryCompiler:
             column_sql=lambda name:self.columns(registered,[name])[0],dialect=self.dialect)
 
     def finish(self, sql: str, params: dict, op: str, columns: Iterable[str] = ()) -> ValidatedQuery:
-        return self.guard.validate(sql, params, operator=op, result_columns=columns)
+        query = self.guard.validate(sql, params, operator=op, result_columns=columns)
+        if self.dialect == "mysql":
+            # Quote compiler-owned aliases such as ROWS, a MySQL keyword. Parse
+            # only after the strict guard has ruled out command fallbacks.
+            sql = sqlglot.parse_one(query.sql, read="mysql").sql(dialect="mysql", identify=True)
+            return self.guard.validate(sql, params, operator=op, result_columns=query.result_columns)
+        return query
 
     def projection(self, table: TableSpec, columns: list[str], *, predicate: dict | None = None, distinct: bool = True, limit: int = 20000) -> ValidatedQuery:
         if not isinstance(limit, int) or not 1 <= limit <= 10_000_000:
@@ -52,12 +95,13 @@ class QueryCompiler:
     def profile_column(self, table: TableSpec, column: str, predicate=None) -> ValidatedQuery:
         c, params = self.columns(table, [column])[0], {}
         where = self.predicate(table, predicate, params)
-        text = f"CAST({c} AS TEXT)"
+        text = f"CAST({c} AS {'CHAR' if self.dialect == 'mysql' else 'TEXT'})"
+        length = "CHAR_LENGTH" if self.dialect == "mysql" else "LENGTH"
         sql = f"""SELECT COUNT(*) AS rows, COUNT({c}) AS non_null,
             COUNT(DISTINCT {c}) AS distinct_exact,
             SUM(CASE WHEN {c} IS NULL THEN 1 ELSE 0 END) AS nulls,
             SUM(CASE WHEN {text} = '' THEN 1 ELSE 0 END) AS empty_str,
-            MIN(LENGTH({text})) AS min_len, MAX(LENGTH({text})) AS max_len
+            MIN({length}({text})) AS min_len, MAX({length}({text})) AS max_len
             FROM {self.table(table)} WHERE {where}"""
         return self.finish(sql, params, "profile_column")
 
@@ -125,14 +169,14 @@ class QueryCompiler:
         join = " AND ".join(f"s.{a} = t.{b}" for a, b in zip(sc, tc))
         binding_alias = "_lg_bindings"
         while binding_alias in target_columns: binding_alias = "_" + binding_alias
-        binding_count = "t." + ident(binding_alias)
+        binding_count = "t." + self.ident(binding_alias)
         sql = f"""SELECT COUNT(*) AS source_ref_tuples,
           COALESCE(SUM(CASE WHEN {missing} THEN 1 ELSE 0 END), 0) AS null_refs,
           COALESCE(SUM(CASE WHEN NOT ({missing}) AND {binding_count} IS NULL THEN 1 ELSE 0 END), 0) AS unmatched,
           COALESCE(SUM(CASE WHEN {binding_count} > 1 THEN 1 ELSE 0 END), 0) AS ambiguous,
           COALESCE(SUM(CASE WHEN {binding_count} = 1 THEN 1 ELSE 0 END), 0) AS unique_matches
           FROM (SELECT DISTINCT {', '.join(sc)} FROM {self.table(source)} WHERE {sw}) s
-          LEFT JOIN (SELECT {', '.join(tc)}, COUNT(*) AS {ident(binding_alias)}
+          LEFT JOIN (SELECT {', '.join(tc)}, COUNT(*) AS {self.ident(binding_alias)}
             FROM (SELECT DISTINCT {bindings} FROM {self.table(target)} WHERE ({tw}) AND {complete}) b
             GROUP BY {', '.join(tc)}) t ON {join}"""
         return self.finish(sql, params, "check_reference")
@@ -162,5 +206,13 @@ class QueryCompiler:
     def compare_attribute_role(self, a: TableSpec, ca: str, b: TableSpec, cb: str, predicate=None, target_predicate=None) -> ValidatedQuery:
         ac,bc=self.columns(a,[ca])[0],self.columns(b,[cb])[0]
         params={}; aw=self.predicate(a,predicate,params);bw=self.predicate(b,target_predicate,params)
-        sql=f"SELECT COUNT(*) AS overlap_values FROM (SELECT DISTINCT {ac} AS v FROM {self.table(a)} WHERE ({aw}) AND {ac} IS NOT NULL INTERSECT SELECT DISTINCT {bc} AS v FROM {self.table(b)} WHERE ({bw}) AND {bc} IS NOT NULL) i"
+        if self.dialect == "mysql":
+            # INTERSECT is unavailable on MySQL releases before 8.0.31. The
+            # distinct equijoin preserves set-overlap counts without a product.
+            sql = f"""SELECT COUNT(*) AS overlap_values
+              FROM (SELECT DISTINCT {ac} AS v FROM {self.table(a)} WHERE ({aw}) AND {ac} IS NOT NULL) l
+              INNER JOIN (SELECT DISTINCT {bc} AS v FROM {self.table(b)} WHERE ({bw}) AND {bc} IS NOT NULL) r
+              ON l.v = r.v"""
+        else:
+            sql=f"SELECT COUNT(*) AS overlap_values FROM (SELECT DISTINCT {ac} AS v FROM {self.table(a)} WHERE ({aw}) AND {ac} IS NOT NULL INTERSECT SELECT DISTINCT {bc} AS v FROM {self.table(b)} WHERE ({bw}) AND {bc} IS NOT NULL) i"
         return self.finish(sql, params, "compare_attribute_role")

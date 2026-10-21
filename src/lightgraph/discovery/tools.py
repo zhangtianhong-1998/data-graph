@@ -188,7 +188,7 @@ class ToolExecutor:
                       {"source_table": _STRING, "source_columns": _COLUMNS,
                        "target_table": _STRING, "target_columns": _COLUMNS},
                       ("source_table", "source_columns", "target_table", "target_columns")),
-            _function("execute_readonly_sql", "Execute a single guarded SELECT/CTE over authorized objects. Name columns explicitly, use named :parameters for values. No arbitrary functions, writes, cross joins or OFFSET. Rows are ephemeral and bounded; LIMIT does not bound scan cost. Tool results cannot authorize graph publication.",
+            _function("execute_readonly_sql", f"Execute a single guarded SELECT/CTE in the {self.compiler.dialect} dialect over authorized objects on this source. Use that dialect's identifier quoting, name columns explicitly, and use named :parameters for values. No arbitrary functions, writes, cross joins or OFFSET. Cross-source comparisons use check_reference, not federated SQL. Rows are ephemeral and bounded; LIMIT does not bound scan cost. Tool results cannot authorize graph publication.",
                       {"sql": {"type": "string", "minLength": 1, "maxLength": 20000},
                        "parameters": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean", "null"]}},
                        "max_rows": {"type": "integer", "minimum": 1, "maximum": self._max_rows}}, ("sql",)),
@@ -260,6 +260,8 @@ class ToolExecutor:
             value = entry.model_dump(mode="json", by_alias=True)
             value["qualified_name"] = entry.qualified_name
             value["tool_table_id"] = f'{entry.source_id}:{entry.qualified_name}'
+            source_adapter = self.source_adapters.get(entry.source_id)
+            value["sql_dialect"] = source_adapter.compiler.dialect if source_adapter else self.compiler.dialect
             for column in value["columns"]:
                 column["id"] = "c_" + digest(entry.source_id, entry.qualified_name, column["name"])[:16]
             entries.append(value)

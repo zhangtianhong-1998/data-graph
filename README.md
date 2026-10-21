@@ -1,20 +1,39 @@
 # data-graph · 轻量知识图谱
 
-从 Gauss 数据库、Excel 和 CSV 中发现实体列组、层级和引用规则，再用规则生成图谱。一次运行可以混合这些来源。Markdown 可以提供全局说明、表列定义和带出处与条件的分析知识。图中分开显示业务实体、表与列、文档来源。
+从 Gauss、MySQL 数据库、Excel 和 CSV 中发现实体列组、层级和引用规则，再用规则生成图谱。一次运行可以混合这些来源。Markdown 可以提供全局说明、表列定义和带出处与条件的分析知识。图中分开显示业务实体、表与列、文档来源。
 
-**运行源码、测试和页面模板均在 `src/lightgraph/`。** 本项目不需要图数据库。SQLite 只保存抽取结果、规则、来源支持和发布记录；数据库查询返回的行、抽样、模型请求和响应不会进入结果库。
+**所有源码均在 `src/`：Python 后端与引擎位于 `src/lightgraph/`，Vue 3 工作台位于 `src/workbench/`。** 本项目不需要图数据库。SQLite 只保存抽取结果、规则、来源支持和发布记录；数据库查询返回的行、抽样、模型请求和响应不会进入结果库。
 
 依赖的本轮实测版本记录在 `requirements.lock`；需要复现环境时先安装该文件，再安装项目。
 
 当前运行能力与验证边界见 [实施与验收记录](IMPLEMENTATION_STATUS.md)。架构依据是 [设计 v1.0](design/lightweight_graph/README.md)。
 
-工作台页面设计见 [交互与接入设计](design/lightweight_graph/WORKBENCH_DESIGN.md) 和 [用户故事](design/lightweight_graph/WORKBENCH_US.md)。本轮提供独立的合成可交互原型，未接入真实数据库、模型或 Web 后端：
+## 启动 Vue 工作台
+
+工作台通过 FastAPI 管理项目、上传文件、配置目标和 Markdown 范围，并调用现有抽取引擎。先安装下面的 Python 依赖，再构建前端（Node.js 22.12+ 的 22.x、24.x 或 26+）：
 
 ```bash
-python3 -m http.server 4173 --bind 127.0.0.1 --directory src/lightgraph/workbench_prototype
+npm --prefix src/workbench ci
+npm --prefix src/workbench run build
+.venv/bin/lightgraph serve
 ```
 
-打开 `http://127.0.0.1:4173`。原型可编辑目的与文档范围、演示发现和取消、查看两类图及运行记录；配置仅保留在页面内存。说明与验收见 [原型 README](src/lightgraph/workbench_prototype/README.md)。
+打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。同一个服务提供前端页面和 `/api`，页面显示实际项目、运行报告、元数据图和业务图。新建项目后上传 Excel/CSV 与文档，填写目的，读取元数据，再开始抽取；已有结果会作为同项目增量构建的基础。默认关闭模型，启用 AgentScope 时在“Agent 与配置”中填写模型地址、模型名和密钥环境变量名，密钥由启动服务的环境提供。
+
+项目目录不存在时自动创建，默认布局如下：
+
+```text
+workspace/<项目编号>/
+  project.yaml         # 项目信息和文件清单
+  config.yaml          # 目标、来源、模型和预算配置
+  files/               # 上传的 Excel、CSV、YAML、Markdown
+  output/              # 元数据 YAML、图谱与引擎报告
+  runs/                # 历次任务状态和安全报告
+```
+
+上传文件是用户提供的项目资产，可以保存；数据库检索结果仍只在运行内存中使用。`workspace/` 不提交 Git。YAML 配置只允许引用本项目登记的文件，Markdown 默认全局，可绑定读取到的具体表。工作台配置不保存明文密钥或数据库连接串，使用 `api_key_env` / `dsn_env`。MySQL/Gauss 来源可在数据库表单中添加；高级列权限和 CSV 格式可通过完整配置编辑器或上传的运行 YAML 设置。
+
+服务默认只监听本机，每个 workspace 只允许一个服务。页面按秒轮询真实任务状态；不向浏览器传送查询样本、模型原文，也不虚构进度百分比。详细接口、当前范围和启动方式见 [Vue 工作台实现](design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md)。原 [交互设计](design/lightweight_graph/WORKBENCH_DESIGN.md) 和 [用户故事](design/lightweight_graph/WORKBENCH_US.md) 中的后续能力仍单独列出。旧合成原型保留在 `src/lightgraph/workbench_prototype/`，不再作为实际工作台入口。
 
 公开仓库包含源码、测试、设计文档和示例配置。合成 Excel、运行结果与安装包由下面的命令在本地生成；不会随源码提交。
 
@@ -91,6 +110,17 @@ scope:
 
 只读账号权限、只读事务、表列白名单、工具内 SQL AST 检查共同限制源库操作。发现 Agent 可以调用统计工具，也可以提交只读 SQL；两者都经过同一查询检查，不通过的 SQL 整条拒绝。系统检查查询次数、返回行数、字节和截止时间，不把截断当作完整分区。`LIMIT` 不能限制扫描成本；实际 Gauss 的超时和取消仍需环境验收。租户行权限应由数据库账号、授权视图或数据库行策略提供，`goal.source_scope` 和结果导出的 `scopes` 都不能替代源库权限。
 
+## MySQL 接入
+
+MySQL 与 Gauss 可以同时配置，示例见 [examples/mysql.yaml](examples/mysql.yaml)。设置 `kind: mysql_database`、`dsn_env` 和 `allowed_tables`；MySQL 授权表写成 `database.table`。环境变量保存 `mysql://user:password@host:3306/database` 形式的连接串，非本机连接默认使用系统 CA 验证 TLS 和主机名，可通过 `ssl_ca` 指定客户 CA。
+
+```bash
+.venv/bin/lightgraph connect-check examples/mysql.yaml
+.venv/bin/lightgraph connect-check examples/mysql.yaml --verify-runtime --output mysql-capabilities.yaml
+```
+
+首期目标是 Oracle MySQL 8.0/8.4 的 InnoDB 基础表，使用 PyMySQL 流式游标、只读一致快照与相同 SQL 守卫。实例抽取前仍需匹配的能力清单和部署留存确认。当前已完成替身驱动和方言测试，尚未连接真实 MySQL/Gauss；兼容产品、特殊类型和客户环境验证边界见 [MySQL 接入说明](design/lightweight_graph/MYSQL_ADAPTER.md)。
+
 ## 抽取方向与发现 Agent
 
 运行前在 `goal` 中说明本次要构建什么图。下面的配置不指定业务表名或字段映射：
@@ -153,7 +183,7 @@ llm:
 .venv/bin/lightgraph discover examples/agentscope_discovery.yaml
 ```
 
-`stream: true` 使用模型 SSE 流，`false` 接收完整 JSON；旧配置默认 `false`。两种模式使用相同的工具和输出校验，工具名称与参数完整到达后才执行工具，不执行半截参数。`stream_options_include_usage` 控制是否请求流末尾的 token 用量；网关不支持该选项时设为 `false`，缺少用量时按保守预算记账。这里的流式指模型传输，前端任务事件接口尚未实现，原型不会实时显示这次模型调用。
+`stream: true` 使用模型 SSE 流，`false` 接收完整 JSON；旧配置默认 `false`。两种模式使用相同的工具和输出校验，工具名称与参数完整到达后才执行工具，不执行半截参数。`stream_options_include_usage` 控制是否请求流末尾的 token 用量；网关不支持该选项时设为 `false`，缺少用量时按保守预算记账。这里的流式指模型传输；Vue 工作台采用 HTTP 轮询显示真实任务状态，尚不提供逐工具事件流，也不显示模型原文。
 
 远端默认要求 HTTPS。客户的可信内网网关只有 HTTP 时，可以显式设置 `allow_insecure_http: true`；该设置不改变数据查询权限或允许发送的内容。
 

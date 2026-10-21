@@ -5,4 +5,5 @@ from .budget import QueryBudget
 from .excel import ExcelSource
 from .csv import CSVSource
 from .gauss import GaussSource
-__all__ = ["SourceAdapter", "EphemeralBatch", "QueryStats", "MemorySource", "ExcelSource", "CSVSource", "GaussSource", "QueryBudget"]
+from .mysql import MySQLSource
+__all__ = ["SourceAdapter", "EphemeralBatch", "QueryStats", "MemorySource", "ExcelSource", "CSVSource", "GaussSource", "MySQLSource", "QueryBudget"]

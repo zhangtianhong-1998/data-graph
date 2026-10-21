@@ -1,6 +1,6 @@
 # 数据抽取工作台：交互与接入设计
 
-日期：2026-10-20。状态：设计与可交互原型，Web 服务尚未实现。本文统一用户提供的内网工作台方案与当前 `lightgraph` 抽取引擎，作为后续前后端开发依据。
+原设计日期：2026-10-20。2026-10-21 已实现 Vue 3 工作台与真实 FastAPI 项目服务，源码位于 `src/workbench/` 和 `src/lightgraph/web/`。实际接口、workspace 文件布局、运行状态和功能边界以 [工作台实现](WORKBENCH_IMPLEMENTATION.md) 为准。下文保留完整目标设计，未实现部分不能视为本轮交付；旧合成原型只用于历史对照。
 
 配套：[工作台用户故事](WORKBENCH_US.md)、[原型说明](../../src/lightgraph/workbench_prototype/README.md)、[引擎实施记录](../../IMPLEMENTATION_STATUS.md)。实体身份、文档范围、查询权限和发布规则沿用 [SDD](SDD.md)，本文不另设一套图模型。
 
