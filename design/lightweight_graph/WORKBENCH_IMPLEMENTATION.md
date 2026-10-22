@@ -24,6 +24,7 @@ workspace/
     project.yaml
     config.yaml
     files/<file_id>_<原始文件名>
+    metadata/<file_id>.yaml    # 单个上传文件的结构预览
     output/
       metadata.yaml
       metadata-context.json
@@ -40,13 +41,26 @@ workspace/
 
 ## 页面到后端的实际流程
 
+界面按两个阶段组织，配置页面不再与结果图交错排列：
+
+| 阶段 | 页面 | 内容 |
+| --- | --- | --- |
+| 配置 | 数据接入 | 本地数据、数据库连接与选表、元数据 YAML 预览 |
+| 配置 | 知识文档 | Markdown 上传、用途、全局或指定表范围 |
+| 配置 | 抽取目标 | 目的、包含与排除内容、发现提示 |
+| 配置 | Agent 与模型 | URL、模型名、会话 API key、流式开关和高级配置 |
+| 运行与结果 | 元数据图 | 表、列、声明外键及已核验的列关系 |
+| 运行与结果 | 业务图谱 | 当前发布的业务实体和关系 |
+| 运行与结果 | 运行记录 | 状态、报告、取消与临时数据清理结果 |
+
 1. 创建项目，服务保存 `project.yaml` 和初始 `config.yaml`。
-2. 上传 XLSX/CSV 后自动登记来源；CSV 初值为 UTF-8、逗号、首行表头、空串为 NULL、文本解析，可在完整配置中修改。上传 Markdown 后加入 documents；无范围声明时为全局，已有 frontmatter 范围保留。
-3. 编辑抽取目的、包含/排除内容和探索提示。模型设置支持 URL、模型名、密钥环境变量及流式开关。Gauss/MySQL 可通过数据库来源表单并存；高级列权限保留在完整配置中。
-4. 显式“读取元数据”调用连接器的目录路径。打开项目、切换页面或读取缓存不会自动连接数据库。上传 Excel 的解析可以读取用户文件内容，但不执行数据库实例查询。
-5. Markdown 可以选择数据说明、分析知识、混合或待分类，以及全局或具体表范围；绑定写回实际 frontmatter，后续引擎读取同一份文件。表标识为 `source_id.schema.table`。
-6. 开始抽取时先保存配置，再创建后台 worker。worker 使用固定配置调用真实 pipeline，来源与文档依赖指纹在前后检查。页面每秒查询任务状态。
-7. 元数据图和业务图分别读后端结果。业务图以 GraphStore 当前发布为准，不用可能过期的 graph.json。原图非空时后续运行继续使用同一结果库，实现同项目增量。
+2. 上传 XLSX/CSV 后登记来源，并单独解析该文件的表结构；无需先连通项目中的其他数据库。CSV 初值为 UTF-8、逗号、首行表头、空串为 NULL、文本解析。结构预览只保存声明，不保存单元格值，也不冒充整个项目已完成元数据读取。
+3. 数据库可输入连接串，或地址、端口、数据库、用户名和密码。先测试连接，再读取表清单并筛选勾选；也可手动输入表名或导入 Excel 表清单。后者仅用于选表，不登记为业务数据来源。提交后保存授权表并读取所选表的元数据。
+4. 元数据提供 `tables.yaml`、`constraints.yaml`、`foreign_keys.yaml` 预览与下载。主键、唯一键、外键来自连接器声明；未读取的 CHECK/default 等保持 unknown。文件来源没有声明外键时不会凭名称自动补上。导出和打开缓存不连接数据库；全项目“读取元数据”是显式操作。
+5. 上传 Markdown 后加入 documents；无范围声明时默认全局，已有 frontmatter 范围保留。可选择数据说明、分析知识、混合或待分类，以及全局或具体表范围。绑定写回实际 frontmatter；表标识为 `source_id.schema.table`。
+6. 填写抽取目的、包含/排除内容和探索提示。在 Agent 配置中填写 URL、模型名与流式开关，API key 可直接输入为会话凭据；原有环境变量方式继续支持。
+7. 开始抽取时先保存配置，再创建后台 worker。worker 使用固定配置调用真实 pipeline，来源与文档依赖指纹在前后检查。页面每秒查询任务状态，完成后可查看元数据图、业务图与运行记录。
+8. 业务图以 GraphStore 当前发布为准。原图非空时后续运行继续使用同一结果库，实现同项目增量。
 
 运行期间不允许从 API 修改项目输入。当前采用锁定编辑，而不是旧设计中的“当前运行快照 + 下一轮可编辑草稿”双版本界面。手工在磁盘修改输入会报告 `partial/input_dependency_changed`；已经发布的完整分区不会因此自动回滚。
 
@@ -59,7 +73,17 @@ workspace/
 | GET /health | 服务健康状态 |
 | GET /projects；POST /projects | 列出、新建项目 |
 | GET /projects/{pid}；PATCH 同路径 | 项目详情、改名 |
+| POST /projects/{pid}/session | 创建仅在内存中的项目会话 |
+| GET /projects/{pid}/credentials | 会话凭据存在状态，不回显内容 |
+| PUT /projects/{pid}/credentials/model | 保存会话 API key，绑定当前模型配置 |
+| DELETE /projects/{pid}/credentials/model | 清除会话 API key |
+| POST /projects/{pid}/database/test | 用请求中的连接信息验证只读连接 |
+| POST /projects/{pid}/database/tables | 读取指定 schema 的有界表清单 |
+| POST /projects/{pid}/database/table-list | 从 Excel 读取表名清单，不登记为数据来源 |
+| POST /projects/{pid}/database/connect | 保存来源/授权表、保留会话凭据并读取元数据 |
 | POST /projects/{pid}/files | multipart 上传 file |
+| GET /projects/{pid}/files/{fid}/metadata | 单个本地数据文件的表结构和 YAML 预览 |
+| GET /projects/{pid}/metadata/yaml | 已缓存的元数据 YAML；部分来源已读取时标注缺失来源，过期时要求刷新，不自动连接源库 |
 | GET /projects/{pid}/files/{fid}/content | Markdown/YAML 原文预览，重新检查 YAML 凭据 |
 | PATCH /projects/{pid}/files/{fid}/binding | Markdown purpose 与 scope |
 | GET /projects/{pid}/config；PUT 同路径 | 当前完整 RunConfig |
@@ -72,11 +96,19 @@ workspace/
 | GET /projects/{pid}/runs/{rid} | 任务实际状态和安全报告 |
 | POST /projects/{pid}/runs/{rid}/cancel | 请求取消并等待有界清理 |
 
-上传单文件 20 MiB，Markdown/YAML 2 MiB，请求体上限 21 MiB。YAML 禁止 alias、anchor、自定义 tag、重复键；配置禁止明文 API key、密码和 DSN，使用环境变量。API 不提供任意 SQL 执行入口；Agent 工具仍经过内部 SQL 守卫。
+上传单文件 20 MiB，Markdown/YAML 2 MiB，请求体上限 21 MiB。YAML 禁止 alias、anchor、自定义 tag、重复键；持久化配置禁止明文 API key、密码和 DSN；直接输入走单独的会话接口，环境变量方式仍可使用。API 不提供任意 SQL 执行入口；Agent 工具仍经过内部 SQL 守卫。
 
 元数据缓存绑定来源、允许表列范围和上传输入摘要。变更后不把旧授权目录继续作为当前目录返回。刷新声明时，仅当引擎元数据的来源全集与各 schema 版本都吻合，才合入它的验证关系；否则返回新声明和 `stale_engine_metadata` 提示，等待重新运行。
 
 图接口最多返回 1,000 节点、3,000 边，并标记真实总数与截断状态。前端一次绘制最多 240 个筛选后节点。搜索只覆盖已返回集合；本期不是全图分页或大规模图检索服务。
+
+## 会话凭据
+
+数据库密码、连接串和 API key 不写进项目配置、YAML、运行记录或浏览器存储。页面通过单独接口交给服务端内存，使用与项目绑定的会话令牌访问。刷新页面、服务重启或会话过期后需要重新输入；配置页面只显示是否已提供凭据，不回显密钥。
+
+模型密钥绑定配置中的服务地址与模型名，修改后需重新提供。数据库接入操作更新来源配置和目录身份；旧目录不能仅因来源编号相同而继续视为有效。Worker 所需凭据通过 stdin 管道传递，不使用全局环境变量临时替换，不写临时文件。
+
+连接测试与读取表清单只执行固定的只读目录查询，不接收任意 SQL，也不执行业务表的 COUNT 或样本查询。测试通过不替代实例抽取的权限、超时/取消能力和部署留存验证。手动输入或导入的表清单仍需连接器核验访问权限。
 
 ## 后台任务与清理
 
@@ -96,7 +128,7 @@ workspace/
 
 实际具备项目隔离、文件持久化、目标/文档配置、真实后台执行、增量结果读取、两类图、取消与状态恢复。浏览器刷新后重新从 API 读取，不依赖 localStorage，也不预置合成结果。
 
-尚未实现：多用户登录/RBAC、跨项目继承、运行间图差异视图、文件删除/替换界面、在线 Markdown 正文编辑、全图服务端搜索、细粒度 Agent 事件/SSE。当前是监听本机的单用户工作台；来源权限仍由数据库账号与表列白名单决定。不能将它直接当作公网多租户服务部署。
+尚未实现：多用户登录/RBAC、跨项目继承、运行间图差异视图、文件删除/替换界面、在线 Markdown 正文编辑、物理元数据 YAML 在线改写、全图服务端搜索、细粒度 Agent 事件/SSE。当前是监听本机的单用户工作台；来源权限仍由数据库账号与表列白名单决定。不能将它直接当作公网多租户服务部署。
 
 用户填写模型配置或数据库连接配置，不等于相应环境已验收。真实模型发现质量、真实 MySQL/Gauss 权限与取消、服务端日志和部署级不落盘要求另行验证。当前实测结果汇总在 [实施与验收记录](../../IMPLEMENTATION_STATUS.md)。
 

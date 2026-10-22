@@ -1,46 +1,93 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { updateDatabaseSources } from './database'
 import type { DatabaseForm } from './database'
-import type { ProjectFile, SourceConfig } from './types'
+import { connectionPayload, selectedTables, validateSourceId } from './onboarding'
+import type { ConnectionForm, DatabaseTable } from './onboarding'
+import { ensureSession, json, projectPath, request } from './api'
+import type { Metadata, ProjectFile, RunConfig, SourceConfig } from './types'
 
-const props = defineProps<{ source: SourceConfig | null; sources: SourceConfig[]; files: ProjectFile[]; retentionVerified: boolean; busy: boolean; error: string }>()
-const emit = defineEmits<{ close: []; save: [sources: SourceConfig[], retentionVerified: boolean] }>()
-const form = ref<DatabaseForm>({
-  id: props.source?.id || '', kind: props.source?.kind === 'mysql_database' ? 'mysql_database' : 'gauss_database',
-  dsnEnv: typeof props.source?.dsn_env === 'string' ? props.source.dsn_env : '',
-  tables: Array.isArray(props.source?.allowed_tables) ? props.source.allowed_tables.join('\n') : '',
-  capabilityManifest: typeof props.source?.capability_manifest === 'string' ? props.source.capability_manifest : '',
-})
-const retention = ref(props.retentionVerified)
-const localError = ref('')
+const props = defineProps<{ projectId: string; source: SourceConfig | null; sources: SourceConfig[]; files: ProjectFile[]; retentionVerified: boolean; busy: boolean; error: string }>()
+const emit = defineEmits<{ close: []; save: [sources: SourceConfig[], retentionVerified: boolean]; connected: [config: RunConfig, metadata: Metadata] }>()
+const form = ref<DatabaseForm>({ id: props.source?.id || '', kind: props.source?.kind === 'mysql_database' ? 'mysql_database' : 'gauss_database', dsnEnv: typeof props.source?.dsn_env === 'string' ? props.source.dsn_env : '', tables: Array.isArray(props.source?.allowed_tables) ? props.source.allowed_tables.join('\n') : '', capabilityManifest: typeof props.source?.capability_manifest === 'string' ? props.source.capability_manifest : '' })
+const connection = ref<ConnectionForm>({ kind: form.value.kind, format: 'fields', dsn: '', host: '', port: form.value.kind === 'mysql_database' ? '3306' : '5432', database: '', username: '', password: '', schema: '' })
+const mode = ref<'direct' | 'environment'>('direct')
+const retention = ref(props.retentionVerified), localError = ref(''), pending = ref(false), tested = ref(false), tableLoaded = ref(false), truncated = ref(false)
+const tables = ref<DatabaseTable[]>([]), checked = ref<string[]>([]), filter = ref(''), listFileInput = ref<HTMLInputElement | null>(null)
 const manifests = computed(() => props.files.filter(file => file.kind === 'yaml'))
 const missingManifest = computed(() => form.value.capabilityManifest && !manifests.value.some(file => file.relative_path === form.value.capabilityManifest))
-function submit() {
-  localError.value = ''
-  try { emit('save', updateDatabaseSources(props.sources, props.source?.id || null, form.value, manifests.value.map(file => file.relative_path)), retention.value) }
-  catch (error) { localError.value = error instanceof Error ? error.message : '请检查数据库来源配置。' }
+const locked = computed(() => props.busy || pending.value)
+const path = computed(() => projectPath(props.projectId))
+const visibleTables = computed(() => tables.value.filter(table => table.qualified_name.toLowerCase().includes(filter.value.toLowerCase())))
+const tableCount = computed(() => new Set([...checked.value, ...form.value.tables.split('\n').map(value => value.trim()).filter(Boolean)]).size)
+watch(() => form.value.kind, kind => { connection.value.kind = kind; connection.value.port = kind === 'mysql_database' ? '3306' : '5432' })
+watch(connection, () => { tested.value = false; tableLoaded.value = false; tables.value = []; checked.value = []; truncated.value = false }, { deep: true })
+function clearSecrets() { connection.value.password = ''; connection.value.dsn = '' }
+function close() { if (locked.value) return; clearSecrets(); emit('close') }
+onUnmounted(clearSecrets)
+async function perform(operation: () => Promise<void>) {
+  if (locked.value) return
+  pending.value = true; localError.value = ''
+  try { await ensureSession(props.projectId); await operation() }
+  catch (error) { localError.value = error instanceof Error ? error.message : '操作未完成，请重试。' }
+  finally { pending.value = false }
+}
+async function testConnection() {
+  await perform(async () => { tested.value = false; await request(`${path.value}/database/test`, { method: 'POST', body: json({ connection: connectionPayload(connection.value) }) }); tested.value = true })
+}
+async function discoverTables() {
+  await perform(async () => { const result = await request<{ tables: DatabaseTable[]; truncated: boolean }>(`${path.value}/database/tables`, { method: 'POST', body: json({ connection: connectionPayload(connection.value) }) }); tables.value = result.tables; truncated.value = result.truncated; tableLoaded.value = true })
+}
+async function importTableList(event: Event) {
+  const input = event.target as HTMLInputElement, file = input.files?.[0]
+  if (!file) return
+  await perform(async () => { const body = new FormData(); body.append('file', file); const result = await request<{ tables: string[] }>(`${path.value}/database/table-list`, { method: 'POST', body }); form.value.tables = [...new Set([...form.value.tables.split('\n').filter(Boolean), ...result.tables])].join('\n') })
+  input.value = ''
+}
+function toggleVisible() {
+  const visible = visibleTables.value.map(table => table.qualified_name)
+  checked.value = visible.every(name => checked.value.includes(name)) ? checked.value.filter(name => !visible.includes(name)) : [...new Set([...checked.value, ...visible])]
+}
+async function submit() {
+  if (mode.value === 'environment') {
+    localError.value = ''
+    try { emit('save', updateDatabaseSources(props.sources, props.source?.id || null, form.value, manifests.value.map(file => file.relative_path)), retention.value) }
+    catch (error) { localError.value = error instanceof Error ? error.message : '请检查数据库来源配置。' }
+    return
+  }
+  await perform(async () => {
+    validateSourceId(form.value.id.trim(), props.source, props.sources)
+    const allowedTables = selectedTables(form.value.tables, checked.value)
+    if (form.value.capabilityManifest && !manifests.value.some(file => file.relative_path === form.value.capabilityManifest)) throw new Error('请重新选择能力验证文件。')
+    const result = await request<{ config: RunConfig; metadata: Metadata }>(`${path.value}/database/connect`, { method: 'POST', body: json({ source_id: form.value.id.trim(), connection: connectionPayload(connection.value), allowed_tables: allowedTables, deployment_retention_verified: retention.value, capability_manifest: form.value.capabilityManifest || null }) })
+    clearSecrets(); emit('connected', result.config, result.metadata)
+  })
 }
 </script>
 
 <template>
-  <div class="modal-backdrop" @click.self="!busy && emit('close')">
+  <div class="modal-backdrop" @click.self="close">
     <section class="modal wide database-modal" role="dialog" aria-modal="true" aria-labelledby="database-title">
-      <form @submit.prevent="submit">
-        <div class="panel-head"><h2 id="database-title">{{ source ? '编辑数据库来源' : '添加数据库来源' }}</h2><button type="button" class="close" aria-label="关闭" :disabled="busy" @click="emit('close')">×</button></div>
+      <form @submit.prevent="submit" autocomplete="off">
+        <div class="panel-head"><div><h2 id="database-title">{{ source ? '编辑数据库来源' : '接入数据库' }}</h2><p class="field-hint">连接数据库 → 选择表 → 抽取元数据</p></div><button type="button" class="close" aria-label="关闭" :disabled="locked" @click="close">×</button></div>
         <div class="panel-body">
           <p v-if="localError || error" class="note amber form-error" role="alert">{{ localError || error }}</p>
-          <div class="two-fields">
-            <div class="field"><label for="database-kind">数据库类型</label><select id="database-kind" v-model="form.kind" :disabled="busy"><option value="gauss_database">Gauss / openGauss</option><option value="mysql_database">MySQL</option></select></div>
-            <div class="field"><label for="database-id">来源编号</label><input id="database-id" v-model="form.id" :disabled="busy || !!source" required maxlength="64" placeholder="例如：business_mysql"/><p class="field-hint">项目内唯一；保存后保持不变，供文档和图谱引用。</p></div>
-          </div>
-          <div class="field"><label for="database-env">数据库连接环境变量名</label><input id="database-env" v-model="form.dsnEnv" :disabled="busy" required placeholder="例如：LIGHTGRAPH_MYSQL_DSN" autocomplete="off"/><p class="field-hint">由服务器管理员设置连接信息。这里只填写变量名，不输入地址、用户名、密码或完整连接串。</p></div>
-          <div class="field"><label for="database-tables">允许查询的表</label><textarea id="database-tables" v-model="form.tables" :disabled="busy" required :placeholder="form.kind === 'mysql_database' ? '每行一张表，包含数据库名，例如：\nanalytics.report_items\nanalytics.organizations' : '每行一张表，包含 schema，例如：\npublic.report_items\npublic.organizations'"/><p class="field-hint">明确列出授权表，不支持通配符。已有列级访问限制会保留，可在完整配置中查看或修改。</p></div>
-          <div class="field"><label for="database-manifest">能力验证文件（可选）</label><select id="database-manifest" v-model="form.capabilityManifest" :disabled="busy"><option value="">暂不指定</option><option v-if="missingManifest" :value="form.capabilityManifest" disabled>原文件不在上传列表，请重新选择</option><option v-for="file in manifests" :key="file.file_id" :value="file.relative_path">{{ file.name }}</option></select><p class="field-hint">只能引用此项目已上传的 YAML 文件。此项不等于授权确认，后端仍会核验其中的能力记录。</p></div>
-          <div class="retention-box"><label class="checkbox-line"><input v-model="retention" type="checkbox" :disabled="busy"/>此项目的部署环境已完成数据留存检查</label><p class="field-hint">这是项目级确认，影响全部数据库来源。尚未完成时也可保存连接并读取元数据，但不能启动访问真实实例数据的抽取。</p></div>
-          <p v-if="source?.allowed_columns" class="field-hint">此来源已有列级访问限制，本次保存会保留原配置。</p>
+          <div class="two-fields"><div class="field"><label for="database-kind">数据库类型</label><select id="database-kind" v-model="form.kind" :disabled="locked || !!source"><option value="gauss_database">Gauss / openGauss</option><option value="mysql_database">MySQL</option></select></div><div class="field"><label for="database-id">来源编号</label><input id="database-id" v-model="form.id" :disabled="locked || !!source" required maxlength="64" placeholder="例如：business_mysql"/></div></div>
+          <div class="radio-line connection-mode"><label><input v-model="mode" type="radio" value="direct" :disabled="locked"/>直接连接</label><label><input v-model="mode" type="radio" value="environment" :disabled="locked"/>服务器环境变量（高级）</label></div>
+          <template v-if="mode === 'direct'">
+            <section class="connection-step"><h3><span>1</span>填写连接信息</h3><div class="radio-line connection-format"><label><input v-model="connection.format" type="radio" value="fields" :disabled="locked"/>分项填写</label><label><input v-model="connection.format" type="radio" value="dsn" :disabled="locked"/>连接串</label></div>
+              <template v-if="connection.format === 'fields'"><div class="host-port"><div class="field"><label for="database-host">主机地址</label><input id="database-host" v-model="connection.host" :disabled="locked" placeholder="db.example.com" autocomplete="off"/></div><div class="field"><label for="database-port">端口</label><input id="database-port" v-model="connection.port" :disabled="locked" inputmode="numeric"/></div></div><div class="two-fields"><div class="field"><label for="database-name">数据库名</label><input id="database-name" v-model="connection.database" :disabled="locked" autocomplete="off"/></div><div class="field"><label for="database-schema">Schema（可选）</label><input id="database-schema" v-model="connection.schema" :disabled="locked" :placeholder="form.kind === 'mysql_database' ? '默认使用数据库名' : '例如：public'"/></div></div><div class="two-fields"><div class="field"><label for="database-username">用户名</label><input id="database-username" v-model="connection.username" :disabled="locked" autocomplete="off"/></div><div class="field"><label for="database-password">密码</label><input id="database-password" v-model="connection.password" :disabled="locked" type="password" autocomplete="new-password"/></div></div></template>
+              <template v-else><div class="field"><label for="database-dsn">连接串</label><input id="database-dsn" v-model="connection.dsn" :disabled="locked" type="password" autocomplete="new-password" :placeholder="form.kind === 'mysql_database' ? 'mysql://用户名:密码@主机:3306/数据库' : 'postgresql://用户名:密码@主机:5432/数据库'"/></div><div class="field"><label for="dsn-schema">Schema（可选）</label><input id="dsn-schema" v-model="connection.schema" :disabled="locked"/></div></template>
+              <div class="actions"><button type="button" class="btn" :disabled="locked" @click="testConnection">测试连接</button><span v-if="tested" class="badge green" role="status">连接成功</span><span v-if="pending" class="muted small-text">正在处理…</span></div><p class="field-hint">密码仅用于本次会话。连接后可用于元数据读取和抽取；刷新页面后需要重新填写。</p>
+            </section>
+            <section class="connection-step"><div class="selection-head"><h3><span>2</span>选择要分析的表</h3><button type="button" class="btn small" :disabled="locked" @click="discoverTables">读取表清单</button></div><div v-if="tableLoaded" class="table-picker"><input v-model="filter" aria-label="筛选数据库表" placeholder="按表名筛选" :disabled="locked"/><div class="table-picker-head"><span>{{ visibleTables.length }} 张表</span><button type="button" :disabled="locked || !visibleTables.length" @click="toggleVisible">选择 / 取消当前筛选</button></div><div class="table-picker-items"><label v-for="table in visibleTables" :key="table.qualified_name" class="table-choice"><input v-model="checked" type="checkbox" :value="table.qualified_name" :disabled="locked"/><span>{{ table.qualified_name }}</span><small>{{ table.table_type }}</small></label><p v-if="!visibleTables.length" class="empty-state">没有匹配的表</p></div><p v-if="truncated" class="note amber">表清单已达到服务端限制，可缩小 Schema 范围后重试，或补充手动表名。</p></div>
+              <div class="field manual-tables"><div class="selection-head"><label for="database-tables">手动填写或补充表名</label><button type="button" class="btn small" :disabled="locked" @click="listFileInput?.click()">从 Excel 导入表清单</button><input ref="listFileInput" type="file" hidden accept=".xlsx" @change="importTableList"/></div><textarea id="database-tables" v-model="form.tables" :disabled="locked" :placeholder="form.kind === 'mysql_database' ? '每行一张表，例如：\nanalytics.metrics\nanalytics.organizations' : '每行一张表，例如：\npublic.metrics\npublic.organizations'"/><p class="field-hint">合并勾选与手动表名，共 {{ tableCount }} 张。表清单文件仅用于选表，不会登记为业务数据源。</p></div>
+            </section>
+          </template>
+          <template v-else><div class="field"><label for="database-env">数据库连接环境变量名</label><input id="database-env" v-model="form.dsnEnv" :disabled="locked" required placeholder="LIGHTGRAPH_MYSQL_DSN" autocomplete="off"/><p class="field-hint">适用于已有服务器凭据配置的部署环境。</p></div><div class="field"><label for="environment-tables">允许查询的表</label><textarea id="environment-tables" v-model="form.tables" :disabled="locked" required placeholder="每行一张表，包含 Schema；不使用通配符。"/></div></template>
+          <details class="connection-advanced"><summary>运行权限与高级选项</summary><div class="field"><label for="database-manifest">能力验证文件（可选）</label><select id="database-manifest" v-model="form.capabilityManifest" :disabled="locked"><option value="">暂不指定</option><option v-if="missingManifest" :value="form.capabilityManifest" disabled>原文件不在上传列表，请重新选择</option><option v-for="file in manifests" :key="file.file_id" :value="file.relative_path">{{ file.name }}</option></select></div><div class="retention-box"><label class="checkbox-line"><input v-model="retention" type="checkbox" :disabled="locked"/>此项目的部署环境已完成数据留存检查</label><p class="field-hint">此项影响真实实例数据的抽取。未确认时仍可连接并读取元数据。</p></div><p v-if="source?.allowed_columns" class="field-hint">已有列级访问限制会保留。</p></details>
         </div>
-        <div class="panel-footer"><span>保存配置不会主动连接数据库；读取元数据时再连接。</span><button type="submit" class="btn primary" :disabled="busy">保存数据库来源</button></div>
+        <div class="panel-footer"><span>{{ mode === 'direct' ? '连接信息不会写入项目 YAML 或浏览器存储' : '保存后可在数据接入页读取元数据' }}</span><button type="submit" class="btn primary" :disabled="locked">{{ pending ? '处理中…' : mode === 'direct' ? source ? '更新并抽取元数据' : '添加并抽取元数据' : '保存数据库来源' }}</button></div>
       </form>
     </section>
   </div>

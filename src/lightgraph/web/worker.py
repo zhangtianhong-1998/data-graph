@@ -72,7 +72,10 @@ def execute(payload, result_path):
         check_dependencies(payload["dependencies"], project)
         check_cancelled()
         opening_sources = True
-        sources = open_sources(config)
+        # Direct credentials arrive through the parent's private stdin pipe.
+        # They never enter the persisted RunConfig or process environment.
+        options = {"source_credentials": payload["source_credentials"]} if payload.get("source_credentials") else {}
+        sources = open_sources(config, **options)
         opening_sources = False
         check_cancelled()
         rules = load_rules(config.rules) if config.rules else None

@@ -110,7 +110,7 @@ def check_dependencies(expected, project_path):
         raise LightGraphError("input_dependency_changed")
 
 
-def _resolved_payload(config, project_path):
+def _resolved_payload(config, project_path, *, source_credentials=None, model_api_key=None):
     # Private resolved AgentConfig is not serialized by RunConfig. Flatten it
     # for this worker only; credentials travel through a pipe, never a file.
     data = config.model_dump(mode="json", by_alias=True)
@@ -119,8 +119,13 @@ def _resolved_payload(config, project_path):
     secret = config.resolved_model.api_key
     if secret is not None:
         data["model"]["api_key"] = secret.get_secret_value()
-    return {"config": data, "agent_name": config.agent_name,
-            "dependencies": _input_manifest(config, project_path)}
+    if model_api_key is not None:
+        data["model"]["api_key"] = model_api_key
+    payload = {"config": data, "agent_name": config.agent_name,
+               "dependencies": _input_manifest(config, project_path)}
+    if source_credentials:
+        payload["source_credentials"] = dict(source_credentials)
+    return payload
 
 
 class RunManager:
@@ -177,7 +182,7 @@ class RunManager:
                 except (LightGraphError, OSError):
                     continue
 
-    def start(self, pid):
+    def start(self, pid, *, source_credentials=None, model_api_key=None):
         with self.workspace.lock(pid), self._guard:
             if self._closed:
                 raise LightGraphError("run_service_stopped")
@@ -189,7 +194,11 @@ class RunManager:
                 raise LightGraphError("extraction_purpose_required")
             if not config.sources and not config.documents:
                 raise LightGraphError("project_inputs_required")
-            payload = _resolved_payload(config, project)
+            for source in config.sources:
+                if source.credential_mode == "session" and not (source_credentials or {}).get(source.id):
+                    raise LightGraphError("source_credential_missing")
+            payload = _resolved_payload(config, project, source_credentials=source_credentials,
+                                        model_api_key=model_api_key)
             rid = "run_" + uuid.uuid4().hex[:24]
             result_path = runs / (rid + ".result.json")
             record = {"run_id": rid, "project_id": pid, "status": "queued", "stage": "starting",
@@ -362,8 +371,12 @@ def read_graph(workspace, pid, layer="business"):
 
 def _metadata_context(config, project_path):
     paths = {p for source in config.sources for p in (source.path, source.capability_manifest) if p}
+    files = _file_manifest(paths, project_path)
     return {"source_revision": digest([source.model_dump(mode="json") for source in config.sources]),
-            "file_revisions": _file_manifest(paths, project_path)}
+            "file_revisions": files,
+            "source_revisions": {source.id: digest(source.model_dump(mode="json"),
+                {str(Path(p).resolve().relative_to(project_path.resolve())): files[str(Path(p).resolve().relative_to(project_path.resolve()))]
+                 for p in (source.path, source.capability_manifest) if p}) for source in config.sources}}
 
 
 def write_metadata_context(config, project_path):
@@ -371,10 +384,10 @@ def write_metadata_context(config, project_path):
     _save(Path(config.output_dir) / "metadata-context.json", _metadata_context(config, project_path))
 
 
-def read_metadata(workspace, pid, refresh=False):
+def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, source_ids=None):
     """Cached GETs never connect; explicit refresh reads authorized declarations."""
     import yaml
-    from ..catalog import DeclaredCatalog, declared_catalog, semantic_catalog, write_catalog, read_semantic_catalog
+    from ..catalog import CATALOG_VERSION, DeclaredCatalog, declared_catalog, semantic_catalog, write_catalog, read_semantic_catalog
     from ..contracts import CapabilityManifest
     from ..metadata import publish_metadata
     from ..runtime.config import open_sources
@@ -385,6 +398,7 @@ def read_metadata(workspace, pid, refresh=False):
     adapters = []
     project = workspace.project_path(pid)
     context = _metadata_context(config, project)
+    prior_context = None
     def unread(stale=False):
         return {**_bounded_view({}, "metadata"), "tables": [], "revision": None,
                 "coverage": "not_read", "instance_queries": 0, "requires_refresh": True,
@@ -398,6 +412,15 @@ def read_metadata(workspace, pid, refresh=False):
             return unread(stale=True)
         if cached_context != context:
             return unread(stale=True)
+    else:
+        try:
+            prior_context = _json_file(output / "metadata-context.json")
+        except LightGraphError:
+            pass
+        # Invalidate the read marker before any artifact can be replaced. A
+        # failed graph render or connection rollback must never associate new
+        # declarations with the previous source authorization context.
+        _save(output / "metadata-context.json", {"refresh_pending": True})
 
     class CatalogAdapter:
         # No in-memory database or source rows are needed to render declarations.
@@ -418,10 +441,40 @@ def read_metadata(workspace, pid, refresh=False):
             except (OSError, ValueError, KeyError, TypeError):
                 raise LightGraphError("metadata_artifact_invalid") from None
         else:
-            adapters = open_sources(config, metadata_only=True)
+            options = {"source_credentials": source_credentials} if source_credentials else {}
+            selected = set(source_ids) if source_ids is not None else None
+            source_config = config
+            if selected is not None:
+                if not selected or selected - {s.id for s in config.sources}:
+                    raise LightGraphError("source_scope_missing")
+                source_config = config.model_copy(deep=True)
+                source_config.sources = [s for s in config.sources if s.id in selected]
+            adapters = open_sources(source_config, metadata_only=True, **options)
             declared = declared_catalog(adapters)
+            if selected is not None and path.exists():
+                # Reuse only declarations tied to unchanged source authorization
+                # and file revisions. Adding a DB never reconnects other DBs.
+                try:
+                    if path.is_symlink():
+                        raise ValueError
+                    prior = DeclaredCatalog.model_validate(yaml.safe_load(path.read_text(encoding="utf-8"))["declared"])
+                    retained = {sid for sid, revision in context["source_revisions"].items()
+                                if sid not in selected and (prior_context or {}).get("source_revisions", {}).get(sid) == revision}
+                    tables = sorted(declared.tables + [t for t in prior.tables if t.source_id in retained],
+                                    key=lambda t: (t.source_id, t.schema_name, t.name))
+                    descriptions = sorted(declared.sources + [s for s in prior.sources if s.source_id in retained],
+                                          key=lambda s: s.source_id)
+                    declared = DeclaredCatalog(tables=tables, sources=descriptions,
+                        revision=digest(CATALOG_VERSION, [t.model_dump(by_alias=True) for t in tables],
+                                        [s.model_dump() for s in descriptions]))
+                except (LightGraphError, OSError, ValueError, KeyError, TypeError):
+                    pass
             from ..documents import load_documents
-            documents = load_documents(config.documents)
+            missing = {s.id for s in config.sources} - {s.source_id for s in declared.sources}
+            # Table-bound documents cannot be validated against an incomplete
+            # catalog. Defer interpretations until a full refresh/run, keeping
+            # the source declarations available for configuration preview.
+            documents = [] if missing else load_documents(config.documents)
             write_catalog(output, declared, semantic_catalog(
                 declared, config.goal, documents=documents, previous=read_semantic_catalog(output)))
         with GraphStore(":memory:") as store:
@@ -461,9 +514,13 @@ def read_metadata(workspace, pid, refresh=False):
         graph = _bounded_view(view, "metadata")
         tables = [{"id": t.source_id + "." + t.qualified_name,
                    **t.model_dump(mode="json", by_alias=True)} for t in declared.tables]
+        missing_sources = sorted({s.id for s in config.sources} - {s.source_id for s in declared.sources})
         return {**graph, "tables": tables, "revision": declared.revision,
-                "coverage": "declarations_only", "instance_queries": 0,
-                "requires_refresh": False, "stale_engine_metadata": stale}
+                "sources": [s.model_dump(mode="json") for s in declared.sources],
+                "coverage": "declarations_partial" if missing_sources else "declarations_only", "instance_queries": 0,
+                "requires_refresh": bool(missing_sources), "missing_sources": missing_sources,
+                "document_context_deferred": bool(missing_sources),
+                "stale_engine_metadata": stale}
     finally:
         for adapter in adapters:
             adapter.close()

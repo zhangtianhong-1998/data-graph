@@ -25,6 +25,10 @@ describe('数据库来源编辑', () => {
     expect(() => updateDatabaseSources([], null, { ...form, tables: 'analytics.*' }, ['files/capabilities.yaml'])).toThrow('通配符')
     expect(() => updateDatabaseSources([], null, form, [])).toThrow('已上传')
   })
+  it('从会话连接切换到环境变量时清除旧凭据绑定', () => {
+    const source = { id: form.id, kind: 'mysql_database', credential_mode: 'session', credential_revision: 'old-revision' }
+    expect(updateDatabaseSources([source], source.id, form, ['files/capabilities.yaml'])[0]).toMatchObject({ credential_mode: 'environment', credential_revision: null, dsn_env: 'MYSQL_DSN' })
+  })
   it('允许暂未设置能力文件，以便先配置并读取元数据', () => {
     expect(updateDatabaseSources([], null, { ...form, kind: 'gauss_database', capabilityManifest: '' }, [])[0]).toMatchObject({ kind: 'gauss_database', capability_manifest: null })
   })

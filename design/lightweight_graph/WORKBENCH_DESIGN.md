@@ -2,6 +2,8 @@
 
 原设计日期：2026-10-20。2026-10-21 已实现 Vue 3 工作台与真实 FastAPI 项目服务，源码位于 `src/workbench/` 和 `src/lightgraph/web/`。实际接口、workspace 文件布局、运行状态和功能边界以 [工作台实现](WORKBENCH_IMPLEMENTATION.md) 为准。下文保留完整目标设计，未实现部分不能视为本轮交付；旧合成原型只用于历史对照。
 
+2026-10-22 交互调整：配置阶段单独管理数据接入、知识文档、目标与 Agent，运行阶段只展示图与运行记录。当前实现支持会话内直接输入凭据、连接测试、选表与 YAML 预览；下文六页签和持久凭据引用属于旧设计，当前行为以实现文档为准。
+
 配套：[工作台用户故事](WORKBENCH_US.md)、[原型说明](../../src/lightgraph/workbench_prototype/README.md)、[引擎实施记录](../../IMPLEMENTATION_STATUS.md)。实体身份、文档范围、查询权限和发布规则沿用 [SDD](SDD.md)，本文不另设一套图模型。
 
 ## 1. 本轮交付和现有能力

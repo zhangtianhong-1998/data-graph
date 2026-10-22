@@ -7,12 +7,14 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+import uuid
+import re
 
 import yaml
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Header, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 from starlette.middleware.cors import CORSMiddleware
@@ -22,6 +24,9 @@ from starlette.staticfiles import StaticFiles
 from lightgraph.errors import LightGraphError
 from .workspace import Workspace
 from .execution import RunManager, read_graph, read_metadata
+from .credentials import SessionCredentials
+from .database_access import (ConnectionSpec, build_dsn, test_connection,
+                              discover_tables, parse_table_list_excel, normalize_selected_tables)
 
 ROOT=Path(__file__).resolve().parents[3]
 MAX_REQUEST_BYTES=21*1024*1024
@@ -29,7 +34,7 @@ ALLOWED_ORIGINS={f'http://{host}:{port}' for host in ('127.0.0.1','localhost') f
 
 
 def error_response(code: str, status: int=400) -> JSONResponse:
-    return JSONResponse({'error':{'code':code}},status_code=status)
+    return JSONResponse({'error':{'code':code}},status_code=status,headers={'Cache-Control':'no-store'})
 
 
 def error_status(code: str) -> int:
@@ -74,7 +79,11 @@ class RequestBoundary:
             return message
         async def tracked_send(message):
             nonlocal started
-            if message['type']=='http.response.start':started=True
+            if message['type']=='http.response.start':
+                started=True
+                if scope.get('path','').startswith('/api/'):
+                    message['headers']=[(k,v) for k,v in message.get('headers',[]) if k.lower()!=b'cache-control']
+                    message['headers'].append((b'cache-control',b'no-store'))
             await send(message)
         try:
             return await self.app(scope,limited_receive,tracked_send)
@@ -108,21 +117,42 @@ class ImportConfig(InputModel):
     file_id: str
 
 
+class ModelCredential(InputModel):
+    api_key: SecretStr = Field(min_length=1,max_length=16384)
+
+
+class DatabaseRequest(InputModel):
+    connection: ConnectionSpec
+
+
+class ConnectDatabase(DatabaseRequest):
+    source_id: str = Field(min_length=1,max_length=128)
+    allowed_tables: list[str] = Field(min_length=1,max_length=1000)
+    deployment_retention_verified: bool | None = None
+    capability_manifest: str | None = None
+
+
 def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|None=None,
                manager_factory=RunManager) -> FastAPI:
     workspace=Workspace(Path(workspace_root) if workspace_root else ROOT/'workspace')
     manager=manager_factory(workspace)
+    credentials=SessionCredentials()
 
     @asynccontextmanager
     async def lifespan(app):
-        yield
-        await run_in_threadpool(manager.shutdown)
+        try:
+            yield
+        finally:
+            credentials.clear()
+            await run_in_threadpool(manager.shutdown)
 
     app=FastAPI(title='Data Graph Workbench',version='1.1.0',lifespan=lifespan)
     app.state.workspace=workspace
     app.state.manager=manager
+    app.state.credentials=credentials
     app.add_middleware(CORSMiddleware,allow_origins=sorted(ALLOWED_ORIGINS),
-        allow_methods=['GET','POST','PUT','PATCH','OPTIONS'],allow_headers=['Content-Type'],allow_credentials=False)
+        allow_methods=['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+        allow_headers=['Content-Type','X-Workbench-Session'],allow_credentials=False)
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver'])
     app.add_middleware(RequestBoundary)
 
@@ -141,6 +171,15 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     def mutable(pid):
         workspace.get(pid)
         if manager.active(pid):raise LightGraphError('project_run_active')
+
+    def resolved_credentials(pid, token):
+        if not token:
+            return {}, None
+        return credentials.resolve(pid,token,workspace.resolved_config(pid))
+
+    def credential_status(pid, token):
+        sources, model=resolved_credentials(pid,token)
+        return {'database_sources':sorted(sources),'model':model is not None}
 
     @app.get('/api/health')
     def health():
@@ -164,6 +203,109 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             mutable(pid)
             return workspace.rename(pid,data.name)
 
+    @app.post('/api/projects/{pid}/session',status_code=201)
+    def create_session(pid:str):
+        workspace.get(pid)
+        return {'session_id':credentials.create(pid),'expires_in_seconds':credentials.ttl_seconds}
+
+    @app.get('/api/projects/{pid}/credentials')
+    def get_credentials(pid:str,x_workbench_session:str|None=Header(default=None)):
+        with workspace.lock(pid):
+            workspace.get(pid)
+            return credential_status(pid,x_workbench_session)
+
+    @app.put('/api/projects/{pid}/credentials/model')
+    def model_credential(pid:str,data:ModelCredential,x_workbench_session:str|None=Header(default=None)):
+        with workspace.lock(pid):
+            mutable(pid)
+            credentials.set_model(pid,x_workbench_session,workspace.resolved_config(pid),data.api_key.get_secret_value())
+            return credential_status(pid,x_workbench_session)
+
+    @app.delete('/api/projects/{pid}/credentials/model')
+    def clear_model_credential(pid:str,x_workbench_session:str|None=Header(default=None)):
+        with workspace.lock(pid):
+            mutable(pid)
+            credentials.clear_model(pid,x_workbench_session)
+            return credential_status(pid,x_workbench_session)
+
+    @app.post('/api/projects/{pid}/database/test')
+    def database_test(pid:str,data:DatabaseRequest):
+        with workspace.lock(pid):
+            mutable(pid)
+            return test_connection(data.connection)
+
+    @app.post('/api/projects/{pid}/database/tables')
+    def database_tables(pid:str,data:DatabaseRequest):
+        with workspace.lock(pid):
+            mutable(pid)
+            return discover_tables(data.connection)
+
+    @app.post('/api/projects/{pid}/database/table-list')
+    async def database_table_list(pid:str,file:UploadFile=File(...)):
+        from .database_access import MAX_EXCEL_BYTES
+        try:
+            content=await file.read(MAX_EXCEL_BYTES+1)
+            if len(content)>MAX_EXCEL_BYTES:
+                raise LightGraphError('database_table_list_too_large')
+            def parse():
+                with workspace.lock(pid):
+                    mutable(pid)
+                    return {'tables':parse_table_list_excel(content)}
+            return await run_in_threadpool(parse)
+        finally:
+            await file.close()
+
+    @app.post('/api/projects/{pid}/database/connect')
+    def database_connect(pid:str,data:ConnectDatabase,x_workbench_session:str|None=Header(default=None)):
+        with workspace.lock(pid):
+            mutable(pid)
+            credentials.require(pid,x_workbench_session)
+            old_config=workspace.get_config(pid)
+            old_resolved=workspace.resolved_config(pid)
+            old_secrets,_=credentials.resolve(pid,x_workbench_session,old_resolved)
+            existing=next((s for s in old_resolved.sources if s.id==data.source_id),None)
+            if existing is None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}',data.source_id):
+                raise LightGraphError('source_id_invalid')
+            if any(s.id==data.source_id and s.kind not in {'gauss_database','mysql_database'} for s in old_resolved.sources):
+                raise LightGraphError('source_id_conflict')
+            if existing is not None and existing.kind!=data.connection.kind:
+                raise LightGraphError('source_kind_conflict')
+            # The metadata adapter validates these exact names. Manual choices
+            # must also work beyond the bounded table-discovery first page.
+            selected=normalize_selected_tables(data.connection,data.allowed_tables)
+            dsn=build_dsn(data.connection)
+            config={**old_config,'sources':[s for s in old_config['sources'] if s['id']!=data.source_id]}
+            previous=next((s for s in old_config['sources'] if s['id']==data.source_id),None)
+            source_config=dict(previous) if previous and previous['kind']==data.connection.kind else {}
+            if set(source_config.get('allowed_columns') or {})-set(selected):
+                raise LightGraphError('source_column_scope_conflict')
+            source_config.update({'id':data.source_id,'kind':data.connection.kind,'dsn_env':None,
+                'credential_mode':'session','credential_revision':uuid.uuid4().hex,
+                'allowed_tables':selected})
+            if 'capability_manifest' in data.model_fields_set:
+                source_config['capability_manifest']=data.capability_manifest
+            config['sources'].append(source_config)
+            if data.deployment_retention_verified is not None:
+                config['deployment_retention_verified']=data.deployment_retention_verified
+            workspace.save_config(pid,config)
+            source=next(s for s in workspace.resolved_config(pid).sources if s.id==data.source_id)
+            credentials.set_source(pid,x_workbench_session,source,dsn)
+            try:
+                secrets_by_source,_=resolved_credentials(pid,x_workbench_session)
+                metadata=read_metadata(workspace,pid,refresh=True,source_credentials=secrets_by_source,
+                                       source_ids=[data.source_id])
+            except Exception:
+                workspace.save_config(pid,old_config)
+                credentials.clear_source(pid,x_workbench_session,data.source_id)
+                old_source=next((s for s in old_resolved.sources if s.id==data.source_id),None)
+                if old_source and data.source_id in old_secrets:
+                    credentials.set_source(pid,x_workbench_session,old_source,old_secrets[data.source_id])
+                raise
+            from .metadata_views import _yaml_files
+            metadata['files']=_yaml_files(metadata['tables'],metadata.get('sources'))
+            return {'config':workspace.get_config(pid),'metadata':metadata,
+                    'credentials':credential_status(pid,x_workbench_session)}
+
     @app.post('/api/projects/{pid}/files',status_code=201)
     async def upload(pid:str,file:UploadFile=File(...)):
         try:
@@ -181,6 +323,13 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     @app.get('/api/projects/{pid}/files/{fid}/content')
     def text_file(pid:str,fid:str):
         return {'content':workspace.text_content(pid,fid)}
+
+    @app.get('/api/projects/{pid}/files/{fid}/metadata')
+    def preview_file(pid:str,fid:str):
+        from .metadata_views import preview_file_metadata
+        with workspace.lock(pid):
+            mutable(pid)
+            return preview_file_metadata(workspace,pid,fid)
 
     @app.patch('/api/projects/{pid}/files/{fid}/binding')
     def binding(pid:str,fid:str,data:DocumentBinding):
@@ -216,11 +365,20 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             workspace.get(pid)
             return read_metadata(workspace,pid)
 
+    @app.get('/api/projects/{pid}/metadata/yaml')
+    def metadata_documents(pid:str):
+        from .metadata_views import metadata_yaml
+        with workspace.lock(pid):
+            workspace.get(pid)
+            return metadata_yaml(workspace,pid)
+
     @app.post('/api/projects/{pid}/metadata/refresh')
-    def refresh_metadata(pid:str):
+    def refresh_metadata(pid:str,x_workbench_session:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
-            return read_metadata(workspace,pid,refresh=True)
+            sources,_=resolved_credentials(pid,x_workbench_session)
+            options={'source_credentials':sources} if sources else {}
+            return read_metadata(workspace,pid,refresh=True,**options)
 
     @app.get('/api/projects/{pid}/graph')
     def graph(pid:str,layer:str='business'):
@@ -235,10 +393,14 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return {'runs':manager.list(pid)}
 
     @app.post('/api/projects/{pid}/runs',status_code=202)
-    def start_run(pid:str):
+    def start_run(pid:str,x_workbench_session:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
-            return manager.start(pid)
+            sources,model=resolved_credentials(pid,x_workbench_session)
+            options={}
+            if sources:options['source_credentials']=sources
+            if model is not None:options['model_api_key']=model
+            return manager.start(pid,**options)
 
     @app.get('/api/projects/{pid}/runs/{rid}')
     def run_status(pid:str,rid:str):

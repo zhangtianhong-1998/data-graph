@@ -286,6 +286,27 @@
           "default": null,
           "title": "Dsn Env"
         },
+        "credential_mode": {
+          "default": "environment",
+          "enum": [
+            "environment",
+            "session"
+          ],
+          "title": "Credential Mode",
+          "type": "string"
+        },
+        "credential_revision": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Credential Revision"
+        },
         "allowed_tables": {
           "items": {
             "type": "string"

@@ -18,7 +18,7 @@ npm --prefix src/workbench run build
 .venv/bin/lightgraph serve
 ```
 
-打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。同一个服务提供前端页面和 `/api`，页面显示实际项目、运行报告、元数据图和业务图。新建项目后上传 Excel/CSV 与文档，填写目的，读取元数据，再开始抽取；已有结果会作为同项目增量构建的基础。默认关闭模型，启用 AgentScope 时在“Agent 与配置”中填写模型地址、模型名和密钥环境变量名，密钥由启动服务的环境提供。
+打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。同一个服务提供前端页面和 `/api`，页面显示实际项目、运行报告、元数据图和业务图。页面分为“配置”和“运行与结果”：前者配置数据来源、知识文档、抽取目标和 Agent，后者查看元数据图、业务图谱和运行记录。新建项目后上传 Excel/CSV 会自动解析表结构；数据库按“连接 → 选表 → 读取元数据”接入。默认关闭模型，启用 AgentScope 时可在页面填写模型地址、模型名、API key 和流式开关。已有结果会作为同项目增量构建的基础。
 
 项目目录不存在时自动创建，默认布局如下：
 
@@ -31,7 +31,7 @@ workspace/<项目编号>/
   runs/                # 历次任务状态和安全报告
 ```
 
-上传文件是用户提供的项目资产，可以保存；数据库检索结果仍只在运行内存中使用。`workspace/` 不提交 Git。YAML 配置只允许引用本项目登记的文件，Markdown 默认全局，可绑定读取到的具体表。工作台配置不保存明文密钥或数据库连接串，使用 `api_key_env` / `dsn_env`。MySQL/Gauss 来源可在数据库表单中添加；高级列权限和 CSV 格式可通过完整配置编辑器或上传的运行 YAML 设置。
+上传文件是用户提供的项目资产，可以保存；数据库检索结果仍只在运行内存中使用。`workspace/` 不提交 Git。YAML 配置只允许引用本项目登记的文件，Markdown 默认全局，可绑定读取到的具体表。MySQL/Gauss 可以直接填写连接信息并测试、读取表清单，也支持手动输入表名或导入 Excel 表清单。直接输入的数据库凭据和 API key 仅保留在当前会话的服务端内存中，不进入配置、导出的 YAML 或运行记录；页面刷新或服务重启后需重新输入。已有 `api_key_env` / `dsn_env` 配置仍可使用。高级列权限和 CSV 格式可通过完整配置编辑器或上传的运行 YAML 设置。元数据提供 tables.yaml、constraints.yaml 和 foreign_keys.yaml 的预览与下载；本轮不开放物理声明的在线改写。
 
 服务默认只监听本机，每个 workspace 只允许一个服务。页面按秒轮询真实任务状态；不向浏览器传送查询样本、模型原文，也不虚构进度百分比。详细接口、当前范围和启动方式见 [Vue 工作台实现](design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md)。原 [交互设计](design/lightweight_graph/WORKBENCH_DESIGN.md) 和 [用户故事](design/lightweight_graph/WORKBENCH_US.md) 中的后续能力仍单独列出。旧合成原型保留在 `src/lightgraph/workbench_prototype/`，不再作为实际工作台入口。
 

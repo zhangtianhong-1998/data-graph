@@ -4,7 +4,26 @@ const messages: Record<string, string> = {
   invalid_project_id: '项目编号只能包含字母、数字、短横线和下划线。',
   invalid_project_or_file_id: '项目编号须以字母或数字开头，其余只能包含字母、数字、短横线和下划线。',
   config_invalid: '配置未通过校验，请检查来源、模型和抽取范围。',
-  model_credential_missing: '服务器未配置模型密钥环境变量。', source_credential_missing: '服务器未配置数据库连接环境变量。',
+  model_credential_missing: '请在 Agent 与模型中填写当前会话的 API key，或配置服务器环境变量。', source_credential_missing: '请重新连接数据库，或检查服务器的连接环境变量。',
+  session_required: '连接会话已失效，请刷新页面后重新填写凭据。', session_invalid: '连接会话已失效，请刷新页面后重新填写凭据。',
+  credential_session_invalid: '连接会话已失效，请刷新页面后重新填写凭据。', credential_session_capacity_reached: '服务当前会话已满，请稍后重试。',
+  model_endpoint_required: '请先填写并保存模型服务地址和模型名称。',
+  database_tls_required: '远程数据库要求 TLS 证书校验，请使用包含 TLS 配置的连接串。',
+  database_host_invalid: '数据库主机地址无效，请检查后重试。',
+  database_identifier_invalid: '表名或 Schema 格式不支持，请检查表清单。',
+  database_table_schema_mismatch: '选中的表与连接的 Schema 不一致，请检查表名。',
+  database_table_selection_invalid: '请明确列出要读取的表，不使用通配符。',
+  source_column_scope_conflict: '已有列级权限引用了未选中的表，请保留这些表或先调整完整配置。',
+  source_kind_conflict: '已有来源不能更换数据库类型，请使用新编号接入另一数据库。',
+  source_id_conflict: '来源编号已被其他来源使用，请更换编号。',
+  source_id_invalid: '来源编号只能包含字母、数字、短横线和下划线。',
+  read_only_transaction_unverified: '无法确认数据库只读事务，连接已停止。请检查账号和数据库设置。',
+  table_list_empty: 'Excel 中没有找到表名，请使用表名列或 Schema 与表名两列。',
+  table_list_invalid: '表清单无法解析，请使用 XLSX 文件。',
+  table_list_formula_forbidden: '表清单不能包含公式，请先粘贴为纯文本值。',
+  table_list_size_limit: '表清单超过服务端限制，请缩小范围后导入。',
+  database_connection_failed: '数据库连接失败，请检查连接信息和网络。', database_connection_invalid: '请检查数据库地址、端口、库名和账号。',
+  database_metadata_failed: '连接已处理，但元数据读取失败，请检查授权表与只读账号权限。',
   deployment_retention_unverified: '连接真实数据库前，需要完成部署环境的数据留存检查。',
   run_already_active: '此项目正在运行，请等待完成或先取消。', project_busy: '项目正在运行，暂时无法修改。',
   project_run_active: '此项目正在运行，请等待完成或先取消。', extraction_purpose_required: '请先填写抽取目的。',
@@ -18,11 +37,31 @@ const messages: Record<string, string> = {
 export class ApiError extends Error {
   constructor(public code: string, public status = 0) { super(messages[code] || `操作未完成（${code}）`); this.name = 'ApiError' }
 }
+// Tokens and credentials stay in this page's memory, never browser storage.
+const sessions = new Map<string, string>()
+const pendingSessions = new Map<string, Promise<void>>()
+function sessionHeader(path: string): Record<string, string> {
+  const project = path.match(/^\/projects\/([^/]+)(?:\/|$)/)?.[1]
+  const token = project ? sessions.get(project) : undefined
+  return token ? { 'X-Workbench-Session': token } : {}
+}
+export function clearSessions() { sessions.clear(); pendingSessions.clear() }
+export async function ensureSession(projectId: string): Promise<void> {
+  const id = encodeURIComponent(projectId)
+  if (sessions.has(id)) return
+  if (pendingSessions.has(id)) return pendingSessions.get(id)
+  const pending = request<{ session_id: string }>(`${projectPath(projectId)}/session`, { method: 'POST', body: '{}' }).then(response => {
+    if (!response.session_id) throw new ApiError('invalid_response')
+    sessions.set(id, response.session_id)
+  }).finally(() => pendingSessions.delete(id))
+  pendingSessions.set(id, pending)
+  return pending
+}
 export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   let response: Response
   try {
     response = await fetch(`/api${path}`, { ...options, credentials: 'same-origin', cache: 'no-store',
-      headers: { ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...options.headers } })
+      headers: { ...sessionHeader(path), ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...options.headers } })
   } catch { throw new ApiError('network_unavailable') }
   let data: unknown
   try { data = await response.json() } catch { throw new ApiError('invalid_response', response.status) }

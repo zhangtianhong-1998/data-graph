@@ -12,6 +12,10 @@ class SourceConfig(StrictModel):
     kind: Literal["excel_workbook", "csv_file", "gauss_database", "mysql_database"]
     path: str | None = None
     dsn_env: str | None = None
+    credential_mode: Literal["environment", "session"] = "environment"
+    # Opaque non-secret revision invalidates cached metadata when a direct
+    # connection changes. The DSN itself belongs only to the web session.
+    credential_revision: str | None = None
     allowed_tables: list[str] = Field(default_factory=list)
     allowed_columns: dict[str,list[str]] | None = None
     capability_manifest: str | None = None
@@ -162,7 +166,7 @@ def load_config(path):
         raise LightGraphError("config_invalid") from None
 
 
-def open_sources(config, *, metadata_only=False):
+def open_sources(config, *, metadata_only=False, source_credentials=None):
     from ..sources import ExcelSource, CSVSource, GaussSource, MySQLSource
     sources=[]
     from ..sources.budget import QueryBudget
@@ -183,7 +187,9 @@ def open_sources(config, *, metadata_only=False):
             else:
                 if not metadata_only and not config.deployment_retention_verified:
                     raise LightGraphError("deployment_retention_unverified")
-                dsn=os.getenv(s.dsn_env or "")
+                dsn=(source_credentials or {}).get(s.id)
+                if not dsn and s.credential_mode == "environment":
+                    dsn=os.getenv(s.dsn_env or "")
                 if not dsn:raise LightGraphError("source_credential_missing")
                 if not s.allowed_tables:raise LightGraphError("source_scope_missing")
                 verified=None

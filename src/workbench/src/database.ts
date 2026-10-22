@@ -26,6 +26,6 @@ export function updateDatabaseSources(sources: SourceConfig[], originalId: strin
   if (!tables.length) throw new Error('请至少填写一张允许查询的表。')
   if (tables.some(table => table.includes('*'))) throw new Error('允许查询的表必须逐一列出，不能使用通配符。')
   if (form.capabilityManifest && !uploadedManifests.includes(form.capabilityManifest)) throw new Error('能力验证文件必须从此项目已上传的 YAML 文件中选择。')
-  const source: SourceConfig = { ...original, id, kind: form.kind, dsn_env: dsnEnv, allowed_tables: tables, capability_manifest: form.capabilityManifest || null }
+  const source: SourceConfig = { ...original, id, kind: form.kind, dsn_env: dsnEnv, credential_mode: 'environment', credential_revision: null, allowed_tables: tables, capability_manifest: form.capabilityManifest || null }
   return original ? sources.map(item => item.id === originalId ? source : item) : [...sources, source]
 }
