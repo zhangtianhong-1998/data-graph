@@ -119,3 +119,29 @@ def test_uploaded_file_catalog_survives_reload_without_reopening_source(tmp_path
     assert not metadata["requires_refresh"]
     assert {table["name"] for table in metadata["tables"]} == {"items", "regions"}
     assert "FIRST_CELL" not in str(metadata) and "SECOND_CELL" not in str(metadata)
+
+
+def test_selected_metadata_yaml_is_scoped_and_never_opens_sources(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from lightgraph.web.app import create_app
+
+    workspace = project(tmp_path)
+    for name in ('first', 'second'):
+        file = workspace.add_file('alpha', f'{name}.csv', b'code,label\nA,PRIVATE_SAMPLE\n')
+        preview_file_metadata(workspace, 'alpha', file['file_id'])
+    source = workspace.get_config('alpha')['sources'][0]['id']
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources',
+                        lambda *a, **kw: pytest.fail('selection must not reconnect'))
+    with TestClient(create_app(workspace.root, frontend_dir=tmp_path / 'absent')) as client:
+        result = client.get('/api/projects/alpha/metadata/yaml',
+                            params={'source_id': source, 'schema': 'public', 'table': 'first'})
+        assert result.status_code == 200
+        files = {item['name']: yaml.safe_load(item['content']) for item in result.json()['files']}
+        assert [(t['source_id'], t['name']) for t in files['tables.yaml']['tables']] == [(source, 'first')]
+        assert len(files['constraints.yaml']['tables']) == 1
+        assert {s['source_id'] for s in files['constraints.yaml']['sources']} == {source}
+        assert 'PRIVATE_SAMPLE' not in result.text
+        # A mismatched source/table pair cannot silently fall back to all tables.
+        mismatch = client.get('/api/projects/alpha/metadata/yaml',
+                              params={'source_id': source, 'table': 'second'})
+        assert mismatch.json()['files'] == []

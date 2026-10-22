@@ -70,11 +70,18 @@ def preview_file_metadata(workspace, pid: str, fid: str) -> dict:
             "coverage": "declarations_only"}
 
 
-def metadata_yaml(workspace, pid: str) -> dict:
+def metadata_yaml(workspace, pid: str, *, source_id: str | None = None,
+                  schema: str | None = None, table: str | None = None) -> dict:
     """Read only a current cached catalog; exporting YAML never opens a database."""
     view = read_metadata(workspace, pid)
     if view.get("requires_refresh") and not view.get("tables"):
         return {"files": [], "requires_refresh": True}
-    return {"files": _yaml_files(view["tables"], view.get("sources")),
+    tables = [item for item in view["tables"]
+              if (source_id is None or item["source_id"] == source_id)
+              and (schema is None or item["schema"] == schema)
+              and (table is None or item["name"] == table)]
+    source_ids = {item["source_id"] for item in tables}
+    sources = [item for item in view.get("sources", []) if item["source_id"] in source_ids]
+    return {"files": _yaml_files(tables, sources) if tables else [],
             "requires_refresh": bool(view.get("requires_refresh")),
             "missing_sources": view.get("missing_sources", [])}

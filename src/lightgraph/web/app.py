@@ -366,11 +366,11 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return read_metadata(workspace,pid)
 
     @app.get('/api/projects/{pid}/metadata/yaml')
-    def metadata_documents(pid:str):
+    def metadata_documents(pid:str,source_id:str|None=None,schema:str|None=None,table:str|None=None):
         from .metadata_views import metadata_yaml
         with workspace.lock(pid):
             workspace.get(pid)
-            return metadata_yaml(workspace,pid)
+            return metadata_yaml(workspace,pid,source_id=source_id,schema=schema,table=table)
 
     @app.post('/api/projects/{pid}/metadata/refresh')
     def refresh_metadata(pid:str,x_workbench_session:str|None=Header(default=None)):

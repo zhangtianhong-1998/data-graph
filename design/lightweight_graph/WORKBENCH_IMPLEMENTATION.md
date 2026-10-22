@@ -54,7 +54,7 @@ workspace/
 | 运行与结果 | 运行记录 | 状态、报告、取消与临时数据清理结果 |
 
 1. 创建项目，服务保存 `project.yaml` 和初始 `config.yaml`。
-2. 上传 XLSX/CSV 后登记来源，并单独解析该文件的表结构；无需先连通项目中的其他数据库。CSV 初值为 UTF-8、逗号、首行表头、空串为 NULL、文本解析。结构预览只保存声明，不保存单元格值，也不冒充整个项目已完成元数据读取。
+2. 数据接入分为三列：左侧切换数据库或本地文件，中间显示已选数据库表或上传文件，右侧显示当前项的表列和 YAML。默认选择第一项；切换时清空旧预览，迟到的请求不能覆盖新选择。上传 XLSX/CSV 后登记来源，并单独解析该文件的表结构；无需先连通项目中的其他数据库。CSV 初值为 UTF-8、逗号、首行表头、空串为 NULL、文本解析。结构预览只保存声明，不保存单元格值，也不冒充整个项目已完成元数据读取。
 3. 数据库可输入连接串，或地址、端口、数据库、用户名和密码。先测试连接，再读取表清单并筛选勾选；也可手动输入表名或导入 Excel 表清单。后者仅用于选表，不登记为业务数据来源。提交后保存授权表并读取所选表的元数据。
 4. 元数据提供 `tables.yaml`、`constraints.yaml`、`foreign_keys.yaml` 预览与下载。主键、唯一键、外键来自连接器声明；未读取的 CHECK/default 等保持 unknown。文件来源没有声明外键时不会凭名称自动补上。导出和打开缓存不连接数据库；全项目“读取元数据”是显式操作。
 5. 上传 Markdown 后加入 documents；无范围声明时默认全局，已有 frontmatter 范围保留。可选择数据说明、分析知识、混合或待分类，以及全局或具体表范围。绑定写回实际 frontmatter；表标识为 `source_id.schema.table`。
@@ -83,7 +83,7 @@ workspace/
 | POST /projects/{pid}/database/connect | 保存来源/授权表、保留会话凭据并读取元数据 |
 | POST /projects/{pid}/files | multipart 上传 file |
 | GET /projects/{pid}/files/{fid}/metadata | 单个本地数据文件的表结构和 YAML 预览 |
-| GET /projects/{pid}/metadata/yaml | 已缓存的元数据 YAML；部分来源已读取时标注缺失来源，过期时要求刷新，不自动连接源库 |
+| GET /projects/{pid}/metadata/yaml | 已缓存的元数据 YAML；可用 source_id、schema、table 限定当前选择，交叉筛选无匹配时返回空列表，不回退到全项目；不连接源库 |
 | GET /projects/{pid}/files/{fid}/content | Markdown/YAML 原文预览，重新检查 YAML 凭据 |
 | PATCH /projects/{pid}/files/{fid}/binding | Markdown purpose 与 scope |
 | GET /projects/{pid}/config；PUT 同路径 | 当前完整 RunConfig |
