@@ -16,10 +16,18 @@ from lightgraph.web.execution import _resolved_payload, read_metadata
 
 @pytest.fixture
 def client(tmp_path):
-    with TestClient(create_app(tmp_path / 'workspace', frontend_dir=tmp_path / 'absent')) as client:
-        for pid in ('alpha', 'beta'):
-            assert client.post('/api/projects', json={'name':pid, 'project_id':pid}).status_code == 201
-        yield client
+    root = tmp_path / 'workspace'
+    audit_secrets = []
+    try:
+        with TestClient(create_app(root, frontend_dir=tmp_path / 'absent')) as client:
+            client._audit_secrets = audit_secrets
+            for pid in ('alpha', 'beta'):
+                assert client.post('/api/projects', json={'name':pid, 'project_id':pid}).status_code == 201
+            yield client
+    finally:
+        # Windows denies reads of the live service lease. Audit after lifespan
+        # shutdown, including the lock and anything written during cleanup.
+        _scan_workspace(root, audit_secrets)
 
 
 def session(client, pid='alpha'):
@@ -37,9 +45,38 @@ def set_model(client):
 
 
 def scan_no_secrets(client, *secrets):
-    for path in client.app.state.workspace.root.rglob('*'):
+    client._audit_secrets.extend(secrets)
+
+
+def _scan_workspace(root, secrets):
+    for path in root.rglob('*'):
         if path.is_file():
-            assert all(secret.encode() not in path.read_bytes() for secret in secrets)
+            content = path.read_bytes()
+            assert all(secret.encode() not in content for secret in secrets), f'credential persisted in {path}'
+
+
+def test_secret_audit_includes_released_service_lock(tmp_path):
+    from lightgraph.runtime.locking import FileLock
+
+    path = tmp_path / '.service.lock'
+    secret = 'SECRET_LOCK_AUDIT'
+    path.write_text(secret, encoding='utf-8')
+    lock = FileLock(path).acquire()
+    lock.close()
+    with pytest.raises(AssertionError, match='credential persisted'):
+        _scan_workspace(tmp_path, [secret])
+
+
+def test_secret_audit_does_not_ignore_unreadable_files(tmp_path, monkeypatch):
+    path = tmp_path / 'config.yaml'
+    path.write_text('configuration', encoding='utf-8')
+
+    def denied(_path):
+        raise PermissionError('audit read denied')
+
+    monkeypatch.setattr(type(path), 'read_bytes', denied)
+    with pytest.raises(PermissionError, match='audit read denied'):
+        _scan_workspace(tmp_path, ['SECRET_AUDIT'])
 
 
 def test_model_key_is_project_session_only_and_binds_endpoint(client, monkeypatch):

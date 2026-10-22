@@ -13,7 +13,9 @@ jobs:
   python:
     name: Python ${{ matrix.python }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # Windows complete-suite runs include durable SQLite writes and real child
+    # processes; observed runs exceed the old 20-minute install + test budget.
+    timeout-minutes: ${{ startsWith(matrix.os, 'windows') && 35 || 20 }}
     strategy:
       fail-fast: false
       matrix:
@@ -39,8 +41,10 @@ jobs:
         run: python -m pip install -e ".[test]"
       - name: Check dependency compatibility
         run: python -m pip check
+      - name: Check credential retention lifecycle
+        run: python -m pytest -q src/lightgraph/tests/test_web_credentials.py
       - name: Run complete test suite
-        run: python -m pytest -q -o faulthandler_timeout=90
+        run: python -m pytest -q --durations=15 -o faulthandler_timeout=90
 
   frontend:
     runs-on: ubuntu-latest
