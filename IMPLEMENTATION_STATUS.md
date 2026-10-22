@@ -220,4 +220,16 @@ Windows 端到端测试耗时较长，CI 保留相同断言和持久化设置；
 - 新增两项检查：锁文件中的凭据也必须检出；不可读文件必须让审计失败。
 - CI 在完整测试前单独运行凭据测试，Windows 任务上限改为 35 分钟，并输出最慢的 15 项测试。完整测试集合和持久化设置保持不变。
 
-本机验证：凭据测试 **18 passed**，完整测试 **918 passed in 36.99s**。修复后的远端跨平台结果以对应提交的 Actions 为准。
+本机验证：凭据测试 **18 passed**，完整测试 **918 passed in 36.99s**。
+
+修复提交 `7fe3666` 的 [GitHub Actions](https://github.com/zhangtianhong-1998/data-graph/actions/runs/39798019129) 已全部通过：
+
+| 环境 | 完整测试结果 |
+| --- | --- |
+| Windows / Python 3.11 | 918 passed，851.43 秒 |
+| Windows / Python 3.13 | 918 passed，836.23 秒 |
+| Linux / Python 3.13 | 918 passed，99.16 秒 |
+| macOS / Python 3.13 | 918 passed，84.55 秒 |
+| 前端 / Node 24 | 19 项测试与生产构建通过 |
+
+四个 Python 环境的前置凭据检查也均为 18 passed。以上为合成测试和替身驱动验证，不包含真实客户数据库或模型调用。
