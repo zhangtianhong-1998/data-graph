@@ -1,6 +1,6 @@
 # 实施与验收记录
 
-更新日期：2026-10-21。依据 `design/lightweight_graph/` 的 v1.0 架构、SDD §18 及发现 Agent 更新；后端、测试、JSON Schema 和 HTML 模板在 `src/lightgraph/`，Vue 工作台在 `src/workbench/`。历史验证数字按日期保留，不代表最新代码已经完成同等范围的运行验收。
+更新日期：2026-10-22。依据 `design/lightweight_graph/` 的 v1.0 架构、SDD §18 及发现 Agent 更新；后端、测试、JSON Schema 和 HTML 模板在 `src/lightgraph/`，Vue 工作台在 `src/workbench/`。历史验证数字按日期保留，不代表最新代码已经完成同等范围的运行验收。
 
 ## 已实现的主流程
 
@@ -169,3 +169,30 @@ JavaScript 语法、文档本地链接与 `git diff --check` 通过。Chrome 检
 - 服务重启后上述项目、文件、绑定和运行记录仍可读取。通过页面分别添加 MySQL、Gauss 来源并检查后端保存的类型及授权表；没有连接这两项演示配置。变更来源后元数据提示重新读取，已发布的业务图仍可查看。
 
 **尚未验证：**真实 MySQL/Gauss 的权限、TLS、超时/取消、目录兼容性、实例抽取和部署留存条件；本机 Docker 引擎未启动。没有调用真实模型。UI 目前轮询任务状态，尚未提供细粒度 Agent 事件流、多用户认证、全图分页或 Windows 服务锁。测试与合成联调不能代替这些验收。
+
+
+## Windows 文件锁、取消与跨平台回归（2026-10-22）
+
+本轮修复 Windows 的真实运行阻断：`fcntl` 不可用时原抽取路径无法加载，Web 服务也会主动拒绝启动。不是仅影响测试，更不能通过禁用锁绕过。
+
+- 输出目录和工作台统一使用 `FileLock`：POSIX `flock`，Windows 独占文件 HANDLE。worker 显式继承句柄；父进程退出或关闭自身句柄，仍不能让第二个服务与存活 worker 同时写入。
+- 取消改为固定状态标记与来源协作取消。信号处理器只记录状态，阶段检查点正常退出；没有异步异常跳过 finally。迟到取消、打开来源中取消、真实子进程取消和超时强杀均有回归。强杀或没有可信清理报告时保留 `unknown`。
+- CSV fixture 使用明确 UTF-8 和换行模式；新增 LF/CRLF 单元格保真检查，未把生产输入强制归一化。原崩溃恢复测试去掉 POSIX 限制，在 Windows 实际终止子进程后核验恢复。
+- MySQL 取消探针替身使用 Event 同步，消除短 sleep 的调度假设；生产超时与取消判定保持不变。
+- 新增 GitHub Actions 跨平台完整测试。CI 只使用合成数据、内存来源及替身驱动，无客户数据库、模型密钥或真实业务数据。
+
+测试源代码提交：`bcd589533de6dfc8d2d7981833a21a458e6a56e8`。本机完整测试 **832 passed in 36.29s**，编译与差异格式检查通过。
+
+跨平台结果见 [GitHub Actions 本轮记录](https://github.com/zhangtianhong-1998/data-graph/actions/runs/39729625695)：
+
+| 环境 | 结果 |
+| --- | --- |
+| Windows / Python 3.13 | 832 passed，755.42 秒，无跳过 |
+| Windows / Python 3.11 | 832 passed，1072.19 秒，无跳过 |
+| macOS / Python 3.13 | 832 passed，75.58 秒，无跳过 |
+| Linux / Python 3.13 | 832 passed，88.97 秒，无跳过 |
+| 前端 / Node 24 | 12 项测试与生产构建通过 |
+
+Windows 端到端测试耗时较长，CI 保留相同断言和持久化设置；没有关闭 SQLite 同步或缩小数据来改变验收。首次 CI 暴露的定时测试问题已修复，最终结果以上述完整运行记录为准。
+
+详见 [Windows 运行说明](design/lightweight_graph/WINDOWS_COMPATIBILITY.md)。这些结果不包括客户的华为 IAM 集成分支，也不证明真实 MySQL/Gauss、模型或部署级留存要求已验收。
