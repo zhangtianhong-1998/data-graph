@@ -1,6 +1,6 @@
 # Vue 工作台与项目服务
 
-更新：2026-10-21。本文记录实际实现，优先于旧工作台设计中尚未开发的接口与页面约定。
+更新：2026-10-22。本文记录实际实现，优先于旧工作台设计中尚未开发的接口与页面约定。
 
 ## 入口与目录
 
@@ -86,9 +86,11 @@ workspace/
 - `stage`：starting、extracting、finished。没有用计时器伪造 Agent 每个子阶段或百分比。
 - `cleanup_status`：pending、completed、unknown。worker 关闭来源后才报告 completed；强杀、无有效结果或服务异常恢复时为 unknown，不代表系统内存物理擦除。
 
+取消先写入仅含固定状态的运行专属标记，worker 在内存中请求来源取消并执行清理；超过期限才强制终止。标记在收尾或重启恢复时清除，不保存查询内容。Windows 的 terminate 是强杀，不用于冒充正常清理。
+
 取消不等于“本次没有发布任何结果”。页面仍显示已经发布的完整分区，未完成分区不会被当作完整删除证据。worker 正常退出但没有合法报告时，服务判失败。
 
-一个 workspace 只允许一个服务，服务持有操作系统文件锁，worker 继承同一锁。父进程异常退出时，旧 worker 没退出就不能启动第二个写者；不能用磁盘里记录的旧 PID 去杀进程。待旧 worker 退出后重启服务，未结束记录显示 interrupted。当前服务锁使用 POSIX flock，支持 macOS/Linux；其他平台明确拒绝启动，尚未实现 Windows 等价锁。
+一个 workspace 只允许一个服务，服务持有操作系统文件锁，worker 继承同一锁。父进程异常退出时，旧 worker 没退出就不能启动第二个写者；不能用磁盘里记录的旧 PID 去杀进程。待旧 worker 退出后重启服务，未结束记录显示 interrupted。macOS/Linux 使用 flock，Windows 使用独占文件句柄及显式句柄继承，详见 [Windows 兼容说明](WINDOWS_COMPATIBILITY.md)。
 
 ## 已实现与后续边界
 

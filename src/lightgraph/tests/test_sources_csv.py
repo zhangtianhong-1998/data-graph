@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -25,7 +26,8 @@ def rows(source, columns=None):
 
 def test_csv_is_text_exact_and_memory_only(tmp_path):
     path = tmp_path / "codes.csv"
-    path.write_text('code,name,extra\n001,"Hello, world",NULL\n0002,"line\nbreak",\n 03 ,中文,001\n')
+    path.write_text('code,name,extra\n001,"Hello, world",NULL\n0002,"line\nbreak",\n 03 ,中文,001\n',
+                    encoding="utf-8", newline="")
     before = set(tmp_path.iterdir())
     with CSVSource(path, source_id="csv_codes", **FORMAT) as source:
         assert rows(source) == [
@@ -47,9 +49,23 @@ def test_csv_is_text_exact_and_memory_only(tmp_path):
     assert set(tmp_path.iterdir()) == before
 
 
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_csv_preserves_quoted_cell_line_endings_and_input_bytes(tmp_path, line_ending):
+    path = tmp_path / "multiline.csv"
+    content = f'code,name{line_ending}001,"第一行{line_ending}第二行"{line_ending}'
+    expected_bytes = content.encode("utf-8")
+    # Keep the fixture exact on every OS, including CRLF inside a quoted cell.
+    path.write_text(content, encoding="utf-8", newline="")
+    assert path.read_bytes() == expected_bytes
+    with CSVSource(path, **FORMAT) as source:
+        assert rows(source) == [("001", f"第一行{line_ending}第二行")]
+        assert source.format_metadata["input_revision"] == hashlib.sha256(expected_bytes).hexdigest()
+    assert path.read_bytes() == expected_bytes
+
+
 def test_explicit_utf16_semicolon_no_header(tmp_path):
     path = tmp_path / "sheet.csv"
-    path.write_text("001;说明\n002;NULL\n", encoding="utf-16")
+    path.write_text("001;说明\n002;NULL\n", encoding="utf-16", newline="")
     options = {**FORMAT, "encoding": "utf-16", "delimiter": ";", "header": False}
     with CSVSource(path, source_id="s", columns=["code", "description"],
                    table_name="logical", schema_name="uploads", **options) as source:
@@ -63,7 +79,7 @@ def test_explicit_utf16_semicolon_no_header(tmp_path):
 ])
 def test_csv_bad_format_never_repaired(tmp_path, content):
     path = tmp_path / "bad.csv"
-    path.write_text(content)
+    path.write_text(content, encoding="utf-8", newline="")
     with pytest.raises(LightGraphError) as error:
         CSVSource(path, **FORMAT)
     assert "unterminated" not in str(error.value) and "tail" not in str(error.value)
@@ -83,7 +99,7 @@ def test_csv_wrong_encoding_does_not_fallback(tmp_path):
 ])
 def test_csv_explicit_budgets(tmp_path, options):
     path = tmp_path / "codes.csv"
-    path.write_text("code,label\n001,A\n002,B\n")
+    path.write_text("code,label\n001,A\n002,B\n", encoding="utf-8", newline="")
     with pytest.raises(LightGraphError):
         CSVSource(path, **FORMAT, **options)
     assert list(tmp_path.iterdir()) == [path]
@@ -91,7 +107,7 @@ def test_csv_explicit_budgets(tmp_path, options):
 
 def test_csv_metadata_only_reads_header_without_instance_queries(tmp_path):
     path = tmp_path / "codes.csv"
-    path.write_text("code,label\nmalformed,row,not,parsed\n")
+    path.write_text("code,label\nmalformed,row,not,parsed\n", encoding="utf-8", newline="")
     with CSVSource(path, **FORMAT, metadata_only=True) as source:
         assert source.stats.queries == 0
         assert source.describe()[0].column_names == ["code", "label"]
@@ -116,7 +132,7 @@ def test_csv_config_requires_explicit_format_and_unique_source_id():
 def test_mixed_csv_excel_and_database_substitute(tmp_path, monkeypatch):
     import lightgraph.sources
     csv_path = tmp_path / "codes.csv"
-    csv_path.write_text("code\n001\n")
+    csv_path.write_text("code\n001\n", encoding="utf-8", newline="")
     excel_path = tmp_path / "codes.xlsx"
     workbook = openpyxl.Workbook()
     workbook.active.title = "codes"

@@ -166,7 +166,7 @@ def test_marker_failure_preserves_published_accounting_and_cleans_staging(tmp_pa
     assert not set(report.rules_published) & set(report.rules_skipped)
     assert any(issue["code"]=="injected_marker_failure" for issue in report.issues)
     assert len(failed_markers)==1
-    saved=json.loads((tmp_path/"report.json").read_text())
+    saved=json.loads((tmp_path/"report.json").read_text(encoding="utf-8"))
     assert saved["rules_published"]==report.rules_published
     assert not set(saved["rules_published"]) & set(saved["rules_skipped"])
     with GraphStore(tmp_path/"graph.sqlite") as store:

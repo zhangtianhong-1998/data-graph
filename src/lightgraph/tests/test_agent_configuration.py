@@ -140,7 +140,7 @@ def test_example_agent_and_schema_are_valid():
     assert config.framework == "agentscope"
     assert config.llm.stream is True
     assert not config.llm.api_key.get_secret_value()
-    schema = json.loads((root / "src/lightgraph/schemas/RunConfig.schema.json").read_text())
+    schema = json.loads((root / "src/lightgraph/schemas/RunConfig.schema.json").read_text(encoding="utf-8"))
     assert schema == RunConfig.model_json_schema()
 
 
@@ -191,11 +191,11 @@ def test_internal_http_requires_explicit_configuration(tmp_path):
 def test_agent_schema_matches_contract_and_cli_exports_it(tmp_path, capsys):
     from lightgraph.cli import parser, run
     root = Path(__file__).resolve().parents[3]
-    schema = json.loads((root / "src/lightgraph/schemas/AgentConfig.schema.json").read_text())
+    schema = json.loads((root / "src/lightgraph/schemas/AgentConfig.schema.json").read_text(encoding="utf-8"))
     assert schema == AgentConfig.model_json_schema()
     output = tmp_path / "schemas"
     assert run(parser().parse_args(["schema", str(output)])) == 0
-    assert json.loads((output / "AgentConfig.schema.json").read_text()) == schema
+    assert json.loads((output / "AgentConfig.schema.json").read_text(encoding="utf-8")) == schema
     assert CANARY not in capsys.readouterr().out
 
 

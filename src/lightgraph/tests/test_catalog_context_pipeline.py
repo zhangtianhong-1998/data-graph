@@ -33,18 +33,18 @@ def test_catalog_keeps_declaration_goal_revisions_and_never_observations(tmp_pat
     with MemorySource([t],{"public.items":[("001","销售费用",sentinel)]}) as source:
         report=run_pipeline(config,[source],model=model)
         assert report.rules_published,report.issues
-        first=yaml.safe_load((tmp_path/"out/metadata.yaml").read_text())
+        first=yaml.safe_load((tmp_path/"out/metadata.yaml").read_text(encoding="utf-8"))
         calls=model.usage["calls"]
         repeated=run_pipeline(config,[source],model=model)
         assert repeated.counts["reused_rules"]==1
         assert model.usage["calls"]==calls
         # Roles intentionally excluded from graph projection still belong in
         # the data description; a cache hit must not erase that interpretation.
-        assert yaml.safe_load((tmp_path/"out/metadata.yaml").read_text())==first
+        assert yaml.safe_load((tmp_path/"out/metadata.yaml").read_text(encoding="utf-8"))==first
         config.goal.purpose="保留用于经营分析的定义，排除观测金额"
         report=run_pipeline(config,[source],model=model)
         assert report.rules_published,report.issues
-        second=yaml.safe_load((tmp_path/"out/metadata.yaml").read_text())
+        second=yaml.safe_load((tmp_path/"out/metadata.yaml").read_text(encoding="utf-8"))
     assert first["declared"]==second["declared"]
     assert first["semantic_annotations"]["goal_revision"]!=second["semantic_annotations"]["goal_revision"]
     assert second["declared"]["tables"][0]["columns"][0]["comment"]=="key"

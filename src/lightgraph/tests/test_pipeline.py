@@ -210,7 +210,7 @@ def test_export_schema_and_repeat_bytes(tmp_path):
     from lightgraph.presentation.schema import snapshot_schema
     from lightgraph.presentation import export_graph
     path=tmp_path/'output/graph.json'
-    jsonschema.validate(json.loads(path.read_text()),snapshot_schema())
+    jsonschema.validate(json.loads(path.read_text(encoding="utf-8")),snapshot_schema())
     original=path.read_bytes()
     with GraphStore(tmp_path/'output/graph.sqlite') as store:
         export_graph(store,tmp_path/'output',scopes={'A','B','public'})

@@ -8,10 +8,11 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import selectors
+from queue import Empty, Queue
 import signal
 import subprocess
 import sys
+from threading import Thread
 
 import httpx
 import pytest
@@ -161,7 +162,6 @@ def test_streamed_http_response_never_enters_artifacts_or_captured_output(tmp_pa
     assert_retained_nothing(tmp_path,capsys,caplog,packets)
 
 
-@pytest.mark.skipif(os.name!='posix',reason='SIGKILL recovery audit requires POSIX')
 def test_actual_process_kill_recovers_staging_without_source_retention(tmp_path,capsys,caplog):
     tables,rows=source_rows()
     with MemorySource(tables,rows) as source:
@@ -173,12 +173,14 @@ def test_actual_process_kill_recovers_staging_without_source_retention(tmp_path,
     # No source-data fixture is written: the child receives a generated marker in
     # its environment, creates only an in-memory source and stages allowed facts.
     script=r'''
-import os, signal, resource
+import os, threading
 from lightgraph.contracts import TableSpec,ColumnSpec,SourceRef,RuleSpec,IdentitySpec,AttributeSpec,ExcludedColumn
 from lightgraph.sources import MemorySource
 from lightgraph.rules import RuleEngine
 from lightgraph.store import GraphStore
-resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+if os.name == 'posix':
+    import resource
+    resource.setrlimit(resource.RLIMIT_CORE,(0,0))
 table=TableSpec(source_id='audit',name='items',columns=[ColumnSpec(name=c) for c in ('item_code','item_name','private_note')])
 source=MemorySource([table],{'public.items':[{'item_code':'A','item_name':'Pending label','private_note':os.environ['TEST_CANARY']}]})
 rule=RuleSpec(rule_id='items',kind='column_group_entity',source=SourceRef(source_id='audit',table='items'),identity=IdentitySpec(key_columns=['item_code'],entity_kind='ReportItem'),attributes=AttributeSpec(single_valued={'label':'item_name'},excluded=[ExcludedColumn(column='private_note',reason='excluded')]))
@@ -186,25 +188,35 @@ store=GraphStore(os.environ['TEST_GRAPH_PATH'])
 result=RuleEngine(store).execute(source,rule,defer_publish=True)
 if not result.prepared: raise SystemExit(17)
 print('STAGING_READY',flush=True)
-signal.pause()
+threading.Event().wait()
 '''
     env={**os.environ,'TEST_CANARY':CANARY,'TEST_GRAPH_PATH':str(db),'PYTHONDONTWRITEBYTECODE':'1'}
     process=subprocess.Popen([sys.executable,'-c',script],stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-        text=True,env=env,cwd=tmp_path)
+        text=True,encoding='utf-8',env=env,cwd=tmp_path)
     assert process.stdout is not None
     ready='';stdout='';stderr=''
+    # Windows selectors cannot watch anonymous process pipes. Read the bounded
+    # ready marker on a thread; always kill and join before collecting output.
+    ready_lines=Queue(maxsize=1)
+    reader=Thread(target=lambda:ready_lines.put(process.stdout.readline(128)),daemon=True)
+    reader.start()
     try:
-        with selectors.DefaultSelector() as selector:
-            selector.register(process.stdout,selectors.EVENT_READ)
-            assert selector.select(timeout=10),'child did not reach staging'
-            ready=process.stdout.readline()
+        try:
+            ready=ready_lines.get(timeout=10)
+        except Empty:
+            pytest.fail('child did not reach staging')
         assert ready.strip()=='STAGING_READY'
         process.kill()
-        stdout,stderr=process.communicate(timeout=10)
-        assert process.returncode==-signal.SIGKILL
     finally:
         if process.poll() is None:
-            process.kill();process.communicate(timeout=10)
+            process.kill()
+        reader.join(timeout=10)
+        assert not reader.is_alive(),'child stdout reader did not stop'
+        stdout,stderr=process.communicate(timeout=10)
+    if os.name=='nt':
+        assert process.returncode==1  # Popen.kill uses TerminateProcess(..., 1).
+    else:
+        assert process.returncode==-signal.SIGKILL
     assert CANARY not in ready+stdout+stderr
     with GraphStore(db) as store:
         recovered=store.recover_staging()

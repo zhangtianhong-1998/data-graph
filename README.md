@@ -48,6 +48,8 @@ python3 -m venv .venv
 .venv/bin/lightgraph verify --output runs/acceptance --rows 5000
 ```
 
+Windows 的安装、测试与启动命令见 [Windows 兼容说明](design/lightweight_graph/WINDOWS_COMPATIBILITY.md)。输出目录和工作台服务使用跨进程文件锁；Windows 不会跳过单写者检查。
+
 `verify` 分别执行固定规则实验 E 和自动发现实验 D，并核对共享实体、缺层、同层兄弟节点、指标与度量关系、重复运行及输出中不含排除列内容。它使用合成数据，不调用模型。真实 Gauss 和真实模型验收单独记为未执行。
 
 结果位于 `runs/acceptance/acceptance.json`，两份可视化在 `runs/acceptance/E/viewer.html` 和 `runs/acceptance/D/viewer.html`。验收目录必须为空，避免把两次实验混在一起。

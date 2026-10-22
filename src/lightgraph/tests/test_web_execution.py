@@ -31,7 +31,7 @@ class ProjectWorkspace:
         path = self.root / pid
         path.mkdir()
         document = path / 'analysis.md'
-        document.write_text('---\npurpose: analysis_knowledge\n---\n# 分析目标\n分析收入指标。\n')
+        document.write_text('---\npurpose: analysis_knowledge\n---\n# 分析目标\n分析收入指标。\n', encoding='utf-8')
         self.configs[pid] = RunConfig(sources=[], documents=[str(document)], output_dir=str(path / 'output'), isolation_domain=pid)
         return path
 
@@ -60,7 +60,7 @@ def workspace(tmp_path):
 def prepare_csv(workspace):
     project = workspace.project_path('alpha')
     data = project / 'metrics.csv'
-    data.write_text('metric_code,metric_name,amount\nK1,收入,RETENTION_SECRET_312\nK1,收入,999\nK2,费用,100\n')
+    data.write_text('metric_code,metric_name,amount\nK1,收入,RETENTION_SECRET_312\nK1,收入,999\nK2,费用,100\n', encoding='utf-8')
     rule = RuleSpec(rule_id='metrics', kind='column_group_entity',
                     source={'source_id': 'input', 'table': 'metrics'},
                     identity={'key_columns': ['metric_code'], 'entity_kind': 'Metric'},
@@ -68,7 +68,7 @@ def prepare_csv(workspace):
                                 'excluded': [{'column': 'amount', 'reason': 'observation_value'}]},
                     evidence={'semantic_basis': ['fixture:E:approved_definition']})
     rules = project / 'rules.yaml'
-    rules.write_text(yaml.safe_dump([rule.model_dump(mode='json', by_alias=True)]))
+    rules.write_text(yaml.safe_dump([rule.model_dump(mode='json', by_alias=True)]), encoding='utf-8')
     workspace.configs['alpha'] = RunConfig(
         sources=[dict(id='input', kind='csv_file', path=str(data), encoding='utf-8', delimiter=',',
                       header=True, null_values=[''], type_inference='text', table_name='metrics')],
@@ -76,7 +76,7 @@ def prepare_csv(workspace):
     return data
 
 
-def wait_run(manager, pid, rid, timeout=15):
+def wait_run(manager, pid, rid, timeout=30):
     until = time.monotonic() + timeout
     while time.monotonic() < until:
         record = manager.get(pid, rid)
@@ -148,12 +148,12 @@ def test_force_cancel_does_not_claim_cleanup(workspace, monkeypatch):
     real_popen = subprocess.Popen
     ready = workspace.project_path('alpha') / 'ready'
     def child(*args, **kwargs):
-        code = 'import signal,sys,time,pathlib; signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path("ready").touch(); sys.stdin.buffer.read(); time.sleep(30)'
+        code = 'import sys,time,pathlib; pathlib.Path("ready").touch(); sys.stdin.buffer.read(); time.sleep(30)'
         return real_popen([sys.executable, '-c', code], **kwargs)
     monkeypatch.setattr('lightgraph.web.execution.subprocess.Popen', child)
     manager = RunManager(workspace, cancel_timeout=.05)
     record = manager.start('alpha')
-    until = time.monotonic() + 3
+    until = time.monotonic() + 15
     while not ready.exists() and time.monotonic() < until:
         time.sleep(.01)
     assert ready.exists()
@@ -164,18 +164,73 @@ def test_force_cancel_does_not_claim_cleanup(workspace, monkeypatch):
     manager.shutdown()
 
 
+def test_real_worker_cooperative_cancel_cleans_sources_and_keeps_report(workspace, monkeypatch):
+    # Run the real worker entrypoint/monitor in a child on every OS. Only the
+    # pipeline is replaced, so no database or model is needed for cancellation.
+    code = r'''
+import sys,time
+from pathlib import Path
+import lightgraph.pipeline as pipeline
+import lightgraph.runtime.config as config
+from lightgraph.contracts import RunReport
+from lightgraph.sources import MemorySource
+from lightgraph.web.worker import main
+source=MemorySource([],{})
+close=source.close
+def closed():
+    close()
+    Path('source-closed').touch()
+source.close=closed
+config.open_sources=lambda _: [source]
+def run(*a,**kw):
+    Path('worker-ready').touch()
+    try:
+        while True: time.sleep(.01)
+    except KeyboardInterrupt:
+        return RunReport(run_id='cancelled',status='PARTIAL',rules_published=['already_published'])
+pipeline.run_pipeline=run
+sys.exit(main())
+'''
+    real_popen = subprocess.Popen
+    def child(args, **kwargs):
+        return real_popen([sys.executable, '-c', code, args[-1]], **kwargs)
+    monkeypatch.setattr('lightgraph.web.execution.subprocess.Popen', child)
+    manager = RunManager(workspace, cancel_timeout=5)
+    project = workspace.project_path('alpha')
+    try:
+        record = manager.start('alpha')
+        until = time.monotonic() + 30
+        while not (project / 'worker-ready').exists() and time.monotonic() < until:
+            assert manager.active('alpha'), manager.get('alpha', record['run_id'])
+            time.sleep(.03)
+        assert (project / 'worker-ready').exists()
+        result = manager.cancel('alpha', record['run_id'])
+        assert result['status'] == 'cancelled'
+        assert result['error_code'] == 'run_cancelled'
+        assert result['cleanup_status'] == 'completed'
+        assert result['report']['rules_published'] == ['already_published']
+        assert (project / 'source-closed').exists()
+        assert not list((project / 'runs').glob('*.cancel'))
+        assert not manager.active('alpha')
+    finally:
+        manager.shutdown()
+
+
 def test_restart_marks_old_records_interrupted_without_signalling_pid(workspace, monkeypatch):
     runs = workspace.project_path('alpha') / 'runs'
     runs.mkdir()
     rid = 'run_' + 'a' * 24
     path = runs / (rid + '.json')
     path.write_text(json.dumps(dict(run_id=rid, project_id='alpha', status='running', created_at='2026', pid=1)))
+    marker = runs / (rid + '.result.cancel')
+    marker.write_text('cancel\n', encoding='utf-8')
     monkeypatch.setattr('os.kill', lambda *_: pytest.fail('historical PID must not be killed'))
     manager = RunManager(workspace)
     record = manager.get('alpha', rid)
     assert record['status'] == 'interrupted'
     assert record['cleanup_status'] == 'unknown'
     assert record['error_code'] == 'service_restarted'
+    assert not marker.exists()
     manager.shutdown()
 
 
@@ -184,7 +239,7 @@ def test_worker_error_redacts_exception_and_credentials(workspace, monkeypatch):
     monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _config: (_ for _ in ()).throw(RuntimeError('SOURCE_ROW_SECRET password=secret')))
     path = workspace.project_path('alpha') / 'runs' / 'result.json'
     execute(_resolved_payload(config, workspace.project_path('alpha')), path)
-    raw = path.read_text()
+    raw = path.read_text(encoding='utf-8')
     assert 'SOURCE_ROW_SECRET' not in raw and 'password' not in raw
     assert json.loads(raw)['error_code'] == 'worker_execution_failed'
 
@@ -199,7 +254,7 @@ def test_worker_dependency_change_is_partial_with_safe_report(workspace, monkeyp
     monkeypatch.setattr('lightgraph.pipeline.run_pipeline', run)
     result = workspace.project_path('alpha') / 'runs' / 'result.json'
     execute(_resolved_payload(config, workspace.project_path('alpha')), result)
-    record = json.loads(result.read_text())
+    record = json.loads(result.read_text(encoding='utf-8'))
     assert record['status'] == 'partial'
     assert record['report']['rules_published'] == ['existing']
     assert record['report']['status'] == 'PARTIAL'
@@ -223,7 +278,7 @@ def test_metadata_refresh_only_describes_and_closes_adapter(workspace, monkeypat
     assert any(edge['relation'] == 'table_has_column' for edge in result['edges'])
     assert 'PRIVATE_VALUE' not in json.dumps(result)
     path = workspace.project_path('alpha') / 'output' / 'metadata.yaml'
-    assert path.exists() and 'PRIVATE_VALUE' not in path.read_text()
+    assert path.exists() and 'PRIVATE_VALUE' not in path.read_text(encoding='utf-8')
     # Cached declaration remains usable without connecting or loading rows.
     monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda *_a, **_kw: pytest.fail('cached read reconnects'))
     assert read_metadata(workspace, 'alpha')['tables'] == result['tables']
@@ -325,10 +380,44 @@ def test_graceful_cancel_preserves_published_report_and_closes_sources(workspace
     monkeypatch.setattr('lightgraph.pipeline.run_pipeline', run)
     path = workspace.project_path('alpha') / 'runs' / 'cancel.json'
     execute(_resolved_payload(workspace.configs['alpha'], workspace.project_path('alpha')), path)
-    record = json.loads(path.read_text())
+    record = json.loads(path.read_text(encoding='utf-8'))
     assert record['status'] == 'cancelled' and record['cleanup_status'] == 'completed'
     assert record['report']['rules_published'] == ['already_published']
     assert source._closed
+
+
+def test_late_cancel_marker_cannot_interrupt_source_cleanup(workspace, monkeypatch):
+    source = MemorySource([], {})
+    path = workspace.project_path('alpha') / 'runs' / 'late.json'
+    path.parent.mkdir()
+    close = source.close
+    def closing():
+        path.with_suffix('.cancel').write_text('cancel\n', encoding='utf-8')
+        time.sleep(.1)
+        close()
+    source.close = closing
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _config: [source])
+    monkeypatch.setattr('lightgraph.pipeline.run_pipeline', lambda *_a, **_kw: RunReport(run_id='done'))
+    execute(_resolved_payload(workspace.configs['alpha'], workspace.project_path('alpha')), path)
+    record = json.loads(path.read_text(encoding='utf-8'))
+    assert record['status'] == 'completed'
+    assert record['cleanup_status'] == 'completed' and source._closed
+
+
+def test_preexisting_cancel_marker_still_runs_worker_finally(workspace, monkeypatch):
+    path = workspace.project_path('alpha') / 'runs' / 'early.json'
+    path.parent.mkdir()
+    path.with_suffix('.cancel').write_text('cancel\n', encoding='utf-8')
+    def opening(_config):
+        time.sleep(.15)
+        return []
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', opening)
+    execute(_resolved_payload(workspace.configs['alpha'], workspace.project_path('alpha')), path)
+    record = json.loads(path.read_text(encoding='utf-8'))
+    assert record['status'] == 'cancelled'
+    # Interrupted source opening cannot attest that every created driver closed.
+    assert record['cleanup_status'] == 'unknown'
+    assert record['error_code'] == 'run_cancelled'
 
 
 def test_workspace_service_lock_excludes_second_manager_and_releases(workspace):
@@ -343,8 +432,8 @@ def test_workspace_service_lock_excludes_second_manager_and_releases(workspace):
 
 
 def test_child_retains_service_lock_after_parent_crash(workspace):
-    # Exercise the actual Popen pass_fds path; the replacement worker only
-    # sleeps, so this crash test cannot query a database or call a model.
+    # Exercise actual OS handle inheritance. The child stays alive until this
+    # test releases it, avoiding timing assumptions on Windows CI machines.
     script = r"""
 import os,sys,threading,subprocess
 from pathlib import Path
@@ -359,7 +448,8 @@ class W:
 real=subprocess.Popen
 import lightgraph.web.execution as ex
 def child(*a,**kw):
-    return real([sys.executable,'-c','import sys,time; sys.stdin.buffer.read(); time.sleep(1.5)'],**kw)
+    code='import sys,time,pathlib; sys.stdin.buffer.read(); stop=pathlib.Path("release-orphan"); deadline=time.monotonic()+45\nwhile not stop.exists() and time.monotonic()<deadline: time.sleep(.03)'
+    return real([sys.executable,'-c',code],**kw)
 ex.subprocess.Popen=child
 m=RunManager(W())
 m.start('alpha')
@@ -367,10 +457,15 @@ os._exit(0)
 """
     parent = subprocess.Popen([sys.executable, '-c', script, str(workspace.root)],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    assert parent.wait(timeout=10) == 0
-    with pytest.raises(LightGraphError, match='workspace_service_active'):
-        RunManager(workspace)
-    until = time.monotonic() + 6
+    try:
+        assert parent.wait(timeout=30) == 0
+        with pytest.raises(LightGraphError, match='workspace_service_active'):
+            RunManager(workspace)
+    finally:
+        (workspace.project_path('alpha') / 'release-orphan').touch()
+        if parent.poll() is None:
+            parent.kill(); parent.wait()
+    until = time.monotonic() + 15
     while True:
         try:
             recovered = RunManager(workspace)

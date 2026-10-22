@@ -18,6 +18,7 @@ import uuid
 
 from ..contracts import RunReport, digest
 from ..errors import LightGraphError
+from ..runtime.locking import FileLock
 from ..runtime.retention import atomic_text
 
 ACTIVE_STATUSES = frozenset({"queued", "running"})
@@ -47,6 +48,11 @@ def _json_file(path):
 
 def _save(path, value):
     atomic_text(path, json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def _cancel_path(result_path):
+    # Only a cancellation request is persisted, never a query or source value.
+    return result_path.with_suffix(".cancel")
 
 
 def _safe_report(value):
@@ -125,31 +131,14 @@ class RunManager:
         self._processes = {}
         self._guard = threading.RLock()
         self._closed = False
-        self._service_fd = self._claim_service_lock()
+        self._service_lock = FileLock(self.workspace.root / ".service.lock",
+            busy_code="workspace_service_active", invalid_code="workspace_service_lock_invalid").acquire()
         try:
             self._recover()
         except BaseException:
-            os.close(self._service_fd)
-            self._service_fd = None
+            self._service_lock.close()
+            self._service_lock = None
             raise
-
-    def _claim_service_lock(self):
-        # The worker inherits this *open file description*. A crashed service
-        # cannot release its exclusivity while a surviving child still writes.
-        if os.name != "posix":
-            raise LightGraphError("workspace_service_lock_unsupported")
-        import fcntl
-        path = self.workspace.root / ".service.lock"
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        except OSError:
-            raise LightGraphError("workspace_service_lock_invalid") from None
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
-            raise LightGraphError("workspace_service_active") from None
-        return fd
 
     def _paths(self, pid, rid=None):
         project = self.workspace.project_path(pid)
@@ -182,7 +171,10 @@ class RunManager:
                         record.update(status="interrupted", stage="finished", finished_at=_now(),
                                       cleanup_status="unknown", error_code="service_restarted")
                         _save(path, record)
-                except LightGraphError:
+                    # Exclusive service ownership proves no surviving worker
+                    # still needs a cancellation request from a previous run.
+                    _cancel_path(path.with_name(path.stem + ".result.json")).unlink(missing_ok=True)
+                except (LightGraphError, OSError):
                     continue
 
     def start(self, pid):
@@ -210,10 +202,14 @@ class RunManager:
             source_root = str(Path(__file__).resolve().parents[2])
             env["PYTHONPATH"] = source_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
             try:
-                proc = subprocess.Popen([sys.executable, "-m", "lightgraph.web.worker", str(result_path)],
-                                        cwd=project, env=env, stdin=subprocess.PIPE,
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                        start_new_session=True, pass_fds=(self._service_fd,))
+                # The inherited lock stays held if this service crashes while
+                # its worker is still publishing. Handle inheritance differs
+                # between POSIX and Windows and is owned by FileLock.
+                with self._service_lock.child_process_options() as child_options:
+                    proc = subprocess.Popen([sys.executable, "-m", "lightgraph.web.worker", str(result_path)],
+                                            cwd=project, env=env, stdin=subprocess.PIPE,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                            **child_options)
                 self._processes[pid] = {"process": proc, "record": record, "result": result_path,
                                         "cancel_requested": False, "forced": False, "config": config}
                 proc.stdin.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
@@ -267,6 +263,7 @@ class RunManager:
         _save(self._paths(pid, record["run_id"])[1], record)
         try:
             entry["result"].unlink(missing_ok=True)
+            _cancel_path(entry["result"]).unlink(missing_ok=True)
         except OSError:
             pass
         self._processes.pop(pid, None)
@@ -302,7 +299,13 @@ class RunManager:
                 self._finish(pid, entry)
                 return self.get(pid, rid)
             entry["cancel_requested"] = True
-            proc.terminate()
+            try:
+                # Windows terminate() is a force kill. A private marker lets
+                # every worker run its normal source/transaction cleanup first.
+                atomic_text(_cancel_path(entry["result"]), "cancel\n")
+            except OSError:
+                entry["forced"] = True
+                proc.kill()
         try:
             proc.wait(timeout=self.cancel_timeout)
         except subprocess.TimeoutExpired:
@@ -321,9 +324,9 @@ class RunManager:
         for pid, rid in entries:
             self.cancel(pid, rid)
         with self._guard:
-            if self._service_fd is not None:
-                os.close(self._service_fd)
-                self._service_fd = None
+            if self._service_lock is not None:
+                self._service_lock.close()
+                self._service_lock = None
 
 
 def _bounded_view(view, layer):

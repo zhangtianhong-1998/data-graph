@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 
 import pytest
@@ -56,7 +57,12 @@ def test_filename_cannot_escape(workspace, name):
 def test_symlinked_project_root_file_and_output_rejected(workspace, tmp_path):
     target = tmp_path / "outside"
     target.mkdir()
-    (workspace.root / "linked").symlink_to(target, target_is_directory=True)
+    try:
+        (workspace.root / "linked").symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+            pytest.skip("Windows symlink creation requires Developer Mode or an authorized account")
+        raise
     with pytest.raises(LightGraphError, match="symlink"):
         workspace.create("linked", "linked")
     with pytest.raises(LightGraphError, match="symlink"):
@@ -148,7 +154,7 @@ def test_document_binding_is_read_by_real_loader_and_changes_revision(workspace)
     assert after.purpose == "data_description"
     assert after.document_id == before.document_id
     assert after.revision != before.revision
-    text = workspace.file_path("project_a", doc["file_id"]).read_text()
+    text = workspace.file_path("project_a", doc["file_id"]).read_text(encoding="utf-8")
     assert "author: 维护人员" in text
     assert text.endswith("# 使用说明\n\n此处为正文。\n")
     reopened = Workspace(workspace.root)
@@ -171,7 +177,7 @@ def test_credentials_not_retained_or_echoed(workspace):
     assert secret not in str(caught.value)
     with pytest.raises(LightGraphError, match="credential_environment"):
         workspace.add_file("project_a", "agent.yaml", f"llm:\n  api_key: {secret}\n".encode())
-    assert secret not in "".join(p.read_text() for p in workspace.root.rglob("*.yaml"))
+    assert secret not in "".join(p.read_text(encoding="utf-8") for p in workspace.root.rglob("*.yaml"))
     # A rule's business attribute named password is not a connector credential.
     workspace.add_file("project_a", "rule.yaml", b"attributes:\n  single_valued:\n    password: source_column\n")
 

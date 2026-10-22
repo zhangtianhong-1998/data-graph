@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import _thread
 from pathlib import Path
 import signal
 import sys
+import threading
 
 
 def execute(payload, result_path):
@@ -13,7 +15,7 @@ def execute(payload, result_path):
     from ..errors import LightGraphError
     from ..pipeline import load_rules, make_model, run_pipeline
     from ..runtime.config import AgentConfig, RunConfig, open_sources
-    from .execution import check_dependencies, write_metadata_context, _safe_code, _safe_report, _save
+    from .execution import check_dependencies, write_metadata_context, _safe_code, _safe_report, _save, _cancel_path
 
     config = None
     sources = []
@@ -23,22 +25,46 @@ def execute(payload, result_path):
     cleanup = "completed"
     cancelled = False
     opening_sources = False
+    closing = threading.Event()
+    cancellation_started = False
 
-    def stop(_signum, _frame):
-        nonlocal cancelled
-        cancelled = True
-        # A second SIGTERM must not interrupt finally blocks; the parent owns
-        # bounded escalation to kill if a driver refuses to release resources.
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        for source in sources:
+    def cancel_sources():
+        nonlocal cancellation_started
+        if cancellation_started:
+            return
+        cancellation_started = True
+        for source in tuple(sources):
             try:
                 source.cancel()
             except Exception:
                 pass
+
+    def stop(_signum, _frame):
+        nonlocal cancelled
+        if closing.is_set():
+            return
+        cancelled = True
+        # A second SIGTERM must not interrupt finally blocks; the parent owns
+        # bounded escalation to kill if a driver refuses to release resources.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        cancel_sources()
         raise KeyboardInterrupt
 
     previous = signal.signal(signal.SIGTERM, stop)
+    def watch_cancellation():
+        nonlocal cancelled
+        while not closing.wait(.05):
+            if _cancel_path(result_path).exists():
+                cancelled = True
+                # Cancel driver I/O from outside the main thread so blocked
+                # reads get a chance to return before the parent force-kills.
+                cancel_sources()
+                if not closing.is_set():
+                    _thread.interrupt_main(signal.SIGTERM)
+                return
+    watcher = threading.Thread(target=watch_cancellation, daemon=True)
     try:
+        watcher.start()
         config = RunConfig.model_validate(payload["config"])
         config._agent = AgentConfig(name=payload.get("agent_name", "lightgraph-discovery"), llm=config.model)
         project = result_path.parent.parent
@@ -69,6 +95,8 @@ def execute(payload, result_path):
     except Exception:
         error_code = "worker_execution_failed"
     finally:
+        # Late cancellation must not interrupt release/report finally blocks.
+        closing.set()
         if opening_sources:
             cleanup = "unknown"
         for source in sources:
@@ -78,6 +106,10 @@ def execute(payload, result_path):
                 cleanup = "unknown"
         sources.clear()
         payload.clear()
+        if watcher.ident is not None:
+            watcher.join(timeout=.2)
+        if watcher.is_alive():
+            cleanup = "unknown"
         if cancelled:
             status = "cancelled"
             error_code = "run_cancelled"
