@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue'
 import type { Graph, GraphNode } from './types'
+import { fitCamera, zoomCamera } from './graphViewport'
 
 const props = defineProps<{ graph: Graph; layer: string; loading?: boolean }>()
 const search = ref('')
@@ -16,12 +17,11 @@ const kinds = computed(() => [...new Set(props.graph.nodes.map(n => String(n.kin
 const filtered = computed(() => props.graph.nodes.filter(n => (!selectedKind.value || (n.kind || n.layer || '节点') === selectedKind.value)
   && (!search.value || `${n.label || n.name || ''} ${n.id}`.toLowerCase().includes(search.value.toLowerCase()))))
 const visible = computed(() => filtered.value.slice(0, 240))
-const compact = computed(() => visible.value.length <= 12)
 const columns = computed(() => {
   const desired = Math.max(1, Math.min(visible.value.length, Math.ceil(Math.sqrt(visible.value.length * 1.7))))
-  return compact.value ? Math.min(desired, Math.max(1, Math.floor(viewport.value.width / 190))) : desired
+  return Math.min(desired, Math.max(1, Math.floor(viewport.value.width / 190)))
 })
-const width = computed(() => compact.value ? viewport.value.width : Math.max(viewport.value.width, columns.value * 190))
+const width = computed(() => viewport.value.width)
 const height = computed(() => Math.max(viewport.value.height, Math.ceil(visible.value.length / columns.value) * 118 + 50))
 const points = computed(() => {
   const rows = Math.ceil(visible.value.length / columns.value)
@@ -38,14 +38,23 @@ const display = (node: GraphNode) => String(node.label || node.name || node.id)
 const shortLabel = (node: GraphNode) => { const text = display(node); return text.length > 15 ? text.slice(0, 14) + '…' : text }
 const kindColor = (node: GraphNode) => ['#407ff2', '#20a27e', '#9a6add', '#da9b37', '#54a6bc'][Math.max(0, kinds.value.indexOf(String(node.kind || node.layer || '节点'))) % 5]
 function reset() { zoom.value = 1; offset.value = { x: 0, y: 0 } }
+function setZoom(value: number) {
+  const camera = zoomCamera({ zoom: zoom.value, offset: offset.value }, Math.max(.05, Math.min(3, value)), viewport.value)
+  zoom.value = camera.zoom; offset.value = camera.offset
+}
+function fit() {
+  const camera = fitCamera({ width: width.value, height: height.value }, viewport.value)
+  zoom.value = camera.zoom; offset.value = camera.offset
+}
 function move(event: PointerEvent) { if (drag) offset.value = { x: drag.ox + (event.clientX - drag.x) * drag.factor, y: drag.oy + (event.clientY - drag.y) * drag.factor } }
 function start(event: PointerEvent) {
-  if ((event.target as Element).closest('.graph-node')) return
+  if (event.button !== 0 || (event.target as Element).closest('.graph-node')) return
   const rect = (event.currentTarget as Element).getBoundingClientRect()
-  drag = { x: event.clientX, y: event.clientY, ox: offset.value.x, oy: offset.value.y, factor: Math.max(width.value / rect.width, height.value / rect.height) }
+  drag = { x: event.clientX, y: event.clientY, ox: offset.value.x, oy: offset.value.y, factor: Math.max(viewport.value.width / rect.width, viewport.value.height / rect.height) }
   ;(event.currentTarget as Element).setPointerCapture(event.pointerId)
 }
 watch(() => props.graph, () => { selected.value = null; reset() })
+watch([search, selectedKind], () => { selected.value = null; reset() })
 watch(canvas, element => {
   observer?.disconnect()
   if (!element) return
@@ -63,15 +72,15 @@ onUnmounted(() => observer?.disconnect())
     <section class="panel graph-panel">
       <div class="graph-toolbar">
         <div class="actions"><input v-model="search" class="graph-search" aria-label="搜索图节点" placeholder="搜索名称或编号"/><select v-model="selectedKind" aria-label="筛选节点类型"><option value="">全部类型</option><option v-for="kind in kinds" :key="kind">{{ kind }}</option></select></div>
-        <div class="actions"><button class="btn small" aria-label="缩小图谱" @click="zoom = Math.max(.3, zoom - .15)">−</button><span class="muted">{{ Math.round(zoom * 100) }}%</span><button class="btn small" aria-label="放大图谱" @click="zoom = Math.min(3, zoom + .15)">+</button><button class="btn small" @click="reset">复位</button></div>
+        <div class="actions"><button class="btn small" aria-label="缩小图谱" @click="setZoom(zoom / 1.2)">−</button><span class="muted">{{ Math.round(zoom * 100) }}%</span><button class="btn small" aria-label="放大图谱" @click="setZoom(zoom * 1.2)">+</button><button class="btn small" @click="fit">适配全图</button><button class="btn small" @click="reset">原始大小</button></div>
       </div>
       <div v-if="loading" class="empty-state"><div class="spinner"></div>正在读取图谱</div>
       <div v-else-if="!graph.nodes.length" class="empty-state graph-empty"><div class="empty-graphic">◇</div><h3>{{ layer === 'metadata' ? '还没有元数据图' : '还没有业务图谱' }}</h3><p>{{ layer === 'metadata' ? '上传数据并读取元数据后，这里会展示真实的表、列及其关系。' : '完成抽取后，这里会展示已发布的实体与关系。现有图谱会在后续运行中保留并更新。' }}</p></div>
       <div v-else-if="!visible.length" class="empty-state">没有匹配的节点，请调整搜索或类型。</div>
       <div v-else ref="canvas" class="graph-canvas">
-        <svg :viewBox="`0 0 ${width} ${height}`" role="group" :aria-label="layer === 'metadata' ? '元数据关联图' : '业务知识图谱'" @pointerdown="start" @pointermove="move" @pointerup="drag = null" @pointercancel="drag = null">
+        <svg :viewBox="`0 0 ${viewport.width} ${viewport.height}`" role="group" :aria-label="layer === 'metadata' ? '元数据关联图' : '业务知识图谱'" @pointerdown="start" @pointermove="move" @pointerup="drag = null" @pointercancel="drag = null" @lostpointercapture="drag = null">
           <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#b6c4da"/></marker></defs>
-          <g :transform="`translate(${offset.x + width / 2} ${offset.y + height / 2}) scale(${zoom}) translate(${-width / 2} ${-height / 2})`">
+          <g :transform="`translate(${offset.x} ${offset.y}) scale(${zoom})`">
             <g v-for="(edge, index) in edges" :key="`${edge.source}-${edge.target}-${index}`" class="graph-edge" :class="{ emphasized: selected && (edge.source === selected.id || edge.target === selected.id) }">
               <path :d="`M ${points.get(edge.source)!.x} ${points.get(edge.source)!.y} L ${points.get(edge.target)!.x} ${points.get(edge.target)!.y}`" marker-end="url(#arrow)"/><title>{{ edge.relation || '关联' }}</title>
               <text v-if="selected && (edge.source === selected.id || edge.target === selected.id)" :x="(points.get(edge.source)!.x + points.get(edge.target)!.x) / 2" :y="(points.get(edge.source)!.y + points.get(edge.target)!.y) / 2 - 7">{{ edge.relation }}</text>

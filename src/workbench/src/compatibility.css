@@ -1,0 +1,120 @@
+/* Use the same control geometry on macOS, Windows and Linux. */
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans", sans-serif;
+  color-scheme: light;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+body { line-height: 1.5; }
+button, input, select, textarea { min-width: 0; }
+button { -webkit-appearance: none; appearance: none; }
+input:not([type=checkbox]):not([type=radio]), select, textarea {
+  -webkit-appearance: none;
+  appearance: none;
+  font-size: 14px;
+}
+input:not([type=checkbox]):not([type=radio]), select { min-height: 42px; }
+select {
+  padding-right: 32px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='m1 1 5 5 5-5' fill='none' stroke='%2353647d' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+}
+input[type=checkbox], input[type=radio] {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  margin: 0;
+}
+input:disabled, select:disabled, textarea:disabled { opacity: 1; -webkit-text-fill-color: #8892a4; }
+.panel, .field, .title-line, .panel-head > div, .phase-navigation > button,
+.two-fields > *, .host-port > *, .layout-two > *, .graph-layout > * { min-width: 0; }
+h1, h2, .panel-footer > span, .title-line .badge, .note, .check-option span {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.phase-number, .close { flex-shrink: 0; }
+.close { min-width: 32px; min-height: 32px; }
+.radio-line { flex-wrap: wrap; }
+.radio-line label { min-width: 0; }
+.schema-table-list td, .schema-table-list th { font-size: 12px; }
+.schema-table-list summary, .input-item, .input-types button, .tab, .btn { font-size: 13px; }
+.schema-table-list td { overflow-wrap: anywhere; white-space: normal; }
+.schema-table-list td:last-child { min-width: 110px; }
+.table-scroll, .schema-table-list, .input-items, .graph-detail, .table-picker-items {
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+/* Keep close/submit visible; only the form body scrolls in short windows. */
+body:has(.modal-backdrop) { overflow: hidden; }
+.modal-backdrop { -webkit-backdrop-filter: blur(3px); }
+.modal {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 48px);
+}
+.modal > form { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.modal .panel-head, .modal .panel-footer { flex: 0 0 auto; }
+.modal .panel-head { padding: 16px 23px; }
+.modal .panel-body { min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.modal .two-fields { margin-bottom: 20px; }
+.modal .two-fields .field { margin-bottom: 0; }
+.modal .panel-footer { flex-wrap: wrap; }
+.graph-toolbar select { padding-right: 30px; }
+.graph-toolbar .actions { min-width: 0; }
+.graph-toolbar input, .graph-toolbar select { max-width: 100%; }
+.node-label { font-size: 13px; }
+.node-kind { font-size: 11px; }
+@media (max-width: 740px) {
+  .create-project { font-size: 0; }
+  .tabs { gap: 14px; }
+  .tab { font-size: 12px; }
+  .modal { max-height: calc(100vh - 24px); max-height: calc(100dvh - 24px); }
+  .modal .panel-head, .modal .panel-body, .modal .panel-footer { padding: 16px; }
+}
+@media (max-width: 480px) {
+  .host-port { grid-template-columns: minmax(0, 1fr); }
+  .graph-toolbar input, .graph-toolbar select { width: 100%; }
+  .graph-toolbar > .actions { width: 100%; }
+}
+@media (forced-colors: active) {
+  select { appearance: auto; background-image: none; }
+}
+
+/* Constrain scrolling to the content area; the two input panels scroll separately. */
+.app-shell { height: 100vh; height: 100dvh; min-height: 0; overflow: hidden; }
+.workspace { height: 100%; display: flex; flex-direction: column; }
+.topbar, .project-head, .error-strip { flex-shrink: 0; }
+.topbar { height: 44px; }
+.project-head { padding-top: 14px; }
+.phase-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.phase-tabs { display: flex; align-items: center; gap: 4px; padding: 4px; background: #f0f3f8; border-radius: 8px; }
+.phase-tabs button { display: flex; align-items: center; gap: 8px; padding: 9px 18px; font-size: 14px; color: #687b96; border-radius: 6px; }
+.phase-tabs button.active { background: white; color: var(--blue); font-weight: 600; box-shadow: 0 1px 4px #25385a18; }
+.phase-tabs .status-dot { margin: 0; }
+.project-head .tabs { margin-top: 18px; }
+.content { flex: 1; min-height: 0; width: 100%; overflow: auto; overscroll-behavior: contain; }
+.content.inputs-content { display: flex; flex-direction: column; overflow: hidden; padding-bottom: 24px; }
+.inputs-content > .run-banner { flex-shrink: 0; }
+.input-workspace { flex: 1; min-height: 0; grid-template-rows: minmax(0, 1fr); align-items: stretch; }
+.input-types { align-self: start; }
+.input-selection { display: flex; flex-direction: column; min-height: 0; }
+.input-selection .panel-head, .input-selection .panel-footer { flex-shrink: 0; }
+.input-selection .input-items { flex: 1; min-height: 0; max-height: none; }
+.input-metadata { display: flex; flex-direction: column; min-height: 0; }
+.input-metadata > .note { flex-shrink: 0; }
+.input-metadata .schema-preview { display: flex; flex-direction: column; align-self: stretch; flex: 1; min-height: 0; }
+.schema-preview .panel-head, .schema-preview .preview-switch, .schema-preview .yaml-toolbar { flex-shrink: 0; }
+.input-metadata .schema-table-list, .input-metadata .yaml-preview { flex: 1; min-height: 0; max-height: none; overflow: auto; }
+@media (min-width: 601px) and (max-width: 900px) {
+  .input-workspace { grid-template-rows: auto minmax(0, 1fr); }
+}
+@media (max-width: 600px) {
+  .phase-bar { gap: 10px; }
+  .phase-tabs button { padding: 8px 10px; font-size: 13px; }
+  .content.inputs-content { overflow: auto; }
+  .input-workspace { flex: none; grid-template-rows: auto 280px 500px; }
+}

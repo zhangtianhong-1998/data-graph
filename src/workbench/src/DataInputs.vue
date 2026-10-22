@@ -52,7 +52,7 @@ onUnmounted(() => { revision++ })
     </nav>
     <section class="panel input-selection">
       <div class="panel-head"><h2>{{ kind === 'database' ? '已选数据表' : '数据文件' }}</h2><button class="btn primary small" :disabled="locked" @click="kind === 'database' ? emit('connect') : emit('upload')">{{ kind === 'database' ? '＋ 连接' : '＋ 上传' }}</button></div>
-      <div class="input-items">
+      <div class="input-items" tabindex="0" role="region" aria-label="已接入数据列表">
         <template v-if="kind === 'database'">
           <section v-for="source in databases" :key="source.id" class="database-group">
             <div class="source-heading"><div><strong>{{ source.id }}</strong><small>{{ sourceKindLabel(source.kind) }}</small></div><button class="text-button" :disabled="locked" :aria-label="`配置 ${source.id}`" @click="emit('connect', source)">配置</button></div>
@@ -64,9 +64,9 @@ onUnmounted(() => { revision++ })
           <button v-for="item in entries" :key="item.key" class="input-item" :class="{ active: current?.key === item.key }" :aria-pressed="current?.key === item.key" @click="selected = item.key"><span>{{ item.label }}</span><small>{{ item.label.split('.').pop()?.toUpperCase() }}</small></button>
           <div v-if="!localFiles.length" class="empty-state">上传 Excel 或 CSV</div>
         </template>
+        <details v-if="kind === 'file' && yamlFiles.length" class="config-files"><summary>配置文件 · {{ yamlFiles.length }}</summary><div v-for="file in yamlFiles" :key="file.file_id" class="file-row"><div class="file-info"><h3>{{ file.name }}</h3></div><button class="text-button" :disabled="locked" @click="emit('preview', file)">查看</button><button class="text-button" :disabled="locked" @click="emit('import', file)">导入</button></div></details>
       </div>
       <div class="panel-footer"><span>{{ entries.length }} {{ kind === 'database' ? '张表' : '个文件' }}</span><button class="text-button" :disabled="locked || !sources.length" @click="emit('refresh')">刷新元数据</button></div>
-      <details v-if="kind === 'file' && yamlFiles.length" class="config-files"><summary>配置文件 · {{ yamlFiles.length }}</summary><div v-for="file in yamlFiles" :key="file.file_id" class="file-row"><div class="file-info"><h3>{{ file.name }}</h3></div><button class="text-button" :disabled="locked" @click="emit('preview', file)">查看</button><button class="text-button" :disabled="locked" @click="emit('import', file)">导入</button></div></details>
     </section>
     <div class="input-metadata">
       <p v-if="error" class="note amber" role="alert">{{ error }}</p>

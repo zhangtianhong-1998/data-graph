@@ -18,6 +18,13 @@ const configurationTab = ref<ConfigurationTab>('inputs'), resultTab = ref<Result
 const inResults = computed(() => isResultTab(tab.value))
 const tabs = computed(() => inResults.value ? resultTabs : configurationTabs)
 watch(tab, value => { if (isResultTab(value)) resultTab.value = value; else configurationTab.value = value })
+function phaseKeydown(event: KeyboardEvent) {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+  event.preventDefault()
+  const results = event.key === 'End' || (event.key !== 'Home' && !inResults.value)
+  tab.value = results ? resultTab.value : configurationTab.value
+  ;(event.currentTarget as HTMLElement).querySelectorAll<HTMLButtonElement>('[role=tab]')[results ? 1 : 0]?.focus()
+}
 const loading = ref(true)
 const busy = ref(false)
 const error = ref('')
@@ -249,11 +256,16 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
       <div v-else-if="!project" class="page-empty"><span class="empty-graphic">◇</span><h1>从一个项目开始</h1><p>上传数据、指定抽取目的，让 Agent 发现关键列和关系。<br/>Excel、CSV、Markdown 和配置文件会保存在项目自己的文件夹中。</p><button class="btn primary" @click="newProjectOpen = true">新建项目</button><button v-if="error" class="btn" @click="action(() => reloadProjects(projects[0]?.project_id))">重新连接</button></div>
       <template v-else>
         <section class="project-head">
-          <div class="heading-row"><div><div class="title-line"><h1>{{ project.name }}</h1><span class="badge blue">{{ project.project_id }}</span><span v-if="dirty" class="badge amber">有未保存修改</span></div></div><div class="actions"><button class="btn primary" :disabled="locked || (!config.sources?.length && !documentFiles.length) || !purpose.trim()" :title="!purpose.trim() ? '请先填写抽取目的' : '保存配置后启动抽取'" @click="startRun">{{ activeRun ? '正在抽取' : dirty ? '保存并开始抽取' : '开始抽取' }}</button></div></div>
-          <div class="phase-navigation" aria-label="工作阶段"><button :class="{ active: !inResults }" :aria-current="!inResults ? 'page' : undefined" @click="tab = configurationTab"><span class="phase-number">1</span><span>项目配置<small>数据 · 文档 · 目标 · 模型</small></span></button><span class="phase-arrow" aria-hidden="true">→</span><button :class="{ active: inResults }" :aria-current="inResults ? 'page' : undefined" @click="tab = resultTab"><span class="phase-number">2</span><span>运行与结果<small>元数据图 · 业务图谱 · 运行记录</small></span><span v-if="activeRun" class="status-dot" aria-label="正在运行"></span></button></div>
+          <div class="phase-bar">
+            <div class="phase-tabs" role="tablist" aria-label="工作阶段" @keydown="phaseKeydown">
+              <button id="configuration-phase" role="tab" aria-controls="phase-content" :aria-selected="!inResults" :tabindex="!inResults ? 0 : -1" :class="{ active: !inResults }" @click="tab = configurationTab">项目配置</button>
+              <button id="results-phase" role="tab" aria-controls="phase-content" :aria-selected="inResults" :tabindex="inResults ? 0 : -1" :class="{ active: inResults }" @click="tab = resultTab">运行与结果<span v-if="activeRun" class="status-dot" aria-label="正在运行"></span></button>
+            </div>
+            <div class="actions"><span v-if="dirty" class="badge amber">有未保存修改</span><button class="btn primary" :disabled="locked || (!config.sources?.length && !documentFiles.length) || !purpose.trim()" :title="!purpose.trim() ? '请先填写抽取目的' : '保存配置后启动抽取'" @click="startRun">{{ activeRun ? '正在抽取' : dirty ? '保存并开始抽取' : '开始抽取' }}</button></div>
+          </div>
           <nav class="tabs" :aria-label="inResults ? '运行与结果' : '项目配置'"><button v-for="item in tabs" :key="item.id" class="tab" :class="{ active: tab === item.id }" @click="tab = item.id">{{ item.label }}<span v-if="item.id === 'runs' && runs.length" class="count">{{ runs.length }}</span></button></nav>
         </section>
-        <div class="content">
+        <div id="phase-content" class="content" :class="{ 'inputs-content': tab === 'inputs' }" role="tabpanel" :aria-labelledby="inResults ? 'results-phase' : 'configuration-phase'">
           <div v-if="activeRun" class="run-banner"><span class="spinner tiny"></span><div><strong>{{ runLabels[activeRun.status] }}</strong><span>{{ stageLabel(activeRun.stage) }} · {{ activeRun.run_id }}</span></div><button class="btn small" :disabled="busy" @click="cancelRun(activeRun)">取消运行</button></div>
           <template v-if="tab === 'goal'">
             <div class="intro"><div><h2>这次希望发现什么？</h2></div></div>
