@@ -40,7 +40,7 @@ jobs:
       - name: Check dependency compatibility
         run: python -m pip check
       - name: Run complete test suite
-        run: python -m pytest -q
+        run: python -m pytest -q -o faulthandler_timeout=90
 
   frontend:
     runs-on: ubuntu-latest

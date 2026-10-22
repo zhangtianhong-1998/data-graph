@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import _thread
 from pathlib import Path
 import signal
 import sys
@@ -26,14 +25,15 @@ def execute(payload, result_path):
     cancelled = False
     opening_sources = False
     closing = threading.Event()
-    cancellation_started = False
+    cancelled_sources = set()
+    cancellation_lock = threading.Lock()
 
     def cancel_sources():
-        nonlocal cancellation_started
-        if cancellation_started:
-            return
-        cancellation_started = True
         for source in tuple(sources):
+            with cancellation_lock:
+                if id(source) in cancelled_sources:
+                    continue
+                cancelled_sources.add(id(source))
             try:
                 source.cancel()
             except Exception:
@@ -41,27 +41,28 @@ def execute(payload, result_path):
 
     def stop(_signum, _frame):
         nonlocal cancelled
-        if closing.is_set():
-            return
+        # A signal can arrive between any two instructions, including finally's
+        # first instruction. Never raise or perform driver I/O from this handler.
         cancelled = True
-        # A second SIGTERM must not interrupt finally blocks; the parent owns
-        # bounded escalation to kill if a driver refuses to release resources.
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        cancel_sources()
-        raise KeyboardInterrupt
+
+    def check_cancelled():
+        nonlocal cancelled
+        if cancelled or _cancel_path(result_path).exists():
+            cancelled = True
+            cancel_sources()
+            # This is a normal control-flow checkpoint inside try, not an
+            # asynchronous exception that can escape resource cleanup.
+            raise KeyboardInterrupt
 
     previous = signal.signal(signal.SIGTERM, stop)
     def watch_cancellation():
         nonlocal cancelled
         while not closing.wait(.05):
-            if _cancel_path(result_path).exists():
+            if cancelled or _cancel_path(result_path).exists():
                 cancelled = True
                 # Cancel driver I/O from outside the main thread so blocked
                 # reads get a chance to return before the parent force-kills.
                 cancel_sources()
-                if not closing.is_set():
-                    _thread.interrupt_main(signal.SIGTERM)
-                return
     watcher = threading.Thread(target=watch_cancellation, daemon=True)
     try:
         watcher.start()
@@ -69,14 +70,21 @@ def execute(payload, result_path):
         config._agent = AgentConfig(name=payload.get("agent_name", "lightgraph-discovery"), llm=config.model)
         project = result_path.parent.parent
         check_dependencies(payload["dependencies"], project)
+        check_cancelled()
         opening_sources = True
         sources = open_sources(config)
         opening_sources = False
+        check_cancelled()
         rules = load_rules(config.rules) if config.rules else None
+        check_cancelled()
         documents = load_documents(config.documents)
+        check_cancelled()
         metadata_path = Path(config.output_dir) / "metadata.yaml"
         metadata_before = metadata_path.stat().st_mtime_ns if metadata_path.exists() else None
-        report = run_pipeline(config, sources, rules=rules, documents=documents, model=make_model(config))
+        model = make_model(config)
+        check_cancelled()
+        report = run_pipeline(config, sources, rules=rules, documents=documents, model=model)
+        check_cancelled()
         status = {"COMPLETED": "completed", "COMPLETED_WITH_GAPS": "partial",
                   "PARTIAL": "partial", "FAILED": "failed"}[report.status]
         try:
@@ -97,6 +105,10 @@ def execute(payload, result_path):
     finally:
         # Late cancellation must not interrupt release/report finally blocks.
         closing.set()
+        if watcher.ident is not None:
+            watcher.join(timeout=.2)
+        if watcher.is_alive():
+            cleanup = "unknown"
         if opening_sources:
             cleanup = "unknown"
         for source in sources:
@@ -106,10 +118,6 @@ def execute(payload, result_path):
                 cleanup = "unknown"
         sources.clear()
         payload.clear()
-        if watcher.ident is not None:
-            watcher.join(timeout=.2)
-        if watcher.is_alive():
-            cleanup = "unknown"
         if cancelled:
             status = "cancelled"
             error_code = "run_cancelled"

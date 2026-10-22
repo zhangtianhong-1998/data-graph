@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import ssl
 import threading
-import time
 
 import pytest
 
@@ -37,14 +36,26 @@ class Cursor:
         db.executed.append((sql, parameters))
         self.result = []
         if sql.startswith('KILL QUERY'):
-            if not db.owner.cancel_works:
-                raise DBError(1095, 'PRIVATE_CANCEL_DETAIL')
-            db.owner.cancelled.set()
+            # Model a running query, not a race between two short sleeps. The
+            # callback may reach this substitute before its query thread runs.
+            if db.owner.cancel_probe_pending:
+                if not db.owner.cancel_probe_started.wait(timeout=5):
+                    raise DBError(0, 'probe query did not start')
+            try:
+                if not db.owner.cancel_works:
+                    raise DBError(1095, 'PRIVATE_CANCEL_DETAIL')
+                db.owner.cancelled.set()
+            finally:
+                db.owner.cancel_attempt_finished.set()
         elif sql.startswith('SET SESSION sql_mode'):
             if not db.ignore_sql_mode:
                 db.sql_mode = sql.split("'")[1]
         elif sql.startswith('SET SESSION max_execution_time'):
             db.timeout = int(sql.rsplit('=', 1)[1])
+            if db.timeout == 1000:
+                db.cancel_probe_pending = True
+                db.cancel_probe_started.clear()
+                db.cancel_attempt_finished.clear()
         elif sql.startswith('SELECT @@session.transaction_read_only'):
             self.result = [(db.readonly, db.isolation, db.timeout, db.sql_mode)]
         elif sql.startswith('SELECT VERSION()'):
@@ -75,7 +86,10 @@ class Cursor:
                 if db.timeout_works:
                     raise DBError(3024, 'PRIVATE_TIMEOUT_DETAIL')
             else:
-                time.sleep(.08)
+                db.cancel_probe_started.set()
+                if not db.cancel_attempt_finished.wait(timeout=5):
+                    pytest.fail('probe cancellation callback did not finish')
+                db.cancel_probe_pending = False
                 if db.cancelled.is_set():
                     db.cancelled.clear()
                     raise DBError(1317, 'PRIVATE_CANCEL_DETAIL')
@@ -122,6 +136,9 @@ class Connection:
         self.timeout_works = self.cancel_works = True
         self.false_timeout_on_cancel = False
         self.cancelled = threading.Event()
+        self.cancel_probe_pending = False
+        self.cancel_probe_started = threading.Event()
+        self.cancel_attempt_finished = threading.Event()
         self.rows = [('001', 'Expenses')]
         self.fail_errno = None
         self.on_query = None
@@ -250,6 +267,7 @@ def test_runtime_probes_verify_actual_interruptions_without_repeating_catalog():
         assert sum('information_schema' in sql for sql, _ in driver.main.executed) == catalog_before
         assert driver.control.executed == [('SELECT @@server_uuid, CURRENT_USER()', None), ('KILL QUERY 42', None)]
         assert 'SELECT SLEEP(0.25), 1' in [s for s, _ in driver.main.executed]
+        assert driver.main.cancel_probe_started.is_set() and driver.main.cancel_attempt_finished.is_set()
 
 
 def test_cancel_probe_does_not_accept_server_timeout_as_cancellation():

@@ -172,10 +172,12 @@ import sys,time
 from pathlib import Path
 import lightgraph.pipeline as pipeline
 import lightgraph.runtime.config as config
-from lightgraph.contracts import RunReport
+from lightgraph.contracts import RunReport, TableSpec, ColumnSpec, QueryLimits
+from lightgraph.errors import LightGraphError
 from lightgraph.sources import MemorySource
 from lightgraph.web.worker import main
-source=MemorySource([],{})
+table=TableSpec(source_id='memory',name='items',columns=[ColumnSpec(name='code')])
+source=MemorySource([table],{'public.items':[(str(i),) for i in range(100)]},limits=QueryLimits(max_batch_rows=1))
 close=source.close
 def closed():
     close()
@@ -183,11 +185,14 @@ def closed():
 source.close=closed
 config.open_sources=lambda _: [source]
 def run(*a,**kw):
-    Path('worker-ready').touch()
     try:
-        while True: time.sleep(.01)
-    except KeyboardInterrupt:
+        for batch in source.project(table,['code']):
+            Path('worker-ready').touch()
+            time.sleep(.1)
+    except LightGraphError as exc:
+        if exc.code!='query_cancelled': raise
         return RunReport(run_id='cancelled',status='PARTIAL',rules_published=['already_published'])
+    raise AssertionError('query was not cancelled')
 pipeline.run_pipeline=run
 sys.exit(main())
 '''
@@ -373,10 +378,8 @@ def test_graceful_cancel_preserves_published_report_and_closes_sources(workspace
     source = MemorySource([], {})
     monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _config: [source])
     def run(*_a, **_kw):
-        try:
-            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
-        except KeyboardInterrupt:
-            return RunReport(run_id='cancelled', status='PARTIAL', rules_published=['already_published'])
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        return RunReport(run_id='cancelled', status='PARTIAL', rules_published=['already_published'])
     monkeypatch.setattr('lightgraph.pipeline.run_pipeline', run)
     path = workspace.project_path('alpha') / 'runs' / 'cancel.json'
     execute(_resolved_payload(workspace.configs['alpha'], workspace.project_path('alpha')), path)
@@ -408,16 +411,63 @@ def test_preexisting_cancel_marker_still_runs_worker_finally(workspace, monkeypa
     path = workspace.project_path('alpha') / 'runs' / 'early.json'
     path.parent.mkdir()
     path.with_suffix('.cancel').write_text('cancel\n', encoding='utf-8')
-    def opening(_config):
-        time.sleep(.15)
-        return []
-    monkeypatch.setattr('lightgraph.runtime.config.open_sources', opening)
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _: pytest.fail('cancelled startup must not open sources'))
     execute(_resolved_payload(workspace.configs['alpha'], workspace.project_path('alpha')), path)
     record = json.loads(path.read_text(encoding='utf-8'))
     assert record['status'] == 'cancelled'
-    # Interrupted source opening cannot attest that every created driver closed.
-    assert record['cleanup_status'] == 'unknown'
+    assert record['cleanup_status'] == 'completed'
     assert record['error_code'] == 'run_cancelled'
+
+
+def test_cancel_during_opening_closes_new_sources_without_starting_pipeline(workspace, monkeypatch):
+    path = workspace.project_path('alpha') / 'runs' / 'opening.json'
+    path.parent.mkdir()
+    source = MemorySource([], {})
+    cancel_calls = []
+    cancel = source.cancel
+    def cancelled():
+        cancel_calls.append(True)
+        cancel()
+    source.cancel = cancelled
+    def opening(_config):
+        # Inject at an explicit phase, without relying on timer scheduling.
+        path.with_suffix('.cancel').write_text('cancel\n', encoding='utf-8')
+        return [source]
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', opening)
+    monkeypatch.setattr('lightgraph.pipeline.run_pipeline', lambda *_a, **_kw: pytest.fail('cancelled opening must not run pipeline'))
+    execute(_resolved_payload(workspace.configs['alpha'], workspace.project_path('alpha')), path)
+    record = json.loads(path.read_text(encoding='utf-8'))
+    assert record['status'] == 'cancelled' and record['cleanup_status'] == 'completed'
+    assert cancel_calls == [True] and source._closed
+
+
+@pytest.mark.parametrize('statement', ['closing.set()', 'source.close()', '_save(result_path, result)'])
+def test_signal_at_exact_cleanup_instruction_never_skips_finally(workspace, monkeypatch, statement):
+    import inspect
+    import signal
+    source = MemorySource([], {})
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _: [source])
+    monkeypatch.setattr('lightgraph.pipeline.run_pipeline', lambda *_a, **_kw: RunReport(run_id='done'))
+    lines, start = inspect.getsourcelines(execute)
+    target_line = next(start + i for i, line in enumerate(lines) if line.strip() == statement)
+    injected = []
+    def trace(frame, event, _arg):
+        if event == 'line' and frame.f_code is execute.__code__ and frame.f_lineno == target_line and not injected:
+            injected.append(True)
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, frame)
+        return trace
+    previous = sys.gettrace()
+    path = workspace.project_path('alpha') / 'runs' / 'signal.json'
+    try:
+        sys.settrace(trace)
+        execute(_resolved_payload(workspace.configs['alpha'], workspace.project_path('alpha')), path)
+    finally:
+        sys.settrace(previous)
+    record = json.loads(path.read_text(encoding='utf-8'))
+    assert injected and source._closed
+    assert record['cleanup_status'] == 'completed'
+    if statement != '_save(result_path, result)':
+        assert record['status'] == 'cancelled'
 
 
 def test_workspace_service_lock_excludes_second_manager_and_releases(workspace):

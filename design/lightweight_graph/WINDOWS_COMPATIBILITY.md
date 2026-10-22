@@ -13,7 +13,7 @@
 - 启动 worker 时只传入指定的锁 FD/HANDLE。父服务关闭或崩溃后，只要 worker 仍持有继承句柄，新的服务就无法取得同一 workspace；最后一个持有者退出后自动释放。
 - 关闭锁对象只关闭当前句柄，不主动解除其他进程仍持有的锁。锁路径拒绝符号链接和 Windows 重解析点。
 
-Windows 的 `Popen.terminate()` 会强制终止进程，不能当作发送 POSIX SIGTERM。工作台的取消与强制终止分别处理；没有合法清理报告或被强杀时必须显示 `cleanup_status=unknown`。
+Windows 的 `Popen.terminate()` 会强制终止进程，不能当作发送 POSIX SIGTERM。工作台先写入固定取消标记，监视线程请求 `source.cancel()`，主线程在处理阶段检查取消状态；信号处理器只记录状态，不异步抛出异常打断清理。若驱动、模型或文档处理不能及时退出，父服务在期限后强杀。没有合法清理报告或被强杀时必须显示 `cleanup_status=unknown`。
 
 参考：[Microsoft 文件共享与继承说明](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)、[Python 子进程句柄白名单](https://docs.python.org/3/library/subprocess.html#subprocess.STARTUPINFO)。
 
