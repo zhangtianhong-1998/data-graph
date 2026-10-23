@@ -28,6 +28,8 @@ MAX_EXCEL_EXPANDED_BYTES = 20 * 1024 * 1024
 _IDENTIFIER = re.compile(r"[^\x00-\x1f\x7f./\\]{1,128}\Z", re.UNICODE)
 _SYSTEM_SCHEMAS = {"mysql", "sys", "information_schema", "performance_schema", "pg_catalog", "pg_toast"}
 _GAUSS_JDBC_PREFIXES = ("jdbc:gaussdb://", "jdbc:postgresql://")
+GaussSSLMode = Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
+_GAUSS_SSL_MODES = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
 
 
 class DatabaseAccessError(LightGraphError):
@@ -45,6 +47,7 @@ class ConnectionSpec(BaseModel):
     username: str | None = Field(default=None, max_length=128)
     password: SecretStr | None = Field(default=None, repr=False)
     schema_name: str | None = Field(default=None, max_length=128, alias="schema")
+    sslmode: GaussSSLMode | None = None
 
     @field_validator("kind", mode="before")
     @classmethod
@@ -53,6 +56,8 @@ class ConnectionSpec(BaseModel):
 
     @model_validator(mode="after")
     def one_connection_form(self):
+        if self.kind != "gauss_database" and self.sslmode is not None:
+            raise ValueError("database_sslmode_not_supported")
         if self.dsn is not None:
             if not self.dsn.get_secret_value() or len(self.dsn.get_secret_value()) > 8192:
                 raise ValueError("database_connection_invalid")
@@ -176,9 +181,11 @@ def _resolved(spec: ConnectionSpec) -> dict:
                 raise DatabaseAccessError("database_connection_invalid")
             _identifier(options["dbname"])
             schema = _schema(spec.schema_name or "public")
-            mode = options.get("sslmode") or ("disable" if loopback else "verify-full")
-            if mode not in {"disable", "verify-full"} or mode == "disable" and not loopback:
-                raise DatabaseAccessError("database_tls_required")
+            # An explicit form choice overrides the URL; omission preserves the
+            # URL mode or the existing defaults. Never retry with weaker TLS.
+            if options.get("sslmode") and options["sslmode"] not in _GAUSS_SSL_MODES:
+                raise DatabaseAccessError("database_sslmode_invalid")
+            mode = spec.sslmode or options.get("sslmode") or ("disable" if loopback else "verify-full")
             options.update(port=str(port), sslmode=mode, connect_timeout=str(CONNECTION_TIMEOUT_SECONDS))
             return {"dsn": make_conninfo(**options), "host": host, "port": port,
                     "database": options["dbname"], "username": options["user"], "schema": schema}

@@ -30,6 +30,26 @@ class Connection:
     def close(self): self.closed=True
     def cancel(self): self.cancelled=True
 
+
+@pytest.mark.parametrize("mode", ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"])
+def test_runtime_driver_preserves_explicit_ssl_mode(monkeypatch, mode):
+    from psycopg.conninfo import conninfo_to_dict
+    from lightgraph.web.database_access import ConnectionSpec, build_dsn
+
+    dsn = build_dsn(ConnectionSpec(kind="gauss", host="db.example.com", database="business", username="reader", sslmode=mode))
+    db = Connection()
+    calls = []
+    def connect(value, **kwargs):
+        calls.append((conninfo_to_dict(value), kwargs))
+        return db
+    monkeypatch.setattr("psycopg.connect", connect)
+    with GaussSource(dsn, allowed_tables=["public.items"]) as source:
+        assert source.describe()[0].name == "items"
+    assert len(calls) == 1 and calls[0][0]["sslmode"] == mode
+    assert any("READ ONLY" in sql for sql, _ in db.executed)
+    assert db.closed
+
+
 def test_unknown_runtime_capabilities_block_instance_rows():
     db=Connection()
     with GaussSource("SECRET_DSN",source_id="s",allowed_tables=["public.items"],connect_factory=lambda _: db) as source:
@@ -267,10 +287,45 @@ def test_cli_connect_check_uses_single_catalog_preflight(tmp_path,monkeypatch,ca
     assert db.closed
 
 
-@pytest.mark.parametrize("cancellation_works",[False,True])
-def test_cancel_probe_cannot_be_satisfied_by_short_statement_timeout(cancellation_works):
-    import re,time
+@pytest.mark.parametrize("cancel_outcome", ["cancelled", "driver_error", "ignored", "late", "never"])
+def test_cancel_probe_cannot_be_satisfied_by_short_statement_timeout(monkeypatch, cancel_outcome):
+    import re
+    import threading
+    from types import SimpleNamespace
     from lightgraph.contracts import QueryLimits
+
+    timers = []
+
+    class ProbeTimer:
+        """Control query/cancel ordering without relying on OS timer scheduling."""
+
+        def __init__(self, interval, callback):
+            self.callback = callback
+            self.started = self.stopped = self.joined = False
+            timers.append(self)
+
+        def start(self):
+            self.started = True
+
+        def fire(self):
+            assert self.started
+            self.callback()
+
+        def cancel(self):
+            self.stopped = True
+
+        def join(self):
+            # A callback already running cannot be stopped by Timer.cancel().
+            # Model it returning only after the query has finished normally.
+            if cancel_outcome == "late":
+                self.fire()
+            self.joined = True
+
+    # Replace only this adapter's timer; QueryBudget has independent deadlines.
+    monkeypatch.setattr("lightgraph.sources.gauss.threading", SimpleNamespace(
+        Timer=ProbeTimer, Event=threading.Event, RLock=threading.RLock,
+    ))
+
     class Cancelled(Exception):sqlstate="57014"
     class RuntimeCursor(Cursor):
         def execute(self,sql,parameters=None):
@@ -278,21 +333,24 @@ def test_cancel_probe_cannot_be_satisfied_by_short_statement_timeout(cancellatio
                 self.connection.timeout=int(re.search(r"'([0-9]+)ms'",sql).group(1))
             if "pg_sleep" in sql:
                 if self.connection.timeout<250:raise Cancelled("PRIVATE_TIMEOUT_DETAIL")
-                time.sleep(.08)
+                if cancel_outcome not in {"late", "never"}:
+                    timers[0].fire()
                 if self.connection.cancelled:raise Cancelled("PRIVATE_CANCEL_DETAIL")
             return super().execute(sql,parameters)
     class RuntimeConnection(Connection):
         timeout=0
         def cursor(self,name=None):return RuntimeCursor(self,name)
         def cancel(self):
-            if cancellation_works:self.cancelled=True
-            else:raise RuntimeError("PRIVATE_DRIVER_DETAIL")
+            if cancel_outcome in {"cancelled", "late"}:self.cancelled=True
+            elif cancel_outcome == "driver_error":raise RuntimeError("PRIVATE_DRIVER_DETAIL")
     db=RuntimeConnection()
     with GaussSource("secret",allowed_tables=["public.items"],limits=QueryLimits(timeout_ms=1),connect_factory=lambda _:db) as source:
-        if cancellation_works:
+        if cancel_outcome == "cancelled":
             source._probe_runtime_control(cancel=True)
             assert source.capabilities().capabilities["query_cancel"]=="verified"
         else:
-            with pytest.raises(LightGraphError,match="query_cancel_unverified"):
+            with pytest.raises(LightGraphError,match="^query_cancel_unverified$"):
                 source._probe_runtime_control(cancel=True)
             assert source.capabilities().capabilities["query_cancel"]=="unknown"
+    assert len(timers) == 1 and timers[0].stopped and timers[0].joined
+    assert db.closed

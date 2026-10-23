@@ -52,6 +52,13 @@ async function useDsn(dsn: string) {
   await inputValue('#database-dsn', dsn)
 }
 
+async function selectValue(selector: string, value: string) {
+  const select = element<HTMLSelectElement>(selector)
+  select.value = value
+  select.dispatchEvent(new Event('change', { bubbles: true }))
+  await nextTick()
+}
+
 async function fillConnection(kind = 'gauss_database') {
   const select = element<HTMLSelectElement>('#database-kind')
   select.value = kind
@@ -193,6 +200,61 @@ describe('数据库连接弹窗', () => {
     button('测试连接').click()
     await vi.waitFor(() => expect(api.request).toHaveBeenCalledTimes(2))
     for (const call of api.request.mock.calls) expect(JSON.parse(call[1].body)).toEqual({ connection: { kind: 'gauss_database', dsn } })
+  })
+
+  it.each(['fields', 'postgresql', 'jdbc'])('%s 连接传递显式 SSL 选择，自动模式不覆盖连接串', async format => {
+    await fillConnection()
+    if (format === 'postgresql') await useDsn('postgresql://reader:fake@db.example.com:8000/analytics?sslmode=verify-full')
+    if (format === 'jdbc') await useDsn('jdbc:gaussdb://db.example.com:8000/analytics?sslmode=verify-full')
+    expect(element<HTMLSelectElement>('#database-sslmode').value).toBe('auto')
+    await selectValue('#database-sslmode', 'prefer')
+    expect(element('#database-sslmode-hint').textContent).toContain('可能使用未加密连接')
+    api.request.mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({ tables: [], truncated: false })
+    button('测试连接').click()
+    await vi.waitFor(() => expect(element('.dialog-feedback').textContent).toContain('连接成功，已读取'))
+    expect(api.request).toHaveBeenCalledTimes(2)
+    for (const call of api.request.mock.calls) {
+      const payload = JSON.parse(call[1].body).connection
+      expect(payload.sslmode).toBe('prefer')
+      if (format !== 'fields') expect(payload.dsn).toContain('sslmode=verify-full')
+    }
+    api.request.mockClear().mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({ tables: [], truncated: false })
+    await selectValue('#database-sslmode', 'auto')
+    button('测试连接').click()
+    await vi.waitFor(() => expect(element('.dialog-feedback').textContent).toContain('连接成功，已读取'))
+    expect(api.request).toHaveBeenCalledTimes(2)
+    for (const call of api.request.mock.calls) expect(JSON.parse(call[1].body).connection).not.toHaveProperty('sslmode')
+  })
+
+  it('修改 SSL 模式会使连接成功状态与已选表失效，避免复用旧连接结果', async () => {
+    await fillConnection()
+    api.request.mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({
+      tables: [{ schema: 'public', name: 'metrics', qualified_name: 'public.metrics' }], truncated: false,
+    })
+    button('测试连接').click()
+    await vi.waitFor(() => expect(root.querySelector('.table-choice')).not.toBeNull())
+    element<HTMLInputElement>('.table-choice input').click()
+    await nextTick()
+    expect(element('.manual-tables').textContent).toContain('已选 1 张表')
+    await selectValue('#database-sslmode', 'require')
+    expect(root.querySelector('.table-choice')).toBeNull()
+    expect(root.querySelector('.badge.green')).toBeNull()
+    expect(element('.manual-tables').textContent).toContain('已选 0 张表')
+    expect(element('#database-sslmode-hint').textContent).toContain('不校验服务器主机名')
+  })
+
+  it('切换 MySQL 后隐藏 SSL 控件且不提交 Gauss 的 SSL 值', async () => {
+    await fillConnection()
+    await selectValue('#database-sslmode', 'disable')
+    await selectValue('#database-kind', 'mysql_database')
+    expect(root.querySelector('#database-sslmode')).toBeNull()
+    api.request.mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({ tables: [], truncated: false })
+    button('测试连接').click()
+    await vi.waitFor(() => expect(element('.dialog-feedback').textContent).toContain('连接成功，已读取'))
+    expect(api.request).toHaveBeenCalledTimes(2)
+    for (const call of api.request.mock.calls) expect(JSON.parse(call[1].body).connection).not.toHaveProperty('sslmode')
+    await selectValue('#database-kind', 'gauss_database')
+    expect(element<HTMLSelectElement>('#database-sslmode').value).toBe('disable')
   })
 
   it('请求等待期间重复点击不会发出第二次测试，关闭按钮也暂不可用', async () => {

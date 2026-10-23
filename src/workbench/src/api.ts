@@ -11,6 +11,8 @@ const messages: Record<string, string> = {
   credential_session_invalid: '连接会话已失效，请刷新页面后重新填写凭据。', credential_session_capacity_reached: '服务当前会话已满，请稍后重试。',
   model_endpoint_required: '请先填写并保存模型服务地址和模型名称。',
   database_tls_required: '远程数据库要求 TLS 证书校验，请使用包含 TLS 配置的连接串。',
+  database_sslmode_invalid: '连接串中的 sslmode 无效，请修正该参数，或删除该参数后在表单中选择。',
+  database_sslmode_not_supported: '此 SSL 模式配置仅用于 Gauss 数据库。',
   database_host_invalid: '数据库主机地址无效，请检查后重试。',
   database_identifier_invalid: '表名或 Schema 格式不支持，请检查表清单。',
   database_table_schema_mismatch: '选中的表与连接的 Schema 不一致，请检查表名。',

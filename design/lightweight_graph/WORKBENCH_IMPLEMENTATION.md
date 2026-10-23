@@ -67,11 +67,17 @@ workspace/
 
    Gauss 的连接串模式支持 `jdbc:gaussdb://db.example.com:8000/business` 和 `jdbc:postgresql://db.example.com:8000/business`。粘贴 JDBC 地址后显示独立用户名、密码字段，密码中的特殊字符原样提交，无需用户编码。地址末尾的 `business` 是数据库名，Schema 仍单独填写。用户名和密码分开传递的形式参照[华为云 JDBC 连接介绍](https://support.huaweicloud.com/centralized-devg-v10-gaussdb/gaussdb-42-0082.html)。
 
-   当前支持单主机 JDBC URL；可选查询参数为 `user`、`password`、`sslmode`、`connectTimeout` / `connect_timeout`。查询参数中的特殊字符需要 URL 编码；重复参数、与单独输入不一致的凭据、其他 JDBC 驱动属性会报错，不会静默忽略。Schema 使用页面独立字段，不使用 `currentSchema` 参数。连接超时仍固定为 5 秒，远程连接仍要求 `verify-full`；本次没有增加证书配置入口或更换驱动。后端将 JDBC 地址转成现有驱动可用的连接信息，供测试、选表、元数据读取和后续运行共用，仅保留在会话内存。原生 PostgreSQL/MySQL DSN 的行为不变；服务器环境变量仍填写原生驱动 DSN。
+   当前支持单主机 JDBC URL；可选查询参数为 `user`、`password`、`sslmode`、`connectTimeout` / `connect_timeout`。查询参数中的特殊字符需要 URL 编码；重复参数、与单独输入不一致的凭据、其他 JDBC 驱动属性会报错，不会静默忽略。Schema 使用页面独立字段，不使用 `currentSchema` 参数。连接测试超时仍固定为 5 秒。后端将 JDBC 地址转成现有驱动可用的连接信息，供测试、选表、元数据读取和后续运行共用，仅保留在会话内存；服务器环境变量仍填写原生驱动 DSN。
+
+   Gauss 的分项填写和连接串模式均可选择 SSL 模式。选择“自动”时沿用连接串的 `sslmode`，连接串未指定时，远程默认 `verify-full`，本机默认 `disable`。显式选择时优先使用下拉框的值，支持 `disable`、`allow`、`prefer`、`require`、`verify-ca`、`verify-full`。`prefer` 优先尝试 SSL，并允许非 SSL 连接；`require` 要求 SSL、不验证主机名（客户端已有根证书时 libpq 可能验证证书链）；`verify-ca` 验证证书链，`verify-full` 再验证主机名。行为以 [libpq SSL 文档](https://www.postgresql.org/docs/current/libpq-ssl.html)为准。应用不在连接失败后自动换模式重试。客户可显式选择与原有客户端相同的 `prefer`；这不代表真实网络、账号、数据库版本和认证方式已经通过验证。
+
+   页面不提供上传根证书或任意服务器证书路径的入口，`verify-ca` / `verify-full` 使用部署环境配置的证书。MySQL 的 SSL 参数和默认策略保持原样，Gauss 的 `sslmode` 字段不会发送给 MySQL。所选模式随规范连接串保留在会话中，后续运行不会重置为 `verify-full`。
 
    数据库弹窗仅通过关闭按钮退出，点击遮罩、移出鼠标或向外拖选都不丢弃表单。连接状态和错误显示在正文之外的固定反馈区。测试前先校验必填项；测试及读取表清单直接调用只读接口，无需先建立凭据会话，只有保存来源时才建立会话。测试成功自动读取表清单，两个阶段分别显示进度。前端等待上限为：测试 15 秒、表清单 30 秒、会话 10 秒、元数据提交 120 秒。超时不会自动重发请求，也不代表服务端操作已经回滚。
 
-   当前前端 43 项测试及构建通过；数据库接入与会话凭据相关后端测试 108 项通过。浏览器通过 4173 代理实际验证了 JDBC 地址识别、独立账号输入、缺少用户名、本机关闭端口的连接失败。此前验证过固定错误反馈及遮罩点击保留表单；连接成功后选表、凭据向运行任务传递使用模拟接口或驱动验证，客户数据库的真实连通性仍需有效配置验证。
+   当前后端全量 994 项、前端 57 项测试及构建通过。SSL 模式覆盖分项、原生 DSN、JDBC、选表、元数据读取后的会话传递，以及正式抽取适配器传参。此前浏览器通过 4173 代理实际验证了 JDBC 地址识别、独立账号输入、缺少用户名、本机关闭端口的连接失败、固定错误反馈及遮罩点击保留表单；新增 SSL 控件本轮通过组件测试，尚未做浏览器视觉验收。连接成功流程使用模拟接口或驱动验证，客户数据库的真实连通性仍需有效配置验证。
+
+   GitHub run `39908319887` 的 macOS 失败来自取消探测单测的定时器调度竞争。测试已改为确定性控制顺序，覆盖取消成功、驱动异常、取消无效、取消晚到及未发出；仍拒绝把单纯超时当作取消成功。生产取消机制和 CI 超时未调整。
 4. 元数据提供 `tables.yaml`、`constraints.yaml`、`foreign_keys.yaml` 预览与下载。主键、唯一键、外键来自连接器声明；未读取的 CHECK/default 等保持 unknown。文件来源没有声明外键时不会凭名称自动补上。导出和打开缓存不连接数据库；全项目“读取元数据”是显式操作。
 5. 上传 Markdown 后加入 documents；无范围声明时默认全局，已有 frontmatter 范围保留。可选择数据说明、分析知识、混合或待分类，以及全局或具体表范围。绑定写回实际 frontmatter；表标识为 `source_id.schema.table`。
 6. 填写抽取目的、包含/排除内容和探索提示。在 Agent 配置中填写 URL、模型名与流式开关，API key 可直接输入为会话凭据；原有环境变量方式继续支持。

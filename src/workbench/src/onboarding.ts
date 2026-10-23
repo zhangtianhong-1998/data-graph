@@ -11,11 +11,14 @@ export const resultTabs: Array<{ id: ResultTab; label: string }> = [
   { id: 'metadata', label: '元数据图' }, { id: 'business', label: '业务图谱' }, { id: 'runs', label: '运行记录' },
 ]
 export function isResultTab(tab: WorkbenchTab): tab is ResultTab { return resultTabs.some(item => item.id === tab) }
-export interface ConnectionForm { kind: 'gauss_database' | 'mysql_database'; format: 'fields' | 'dsn'; dsn: string; host: string; port: string; database: string; username: string; password: string; schema: string }
+export type GaussSslMode = 'auto' | 'disable' | 'allow' | 'prefer' | 'require' | 'verify-ca' | 'verify-full'
+export interface ConnectionForm { kind: 'gauss_database' | 'mysql_database'; format: 'fields' | 'dsn'; dsn: string; host: string; port: string; database: string; username: string; password: string; schema: string; sslmode?: GaussSslMode }
 export interface DatabaseTable { schema: string; name: string; qualified_name: string; table_type?: string }
 export function isGaussJdbcDsn(dsn: string): boolean { return /^jdbc:(gaussdb|postgresql):\/\//.test(dsn.trim()) }
 /** The returned object goes only to the ephemeral connection endpoint, never config. */
 export function connectionPayload(form: ConnectionForm): Record<string, unknown> {
+  // Auto leaves any DSN setting intact; explicit choices are resolved by the backend.
+  const tls = form.kind === 'gauss_database' && form.sslmode && form.sslmode !== 'auto' ? { sslmode: form.sslmode } : {}
   if (form.format === 'dsn') {
     const dsn = form.dsn.trim()
     if (!dsn) throw new Error('请填写数据库连接串。')
@@ -32,12 +35,12 @@ export function connectionPayload(form: ConnectionForm): Record<string, unknown>
       // Keep special characters unchanged; the backend builds the driver connection string.
       if (form.password) credentials.password = form.password
     }
-    return { kind: form.kind, dsn, ...credentials, ...(form.schema.trim() ? { schema: form.schema.trim() } : {}) }
+    return { kind: form.kind, dsn, ...credentials, ...tls, ...(form.schema.trim() ? { schema: form.schema.trim() } : {}) }
   }
   if (!form.host.trim() || !form.database.trim() || !form.username.trim()) throw new Error('请填写主机、数据库名和用户名。')
   const port = Number(form.port)
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('端口须为 1 到 65535 之间的整数。')
-  return { kind: form.kind, host: form.host.trim(), port, database: form.database.trim(), username: form.username.trim(), password: form.password, ...(form.schema.trim() ? { schema: form.schema.trim() } : {}) }
+  return { kind: form.kind, host: form.host.trim(), port, database: form.database.trim(), username: form.username.trim(), password: form.password, ...tls, ...(form.schema.trim() ? { schema: form.schema.trim() } : {}) }
 }
 export function selectedTables(manual: string, checked: string[]): string[] {
   const tables = [...new Set([...checked, ...splitLines(manual)])]

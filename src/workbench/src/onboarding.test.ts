@@ -43,6 +43,21 @@ describe('直接连接输入', () => {
     const dsn = 'postgresql://dsn_reader:dsn_password@db.example.com:8000/analytics'
     expect(connectionPayload({ ...form, kind: 'gauss_database', format: 'dsn', dsn })).toEqual({ kind: 'gauss_database', dsn })
   })
+  it.each(['disable', 'allow', 'prefer', 'require', 'verify-ca', 'verify-full'] as const)('Gauss 分项填写明确传递 SSL 模式 %s', sslmode => {
+    expect(connectionPayload({ ...form, kind: 'gauss_database', sslmode })).toMatchObject({ kind: 'gauss_database', sslmode })
+  })
+  it.each(['postgresql://reader:fake@db.example.com:8000/analytics?sslmode=verify-full', 'jdbc:gaussdb://db.example.com:8000/analytics?sslmode=verify-full'])(
+    'SSL 选择独立于连接串，自动模式保留原参数：%s', dsn => {
+      const config: ConnectionForm = { ...form, kind: 'gauss_database', format: 'dsn', dsn }
+      expect(connectionPayload({ ...config, sslmode: 'auto' })).not.toHaveProperty('sslmode')
+      expect(connectionPayload({ ...config, sslmode: 'prefer' })).toMatchObject({ dsn, sslmode: 'prefer' })
+    },
+  )
+  it('自动模式不覆盖已有默认，MySQL 不发送残留的 Gauss SSL 选择', () => {
+    expect(connectionPayload({ ...form, kind: 'gauss_database', sslmode: 'auto' })).not.toHaveProperty('sslmode')
+    expect(connectionPayload({ ...form, sslmode: 'disable' })).not.toHaveProperty('sslmode')
+    expect(connectionPayload({ ...form, format: 'dsn', dsn: 'mysql://reader:fake@db.local/app', sslmode: 'disable' })).not.toHaveProperty('sslmode')
+  })
   it('合并发现选表、手工表名和导入表单，不默默扩大范围', () => {
     expect(selectedTables('app.manual\napp.selected\n', ['app.selected'])).toEqual(['app.selected', 'app.manual'])
     expect(() => selectedTables('', [])).toThrow('至少')

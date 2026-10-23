@@ -126,7 +126,7 @@ def test_connection_forms_are_exclusive_and_validation_hides_values(kwargs):
     "host=localhost dbname=db user=r service=private_service",
     "host=localhost dbname=db user=r passfile=/private/file",
     "host=/tmp dbname=db user=r",
-    "host=db.example.com dbname=db user=r sslmode=disable",
+    "host=db.example.com dbname=db user=r sslmode=invalid",
     "host=localhost,other dbname=db user=r",
     "host=localhost dbname=db user=r port=99999",
     "not valid PRIVATE_PASSWORD",
@@ -137,7 +137,7 @@ def test_gauss_rejects_unbounded_startup_options_and_local_file_resolution(dsn):
     assert "PRIVATE_PASSWORD" not in str(error.value)
 
 
-def test_remote_connections_require_tls_verification():
+def test_remote_connections_default_to_tls_verification():
     from psycopg.conninfo import conninfo_to_dict
     from lightgraph.sources.mysql import _connect_options
     from lightgraph.contracts import QueryLimits
@@ -149,6 +149,58 @@ def test_remote_connections_require_tls_verification():
     assert options["local_infile"] is False and options["client_flag"] == 0
     with pytest.raises(DatabaseAccessError):
         build_dsn(ConnectionSpec(kind="mysql", dsn="mysql://r:p@db.example.com/db?ssl_mode=DISABLED"))
+
+
+@pytest.mark.parametrize("mode", ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"])
+@pytest.mark.parametrize("form", ["fields", "jdbc", "native"])
+def test_explicit_ssl_mode_applies_to_tests_and_table_discovery(monkeypatch, mode, form):
+    from psycopg.conninfo import conninfo_to_dict
+    fields = {"host": "db.example.com", "database": "business", "username": "reader", "password": SECRET}
+    if form == "jdbc":
+        fields = {"dsn": "jdbc:gaussdb://db.example.com:8000/business?sslmode=verify-full", "username": "reader", "password": SECRET}
+    elif form == "native":
+        fields = {"dsn": f"postgresql://reader:{SECRET}@db.example.com:8000/business?sslmode=verify-full"}
+    value = ConnectionSpec(kind="gauss", sslmode=mode, **fields)
+    db = Connection(schema="public")
+    calls = install_driver(monkeypatch, "gauss", db)
+    assert check_connection(value) == {"status": "ok"}
+    assert discover_tables(value)["tables"][0]["qualified_name"] == "public.items"
+    for args, _ in calls:
+        options = conninfo_to_dict(args[0])
+        assert options["sslmode"] == mode
+        assert options["host"] == "db.example.com" and options["password"] == SECRET
+    assert len(calls) == 2
+    assert any("READ ONLY" in sql for sql, _ in db.executed)
+
+
+@pytest.mark.parametrize("mode", ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"])
+@pytest.mark.parametrize("prefix", ["jdbc:gaussdb", "postgresql"])
+def test_ssl_mode_in_url_preserved_without_form_override(mode, prefix):
+    from psycopg.conninfo import conninfo_to_dict
+    value = ConnectionSpec(kind="gauss", dsn=f"{prefix}://db.example.com:8000/business?user=reader&sslmode={mode}")
+    assert conninfo_to_dict(build_dsn(value))["sslmode"] == mode
+
+
+def test_invalid_ssl_mode_or_mysql_mode_cannot_silently_change_connection():
+    with pytest.raises(ValidationError):
+        spec("gauss", sslmode="unknown")
+    with pytest.raises(ValidationError, match="database_sslmode_not_supported"):
+        spec("mysql", sslmode="disable")
+    with pytest.raises(DatabaseAccessError, match="^database_sslmode_invalid$"):
+        build_dsn(ConnectionSpec(kind="gauss", dsn="jdbc:gaussdb://localhost/db?user=r&sslmode=typo", sslmode="disable"))
+
+
+def test_failed_ssl_connection_never_retries_a_weaker_mode(monkeypatch):
+    from psycopg.conninfo import conninfo_to_dict
+    calls = []
+    def fail(dsn, **kwargs):
+        calls.append(conninfo_to_dict(dsn)["sslmode"])
+        raise RuntimeError(SECRET + " certificate verify failed")
+    monkeypatch.setattr("psycopg.connect", fail)
+    value = ConnectionSpec(kind="gauss", host="db.example.com", database="business", username="reader", sslmode="require")
+    with pytest.raises(DatabaseAccessError, match="^database_connection_failed$"):
+        check_connection(value)
+    assert calls == ["require"]
 
 
 @pytest.mark.parametrize("prefix", ["jdbc:gaussdb", "jdbc:postgresql"])
@@ -195,7 +247,7 @@ def test_jdbc_credentials_conflict_is_rejected_without_echoing_secrets(query, fi
     "localhost:8000/db?service=private_service", "localhost:8000/db?passfile=/private/file",
     "localhost:8000/db?host=other", "localhost:8000/db?password=%ZZ", "localhost:8000/db?password=%FF",
     "localhost:8000/db?connectTimeout=3&connect_timeout=5", "local\nhost:8000/db",
-    "db.example.com:8000/db?sslmode=disable",
+    "db.example.com:8000/db?sslmode=invalid",
 ])
 def test_jdbc_invalid_or_unsupported_options_fail_before_connecting(monkeypatch, suffix):
     calls = install_driver(monkeypatch, "gauss", Connection())

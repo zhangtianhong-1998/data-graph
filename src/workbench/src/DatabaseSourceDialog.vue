@@ -10,7 +10,7 @@ import type { Metadata, ProjectFile, RunConfig, SourceConfig } from './types'
 const props = defineProps<{ projectId: string; source: SourceConfig | null; sources: SourceConfig[]; files: ProjectFile[]; retentionVerified: boolean; busy: boolean; error: string }>()
 const emit = defineEmits<{ close: []; save: [sources: SourceConfig[], retentionVerified: boolean]; connected: [config: RunConfig, metadata: Metadata] }>()
 const form = ref<DatabaseForm>({ id: props.source?.id || '', kind: props.source?.kind === 'mysql_database' ? 'mysql_database' : 'gauss_database', dsnEnv: typeof props.source?.dsn_env === 'string' ? props.source.dsn_env : '', tables: Array.isArray(props.source?.allowed_tables) ? props.source.allowed_tables.join('\n') : '', capabilityManifest: typeof props.source?.capability_manifest === 'string' ? props.source.capability_manifest : '' })
-const connection = ref<ConnectionForm>({ kind: form.value.kind, format: 'fields', dsn: '', host: '', port: form.value.kind === 'mysql_database' ? '3306' : '5432', database: '', username: '', password: '', schema: '' })
+const connection = ref<ConnectionForm>({ kind: form.value.kind, format: 'fields', dsn: '', host: '', port: form.value.kind === 'mysql_database' ? '3306' : '5432', database: '', username: '', password: '', schema: '', sslmode: 'auto' })
 const mode = ref<'direct' | 'environment'>('direct')
 const progress = ref('')
 const controller = new AbortController()
@@ -20,6 +20,12 @@ const manifests = computed(() => props.files.filter(file => file.kind === 'yaml'
 const missingManifest = computed(() => form.value.capabilityManifest && !manifests.value.some(file => file.relative_path === form.value.capabilityManifest))
 const locked = computed(() => props.busy || pending.value)
 const jdbcConnection = computed(() => connection.value.kind === 'gauss_database' && isGaussJdbcDsn(connection.value.dsn))
+const sslHint = computed(() => {
+  if (['disable', 'allow', 'prefer'].includes(connection.value.sslmode || '')) return '此模式可能使用未加密连接，请按数据库要求选择。'
+  if (connection.value.sslmode === 'require') return '要求加密，不校验服务器主机名。'
+  if (connection.value.sslmode === 'auto') return '优先使用连接串中的设置；未指定时，远程连接默认校验证书和主机名。'
+  return ''
+})
 const path = computed(() => projectPath(props.projectId))
 const visibleTables = computed(() => tables.value.filter(table => table.qualified_name.toLowerCase().includes(filter.value.toLowerCase())))
 const tableCount = computed(() => new Set([...checked.value, ...form.value.tables.split('\n').map(value => value.trim()).filter(Boolean)]).size)
@@ -100,6 +106,19 @@ async function submit() {
               <template v-if="connection.format === 'fields'"><div class="host-port"><div class="field"><label for="database-host">主机地址</label><input id="database-host" v-model="connection.host" :disabled="locked" placeholder="db.example.com" autocomplete="off"/></div><div class="field"><label for="database-port">端口</label><input id="database-port" v-model="connection.port" :disabled="locked" inputmode="numeric"/></div></div><div class="two-fields"><div class="field"><label for="database-name">数据库名</label><input id="database-name" v-model="connection.database" :disabled="locked" autocomplete="off"/></div><div class="field"><label for="database-schema">Schema（可选）</label><input id="database-schema" v-model="connection.schema" :disabled="locked" :placeholder="form.kind === 'mysql_database' ? '默认使用数据库名' : '例如：public'"/></div></div></template>
               <template v-else><div class="field"><label for="database-dsn">连接串</label><input id="database-dsn" v-model="connection.dsn" :disabled="locked" type="password" autocomplete="new-password" :placeholder="form.kind === 'mysql_database' ? 'mysql://用户名:密码@主机:3306/数据库' : 'jdbc:gaussdb://主机:8000/数据库'"/></div><div class="field"><label for="dsn-schema">Schema（可选）</label><input id="dsn-schema" v-model="connection.schema" :disabled="locked"/></div></template>
               <template v-if="connection.format === 'fields' || jdbcConnection"><div class="two-fields"><div class="field"><label for="database-username">用户名</label><input id="database-username" v-model="connection.username" :disabled="locked" autocomplete="off"/></div><div class="field"><label for="database-password">密码</label><input id="database-password" v-model="connection.password" :disabled="locked" type="password" autocomplete="new-password"/></div></div></template>
+              <div v-if="form.kind === 'gauss_database'" class="field">
+                <label for="database-sslmode">SSL 模式</label>
+                <select id="database-sslmode" v-model="connection.sslmode" :disabled="locked" :aria-describedby="sslHint ? 'database-sslmode-hint' : undefined">
+                  <option value="auto">自动（沿用连接串或默认设置）</option>
+                  <option value="disable">disable · 不使用 SSL</option>
+                  <option value="allow">allow · 优先非 SSL</option>
+                  <option value="prefer">prefer · 优先 SSL</option>
+                  <option value="require">require · 必须使用 SSL</option>
+                  <option value="verify-ca">verify-ca · 校验证书</option>
+                  <option value="verify-full">verify-full · 校验证书和主机名</option>
+                </select>
+                <p v-if="sslHint" id="database-sslmode-hint" class="field-hint">{{ sslHint }}</p>
+              </div>
               <div class="actions"><button type="button" class="btn" :disabled="locked" @click="testConnection">测试连接</button><span v-if="tested" class="badge green" role="status">连接成功</span></div><p class="field-hint">密码仅本次会话有效。</p>
             </section>
             <section class="connection-step"><div class="selection-head"><h3><span>2</span>选择要分析的表</h3><button type="button" class="btn small" :disabled="locked" @click="discoverTables">{{ tableLoaded ? '刷新表清单' : '读取表清单' }}</button></div><div v-if="tableLoaded" class="table-picker"><input v-model="filter" aria-label="筛选数据库表" placeholder="按表名筛选" :disabled="locked"/><div class="table-picker-head"><span>{{ visibleTables.length }} 张表</span><button type="button" :disabled="locked || !visibleTables.length" @click="toggleVisible">选择 / 取消当前筛选</button></div><div class="table-picker-items"><label v-for="table in visibleTables" :key="table.qualified_name" class="table-choice"><input v-model="checked" type="checkbox" :value="table.qualified_name" :disabled="locked"/><span>{{ table.qualified_name }}</span><small>{{ table.table_type }}</small></label><p v-if="!visibleTables.length" class="empty-state">没有匹配的表</p></div><p v-if="truncated" class="note amber">表清单已达到服务端限制，可缩小 Schema 范围后重试，或补充手动表名。</p></div>
