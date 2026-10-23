@@ -1,5 +1,7 @@
 const messages: Record<string, string> = {
   network_unavailable: '无法连接服务，请确认后端已启动。', invalid_response: '服务返回的内容无法读取，请刷新后重试。',
+  request_timeout: '请求超时，请检查后端服务、数据库地址和网络后重试。',
+  request_cancelled: '请求已取消。',
   project_not_found: '项目不存在，请重新选择。', project_exists: '项目编号已存在，请更换编号。',
   invalid_project_id: '项目编号只能包含字母、数字、短横线和下划线。',
   invalid_project_or_file_id: '项目编号须以字母或数字开头，其余只能包含字母、数字、短横线和下划线。',
@@ -50,27 +52,43 @@ export async function ensureSession(projectId: string): Promise<void> {
   const id = encodeURIComponent(projectId)
   if (sessions.has(id)) return
   if (pendingSessions.has(id)) return pendingSessions.get(id)
-  const pending = request<{ session_id: string }>(`${projectPath(projectId)}/session`, { method: 'POST', body: '{}' }).then(response => {
+  const pending = request<{ session_id: string }>(`${projectPath(projectId)}/session`, { method: 'POST', body: '{}', timeoutMs: 10000 }).then(response => {
     if (!response.session_id) throw new ApiError('invalid_response')
     sessions.set(id, response.session_id)
   }).finally(() => pendingSessions.delete(id))
   pendingSessions.set(id, pending)
   return pending
 }
-export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  let response: Response
+export type RequestOptions = RequestInit & { timeoutMs?: number }
+export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const { timeoutMs = 60000, signal, ...init } = options
+  const controller = new AbortController()
+  let timedOut = false
+  const abort = () => controller.abort()
+  signal?.addEventListener('abort', abort, { once: true })
+  if (signal?.aborted) abort()
+  // Bound both waiting for headers and reading the response body. Never retry writes automatically.
+  const timer = setTimeout(() => { timedOut = true; controller.abort() }, timeoutMs)
   try {
-    response = await fetch(`/api${path}`, { ...options, credentials: 'same-origin', cache: 'no-store',
+    const response = await fetch(`/api${path}`, { ...init, signal: controller.signal, credentials: 'same-origin', cache: 'no-store',
       headers: { ...sessionHeader(path), ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...options.headers } })
-  } catch { throw new ApiError('network_unavailable') }
-  let data: unknown
-  try { data = await response.json() } catch { throw new ApiError('invalid_response', response.status) }
-  if (!response.ok) {
-    const code = (data as { error?: { code?: unknown } })?.error?.code
-    // Render only the short public error code; never reflect raw server errors or HTML.
-    throw new ApiError(typeof code === 'string' && /^[a-zA-Z0-9_.:-]{1,100}$/.test(code) ? code : `http_${response.status}`, response.status)
+    let data: unknown
+    try { data = await response.json() } catch { throw new ApiError('invalid_response', response.status) }
+    if (!response.ok) {
+      const code = (data as { error?: { code?: unknown } })?.error?.code
+      // Render only the short public error code; never reflect raw server errors or HTML.
+      throw new ApiError(typeof code === 'string' && /^[a-zA-Z0-9_.:-]{1,100}$/.test(code) ? code : `http_${response.status}`, response.status)
+    }
+    return data as T
+  } catch (error) {
+    if (timedOut) throw new ApiError('request_timeout')
+    if (controller.signal.aborted) throw new ApiError('request_cancelled')
+    if (error instanceof ApiError) throw error
+    throw new ApiError('network_unavailable')
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', abort)
   }
-  return data as T
 }
 export const json = (value: unknown): string => JSON.stringify(value)
 export const projectPath = (id: string): string => `/projects/${encodeURIComponent(id)}`

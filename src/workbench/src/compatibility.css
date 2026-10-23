@@ -63,6 +63,9 @@ body:has(.modal-backdrop) { overflow: hidden; }
 .modal .two-fields { margin-bottom: 20px; }
 .modal .two-fields .field { margin-bottom: 0; }
 .modal .panel-footer { flex-wrap: wrap; }
+.dialog-feedback { flex: 0 0 auto; padding: 10px 23px; border-top: 1px solid var(--line); }
+.dialog-feedback .note { padding: 8px 12px; font-size: 12px; }
+.note.success { color: #22765c; background: #eaf7f1; }
 .graph-toolbar select { padding-right: 30px; }
 .graph-toolbar .actions { min-width: 0; }
 .graph-toolbar input, .graph-toolbar select { max-width: 100%; }
