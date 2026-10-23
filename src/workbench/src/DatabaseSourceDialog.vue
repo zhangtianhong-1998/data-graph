@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { updateDatabaseSources } from './database'
+import { ConnectionDraftWriter } from './connectionDraft'
+import type { ConnectionDraft, DraftResult, DraftStatus } from './connectionDraft'
 import type { DatabaseForm } from './database'
 import { connectionFormFromPayload, connectionPayload, isGaussJdbcDsn, selectedTables, validateSourceId } from './onboarding'
 import type { ConnectionForm, ConnectionPayload, DatabaseTable } from './onboarding'
@@ -29,18 +31,73 @@ const sslHint = computed(() => {
 const path = computed(() => projectPath(props.projectId))
 const visibleTables = computed(() => tables.value.filter(table => table.qualified_name.toLowerCase().includes(filter.value.toLowerCase())))
 const tableCount = computed(() => new Set([...checked.value, ...form.value.tables.split('\n').map(value => value.trim()).filter(Boolean)]).size)
-watch(() => form.value.kind, kind => { connection.value.kind = kind; connection.value.port = kind === 'mysql_database' ? '3306' : '5432' })
-watch(connection, () => { tested.value = false; tableLoaded.value = false; tables.value = []; checked.value = []; truncated.value = false; skippedCount.value = 0 }, { deep: true })
+const draftStatus = ref<DraftStatus>('idle'), draftError = ref(''), draftRecoverable = ref(false)
+const draftKey = props.source ? `source-${props.source.id}` : 'new'
+const draftPath = `${path.value}/database/drafts/${encodeURIComponent(draftKey)}`
+let restoring = true, ending = false
+const draftWriter = new ConnectionDraftWriter(props.projectId, draftPath, (status, error = '') => {
+  draftStatus.value = status; draftError.value = error
+})
+function draftSnapshot(): ConnectionDraft {
+  return { form: { ...form.value }, connection: { ...connection.value }, mode: mode.value, retention: retention.value, checked: [...checked.value] }
+}
+function saveDraft() {
+  if (!restoring && !ending && rememberConnection.value) draftWriter.update(draftSnapshot())
+}
+watch(() => form.value.kind, kind => { if (!restoring) { connection.value.kind = kind; connection.value.port = kind === 'mysql_database' ? '3306' : '5432' } }, { flush: 'sync' })
+watch(connection, () => {
+  if (restoring) return
+  tested.value = false; tableLoaded.value = false; tables.value = []; checked.value = []; truncated.value = false; skippedCount.value = 0
+}, { deep: true, flush: 'sync' })
+watch([form, connection, mode, retention, checked], saveDraft, { deep: true })
+watch(rememberConnection, async enabled => {
+  if (restoring || ending) return
+  if (enabled) { draftWriter.activate(); saveDraft(); return }
+  await forgetConnection().catch(() => {})
+})
 function clearSecrets() { connection.value.password = ''; connection.value.dsn = '' }
-function close() { if (locked.value) return; clearSecrets(); emit('close') }
-onUnmounted(() => { controller.abort(); clearSecrets() })
+async function flushDraft() { if (!restoring && !ending) await draftWriter.flush() }
+async function retryDraft() {
+  if (!rememberConnection.value) { await forgetConnection().catch(() => {}); return }
+  draftWriter.activate(); saveDraft(); await flushDraft().catch(() => {})
+}
+async function close() {
+  if (locked.value) return
+  pending.value = true; progress.value = '正在保存连接信息…'
+  try { await flushDraft() } catch { return }
+  finally { pending.value = false; progress.value = '' }
+  ending = true; clearSecrets(); emit('close')
+}
+function pageHide() { if (!restoring && !ending) void draftWriter.flush(true).catch(() => {}) }
+onUnmounted(() => {
+  pageHide(); ending = true; controller.abort(); window.removeEventListener('pagehide', pageHide); clearSecrets()
+})
 onMounted(async () => {
-  if (!props.source) return
+  window.addEventListener('pagehide', pageHide)
   await perform(async () => {
     await ensureSession(props.projectId)
     if (controller.signal.aborted) return
+    let restoredDraft = false
     try {
-      const result = await request<{ saved: boolean; connection?: ConnectionPayload }>(`${path.value}/database/connections/${encodeURIComponent(props.source!.id)}`, { signal: controller.signal })
+      const result = await request<DraftResult>(draftPath, { signal: controller.signal })
+      if (controller.signal.aborted) return
+      draftWriter.restore(result.revision)
+      if (result.saved && result.draft) {
+        const draft = result.draft
+        if (props.source && (draft.form.id !== props.source.id || draft.form.kind !== props.source.kind)) throw new Error('草稿与当前数据源不一致，请清除后重新填写。')
+        form.value = draft.form; connection.value = draft.connection; mode.value = draft.mode
+        retention.value = draft.retention; checked.value = draft.checked
+        draftStatus.value = 'saved'; restoredDraft = true; savedConnection.value = !!props.source
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return
+      const code = (error as { code?: string } | null)?.code
+      draftRecoverable.value = code === 'saved_connection_corrupt' || code === 'saved_connection_key_missing' || code === 'connection_draft_corrupt'
+      draftStatus.value = 'failed'; draftError.value = error instanceof Error ? error.message : '草稿加载失败，请重试。'
+    }
+    if (!props.source || restoredDraft) return
+    try {
+      const result = await request<{ saved: boolean; connection?: ConnectionPayload }>(`${path.value}/database/connections/${encodeURIComponent(props.source.id)}`, { signal: controller.signal })
       if (controller.signal.aborted) return
       savedConnection.value = result.saved
       if (result.saved && result.connection) {
@@ -49,26 +106,41 @@ onMounted(async () => {
         rememberConnection.value = true
       }
     } catch (error) {
-      // Corrupt encrypted profiles can still be deleted without decrypting their contents.
       const code = (error as { code?: string } | null)?.code
       if (!controller.signal.aborted && (code === 'saved_connection_corrupt' || code === 'saved_connection_key_missing')) savedConnection.value = true
       throw error
     }
-  }, '正在加载已保存连接…')
+  }, '正在加载已保存连接…', () => {}, true)
+  await nextTick()
+  restoring = false
 })
+async function forgetConnection() {
+  await draftWriter.erase()
+  if (props.source) {
+    try {
+      await request(`${path.value}/database/connections/${encodeURIComponent(props.source.id)}`, { method: 'DELETE' })
+      savedConnection.value = false
+    } catch (error) {
+      draftStatus.value = 'failed'; draftError.value = error instanceof Error ? error.message : '删除失败，请重试。'
+      throw error
+    }
+  }
+}
 async function deleteSavedConnection() {
-  if (!props.source) return
   await perform(async () => {
-    await ensureSession(props.projectId)
-    if (controller.signal.aborted) return
-    await request(`${path.value}/database/connections/${encodeURIComponent(props.source!.id)}`, { method: 'DELETE', signal: controller.signal })
-    if (controller.signal.aborted) return
-    savedConnection.value = false; rememberConnection.value = false
+    restoring = true; rememberConnection.value = false; await nextTick(); restoring = false
+    await forgetConnection()
     notice.value = '已删除保存的连接，当前填写内容仅用于本次会话。'
   }, '正在删除已保存连接…')
 }
-async function perform(operation: () => Promise<void>, message = '正在处理…', validate: () => void = () => {}) {
-  if (locked.value) return
+async function clearDraft() {
+  try {
+    await draftWriter.erase(); draftRecoverable.value = false
+    if (rememberConnection.value) { draftWriter.activate(); saveDraft(); await flushDraft() }
+  } catch { /* Status and retry are rendered separately from database errors. */ }
+}
+async function perform(operation: () => Promise<void>, message = '正在处理…', validate: () => void = () => {}, initializing = false) {
+  if (locked.value && !initializing) return
   pending.value = true; localError.value = ''; notice.value = ''; progress.value = message
   try { validate(); if (!controller.signal.aborted) await operation() }
   catch (error) { if (!controller.signal.aborted) localError.value = error instanceof Error ? error.message : '操作未完成，请重试。' }
@@ -108,6 +180,11 @@ function toggleVisible() {
   const visible = visibleTables.value.map(table => table.qualified_name)
   checked.value = visible.every(name => checked.value.includes(name)) ? checked.value.filter(name => !visible.includes(name)) : [...new Set([...checked.value, ...visible])]
 }
+async function finalizeDraft() {
+  await draftWriter.erase()
+  ending = true
+}
+defineExpose({ completeDraft: finalizeDraft })
 async function submit() {
   if (mode.value === 'environment') {
     localError.value = ''
@@ -124,6 +201,7 @@ async function submit() {
     if (controller.signal.aborted) return
     const result = await request<{ config: RunConfig; metadata: Metadata }>(`${path.value}/database/connect`, { method: 'POST', body: json({ source_id: form.value.id.trim(), remember_connection: rememberConnection.value, connection: connectionPayload(connection.value), allowed_tables: allowedTables, deployment_retention_verified: retention.value, capability_manifest: form.value.capabilityManifest || null }), signal: controller.signal, timeoutMs: 120000 })
     if (controller.signal.aborted) return
+    await finalizeDraft()
     clearSecrets(); emit('connected', result.config, result.metadata)
   }, '正在抽取元数据…')
 }
@@ -132,7 +210,7 @@ async function submit() {
 <template>
   <div class="modal-backdrop">
     <section class="modal wide database-modal" role="dialog" aria-modal="true" aria-labelledby="database-title">
-      <form @submit.prevent="submit" autocomplete="off">
+      <form @submit.prevent="submit" @focusout="flushDraft().catch(() => {})" autocomplete="off">
         <div class="panel-head"><div><h2 id="database-title">{{ source ? '编辑数据库来源' : '接入数据库' }}</h2></div><button type="button" class="close" aria-label="关闭" :disabled="locked" @click="close">×</button></div>
         <div class="panel-body">
           <div class="two-fields"><div class="field"><label for="database-kind">数据库类型</label><select id="database-kind" v-model="form.kind" :disabled="locked || !!source"><option value="gauss_database">Gauss / openGauss</option><option value="mysql_database">MySQL</option></select></div><div class="field"><label for="database-id">来源编号</label><input id="database-id" v-model="form.id" :disabled="locked || !!source" required maxlength="64" placeholder="例如：business_mysql"/></div></div>
@@ -155,7 +233,7 @@ async function submit() {
                 </select>
                 <p v-if="sslHint" id="database-sslmode-hint" class="field-hint">{{ sslHint }}</p>
               </div>
-              <div class="actions"><button type="button" class="btn" :disabled="locked" @click="testConnection">测试连接</button><span v-if="tested" class="badge green" role="status">连接成功</span></div><div class="field"><label class="checkbox-line"><input id="remember-connection" v-model="rememberConnection" type="checkbox" :disabled="locked"/>保存连接信息到本机</label><p class="field-hint">{{ rememberConnection ? '添加或更新成功后加密保存，下次打开自动加载。' : '本次连接仅在会话内使用，更新后会删除此前保存的连接。' }}</p><button v-if="savedConnection" type="button" class="btn small" :disabled="locked" @click="deleteSavedConnection">删除已保存连接</button></div>
+              <div class="actions"><button type="button" class="btn" :disabled="locked" @click="testConnection">测试连接</button><span v-if="tested" class="badge green" role="status">连接成功</span></div><div class="field"><label class="checkbox-line"><input id="remember-connection" v-model="rememberConnection" type="checkbox" :disabled="locked"/>保存连接信息到本机</label><p class="field-hint">{{ rememberConnection ? '填写后自动加密保存，刷新后继续填写。' : '仅用于本次会话，此前保存的连接和草稿会被删除。' }}</p><button v-if="savedConnection" type="button" class="btn small" :disabled="locked" @click="deleteSavedConnection">删除已保存连接</button></div>
             </section>
             <section class="connection-step"><div class="selection-head"><h3><span>2</span>选择要分析的表</h3><button type="button" class="btn small" :disabled="locked" @click="discoverTables">{{ tableLoaded ? '刷新表清单' : '读取表清单' }}</button></div><div v-if="tableLoaded" class="table-picker"><input v-model="filter" aria-label="筛选数据库表" placeholder="按表名筛选" :disabled="locked"/><div class="table-picker-head"><span>{{ visibleTables.length }} 张表</span><button type="button" :disabled="locked || !visibleTables.length" @click="toggleVisible">选择 / 取消当前筛选</button></div><div class="table-picker-items"><label v-for="table in visibleTables" :key="table.qualified_name" class="table-choice"><input v-model="checked" type="checkbox" :value="table.qualified_name" :disabled="locked"/><span>{{ table.qualified_name }}</span><small>{{ table.table_type }}</small></label><p v-if="!visibleTables.length" class="empty-state">没有匹配的表</p></div><p v-if="skippedCount" class="field-hint">已跳过 {{ skippedCount }} 张不支持表名的表。</p><p v-if="truncated" class="note amber">表清单已达到服务端限制，可缩小 Schema 范围后重试，或补充手动表名。</p></div>
               <div class="field manual-tables"><div class="selection-head"><label for="database-tables">补充表名</label><button type="button" class="btn small" :disabled="locked" @click="listFileInput?.click()">从 Excel 导入表清单</button><input ref="listFileInput" type="file" hidden accept=".xlsx" @change="importTableList"/></div><textarea id="database-tables" v-model="form.tables" :disabled="locked" :placeholder="form.kind === 'mysql_database' ? '每行一张表，例如：\nanalytics.metrics\nanalytics.organizations' : '每行一张表，例如：\npublic.metrics\npublic.organizations'"/><p class="field-hint">已选 {{ tableCount }} 张表</p></div>
@@ -163,6 +241,12 @@ async function submit() {
           </template>
           <template v-else><div class="field"><label for="database-env">数据库连接环境变量名</label><input id="database-env" v-model="form.dsnEnv" :disabled="locked" required placeholder="LIGHTGRAPH_MYSQL_DSN" autocomplete="off"/></div><div class="field"><label for="environment-tables">允许查询的表</label><textarea id="environment-tables" v-model="form.tables" :disabled="locked" required placeholder="每行一张表，包含 Schema；不使用通配符。"/></div></template>
           <details class="connection-advanced"><summary>运行权限与高级选项</summary><div class="field"><label for="database-manifest">能力验证文件（可选）</label><select id="database-manifest" v-model="form.capabilityManifest" :disabled="locked"><option value="">暂不指定</option><option v-if="missingManifest" :value="form.capabilityManifest" disabled>原文件不在上传列表，请重新选择</option><option v-for="file in manifests" :key="file.file_id" :value="file.relative_path">{{ file.name }}</option></select></div><div class="retention-box"><label class="checkbox-line"><input v-model="retention" type="checkbox" :disabled="locked"/>此项目的部署环境已完成数据留存检查</label><p class="field-hint">此项影响真实实例数据的抽取。未确认时仍可连接并读取元数据。</p></div><p v-if="source?.allowed_columns" class="field-hint">已有列级访问限制会保留。</p></details>
+        </div>
+        <div v-if="draftStatus !== 'idle'" class="draft-feedback panel-footer" aria-live="polite">
+          <span v-if="draftStatus === 'saving'" role="status">连接草稿保存中…</span>
+          <span v-else-if="draftStatus === 'saved'" role="status">连接草稿已保存到本机</span>
+          <span v-else-if="draftStatus === 'off'" role="status">连接信息仅用于本次会话</span>
+          <template v-else-if="draftStatus === 'failed'"><span role="alert">{{ rememberConnection ? '连接草稿未保存' : '连接信息删除失败' }}：{{ draftError }}</span> <button type="button" class="btn small" :disabled="locked" @click="retryDraft">{{ rememberConnection ? '重试保存' : '重试删除' }}</button></template><button v-if="draftRecoverable" type="button" class="btn small" :disabled="locked" @click="clearDraft">清除损坏草稿</button>
         </div>
         <div v-if="localError || error || pending || tested || notice" class="dialog-feedback" aria-live="polite">
           <p v-if="localError || error" class="note amber" role="alert">{{ localError || error }}</p>

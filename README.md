@@ -103,7 +103,7 @@ scope:
 
 参考 [examples/gauss.yaml](examples/gauss.yaml)。数据库连接串通过配置指定的环境变量读取。模型密钥可用环境变量，也可放在不提交 Git 的本地 Agent 配置中，详见下面的模型配置；密钥不进入运行报告。
 
-使用工作台时，可直接填写 `jdbc:gaussdb://主机:8000/数据库`，单独填写用户名、密码并选择 SSL 模式。勾选“保存连接信息到本机”后，成功接入的连接会按项目加密保存，刷新或重启后可加载；可在编辑来源时删除已保存连接。存储位置与访问边界见 [工作台实现说明](design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md#数据库连接保存与会话凭据)。数据库检索返回的样本数据仍不保存。
+使用工作台时，可直接填写 `jdbc:gaussdb://主机:8000/数据库`，单独填写用户名、密码并选择 SSL 模式。默认勾选“保存连接信息到本机”，填写时即按项目加密保存草稿，无须先测试或抽取元数据，刷新后继续填写。接入成功后另存正式连接，供后续运行加载；可取消保存或删除已保存连接。存储位置与访问边界见 [工作台实现说明](design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md#数据库连接保存与会话凭据)。数据库检索返回的样本数据仍不保存。
 
 ```bash
 .venv/bin/lightgraph connect-check examples/gauss.yaml

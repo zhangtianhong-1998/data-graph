@@ -22,6 +22,7 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from ..errors import LightGraphError
 from ..runtime.config import SourceConfig
+from .connection_drafts import DatabaseDraft, SaveConnectionDraft
 from .database_access import ConnectionSpec
 
 
@@ -126,7 +127,7 @@ class SavedConnections:
         if not self.key_path.exists():
             # Never silently rotate a lost key: all existing profiles would
             # become unreadable. Inspect profile paths only, never project data.
-            if not create or next(self.root.glob("*/.connections/*.enc"), None) is not None:
+            if not create or self._has_saved_content():
                 raise LightGraphError("saved_connection_key_missing")
             _atomic_write(self.key_path, Fernet.generate_key())
         try:
@@ -138,11 +139,114 @@ class SavedConnections:
             # explicitly deleted. Never treat unsafe paths as damaged contents.
             if exc.code != "saved_connection_corrupt":
                 raise
-        if create and next(self.root.glob("*/.connections/*.enc"), None) is None:
+        if create and not self._has_saved_content():
             key = Fernet.generate_key()
             _atomic_write(self.key_path, key)
             return Fernet(key)
         raise LightGraphError("saved_connection_corrupt") from None
+
+    def _has_saved_content(self) -> bool:
+        # Drafts share the key with runnable profiles. Rotating while either
+        # collection remains would destroy recoverable connection information.
+        return any(next(self.root.glob(pattern), None) is not None for pattern in
+                   ("*/.connections/*.enc", "*/.connection-drafts/*.enc"))
+
+    def _draft_path(self, pid: str, key: str) -> Path:
+        if (not isinstance(pid, str) or not _PROJECT_ID.fullmatch(pid) or
+                not isinstance(key, str) or not (key == "new" or
+                    key.startswith("source-") and _SOURCE_ID.fullmatch(key[7:]))):
+            raise LightGraphError("saved_connection_invalid")
+        path = self.root / pid / ".connection-drafts" / (key + ".enc")
+        _safe_path(path)
+        return path
+
+    def save_draft(self, pid: str, key: str, draft: DatabaseDraft, revision: int) -> int:
+        """Save an unfinished form; delayed requests cannot replace newer edits."""
+        with _LOCK, _safe_storage_errors():
+            path = self._draft_path(pid, key)
+            try:
+                request = SaveConnectionDraft(draft=draft, revision=revision)
+            except (ValueError, TypeError):
+                raise LightGraphError("saved_connection_invalid") from None
+            deleted_revision = self._draft_tombstone(path)
+            current = self.load_draft(pid, key)
+            if deleted_revision is not None and revision <= deleted_revision:
+                return max(deleted_revision, current["revision"] if current is not None else 0)
+            if current is not None and revision <= current["revision"]:
+                return current["revision"]
+            _private_directory(path.parent)
+            cipher = self._cipher(create=True)
+            payload = {"version": 1, "project_id": pid, "draft_key": key,
+                       "draft": request.draft.to_payload(), "revision": request.revision}
+            encoded = cipher.encrypt(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            if len(encoded) > _MAX_PROFILE_BYTES:
+                raise LightGraphError("saved_connection_invalid")
+            _atomic_write(path, encoded)
+            return revision
+
+    def load_draft(self, pid: str, key: str) -> dict | None:
+        with _LOCK, _safe_storage_errors():
+            path = self._draft_path(pid, key)
+            if not path.exists():
+                return None
+            cipher = self._cipher(create=False)
+            try:
+                payload = json.loads(cipher.decrypt(_read(path, _MAX_PROFILE_BYTES)))
+                if not isinstance(payload, dict) or payload.get("version") != 1:
+                    raise ValueError("invalid_draft")
+                draft = SaveConnectionDraft.model_validate({"draft": payload["draft"],
+                                                             "revision": payload["revision"]})
+            except (InvalidToken, ValueError, TypeError, KeyError):
+                raise LightGraphError("saved_connection_corrupt") from None
+            if (payload.get("project_id"), payload.get("draft_key")) != (pid, key):
+                return None
+            deleted_revision = self._draft_tombstone(path)
+            if deleted_revision is not None and draft.revision <= deleted_revision:
+                return None
+            return {"draft": draft.draft.to_payload(), "revision": draft.revision}
+
+    def _draft_tombstone(self, path: Path) -> int | None:
+        marker = path.with_suffix(".rev")
+        _safe_path(marker)
+        if not marker.exists():
+            return None
+        value = _read(marker, 32)
+        if not re.fullmatch(rb"0|[1-9][0-9]{0,15}", value) or int(value) > 2**53 - 1:
+            raise LightGraphError("saved_connection_corrupt")
+        return int(value)
+
+    def load_draft_revision(self, pid: str, key: str) -> int:
+        """Seed client ordering after a refresh, including explicitly erased drafts."""
+        with _LOCK, _safe_storage_errors():
+            deleted = self._draft_tombstone(self._draft_path(pid, key))
+            current = self.load_draft(pid, key)
+            return max(deleted or 0, current["revision"] if current is not None else 0)
+
+    def delete_draft(self, pid: str, key: str, revision: int | None = None) -> int:
+        """Keep a nonsecret revision so late unload requests cannot restore secrets."""
+        with _LOCK, _safe_storage_errors():
+            path = self._draft_path(pid, key)
+            if revision is not None and (type(revision) is not int or not 0 <= revision <= 2**53 - 1):
+                raise LightGraphError("saved_connection_invalid")
+            deleted = self._draft_tombstone(path)
+            try:
+                current = self.load_draft(pid, key)
+            except LightGraphError as exc:
+                # Erasure must still work after key loss or corrupt ciphertext.
+                # Never downgrade unsafe paths or genuine I/O errors to erasure.
+                if exc.code not in {"saved_connection_key_missing", "saved_connection_corrupt"}:
+                    raise
+                current = None
+            highest = max(deleted or 0, current["revision"] if current is not None else 0)
+            if revision is None:
+                revision = highest
+            elif (deleted is not None and revision <= deleted or
+                    current is not None and revision < current["revision"]):
+                return highest
+            _private_directory(path.parent)
+            _atomic_write(path.with_suffix(".rev"), str(revision).encode("ascii"))
+            path.unlink(missing_ok=True)
+            return revision
 
     def save(self, pid: str, source: SourceConfig, connection: ConnectionSpec, dsn: str) -> None:
         with _LOCK, _safe_storage_errors():

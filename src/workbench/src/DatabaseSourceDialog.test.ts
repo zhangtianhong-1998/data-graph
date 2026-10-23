@@ -5,9 +5,9 @@ import type { App } from 'vue'
 import type { SourceConfig } from './types'
 import DatabaseSourceDialog from './DatabaseSourceDialog.vue'
 
-const api = vi.hoisted(() => ({ request: vi.fn(), ensureSession: vi.fn() }))
+const api = vi.hoisted(() => ({ request: vi.fn(), draftRequest: vi.fn(), ensureSession: vi.fn() }))
 vi.mock('./api', () => ({
-  request: api.request,
+  request: (path: string, options: Record<string, unknown>) => path.includes('/database/drafts/') ? api.draftRequest(path, options) : api.request(path, options),
   ensureSession: api.ensureSession,
   projectPath: (id: string) => `/projects/${id}`,
   json: JSON.stringify,
@@ -84,10 +84,13 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  api.draftRequest.mockReset().mockImplementation((_path: string, options: RequestInit = {}) => Promise.resolve({ saved: options.method === 'PUT', revision: options.body ? JSON.parse(String(options.body)).revision : 0 }))
   api.request.mockReset()
   api.ensureSession.mockReset().mockResolvedValue(undefined)
   mount()
+  await vi.waitFor(() => expect(button('测试连接').disabled).toBe(false))
+  api.ensureSession.mockClear(); api.draftRequest.mockClear()
 })
 afterEach(() => { app?.unmount(); app = undefined; root.remove() })
 
@@ -110,8 +113,7 @@ describe('数据库连接弹窗', () => {
   it('显式关闭会清除凭据并通知父组件', async () => {
     await fillConnection()
     element<HTMLButtonElement>('button[aria-label="关闭"]').click()
-    await nextTick()
-    expect(onClose).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(onClose).toHaveBeenCalledOnce())
     expect(element<HTMLInputElement>('#database-password').value).toBe('')
   })
 
@@ -374,7 +376,7 @@ describe('数据库连接本机保存与恢复', () => {
     expect(onClose).not.toHaveBeenCalled()
   })
 
-  it('删除失败保留保存状态并显示错误', async () => {
+  it('删除失败保留删除按钮并显示错误，暂停自动保存防止复活', async () => {
     api.request.mockResolvedValueOnce({ saved: true, connection: savedFields })
     reopenSource()
     await vi.waitFor(() => expect(root.textContent).toContain('删除已保存连接'))
@@ -382,8 +384,12 @@ describe('数据库连接本机保存与恢复', () => {
     button('删除已保存连接').click()
     await vi.waitFor(() => expect(root.querySelector('[role="alert"]')).not.toBeNull())
     expect(element('[role="alert"]').textContent).toContain('连接信息保存或加载失败')
-    expect(element<HTMLInputElement>('#remember-connection').checked).toBe(true)
+    expect(element<HTMLInputElement>('#remember-connection').checked).toBe(false)
     expect(button('删除已保存连接').disabled).toBe(false)
+    api.request.mockResolvedValueOnce({ saved: false })
+    button('重试删除').click()
+    await vi.waitFor(() => expect(root.textContent).not.toContain('删除已保存连接'))
+    expect(api.request.mock.calls.at(-1)![1].method).toBe('DELETE')
   })
 
   it('加载失败显示错误且不阻止手工重新填写', async () => {
@@ -429,5 +435,156 @@ describe('数据库连接本机保存与恢复', () => {
     element<HTMLInputElement>('.table-choice input').click()
     await nextTick()
     expect(element('.manual-tables').textContent).toContain('已选 1 张表')
+  })
+})
+
+describe('未连接成功的数据库草稿', () => {
+  it('未填写来源编号或有效 JDBC 地址也自动保存，不测试数据库，不写浏览器存储', async () => {
+    const localWrite = vi.spyOn(Storage.prototype, 'setItem')
+    await useDsn('jdbc:gaussdb://unfinished-host:')
+    await vi.waitFor(() => expect(api.draftRequest.mock.calls.some(call => call[1]?.method === 'PUT')).toBe(true))
+    const write = api.draftRequest.mock.calls.find(call => call[1]?.method === 'PUT')!
+    expect(write[0]).toBe('/projects/dialog-test/database/drafts/new')
+    const payload = JSON.parse(write[1].body)
+    expect(payload.draft.form.id).toBe('')
+    expect(payload.draft.connection.dsn).toBe('jdbc:gaussdb://unfinished-host:')
+    expect(Number.isSafeInteger(payload.revision)).toBe(true)
+    expect(api.request).not.toHaveBeenCalled()
+    expect(localWrite).not.toHaveBeenCalled()
+    expect(element('.draft-feedback').textContent).toContain('已保存到本机')
+    localWrite.mockRestore()
+  })
+
+  it('刷新后恢复未完成连接的完整输入，不需要先添加数据源', async () => {
+    await useDsn('jdbc:gaussdb://partial')
+    await inputValue('#database-id', 'new-draft')
+    await inputValue('#database-username', 'draft-reader')
+    await inputValue('#database-password', ' secret :@+= ')
+    await inputValue('#database-tables', 'public.metrics\npublic.organizations')
+    await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('已保存到本机'))
+    const saved = JSON.parse(api.draftRequest.mock.calls.filter(call => call[1]?.method === 'PUT').at(-1)![1].body)
+    app?.unmount(); root.remove()
+    api.draftRequest.mockResolvedValueOnce({ saved: true, ...saved })
+    mount()
+    await vi.waitFor(() => expect(root.querySelector('#database-dsn')).not.toBeNull())
+    expect(element<HTMLInputElement>('#database-dsn').value).toBe('jdbc:gaussdb://partial')
+    expect(element<HTMLInputElement>('#database-id').value).toBe('new-draft')
+    expect(element<HTMLInputElement>('#database-username').value).toBe('draft-reader')
+    expect(element<HTMLInputElement>('#database-password').value).toBe(' secret :@+= ')
+    expect(element<HTMLTextAreaElement>('#database-tables').value).toContain('public.organizations')
+    expect(api.request).not.toHaveBeenCalled()
+  })
+
+  it('恢复已选表不会被连接字段的 watcher 清空，成功连接后清除草稿', async () => {
+    await fillConnection()
+    api.request.mockResolvedValueOnce({ tables: [{ schema: 'public', name: 'metrics', qualified_name: 'public.metrics' }], truncated: false })
+    button('读取表清单').click()
+    await vi.waitFor(() => expect(root.querySelector('.table-choice')).not.toBeNull())
+    element<HTMLInputElement>('.table-choice input').click()
+    await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('已保存到本机'))
+    const saved = JSON.parse(api.draftRequest.mock.calls.filter(call => call[1]?.method === 'PUT').at(-1)![1].body)
+    expect(saved.draft.checked).toEqual(['public.metrics'])
+    app?.unmount(); root.remove()
+    api.draftRequest.mockResolvedValueOnce({ saved: true, ...saved }); mount()
+    await vi.waitFor(() => expect(root.querySelector('.draft-feedback')?.textContent).toContain('已保存到本机'))
+    expect(element('.manual-tables').textContent).toContain('已选 1 张表')
+    api.request.mockResolvedValueOnce({ config: {}, metadata: {} })
+    element('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await vi.waitFor(() => expect(onConnected).toHaveBeenCalledOnce())
+    expect(JSON.parse(api.request.mock.calls.filter(call => call[0].endsWith('/connect')).at(-1)![1].body).allowed_tables).toEqual(['public.metrics'])
+    expect(api.draftRequest.mock.calls.filter(call => call[1]?.method === 'DELETE')).toHaveLength(1)
+  })
+
+  it('数据库测试失败仍保存连接草稿', async () => {
+    await fillConnection()
+    api.request.mockRejectedValueOnce(new Error('数据库连接失败'))
+    button('测试连接').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('数据库连接失败'))
+    await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('已保存到本机'))
+    expect(api.draftRequest.mock.calls.some(call => call[1]?.method === 'DELETE')).toBe(false)
+    const payload = JSON.parse(api.draftRequest.mock.calls.filter(call => call[1]?.method === 'PUT').at(-1)![1].body)
+    expect(payload.draft.connection.password).toBe('fake-password-for-tests')
+  })
+
+  it('立即刷新发送 keepalive 最新草稿且不被组件卸载取消', async () => {
+    await useDsn('jdbc:gaussdb://last-character')
+    window.dispatchEvent(new Event('pagehide'))
+    const write = api.draftRequest.mock.calls.find(call => call[1]?.method === 'PUT')!
+    expect(write).toBeTruthy()
+    expect(write[1].keepalive).toBe(true)
+    expect(write[1].signal).toBeUndefined()
+    expect(JSON.parse(write[1].body).draft.connection.dsn).toBe('jdbc:gaussdb://last-character')
+    app?.unmount(); app = undefined
+    await nextTick()
+    expect(write[1].signal).toBeUndefined()
+  })
+
+  it('显式关闭先等待保存完成', async () => {
+    await fillConnection()
+    const saving = deferred<unknown>()
+    api.draftRequest.mockReturnValueOnce(saving.promise)
+    element<HTMLButtonElement>('button[aria-label="关闭"]').click()
+    await vi.waitFor(() => expect(api.draftRequest).toHaveBeenCalledOnce())
+    expect(onClose).not.toHaveBeenCalled()
+    saving.resolve({ saved: true, revision: JSON.parse(api.draftRequest.mock.calls[0]![1].body).revision })
+    await vi.waitFor(() => expect(onClose).toHaveBeenCalledOnce())
+  })
+
+  it('取消保存等待旧写入后删除，迟到响应不触发新保存', async () => {
+    await fillConnection()
+    const saving = deferred<unknown>()
+    api.draftRequest.mockReturnValueOnce(saving.promise)
+    element('#database-password').dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
+    await vi.waitFor(() => expect(api.draftRequest).toHaveBeenCalledOnce())
+    const previousRevision = JSON.parse(api.draftRequest.mock.calls[0]![1].body).revision
+    element<HTMLInputElement>('#remember-connection').click()
+    await nextTick()
+    expect(api.draftRequest).toHaveBeenCalledOnce()
+    saving.resolve({ saved: true, revision: previousRevision })
+    await vi.waitFor(() => expect(api.draftRequest).toHaveBeenCalledTimes(2))
+    const deletion = api.draftRequest.mock.calls[1]!
+    expect(deletion[1].method).toBe('DELETE')
+    expect(JSON.parse(deletion[1].body).revision).toBeGreaterThan(previousRevision)
+    await inputValue('#database-password', 'not-persisted')
+    window.dispatchEvent(new Event('pagehide'))
+    await new Promise(resolve => setTimeout(resolve, 300))
+    expect(api.draftRequest).toHaveBeenCalledTimes(2)
+    expect(element('.draft-feedback').textContent).toContain('仅用于本次会话')
+  })
+
+  it('保存失败可见并可重试，不阻止继续编辑', async () => {
+    await useDsn('jdbc:gaussdb://partial')
+    api.draftRequest.mockRejectedValueOnce(new Error('本机存储权限不足'))
+    await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('本机存储权限不足'))
+    expect(element<HTMLInputElement>('#database-dsn').disabled).toBe(false)
+    button('重试保存').click()
+    await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('已保存到本机'))
+    expect(api.draftRequest.mock.calls.filter(call => call[1]?.method === 'PUT')).toHaveLength(2)
+  })
+
+  it('损坏的新增草稿能清除并重新保存', async () => {
+    app?.unmount(); root.remove()
+    api.draftRequest.mockRejectedValueOnce(Object.assign(new Error('草稿无法解密'), { code: 'saved_connection_corrupt' }))
+    mount()
+    await vi.waitFor(() => expect(root.textContent).toContain('清除损坏草稿'))
+    await inputValue('#database-host', 'restored.invalid')
+    button('清除损坏草稿').click()
+    await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('已保存到本机'))
+    expect(api.draftRequest.mock.calls.some(call => call[1]?.method === 'DELETE')).toBe(true)
+    expect(element<HTMLInputElement>('#database-host').value).toBe('restored.invalid')
+  })
+
+  it('其他页面已更新草稿时不关闭，刷新也不会反向覆盖', async () => {
+    await useDsn('jdbc:gaussdb://older')
+    api.draftRequest.mockImplementationOnce((_path, options) => Promise.resolve({ saved: true, revision: JSON.parse(options.body).revision + 100 }))
+    element<HTMLButtonElement>('button[aria-label="关闭"]').click()
+    await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('其他页面更新了连接草稿'))
+    expect(onClose).not.toHaveBeenCalled()
+    window.dispatchEvent(new Event('pagehide'))
+    await nextTick()
+    expect(api.draftRequest).toHaveBeenCalledOnce()
+    button('重试保存').click()
+    await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('已保存到本机'))
+    expect(api.draftRequest).toHaveBeenCalledTimes(2)
   })
 })

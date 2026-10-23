@@ -7,6 +7,7 @@ import { configurationTabs, resultTabs, isResultTab } from './onboarding'
 import type { ConfigurationTab, ResultTab, WorkbenchTab } from './onboarding'
 import { ApiError, ensureSession, clearSessions, json, projectPath, request } from './api'
 import { assertNoCredentials, isActive, runLabels, splitLines, stageLabel } from './state'
+import { WorkbenchLocation } from './workbenchLocation'
 import type { DocumentScope, Graph, Metadata, Project, ProjectFile, Run, RunConfig, SourceConfig } from './types'
 
 
@@ -40,6 +41,8 @@ const runs = ref<Run[]>([])
 const selectedRun = ref<Run | null>(null)
 const newProjectOpen = ref(false), newName = ref(''), newId = ref('')
 const databaseOpen = ref(false), databaseSource = ref<SourceConfig | null>(null)
+const databaseDialog = ref<{ completeDraft: () => Promise<void> } | null>(null)
+const workbenchLocation = new WorkbenchLocation()
 const uploadInput = ref<HTMLInputElement | null>(null)
 const documentInput = ref<HTMLInputElement | null>(null)
 const bindingFile = ref<ProjectFile | null>(null)
@@ -81,13 +84,14 @@ async function action(fn: () => Promise<void>) {
 async function reloadProjects(select?: string) {
   const response = await request<{ projects: Project[] }>('/projects')
   projects.value = response.projects
-  if (!select && project.value) return
-  const next = select || response.projects[0]?.project_id
+  if (!select && project.value && response.projects.some(item => item.project_id === project.value?.project_id)) return
+  const next = select || workbenchLocation.preferredProject(response.projects)
   if (next) await loadProject(next)
-  else loading.value = false
+  else { project.value = null; databaseOpen.value = false; loading.value = false }
 }
 async function loadProject(id: string) {
   if (project.value && project.value.project_id !== id && dirty.value && !window.confirm('当前项目有未保存的目标或模型修改。切换项目会放弃这些修改，继续吗？')) return
+  workbenchLocation.selectProject(id)
   const epoch = ++generation
   clearTimeout(pollTimer); loading.value = true; error.value = ''; selectedRun.value = null; preview.value = null; bindingFile.value = null; databaseOpen.value = false; modelKey.value = ''; credentials.value = { database_sources: [], model: false }
   const p = projectPath(id)
@@ -106,6 +110,10 @@ async function loadProject(id: string) {
     if (failed?.status === 'rejected') report(failed.reason)
     selectedRun.value = runs.value[0] || null
     schedulePoll(epoch)
+    const restored = workbenchLocation.restoreDatabase(id, config.value.sources || [])
+    if (restored && !activeRun.value) {
+      tab.value = 'inputs'; databaseSource.value = restored.source; databaseOpen.value = true
+    }
   } catch (exception) { if (epoch === generation) { project.value = null; report(exception) } }
   finally { if (epoch === generation) loading.value = false }
 }
@@ -222,10 +230,18 @@ async function saveAdvanced() {
   })
 }
 async function openDatabaseSource(source: SourceConfig | null = null) {
-  await action(async () => { if (dirty.value) await saveForms(); error.value = ''; databaseSource.value = source; databaseOpen.value = true })
+  await action(async () => {
+    if (dirty.value) await saveForms()
+    error.value = ''; databaseSource.value = source; databaseOpen.value = true
+    workbenchLocation.openDatabase(project.value!.project_id, source?.id ?? null)
+  })
+}
+function closeDatabaseSource() {
+  databaseOpen.value = false
+  if (project.value) workbenchLocation.closeDatabase(project.value.project_id)
 }
 async function databaseConnected(value: RunConfig, result: Metadata) {
-  databaseOpen.value = false
+  closeDatabaseSource()
   await action(async () => { fillForms(value); metadata.value = result; await refreshProjectConfig(); await refreshCredentials(); notify('数据库已接入，选中表的元数据已生成') })
 }
 
@@ -233,7 +249,8 @@ async function saveDatabaseSources(sources: SourceConfig[], retentionVerified: b
   await action(async () => {
     const value = { ...formConfig(), sources, deployment_retention_verified: retentionVerified }
     fillForms(await request<RunConfig>(`${path.value}/config`, { method: 'PUT', body: json(value) }))
-    databaseOpen.value = false; await refreshCredentials(); notify('数据库来源已保存，点击读取元数据可连接服务器。')
+    await databaseDialog.value?.completeDraft()
+    closeDatabaseSource(); await refreshCredentials(); notify('数据库来源已保存，点击读取元数据可连接服务器。')
   })
 }
 onMounted(async () => { try { await reloadProjects() } catch (exception) { report(exception); loading.value = false } })
@@ -285,7 +302,7 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
         </div>
       </template>
     </main>
-    <DatabaseSourceDialog v-if="databaseOpen" :project-id="project?.project_id || ''" :source="databaseSource" :sources="config.sources || []" :files="project?.files || []" :retention-verified="config.deployment_retention_verified === true" :busy="busy" :error="error" @close="databaseOpen = false" @save="saveDatabaseSources" @connected="databaseConnected"/>
+    <DatabaseSourceDialog v-if="databaseOpen" ref="databaseDialog" :project-id="project?.project_id || ''" :source="databaseSource" :sources="config.sources || []" :files="project?.files || []" :retention-verified="config.deployment_retention_verified === true" :busy="busy" :error="error" @close="closeDatabaseSource" @save="saveDatabaseSources" @connected="databaseConnected"/>
     <div v-if="newProjectOpen" class="modal-backdrop" @click.self="!busy && (newProjectOpen = false)"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="new-project-title"><form @submit.prevent="createProject"><div class="panel-head"><h2 id="new-project-title">新建项目</h2><button type="button" class="close" aria-label="关闭" :disabled="busy" @click="newProjectOpen = false">×</button></div><div class="panel-body"><p v-if="error" class="note amber" role="alert">{{ error }}</p><div class="field"><label for="new-name">项目名称</label><input id="new-name" v-model="newName" required maxlength="120" autofocus placeholder="例如：经营分析知识图谱"/></div><div class="field"><label for="new-id">项目编号（可选）</label><input id="new-id" v-model="newId" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="留空由服务端生成"/><p class="field-hint">用于 workspace 下的隔离文件夹，创建后保持不变。</p></div></div><div class="panel-footer"><span>文件夹不存在时会自动创建</span><button class="btn primary" :disabled="busy || !newName.trim()">创建项目</button></div></form></section></div>
     <div v-if="bindingFile" class="modal-backdrop" @click.self="!busy && (bindingFile = null)"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="binding-title"><div class="panel-head"><h2 id="binding-title">文档用途与使用范围</h2><button class="close" aria-label="关闭" :disabled="busy" @click="bindingFile = null">×</button></div><div class="panel-body"><p class="document-name">{{ bindingFile.name }}</p><p v-if="error" class="note amber" role="alert">{{ error }}</p><div class="field"><label for="doc-purpose">文档用途</label><select id="doc-purpose" v-model="bindingPurpose"><option v-for="(label, key) in purposeLabels" :key="key" :value="key">{{ label }}</option></select></div><div class="field"><label>使用范围</label><div class="radio-line"><label><input v-model="bindingMode" type="radio" value="global"/>全局使用</label><label><input v-model="bindingMode" type="radio" value="tables"/>绑定具体表</label></div></div><div v-if="bindingMode === 'tables'" class="binding-options"><p v-if="!metadata.tables.length" class="note amber">请先关闭此窗口并读取元数据，再选择表。</p><label v-for="table in metadata.tables" :key="tableKey(table)" class="check-option"><input v-model="bindingTables" type="checkbox" :value="tableKey(table)"/><span>{{ tableKey(table) }}</span></label><p v-if="bindingScope.columns.length" class="field-hint">已有列限制将保留：{{ bindingScope.columns.join('、') }}</p></div><p v-else class="note">所有相关分析都可使用此文档；设置为全局会移除原有表和列限制。</p></div><div class="panel-footer"><span>只影响上下文使用范围，不授予数据访问权限</span><button class="btn primary" :disabled="busy || (bindingMode === 'tables' && !bindingTables.length)" @click="saveBinding">保存绑定</button></div></section></div>
     <div v-if="preview" class="modal-backdrop" @click.self="preview = null"><section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="preview-title"><div class="panel-head"><h2 id="preview-title">{{ preview.name }}</h2><button class="close" aria-label="关闭" @click="preview = null">×</button></div><div class="panel-body"><pre class="code file-preview">{{ preview.content }}</pre></div></section></div>

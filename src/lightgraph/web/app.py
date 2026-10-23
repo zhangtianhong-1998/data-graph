@@ -26,6 +26,7 @@ from .workspace import Workspace
 from .execution import RunManager, read_graph, read_metadata
 from .credentials import SessionCredentials
 from .saved_connections import SavedConnections
+from .connection_drafts import SaveConnectionDraft
 from .database_access import (ConnectionSpec, build_dsn, test_connection,
                               discover_tables, parse_table_list_excel, normalize_selected_tables)
 
@@ -120,6 +121,10 @@ class ImportConfig(InputModel):
 
 class ModelCredential(InputModel):
     api_key: SecretStr = Field(min_length=1,max_length=16384)
+
+
+class DeleteConnectionDraft(InputModel):
+    revision: int = Field(ge=0,le=9007199254740991)
 
 
 class DatabaseRequest(InputModel):
@@ -337,6 +342,50 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             metadata['files']=_yaml_files(metadata['tables'],metadata.get('sources'))
             return {'config':workspace.get_config(pid),'metadata':metadata,
                     'credentials':credential_status(pid,x_workbench_session)}
+
+    def draft_source(pid, key):
+        if key == 'new':
+            return None
+        if not key.startswith('source-'):
+            raise LightGraphError('saved_connection_invalid')
+        source=next((s for s in workspace.resolved_config(pid).sources if s.id==key[7:]),None)
+        if source is None or source.kind not in {'gauss_database','mysql_database'}:
+            raise LightGraphError('source_not_found')
+        return source
+
+    @app.get('/api/projects/{pid}/database/drafts/{key}')
+    def load_connection_draft(pid:str,key:str,x_workbench_session:str|None=Header(default=None)):
+        with workspace.lock(pid):
+            workspace.get(pid)
+            credentials.require(pid,x_workbench_session)
+            draft_source(pid,key)
+            saved=saved_connections.load_draft(pid,key)
+            if saved is not None:
+                return {'saved':True,**saved}
+            revision=saved_connections.load_draft_revision(pid,key)
+            return {'saved':False,**({'revision':revision} if revision else {})}
+
+    @app.put('/api/projects/{pid}/database/drafts/{key}')
+    def save_connection_draft(pid:str,key:str,data:SaveConnectionDraft,x_workbench_session:str|None=Header(default=None)):
+        # Incomplete forms are drafts, not live credentials or extraction config.
+        # Saving never tests the connection or changes an active run's inputs.
+        with workspace.lock(pid):
+            workspace.get(pid)
+            credentials.require(pid,x_workbench_session)
+            source=draft_source(pid,key)
+            if source and (data.draft.form.id!=source.id or data.draft.form.kind!=source.kind):
+                raise LightGraphError('saved_connection_invalid')
+            revision=saved_connections.save_draft(pid,key,data.draft,data.revision)
+            return {'saved':True,'revision':revision}
+
+    @app.delete('/api/projects/{pid}/database/drafts/{key}')
+    def delete_connection_draft(pid:str,key:str,data:DeleteConnectionDraft|None=None,x_workbench_session:str|None=Header(default=None)):
+        with workspace.lock(pid):
+            workspace.get(pid)
+            credentials.require(pid,x_workbench_session)
+            # Orphaned drafts remain removable after their source was deleted.
+            revision=saved_connections.delete_draft(pid,key,data.revision if data else None)
+            return {'saved':saved_connections.load_draft(pid,key) is not None,'revision':revision}
 
     @app.get('/api/projects/{pid}/database/connections/{sid}')
     def load_database_connection(pid:str,sid:str,x_workbench_session:str|None=Header(default=None)):
