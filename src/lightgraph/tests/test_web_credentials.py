@@ -176,6 +176,32 @@ def test_connect_uses_only_selected_source_and_keeps_credentials_out_of_files(cl
     scan_no_secrets(client,'SECRET_DB_BROWSER_382',headers['X-Workbench-Session'])
 
 
+def test_jdbc_connect_normalizes_session_credential_and_reuses_it_for_run(client, monkeypatch):
+    from psycopg.conninfo import conninfo_to_dict
+    headers = session(client)
+    calls = []
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', fake_open(calls))
+    password = "SECRET_JDBC_BROWSER:/@? #中文'&+%"
+    jdbc = 'jdbc:gaussdb://db.example.com:8000/business'
+    result = client.post('/api/projects/alpha/database/connect', headers=headers, json={
+        'source_id': 'warehouse', 'allowed_tables': ['metrics'],
+        'connection': {'kind': 'gauss_database', 'dsn': jdbc, 'username': 'reader', 'password': password},
+    })
+    assert result.status_code == 200, result.text
+    normalized = calls[-1][2]['warehouse']
+    options = conninfo_to_dict(normalized)
+    assert options['host'] == 'db.example.com' and options['port'] == '8000'
+    assert options['dbname'] == 'business' and options['user'] == 'reader' and options['password'] == password
+    assert options['sslmode'] == 'verify-full'
+    assert password not in result.text and jdbc not in result.text
+    assert result.json()['config']['sources'][0]['allowed_tables'] == ['public.metrics']
+    sent = []
+    monkeypatch.setattr(client.app.state.manager, 'start', lambda pid, **kwargs: sent.append(kwargs) or {'run_id': 'fake'})
+    assert client.post('/api/projects/alpha/runs', headers=headers).status_code == 202
+    assert sent[-1]['source_credentials']['warehouse'] == normalized
+    scan_no_secrets(client, password, jdbc, headers['X-Workbench-Session'])
+
+
 def test_connect_failure_rolls_back_config_and_secret(client,monkeypatch):
     headers=session(client)
     before=client.get('/api/projects/alpha/config').json()

@@ -151,6 +151,86 @@ def test_remote_connections_require_tls_verification():
         build_dsn(ConnectionSpec(kind="mysql", dsn="mysql://r:p@db.example.com/db?ssl_mode=DISABLED"))
 
 
+@pytest.mark.parametrize("prefix", ["jdbc:gaussdb", "jdbc:postgresql"])
+@pytest.mark.parametrize("host", ["db.example.com", "[::1]"])
+def test_jdbc_url_with_separate_credentials_preserves_endpoint_and_password(prefix, host):
+    from psycopg.conninfo import conninfo_to_dict
+    password = "  secret:/@? #中文'&+%  "
+    value = ConnectionSpec(kind="gauss", dsn=f"{prefix}://{host}:8000/business", username="reader", password=password)
+    options = conninfo_to_dict(build_dsn(value))
+    assert options == {"host": host.strip("[]"), "port": "8000", "dbname": "business", "user": "reader",
+                       "password": password, "sslmode": "disable" if host == "[::1]" else "verify-full", "connect_timeout": "5"}
+    assert safe_connection_details(value)["database"] == "business"
+    assert password not in repr(value) and password not in value.model_dump_json()
+
+
+def test_jdbc_query_credentials_decode_once_and_matching_separate_credentials_work():
+    from urllib.parse import urlencode
+    from psycopg.conninfo import conninfo_to_dict
+    password = "SECRET_JDBC:/@? #中文'&+%25"
+    query = urlencode({"user": "reader", "password": password, "connectTimeout": "9999", "sslmode": "verify-full"})
+    dsn = "jdbc:gaussdb://db.example.com:8000/%E4%B8%9A%E5%8A%A1?" + query
+    for fields in ({}, {"username": "reader", "password": password}):
+        value = ConnectionSpec(kind="gauss", dsn=dsn, **fields)
+        options = conninfo_to_dict(build_dsn(value))
+        assert options["dbname"] == "业务" and options["password"] == password
+        assert options["connect_timeout"] == "5"
+        assert password not in repr(value) and query not in repr(value)
+
+
+@pytest.mark.parametrize("query,fields", [
+    ("user=other", {"username": "reader"}),
+    ("user=reader&password=OTHER_SECRET", {"password": SECRET}),
+])
+def test_jdbc_credentials_conflict_is_rejected_without_echoing_secrets(query, fields):
+    with pytest.raises(DatabaseAccessError, match="^database_connection_credentials_conflict$") as error:
+        build_dsn(ConnectionSpec(kind="gauss", dsn="jdbc:gaussdb://localhost:8000/business?" + query, **fields))
+    assert SECRET not in str(error.value) and "OTHER_SECRET" not in str(error.value)
+
+
+@pytest.mark.parametrize("suffix", [
+    "localhost:8000/", "localhost:8000/db/other", "localhost:0/db", "localhost:65536/db", "localhost:/db",
+    "localhost,other:8000/db", "reader:PRIVATE_PASSWORD@localhost:8000/db", "localhost:8000/db#PRIVATE_PASSWORD",
+    "localhost:8000/db?user=a&user=b", "localhost:8000/db?options=-c%20transaction_read_only=off",
+    "localhost:8000/db?service=private_service", "localhost:8000/db?passfile=/private/file",
+    "localhost:8000/db?host=other", "localhost:8000/db?password=%ZZ", "localhost:8000/db?password=%FF",
+    "localhost:8000/db?connectTimeout=3&connect_timeout=5", "local\nhost:8000/db",
+    "db.example.com:8000/db?sslmode=disable",
+])
+def test_jdbc_invalid_or_unsupported_options_fail_before_connecting(monkeypatch, suffix):
+    calls = install_driver(monkeypatch, "gauss", Connection())
+    with pytest.raises(DatabaseAccessError) as error:
+        check_connection(ConnectionSpec(kind="gauss", dsn="jdbc:gaussdb://" + suffix, username="reader"))
+    assert not calls and "PRIVATE_PASSWORD" not in str(error.value)
+
+
+def test_jdbc_requires_user_and_still_rejects_mixed_endpoints():
+    dsn = "jdbc:gaussdb://localhost:8000/business"
+    with pytest.raises(DatabaseAccessError, match="^database_connection_fields_required$"):
+        build_dsn(ConnectionSpec(kind="gauss", dsn=dsn))
+    with pytest.raises(ValidationError, match="database_connection_forms_conflict"):
+        ConnectionSpec(kind="gauss", dsn=dsn, username="reader", host="other")
+    with pytest.raises(ValidationError, match="database_connection_forms_conflict"):
+        ConnectionSpec(kind="gauss", dsn="postgresql://reader@localhost/business", password=SECRET)
+
+
+def test_jdbc_test_and_discovery_use_normalized_readonly_connection(monkeypatch):
+    from psycopg.conninfo import conninfo_to_dict
+    db = Connection(schema="public")
+    calls = install_driver(monkeypatch, "gauss", db)
+    value = ConnectionSpec(kind="gauss", dsn="jdbc:gaussdb://localhost:8000/business", username="reader", password=SECRET)
+    assert check_connection(value) == {"status": "ok"}
+    assert discover_tables(value)["tables"][0]["qualified_name"] == "public.items"
+    assert len(calls) == 2
+    for args, kwargs in calls:
+        assert not args[0].startswith("jdbc:")
+        assert conninfo_to_dict(args[0])["port"] == "8000"
+        assert conninfo_to_dict(args[0])["password"] == SECRET
+        assert kwargs["connect_timeout"] == 5
+    assert any("READ ONLY" in sql for sql, _ in db.executed)
+    assert db.closed and db.rollback_calls == 2
+
+
 @pytest.mark.parametrize("kind", ["mysql", "gauss"])
 def test_connection_probe_is_fixed_readonly_and_closes(monkeypatch, kind):
     db = Connection()

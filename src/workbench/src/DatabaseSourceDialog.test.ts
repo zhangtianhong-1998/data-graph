@@ -39,6 +39,19 @@ function button(label: string): HTMLButtonElement {
   return result
 }
 
+async function inputValue(selector: string, value: string) {
+  const input = element<HTMLInputElement>(selector)
+  input.value = value
+  input.dispatchEvent(new Event('input', { bubbles: true }))
+  await nextTick()
+}
+
+async function useDsn(dsn: string) {
+  element<HTMLInputElement>('.connection-format input[value="dsn"]').click()
+  await nextTick()
+  await inputValue('#database-dsn', dsn)
+}
+
 async function fillConnection(kind = 'gauss_database') {
   const select = element<HTMLSelectElement>('#database-kind')
   select.value = kind
@@ -141,6 +154,45 @@ describe('数据库连接弹窗', () => {
     expect(element('.dialog-feedback').textContent).toContain('连接成功，已读取 1 张表')
     expect(button('测试连接').disabled).toBe(false)
     expect(api.ensureSession).not.toHaveBeenCalled()
+  })
+
+  it.each(['gaussdb', 'postgresql'])('粘贴 JDBC %s 地址后可单独填账号，测试与表发现使用同一凭据', async protocol => {
+    const dsn = `jdbc:${protocol}://db.example.com:8000/analytics`
+    await useDsn(dsn)
+    await inputValue('#database-username', 'reader')
+    await inputValue('#database-password', ' p@ss:/?#&%=+ ')
+    api.request.mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({
+      tables: [{ schema: 'public', name: 'metrics', qualified_name: 'public.metrics' }], truncated: false,
+    })
+    button('测试连接').click()
+    await vi.waitFor(() => expect(root.querySelector('.table-choice')?.textContent).toContain('public.metrics'))
+    expect(api.request.mock.calls.map(call => call[0])).toEqual([
+      '/projects/dialog-test/database/test', '/projects/dialog-test/database/tables',
+    ])
+    for (const call of api.request.mock.calls) expect(JSON.parse(call[1].body)).toEqual({
+      connection: { kind: 'gauss_database', dsn, username: 'reader', password: ' p@ss:/?#&%=+ ' },
+    })
+    expect(element('.dialog-feedback').textContent).toContain('连接成功，已读取 1 张表')
+  })
+
+  it('JDBC 缺少用户名时直接提示，不发送连接请求', async () => {
+    await useDsn('jdbc:gaussdb://db.example.com:8000/analytics')
+    button('测试连接').click()
+    await nextTick()
+    expect(element('[role="alert"]').textContent).toContain('请填写数据库用户名')
+    expect(api.request).not.toHaveBeenCalled()
+  })
+
+  it('普通 Gauss 连接串仍可连接，隐藏且不发送分项填写残留的凭据', async () => {
+    await fillConnection()
+    const dsn = 'postgresql://dsn_reader:dsn_password@db.example.com:8000/analytics'
+    await useDsn(dsn)
+    expect(root.querySelector('#database-username')).toBeNull()
+    expect(root.querySelector('#database-password')).toBeNull()
+    api.request.mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({ tables: [], truncated: false })
+    button('测试连接').click()
+    await vi.waitFor(() => expect(api.request).toHaveBeenCalledTimes(2))
+    for (const call of api.request.mock.calls) expect(JSON.parse(call[1].body)).toEqual({ connection: { kind: 'gauss_database', dsn } })
   })
 
   it('请求等待期间重复点击不会发出第二次测试，关闭按钮也暂不可用', async () => {

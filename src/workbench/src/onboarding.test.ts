@@ -21,6 +21,28 @@ describe('直接连接输入', () => {
     expect(() => connectionPayload({ ...form, port: '99999' })).toThrow('端口')
     expect(() => connectionPayload({ ...form, host: '' })).toThrow('主机')
   })
+  it.each(['gaussdb', 'postgresql'])('JDBC %s 地址单独传递账号，保留密码特殊字符', protocol => {
+    const dsn = `jdbc:${protocol}://db.example.com:8000/analytics`
+    expect(connectionPayload({ ...form, kind: 'gauss_database', format: 'dsn', dsn: ` ${dsn} `, username: ' reader ', password: ' p@ss:/?#&%=+ ' })).toEqual({
+      kind: 'gauss_database', dsn, username: 'reader', password: ' p@ss:/?#&%=+ ',
+    })
+  })
+  it('JDBC 连接串可包含账号，不重复追加空凭据', () => {
+    const dsn = 'jdbc:gaussdb://db.example.com:8000/analytics?user=reader&password=fake%40password'
+    expect(connectionPayload({ ...form, kind: 'gauss_database', format: 'dsn', dsn, username: '', password: '' })).toEqual({ kind: 'gauss_database', dsn })
+    expect(() => connectionPayload({ ...form, kind: 'gauss_database', format: 'dsn', dsn: 'jdbc:gaussdb://db.example.com:8000/analytics', username: '', password: '' })).toThrow('用户名')
+  })
+  it.each([
+    'jdbc:gaussdb://reader:password@db.example.com:8000/analytics',
+    'jdbc:gaussdb://db.example.com:8000',
+    'jdbc:gaussdb://',
+  ])('JDBC 不接受 authority 凭据或不完整地址：%s', dsn => {
+    expect(() => connectionPayload({ ...form, kind: 'gauss_database', format: 'dsn', dsn })).toThrow('请检查 JDBC 连接串')
+  })
+  it('原生 Gauss 连接串不携带分项填写残留的账号密码', () => {
+    const dsn = 'postgresql://dsn_reader:dsn_password@db.example.com:8000/analytics'
+    expect(connectionPayload({ ...form, kind: 'gauss_database', format: 'dsn', dsn })).toEqual({ kind: 'gauss_database', dsn })
+  })
   it('合并发现选表、手工表名和导入表单，不默默扩大范围', () => {
     expect(selectedTables('app.manual\napp.selected\n', ['app.selected'])).toEqual(['app.selected', 'app.manual'])
     expect(() => selectedTables('', [])).toThrow('至少')

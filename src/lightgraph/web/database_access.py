@@ -12,7 +12,7 @@ import ipaddress
 import re
 import sys
 from typing import Literal
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 from zipfile import ZipFile
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
@@ -27,6 +27,7 @@ MAX_EXCEL_BYTES = 5 * 1024 * 1024
 MAX_EXCEL_EXPANDED_BYTES = 20 * 1024 * 1024
 _IDENTIFIER = re.compile(r"[^\x00-\x1f\x7f./\\]{1,128}\Z", re.UNICODE)
 _SYSTEM_SCHEMAS = {"mysql", "sys", "information_schema", "performance_schema", "pg_catalog", "pg_toast"}
+_GAUSS_JDBC_PREFIXES = ("jdbc:gaussdb://", "jdbc:postgresql://")
 
 
 class DatabaseAccessError(LightGraphError):
@@ -55,7 +56,10 @@ class ConnectionSpec(BaseModel):
         if self.dsn is not None:
             if not self.dsn.get_secret_value() or len(self.dsn.get_secret_value()) > 8192:
                 raise ValueError("database_connection_invalid")
-            if any(value is not None for value in (self.host, self.port, self.database, self.username, self.password)):
+            jdbc = self.kind == "gauss_database" and self.dsn.get_secret_value().strip().startswith(_GAUSS_JDBC_PREFIXES)
+            if any(value is not None for value in (self.host, self.port, self.database)) or (
+                not jdbc and any(value is not None for value in (self.username, self.password))
+            ):
                 raise ValueError("database_connection_forms_conflict")
         elif not self.host or not self.database or not self.username:
             raise ValueError("database_connection_fields_required")
@@ -92,6 +96,43 @@ def _host(value: str) -> tuple[str, bool]:
     return value, value.casefold() == "localhost"
 
 
+def _jdbc_options(dsn: str, spec: ConnectionSpec) -> dict[str, str]:
+    """Translate the supported JDBC URL subset, never execute JDBC properties.
+
+    Credentials may be supplied separately, as in JDBC's three-argument API.
+    Ambiguous duplicate properties fail instead of silently changing targets or
+    credentials. TLS, host validation and the bounded timeout are applied below.
+    """
+    if re.search(r"[\x00-\x20\x7f]", dsn) or re.search(r"%(?![0-9A-Fa-f]{2})", dsn):
+        raise DatabaseAccessError("database_connection_invalid")
+    url = urlsplit(dsn.removeprefix("jdbc:"))
+    if not url.hostname or url.username is not None or url.password is not None or "#" in dsn:
+        raise DatabaseAccessError("database_connection_invalid")
+    if not url.path.startswith("/") or not url.path[1:] or "/" in url.path[1:]:
+        raise DatabaseAccessError("database_connection_invalid")
+    # url.port validates numeric ports; reject a dangling colon as well.
+    if url.netloc.endswith(":"):
+        raise DatabaseAccessError("database_connection_invalid")
+    options = {"host": url.hostname, "port": str(url.port if url.port is not None else 5432),
+               "dbname": unquote(url.path[1:], errors="strict")}
+    allowed = {"user": "user", "password": "password", "sslmode": "sslmode",
+               "connectTimeout": "connect_timeout", "connect_timeout": "connect_timeout"}
+    for name, value in parse_qsl(url.query, keep_blank_values=True, strict_parsing=True, errors="strict"):
+        key = allowed.get(name)
+        if key is None:
+            raise DatabaseAccessError("database_connection_option_forbidden")
+        if key in options:
+            raise DatabaseAccessError("database_connection_invalid")
+        options[key] = value
+    for key, value in (("user", spec.username),
+                       ("password", spec.password.get_secret_value() if spec.password is not None else None)):
+        if value is not None:
+            if key in options and options[key] != value:
+                raise DatabaseAccessError("database_connection_credentials_conflict")
+            options[key] = value
+    return options
+
+
 def _resolved(spec: ConnectionSpec) -> dict:
     """Normalize endpoint options without echoing parser exceptions."""
     try:
@@ -116,7 +157,9 @@ def _resolved(spec: ConnectionSpec) -> dict:
                 options.clear()
         from psycopg.conninfo import conninfo_to_dict, make_conninfo
         if spec.dsn is not None:
-            options = conninfo_to_dict(spec.dsn.get_secret_value())
+            dsn = spec.dsn.get_secret_value().strip()
+            options = (_jdbc_options(dsn, spec) if dsn.startswith(_GAUSS_JDBC_PREFIXES)
+                       else conninfo_to_dict(dsn))
         else:
             options = {"host": spec.host, "port": str(spec.port or 5432), "dbname": spec.database,
                        "user": spec.username, "password": spec.password.get_secret_value() if spec.password else ""}
