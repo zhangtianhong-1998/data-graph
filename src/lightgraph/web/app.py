@@ -25,6 +25,7 @@ from lightgraph.errors import LightGraphError
 from .workspace import Workspace
 from .execution import RunManager, read_graph, read_metadata
 from .credentials import SessionCredentials
+from .saved_connections import SavedConnections
 from .database_access import (ConnectionSpec, build_dsn, test_connection,
                               discover_tables, parse_table_list_excel, normalize_selected_tables)
 
@@ -130,6 +131,7 @@ class ConnectDatabase(DatabaseRequest):
     allowed_tables: list[str] = Field(min_length=1,max_length=1000)
     deployment_retention_verified: bool | None = None
     capability_manifest: str | None = None
+    remember_connection: bool = False
 
 
 def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|None=None,
@@ -137,6 +139,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     workspace=Workspace(Path(workspace_root) if workspace_root else ROOT/'workspace')
     manager=manager_factory(workspace)
     credentials=SessionCredentials()
+    saved_connections=SavedConnections(workspace.root)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -150,6 +153,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     app.state.workspace=workspace
     app.state.manager=manager
     app.state.credentials=credentials
+    app.state.saved_connections=saved_connections
     app.add_middleware(CORSMiddleware,allow_origins=sorted(ALLOWED_ORIGINS),
         allow_methods=['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
         allow_headers=['Content-Type','X-Workbench-Session'],allow_credentials=False)
@@ -172,14 +176,36 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         workspace.get(pid)
         if manager.active(pid):raise LightGraphError('project_run_active')
 
-    def resolved_credentials(pid, token):
+    def resolved_credentials(pid, token, *, source_ids=None, profile_errors=None):
         if not token:
             return {}, None
-        return credentials.resolve(pid,token,workspace.resolved_config(pid))
+        config=workspace.resolved_config(pid)
+        sources,model=credentials.resolve(pid,token,config)
+        for source in config.sources:
+            if source_ids is not None and source.id not in source_ids:
+                continue
+            if source.credential_mode == 'session' and source.id not in sources:
+                try:
+                    saved=saved_connections.load(pid,source)
+                except LightGraphError as exc:
+                    if profile_errors is None or not exc.code.startswith('saved_connection_'):
+                        raise
+                    profile_errors[source.id]=exc.code
+                    continue
+                if saved is not None:
+                    credentials.set_source(pid,token,source,saved['dsn'])
+                    sources[source.id]=saved['dsn']
+        return sources,model
 
     def credential_status(pid, token):
-        sources, model=resolved_credentials(pid,token)
-        return {'database_sources':sorted(sources),'model':model is not None}
+        # A broken profile must not block editing other sources or model settings.
+        # Execution still requires every needed profile to load successfully.
+        errors={}
+        sources, model=resolved_credentials(pid,token,profile_errors=errors)
+        result={'database_sources':sorted(sources),'model':model is not None}
+        if errors:
+            result['database_errors']=errors
+        return result
 
     @app.get('/api/health')
     def health():
@@ -291,9 +317,15 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             source=next(s for s in workspace.resolved_config(pid).sources if s.id==data.source_id)
             credentials.set_source(pid,x_workbench_session,source,dsn)
             try:
-                secrets_by_source,_=resolved_credentials(pid,x_workbench_session)
+                secrets_by_source,_=resolved_credentials(pid,x_workbench_session,source_ids={data.source_id})
                 metadata=read_metadata(workspace,pid,refresh=True,source_credentials=secrets_by_source,
                                        source_ids=[data.source_id])
+                # Commit the profile only after metadata succeeds. A failed
+                # replacement must keep the previously saved connection usable.
+                if data.remember_connection:
+                    saved_connections.save(pid,source,data.connection,dsn)
+                else:
+                    saved_connections.delete(pid,source.id)
             except Exception:
                 workspace.save_config(pid,old_config)
                 credentials.clear_source(pid,x_workbench_session,data.source_id)
@@ -305,6 +337,30 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             metadata['files']=_yaml_files(metadata['tables'],metadata.get('sources'))
             return {'config':workspace.get_config(pid),'metadata':metadata,
                     'credentials':credential_status(pid,x_workbench_session)}
+
+    @app.get('/api/projects/{pid}/database/connections/{sid}')
+    def load_database_connection(pid:str,sid:str,x_workbench_session:str|None=Header(default=None)):
+        with workspace.lock(pid):
+            workspace.get(pid)
+            credentials.require(pid,x_workbench_session)
+            source=next((s for s in workspace.resolved_config(pid).sources if s.id==sid),None)
+            if source is None or source.kind not in {'gauss_database','mysql_database'}:
+                raise LightGraphError('source_not_found')
+            saved=saved_connections.load(pid,source)
+            # The explicit edit form needs the saved input. Other config,
+            # status, metadata and run endpoints never return these values.
+            return {'saved':False} if saved is None else {'saved':True,'connection':saved['connection']}
+
+    @app.delete('/api/projects/{pid}/database/connections/{sid}')
+    def forget_database_connection(pid:str,sid:str,x_workbench_session:str|None=Header(default=None)):
+        with workspace.lock(pid):
+            mutable(pid)
+            credentials.require(pid,x_workbench_session)
+            if not any(s.id==sid for s in workspace.resolved_config(pid).sources):
+                raise LightGraphError('source_not_found')
+            saved_connections.delete(pid,sid)
+            credentials.clear_source_sessions(pid,sid)
+            return {'saved':False}
 
     @app.post('/api/projects/{pid}/files',status_code=201)
     async def upload(pid:str,file:UploadFile=File(...)):

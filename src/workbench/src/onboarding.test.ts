@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { clearSessions, ensureSession, request } from './api'
-import { configurationTabs, resultTabs, isResultTab, connectionPayload, selectedTables, validateSourceId } from './onboarding'
+import { configurationTabs, resultTabs, isResultTab, connectionFormFromPayload, connectionPayload, selectedTables, validateSourceId } from './onboarding'
 import type { ConnectionForm } from './onboarding'
 const form: ConnectionForm = { kind: 'mysql_database', format: 'fields', dsn: 'unused secret', host: ' db.local ', port: '3306', database: 'app', username: 'reader', password: ' p a s s ', schema: '' }
 afterEach(() => { clearSessions(); vi.unstubAllGlobals() })
@@ -16,6 +16,12 @@ describe('直接连接输入', () => {
   it('保留密码原文，不将未采用的连接串一并发送', () => {
     expect(connectionPayload(form)).toEqual({ kind: 'mysql_database', host: 'db.local', port: 3306, database: 'app', username: 'reader', password: ' p a s s ' })
     expect(connectionPayload({ ...form, format: 'dsn', dsn: 'mysql://reader:private@db.local/app', schema: ' scope ' })).toEqual({ kind: 'mysql_database', dsn: 'mysql://reader:private@db.local/app', schema: 'scope' })
+  })
+  it('恢复本机连接后再提交保留原凭据与模式', () => {
+    const fields = { kind: 'mysql_database' as const, host: 'db.example.invalid', port: 3307, database: 'analytics', username: 'reader', password: ' p@ss:/ ', schema: 'analytics' }
+    expect(connectionPayload(connectionFormFromPayload(fields))).toEqual(fields)
+    const dsn = { kind: 'gauss_database' as const, dsn: 'jdbc:gaussdb://db.example.invalid:8000/analytics', username: 'reader', password: ' p@ss:/ ', sslmode: 'prefer' as const }
+    expect(connectionPayload(connectionFormFromPayload(dsn))).toEqual(dsn)
   })
   it('非法端口与缺少地址先在本地报告', () => {
     expect(() => connectionPayload({ ...form, port: '99999' })).toThrow('端口')
@@ -76,6 +82,7 @@ describe('会话凭据只在内存中按项目隔离', () => {
     await request('/projects/project-b/credentials')
     await request('/projects')
     expect(fetcher.mock.calls.filter(call => call[0].endsWith('/session'))).toHaveLength(1)
+    expect(fetcher.mock.calls[1]?.[1].cache).toBe('no-store')
     expect(fetcher.mock.calls[1]?.[1].headers).toMatchObject({ 'X-Workbench-Session': 'private-token' })
     expect(fetcher.mock.calls[2]?.[1].headers).not.toHaveProperty('X-Workbench-Session')
     expect(fetcher.mock.calls[3]?.[1].headers).not.toHaveProperty('X-Workbench-Session')

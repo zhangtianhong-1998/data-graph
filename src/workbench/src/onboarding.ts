@@ -15,8 +15,22 @@ export type GaussSslMode = 'auto' | 'disable' | 'allow' | 'prefer' | 'require' |
 export interface ConnectionForm { kind: 'gauss_database' | 'mysql_database'; format: 'fields' | 'dsn'; dsn: string; host: string; port: string; database: string; username: string; password: string; schema: string; sslmode?: GaussSslMode }
 export interface DatabaseTable { schema: string; name: string; qualified_name: string; table_type?: string }
 export function isGaussJdbcDsn(dsn: string): boolean { return /^jdbc:(gaussdb|postgresql):\/\//.test(dsn.trim()) }
-/** The returned object goes only to the ephemeral connection endpoint, never config. */
-export function connectionPayload(form: ConnectionForm): Record<string, unknown> {
+export interface ConnectionPayload {
+  kind: ConnectionForm['kind']; dsn?: string; host?: string; port?: number; database?: string;
+  username?: string; password?: string; schema?: string; sslmode?: Exclude<GaussSslMode, 'auto'>;
+}
+/** Restore only the connection form; source identity and table scope stay in project config. */
+export function connectionFormFromPayload(payload: ConnectionPayload): ConnectionForm {
+  if (!['gauss_database', 'mysql_database'].includes(payload.kind)) throw new Error('已保存的连接类型不支持，请重新填写。')
+  return {
+    kind: payload.kind, format: payload.dsn ? 'dsn' : 'fields', dsn: payload.dsn || '',
+    host: payload.host || '', port: String(payload.port || (payload.kind === 'mysql_database' ? 3306 : 5432)),
+    database: payload.database || '', username: payload.username || '', password: payload.password || '',
+    schema: payload.schema || '', sslmode: payload.sslmode || 'auto',
+  }
+}
+/** Credentials go to the connection/profile endpoints, never the project YAML. */
+export function connectionPayload(form: ConnectionForm): ConnectionPayload {
   // Auto leaves any DSN setting intact; explicit choices are resolved by the backend.
   const tls = form.kind === 'gauss_database' && form.sslmode && form.sslmode !== 'auto' ? { sslmode: form.sslmode } : {}
   if (form.format === 'dsn') {

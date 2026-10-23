@@ -31,7 +31,7 @@ workspace/<项目编号>/
   runs/                # 历次任务状态和安全报告
 ```
 
-上传文件是用户提供的项目资产，可以保存；数据库检索结果仍只在运行内存中使用。`workspace/` 不提交 Git。YAML 配置只允许引用本项目登记的文件，Markdown 默认全局，可绑定读取到的具体表。MySQL/Gauss 可以直接填写连接信息并测试、读取表清单，也支持手动输入表名或导入 Excel 表清单。直接输入的数据库凭据和 API key 仅保留在当前会话的服务端内存中，不进入配置、导出的 YAML 或运行记录；页面刷新或服务重启后需重新输入。已有 `api_key_env` / `dsn_env` 配置仍可使用。高级列权限和 CSV 格式可通过完整配置编辑器或上传的运行 YAML 设置。元数据提供 tables.yaml、constraints.yaml 和 foreign_keys.yaml 的预览与下载；本轮不开放物理声明的在线改写。
+上传文件是用户提供的项目资产，可以保存；数据库检索结果仍只在运行内存中使用。`workspace/` 不提交 Git。YAML 配置只允许引用本项目登记的文件，Markdown 默认全局，可绑定读取到的具体表。MySQL/Gauss 可以直接填写连接信息并测试、读取表清单，也支持手动输入表名或导入 Excel 表清单。数据库连接可以按项目加密保存在本机，刷新页面或重启服务后加载；取消保存则仅保留在会话内存。模型 API key 仍只在当前会话内使用。明文凭据不进入配置、导出的 YAML 或运行记录。已有 `api_key_env` / `dsn_env` 配置仍可使用。高级列权限和 CSV 格式可通过完整配置编辑器或上传的运行 YAML 设置。元数据提供 tables.yaml、constraints.yaml 和 foreign_keys.yaml 的预览与下载；本轮不开放物理声明的在线改写。
 
 服务默认只监听本机，每个 workspace 只允许一个服务。页面按秒轮询真实任务状态；不向浏览器传送查询样本、模型原文，也不虚构进度百分比。详细接口、当前范围和启动方式见 [Vue 工作台实现](design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md)。原 [交互设计](design/lightweight_graph/WORKBENCH_DESIGN.md) 和 [用户故事](design/lightweight_graph/WORKBENCH_US.md) 中的后续能力仍单独列出。旧合成原型保留在 `src/lightgraph/workbench_prototype/`，不再作为实际工作台入口。
 
@@ -102,6 +102,8 @@ scope:
 ## Gauss 接入
 
 参考 [examples/gauss.yaml](examples/gauss.yaml)。数据库连接串通过配置指定的环境变量读取。模型密钥可用环境变量，也可放在不提交 Git 的本地 Agent 配置中，详见下面的模型配置；密钥不进入运行报告。
+
+使用工作台时，可直接填写 `jdbc:gaussdb://主机:8000/数据库`，单独填写用户名、密码并选择 SSL 模式。勾选“保存连接信息到本机”后，成功接入的连接会按项目加密保存，刷新或重启后可加载；可在编辑来源时删除已保存连接。存储位置与访问边界见 [工作台实现说明](design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md#数据库连接保存与会话凭据)。数据库检索返回的样本数据仍不保存。
 
 ```bash
 .venv/bin/lightgraph connect-check examples/gauss.yaml

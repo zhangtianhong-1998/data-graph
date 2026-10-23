@@ -67,15 +67,17 @@ workspace/
 
    Gauss 的连接串模式支持 `jdbc:gaussdb://db.example.com:8000/business` 和 `jdbc:postgresql://db.example.com:8000/business`。粘贴 JDBC 地址后显示独立用户名、密码字段，密码中的特殊字符原样提交，无需用户编码。地址末尾的 `business` 是数据库名，Schema 仍单独填写。用户名和密码分开传递的形式参照[华为云 JDBC 连接介绍](https://support.huaweicloud.com/centralized-devg-v10-gaussdb/gaussdb-42-0082.html)。
 
-   当前支持单主机 JDBC URL；可选查询参数为 `user`、`password`、`sslmode`、`connectTimeout` / `connect_timeout`。查询参数中的特殊字符需要 URL 编码；重复参数、与单独输入不一致的凭据、其他 JDBC 驱动属性会报错，不会静默忽略。Schema 使用页面独立字段，不使用 `currentSchema` 参数。连接测试超时仍固定为 5 秒。后端将 JDBC 地址转成现有驱动可用的连接信息，供测试、选表、元数据读取和后续运行共用，仅保留在会话内存；服务器环境变量仍填写原生驱动 DSN。
+   当前支持单主机 JDBC URL；可选查询参数为 `user`、`password`、`sslmode`、`connectTimeout` / `connect_timeout`。查询参数中的特殊字符需要 URL 编码；重复参数、与单独输入不一致的凭据、其他 JDBC 驱动属性会报错，不会静默忽略。Schema 使用页面独立字段，不使用 `currentSchema` 参数。驱动建立连接的超时为 5 秒，Gauss 接入层的目录查询超时为 30 秒。后端将 JDBC 地址转成现有驱动可用的连接信息，供测试、选表、元数据读取和后续运行共用；服务器环境变量仍填写原生驱动 DSN。
 
    Gauss 的分项填写和连接串模式均可选择 SSL 模式。选择“自动”时沿用连接串的 `sslmode`，连接串未指定时，远程默认 `verify-full`，本机默认 `disable`。显式选择时优先使用下拉框的值，支持 `disable`、`allow`、`prefer`、`require`、`verify-ca`、`verify-full`。`prefer` 优先尝试 SSL，并允许非 SSL 连接；`require` 要求 SSL、不验证主机名（客户端已有根证书时 libpq 可能验证证书链）；`verify-ca` 验证证书链，`verify-full` 再验证主机名。行为以 [libpq SSL 文档](https://www.postgresql.org/docs/current/libpq-ssl.html)为准。应用不在连接失败后自动换模式重试。客户可显式选择与原有客户端相同的 `prefer`；这不代表真实网络、账号、数据库版本和认证方式已经通过验证。
 
    页面不提供上传根证书或任意服务器证书路径的入口，`verify-ca` / `verify-full` 使用部署环境配置的证书。MySQL 的 SSL 参数和默认策略保持原样，Gauss 的 `sslmode` 字段不会发送给 MySQL。所选模式随规范连接串保留在会话中，后续运行不会重置为 `verify-full`。
 
-   数据库弹窗仅通过关闭按钮退出，点击遮罩、移出鼠标或向外拖选都不丢弃表单。连接状态和错误显示在正文之外的固定反馈区。测试前先校验必填项；测试及读取表清单直接调用只读接口，无需先建立凭据会话，只有保存来源时才建立会话。测试成功自动读取表清单，两个阶段分别显示进度。前端等待上限为：测试 15 秒、表清单 30 秒、会话 10 秒、元数据提交 120 秒。超时不会自动重发请求，也不代表服务端操作已经回滚。
+   数据库弹窗仅通过关闭按钮退出，点击遮罩、移出鼠标或向外拖选都不丢弃表单。连接串输入框可见，密码独立字段仍遮挡。连接状态和错误显示在正文之外的固定反馈区。测试前先校验必填项；测试及读取表清单直接调用只读接口，保存来源或加载已保存连接时建立会话。测试成功自动读取表清单，两个阶段分别显示进度。前端等待上限为：测试 30 秒、表清单 45 秒、会话 10 秒、元数据提交 120 秒。表清单等待时间留出数据库连接和网络开销，不与 30 秒语句超时同时触发。超时不会自动重发请求，也不代表服务端操作已经回滚。
 
-   当前后端全量 994 项、前端 57 项测试及构建通过。SSL 模式覆盖分项、原生 DSN、JDBC、选表、元数据读取后的会话传递，以及正式抽取适配器传参。此前浏览器通过 4173 代理实际验证了 JDBC 地址识别、独立账号输入、缺少用户名、本机关闭端口的连接失败、固定错误反馈及遮罩点击保留表单；新增 SSL 控件本轮通过组件测试，尚未做浏览器视觉验收。连接成功流程使用模拟接口或驱动验证，客户数据库的真实连通性仍需有效配置验证。
+   Gauss 适配器使用保存点探测可选的 `lock_timeout`，仅遇到已知“不支持参数”错误时恢复保存点并继续，保留已开启的只读事务及快照。接入层与正式抽取共用严格 UTF-8 元数据解码；非法编码会报错，不替换标识符。表发现跳过名称含点号的表并返回 `skipped_count`，仍按扫描数判断截断，不把其余异常目录行静默忽略。移除额外的 `search_path` 设置，固定目录对象和函数使用限定名；原查询已是 `information_schema.tables`，不能据此宣称原来“看不到 information_schema”（参见 [PostgreSQL 说明](https://www.postgresql.org/docs/17/infoschema-schema.html)）。错误诊断保留安全类别与 SQLSTATE，不记录驱动原文或原始异常链。
+
+   当前 macOS 后端全量 1,054 项、前端 71 项测试及构建通过。SSL 模式覆盖分项、原生 DSN、JDBC、选表、元数据读取后的会话传递，以及正式抽取适配器传参。此前浏览器通过 4173 代理实际验证了 JDBC 地址识别、独立账号输入、缺少用户名、本机关闭端口的连接失败、固定错误反馈及遮罩点击保留表单；SSL 控件及连接保存、加载、删除本轮通过组件测试，尚未做本轮浏览器视觉验收。连接成功流程使用模拟接口或驱动验证，客户数据库的真实连通性仍需有效配置验证。
 
    GitHub run `39908319887` 的 macOS 失败来自取消探测单测的定时器调度竞争。测试已改为确定性控制顺序，覆盖取消成功、驱动异常、取消无效、取消晚到及未发出；仍拒绝把单纯超时当作取消成功。生产取消机制和 CI 超时未调整。
 4. 元数据提供 `tables.yaml`、`constraints.yaml`、`foreign_keys.yaml` 预览与下载。主键、唯一键、外键来自连接器声明；未读取的 CHECK/default 等保持 unknown。文件来源没有声明外键时不会凭名称自动补上。导出和打开缓存不连接数据库；全项目“读取元数据”是显式操作。
@@ -96,13 +98,15 @@ workspace/
 | GET /projects；POST /projects | 列出、新建项目 |
 | GET /projects/{pid}；PATCH 同路径 | 项目详情、改名 |
 | POST /projects/{pid}/session | 创建仅在内存中的项目会话 |
-| GET /projects/{pid}/credentials | 会话凭据存在状态，不回显内容 |
+| GET /projects/{pid}/credentials | 凭据可用状态及各来源的安全加载错误，不回显内容 |
 | PUT /projects/{pid}/credentials/model | 保存会话 API key，绑定当前模型配置 |
 | DELETE /projects/{pid}/credentials/model | 清除会话 API key |
 | POST /projects/{pid}/database/test | 用请求中的连接信息验证只读连接 |
 | POST /projects/{pid}/database/tables | 读取指定 schema 的有界表清单 |
 | POST /projects/{pid}/database/table-list | 从 Excel 读取表名清单，不登记为数据来源 |
 | POST /projects/{pid}/database/connect | 保存来源/授权表、保留会话凭据并读取元数据 |
+| GET /projects/{pid}/database/connections/{sid} | 在项目会话中加载该来源的已保存连接，仅供编辑表单 |
+| DELETE /projects/{pid}/database/connections/{sid} | 删除本地保存连接及该来源的会话副本，不删除数据源或图谱 |
 | POST /projects/{pid}/files | multipart 上传 file |
 | GET /projects/{pid}/files/{fid}/metadata | 单个本地数据文件的表结构和 YAML 预览 |
 | GET /projects/{pid}/metadata/yaml | 已缓存的元数据 YAML；可用 source_id、schema、table 限定当前选择，交叉筛选无匹配时返回空列表，不回退到全项目；不连接源库 |
@@ -124,9 +128,15 @@ workspace/
 
 图接口最多返回 1,000 节点、3,000 边，并标记真实总数与截断状态。前端一次绘制最多 240 个筛选后节点。搜索只覆盖已返回集合；本期不是全图分页或大规模图检索服务。
 
-## 会话凭据
+## 数据库连接保存与会话凭据
 
-数据库密码、连接串和 API key 不写进项目配置、YAML、运行记录或浏览器存储。页面通过单独接口交给服务端内存，使用与项目绑定的会话令牌访问。刷新页面、服务重启或会话过期后需要重新输入；配置页面只显示是否已提供凭据，不回显密钥。
+数据库连接表单默认勾选“保存连接信息到本机”。“添加并抽取元数据”成功后，连接串、账号密码、Schema 和 SSL 模式加密保存在 `workspace/<项目编号>/.connections/<来源编号>.enc`，密钥为 `workspace/.connection-key`。保存失败会回滚来源配置；元数据读取失败不会覆盖上一份有效连接。刷新页面或重启服务后，新项目会话会加载匹配的连接；编辑已有来源时表单恢复原输入。未勾选时只保留会话内存，并删除该来源以前保存的连接。
+
+保存文件使用认证加密与原子替换，POSIX 上目录权限为 0700、文件为 0600；Windows 使用所在用户目录的 ACL。密钥与密文都在本机，所以这不是操作系统密钥库，也不能防止已能读取整个 workspace 的用户解密。工作台沿用单机可信用户的访问模型；此功能不增加多用户权限边界。请勿把整个 workspace 当成可公开分享的项目包。
+
+保存内容绑定项目、来源、数据库类型和凭据版本，类型或版本不匹配不复用；密文损坏或密钥缺失时报安全错误。只要还有保存的连接，就不替换密钥；用户删除全部保存连接后，可在下次保存时重建丢失或损坏的密钥。单个来源损坏不阻断其他来源接入，但包含该来源的正式运行仍会失败。加载接口需要项目会话并返回 `Cache-Control: no-store`；配置、元数据、图谱、运行记录、YAML 导出和浏览器存储仍不包含连接密码。数据库查询返回的样本数据不属于连接配置，仍不落盘。删除已保存连接会清除本地密文及活动会话副本，保留数据源和已有图谱。
+
+模型 API key 仍仅本次会话有效，不包含在本次数据库连接持久化功能中。
 
 模型密钥绑定配置中的服务地址与模型名，修改后需重新提供。数据库接入操作更新来源配置和目录身份；旧目录不能仅因来源编号相同而继续视为有效。Worker 所需凭据通过 stdin 管道传递，不使用全局环境变量临时替换，不写临时文件。
 

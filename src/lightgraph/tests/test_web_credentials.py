@@ -203,6 +203,78 @@ def test_jdbc_connect_normalizes_session_credential_and_reuses_it_for_run(client
     scan_no_secrets(client, password, jdbc, headers['X-Workbench-Session'])
 
 
+def test_saved_connection_loads_into_new_session_and_can_be_forgotten(client, monkeypatch):
+    headers=session(client)
+    other=session(client)
+    calls=[]
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources',fake_open(calls))
+    body={**db_body(),'remember_connection':True}
+    result=client.post('/api/projects/alpha/database/connect',headers=headers,json=body)
+    assert result.status_code==200,result.text
+    endpoint='/api/projects/alpha/database/connections/warehouse'
+    loaded=client.get(endpoint,headers=other)
+    assert loaded.status_code==200 and loaded.headers['Cache-Control']=='no-store'
+    assert loaded.json()['connection']['password']==body['connection']['password']
+    assert client.get('/api/projects/alpha/credentials',headers=other).json()['database_sources']==['warehouse']
+    assert client.get(endpoint).status_code==400
+    assert client.get(endpoint,headers=session(client,'beta')).status_code==400
+    sent=[]
+    monkeypatch.setattr(client.app.state.manager,'start',lambda pid,**kwargs:sent.append(kwargs) or {'run_id':'fake'})
+    assert client.post('/api/projects/alpha/runs',headers=other).status_code==202
+    assert body['connection']['password'] in sent[-1]['source_credentials']['warehouse']
+    assert client.delete(endpoint,headers=headers).json()=={'saved':False}
+    assert client.get(endpoint,headers=other).json()=={'saved':False}
+    assert client.get('/api/projects/alpha/credentials',headers=other).json()['database_sources']==[]
+    assert client.get('/api/projects/alpha/config').json()['sources'][0]['id']=='warehouse'
+    scan_no_secrets(client,body['connection']['password'])
+
+
+def test_failed_replacement_does_not_overwrite_saved_connection(client, monkeypatch):
+    headers=session(client)
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources',fake_open([]))
+    body={**db_body(),'remember_connection':True}
+    assert client.post('/api/projects/alpha/database/connect',headers=headers,json=body).status_code==200
+    before=client.get('/api/projects/alpha/config').json()
+    changed={**body,'connection':{**body['connection'],'password':'FAILED_NEW_PASSWORD'}}
+    def fail(*args,**kwargs): raise RuntimeError('PRIVATE_DRIVER_DETAIL')
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources',fail)
+    assert client.post('/api/projects/alpha/database/connect',headers=headers,json=changed).status_code==500
+    assert client.get('/api/projects/alpha/config').json()==before
+    loaded=client.get('/api/projects/alpha/database/connections/warehouse',headers=session(client)).json()
+    assert loaded['connection']['password']==body['connection']['password']
+    scan_no_secrets(client,body['connection']['password'],'FAILED_NEW_PASSWORD')
+
+
+def test_saved_connection_survives_service_restart_and_binding_change_invalidates_it(tmp_path, monkeypatch):
+    root=tmp_path/'workspace'
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources',fake_open([]))
+    with TestClient(create_app(root,frontend_dir=tmp_path/'absent')) as first:
+        first.post('/api/projects',json={'name':'alpha','project_id':'alpha'})
+        assert first.post('/api/projects/alpha/database/connect',headers=session(first),json={**db_body(),'remember_connection':True}).status_code==200
+    with TestClient(create_app(root,frontend_dir=tmp_path/'absent')) as second:
+        headers=session(second)
+        assert second.get('/api/projects/alpha/credentials',headers=headers).json()['database_sources']==['warehouse']
+        saved=second.get('/api/projects/alpha/database/connections/warehouse',headers=headers).json()
+        assert saved['connection']['password']==db_body()['connection']['password']
+        config=second.get('/api/projects/alpha/config').json()
+        config['sources'][0]['credential_revision']='changed'
+        assert second.put('/api/projects/alpha/config',json=config).status_code==200
+        assert second.get('/api/projects/alpha/credentials',headers=headers).json()['database_sources']==[]
+        assert second.get('/api/projects/alpha/database/connections/warehouse',headers=headers).json()=={'saved':False}
+    _scan_workspace(root,[db_body()['connection']['password']])
+
+
+def test_unchecking_remember_removes_previous_profile(client,monkeypatch):
+    headers=session(client)
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources',fake_open([]))
+    body={**db_body(),'remember_connection':True}
+    assert client.post('/api/projects/alpha/database/connect',headers=headers,json=body).status_code==200
+    assert client.post('/api/projects/alpha/database/connect',headers=headers,json=db_body()).status_code==200
+    assert client.get('/api/projects/alpha/database/connections/warehouse',headers=headers).json()=={'saved':False}
+    assert client.get('/api/projects/alpha/credentials',headers=session(client)).json()['database_sources']==[]
+    scan_no_secrets(client,body['connection']['password'])
+
+
 def test_connect_failure_rolls_back_config_and_secret(client,monkeypatch):
     headers=session(client)
     before=client.get('/api/projects/alpha/config').json()
@@ -393,3 +465,28 @@ def test_new_mutations_remain_blocked_during_run_and_cors_allows_session_header(
         'Origin':'http://localhost:5173','Access-Control-Request-Method':'PUT',
         'Access-Control-Request-Headers':'X-Workbench-Session,Content-Type'})
     assert cors.status_code==200
+
+
+def test_corrupt_profile_does_not_block_other_sources_or_model_configuration(client, monkeypatch):
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', fake_open([]))
+    payload=db_body('damaged')
+    payload['remember_connection']=True
+    assert client.post('/api/projects/alpha/database/connect', headers=session(client), json=payload).status_code==200
+    profile=client.app.state.workspace.project_path('alpha')/'.connections/damaged.enc'
+    profile.write_bytes(b'broken encrypted profile')
+    headers=session(client)
+    other=db_body('healthy')
+    other['remember_connection']=True
+    result=client.post('/api/projects/alpha/database/connect', headers=headers, json=other)
+    assert result.status_code==200, result.text
+    assert result.json()['credentials']['database_sources']==['healthy']
+    assert result.json()['credentials']['database_errors']=={'damaged':'saved_connection_corrupt'}
+    set_model(client)
+    assert client.put('/api/projects/alpha/credentials/model', headers=headers, json={'api_key':'SECRET_UNRELATED_MODEL'}).status_code==200
+    # A run using the damaged source must fail, rather than silently omit it.
+    result=client.post('/api/projects/alpha/runs',headers=headers)
+    assert result.status_code==400 and result.json()['error']['code']=='saved_connection_corrupt'
+    path='/api/projects/alpha/database/connections/damaged'
+    assert client.delete(path,headers=headers).status_code==200
+    assert client.get(path,headers=headers).json()=={'saved':False}
+    scan_no_secrets(client, 'SECRET_DB_BROWSER_382', 'SECRET_UNRELATED_MODEL')

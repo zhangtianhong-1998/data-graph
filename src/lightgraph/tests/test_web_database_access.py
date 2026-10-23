@@ -291,7 +291,7 @@ def test_connection_probe_is_fixed_readonly_and_closes(monkeypatch, kind):
     assert db.executed[-1] == ("SELECT 1", None)
     assert all("information_schema" not in sql for sql, _ in db.executed)
     assert any("READ ONLY" in sql for sql, _ in db.executed)
-    assert any("5000" in sql for sql, _ in db.executed)
+    assert any(("5000" if kind == "mysql" else "30000") in sql for sql, _ in db.executed)
     assert db.closed and db.rollback_calls == 1 and all(c.closed for c in db.cursors)
     assert all(c._executed is None and c._rows is None for c in db.cursors)
     assert calls[0][1]["connect_timeout"] == 5
@@ -306,7 +306,7 @@ def test_discovery_only_reads_bounded_schema_metadata(monkeypatch, kind, schema)
     assert result == {"tables": [
         {"schema": schema, "name": "items", "qualified_name": schema + ".items", "table_type": "BASE TABLE"},
         {"schema": schema, "name": "items_view", "qualified_name": schema + ".items_view", "table_type": "VIEW"},
-    ], "truncated": False}
+    ], "truncated": False, "skipped_count": 0}
     sql, params = db.executed[-1]
     assert "information_schema" in sql and "LIMIT %s" in sql
     assert params == (schema, 1001)
@@ -474,3 +474,74 @@ def test_selected_literal_names_remain_quoted_through_extraction_compiler(dialec
     query = compiler.projection(table, ["code"], limit=1)
     assert query.operator == "distinct_projection"
     assert len(compiler.guard.validate(query.sql, query.parameters).parameters) == 1
+
+
+def test_gauss_bytes_readonly_and_catalog_decoded_with_dotted_names_skipped(monkeypatch):
+    class ByteCursor(Cursor):
+        def fetchone(self):
+            return (b"on",) if "transaction_read_only" in self.sql else super().fetchone()
+    db = Connection(schema="public")
+    def cursor():
+        result = ByteCursor(db); db.cursors.append(result); return result
+    db.cursor = cursor
+    db.rows = [(b"public", b"SDI.SDI_CPRI_CONTACT_2", b"BASE TABLE"),
+               (b"public", "销售费用".encode("utf-8"), b"BASE TABLE")]
+    install_driver(monkeypatch, "gauss", db)
+    result = discover_tables(spec("gauss"))
+    assert result == {"tables": [{"schema": "public", "name": "销售费用", "qualified_name": "public.销售费用", "table_type": "BASE TABLE"}],
+                      "truncated": False, "skipped_count": 1}
+    assert not any("search_path" in sql for sql, _ in db.executed)
+    assert any("statement_timeout = '30000ms'" in sql for sql, _ in db.executed)
+    assert any("pg_catalog.current_setting" in sql for sql, _ in db.executed)
+
+
+def test_skipped_dot_names_do_not_change_scan_truncation(monkeypatch):
+    db = Connection(schema="public")
+    db.rows = [("public", f"literal.table_{i}", "BASE TABLE") for i in range(1001)]
+    install_driver(monkeypatch, "gauss", db)
+    assert discover_tables(spec("gauss")) == {"tables": [], "truncated": True, "skipped_count": 1000}
+
+
+@pytest.mark.parametrize("value,code", [(b"private\xffname", "database_catalog_encoding_invalid"),
+                                       ("literal.bad\x00name", "database_identifier_invalid"),
+                                       ("literal.bad/name", "database_identifier_invalid")])
+def test_discovery_rejects_other_invalid_names_without_silently_skipping(monkeypatch, value, code):
+    db = Connection(schema="public"); db.rows = [(b"public", value, b"BASE TABLE")]
+    install_driver(monkeypatch, "gauss", db)
+    with pytest.raises(DatabaseAccessError, match=f"^{code}$"):
+        discover_tables(spec("gauss"))
+    assert db.closed
+
+
+@pytest.mark.parametrize("state,success", [("42704", True), ("0A000", True), ("57014", False), ("28P01", False), (None, False)])
+def test_gauss_lock_timeout_failure_recovers_only_unsupported_setting(monkeypatch, caplog, state, success):
+    class DriverError(Exception): sqlstate = state
+    class TransactionCursor(Cursor):
+        def execute(self, sql, params=None):
+            if sql.startswith("ROLLBACK TO SAVEPOINT"):
+                self.connection.failed = False
+            elif self.connection.failed:
+                raise AssertionError("transaction_aborted")
+            super().execute(sql, params)
+            if "SET LOCAL lock_timeout" in sql:
+                self.connection.failed = True
+                raise DriverError(SECRET)
+    db = Connection(schema="public"); db.failed = False
+    def cursor():
+        result = TransactionCursor(db); db.cursors.append(result); return result
+    db.cursor = cursor
+    install_driver(monkeypatch, "gauss", db)
+    if success:
+        assert discover_tables(spec("gauss"))["tables"][0]["name"] == "items"
+    else:
+        with pytest.raises(DatabaseAccessError, match="^database_connection_failed$") as error:
+            discover_tables(spec("gauss"))
+        assert error.value.__cause__.sqlstate == state
+        assert SECRET not in str(error.value.__cause__)
+        import traceback
+        assert SECRET not in "".join(traceback.format_exception(error.value))
+    commands = [sql for sql, _ in db.executed]
+    assert commands.count("BEGIN TRANSACTION READ ONLY") == 1
+    assert ("ROLLBACK TO SAVEPOINT lightgraph_lock_timeout" in commands) is success
+    assert db.rollback_calls == 1 and db.closed
+    assert SECRET not in caplog.text

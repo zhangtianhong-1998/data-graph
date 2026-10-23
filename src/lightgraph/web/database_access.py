@@ -9,6 +9,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from io import BytesIO
 import ipaddress
+import logging
 import re
 import sys
 from typing import Literal
@@ -20,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, m
 from lightgraph.contracts import QueryLimits
 from lightgraph.errors import LightGraphError
 from lightgraph.sources.mysql import _connect_options
+from lightgraph.sources.gauss_compat import catalog_value, safe_database_cause, set_optional_lock_timeout
 
 TABLE_LIMIT = 1000
 CONNECTION_TIMEOUT_SECONDS = 5
@@ -252,18 +254,19 @@ def _read_only_cursor(spec: ConnectionSpec):
             read_only = cursor.fetchone()
         else:
             cursor.execute("BEGIN TRANSACTION READ ONLY")
-            cursor.execute("SET LOCAL search_path TO pg_catalog")
-            cursor.execute("SET LOCAL statement_timeout = '5000ms'")
-            cursor.execute("SET LOCAL lock_timeout = '1000ms'")
-            cursor.execute("SELECT current_setting('transaction_read_only')")
+            cursor.execute("SET LOCAL statement_timeout = '30000ms'")
+            set_optional_lock_timeout(cursor, 1000)
+            cursor.execute("SELECT pg_catalog.current_setting('transaction_read_only')")
             read_only = cursor.fetchone()
-        if not read_only or str(read_only[0]).lower() not in {"1", "on", "true"}:
+        if not read_only or str(catalog_value(read_only[0])).lower() not in {"1", "on", "true"}:
             raise DatabaseAccessError("read_only_transaction_unverified")
         yield cursor, resolved["schema"]
     except DatabaseAccessError:
         raise
-    except Exception:
-        raise DatabaseAccessError("database_connection_failed") from None
+    except LightGraphError as exc:
+        raise DatabaseAccessError(exc.code) from None
+    except Exception as exc:
+        raise DatabaseAccessError("database_connection_failed") from safe_database_cause(exc, logging.getLogger(__name__))
     finally:
         failed = sys.exc_info()[0] is not None
         cleanup_failed = False
@@ -316,14 +319,22 @@ def discover_tables(spec: ConnectionSpec) -> dict:
                 "ORDER BY table_name LIMIT %s", (schema, TABLE_LIMIT + 1))
         rows = cursor.fetchmany(TABLE_LIMIT + 1)
         tables = []
+        skipped_count = 0
         for row in rows[:TABLE_LIMIT]:
+            row = [catalog_value(value) for value in row]
             if len(row) != 3 or row[0] != schema or row[2] not in {"BASE TABLE", "VIEW"}:
                 raise DatabaseAccessError("database_catalog_invalid")
+            # schema.table IDs cannot represent a literal dot in a table name.
+            # Skip only that limitation; malformed/control-byte names still fail.
+            if isinstance(row[1], str) and "." in row[1]:
+                _identifier(row[1].replace(".", "_"))
+                skipped_count += 1
+                continue
             name = _identifier(row[1])
             tables.append({"schema": schema, "name": name, "qualified_name": schema + "." + name,
                            "table_type": row[2]})
         truncated = len(rows) > TABLE_LIMIT
-    return {"tables": tables, "truncated": truncated}
+    return {"tables": tables, "truncated": truncated, "skipped_count": skipped_count}
 
 
 def parse_table_list_excel(content: bytes) -> list[str]:

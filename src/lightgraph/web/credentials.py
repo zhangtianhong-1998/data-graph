@@ -77,6 +77,13 @@ class SessionCredentials:
         with self._lock:
             self._get(pid, token).sources.pop(source_id, None)
 
+    def clear_source_sessions(self, pid, source_id):
+        """Forgetting a saved connection also clears its active session copies."""
+        with self._lock:
+            for item in self._sessions.values():
+                if item.project_id == pid:
+                    item.sources.pop(source_id, None)
+
     def resolve(self, pid, token, config):
         """Return a private copy only to trusted metadata/worker dispatch code."""
         with self._lock:

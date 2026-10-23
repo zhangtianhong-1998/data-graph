@@ -9,7 +9,7 @@ class Cursor:
     def execute(self, sql, parameters=None):
         self.connection.executed.append((sql, parameters))
         if "current_setting" in sql: self.result=[("on","repeatable read")]
-        elif "SELECT version" in sql: self.result=[("openGauss 6.0.0 test fixture",)]
+        elif "SELECT pg_catalog.version" in sql: self.result=[("openGauss 6.0.0 test fixture",)]
         elif sql=="SELECT %s": self.result=[(71,)]
         elif "information_schema.columns" in sql: self.result=[("code","text","NO"),("name","text","YES")]
         elif "pg_catalog.col_description" in sql: self.result=[("code","Business code",1,True),("name","Display name",2,False)]
@@ -167,7 +167,7 @@ def test_nested_snapshot_uses_one_transaction_and_outer_failure_rolls_back():
         assert sum(sql.startswith("BEGIN ") for sql,_ in db.executed[initial_commands:])==1
 
 
-def test_prefix_uses_bound_like_operator_in_catalog_search_path():
+def test_prefix_uses_bound_like_operator_and_qualified_catalog_controls():
     db=Connection()
     with GaussSource("secret",allowed_tables=["public.items"],connect_factory=lambda _:db,
         verified_capabilities={"product":"openGauss","version":"6.0.0","driver":"psycopg_dbapi","capabilities":{"statement_timeout":"verified","query_cancel":"verified"}}) as source:
@@ -176,7 +176,8 @@ def test_prefix_uses_bound_like_operator_in_catalog_search_path():
         sql,parameters=[(sql,p) for sql,p in db.executed if 'FROM "public"."items"' in sql][-1]
         assert "LIKE %(p0)s ESCAPE '!'" in sql
         assert parameters["p0"]=="A!_!%!!%"
-        assert any("search_path" in sql and "pg_catalog" in sql for sql,_ in db.executed)
+        assert not any("search_path" in sql for sql, _ in db.executed)
+        assert any("pg_catalog.current_setting" in sql for sql, _ in db.executed)
 
 
 def test_snapshot_close_failure_is_safe_and_never_confirms_consistency():
@@ -212,7 +213,7 @@ def test_product_version_is_bound_to_product_marker(banner,expected):
 class VersionCursor(Cursor):
     def execute(self,sql,parameters=None):
         super().execute(sql,parameters)
-        if "SELECT version" in sql:self.result=[(self.connection.banner,)]
+        if "SELECT pg_catalog.version" in sql:self.result=[(self.connection.banner,)]
 
 
 class VersionConnection(Connection):
@@ -281,7 +282,7 @@ def test_cli_connect_check_uses_single_catalog_preflight(tmp_path,monkeypatch,ca
     manifest=json.loads(output)["gauss"]
     assert "TEST_ONLY_DSN" not in output
     assert manifest["actual_database_verified"] is verify_runtime
-    assert sum("SELECT version" in sql for sql,_ in db.executed)==1
+    assert sum("SELECT pg_catalog.version" in sql for sql,_ in db.executed)==1
     assert sum("information_schema.columns" in sql for sql,_ in db.executed)==1
     assert probes==([False,True] if verify_runtime else [])
     assert db.closed
@@ -353,4 +354,107 @@ def test_cancel_probe_cannot_be_satisfied_by_short_statement_timeout(monkeypatch
                 source._probe_runtime_control(cancel=True)
             assert source.capabilities().capabilities["query_cancel"]=="unknown"
     assert len(timers) == 1 and timers[0].stopped and timers[0].joined
+    assert db.closed
+
+
+class ByteCatalogCursor(Cursor):
+    def execute(self, sql, parameters=None):
+        super().execute(sql, parameters)
+        if "pg_catalog.col_description" in sql:
+            self.result = [("code", "Business code", "1", "t"), ("name", "Display name", "2", "f")]
+        elif "SELECT k.conname" in sql:
+            self.result = [("items_pkey", "p", "{1}", None, None, None),
+                           ("items_fk", "f", [b"1"], b"{1}", "public", "items")]
+        self.result = [tuple(v.encode("utf-8") if isinstance(v, str) else v for v in row) for row in self.result]
+
+
+class ByteCatalogConnection(Connection):
+    def cursor(self, name=None):
+        return ByteCatalogCursor(self, name)
+
+
+def test_bytes_catalog_preserves_names_comments_constraints_and_readonly():
+    with GaussSource("secret", allowed_tables=["public.items"], allowed_columns={"public.items": ["code", "name"]},
+                     connect_factory=lambda _: ByteCatalogConnection()) as source:
+        table = source.describe()[0]
+        assert source.capabilities().product == "openGauss" and source.capabilities().version == "6.0.0"
+        assert table.comment == "Business registry"
+        assert [(c.name, c.data_type, c.nullable, c.primary_key, c.comment) for c in table.columns] == [
+            ("code", "text", False, True, "Business code"), ("name", "text", True, False, "Display name")]
+        assert table.unique_keys == [["code"]]
+        assert table.foreign_keys[0].name == "items_fk"
+        assert table.foreign_keys[0].target_schema == "public" and table.foreign_keys[0].target_table == "items"
+        assert table.foreign_keys[0].target_columns == ["code"]
+
+
+@pytest.mark.parametrize("location", ["readonly", "version", "column", "annotation", "table_comment", "constraint"])
+def test_invalid_catalog_encoding_never_silently_repairs_identity(location):
+    class InvalidCursor(ByteCatalogCursor):
+        def execute(self, sql, parameters=None):
+            super().execute(sql, parameters)
+            tokens = {"readonly": "current_setting", "version": "pg_catalog.version", "column": "information_schema.columns",
+                      "annotation": "pg_catalog.col_description", "table_comment": "pg_catalog.obj_description", "constraint": "SELECT k.conname"}
+            if tokens[location] in sql:
+                row = list(self.result[0]); row[0] = b"private\xffvalue"; self.result[0] = tuple(row)
+    class InvalidConnection(Connection):
+        def cursor(self, name=None): return InvalidCursor(self, name)
+    with pytest.raises(LightGraphError, match="^database_catalog_encoding_invalid$") as error:
+        GaussSource("secret", allowed_tables=["public.items"], connect_factory=lambda _: InvalidConnection())
+    assert "private" not in str(error.value)
+
+
+@pytest.mark.parametrize("state", ["42704", "0A000"])
+def test_unsupported_lock_timeout_recovers_savepoint_without_replacing_snapshot(state):
+    class UnsupportedSetting(Exception):
+        sqlstate = state
+    class TransactionCursor(Cursor):
+        def execute(self, sql, parameters=None):
+            if sql.startswith("ROLLBACK TO SAVEPOINT"):
+                self.connection.failed = False
+            elif self.connection.failed:
+                raise AssertionError("transaction_aborted")
+            super().execute(sql, parameters)
+            if sql.startswith("SET LOCAL lock_timeout"):
+                self.connection.failed = True
+                raise UnsupportedSetting("PRIVATE_LOCK_TIMEOUT_DRIVER_DETAIL")
+    class TransactionConnection(Connection):
+        failed = False
+        rollbacks = 0
+        def cursor(self, name=None): return TransactionCursor(self, name)
+        def rollback(self): self.failed = False; self.rollbacks += 1
+    db = TransactionConnection()
+    with GaussSource("secret", allowed_tables=["public.items"], connect_factory=lambda _: db,
+                     verified_capabilities={"product":"openGauss", "version":"6.0.0", "driver":"psycopg_dbapi",
+                                            "capabilities":{"statement_timeout":"verified", "query_cancel":"verified"}}) as source:
+        commands = [sql for sql, _ in db.executed]
+        assert commands.count("ROLLBACK TO SAVEPOINT lightgraph_lock_timeout") == 1
+        assert commands.count("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY") == 1
+        assert not db.failed
+        before = db.rollbacks
+        with source.snapshot():
+            with source.snapshot():
+                assert source.capabilities().consistent_snapshot and db.rollbacks == before
+        # Unsupported setting is remembered for this connection, not re-probed.
+        assert sum("SET LOCAL lock_timeout" in sql for sql, _ in db.executed) == 1
+        assert db.rollbacks == before + 1
+
+
+@pytest.mark.parametrize("state", ["57014", "28P01", "08006", "42501", None])
+def test_lock_timeout_non_capability_failures_are_not_swallowed(state, caplog):
+    class DriverError(Exception): sqlstate = state
+    class FailingCursor(Cursor):
+        def execute(self, sql, parameters=None):
+            super().execute(sql, parameters)
+            if "SET LOCAL lock_timeout" in sql: raise DriverError("PRIVATE_DRIVER_PASSWORD")
+    class FailingConnection(Connection):
+        def cursor(self, name=None): return FailingCursor(self, name)
+    db = FailingConnection()
+    with pytest.raises(LightGraphError, match="^database_preflight_failed$") as error:
+        GaussSource("secret", allowed_tables=["public.items"], connect_factory=lambda _: db)
+    assert error.value.__cause__.sqlstate == state
+    assert "PRIVATE_DRIVER_PASSWORD" not in caplog.text
+    assert "PRIVATE_DRIVER_PASSWORD" not in str(error.value.__cause__)
+    import traceback
+    assert "PRIVATE_DRIVER_PASSWORD" not in "".join(traceback.format_exception(error.value))
+    assert not any("ROLLBACK TO SAVEPOINT" in sql for sql, _ in db.executed)
     assert db.closed
