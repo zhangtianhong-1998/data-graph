@@ -282,11 +282,6 @@ async function saveBinding() {
     bindingFile.value = null; await refreshProjectConfig(); notify('文档用途和使用范围已保存')
   })
 }
-async function importYaml(file: ProjectFile) {
-  await action(async () => {
-    await request<RunConfig>(`${path.value}/config/import`, { method: 'POST', body: json({ file_id: file.file_id }) }); await refreshProjectConfig(); notify('YAML 已导入为当前项目配置')
-  })
-}
 async function refreshMetadata() {
   await action(async () => { if (dirty.value) await saveForms(); metadata.value = await request<Metadata>(`${path.value}/metadata/refresh`, { method: 'POST', body: '{}' }); notify('元数据已更新') })
 }
@@ -350,7 +345,7 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
       <header class="topbar"><span>工作台 <span class="breadcrumb-separator">/</span> <strong>{{ project?.name || '项目管理' }}</strong></span><button v-if="project" class="text-button danger-text" :disabled="locked" @click="askDeletion({ kind: 'project', id: project.project_id, name: project.name })">删除项目</button></header>
       <div v-if="error" class="error-strip" role="alert"><span>{{ error }}</span><button aria-label="关闭错误提示" @click="error = ''">×</button></div>
       <div v-if="loading" class="page-empty"><div class="spinner"></div><p>正在读取项目</p></div>
-      <div v-else-if="!project" class="page-empty"><span class="empty-graphic">◇</span><h1>从一个项目开始</h1><p>上传数据、指定抽取目的，让 Agent 发现关键列和关系。<br/>Excel、CSV、Markdown 和配置文件会保存在项目自己的文件夹中。</p><button class="btn primary" @click="newProjectOpen = true">新建项目</button><button v-if="error" class="btn" @click="action(() => reloadProjects(projects[0]?.project_id))">重新连接</button></div>
+      <div v-else-if="!project" class="page-empty"><span class="empty-graphic">◇</span><h1>从一个项目开始</h1><p>上传数据、指定抽取目的，让 Agent 发现关键列和关系。<br/>数据文件和 Markdown 会保存在项目自己的文件夹中。</p><button class="btn primary" @click="newProjectOpen = true">新建项目</button><button v-if="error" class="btn" @click="action(() => reloadProjects(projects[0]?.project_id))">重新连接</button></div>
       <template v-else>
         <section class="project-head">
           <div class="phase-bar">
@@ -369,8 +364,8 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
             <div class="layout-two"><section class="panel"><div class="panel-head"><h2>抽取目标</h2><span class="badge">全流程生效</span></div><div class="panel-body"><div class="field"><label for="purpose">分析目的</label><textarea id="purpose" v-model="purpose" :disabled="locked" class="goal-input" placeholder="例如：构建经营分析所需的指标、度量和组织层级关系，不抽取逐笔交易金额。"/></div><div class="two-fields"><div class="field"><label for="includes">重点关注</label><textarea id="includes" v-model="includes" :disabled="locked" placeholder="每行一个目标，例如：&#10;指标编码与中英文名称&#10;组织上下级关系"/></div><div class="field"><label for="excludes">排除内容</label><textarea id="excludes" v-model="excludes" :disabled="locked" placeholder="每行一项，例如：&#10;逐笔业务金额&#10;展示排序字段"/></div></div><div class="field"><label for="guidance">发现提示</label><textarea id="guidance" v-model="guidance" :disabled="locked" placeholder="可补充业务经验，例如：同一对象在不同分析范围中可能处于不同层级，不要仅凭列位置确定全局层级。"/></div></div><div class="panel-footer"><span>修改只在保存后写入项目配置</span><button class="btn primary" :disabled="locked" @click="action(async () => { await saveForms(); notify('抽取目标已保存') })">保存目标</button></div></section><aside class="stack"><section class="panel"><div class="panel-head"><h2>项目概况</h2></div><div class="panel-body"><div class="scope-row"><span>数据来源</span><strong>{{ config.sources?.length || 0 }}</strong></div><div class="scope-row"><span>知识文档</span><strong>{{ documentFiles.length }}</strong></div><div class="scope-row"><span>已读取的表</span><strong>{{ metadata.tables.length }}</strong></div><div class="scope-row"><span>业务图节点</span><strong>{{ business.nodes.length }}</strong></div></div></section></aside></div>
           </template>
           <template v-if="tab === 'inputs'">
-            <input ref="uploadInput" type="file" hidden multiple accept=".xlsx,.csv,.yaml,.yml" @change="upload"/>
-            <DataInputs :key="project.project_id" :project-id="project.project_id" :sources="config.sources || []" :files="project.files" :metadata="metadata" :locked="locked" @connect="openDatabaseSource" @upload="uploadInput?.click()" @refresh="refreshMetadata" @preview="showContent" @import="importYaml" @delete-file="file => askDeletion({ kind: 'file', file })" @delete-source="source => askDeletion({ kind: 'source', source })" @delete-table="(source, table) => askDeletion({ kind: 'table', source, table })"/>
+            <input ref="uploadInput" type="file" hidden multiple accept=".xlsx,.csv" @change="upload"/>
+            <DataInputs :key="project.project_id" :project-id="project.project_id" :sources="config.sources || []" :files="project.files" :metadata="metadata" :locked="locked" @connect="openDatabaseSource" @upload="uploadInput?.click()" @refresh="refreshMetadata" @delete-file="file => askDeletion({ kind: 'file', file })" @delete-source="source => askDeletion({ kind: 'source', source })" @delete-table="(source, table) => askDeletion({ kind: 'table', source, table })"/>
           </template>
           <template v-if="tab === 'documents'">
             <div class="intro"><div><h2>知识文档</h2></div><button class="btn primary" :disabled="locked" @click="documentInput?.click()">＋ 上传 Markdown</button><input ref="documentInput" type="file" hidden multiple accept=".md,.markdown" @change="upload"/></div>

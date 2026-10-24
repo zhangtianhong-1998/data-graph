@@ -100,7 +100,7 @@ describe('删除项目与输入', () => {
     expect(deletes()[0]?.[0]).toBe('/projects/first/sources/db')
     expect(root.querySelector('.source-heading')).toBeNull()
   })
-  it.each([['数据文件 metrics.csv', 'csv'], ['数据文件 people.xlsx', 'excel'], ['配置文件 tables.yaml', 'yaml'], ['文档 guide.md', 'md']])('删除%s，成功后移除列表项', async (label, id) => {
+  it.each([['数据文件 metrics.csv', 'csv'], ['数据文件 people.xlsx', 'excel'], ['文档 guide.md', 'md']])('删除%s，成功后移除列表项', async (label, id) => {
     mount(); await ready()
     if (id === 'md') button('知识文档').click()
     else [...root.querySelectorAll<HTMLButtonElement>('.input-types button')].find(button => button.textContent?.includes('本地文件'))!.click()
@@ -118,15 +118,26 @@ describe('删除项目与输入', () => {
     button('Agent 与模型').click(); await nextTick(); expect(root.querySelector<HTMLInputElement>('#model-name')?.value).toBe('unsaved-model')
     expect(api.request.mock.calls.some(call => call[1]?.method === 'PUT')).toBe(false)
   })
-  it('删除 Agent 配置文件时保留未保存的目标，但接受服务端关闭模型的设置', async () => {
-    config.agent_config = 'files/tables.yaml'; config.model = { mode: 'approved_external' }
-    mount(); await ready(); button('抽取目标').click(); await nextTick(); await input('purpose', '保留目标草稿')
-    button('数据接入').click(); await nextTick()
+  it('数据列表仅显示数据文件，YAML 随所选数据在右侧预览', async () => {
+    const original = api.request.getMockImplementation()!
+    api.request.mockImplementation(async (...args) => {
+      if (String(args[0]).includes('/metadata/yaml?')) return { files: [{ name: 'tables.yaml', content: 'table: csv_metrics' }] }
+      return original(...args)
+    })
+    mount(); await ready()
     ;[...root.querySelectorAll<HTMLButtonElement>('.input-types button')].find(button => button.textContent?.includes('本地文件'))!.click(); await nextTick()
-    labelled('删除配置文件 tables.yaml').click(); await nextTick(); button('确认删除').click()
-    await vi.waitFor(() => expect(dialog()).toBeNull()); await vi.waitFor(() => expect(button('删除项目').disabled).toBe(false))
-    button('抽取目标').click(); await nextTick(); expect(root.querySelector<HTMLTextAreaElement>('#purpose')?.value).toBe('保留目标草稿')
-    button('Agent 与模型').click(); await nextTick(); expect(root.querySelector<HTMLSelectElement>('#model-mode')?.value).toBe('disabled')
+    await vi.waitFor(() => expect(root.querySelector('.input-metadata')?.textContent).toContain('csv_metrics'))
+    const center = root.querySelector('.input-selection')!
+    expect(center.textContent).toContain('metrics.csv')
+    expect(center.textContent).toContain('people.xlsx')
+    expect(center.textContent).not.toContain('tables.yaml')
+    expect(center.textContent).not.toContain('配置文件')
+    expect(root.querySelector('[aria-label="删除配置文件 tables.yaml"]')).toBeNull()
+    expect(root.querySelector<HTMLInputElement>('input[type="file"][accept=".xlsx,.csv"]')).not.toBeNull()
+    button('YAML').click(); await nextTick()
+    await vi.waitFor(() => expect(root.querySelector('.yaml-preview')?.textContent).toContain('table: csv_metrics'))
+    expect(root.querySelector('.yaml-toolbar')?.textContent).toContain('tables.yaml')
+    expect(deletes()).toHaveLength(0)
   })
   it('删除文件失败后保留文件与元数据，取消确认不改动列表', async () => {
     mount(); await ready()

@@ -6,10 +6,9 @@ import { projectPath, request } from './api'
 import type { Metadata, ProjectFile, SourceConfig } from './types'
 
 const props = defineProps<{ projectId: string; sources: SourceConfig[]; files: ProjectFile[]; metadata: Metadata; locked: boolean }>()
-const emit = defineEmits<{ connect: [source?: SourceConfig]; upload: []; refresh: []; preview: [file: ProjectFile]; import: [file: ProjectFile]; deleteFile: [file: ProjectFile]; deleteSource: [source: SourceConfig]; deleteTable: [source: SourceConfig, table: string] }>()
+const emit = defineEmits<{ connect: [source?: SourceConfig]; upload: []; refresh: []; deleteFile: [file: ProjectFile]; deleteSource: [source: SourceConfig]; deleteTable: [source: SourceConfig, table: string] }>()
 const databases = computed(() => props.sources.filter(isDatabaseSource))
 const localFiles = computed(() => props.files.filter(file => file.kind === 'excel' || file.kind === 'csv'))
-const yamlFiles = computed(() => props.files.filter(file => file.kind === 'yaml'))
 const kind = ref<'database' | 'file'>(databases.value.length || !localFiles.value.length ? 'database' : 'file')
 watch([() => databases.value.length, () => localFiles.value.length], ([db, local], [oldDb, oldLocal]) => {
   if (db > oldDb) kind.value = 'database'
@@ -67,7 +66,6 @@ onUnmounted(() => { revision++ })
           <div v-for="item in entries" :key="item.key" class="input-item-row" :class="{ active: current?.key === item.key }"><button class="input-item" :class="{ active: current?.key === item.key }" :aria-pressed="current?.key === item.key" @click="selected = item.key"><span>{{ item.label }}</span><small>{{ item.label.split('.').pop()?.toUpperCase() }}</small></button><button class="text-button danger-text input-delete" :disabled="locked" :aria-label="`删除数据文件 ${item.label}`" @click="deleteLocalFile(item.key)">删除</button></div>
           <div v-if="!localFiles.length" class="empty-state">上传 Excel 或 CSV</div>
         </template>
-        <details v-if="kind === 'file' && yamlFiles.length" class="config-files"><summary>配置文件 · {{ yamlFiles.length }}</summary><div v-for="file in yamlFiles" :key="file.file_id" class="file-row"><div class="file-info"><h3>{{ file.name }}</h3></div><button class="text-button" :disabled="locked" @click="emit('preview', file)">查看</button><button class="text-button" :disabled="locked" @click="emit('import', file)">导入</button><button class="text-button danger-text" :disabled="locked" :aria-label="`删除配置文件 ${file.name}`" @click="emit('deleteFile', file)">删除</button></div></details>
       </div>
       <div class="panel-footer"><span>{{ entries.length }} {{ kind === 'database' ? '张表' : '个文件' }}</span><button class="text-button" :disabled="locked || !sources.length" @click="emit('refresh')">刷新元数据</button></div>
     </section>

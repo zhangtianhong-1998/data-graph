@@ -73,12 +73,16 @@ def test_delete_needs_own_session_and_idle_project(client, monkeypatch, selectio
 
 
 def test_csv_delete_removes_config_preview_keeps_other_metadata_and_history(client, monkeypatch):
-    first = upload(client, 'first.csv', b'code\nA\n')
     second = upload(client, 'second.csv', b'code\nB\n')
     workspace = client.app.state.workspace
-    preview_file_metadata(workspace, 'alpha', first['file_id'])
     preview_file_metadata(workspace, 'alpha', second['file_id'])
     path = workspace.project_path('alpha')
+    unaffected = {p: p.read_bytes() for p in (path / 'output/metadata').rglob('*.yaml')}
+    first = upload(client, 'first.csv', b'code\nA\n')
+    preview_file_metadata(workspace, 'alpha', first['file_id'])
+    affected = set((path / 'output/metadata').rglob('*.yaml')) - unaffected.keys()
+    assert len(affected) == 2
+    uploaded_yaml = upload(client, 'user_config.yaml', b'rules: []')
     (path / 'runs/run_history.json').write_text('{"status":"completed"}')
     (path / 'output/retained-result.json').write_text('published result')
     import lightgraph.runtime.config as runtime
@@ -91,6 +95,10 @@ def test_csv_delete_removes_config_preview_keeps_other_metadata_and_history(clie
     assert not (path / first['relative_path']).exists()
     assert not (path / f"metadata/{first['file_id']}.yaml").exists()
     assert (path / second['relative_path']).exists()
+    assert (path / f"metadata/{second['file_id']}.yaml").exists()
+    assert (path / uploaded_yaml['relative_path']).exists()
+    assert all(not p.exists() for p in affected)
+    assert all(p.read_bytes() == content for p, content in unaffected.items())
     assert (path / 'runs/run_history.json').exists()
     assert (path / 'output/retained-result.json').read_text() == 'published result'
     metadata = read_metadata(workspace, 'alpha')
@@ -352,7 +360,7 @@ def test_windows_reparse_point_rejected_for_root_and_parent(client, monkeypatch,
 
 
 def test_db_table_delete_prunes_cached_table_and_fk_without_querying(client, monkeypatch):
-    from lightgraph.catalog import DeclaredCatalog, SourceDescription, CATALOG_VERSION
+    from lightgraph.catalog import DeclaredCatalog, SourceDescription, CATALOG_VERSION, semantic_catalog, write_catalog
     from lightgraph.contracts import TableSpec, digest
     from lightgraph.web.execution import write_metadata_context
     db(client)
@@ -364,7 +372,9 @@ def test_db_table_delete_prunes_cached_table_and_fk_without_querying(client, mon
     sources = [SourceDescription(source_id='db', product='GaussDB', constraint_coverage={})]
     catalog = DeclaredCatalog(tables=tables, sources=sources,
         revision=digest(CATALOG_VERSION, [t.model_dump(by_alias=True) for t in tables], [s.model_dump() for s in sources]))
-    ws._write_yaml(ws._path('alpha', 'output/metadata.yaml'), {'declared': catalog.model_dump(mode='json', by_alias=True)})
+    write_catalog(ws._path('alpha', 'output'), catalog, semantic_catalog(catalog, ws.resolved_config('alpha').goal))
+    old_snapshots = list(ws._path('alpha', 'output/metadata').rglob('*.yaml'))
+    assert len(old_snapshots) == 2
     write_metadata_context(ws.resolved_config('alpha'), ws.project_path('alpha'))
     import lightgraph.runtime.config as runtime
     monkeypatch.setattr(runtime, 'open_sources', lambda *_a, **_k: pytest.fail('deletion cannot query database'))
@@ -373,6 +383,52 @@ def test_db_table_delete_prunes_cached_table_and_fk_without_querying(client, mon
     view = read_metadata(ws, 'alpha')
     assert [table['name'] for table in view['tables']] == ['other']
     assert view['tables'][0]['foreign_keys'] == [] and not view['requires_refresh']
+    assert all(not p.exists() for p in old_snapshots)
+
+
+def test_catalog_cleanup_rolls_back_when_an_interpretation_cannot_be_removed(client, monkeypatch):
+    from pathlib import Path
+    file = upload(client, 'data.csv', b'code\nA\n')
+    ws = client.app.state.workspace
+    preview_file_metadata(ws, 'alpha', file['file_id'])
+    root = ws.project_path('alpha')
+    original_config = ws.get_config('alpha')
+    paths = [ws.file_path('alpha', file['file_id']), root / f"metadata/{file['file_id']}.yaml",
+             root / 'output/metadata.yaml', root / 'output/metadata-context.json',
+             *list((root / 'output/metadata').rglob('*.yaml'))]
+    before = {p: p.read_bytes() for p in paths}
+    failing = next(p for p in paths if p.parent.name == 'interpretations')
+    unlink = Path.unlink
+
+    def fail(path, *args, **kwargs):
+        if path == failing:
+            raise OSError('cannot remove interpretation')
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', fail)
+    assert client.delete(f"/api/projects/alpha/files/{file['file_id']}").status_code == 500
+    assert ws.get_config('alpha') == original_config
+    assert all(p.read_bytes() == content for p, content in before.items())
+
+
+def test_catalog_cleanup_rejects_linked_revision_before_deleting_input(client, tmp_path):
+    file = upload(client, 'data.csv', b'code\nA\n')
+    ws = client.app.state.workspace
+    preview_file_metadata(ws, 'alpha', file['file_id'])
+    revision = next(ws._path('alpha', 'output/metadata/declarations').glob('*.yaml'))
+    outside = tmp_path / 'external-catalog.yaml'
+    outside.write_bytes(revision.read_bytes())
+    revision.unlink()
+    try:
+        revision.symlink_to(outside)
+    except OSError as exc:
+        if getattr(exc, 'winerror', None) == 1314:
+            pytest.skip('Windows account cannot create symlinks')
+        raise
+    response = client.delete(f"/api/projects/alpha/files/{file['file_id']}")
+    assert response.status_code == 400
+    assert response.json()['error']['code'] == 'workspace_symlink_forbidden'
+    assert ws.file_path('alpha', file['file_id']).exists() and outside.exists()
 
 
 def test_doc_rebind_write_failure_restores_frontmatter_and_membership(client, monkeypatch):

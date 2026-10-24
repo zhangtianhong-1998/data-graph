@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from ..catalog import CATALOG_VERSION, DeclaredCatalog, semantic_catalog
+from ..catalog import CATALOG_VERSION, DeclaredCatalog, SemanticCatalog, semantic_catalog
 from ..contracts import digest
 from ..documents.core import load_document
 from ..errors import LightGraphError
@@ -139,6 +139,55 @@ def _metadata_update(workspace, pid, config, declared, trusted, targets):
         workspace._path(pid, 'output/metadata-context.json'): json.dumps(
             _metadata_context(resolved, workspace.project_path(pid)), ensure_ascii=False).encode(),
     }
+
+
+def _obsolete_catalogs(workspace, pid, targets):
+    """Remove owned snapshots containing deleted inputs, without rewriting hashes.
+
+    Mixed snapshots are removed as a unit; the current catalog is rebuilt above.
+    Uploads, per-run results and unrelated catalog revisions remain untouched.
+    """
+    if not targets:
+        return []
+
+    def affected(sid, schema=None, name=None):
+        return any(target['source_id'] == sid and (not target.get('name') or
+                   (target.get('schema'), target['name']) == (schema, name)) for target in targets)
+
+    deletions, removed_revisions = [], set()
+    for folder, model in [('declarations', DeclaredCatalog), ('interpretations', SemanticCatalog)]:
+        directory = workspace._path(pid, 'output/metadata/' + folder)
+        for path in sorted(directory.glob('*.yaml')):
+            if not re.fullmatch(r'[0-9a-f]{64}', path.stem):
+                continue
+            _no_symlinks(path)
+            if not path.is_file():
+                continue
+            try:
+                catalog = model.model_validate(workspace._read(path))
+            except ValueError:
+                continue
+            except LightGraphError as exc:
+                if exc.code not in {'invalid_yaml', 'invalid_yaml_mapping', 'yaml_alias_or_tag_forbidden',
+                                    'workspace_metadata_too_large', 'workspace_file_read_failed'}:
+                    raise
+                # An unrecognized artifact is not proof of ownership.
+                continue
+            if catalog.revision != path.stem:
+                continue
+            if isinstance(catalog, DeclaredCatalog):
+                remove = any(affected(s.source_id) for s in catalog.sources) or any(
+                    affected(t.source_id, t.schema_name, t.name) or any(
+                        affected(t.source_id, fk.target_schema, fk.target_table) for fk in t.foreign_keys)
+                    for t in catalog.tables)
+            else:
+                remove = catalog.declaration_revision in removed_revisions or any(
+                    affected(t.source.source_id, t.source.schema_name, t.source.table) for t in catalog.tables)
+            if remove:
+                deletions.append(path)
+                if isinstance(catalog, DeclaredCatalog):
+                    removed_revisions.add(catalog.revision)
+    return deletions
 
 
 def delete_input(workspace, pid, *, fid=None, sid=None, table=None):
@@ -262,6 +311,7 @@ def delete_input(workspace, pid, *, fid=None, sid=None, table=None):
     writes = _metadata_update(workspace, pid, clean, declared, trusted, targets)
     deletions = [workspace._path(pid, f['relative_path']) for f in removed_files]
     deletions.extend(workspace._path(pid, f"metadata/{f['file_id']}.yaml") for f in removed_files)
+    deletions.extend(_obsolete_catalogs(workspace, pid, targets))
     for removed in removed_sources:
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', removed['id']):
             # Imported configurations may use broader IDs. The credential store
