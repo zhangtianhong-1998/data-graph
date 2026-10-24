@@ -35,3 +35,7 @@
 @media(max-width:1000px){.input-workspace{grid-template-columns:110px minmax(180px,.8fr) minmax(250px,1.3fr);gap:10px}.input-types{padding:5px}.input-types button{padding:12px 6px}.input-selection .panel-head{padding:15px 10px;flex-wrap:wrap}}
 @media(max-width:900px){.input-workspace{grid-template-columns:minmax(180px,.7fr) minmax(250px,1.3fr)}.input-types{grid-column:1/-1;flex-direction:row}.input-types button{flex:1;padding:12px}.input-items{min-height:250px}}
 @media(max-width:600px){.input-workspace{grid-template-columns:minmax(0,1fr)}.input-items{min-height:0;max-height:220px}.input-metadata .schema-preview{min-height:300px}}
+
+/* Keep deletion controls separate from selection buttons and reachable on touch screens. */
+.danger-text{color:#b84153}.btn.danger{background:#b9384b;border-color:#b9384b;color:#fff}.btn.danger:hover:not(:disabled){background:#9d2b3c}
+.input-item-row{display:flex;align-items:center;gap:4px;border:1px solid transparent;border-radius:7px;margin-bottom:4px;min-width:0}.input-item-row.active{background:#edf3ff;border-color:#cbdcf9}.input-item-row .input-item{flex:1;min-width:0;margin:0;border:0}.input-delete{flex-shrink:0;min-height:36px;padding:6px 8px}.source-heading>div:first-child{min-width:0}.source-heading .actions{flex-shrink:0;gap:8px}.delete-description{overflow-wrap:anywhere}.modal[role=alertdialog] .note{margin-top:16px}.topbar .danger-text{flex-shrink:0}

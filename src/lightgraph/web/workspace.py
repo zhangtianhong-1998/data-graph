@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import tempfile
 import threading
 from typing import Literal
@@ -43,6 +44,8 @@ class FileRecord(StrictModel):
     size: int = Field(ge=0, le=MAX_UPLOAD_BYTES)
     purpose: str = "unresolved"
     scope: DocumentScope = Field(default_factory=DocumentScope)
+    inactive_reason: str | None = None
+    inactive_targets: list[dict[str, str]] = Field(default_factory=list)
 
 
 class _Project(StrictModel):
@@ -87,6 +90,14 @@ def _no_symlinks(path: Path) -> None:
     """Reject symlinks before resolve/open, including parent directory links."""
     for entry in (path, *path.parents):
         if entry.is_symlink():
+            raise LightGraphError("workspace_symlink_forbidden")
+        try:
+            attributes = getattr(entry.lstat(), "st_file_attributes", 0)
+        except FileNotFoundError:
+            continue
+        # Windows junctions are reparse points but are not reported as symlinks
+        # on Python 3.11. Reject them before reads, writes, or recursive deletion.
+        if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
             raise LightGraphError("workspace_symlink_forbidden")
 
 
@@ -415,12 +426,32 @@ class Workspace:
             meta.update(purpose=purpose, scope=binding)
             updated = "---\n" + yaml.safe_dump(meta, allow_unicode=True, sort_keys=False) + "---\n" + body
             # Validate the full section-scope inheritance before changing the file.
-            load_document(path, text=updated)
+            document = load_document(path, text=updated)
             if len(updated.encode()) > MAX_TEXT_BYTES:
                 raise LightGraphError("upload_too_large")
-            self._atomic(path, updated.encode())
+            original_project = deepcopy(project)
+            original_config = self.get_config(project_id)
+            config = deepcopy(original_config)
+            reactivate = False
+            if file.get("inactive_reason"):
+                from .deletion import document_targets, validate_rebinding
+                if not document_targets(document, file.get("inactive_targets", [])):
+                    validate_rebinding(self, project_id, document)
+                    reactivate = True
             file.update(purpose=purpose, scope=binding, size=len(updated.encode()))
-            self._save(project)
+            if reactivate:
+                if file["relative_path"] not in config["documents"]:
+                    config["documents"].append(file["relative_path"])
+                file.update(inactive_reason=None, inactive_targets=[])
+            try:
+                self._atomic(path, updated.encode())
+                self._write_yaml(self._path(project_id, "config.yaml"), config)
+                self._save(project)
+            except Exception:
+                self._atomic(path, text.encode())
+                self._write_yaml(self._path(project_id, "config.yaml"), original_config)
+                self._save(original_project)
+                raise
             return deepcopy(file)
 
     def _normalize_config(self, project_id: str, value: dict, project: dict | None = None) -> dict:

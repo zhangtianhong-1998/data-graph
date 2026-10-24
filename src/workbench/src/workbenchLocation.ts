@@ -44,6 +44,10 @@ export class WorkbenchLocation {
     return projects[0]?.project_id
   }
 
+  removeProject(projectId: string) {
+    if (this.read()?.projectId === projectId) this.clear()
+  }
+
   selectProject(projectId: string) {
     if (this.read()?.projectId !== projectId) this.write({ projectId })
   }

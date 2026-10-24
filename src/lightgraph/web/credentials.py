@@ -99,6 +99,13 @@ class SessionCredentials:
             return ({sid: values[2] for sid, values in item.sources.items()},
                     item.model[1] if item.model else None)
 
+    def clear_project(self, pid):
+        """Delete every in-memory credential session for a removed project."""
+        with self._lock:
+            for token in list(self._sessions):
+                if self._sessions[token].project_id == pid:
+                    del self._sessions[token]
+
     def clear(self):
         with self._lock:
             self._sessions.clear()

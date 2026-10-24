@@ -127,6 +127,10 @@ class DeleteConnectionDraft(InputModel):
     revision: int = Field(ge=0,le=9007199254740991)
 
 
+class DeleteTable(InputModel):
+    table: str = Field(min_length=1, max_length=512)
+
+
 class DatabaseRequest(InputModel):
     connection: ConnectionSpec
 
@@ -234,10 +238,43 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             mutable(pid)
             return workspace.rename(pid,data.name)
 
+    @app.delete('/api/projects/{pid}')
+    def remove_project(pid: str, x_workbench_session: str | None = Header(default=None)):
+        from .deletion import delete_project
+        with workspace.lock(pid):
+            mutable(pid)
+            credentials.require(pid, x_workbench_session)
+            result = delete_project(workspace, pid)
+            credentials.clear_project(pid)
+            return result
+
+    def remove_input(pid, token, **selection):
+        from .deletion import delete_input
+        with workspace.lock(pid):
+            mutable(pid)
+            credentials.require(pid, token)
+            result = delete_input(workspace, pid, **selection)
+            for sid in result['removed_source_ids']:
+                credentials.clear_source_sessions(pid, sid)
+            return result
+
+    @app.delete('/api/projects/{pid}/files/{fid}')
+    def remove_file(pid: str, fid: str, x_workbench_session: str | None = Header(default=None)):
+        return remove_input(pid, x_workbench_session, fid=fid)
+
+    @app.delete('/api/projects/{pid}/sources/{sid}')
+    def remove_source(pid: str, sid: str, x_workbench_session: str | None = Header(default=None)):
+        return remove_input(pid, x_workbench_session, sid=sid)
+
+    @app.delete('/api/projects/{pid}/sources/{sid}/tables')
+    def remove_table(pid: str, sid: str, data: DeleteTable, x_workbench_session: str | None = Header(default=None)):
+        return remove_input(pid, x_workbench_session, sid=sid, table=data.table)
+
     @app.post('/api/projects/{pid}/session',status_code=201)
     def create_session(pid:str):
-        workspace.get(pid)
-        return {'session_id':credentials.create(pid),'expires_in_seconds':credentials.ttl_seconds}
+        with workspace.lock(pid):
+            workspace.get(pid)
+            return {'session_id':credentials.create(pid),'expires_in_seconds':credentials.ttl_seconds}
 
     @app.get('/api/projects/{pid}/credentials')
     def get_credentials(pid:str,x_workbench_session:str|None=Header(default=None)):

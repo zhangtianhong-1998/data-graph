@@ -42,6 +42,12 @@ const messages: Record<string, string> = {
   run_already_active: '此项目正在运行，请等待完成或先取消。', project_busy: '项目正在运行，暂时无法修改。',
   project_run_active: '此项目正在运行，请等待完成或先取消。', extraction_purpose_required: '请先填写抽取目的。',
   project_inputs_required: '请先上传数据或知识文档。',
+  file_in_use: '此文件仍被来源配置引用，请先移除相关来源或修改配置。',
+  database_source_required: '仅数据库来源支持单独移除数据表。',
+  document_binding_requires_metadata: '请先读取元数据，再重新绑定文档。',
+  project_file_in_use: '此文件仍被来源配置引用，请先移除相关来源或修改配置。',
+  source_not_found: '数据来源不存在，请刷新项目。',
+  source_table_not_found: '数据表不在当前来源中，请刷新项目。',
   file_type_not_supported: '文件类型不支持，请选择 XLSX、CSV、Markdown 或 YAML。',
   unsupported_file_type: '文件类型不支持，请选择 XLSX、CSV、Markdown 或 YAML。',
   file_too_large: '文件超过服务器上传限制。', file_not_found: '文件不存在，请刷新文件列表。',
@@ -59,6 +65,7 @@ function sessionHeader(path: string): Record<string, string> {
   const token = project ? sessions.get(project) : undefined
   return token ? { 'X-Workbench-Session': token } : {}
 }
+export function clearSession(projectId: string) { const id = encodeURIComponent(projectId); sessions.delete(id); pendingSessions.delete(id) }
 export function clearSessions() { sessions.clear(); pendingSessions.clear() }
 export async function ensureSession(projectId: string): Promise<void> {
   const id = encodeURIComponent(projectId)

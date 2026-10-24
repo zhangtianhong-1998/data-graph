@@ -35,6 +35,8 @@ workspace/<项目编号>/
 
 服务默认只监听本机，每个 workspace 只允许一个服务。页面按秒轮询真实任务状态；不向浏览器传送查询样本、模型原文，也不虚构进度百分比。详细接口、当前范围和启动方式见 [Vue 工作台实现](design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md)。原 [交互设计](design/lightweight_graph/WORKBENCH_DESIGN.md) 和 [用户故事](design/lightweight_graph/WORKBENCH_US.md) 中的后续能力仍单独列出。旧合成原型保留在 `src/lightgraph/workbench_prototype/`，不再作为实际工作台入口。
 
+工作台支持删除项目、上传的数据文件、Markdown 和 YAML，以及移除数据库连接或已选表。移除数据库表只调整本项目的抽取范围，不修改源数据库。删除输入保留已有图谱发布和运行记录；删除整个项目则清除该项目的本地文件、配置、连接信息和结果。操作前显示确认，运行中的项目暂不允许删除。
+
 公开仓库包含源码、测试、设计文档和示例配置。合成 Excel、运行结果与安装包由下面的命令在本地生成；不会随源码提交。
 
 ## 安装与小实验
