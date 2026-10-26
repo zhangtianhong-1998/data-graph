@@ -19,7 +19,8 @@ from typing import Any, Iterable
 from lightgraph.contracts import GraphFact, PartitionCompletion, RuleSpec, SupportSpec, ValidationRecord, canonical, digest
 from lightgraph.identity import IdentityRegistry
 from lightgraph.errors import LightGraphError
-from .policy import PersistencePolicy, PersistenceViolation, RELATION_STATES, RELATION_ENDPOINT_KINDS
+from .policy import PersistencePolicy, PersistenceViolation, KINDS
+from lightgraph.semantic_schema import SemanticSchema, EntityTypeDefinition
 
 
 class StoreError(LightGraphError):
@@ -46,6 +47,10 @@ class GraphStore:
         self.policy = policy or PersistencePolicy()
         self._lock = threading.RLock()
         self._initialize()
+        self._goal = None
+        self._goal_revision = 0
+        for row in self.connection.execute("SELECT payload FROM semantic_catalog ORDER BY catalog_id"):
+            self.policy = self.policy.with_schema(SemanticSchema.model_validate_json(row[0]))
         self.identity = IdentityRegistry(self.connection)
 
     def close(self) -> None:
@@ -60,14 +65,35 @@ class GraphStore:
     @contextmanager
     def _transaction(self):
         with self._lock:
-            self.connection.execute("BEGIN IMMEDIATE")
+            # Batch operations such as snapshot import own an outer atomic
+            # transaction; individual store writes must not commit it early.
+            savepoint = "store_" + uuid.uuid4().hex if self.connection.in_transaction else None
+            self.connection.execute("SAVEPOINT " + savepoint if savepoint else "BEGIN IMMEDIATE")
             try:
                 yield
             except BaseException:
-                self.connection.execute("ROLLBACK")
+                if savepoint:
+                    self.connection.execute("ROLLBACK TO " + savepoint)
+                    self.connection.execute("RELEASE " + savepoint)
+                else:
+                    self.connection.execute("ROLLBACK")
                 raise
             else:
-                self.connection.execute("COMMIT")
+                self.connection.execute("RELEASE " + savepoint if savepoint else "COMMIT")
+
+    @contextmanager
+    def import_transaction(self):
+        """Import vocabulary and graph together; a rejected snapshot leaves neither."""
+        with self._lock:
+            prior_policy = self.policy
+            try:
+                with self._transaction():
+                    if self.heads():
+                        raise StoreError("import_requires_empty_store")
+                    yield
+            except BaseException:
+                self.policy = prior_policy
+                raise
 
     def _initialize(self) -> None:
         self.connection.executescript("""
@@ -94,6 +120,16 @@ class GraphStore:
         CREATE TABLE IF NOT EXISTS publication_binding (
           publication_id TEXT NOT NULL REFERENCES publication(publication_id), binding_id TEXT NOT NULL,
           binding_revision INTEGER NOT NULL, PRIMARY KEY(publication_id,binding_id,binding_revision)
+        );
+        CREATE TABLE IF NOT EXISTS rule_generation (
+          publication_id TEXT PRIMARY KEY REFERENCES publication(publication_id),
+          base_heads TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS semantic_catalog (
+          catalog_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          goal_id TEXT NOT NULL, goal_revision INTEGER NOT NULL,
+          rule_id TEXT NOT NULL, rule_revision INTEGER NOT NULL, payload TEXT NOT NULL,
+          UNIQUE(goal_id,goal_revision,rule_id,rule_revision)
         );
         CREATE TABLE IF NOT EXISTS partition_head (
           logical_rule_id TEXT NOT NULL, partition_id TEXT NOT NULL,
@@ -133,6 +169,84 @@ class GraphStore:
         CREATE INDEX IF NOT EXISTS fact_support_fact ON fact_support(fact_id);
         CREATE INDEX IF NOT EXISTS publication_by_rule ON publication(logical_rule_id,partition_id);
         """)
+
+    @staticmethod
+    def _check_schema_goal(schema, goal):
+        if goal is None:
+            return
+        kinds = {entry.name for entry in schema.entity_types}
+        kinds.update(kind for entry in schema.properties for kind in entry.entity_kinds)
+        kinds.update(kind for entry in schema.relations for kind in entry.source_kinds + entry.target_kinds)
+        if goal.entity_kinds and kinds - set(goal.entity_kinds):
+            raise PersistenceViolation("semantic_schema_outside_entity_goal")
+        if goal.relation_kinds and {entry.name for entry in schema.relations} - set(goal.relation_kinds):
+            raise PersistenceViolation("semantic_schema_outside_relation_goal")
+
+    def configure_goal(self, goal, goal_revision: int = 1) -> None:
+        """Install user intent; vocabulary declarations cannot grant source permissions."""
+        from ..contracts import ExtractionGoal
+        goal = ExtractionGoal.model_validate(goal.model_dump())
+        if not isinstance(goal_revision, int) or goal_revision < 1:
+            raise StoreError("invalid_goal_revision")
+        declared_names = {entry.name for entry in goal.semantic_schema.entity_types}
+        declarations = SemanticSchema(entity_types=[EntityTypeDefinition(name=name,
+            description=f"User-declared output type: {name}") for name in sorted(set(goal.entity_kinds) - KINDS["business"] - declared_names)])
+        schema = SemanticSchema.merged(goal.semantic_schema, declarations)
+        self._check_schema_goal(schema, goal)
+        policy = self.policy.with_schema(schema)
+        self._persist_semantic_schema(schema, goal.goal_id, goal_revision, "", 0)
+        self._goal, self._goal_revision, self.policy = goal, goal_revision, policy
+
+    def _rule_schema(self, rule) -> SemanticSchema:
+        schema = SemanticSchema.merged(self._goal.semantic_schema if self._goal else SemanticSchema(),
+                                       rule.semantic_schema)
+        kind = rule.identity.entity_kind
+        # An explicitly named output kind is operator authorization. Automatic
+        # mode must supply its new definition instead of admitting any string.
+        if (self._goal and kind in self._goal.entity_kinds and
+                kind not in KINDS["business"] and
+                kind not in {entry.name for entry in schema.entity_types}):
+            schema = SemanticSchema.merged(schema, SemanticSchema(entity_types=[
+                EntityTypeDefinition(name=kind, description=f"User-declared output type: {kind}")]))
+        return schema
+
+    def preview_rule_semantics(self, rule):
+        """Validate a proposed vocabulary and mapping without persisting a declaration."""
+        schema = self._rule_schema(rule)
+        self._check_schema_goal(schema, self._goal)
+        policy = self.policy.with_schema(schema)
+        policy.check_record(rule)
+        policy.check_rule(rule, self._goal)
+        return policy
+
+    def register_rule_semantics(self, rule) -> None:
+        policy = self.preview_rule_semantics(rule)
+        goal_id = self._goal.goal_id if self._goal else "explicit_rule"
+        self._persist_semantic_schema(self._rule_schema(rule), goal_id, self._goal_revision,
+                                      rule.rule_id, rule.revision)
+        self.policy = policy
+
+    def _persist_semantic_schema(self, schema, goal_id, goal_revision, rule_id, rule_revision):
+        if schema.is_empty():
+            return
+        payload = canonical(schema)
+        if len(payload.encode("utf-8")) > 262144:
+            raise PersistenceViolation("semantic_schema_too_large")
+        with self._transaction():
+            old = self.connection.execute("""SELECT payload FROM semantic_catalog
+                WHERE goal_id=? AND goal_revision=? AND rule_id=? AND rule_revision=?""",
+                (goal_id, goal_revision, rule_id, rule_revision)).fetchone()
+            if old and SemanticSchema.model_validate_json(old[0]) != schema:
+                raise StoreError("semantic_schema_revision_is_immutable")
+            self.connection.execute("""INSERT OR IGNORE INTO semantic_catalog
+                (goal_id,goal_revision,rule_id,rule_revision,payload) VALUES(?,?,?,?,?)""",
+                (goal_id, goal_revision, rule_id, rule_revision, payload))
+
+    def register_import_schema(self, schema: SemanticSchema) -> None:
+        """An imported result is explicit user input, still subject to typed contracts."""
+        policy = self.policy.with_schema(schema)
+        self._persist_semantic_schema(schema, "imported_snapshot", 1, "", 0)
+        self.policy = policy
 
     def get_document_cache(self, document_rule_id: str):
         """Reuse only projections associated with the current valid publication."""
@@ -178,9 +292,17 @@ class GraphStore:
                 'INSERT OR REPLACE INTO document_claim_cache VALUES(?,?,?)', (rid, publication_id, payload))
 
     def begin_publication(self, rule_id: str, revision: int, partition_id: str,
-                          source_versions: dict[str, str | list[str]], *, base_generation: int | None = None) -> str:
+                          source_versions: dict[str, str | list[str]], *, base_generation: int | None = None,
+                          replace_rule: bool = False) -> str:
+        """Stage one partition, or a complete rule generation without source-key tokens.
+
+        Full generations compare the old publication identities at commit time.
+        Query partition values and ordering are deliberately absent from that CAS.
+        """
         for ref in (rule_id, partition_id):
             self.policy._reference(ref)
+        if replace_rule and partition_id != "all":
+            raise StoreError("rule_generation_requires_all_partition")
         if revision < 1 or not isinstance(source_versions, dict):
             raise StoreError("invalid_publication_contract")
         for key, value in source_versions.items():
@@ -202,7 +324,34 @@ class GraphStore:
                 "INSERT INTO publication(publication_id,logical_rule_id,revision,partition_id,source_versions,base_generation,state) VALUES(?,?,?,?,?,?,'staging')",
                 (publication_id, rule_id, revision, partition_id, canonical(source_versions), generation),
             )
+            if replace_rule:
+                self.connection.execute("INSERT INTO rule_generation VALUES(?,?)",
+                                        (publication_id, canonical(self._rule_heads(rule_id))))
         return publication_id
+
+    def _rule_heads(self, rule_id: str) -> list[list[Any]]:
+        # Only internal publication IDs and counters are durable. Legacy
+        # partition IDs may contain source-derived hashes and must not be copied.
+        return [list(row) for row in self.connection.execute(
+            "SELECT publication_id,generation,valid FROM partition_head WHERE logical_rule_id=? ORDER BY publication_id",
+            (rule_id,))]
+
+    def _is_rule_generation(self, publication_id: str) -> bool:
+        return self.connection.execute("SELECT 1 FROM rule_generation WHERE publication_id=?",
+                                       (publication_id,)).fetchone() is not None
+
+    def replaced_publications(self, publication_id: str) -> list[str]:
+        """Current old publications removed by the specified staged replacement."""
+        pub = self._publication(publication_id)
+        if self._is_rule_generation(publication_id):
+            rows = self.connection.execute(
+                "SELECT publication_id FROM partition_head WHERE logical_rule_id=? ORDER BY publication_id",
+                (pub["logical_rule_id"],))
+        else:
+            rows = self.connection.execute(
+                "SELECT publication_id FROM partition_head WHERE logical_rule_id=? AND partition_id=?",
+                (pub["logical_rule_id"], pub["partition_id"]))
+        return [row[0] for row in rows if row[0] != publication_id]
 
     def stage_fact(self, publication_id: str, fact: GraphFact, support: SupportSpec) -> None:
         self.policy.check_fact(fact)
@@ -212,7 +361,7 @@ class GraphStore:
             raise PersistenceViolation("database_support_requires_validation")
         if support.origin == "document_claim" and not support.document_ref:
             raise PersistenceViolation("document_support_requires_revision_and_section")
-        if fact.fact_kind == "Edge" and support.status not in RELATION_STATES[fact.payload["relation"]]:
+        if fact.fact_kind == "Edge" and support.status not in self.policy.relation_states(fact.payload["relation"]):
             raise PersistenceViolation("relation_status_not_permitted")
         with self._transaction():
             publication = self._publication(publication_id)
@@ -282,7 +431,7 @@ class GraphStore:
     def publish_partition(self, completed: PartitionCompletion) -> dict[str, Any]:
         return self.publish_partitions([completed])[0]
 
-    def publish_partitions(self, completed: Iterable[PartitionCompletion]) -> list[dict[str, Any]]:
+    def publish_partitions(self, completed: Iterable[PartitionCompletion], *, expected_heads=None) -> list[dict[str, Any]]:
         """Publish a dependency closure in one transaction, including the watermark."""
         completions = list(completed)
         if not completions:
@@ -295,10 +444,16 @@ class GraphStore:
             if item.checkpoint_ref:
                 self.policy._reference(item.checkpoint_ref)
         with self._transaction():
+            if expected_heads is not None and canonical(expected_heads) != canonical(self.heads()):
+                raise PublicationConflict("graph_generation_changed")
             publications = [self._publication(c.publication_id) for c in completions]
             keys = {(p["logical_rule_id"], p["partition_id"]) for p in publications}
             if len(keys) != len(publications):
                 raise PublicationConflict("duplicate_partition_in_publish_group")
+            full_rules = {p["logical_rule_id"] for p in publications
+                          if self._is_rule_generation(p["publication_id"])}
+            if any(sum(p["logical_rule_id"] == rid for p in publications) != 1 for rid in full_rules):
+                raise PublicationConflict("overlapping_rule_generation_in_publish_group")
             for pub in publications:
                 if pub["state"] == "aborted":
                     raise StoreError("publication_aborted")
@@ -313,6 +468,10 @@ class GraphStore:
                 generation = head[1] if head else 0
                 if generation != pub["base_generation"]:
                     raise PublicationConflict("partition_generation_changed")
+                full = self.connection.execute("SELECT base_heads FROM rule_generation WHERE publication_id=?",
+                                               (pub["publication_id"],)).fetchone()
+                if full and json.loads(full[0]) != self._rule_heads(pub["logical_rule_id"]):
+                    raise PublicationConflict("rule_generation_changed")
                 rule = self.connection.execute("SELECT dependency_state FROM rule WHERE rule_id=? AND revision=?",
                                                (pub["logical_rule_id"], pub["revision"])).fetchone()
                 if rule and rule[0] != "valid":
@@ -328,6 +487,11 @@ class GraphStore:
                     generation = pub["base_generation"] + 1
                     self.connection.execute("UPDATE publication SET state='published',checkpoint_ref=?,published_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE publication_id=?",
                                             (completion.checkpoint_ref, pub["publication_id"]))
+                    if pub["logical_rule_id"] in full_rules:
+                        # History remains in publication/support tables. Removing
+                        # obsolete heads is part of the same visibility change.
+                        self.connection.execute("DELETE FROM partition_head WHERE logical_rule_id=?",
+                                                (pub["logical_rule_id"],))
                     self.connection.execute("""INSERT INTO partition_head VALUES(?,?,?,?,?,1)
                       ON CONFLICT(logical_rule_id,partition_id) DO UPDATE SET
                       publication_id=excluded.publication_id,generation=excluded.generation,
@@ -341,8 +505,11 @@ class GraphStore:
 
     def _prospective_publications(self, replacements: list[sqlite3.Row]) -> list[str]:
         replacement_keys = {(p["logical_rule_id"], p["partition_id"]) for p in replacements}
+        full_rules = {p["logical_rule_id"] for p in replacements
+                      if self._is_rule_generation(p["publication_id"])}
         current = [r["publication_id"] for r in self.connection.execute("SELECT * FROM partition_head WHERE valid=1")
-                   if (r["logical_rule_id"], r["partition_id"]) not in replacement_keys]
+                   if r["logical_rule_id"] not in full_rules
+                   and (r["logical_rule_id"], r["partition_id"]) not in replacement_keys]
         return current + [p["publication_id"] for p in replacements]
 
     def _validate_endpoints(self, publication_ids: list[str]) -> None:
@@ -375,11 +542,13 @@ class GraphStore:
                 required_nodes = accepted_nodes if row["status"] == "accepted" else nodes
                 if source not in required_nodes or target not in required_nodes:
                     raise StoreError("dangling_edge_requires_dependency_publication")
-                source_kinds, target_kinds = RELATION_ENDPOINT_KINDS[payload["relation"]]
+                source_kinds, target_kinds = self.policy.relation_endpoint_kinds(payload["relation"])
                 if nodes[source] not in source_kinds or nodes[target] not in target_kinds:
                     raise StoreError("relation_endpoint_kind_mismatch")
             if row["fact_kind"] == "PropertyValue" and (domain, payload["entity_id"]) not in (accepted_nodes if row["status"] == "accepted" else nodes):
                 raise StoreError("property_requires_visible_node_support")
+            if row["fact_kind"] == "PropertyValue":
+                self.policy.check_property_kind(payload["name"], nodes[(domain, payload["entity_id"])])
         if publication_ids:
             placeholders = ",".join("?" for _ in publication_ids)
             conflicting = self.connection.execute(f"""SELECT pb.binding_id FROM publication_binding pb
@@ -414,7 +583,7 @@ class GraphStore:
           WHERE ps.publication_id IN ({placeholders}) ORDER BY gf.fact_id,fs.support_id,ps.publication_id""", publication_ids))
 
     def view(self, scopes: set[str], domain: str = "default", publication_id: str | None = None,
-             include_candidates: bool = False) -> dict[str, Any]:
+             include_candidates: bool = False, apply_resolutions: bool = True) -> dict[str, Any]:
         """Authorize individual supports before labels, search text or aggregation."""
         if not isinstance(scopes, (set, frozenset)) or not all(isinstance(s, str) for s in scopes):
             raise StoreError("explicit_scope_set_required")
@@ -431,7 +600,13 @@ class GraphStore:
                 rows = self._fact_rows(publication_ids)
                 rows = [r for r in rows if r["isolation_domain"] == domain and r["scope_ref"] in scopes
                         and (r["status"] == "accepted" or (include_candidates and r["status"] in {"candidate", "unresolved"}))]
+                if apply_resolutions and not publication_id:
+                    from ..identity.reconciliation import project_resolutions
+                    rows = project_resolutions(self, rows, scopes, domain)
                 result = self._aggregate(rows)
+                schema = self.policy.schema_for_facts(result["facts"])
+                if not schema.is_empty():
+                    result["semantic_schema"] = schema.model_dump(mode="json")
                 visible_publications = sorted({r["publication_id"] for r in rows})
                 result["publications"] = visible_publications
                 result["historical"] = bool(publication_id)
@@ -439,8 +614,7 @@ class GraphStore:
             finally:
                 self.connection.execute("ROLLBACK")
 
-    @staticmethod
-    def _aggregate(rows: list[sqlite3.Row]) -> dict[str, Any]:
+    def _aggregate(self, rows: list[sqlite3.Row]) -> dict[str, Any]:
         facts: dict[str, dict[str, Any]] = {}
         supports: dict[str, dict[str, Any]] = {}
         priority = {"accepted": 3, "candidate": 2, "unresolved": 1}
@@ -496,7 +670,8 @@ class GraphStore:
                     node["conflicts"].append({"property": "label", "values": values})
             else:
                 node["properties"][name] = values[0] if len(values) == 1 else values
-                if len(values) > 1 and name not in {"business_code", "english_name", "level", "level_no", "source_position"}:
+                definition = self.policy.property_definitions.get(name)
+                if len(values) > 1 and name not in {"business_code", "english_name", "level", "level_no", "source_position"} and not (definition and definition.multi_valued):
                     node["conflicts"].append({"property": name, "values": values})
         edges, claims = [], []
         for fact in facts.values():
@@ -533,12 +708,18 @@ class GraphStore:
         payload = rule.model_dump(mode="json", by_alias=True)
         payload.pop("status")
         serialized = canonical(payload)
-        with self._transaction():
+        with self._lock:
             old = self.connection.execute("SELECT payload FROM rule WHERE rule_id=? AND revision=?", (rule.rule_id, rule.revision)).fetchone()
-            if old and old[0] != serialized:
+            # New optional contracts have defaults. An old record missing those
+            # fields is equivalent to its normalized model, not a new revision.
+            previous = (canonical(RuleSpec.model_validate_json(old[0]).model_dump(mode="json", by_alias=True,
+                                                                                exclude={"status"})) if old else None)
+            if previous is not None and previous != serialized:
                 raise StoreError("rule_revision_is_immutable")
-            self.connection.execute("INSERT INTO rule VALUES(?,?,?,?, 'valid') ON CONFLICT(rule_id,revision) DO UPDATE SET lifecycle=excluded.lifecycle",
-                                    (rule.rule_id, rule.revision, serialized, rule.status))
+            self.register_rule_semantics(rule)
+            with self._transaction():
+                self.connection.execute("INSERT INTO rule VALUES(?,?,?,?, 'valid') ON CONFLICT(rule_id,revision) DO UPDATE SET lifecycle=excluded.lifecycle",
+                                        (rule.rule_id, rule.revision, serialized, rule.status))
 
     def get_rules(self, *, include_stale: bool = False, scopes: set[str] | None = None,
                   domain: str = "default") -> list[RuleSpec]:
@@ -574,6 +755,35 @@ class GraphStore:
                 self.connection.execute("UPDATE rule SET dependency_state='stale' WHERE rule_id=?", (rid,))
                 self.connection.execute("UPDATE partition_head SET valid=0 WHERE logical_rule_id=?", (rid,))
                 self.connection.execute("INSERT INTO rule_event VALUES(?,?,?,?,?)", (uuid.uuid4().hex, rid, 0, "invalidate", reason_code))
+        return sorted(affected)
+
+    def mark_rule_for_review(self, rule_id: str, reason_code: str) -> list[str]:
+        """Hide invalid current results while retaining executable rules and history.
+
+        A data counterexample differs from a stale schema/document dependency:
+        the same rule may become valid again after the source is corrected.
+        """
+        self.policy._reference(rule_id)
+        self.policy._reference(reason_code)
+        latest = {rule.rule_id: rule for rule in self.get_rules(include_stale=True)}
+        affected = {rule_id}
+        while True:
+            dependents = {rule.rule_id for rule in latest.values() if rule.relation and
+                          {rule.relation.source_rule_id, rule.relation.target_rule_id} & affected}
+            if dependents <= affected:
+                break
+            affected.update(dependents)
+        with self._transaction():
+            for rid in sorted(affected):
+                changed = self.connection.execute(
+                    "UPDATE partition_head SET valid=0 WHERE logical_rule_id=? AND valid=1", (rid,)).rowcount
+                recorded = self.connection.execute(
+                    "SELECT 1 FROM rule_event WHERE rule_id=? AND event_type='review_required' AND reason_code=?",
+                    (rid, reason_code)).fetchone()
+                if changed or not recorded:
+                    revision = latest[rid].revision if rid in latest else 0
+                    self.connection.execute("INSERT INTO rule_event VALUES(?,?,?,?,?)",
+                        (uuid.uuid4().hex, rid, revision, "review_required", reason_code))
         return sorted(affected)
 
     def prepare_rule_rollback(self, rule_id: str, revision: int, current_dependencies: dict[str, Any]) -> RuleSpec:

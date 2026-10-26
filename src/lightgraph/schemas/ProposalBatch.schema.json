@@ -19,6 +19,15 @@
           "minItems": 1,
           "title": "Members",
           "type": "array"
+        },
+        "identity_resolution": {
+          "default": "source_scoped",
+          "enum": [
+            "source_scoped",
+            "shared_definition"
+          ],
+          "title": "Identity Resolution",
+          "type": "string"
         }
       },
       "required": [
@@ -267,6 +276,15 @@
           "default": "identity",
           "title": "Normalization",
           "type": "string"
+        },
+        "identity_resolution": {
+          "default": "source_scoped",
+          "enum": [
+            "source_scoped",
+            "shared_definition"
+          ],
+          "title": "Identity Resolution",
+          "type": "string"
         }
       },
       "required": [
@@ -342,6 +360,29 @@
         "claim"
       ],
       "title": "EntityKeyProposal",
+      "type": "object"
+    },
+    "EntityTypeDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description"
+      ],
+      "title": "EntityTypeDefinition",
       "type": "object"
     },
     "Exclusion": {
@@ -628,15 +669,8 @@
         },
         "property_names": {
           "additionalProperties": {
-            "enum": [
-              "label",
-              "alias",
-              "english_name",
-              "description",
-              "definition",
-              "unit",
-              "formula"
-            ],
+            "maxLength": 64,
+            "minLength": 1,
             "type": "string"
           },
           "title": "Property Names",
@@ -820,15 +854,8 @@
         "property_name": {
           "anyOf": [
             {
-              "enum": [
-                "label",
-                "alias",
-                "english_name",
-                "description",
-                "definition",
-                "unit",
-                "formula"
-              ],
+              "maxLength": 64,
+              "minLength": 1,
               "type": "string"
             },
             {
@@ -844,6 +871,55 @@
         "role"
       ],
       "title": "Member",
+      "type": "object"
+    },
+    "PropertyDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "value_type": {
+          "default": "string",
+          "enum": [
+            "string",
+            "integer",
+            "number",
+            "boolean"
+          ],
+          "title": "Value Type",
+          "type": "string"
+        },
+        "entity_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Entity Kinds",
+          "type": "array"
+        },
+        "multi_valued": {
+          "default": false,
+          "title": "Multi Valued",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "entity_kinds"
+      ],
+      "title": "PropertyDefinition",
       "type": "object"
     },
     "Reference": {
@@ -896,6 +972,8 @@
           "default": "unknown",
           "enum": [
             "n_to_1",
+            "1_to_n",
+            "n_to_m",
             "1_to_1",
             "unknown"
           ],
@@ -939,11 +1017,8 @@
         },
         "relation_kind": {
           "default": "verified_reference",
-          "enum": [
-            "verified_reference",
-            "uses_measure",
-            "member_of"
-          ],
+          "maxLength": 64,
+          "minLength": 1,
           "title": "Relation Kind",
           "type": "string"
         }
@@ -1020,6 +1095,80 @@
         "claim"
       ],
       "title": "ReferenceProposal",
+      "type": "object"
+    },
+    "RelationDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "source_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Source Kinds",
+          "type": "array"
+        },
+        "target_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Target Kinds",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "source_kinds",
+        "target_kinds"
+      ],
+      "title": "RelationDefinition",
+      "type": "object"
+    },
+    "SemanticSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "entity_types": {
+          "items": {
+            "$ref": "#/$defs/EntityTypeDefinition"
+          },
+          "maxItems": 64,
+          "title": "Entity Types",
+          "type": "array"
+        },
+        "properties": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PropertyDefinition"
+          },
+          "maxItems": 256,
+          "title": "Properties"
+        },
+        "relations": {
+          "items": {
+            "$ref": "#/$defs/RelationDefinition"
+          },
+          "maxItems": 128,
+          "title": "Relations",
+          "type": "array"
+        }
+      },
+      "title": "SemanticSchema",
       "type": "object"
     },
     "WideHierarchy": {
@@ -1238,6 +1387,9 @@
       ],
       "title": "Task",
       "type": "string"
+    },
+    "semantic_schema": {
+      "$ref": "#/$defs/SemanticSchema"
     },
     "proposals": {
       "items": {

@@ -175,6 +175,29 @@
       "title": "EntityBinding",
       "type": "object"
     },
+    "EntityTypeDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description"
+      ],
+      "title": "EntityTypeDefinition",
+      "type": "object"
+    },
     "ExcludedColumn": {
       "additionalProperties": false,
       "properties": {
@@ -795,6 +818,160 @@
       "title": "PacketStratum",
       "type": "object"
     },
+    "PacketToolObservation": {
+      "additionalProperties": false,
+      "description": "Bounded query evidence for this discovery/review call; never persisted.",
+      "properties": {
+        "probe_id": {
+          "title": "Probe Id",
+          "type": "string"
+        },
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Columns",
+          "type": "array"
+        },
+        "rows": {
+          "items": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "maxItems": 8,
+          "title": "Rows",
+          "type": "array"
+        },
+        "truncated": {
+          "default": false,
+          "title": "Truncated",
+          "type": "boolean"
+        },
+        "full_source_validation": {
+          "const": false,
+          "default": false,
+          "title": "Full Source Validation",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "probe_id",
+        "columns"
+      ],
+      "title": "PacketToolObservation",
+      "type": "object"
+    },
+    "PropertyDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "value_type": {
+          "default": "string",
+          "enum": [
+            "string",
+            "integer",
+            "number",
+            "boolean"
+          ],
+          "title": "Value Type",
+          "type": "string"
+        },
+        "entity_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Entity Kinds",
+          "type": "array"
+        },
+        "multi_valued": {
+          "default": false,
+          "title": "Multi Valued",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "entity_kinds"
+      ],
+      "title": "PropertyDefinition",
+      "type": "object"
+    },
+    "RelationDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "source_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Source Kinds",
+          "type": "array"
+        },
+        "target_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Target Kinds",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "source_kinds",
+        "target_kinds"
+      ],
+      "title": "RelationDefinition",
+      "type": "object"
+    },
     "RelationSpec": {
       "additionalProperties": false,
       "properties": {
@@ -943,6 +1120,56 @@
           },
           "title": "Semantic Basis",
           "type": "array"
+        },
+        "origin": {
+          "default": "user_rule",
+          "enum": [
+            "user_rule",
+            "discovery"
+          ],
+          "title": "Origin",
+          "type": "string"
+        },
+        "semantic_decision": {
+          "default": "unreviewed",
+          "enum": [
+            "unreviewed",
+            "explicit_declaration",
+            "model_review"
+          ],
+          "title": "Semantic Decision",
+          "type": "string"
+        },
+        "semantic_status": {
+          "default": "unresolved",
+          "enum": [
+            "supported",
+            "refuted",
+            "unresolved"
+          ],
+          "title": "Semantic Status",
+          "type": "string"
+        },
+        "reviewed_context_refs": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Reviewed Context Refs",
+          "type": "array"
+        },
+        "refuting_refs": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Refuting Refs",
+          "type": "array"
+        },
+        "conditions_satisfied": {
+          "default": false,
+          "title": "Conditions Satisfied",
+          "type": "boolean"
         }
       },
       "title": "RuleEvidence",
@@ -977,6 +1204,9 @@
           },
           "title": "Goal Refs",
           "type": "array"
+        },
+        "semantic_schema": {
+          "$ref": "#/$defs/SemanticSchema"
         },
         "source": {
           "$ref": "#/$defs/SourceRef"
@@ -1167,6 +1397,37 @@
       "title": "ScopeSpec",
       "type": "object"
     },
+    "SemanticSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "entity_types": {
+          "items": {
+            "$ref": "#/$defs/EntityTypeDefinition"
+          },
+          "maxItems": 64,
+          "title": "Entity Types",
+          "type": "array"
+        },
+        "properties": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PropertyDefinition"
+          },
+          "maxItems": 256,
+          "title": "Properties"
+        },
+        "relations": {
+          "items": {
+            "$ref": "#/$defs/RelationDefinition"
+          },
+          "maxItems": 128,
+          "title": "Relations",
+          "type": "array"
+        }
+      },
+      "title": "SemanticSchema",
+      "type": "object"
+    },
     "SourceRef": {
       "additionalProperties": false,
       "properties": {
@@ -1282,6 +1543,14 @@
       "title": "Goal",
       "type": "object"
     },
+    "iteration_context": {
+      "additionalProperties": true,
+      "title": "Iteration Context",
+      "type": "object"
+    },
+    "semantic_schema": {
+      "$ref": "#/$defs/SemanticSchema"
+    },
     "subtask": {
       "anyOf": [
         {
@@ -1329,6 +1598,14 @@
       },
       "maxItems": 8,
       "title": "Strata Samples",
+      "type": "array"
+    },
+    "tool_observations": {
+      "items": {
+        "$ref": "#/$defs/PacketToolObservation"
+      },
+      "maxItems": 8,
+      "title": "Tool Observations",
       "type": "array"
     },
     "document_snippets": {

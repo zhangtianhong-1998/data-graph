@@ -6,11 +6,11 @@ import type { ConnectionDraft, DraftResult, DraftStatus } from './connectionDraf
 import type { DatabaseForm } from './database'
 import { connectionFormFromPayload, connectionPayload, isGaussJdbcDsn, selectedTables, validateSourceId } from './onboarding'
 import type { ConnectionForm, ConnectionPayload, DatabaseTable } from './onboarding'
-import { ensureSession, json, projectPath, request } from './api'
+import { ensureSession, json, projectPath, request, responseRevision } from './api'
 import type { Metadata, ProjectFile, RunConfig, SourceConfig } from './types'
 
-const props = defineProps<{ projectId: string; source: SourceConfig | null; sources: SourceConfig[]; files: ProjectFile[]; retentionVerified: boolean; busy: boolean; error: string }>()
-const emit = defineEmits<{ close: []; save: [sources: SourceConfig[], retentionVerified: boolean]; connected: [config: RunConfig, metadata: Metadata] }>()
+const props = defineProps<{ projectId: string; source: SourceConfig | null; sources: SourceConfig[]; files: ProjectFile[]; retentionVerified: boolean; busy: boolean; error: string; configRevision?: string }>()
+const emit = defineEmits<{ close: []; save: [sources: SourceConfig[], retentionVerified: boolean]; connected: [config: RunConfig, metadata: Metadata, revision?: string]; capabilityUploaded: [file: ProjectFile, revision?: string] }>()
 const form = ref<DatabaseForm>({ id: props.source?.id || '', kind: props.source?.kind === 'mysql_database' ? 'mysql_database' : 'gauss_database', dsnEnv: typeof props.source?.dsn_env === 'string' ? props.source.dsn_env : '', tables: Array.isArray(props.source?.allowed_tables) ? props.source.allowed_tables.join('\n') : '', capabilityManifest: typeof props.source?.capability_manifest === 'string' ? props.source.capability_manifest : '' })
 const connection = ref<ConnectionForm>({ kind: form.value.kind, format: 'fields', dsn: '', host: '', port: form.value.kind === 'mysql_database' ? '3306' : '5432', database: '', username: '', password: '', schema: '', sslmode: 'auto' })
 const mode = ref<'direct' | 'environment'>('direct')
@@ -18,7 +18,12 @@ const progress = ref(''), notice = ref(''), rememberConnection = ref(true), save
 const controller = new AbortController()
 const retention = ref(props.retentionVerified), localError = ref(''), pending = ref(false), tested = ref(false), tableLoaded = ref(false), truncated = ref(false)
 const tables = ref<DatabaseTable[]>([]), checked = ref<string[]>([]), filter = ref(''), listFileInput = ref<HTMLInputElement | null>(null)
-const manifests = computed(() => props.files.filter(file => file.kind === 'yaml'))
+const uploadedManifests = ref<ProjectFile[]>([])
+const manifestInput = ref<HTMLInputElement | null>(null)
+const configRevision = ref(props.configRevision)
+function revisionHeaders(): Record<string, string> { return configRevision.value ? { 'If-Match': configRevision.value } : {} }
+watch(() => props.configRevision, value => { configRevision.value = value })
+const manifests = computed(() => [...props.files.filter(file => file.kind === 'yaml'), ...uploadedManifests.value.filter(file => !props.files.some(existing => existing.file_id === file.file_id))])
 const missingManifest = computed(() => form.value.capabilityManifest && !manifests.value.some(file => file.relative_path === form.value.capabilityManifest))
 const locked = computed(() => props.busy || pending.value)
 const jdbcConnection = computed(() => connection.value.kind === 'gauss_database' && isGaussJdbcDsn(connection.value.dsn))
@@ -170,6 +175,20 @@ async function loadTables() {
 async function discoverTables() {
   await perform(loadTables, '正在读取表清单…', () => { connectionPayload(connection.value) })
 }
+async function uploadManifest(event: Event) {
+  const input = event.target as HTMLInputElement, file = input.files?.[0]
+  if (!file) return
+  await perform(async () => {
+    validateSourceId(form.value.id.trim(), props.source, props.sources)
+    const body = new FormData(); body.append('file', file)
+    const result = await request<{ file: ProjectFile; runtime_ready: boolean; missing_capabilities: string[] }>(`${path.value}/database/capabilities?source_id=${encodeURIComponent(form.value.id.trim())}&kind=${form.value.kind}`, { method: 'POST', body, headers: revisionHeaders() })
+    configRevision.value = responseRevision(result) || configRevision.value
+    uploadedManifests.value.push(result.file); form.value.capabilityManifest = result.file.relative_path
+    emit('capabilityUploaded', result.file, configRevision.value)
+    notice.value = result.runtime_ready ? '能力清单格式已校验并选中；运行时仍会比对数据库产品、版本和驱动。' : `清单已上传，但实例运行能力尚未齐备${result.missing_capabilities.length ? '：' + result.missing_capabilities.join('、') : '，请检查一致快照与实际验证状态'}。`
+  }, '正在校验能力清单…')
+  input.value = ''
+}
 async function importTableList(event: Event) {
   const input = event.target as HTMLInputElement, file = input.files?.[0]
   if (!file) return
@@ -199,10 +218,10 @@ async function submit() {
     connectionPayload(connection.value)
     await ensureSession(props.projectId)
     if (controller.signal.aborted) return
-    const result = await request<{ config: RunConfig; metadata: Metadata }>(`${path.value}/database/connect`, { method: 'POST', body: json({ source_id: form.value.id.trim(), remember_connection: rememberConnection.value, connection: connectionPayload(connection.value), allowed_tables: allowedTables, deployment_retention_verified: retention.value, capability_manifest: form.value.capabilityManifest || null }), signal: controller.signal, timeoutMs: 120000 })
+    const result = await request<{ config: RunConfig; metadata: Metadata }>(`${path.value}/database/connect`, { method: 'POST', headers: revisionHeaders(), body: json({ source_id: form.value.id.trim(), remember_connection: rememberConnection.value, connection: connectionPayload(connection.value), allowed_tables: allowedTables, deployment_retention_verified: retention.value, capability_manifest: form.value.capabilityManifest || null }), signal: controller.signal, timeoutMs: 120000 })
     if (controller.signal.aborted) return
     await finalizeDraft()
-    clearSecrets(); emit('connected', result.config, result.metadata)
+    clearSecrets(); emit('connected', result.config, result.metadata, responseRevision(result))
   }, '正在抽取元数据…')
 }
 </script>
@@ -240,7 +259,7 @@ async function submit() {
             </section>
           </template>
           <template v-else><div class="field"><label for="database-env">数据库连接环境变量名</label><input id="database-env" v-model="form.dsnEnv" :disabled="locked" required placeholder="LIGHTGRAPH_MYSQL_DSN" autocomplete="off"/></div><div class="field"><label for="environment-tables">允许查询的表</label><textarea id="environment-tables" v-model="form.tables" :disabled="locked" required placeholder="每行一张表，包含 Schema；不使用通配符。"/></div></template>
-          <details class="connection-advanced"><summary>运行权限与高级选项</summary><div class="field"><label for="database-manifest">能力验证文件（可选）</label><select id="database-manifest" v-model="form.capabilityManifest" :disabled="locked"><option value="">暂不指定</option><option v-if="missingManifest" :value="form.capabilityManifest" disabled>原文件不在上传列表，请重新选择</option><option v-for="file in manifests" :key="file.file_id" :value="file.relative_path">{{ file.name }}</option></select></div><div class="retention-box"><label class="checkbox-line"><input v-model="retention" type="checkbox" :disabled="locked"/>此项目的部署环境已完成数据留存检查</label><p class="field-hint">此项影响真实实例数据的抽取。未确认时仍可连接并读取元数据。</p></div><p v-if="source?.allowed_columns" class="field-hint">已有列级访问限制会保留。</p></details>
+          <details class="connection-advanced"><summary>运行权限与高级选项</summary><div class="field"><label for="database-manifest">实例抽取能力清单</label><select id="database-manifest" v-model="form.capabilityManifest" :disabled="locked"><option value="">仅读取元数据，暂不指定</option><option v-if="missingManifest" :value="form.capabilityManifest" disabled>原文件不在上传列表，请重新选择</option><option v-for="file in manifests" :key="file.file_id" :value="file.relative_path">{{ file.name }}</option></select><div class="actions"><button type="button" class="btn small" :disabled="locked || !form.id.trim()" @click="manifestInput?.click()">上传能力清单</button><input ref="manifestInput" type="file" accept=".yaml,.yml" hidden aria-label="上传数据库能力清单" @change="uploadManifest"/></div><p class="field-hint">读取元数据可暂缺；正式实例抽取前需绑定当前数据库产品、版本和驱动的验证结果。</p><details><summary>如何生成能力清单</summary><p class="field-hint">在运行服务所在环境准备对应来源编号的运行配置和只读连接，执行以下命令，再上传输出文件。探针会执行有界超时与取消检查，请使用获准的测试环境。</p><pre class="code">lightgraph connect-check &lt;运行配置.yaml&gt; --verify-runtime --output capabilities.yaml</pre><p class="field-hint">此页面校验文件格式，实际运行仍由后端检查数据库版本与能力；上传文件不会绕过验证。</p></details></div><div class="retention-box"><label class="checkbox-line"><input v-model="retention" type="checkbox" :disabled="locked"/>此项目的部署环境已完成数据留存检查</label><p class="field-hint">此项影响真实实例数据的抽取。未确认时仍可连接并读取元数据。</p></div><p v-if="source?.allowed_columns" class="field-hint">已有列级访问限制会保留。</p></details>
         </div>
         <div v-if="draftStatus !== 'idle'" class="draft-feedback panel-footer" aria-live="polite">
           <span v-if="draftStatus === 'saving'" role="status">连接草稿保存中…</span>

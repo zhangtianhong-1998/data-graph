@@ -2,6 +2,7 @@
 from __future__ import annotations
 from pathlib import Path
 from .contracts import *
+from .discovery.semantics import declaration_block
 
 DESCRIPTION = '''---
 purpose: data_description
@@ -16,6 +17,17 @@ measure_registry 登记度量，metric_registry 登记指标。名称、definiti
 # 维度字典
 region_dictionary 登记区域维度成员。region_code 是租户内的成员编码，region_name 是成员名称，parent_code 指向同租户内的父成员编码；空父编码表示根节点。product_dictionary 登记产品维度成员，product_code 是编码，product_name 是中文名，product_en_name 是英文名。
 '''
+# Gate D has no model. These explicit inputs exercise declaration-driven
+# execution; free prose alone is no longer treated as semantic confirmation.
+DESCRIPTION += '\n# 确定性演示的显式语义声明\n' + '\n\n'.join([
+    declaration_block('public.report_item','shared_definition',['definition'],
+        parameters={'namespace_columns':['tenant_id']}),
+    declaration_block('public.report_tree','ordered_hierarchy',[f'l{i}_code' for i in range(1,6)]),
+    declaration_block('public.report_tree','collapse_consecutive_equal_identity',[f'l{i}_code' for i in range(1,6)]),
+    declaration_block('public.metric_measure_map','uses_measure',
+        ['tenant_id','metric_code'],['tenant_id','measure_code']),
+    declaration_block('public.region_dictionary','parent_column',['region_code'],['parent_code']),
+])
 ANALYSIS = '''---
 purpose: analysis_knowledge
 applies_to: [public.report_item]

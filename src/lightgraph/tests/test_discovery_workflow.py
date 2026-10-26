@@ -9,6 +9,7 @@ from lightgraph.discovery import (discover,discover_references,BudgetAllocator,C
     StructuredModelClient,ModelConfig,ProposalBatch,validate_proposal_references,invalidate_dependencies,revise_after_counterexample)
 from lightgraph.errors import LightGraphError,BudgetExceeded
 from lightgraph.documents import load_document
+from lightgraph.discovery.semantics import declaration_block
 
 
 def source(columns,rows,name='demo',types=None):
@@ -33,7 +34,7 @@ def test_single_level_is_group_and_observations_do_not_expand_identity():
 
 def test_wide_hierarchy_requires_independent_direction_evidence():
     a=source(['l1_code','l1_name','l2_code','l2_name'],[['A','甲','B','乙']])
-    result=discover(a)
+    result=discover(a,ExtractionGoal(entity_kinds=['ReportItem']))
     assert result.rules[0].kind=='wide_hierarchy'
     assert not result.rules[0].hierarchy.order_evidence
     assert result.rules[0].hierarchy.gap_policy=='split'
@@ -42,8 +43,8 @@ def test_wide_hierarchy_requires_independent_direction_evidence():
 
 def test_documented_hierarchy_retains_fill_and_dependency():
     a=source(['l1_code','l1_name','l2_code','l2_name'],[['A','甲','A','甲']])
-    doc=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.demo]\n---\n# 层级\ndemo 的 L1 到 L2 从父到子；重复编码相同名称表示填充并合并。')
-    r=discover(a,documents=[doc]).rules[0]
+    doc=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.demo]\n---\n# 层级\ndemo 的 L1 到 L2 从父到子；重复编码相同名称表示填充并合并。\n'+declaration_block('public.demo','ordered_hierarchy',['l1_code','l2_code'])+'\n'+declaration_block('public.demo','collapse_consecutive_equal_identity',['l1_code','l2_code']))
+    r=discover(a,ExtractionGoal(entity_kinds=['ReportItem']),documents=[doc]).rules[0]
     assert r.hierarchy.fill_semantics_confirmed
     assert r.hierarchy.order_evidence
     assert doc.document_id+'@'+doc.revision in r.dependencies.documents
@@ -57,7 +58,7 @@ def test_source_goal_scope_is_honored():
 
 def test_sample_disagreement_is_unresolved_not_silently_repaired():
     a=source(['item_code','item_name'],[['A','甲']],types={'item_code':'integer'})
-    result=discover(a)
+    result=discover(a,ExtractionGoal(entity_kinds=['ReportItem']))
     assert not result.rules
     assert result.understandings[0].columns[0].conflicts==['declared_numeric_observed_text']
     assert any(x['code']=='schema_value_conflict' for x in result.issues)
@@ -65,7 +66,7 @@ def test_sample_disagreement_is_unresolved_not_silently_repaired():
 
 def test_conflicting_labels_trigger_full_fd_issue():
     a=source(['item_code','item_name'],[['A','甲'],['A','乙']])
-    result=discover(a)
+    result=discover(a,ExtractionGoal(entity_kinds=['ReportItem']))
     assert any(x['code']=='fd_violation' for x in result.issues)
     assert result.rules[0].status=='draft'
 
@@ -181,7 +182,7 @@ def _complex_source(with_discriminator=False,unknown=False):
 
 def test_json_array_reference_proposal_preserves_structure_not_raw_array():
     a,rules=_complex_source()
-    d=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.links]\n---\n# 引用\nlinks 记录指标使用度量，allowed_measure_codes 是允许引用度量的 JSON 数组。')
+    d=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.links]\n---\n# 引用\nlinks 记录指标使用度量，allowed_measure_codes 是允许引用度量的 JSON 数组。\n'+declaration_block('public.links','uses_measure',['tenant_id','resource_code'],['tenant_id','allowed_measure_codes']))
     result=discover_references(a,rules,[d])
     assert len(result.rules)==1
     ref=result.rules[0]
@@ -193,7 +194,7 @@ def test_json_array_reference_proposal_preserves_structure_not_raw_array():
 
 def test_polymorphic_selector_requires_doc_mapping_and_reports_unknown_partition():
     a,rules=_complex_source(True,True)
-    d=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.links]\n---\n# 引用\nlinks 记录指标使用度量，引用类型 m 表示度量，ref_value 是编码 JSON 数组。')
+    d=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.links]\n---\n# 引用\nlinks 记录指标使用度量，引用类型 m 表示度量，ref_value 是编码 JSON 数组。\n'+declaration_block('public.links','uses_measure',['tenant_id','resource_code'],['tenant_id','ref_value'],conditions={'ref_kind':'m'}))
     result=discover_references(a,rules,[d])
     assert len(result.rules)==1
     ref=result.rules[0]
@@ -213,7 +214,7 @@ def test_complex_reference_rejects_missing_target_and_bad_arrays():
 
 def test_long_hierarchy_is_only_proposed_with_parent_declaration():
     a=source(['tenant_id','region_code','region_name','parent_code'],[['A','R0','根',None],['A','R1','地区','R0']],name='region')
-    d=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.region]\n---\n# 字典\nregion 登记区域维度成员，parent_code 指向父成员。')
+    d=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.region]\n---\n# 字典\nregion 登记区域维度成员，parent_code 指向父成员。\n'+declaration_block('public.region','parent_column',['region_code'],['parent_code']))
     rule=discover(a,documents=[d]).rules[0]
     assert rule.kind=='long_hierarchy'
     assert rule.identity.entity_kind=='DimensionMember'
@@ -222,8 +223,8 @@ def test_long_hierarchy_is_only_proposed_with_parent_declaration():
 
 def test_shared_definition_requires_independent_policy_not_same_name():
     a=source(['tenant_id','item_code','item_name','definition'],[['A','1','费用','完整业务定义'],['B','2','费用','完整业务定义']],name='items')
-    assert discover(a).rules[0].identity.semantic_resolution=='source_scoped'
-    d=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.items]\n---\n# 报表项目\nitems 的 definition 表示完整定义。同一完整定义可由多个租户引用。')
+    assert discover(a,ExtractionGoal(entity_kinds=['ReportItem'])).rules[0].identity.semantic_resolution=='source_scoped'
+    d=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.items]\n---\n# 报表项目\nitems 的 definition 表示完整定义。同一完整定义可由多个租户引用。\n'+declaration_block('public.items','shared_definition',['definition'],parameters={'namespace_columns':['tenant_id']}))
     rule=discover(a,documents=[d]).rules[0]
     assert rule.identity.semantic_resolution=='verified_definition_registry'
     assert rule.identity.semantic_namespace.startswith('declared_definition:')
@@ -237,7 +238,7 @@ def test_discover_engine_shares_only_explicitly_declared_equal_definitions():
     columns=['tenant_id','item_code','item_name','definition']
     rows=[['A','1','费用','完整业务定义'],['B','2','费用','完整业务定义'],['B','3','费用','另一业务定义']]
     a=source(columns,rows,name='items')
-    doc=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.items]\n---\n# 报表项目\nitems 的 definition 表示完整定义。同一完整定义可由多个租户引用。')
+    doc=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.items]\n---\n# 报表项目\nitems 的 definition 表示完整定义。同一完整定义可由多个租户引用。\n'+declaration_block('public.items','shared_definition',['definition'],parameters={'namespace_columns':['tenant_id']}))
     shared=discover(a,documents=[doc]).rules[0]
     store=GraphStore();engine=RuleEngine(store)
     outcome=engine.execute(a,shared,document_versions={doc.document_id+'@'+doc.revision})
@@ -245,7 +246,7 @@ def test_discover_engine_shares_only_explicitly_declared_equal_definitions():
     assert engine.bindings[(shared.rule_id,canonical(['A','1']))]==engine.bindings[(shared.rule_id,canonical(['B','2']))]
     assert engine.bindings[(shared.rule_id,canonical(['B','2']))]!=engine.bindings[(shared.rule_id,canonical(['B','3']))]
     store.close()
-    independent=discover(a).rules[0]
+    independent=discover(a,ExtractionGoal(entity_kinds=['ReportItem'])).rules[0]
     store=GraphStore();engine=RuleEngine(store)
     outcome=engine.execute(a,independent)
     assert outcome.published and outcome.counts['entities']==3
@@ -254,7 +255,7 @@ def test_discover_engine_shares_only_explicitly_declared_equal_definitions():
 
 def test_definition_fd_conflict_cannot_authorize_shared_identity():
     a=source(['tenant_id','item_code','item_name','definition'],[['A','1','费用','定义一'],['A','1','费用','定义二']],name='items')
-    d=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.items]\n---\n# 报表项目\nitems 中同一完整定义可由多个租户引用。')
+    d=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.items]\n---\n# 报表项目\nitems 中同一完整定义可由多个租户引用。\n'+declaration_block('public.items','shared_definition',['definition'],parameters={'namespace_columns':['tenant_id']}))
     result=discover(a,documents=[d])
     assert result.rules[0].identity.semantic_resolution=='source_scoped'
     assert any(i['code']=='fd_violation' for i in result.issues)
@@ -263,7 +264,7 @@ def test_definition_fd_conflict_cannot_authorize_shared_identity():
 def test_cached_pattern_reuse_detects_new_discriminator_without_model():
     from lightgraph.discovery import validate_cached_patterns
     a,rules=_complex_source(True,True)
-    doc=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.links]\n---\n# 引用\nlinks 记录指标使用度量，引用类型 m 表示度量，ref_value 是编码 JSON 数组。')
+    doc=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.links]\n---\n# 引用\nlinks 记录指标使用度量，引用类型 m 表示度量，ref_value 是编码 JSON 数组。\n'+declaration_block('public.links','uses_measure',['tenant_id','resource_code'],['tenant_id','ref_value'],conditions={'ref_kind':'m'}))
     ref=discover_references(a,rules,[doc]).rules[0]
     ref.validation_ref='validated_reference';ref.status='validated'
     review=validate_cached_patterns(a,[ref],[doc])
@@ -277,7 +278,7 @@ def test_cached_pattern_reuse_detects_new_discriminator_without_model():
 def test_cached_pattern_unchanged_has_no_review_and_no_new_model_calls():
     from lightgraph.discovery import validate_cached_patterns
     a,rules=_complex_source(True)
-    doc=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.links]\n---\n# 引用\nlinks 记录指标使用度量，引用类型 m 表示度量，ref_value 是编码 JSON 数组。')
+    doc=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.links]\n---\n# 引用\nlinks 记录指标使用度量，引用类型 m 表示度量，ref_value 是编码 JSON 数组。\n'+declaration_block('public.links','uses_measure',['tenant_id','resource_code'],['tenant_id','ref_value'],conditions={'ref_kind':'m'}))
     ref=discover_references(a,rules,[doc]).rules[0]
     ref.validation_ref='validated_reference';ref.status='validated'
     review=validate_cached_patterns(a,[ref],[doc])
@@ -325,11 +326,11 @@ def test_t5_runs_only_for_fd_counterexample_and_adds_namespace():
                 'claim':{'group_id':'scoped','entity_kind_hint':'BusinessConcept','key_columns':[ids['business_id'],ids['item_code']],
                          'attributes':{'single_valued':[ids['item_name']]}},'evidence_cited':['fd_check']}]})
     a=source(['business_id','item_code','item_name'],[['A','1','First'],['B','1','Second']])
-    model=Model();result=discover(a,model=model)
+    model=Model();result=discover(a,ExtractionGoal(entity_kinds=['BusinessConcept']),model=model)
     assert model.tasks==['T1_table_discovery','T5_revision']
     assert result.rules[0].identity.key_columns==['business_id','item_code']
     clean=source(['business_id','item_code','item_name'],[['A','1','First'],['A','1','First']])
-    model=Model();discover(clean,model=model)
+    model=Model();discover(clean,ExtractionGoal(entity_kinds=['BusinessConcept']),model=model)
     assert model.tasks==['T1_table_discovery']
 
 
@@ -337,7 +338,7 @@ def test_json_reference_discovery_to_actual_engine_edges():
     from lightgraph.store import GraphStore
     from lightgraph.rules import RuleEngine
     a,rules=_complex_source()
-    d=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.links]\n---\n# 引用\nlinks 记录指标使用度量，allowed_measure_codes 是允许引用度量的 JSON 数组。')
+    d=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.links]\n---\n# 引用\nlinks 记录指标使用度量，allowed_measure_codes 是允许引用度量的 JSON 数组。\n'+declaration_block('public.links','uses_measure',['tenant_id','resource_code'],['tenant_id','allowed_measure_codes']))
     store=GraphStore();engine=RuleEngine(store)
     for r in rules:assert engine.execute(a,r).published
     result=discover_references(a,store.get_rules(),[d])

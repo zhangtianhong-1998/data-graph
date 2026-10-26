@@ -103,6 +103,7 @@ def test_model_observes_tool_result_and_changes_next_query(monkeypatch,tmp_path,
     assert tools.executed==['get_metadata','execute_readonly_sql'] and tools.closed
     assert data['probe_digest'][-1]['aggregates']=={'violating_groups':0}
     assert CANARY not in json.dumps(data['probe_digest'])
+    assert 'tool_observations' not in data
     assert model.usage['calls']==3 and model.budget.snapshot()['reserved']=={}
     assert set(vars(model))=={'config','budget','transport','usage'}
     assert list(tmp_path.iterdir())==[]
@@ -123,6 +124,25 @@ def test_metadata_only_rejects_source_queries_before_executor_and_strips_samples
     tools=Toolbox()
     assert model.explore(input_packet(),tools).proposals
     assert not tools.executed and tools.closed
+
+
+def test_query_observations_are_bounded_and_require_issued_probe():
+    from lightgraph.discovery.agent import _record_probe,_record_observation
+    from lightgraph.discovery.models import TaskPacket
+    from lightgraph.contracts import canonical
+    from pydantic import ValidationError
+    p=input_packet();p['probe_digest']=[]
+    for index in range(12):
+        result={'status':'ok','probe_id':f'probe_{index:04d}',
+            'data':{'columns':['a','b'],'rows':[['x'*200,'y'*200] for _ in range(20)]}}
+        _record_probe(p,result,'execute_readonly_sql')
+        _record_observation(p,result,'execute_readonly_sql')
+    checked=TaskPacket.model_validate(p)
+    assert 1<=len(checked.tool_observations)<=8
+    assert all(len(o.rows)<=8 and o.truncated and not o.full_source_validation for o in checked.tool_observations)
+    assert sum(len(canonical(o.model_dump()).encode()) for o in checked.tool_observations)<=24576
+    p['tool_observations'][0]['probe_id']='unissued'
+    with pytest.raises(ValidationError,match='unissued_observation_probe'):TaskPacket.model_validate(p)
 
 
 @pytest.mark.parametrize('tool,raw_args,expected',[

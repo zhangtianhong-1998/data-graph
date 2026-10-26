@@ -4,6 +4,7 @@ from pathlib import Path
 from ..contracts import GraphFact,SupportSpec,PartitionCompletion,digest
 from ..errors import LightGraphError
 from ..store import GraphStore
+from ..semantic_schema import SemanticSchema
 
 
 def import_graph(path,store_path,*,max_bytes=64*1024*1024):
@@ -12,15 +13,18 @@ def import_graph(path,store_path,*,max_bytes=64*1024*1024):
     try:
         data=json.loads(path.read_text())
         if data.get('format_version')!='1.0':raise ValueError()
-        domain=data['isolation_domain'];records=data['facts'];supports=data['supports']
+        domain=data['isolation_domain'];records=data['facts'];supports=data['supports'];scopes=data['scopes']
+        schema=SemanticSchema.model_validate(data.get('semantic_schema',{}))
         if not isinstance(records,list) or not isinstance(supports,list):raise ValueError()
+        if not isinstance(scopes,list) or any(not isinstance(scope,str) for scope in scopes):raise ValueError()
         facts={r['id']:GraphFact(isolation_domain=domain,fact_kind=r['fact_kind'],payload=r['payload']) for r in records}
         if len(facts)!=len(records) or any(k!=v.fact_id for k,v in facts.items()):raise ValueError()
     except Exception:raise LightGraphError('invalid_graph_snapshot') from None
     with GraphStore(store_path) as store:
-        if store.heads():raise LightGraphError('import_requires_empty_store')
-        publication=None
-        try:
+        with store.import_transaction():
+            # The snapshot's vocabulary is typed and bounded before any facts
+            # are staged; an arbitrary property string alone grants nothing.
+            store.register_import_schema(schema)
             rid='import:'+digest(sorted(facts))[:24]
             publication=store.begin_publication(rid,1,'all',{'snapshot':digest(data),'domain':domain})
             covered=set()
@@ -35,11 +39,6 @@ def import_graph(path,store_path,*,max_bytes=64*1024*1024):
                 store.stage_fact(publication,fact,support);covered.add(fid)
             if covered!=set(facts):raise LightGraphError('import_missing_support')
             store.publish_partition(PartitionCompletion(publication_id=publication,complete=True,consistent=True,dependencies_valid=True))
-            graph=store.view(set(data['scopes']),domain=domain,include_candidates=True)
-            return {'nodes':len(graph['nodes']),'edges':len(graph['edges']),'claims':len(graph['claims']),
-                'source_revalidation':'not_performed','execution_rules_restored':False}
-        except BaseException:
-            if publication:
-                try:store.abort(publication)
-                except Exception:pass
-            raise
+        graph=store.view(set(scopes),domain=domain,include_candidates=True)
+        return {'nodes':len(graph['nodes']),'edges':len(graph['edges']),'claims':len(graph['claims']),
+            'source_revalidation':'not_performed','execution_rules_restored':False}

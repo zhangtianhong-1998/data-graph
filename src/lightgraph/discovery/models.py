@@ -3,11 +3,14 @@ from __future__ import annotations
 from typing import Annotated, Literal, Union
 from pydantic import Field, model_validator
 from lightgraph.contracts import StrictModel, RuleSpec, SourceRef, TableSpec, digest
+from lightgraph.semantic_schema import SemanticSchema
 
 Role = Literal['identity_code','namespace','label','alias','semantic_attribute','display_order',
                'level_position','fact_value','relation_endpoint','discriminator','audit','unknown']
 Task = Literal['T0_discovery','T1_table_discovery','T2_cross_table','T3_hierarchy','T4_document','T5_revision']
-SemanticProperty = Literal['label','alias','english_name','description','definition','unit','formula']
+# The project catalog validates meaning, type and allowed entities. Parsing a
+# proposed name does not register it or grant permission to persist values.
+SemanticProperty = Annotated[str, Field(min_length=1, max_length=64)]
 
 class Member(StrictModel):
     column_id: str
@@ -26,6 +29,7 @@ class ColumnGroup(StrictModel):
     group_id: str
     entity_kind_hint: str
     members: list[Member] = Field(min_length=1, max_length=64)
+    identity_resolution: Literal['source_scoped', 'shared_definition'] = 'source_scoped'
 
 class KeyAttributes(StrictModel):
     single_valued: list[str] = Field(default_factory=list)
@@ -42,6 +46,7 @@ class EntityKey(StrictModel):
     namespace_columns: list[str] = Field(default_factory=list, max_length=16)
     level_policy: Literal['not_applicable','level_qualified','code_with_fill_merge'] = 'not_applicable'
     normalization: Literal['identity'] = 'identity'
+    identity_resolution: Literal['source_scoped', 'shared_definition'] = 'source_scoped'
     @model_validator(mode='after')
     def guard(self):
         if len(set(self.key_columns)) != len(self.key_columns): raise ValueError('duplicate_key_column')
@@ -100,12 +105,12 @@ class Reference(StrictModel):
     target_entity: str
     target_columns: list[str] = Field(min_length=1,max_length=16,description='Issued foreign-key column IDs on the CURRENT table, ordered to match target_entity key_columns. Do not use remote-table IDs.')
     direction: Literal['source_to_target'] = 'source_to_target'
-    cardinality_hint: Literal['n_to_1','1_to_1','unknown'] = 'unknown'
+    cardinality_hint: Literal['n_to_1','1_to_n','n_to_m','1_to_1','unknown'] = 'unknown'
     condition_ref: str | None = None
     polymorphic_by: str | None = None
     require_full_coverage: bool = False
     normalization: Literal['identity'] = 'identity'
-    relation_kind: Literal['verified_reference','uses_measure','member_of'] = 'verified_reference'
+    relation_kind: str = Field(default='verified_reference',min_length=1,max_length=64)
     @model_validator(mode='after')
     def guard(self):
         # Each endpoint matches its own registered key, whose arity can differ.
@@ -168,6 +173,7 @@ Proposal = Annotated[Union[ColumnGroupProposal,EntityKeyProposal,HierarchyPropos
 class ProposalBatch(StrictModel):
     packet_version: Literal['1.0'] = '1.0'
     task: Task
+    semantic_schema: SemanticSchema = Field(default_factory=SemanticSchema)
     proposals: list[Proposal] = Field(default_factory=list,max_length=6)
     open_questions: list[str] = Field(default_factory=list,max_length=12)
     abstain: bool = False
@@ -240,6 +246,13 @@ class PacketStratum(StrictModel):
     selection: str = 'bounded_sample'
     count: int | None = Field(default=None,ge=0,le=32)
     rows: list[dict[str,str|int|float|bool|None]] = Field(default_factory=list,max_length=32)
+class PacketToolObservation(StrictModel):
+    """Bounded query evidence for this discovery/review call; never persisted."""
+    probe_id: str
+    columns: list[str] = Field(max_length=32)
+    rows: list[list[str|int|float|bool|None]] = Field(default_factory=list,max_length=8,repr=False)
+    truncated: bool = False
+    full_source_validation: Literal[False] = False
 class PacketDocument(StrictModel):
     doc_id: str
     revision: str
@@ -271,12 +284,15 @@ class TaskPacket(StrictModel):
     task: Task
     scope: SourceRef | None = None
     goal: dict = Field(default_factory=dict)
+    iteration_context: dict = Field(default_factory=dict)
+    semantic_schema: SemanticSchema = Field(default_factory=SemanticSchema)
     subtask: str | None = Field(default=None,max_length=2000)
     context_tables: list[SourceRef] = Field(default_factory=list,max_length=64)
     document_refs: list[dict] = Field(default_factory=list,max_length=128)
     metadata_digest: MetadataDigest = Field(default_factory=MetadataDigest)
     probe_digest: list[PacketProbe] = Field(default_factory=list,max_length=96)
     strata_samples: list[PacketStratum] = Field(default_factory=list,max_length=8)
+    tool_observations: list[PacketToolObservation] = Field(default_factory=list,max_length=8,repr=False)
     document_snippets: list[PacketDocument] = Field(default_factory=list,max_length=32)
     known_conflicts: list[PacketConflict] = Field(default_factory=list,max_length=32)
     budget: PacketBudget = Field(default_factory=PacketBudget)
@@ -301,6 +317,14 @@ class TaskPacket(StrictModel):
                 if set(row)-column_ids:raise ValueError('unauthorized_sample_column')
                 if any(isinstance(v,str) and len(v.encode())>200 for v in row.values()):raise ValueError('sample_value_too_large')
                 total+=len(canonical(row).encode())
+        probes={p.probe_id for p in self.probe_digest}
+        for observation in self.tool_observations:
+            if observation.probe_id not in probes:raise ValueError('unissued_observation_probe')
+            if len(set(observation.columns))!=len(observation.columns):raise ValueError('ambiguous_observation_columns')
+            for row in observation.rows:
+                if len(row)!=len(observation.columns):raise ValueError('observation_row_shape_invalid')
+                if any(isinstance(v,str) and len(v.encode())>200 for v in row):raise ValueError('sample_value_too_large')
+            total+=len(canonical(observation.model_dump()).encode())
         if total>24576:raise ValueError('sample_packet_too_large')
         if sum(len(d.text.encode()) for d in self.document_snippets)>12000:raise ValueError('document_context_too_large')
         return self

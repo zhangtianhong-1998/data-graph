@@ -2,9 +2,9 @@
 
 > 2026-10-20 实施更新：上下文范围、混合来源和相对层级路径已按 [SDD §18](SDD.md#18-混合输入上下文范围与可变层级2026-10-19-增补) 接入 `src/lightgraph/`；使用条件、测试位置与剩余边界见 [实现说明](INPUT_CONTEXT_HIERARCHY_UPDATE.md)。本文旧层级伪代码保留为历史策略说明，`relative_path` 以当前契约和执行器为准。
 
-版本：v1.0，架构基线日期 2026-10-17。本文细化假设契约、算子、状态机、预算、层级算法与验收。主流程已在 `src/lightgraph/` 实现；文中的 SQL、伪代码和历史夹具树仍是设计示意，不保证与现有文件逐项对应。实际接口以源码和生成 Schema 为准，验证快照见 [实施记录](../../IMPLEMENTATION_STATUS.md)。真实 Gauss 与付费模型尚未验收。
+版本：v1.1（2026-10-26），保留 2026-10-17 架构中的算子与反例设计，更新当前任务、语义复核、完整规则代际和图级裁决契约。文中的 SQL、JSON 和伪代码用于说明数据流，未逐项实现的规划不能视为运行接口。实际字段以源码为准，本轮实现及缺口见 [迭代引擎实施记录](ITERATIVE_ENGINE_IMPLEMENTATION.md)；真实数据库、真实模型语义及客户 Gold 仍独立验收。
 
-对应需求：US-07、US-08、US-09、US-10、US-11、US-12、US-15、US-16、US-18。对应设计：SDD §6（工作流）、§7（列组与身份）、§8（层级）、§9（规则与算子）、§10（文档）。与 SDD 冲突时，以 SDD 的数据保留边界、安全策略与输出契约优先，本文只做细化。
+对应需求：US-07～US-12、US-15/16/18，以及 US-29～US-34。对应设计：SDD §6（工作流）、§7（列组与身份）、§8（层级）、§9（规则与算子）、§10（文档）。与 SDD 冲突时，以 SDD 的数据保留边界、安全策略与输出契约优先，本文只做细化。
 
 路径约定：`route2/...`、`xiaomeng/...` 是复用审计中的旧项目路径；当前运行模块和测试统一位于 `src/lightgraph/`。旧代码定位仅用于迁移参考，不能作为新系统已实现的证明。规范优先级：SDD 的安全、身份、图事实和发布契约优先；本文维护发现任务、算子细节和错误码；US 维护验收编号，实施计划维护执行顺序。
 
@@ -14,7 +14,10 @@
 - `context.py` 为每次 T0～T5 及文档抽取调用保留 goal、阶段和子任务。`documents/core.py` 解析全局、来源、表列及章节范围；工具按实际读取对象补齐完整说明，动态检索引用进入同一核验登记。
 - `sources/csv.py` 严格解析显式格式，混合来源在 `runtime/config.py` 接入。跨源工具及规则核验调用 `cross_source.py`，分别取得两端必要列 DISTINCT，并检查复合键、NULL、歧义、预算、覆盖和快照；不足时 `unresolved`，不能发布完整引用或撤回旧支持。两端独立快照不代表分布式同一时点。
 - `relative_path` 将已验证身份域与相对层位分开；体系、业务条件和版本限定父子事实。源位置单独保存，NULL/缺槽位、填充、多父和跨规则环分别核验。`rules/views.py` 只读查看入口，`identity/migration.py` 与存储事务核对旧新绑定及依赖闭包。
-- `pipeline.py` 按表记录完成的上下文版本。新增相关文档或绑定变化触发局部复核；失败和延期表不记成完成，下次继续尝试。自动跨表发现当前最多接纳 64 张参与表和 64 个已验证实体端点，超过上限明确延期，未实现端点分页。
+- `pipeline.py` 按表记录完成的上下文版本，并用 `IterationLedger` 持久化目标修订与模式工作项。执行中的 FD、身份、引用或层级反例可触发新的定向 Agent；规则形状不变且问题未解决时记录未决，重复运行不反复调用相同任务。
+- `semantic_schema.py` 登记类型化动态业务词汇；`semantic_review` 独立核对业务命题、已读文档立场、反证、条件和签发引用，结构检查通过不等于语义确认。
+- `rules/engine.py` 在内存中分区查询，全部完成后以 `all` 完整规则代际替换旧 head 集合。查询分区值及其哈希不进入持久化；中断后整代重查。
+- `identity/reconciliation.py` 提供待发布全图检查、有界候选召回、原始事实上的 Agent 复核及可撤销身份裁决。现有人工裁决不会被 Agent 覆盖。自动跨表发现仍限制 64 张参与表和 64 个已验证实体端点，超限延期；全局候选召回与互斥关系裁决仍有覆盖边界。
 
 ## 0. 交付项与章节映射
 
@@ -28,7 +31,7 @@
 | (f) RuleSpec 与执行 | §8 | YAML、编译模板、批量、去重、可解释 |
 | (g) 宽表层级算法 | §9 | 六阶段算法、伪代码、用户样例走查、冲突分类 |
 | (h) 分工与最小工作流 | §10 | 确定性边界、调用次数、调度伪代码 |
-| (i) 夹具与验收 | §11 | 18 张表（t01–t18）、装置、反例矩阵、指标阈值 |
+| (i) 夹具与验收 | §11 | 实际测试/夹具映射、历史反例矩阵与独立 Gold 缺口 |
 | (j) 复用/改造映射 | §12 | path:line 清单、必改点 |
 | 附录 | §13–§15 | 错误码、阈值、实施顺序 |
 
@@ -46,7 +49,7 @@
 ### 1.1 五条设计原则
 
 1. **假设先行，探查有界。** 每个 LLM 调用必须围绕抽取目标、假设或明确的未决问题。Agent 根据上轮结果选择统计工具或提交只读 SQL；两类请求都由工具内部校验并执行（SDD §4.2）。Agent 不持有直接数据库连接。
-2. **规则化执行，逐行不走模型。** 模型只产出结构假设；取值变化由 RuleSpec 批量执行。千万事实行与 LLM 调用数解耦。
+2. **规则化执行，逐行不走模型。** 模型提出结构和语义解释；规则解释过的普通取值由 RuleSpec 批量处理，新的反例模式再触发任务。模型调用由模式、任务与预算控制，不按每行启动。
 3. **确定性优先。** 能用一条确定性规则判定的结论，不交给模型；模型输出永远不能直接变成图事实，必须过验证器。
 4. **预算守恒、分池预留。** 启动新假设前先预留必做验证的最低成本（§6.4）；预算耗尽时输出覆盖缺口与延期队列。DB、LLM、时间/内存分别限额，比例只是试点调度参数。
 5. **不以猜测消解冲突。** 同码异义、环、编码映射缺失和 schema 矛盾影响的部分进入 `unresolved`。多父本身不一定错误：已确认允许 DAG 的分类体系可保留全部合法父边；未知体系不挑父。
@@ -72,8 +75,11 @@ flowchart LR
   Vv --> H
   V -->|状态推进| H
   H --> R[RuleCompiler<br/>RuleSpec]
-  R --> X[批量执行器<br/>DISTINCT 投影]
-  X --> Pub[Publisher<br/>图事实+支持账本]
+  R --> Sr[独立 semantic_review<br/>业务命题与条件]
+  Sr --> X[批量执行器<br/>完整规则投影]
+  X -->|反例模式| S
+  X --> Pub[Publisher<br/>all 代际+支持账本]
+  Pub --> Gr[有界图候选与版本化裁决]
   D[DocChannel 两类文档任务] --> H
   D --> Cv[Claim 校验与实体绑定]
   Cv --> Pub
@@ -94,6 +100,16 @@ flowchart LR
 输入：`ExtractionGoal`（SDD §5.1）、授权对象范围、知识文档 ID 列表、预算上限、可选用户提示（已确认映射，作为 `created_by=user` 的假设进入，仍需验证）。
 输出：已验证 RuleSpec、仅抽样支持的候选假设、图事实变更、未决与冲突报告、覆盖统计。仅抽样候选不得通过 RuleCompiler 自动发布数据事实。**不输出**源行、样本文件、含样本的请求/响应或本地数据副本。
 终止态：`COMPLETED`（目标必做检查均完成，无未覆盖项）、`COMPLETED_WITH_GAPS`（已运行完可执行任务，仍有语义未决/不支持范围）、`PARTIAL`（因资源、超时或来源中断而未完成）、`FAILED`（配置、安全或不可恢复错误）。退出状态与结构覆盖、语义接受结果分别报告，不能只用一个“成功”布尔值代替。
+
+### 1.4 两层迭代与图级复核
+
+单个 Agent 通过 ReAct 工具循环补元数据、文档和少量数据证据；跨 Agent 调度由 `IterationLedger` 负责。`goal_revision` 比较目标与授权 scopes，只有二者变化才递增；它不同于工作台保存配置使用的 `config_revision`。
+
+`WorkItem` 使用随机 work_id，记录目标修订、source、metadata_discovery/review_pattern、模式码、规则修订、上下文版本、状态、尝试次数，以及白名单的 distinct_tuples/conflicts 计数。状态为 `pending / running / resolved / unresolved / deferred`。重启将 running 转 deferred，重新查询完整规则范围。无变化的未决工作不会在普通重跑中重复调用；上下文、规则或安全观察摘要变化后可重新进入复核。若源数据变化但模式码、计数与依赖都相同，当前不能自动识别这是新反例，需显式重新发现。
+
+跨任务传递全局目标、实际相关表列文档、至多 24 条规则映射和至多 32 个工作项，并标明截断。样本、原始 SQL 结果、完整模型对话不会成为长期记忆。`max_discovery_rounds` 控制跨任务轮数；工具步数和模型调用另计。
+
+完整规则代际先做待发布全图约束检查，再提交。图形成后，按有界候选索引进行身份复核。Agent 使用原始授权图事实及相关文档，提交时重新核对图 head、目标、证据和裁决修订；图发生变化不能沿用旧判断。用户裁决与模型复核共用身份守卫，原事实与历史不改写。任意关系冲突自动裁决、任意大候选簇和源行级断点续处理尚不属于当前完成范围。
 
 ## 2. 核心对象与持久化边界
 
@@ -121,7 +137,7 @@ Goal ──scopes──> TableRef ──has──> ColumnProfile（聚合）
 | `ProbeResult` | 算子、无值模板形状指纹、计数、覆盖、成本、状态码 | 返回行、反例值、实际绑定参数、值哈希列表 |
 | `ValidationRecord` | 检查项、计数、覆盖和一致性证明引用、语义依据引用 | 原始证据行、任意 `strata` 值、样本文件或其路径 |
 | `RuleSpec` | 经过验证的映射/谓词、少量语义判别常量及依据、预算、失效条件 | 原始值域、样本/异常值清单；未验模型输出 |
-| `RunBatch` | 逻辑分区 token、完成状态、计数、发布版本 | 起止业务键、最后一行值、键范围哈希、逐行哈希列表 |
+| 完整代际记录 | 常量 all、完成状态、计数、发布版本 | 起止业务键、最后一行值、键范围哈希、逐行哈希列表 |
 | `GraphFact/Support` | 通过输出和保留契约的目标实体/属性/边/主张及支持；candidate/unresolved与accepted分开 | 整行JSON、未选中字段、以“来源支持”为名保留原始行 |
 | LLM 审计 | 任务 ID、无值包结构指纹、契约/模型版本、调用和 token 计数、校验码 | prompt、response、原文 delta、含业务值的请求/输出 hash |
 
@@ -270,7 +286,7 @@ runs/<run_id>/
 | `evidence_level` | 当前最强证据等级（§3.3） | 程序 | 只能随 probe 结果上调，修订可降级 |
 | `created_by` | 来源类型；`user` 提示仍需数据验证 | 调度器 | — |
 | `confidence_band` | 模型自评，仅用于排序提示，**不作为接受门槛** | LLM | low/medium/high |
-| `revision` | 1..3；设计最多 2 次修订（revision ≤3）；试点配置 1 次（revision ≤2）；超限 → `unresolved` | 程序 | 试点 1 次修订 |
+| `revision` | 假设/规则修订号；跨任务轮次由 max_discovery_rounds 控制，不把规则修订号当作全局轮次 | 程序 | 轮次耗尽保留 deferred；无进展保留 unresolved |
 | `support` | 证据引用；`probe_id` 必须真实存在 | LLM 提议、程序写入 | 悬空引用整条拒绝 |
 | `counterexamples` | 反例分类与计数；**不存值** | 程序 | examples 只在内存 |
 | `open_questions` | 待查问题，进入下一轮任务或未决报告 | LLM | ≤12 条 |
@@ -287,7 +303,7 @@ runs/<run_id>/
 | `L3_full_verified` | 声明一致性范围上的结构核验完整通过 | 程序 | validated；业务含义另查 semantic_evidence |
 | `L4_published` | 已发布图事实且有支持账本；是发布记录，不比 L3 增加语义真实性 | 程序 | PUBLISHED（规则/发布外部状态） |
 
-规则：`L3` 必须记录 `scan_scope`、逻辑分区 token、一致性证明、扫描量及其 measured/estimated/unknown 状态。仅抽样不得升级 L3；完整 5 项字典也可达到 L3，不设置“至少 30 项”前置门槛。结构等级、业务语义依据与发布状态分别存储；FD 成立不能证明该列是指标或两表是同一业务对象。
+规则：`L3` 必须记录 `scan_scope`、完整规则 all 代际、一致性证明、扫描量及其 measured/estimated/unknown 状态。仅抽样不得升级 L3；完整 5 项字典也可达到 L3，不设置“至少 30 项”前置门槛。结构等级、业务语义依据与发布状态分别存储；FD 成立不能证明该列是指标或两表是同一业务对象。
 
 ### 3.4 状态
 
@@ -466,7 +482,7 @@ created_by: llm
 | discriminator | discriminating_column, partitions, unpartitioned_rule_policy, unknown_partition_policy | partitions 1～64；每项selector_ref/applies_to_entity/source_value_column必填；未知判别值不得默认为已知分区 |
 | exclusion | exclusions, evidence_requirement | not_excluded；每项column/reason/affects必填，affects仅identity/projection；列不能同时排除与保留 |
 
-策略值来源是SDD规则契约与注册表；未知枚举拒绝，不允许任意字符串降级为自然语言执行。notes/rationale/open_questions为受限解释文本，经无源值持久化检查后才保存；即使满足字数限制，也不能把样本写进去。T4的DocumentClaim不是结构Hypothesis，走SDD的主张契约。
+执行策略值由封闭契约限定，未知策略拒绝；业务实体、属性和关系词汇则可经 `SemanticSchema` 扩展，二者不能混为固定业务枚举。notes/rationale/open_questions为受限解释文本，经无源值持久化检查后才保存；即使满足字数限制，也不能把样本写进去。T4的DocumentClaim不是结构Hypothesis，走SDD的主张契约。
 
 ### 3.6 程序校验器（`validate_hypothesis`）
 
@@ -479,7 +495,7 @@ created_by: llm
 5. 证据引用可解析：`support[].probe_id` 存在于本运行；`document_ref` 指向已授权文档且 revision 匹配。
 6. 指纹去重：同 `fingerprint` 已存在则合并（保留较早证据，追加 support），不新建修订。
 7. 敏感列拦截：命中敏感形态（密钥/邮箱/电话）的列不得进入 LLM 输入包（沿用 `column_role_inference.py:40` 的 `_SENSITIVE_VALUE` 思路）。
-8. 预算：`revision ≤ 3`（设计）/`≤ 2`（试点）、`llm_calls_used` 未超本任务配额。
+8. 预算：单 Agent 步数、调用预算与跨任务 max_discovery_rounds 分别检查；不能用旧的固定 revision 上限替代运行配置。
 
 设计要点：校验器只拒绝**该提案**，不整批失败；被拒项写入 `rejected[]` 供报告，不进入下一轮 prompt 的上下文（避免污染）。
 
@@ -626,7 +642,7 @@ WHERE <scope> AND <col_l4> = <col_l5>          -- 填充层
 ORDER BY <stable_key...> LIMIT :k;
 ```
 
-分层定义（对应 SDD §5.2）：`普通 16 / 高频代表 8 / 稀有与异常 4 / 冲突与反例 4`，合计 ≤ 32 行/表/轮；不同层同一行只占一个名额。每层记录选择方法与局限，不能把稳定排序前 N 行称为代表性随机样本。可用授权键区间/分层页位置覆盖首中尾；没有低成本可重复抽样能力时明确 coverage_gap。键集分页最后键只在内存，崩溃后重新执行未完成逻辑分区。返回按层计数 + 样本（内存）。
+分层定义（对应 SDD §5.2）：`普通 16 / 高频代表 8 / 稀有与异常 4 / 冲突与反例 4`，合计 ≤ 32 行/表/轮；不同层同一行只占一个名额。每层记录选择方法与局限，不能把稳定排序前 N 行称为代表性随机样本。可用授权键区间/分层页位置覆盖首中尾；没有低成本可重复抽样能力时明确 coverage_gap。键集分页最后键只在内存，崩溃后重新执行未完成的完整规则代际。返回按层计数 + 样本（内存）。
 
 **(6) `check_reference`**
 
@@ -784,7 +800,7 @@ ProbeRequest
 | `PROBING` | 正在执行探查 | 预算准入通过 | 进行中 probe 的计划与已花预算 |
 | `SUPPORTED` | 证据足够，待正式验证 | 必需 probe 全部完成且无未消解反例 | 证据引用、覆盖范围 |
 | `COUNTEREXAMPLE_FOUND` | 发现反例 | 任一反例计数 > 0 且未解释 | 反例分类与计数（无值） |
-| `REVISED` | 已修订假设 | 新指纹 ≠ 旧指纹，且 revision ≤ 3（试点 ≤2） | 修订链、修订理由（≤300 字） |
+| `REVISED` | 已修订假设 | 新指纹 ≠ 旧指纹，且仍在配置的修订/发现轮次与预算内 | 修订链、修订理由（≤300 字） |
 | `RULE_VALIDATED` | 验证记录完整、可编译 | 全部必需检查通过 + 编译成功 | ValidationRecord、RuleSpec |
 | `CANARY_CHECKED` | 小范围执行与预期一致 | 1 个分区/≤1000 个图事实的 canary 通过 | canary 计数、差异计数 |
 | `PUBLISHED` | 图事实已发布 | 幂等写入成功 | GraphFact、Support、发布批次 |
@@ -805,17 +821,17 @@ ProbeRequest
 | 5 | `PROBING → SUPPORTED` | 必需 probe 全部 `complete`；反例计数 = 0 | 证据等级按扫描范围定（L2/L3） |
 | 6 | `PROBING → COUNTEREXAMPLE_FOUND` | 违反已声明不变量的计数 >0 | 记录反例分类/计数；不得由模型设置 ignore 跳过 |
 | 7 | `PROBING → UNRESOLVED` | 必需 probe 任一 `partial/timeout/budget_exhausted` 且无替代 | 记录缺口；不升级证据 |
-| 8 | `COUNTEREXAMPLE_FOUND → REVISED` | 反例可被"补作用域/拆版本/改排除/改填充策略"解释，且 revision < 3 | 生成修订提案（LLM T5 或规则模板），新指纹 |
+| 8 | `COUNTEREXAMPLE_FOUND → REVISED` | 反例可被"补作用域/拆版本/改排除/改填充策略"解释，且仍有配置允许的轮次与预算 | 生成修订提案（LLM T5 或规则模板），新指纹 |
 | 9 | `COUNTEREXAMPLE_FOUND → UNRESOLVED` | 身份/方向/映射冲突无独立依据，或修订无变化 | 未决只隔离受影响部分；允许 DAG 时多父不视为反例 |
 | 10 | `COUNTEREXAMPLE_FOUND → REJECTED` | 有明确反证推翻该假设适用范围或违反安全契约 | 记录具体不变量；不以样本比例证明整个来源不存在规律 |
 | 11 | `SUPPORTED → RULE_VALIDATED` | 编译成功；声明范围结构验证完成；必要语义依据已核对；无必做检查缺口 | 写 ValidationRecord + RuleSpec；仅抽样不能触发 |
 | 12 | `RULE_VALIDATED → CANARY_CHECKED` | 完整小分区的已验图事实通过暂存校验，禁止边/身份冲突为0 | 不向正式视图发布，不以节点数接近代替语义核对 |
-| 13 | `CANARY_CHECKED → PUBLISHED` | 一致性范围完整，图事实/支持校验通过 | 原子提交图版本、支持增删和分区 watermark |
+| 13 | `CANARY_CHECKED → PUBLISHED` | 一致性范围完整，图事实/支持校验通过 | 原子提交完整规则代际、支持增删和 all head |
 | 14 | `SUPPORTED/UNRESOLVED/DEFERRED → STALE` | 源 schema 哈希、文档修订或规则版本变化 | 标记旧验证失效；不自动全库重抽 |
 | 15 | 任意 → `DEFERRED` | 预算准入失败且任务可延后 | 保存续跑提示（假设 ID + 预计成本） |
 | 16 | 任意 → `FAILED` | 不可恢复错误（连接失败、权限、契约 bug） | 错误码；不删除已发布事实 |
 
-以上大写枚举是发现工作项状态；Hypothesis 使用 §3 的小写状态，RuleSpec 使用 SDD §9.3 的规则状态，发布批次另记完成情况，三者不能混写。canary 不通过应进入 UNRESOLVED，不发布。PUBLISHED 后，依赖变化或新增数据违反已验模式触发 STALE；符合规则的普通增量直接执行，无需重新跑发现。
+以上大写名称是细化流程的概念阶段；当前 `iteration_work` 使用 §1.4 的五种状态，Hypothesis、RuleSpec 和 publication 各有自己的枚举，不能直接把概念阶段写入账本。canary 不通过应进入 UNRESOLVED，不发布。PUBLISHED 后，依赖变化或新增数据违反已验模式触发 STALE；符合规则的普通增量直接执行，无需重新跑发现。
 
 ### 5.3 状态图
 
@@ -830,7 +846,7 @@ stateDiagram-v2
   PROBING --> COUNTEREXAMPLE_FOUND: 反例>0
   PROBING --> UNRESOLVED: partial/timeout
   PROBING --> DEFERRED: 预算不足
-  COUNTEREXAMPLE_FOUND --> REVISED: 可解释且轮次<3
+  COUNTEREXAMPLE_FOUND --> REVISED: 可解释且预算/轮次允许
   COUNTEREXAMPLE_FOUND --> UNRESOLVED: 冲突不可消解
   COUNTEREXAMPLE_FOUND --> REJECTED: 明确反证或契约拒绝
   REVISED --> PROBING: 新指纹
@@ -850,7 +866,7 @@ stateDiagram-v2
 
 - 每状态转移写一条 `hypothesis_event`：`{hypothesis_id, rev, from, to, at, guard, probe_ids, cost}`。事件流可重放；终态由最后一个事件决定。
 - `ProbeResult` 只存聚合与计数；`sample_envelope` 不写入事件流。若需要向 LLM 展示样本，在调用时现场构造，调用结束即丢弃（只记录无值包形状和校验码，不缓存请求/响应，见 §12.3）。
-- 崩溃恢复：未完成 probe 重新取数，旧内存证据失效；持久化逻辑分区 token 不含键值或键哈希。未完成分区整体重跑，未提交暂存批次不冒充完成。已 PUBLISHED 批次核对原子发布记录；删除/支持撤回只能发生在完整一致分区提交时。
+- 崩溃恢复：未完成 probe 重新取数，旧内存证据失效；持久化发布分区统一为常量 all，不含键值或键哈希。当前未完成的完整规则代际整体重跑；全部查询分区共享 all 发布单元，未提交暂存不冒充完成。已发布批次核对完整 head 集合；删除/支持撤回仅在完整一致代际提交时发生。
 - `STALE` 只影响依赖该 schema/文档的规则，不触发全库重抽（US-18）。源 schema 哈希 = hash(目录中的列名/类型/注释/顺序)；文档修订 = 文档 ID + revision。
 
 ## 6. (d) 预算分配器
@@ -890,19 +906,17 @@ tie-break:    (kind 优先级, 表名, hypothesis_id) 字典序（保证可复�
 
 该分数只是调度启发式，不是语义证据，不写入图事实、也不作为接受门槛（SDD §6.4）。模型给出的 `confidence_band` 只用于把同分任务排序，低置信度不会阻止核验。
 
-### 6.3 三套预算（pilot 初值，客户环境按能力配置放大）
+### 6.3 当前运行限额与历史试点估计
 
-试点口径：从 t01～t18 合成夹具选 8～12 张表、约 3,000～10,000 行、3～6 份文档。预算先取以下初值，再根据真实 Gauss 的估计偏差、查询计划与内存实测调整；不能按行数简单等比放大或固定池比例。
+数据库查询/返回/超时、模型 call/token 和工作内存分别限额，具体值以 `RunConfig`、`ModelConfig` 与来源能力为准。当前 `max_discovery_rounds` 默认 3（1～8），单 Agent `max_discovery_steps` 默认 8（1～32）；二者不是同一轮次。图候选默认检查至多 5,000 个实体、生成至多 256 组候选、执行至多 8 次身份模型复核，并报告超限延期。
 
-| 池 | 总量（8 表/1 万行试点） | 单项上限 | 说明 |
-| --- | --- | --- | --- |
-| DB | 240 次查询；估计/可观测扫描 20M 行；返回 400k 行；累计查询时长 900s | 单查询 60s；每批 ≤65,536 字节且 ≤5,000 行；单表单轮 ≤20查询 | 扫描不可测时记 unknown；超时/成本上限仍有效，不宣称精确行数硬保证 |
-| LLM | 40 calls；1.2M tokens；单次输入包 ≤64KB | 每任务初提1次；每假设试点修订≤1次；同表全部T1/T3/T5合计≤4次 | 包大小和token双重限制；协议/网络重试也消耗预算 |
-| 时间/内存 | 单表180s；整轮30min；并发DB2/LLM2；进程工作集初值256MiB | 每信封65,536字节；单假设连续3次探查无进展则未决 | 内存不足缩批或延期，不spill；必要验证数不能因固定3次总上限被截断 |
+早期 8 表/1 万行的扫描量、并发数、固定两次调用和 40%/55% 配额只是规划估计，未对当前跨任务与语义复核路径标定，已不作为运行约束或完成门槛。真实成本须用配置、实际请求与报告核对，不能由表数外推。
 
-### 6.4 按假设预留必做验证成本
+### 6.4 按假设预留必做验证成本（保留的预算规划）
 
-LLM 的40%与DB查询数的55%可作试点初始分配参考，不是最低消耗要求或客户保证。报告与发布是程序动作，不固定预留 LLM 调用；未用的验证配额可在所有在途验证已经受保的前提下释放。
+本节保留资源向量和预留账本的设计目标，未全部落实为当前调度器接口。现有调用、查询、内存和轮次预算以 §6.3 所列配置及源码为准；不能把以下 ValidationPlan、reservation 字段视为已持久化的运行记录。
+
+准入应为必要结构核验、独立语义复核和收尾保留资源，不再固定探索/核验百分比。报告与发布是程序动作，不固定预留 LLM 调用；未用的验证配额可在所有在途验证已经受保的前提下释放。
 
 每个假设准入前生成 `ValidationPlan`，写明必做检查、语义依据缺口、估计的调用/查询/扫描/返回/时间，以及最大同时占用内存。不同资源以向量检查，禁止把240次查询当作240 CU：
 
@@ -914,7 +928,7 @@ for each concurrent resource r (memory, DB slots, LLM slots):
     admit only if active_lease[r] + need(h)[r] <= limit[r]
 ```
 
-LLM 定向修订只在出现反例时调用；预留一次修订是可选风险准备，不表示每个假设都要复核调用。DB 结构检查、LLM token、返回字节和内存不能互相抵扣。LLM 尚未产出具体假设前，先按该任务允许的最大提案数预留可负担的验证包；模型返回更多提案时仅接纳已经获得验证预留的部分，其余 DEFERRED，不能先消耗全部探索再要求追加验证预算。
+LLM 定向修订只在出现反例时调用；必要的 `semantic_review` 是独立接受条件，不能因“没有结构反例”而省略。DB 结构检查、LLM token、返回字节和内存不能互相抵扣。LLM 尚未产出具体假设前，先按该任务允许的最大提案数预留可负担的验证包；模型返回更多提案时仅接纳已经获得验证预留的部分，其余 DEFERRED，不能先消耗全部探索再要求追加验证预算。
 
 每个 reservation 有唯一 ID、所属假设、预计检查、状态（reserved/active/settled/released）与到期处理。执行实际消耗结算一次；失败、取消和重试也结算，释放未使用额度。崩溃后无法确认的消耗按已预留上界记账，先确认请求已结束再释放并发槽。新预算运行可以重置限额，但须保留旧运行用量，不把续跑当作原运行未超预算。
 
@@ -924,9 +938,9 @@ LLM 定向修订只在出现反例时调用；预留一次修订是可选风险�
 
 停止规则（任一满足即停止当前层，进入下一层/收尾）：
 1. **无可行动假设**：低于试点优先级阈值的可选任务可延期；必做检查不能因低分被静默跳过。目标范围仍有未验证项则 COMPLETED_WITH_GAPS 或 PARTIAL，不标 COMPLETED。
-2. **三振规则**：连续 3 个 probe 对同一假设状态无变化 → 转 `UNRESOLVED`（避免僵尸循环）。
-3. **边际收益**：最近 5 个 probe 没有产生新的 `validated` 或新的反例分类 → 停止该表发现，转核验。
-4. **预算准入**：无法覆盖新假设的最低验证成本时停止新发现，优先完成已预留验证；百分比仅作调度预警，不能停掉已经准入且有保留额度的必要核验。
+2. **无进展**：新任务未改变可执行规则形状，且同一问题仍未解决时记录 `unresolved`，不继续反复发起相同任务。
+3. **轮次耗尽**：跨任务轮次达到 `max_discovery_rounds` 后，剩余可处理问题记为 `deferred`；不能丢弃队列后报告完成。
+4. **预算准入**：无法覆盖新假设的最低验证成本时停止新发现，优先完成已预留验证；不能停掉已经准入且有保留额度的必要核验。
 5. **时间**：整轮超时 → 冻结当前 batch，未完成假设转 `DEFERRED`。
 
 延期规则：`DEFERRED` 必须带 `resume_hint = {hypothesis_id, next_operator, est_cost_cu, est_tokens, depends_on}`，并保证下次运行可仅凭该提示重建任务（不依赖本次内存样本）。
@@ -976,25 +990,31 @@ blocked_admissions:
 scan_measurement: {value: 1834200, kind: estimated}
 ```
 
-CU 只用于查询成本估计和排序，若设置 CU 限额必须另列单位，不能与 db_queries 混用。`charge` 用实测回填；估计偏差超出配置阈值时停止新准入并记录 cost_estimate_drift。续跑只凭无值状态、依赖和逻辑分区 token 重新取数，不依赖旧内存包。
+CU 只用于查询成本估计和排序，若设置 CU 限额必须另列单位，不能与 db_queries 混用。`charge` 用实测回填；估计偏差超出配置阈值时停止新准入并记录 cost_estimate_drift。续跑只凭无值状态、依赖和完整代际记录重新取数，不依赖旧内存包或源分区检查点。
 
 ## 7. (e) LLM 任务契约
 
-### 7.1 任务种类
+### 7.1 任务种类与接受边界
 
-| 任务 | 触发 | 输入包要点 | 输出 | 上限 |
-| --- | --- | --- | --- | --- |
-| T1 表内发现 | 表已画像且存在未解释列组 | 元数据摘要、分层样本、相关文档片段、已有假设 | column_group/entity_key/exclusion 假设 | 2 calls/表 |
-| T2 跨表发现 | 存在已识别实体键 + 候选引用列 | 两侧列组摘要、值交集计数、条件分布、文档 | reference/discriminator 假设 | 2 calls/任务 |
-| T3 层级发现 | path/level/unpivot probe 有结果 | 层级列组、逐层重复率、父子一致性、同码跨层计数、样例路径 | wide_hierarchy 假设 + 冲突分类 | 2 calls/层级表 |
-| T4 文档解释 | 文档段落绑定到假设 | 段落、表格引用、当前假设与冲突 | 文档解释/主张（不是结构事实） | 1 call/文档段 |
-| T5 反例修订 | `COUNTEREXAMPLE_FOUND` | 原假设 + 反例聚合 + ≤8 条反例样本 + 可改字段枚举 | 修订假设或弃权 | 设计 2 calls/假设；试点 1 次 |
+| 职责 | 触发与输入 | 输出与校验 |
+| --- | --- | --- |
+| T0/T1 表内发现 | 目标、元数据、相关说明、有界工具观察和已知规则 | 列组、身份、排除与类型化词汇；校验列与目标许可 |
+| T2 跨表发现 | 两侧已验实体映射、物理外键/候选关联、查询计数与相关文档 | 实体关系规则、原列序与条件；多对多保留真实配对，不做笛卡尔扩张 |
+| T3 层级发现 | 槽位结构、路径观察、相关知识 | 层位解释与路径策略；方向语义和结构分别验证 |
+| T4 文档解释 | 有用途、范围、修订及章节定位的文档 | 带模态/条件的主张；分析指导不自动成为定义证据 |
+| T5/定向修订 | 执行反例、受影响规则、全局目标与迭代上下文 | 新规则解释或弃权；修订后重查完整提交范围 |
+| `semantic_review` | 编译器签发的准确命题、全部已读适用章节、schema/probe 引用、允许的临时观察 | supported/refuted/unresolved；核对方向、端点、条件、反证、引用与文档立场 |
+| 图身份复核 | 已形成图的原始可见事实、有界候选及相关文档 | 申请同一对象裁决或保持未决；提交再检查证据、版本与图约束 |
 
-T5 只在确定性检查发现反例或规则依赖/模式漂移时触发，不是每轮固定调用；常规表内/层级任务不需要模型先"验一遍"。每个任务记录还必须包含：`inputs`（目标、授权对象 ID、列组 ID、文档版本、临时观察、当前假设与依赖）、`outputs`（假设、所需验证算子、备选解释、排除条件、未知项）、`validation_prereqs`（哪些检查必须全范围、哪些只需样本、哪些属业务语义证据）、`state`（提议/探查/待修订/已验证/预算不足/不支持/失效）、`recovery`（只凭规则/状态/结果重新取数，不持久化样本包）。
+省略类型列表时默认自动发现，显式非空列表仍限制类型。新业务词汇由 `SemanticSchema` 声明实体类型、属性类型/多值性与关系端点；不要求用户写 JSON 或先给统一编码。模型可结合元数据、查询和松散知识推断，不能仅引用自己的提案为结论背书。
 
-各任务可在授权内存包中看与其问题有关的少量反例样本；T5 是唯一专门承担修订的任务，并不独占数据读取权限。样本中的异常用于提出结构修订；语义判别常量需另经验证，原始值列表或无证据的编码映射不能持久化为规则。
+结构命中与业务确认分开。`semantic_review` 是独立调用，要求命题精确一致、签发引用有效、所有已读章节有立场、必要条件满足、反证不被忽略。持久化只保留检查后的决定类别、状态和引用，不保留解释原文或样本。`metadata_only` 复核包不含源值观察。
+
+无模型的自动发现只有精确匹配的 `lightgraph-semantic` 声明可以确认相应业务语义；声明包含表、列序、谓词、条件及肯定/否定极性，否定阻止确认。普通自然语言仅作为未决线索。用户已有固定 RuleSpec 保持兼容并接受结构执行核验；这条兼容路径不证明自然语言理解。
 
 ### 7.2 输入包 schema
+
+下例保留早期包结构示意；当前任务包还含 `semantic_schema` 和 `iteration_context`。实际字段由 `discovery/agent.py`、`discovery/models.py` 与调用上下文组装器生成，不由此示例冻结。
 
 ```json
 {
@@ -1053,6 +1073,8 @@ T5 只在确定性检查发现反例或规则依赖/模式漂移时触发，不�
 
 ### 7.3 输出 schema
 
+当前提案可同时携带 `semantic_schema`；新名称必须有类型化定义并与已有定义相容。下例只展示列组提案主体。
+
 ```json
 {
   "packet_version": "1.0",
@@ -1084,7 +1106,7 @@ T5 只在确定性检查发现反例或规则依赖/模式漂移时触发，不�
 
 校验（程序，全部通过才入库）：
 1. JSON Schema + `additionalProperties=false`。
-2. `kind` 必须是本任务允许的类型（T1 不允许 `wide_hierarchy`，防止模型越权猜层级）。
+2. `kind` 必须是当前任务模型允许的提案类型；具体集合以任务校验器为准，不能沿用旧 T1/T3 名称硬编码业务类别。
 3. `evidence_cited` 的 ID 必须存在于输入包的 `metadata_digest.columns[].id`、`probe_digest[].probe_id`、`strata_samples.stratum`、`document_snippets.doc_id` 之一；悬空引用拒绝该提案。
 4. `column_id` 只能映射至输入包授权目录；模型可以看到表/列名称帮助理解，但所有操作引用必须使用签发的ID，不能凭文本自造标识符。
 5. 结构提案使用列/文档/规则引用和受控语义词汇。临时取值只在内存；源样本出现过不代表可保存为值域或exception_list。少量语义判别常量需独立验证及输出保留校验后才能进入规则。实体类型名称是语义候选，不要求在样本中逐字出现。
@@ -1096,22 +1118,24 @@ T5 只在确定性检查发现反例或规则依赖/模式漂移时触发，不�
 ```text
 初提（T1/T2/T3） → 程序探查 → 无反例: SUPPORTED
                             → 有反例: COUNTEREXAMPLE_FOUND
-                                 → T5 修订（≤2 次）
+                                 → 新 Agent 定向修订（配置轮次内）
                                     新指纹 & 反例可解释 → PROBING（新假设）
                                     指纹不变/弃权/仍冲突 → UNRESOLVED
 ```
 
-反例如何触发修订（按反例码给出模板动作，模型只需选择并补参数）：
+反例如何触发修订（以下是可验证方向，不把业务规则硬编码成必选模板）：
 - `fd_violation` → 提议增加命名空间/版本、修改有语义依据的多值策略，或使用无值的冲突谓词隔离；不能保存冲突code例外列表。
 - `same_code_diff_label` → 先区分别名、版本和同码异义；不能为了通过校验直接把label改为多值或自动拆新实体。没有独立依据时隔离受影响绑定。
 - `fill_mismatch` → 关闭填充压缩或改 `repeat_policy=none`（两者都要重新核验受影响声明范围）。
 - `multiple_parent` / `cycle` / `self_loop` → 改 `multiple_parent_policy=report_as_dag_candidate` / `cycle_policy=reject_affected_edges`，报告未决，不允许挑父。
-- `code_series_mismatch` / `document_conflict` → 输出未决与需要的映射来源，不允许模型"纠错"。
+- `code_series_mismatch` / `document_conflict` → 允许 Agent 继续查证潜在映射；没有独立依据则未决，不按编码前缀或名称猜测后直接改写。
 - `schema_value_conflict`（声明与实际值不符）→ 降低证据等级，转文档/用户澄清。
 
 失败记录只含 `{task_id, packet_shape_hash, schema_version, validation_code, repair_rounds, status, usage}`。不保存业务值相关hash或原始响应。abstain是合法未决，不盲目重试；网络/协议修复最多一次，仍需预算准入，所有请求计费与用量都入账。解析失败的响应只在内存参与修复。
 
-### 7.5 Prompt 骨架（中文，可直接实现）
+### 7.5 历史 Prompt 骨架（职责示意）
+
+以下示例保留早期任务意图，不是当前运行提示词；具体任务、可修改字段与数量限制以当前模型契约和预算为准。不得据此省略独立语义复核或限制用户的业务类型。
 
 **P1 表内结构与列组发现（T1）**
 
@@ -1165,7 +1189,7 @@ document_snippets（仅与本表相关的说明文档）、existing_hypotheses�
 你是假设修订任务。原假设、反例聚合、最多 8 条反例样本、可修改字段枚举都在输入中。
 只输出 JSON。
 
-允许的修订动作（只能选这些）：
+可考虑的修订方向（仍需证据与契约校验）：
 add_scope_column / split_version / mark_multi_valued / isolate_by_validated_predicate /
 disable_fill_compression / set_multiple_parent_policy / set_gap_policy /
 set_code_relation(unknown|strict_prefix|set_inclusion) / request_evidence_recheck / abstain
@@ -1184,6 +1208,8 @@ set_code_relation(unknown|strict_prefix|set_inclusion) / request_evidence_rechec
 ## 8. (f) 假设 → RuleSpec → 执行
 
 ### 8.1 RuleSpec 字段与示例
+
+下例是历史字段关系示意；可执行字段以 `contracts.RuleSpec` 与当前导出为准。`partition_by` 只划分内存查询，持久化 coverage/publication/support 均使用 `all`。
 
 `RuleSpec` 是**已验证假设**的可执行编译产物；没有 `validation_ref` 的假设不能生成 RuleSpec。
 
@@ -1220,7 +1246,7 @@ operators:
   - {op: project_attributes, args: {from: entity_rows, single_valued: {label: report_item_l2_cn_name}}, output: properties}
   - {op: emit_alias, args: {from: entity_rows, alias: report_item_l2_en_name}, output: aliases}
 validation_ref: validation_0007
-coverage: {scope: full, partitions: [t1, t2, t3], rows_scanned: 118422, entities: 2150}
+coverage: {scope: full, partitions: [all], rows_scanned: 118422, entities: 2150}
 evidence: {hypothesis: h_2b93c07a1f5d4e88, document: [doc_001#2.1], probe_refs: [probe_8812]}
 budget: {max_db_cu: 40, max_rows_returned: 220000, max_seconds: 120}
 publish: {mode: staged, target: graph, idempotent: true}
@@ -1228,7 +1254,7 @@ stale_when: {schema_hash_changed: true, rule_version_changed: true, doc_revision
 errors: {on_truncated: partition_retry, on_timeout: defer, on_conflict: keep_candidate}
 ```
 
-字段与状态以 SDD §9.3 为准。identity.key_columns 是来源局部绑定，不直接生成共享entity_id；共享身份另经已验证语义解析。仅抽样结果留在Hypothesis层。完整验证的声明分区可以发布该分区的结果，但不得扩大为全表结论。发布mode统一staged，当前视图只读取完成原子提交的发布版本。
+字段与状态以 SDD §9.3 为准。identity.key_columns 是来源局部绑定，不直接生成共享entity_id；共享身份另经已验证语义解析。仅抽样结果留在Hypothesis层。当前执行器的发布范围是逻辑规则完整范围，查询分区完成不构成独立发布许可。发布mode统一staged，当前视图只读取完成原子提交的发布版本。
 
 ### 8.2 编译为受限 SQL 投影
 
@@ -1245,14 +1271,14 @@ errors: {on_truncated: partition_retry, on_timeout: defer, on_conflict: keep_can
 2. 把受限谓词树编译为参数化 SQL 片段；生成只含绑定参数与目录标识符的 SQL；AST 校验（一条 SELECT、递归检查、拒绝锁/写出/导出）。
 3. 估算成本（§6.1）；若 `> budget.max_db_cu` → `defer`，不执行。
 4. 在可证明的一致性范围内流式执行，每批≤5,000行且≤65,536字节；稳定键/游标只在内存。无法可靠证明一致性时只能形成观察结果，不允许缺失撤回。
-5. 每批经校验产出GraphFact与属性级Support并进入待发布区；RunBatch只记逻辑partition_token、计数和状态。禁止持久化最后键、键范围hash或逐行投影hash。
-6. 只有完整且一致的声明分区可签发完成证明；发布和支持撤回与partition_head generation CAS、水位更新在同一事务提交。失败/截断/不一致不撤回，旧版本仍有效。规则revision不进入partition_head的逻辑键，否则无法替换旧规则支持。
+5. 每批经校验产出GraphFact与属性级Support并进入待发布区；安全报告只记规则、计数和状态；持久化发布 token 为常量 all。禁止持久化最后键、键范围hash或逐行投影hash。
+6. 所有内存查询分区完整且一致后才签发完整规则代际证明；发布和支持撤回在同一事务核对旧 head 全集并替换为 all。失败/截断/不一致不按缺失撤回；已查实结构反例的旧当前规则标待复核，历史保留。规则 revision 不改变逻辑规则身份。
 
-**宽转长在 SQL 与程序之间的分工**：SQL 只做 `DISTINCT` 路径投影与固定深度 `UNION ALL`（可选）；压缩、身份解析、边生成、环检测全部在程序内完成。原因是：压缩需要"身份相同"判断与冲突分类（多父/环/编码冲突），SQL 表达会写出脆弱且难验证的递归；DISTINCT虽常能缩小结果，但并不保证内存可承受；仍须执行投影cap、工作集限制和分区延期，禁止回退到本地原始路径缓存。
+**宽转长在 SQL 与程序之间的分工**：SQL 只做 `DISTINCT` 路径投影与固定深度 `UNION ALL`（可选）；压缩、身份解析、边生成、环检测全部在程序内完成。原因是：压缩需要"身份相同"判断与冲突分类（多父/环/编码冲突），SQL 表达会写出脆弱且难验证的递归；DISTINCT虽常能缩小结果，但并不保证内存可承受；仍须执行投影cap、工作集限制和完整代际延期，禁止回退到本地原始路径缓存。
 
 ### 8.3 批量、去重与发布
 
-- 批量单位：规则 × 分区。分区来自 `scope.partition_by`（租户/分类体系/时间分区），每分区独立 `RunBatch`，可并发但同一规则的验证有依赖顺序（实体/绑定先于引用边）。源级CDC水位必须等本窗口所有受影响规则/分区完成后才推进；仅在分区枚举自身完整可靠时才能撤回已消失分区。
+- 查询批次来自 `scope.partition_by`，分区条件仅在内存。发布单位为逻辑规则完整代际：先完成实体/绑定，再完成依赖边，整组校验与原子提交。当前不保存源分区水位，也不实现 CDC；不得根据消失的一个查询分区提前撤回。
 - 幂等键：`fact_id = hash(isolation_domain, fact_kind, canonical_semantic_payload)`，不含source/rule/revision/access scope。语义口径与分类体系等qualifiers属于payload。`support_id = digest(origin, source_binding, rule_id, rule_revision, scope_ref, partition_id, fact_id)`；同语义事实跨来源共享，来源支持分开。
 - 去重：局部namespace+key先查source_binding，再经已验证定义解析到稳定entity_id。代码或名称一致不能直接证明语义等价。标签/别名/单位/定义各为PropertyValue事实并分别挂support，GraphNode.label/properties只是按访问权限筛support后生成的聚合视图。撤回A独有别名不能因B仍支持节点存在而保留该别名。
 - 待发布区先校验节点→属性/别名→边的依赖，正式视图一次原子切换；边端点必须已被授权支持或同批创建。悬空端点不发布，不能暴露中间状态。
@@ -1412,7 +1438,7 @@ def infer_edges(paths, policy):
 | `fill_mismatch` | 重复形态与 `repeat_policy` 矛盾（例如非连续重复） | 关闭压缩，重新验证 |
 | `code_format_conflict` | 同层编码格式不统一（前导零/长度/字符集） | 报告；不做隐式规范化 |
 
-编码重映射必须另有来源：映射表、数据说明文档、或用户确认；模型只能提"疑似映射"并标记 `mapping_source=model_hypothesis`，进入 `unresolved` 队列，不得进入已发布边或实体编码。英文拼写差异按别名/质量问题处理，不新增实体、不覆盖编码冲突（SDD §8.3）。
+编码重映射不得按字符串规律直接猜测。Agent 可结合授权数据、元数据和知识提出对应解释；须通过独立语义复核与身份/图约束，无充分依据则保留未决。英文拼写差异按别名/质量问题处理，不新增实体、不覆盖编码冲突（SDD §8.3）。
 
 ### 9.7 主算法
 
@@ -1512,14 +1538,14 @@ def discover_wide_hierarchy(table, scope, budget, docs):
 | --- | --- | --- |
 | 列组假设（哪几列是一个实体） | LLM 提议 → 程序验证 | 命名/注释语义需要模型；依赖/唯一性必须程序核 |
 | 语义角色（code/label/alias/display/level） | LLM 提议；排序列与层级位置由 `level_probe` 判定 | 数据可检查分布，语义角色仍需适用证据 |
-| 实体种类命名（Metric/ReportItem/Dimension…） | LLM + 文档；无依据保留 `unknown` | 不是数据可推导的 |
+| 实体与关系词汇 | Agent 根据目标、元数据、数据与知识提案；程序校验 SemanticSchema | 不限于指标模板；无依据保留未决 |
 | 层级列组与方向 | 程序给候选，LLM/文档解释层位，再做范围校验 | 分布规律不独立证明业务父子含义 |
 | 连续填充压缩 | **程序** | 纯机械规则，LLM 逐行不可行且不可复现 |
 | 父子边生成/去重/环检测/自环 | **程序** | 图算法 |
-| 多父/编码冲突/缺层 | 程序检测 + LLM 只做"是否需要文档/弃权"的取舍 | 冲突必须报告，不能猜 |
+| 多父/编码冲突/缺层 | 程序检测，Agent 可在授权内继续探查并提出新解释 | 有独立语义依据并通过完整核验才改变规则 |
 | FD、值域、引用覆盖、DISTINCT 投影 | **程序** | 计数与全范围核验 |
 | 文档解释与主张抽取 | LLM + 程序绑定校验 | 语义解释；引用必须可定位 |
-| 修订触发与动作 | 程序判定反例 → LLM 在受限动作里选 | 预算有限，模型不做自由探索 |
+| 修订触发与动作 | 程序登记模式工作项 → 新 Agent 受预算与工具约束探查修订 | 保留目标与已验知识，不继承原始样本 |
 | 发布图事实 | **程序**（单一写入者） | 幂等、可追溯、可撤回 |
 | 增量复用 | 程序检查依赖与新增数据是否符合规则；不符合则定向复核 | US-18；无可靠源变更版本则重新查询 |
 
@@ -1528,13 +1554,13 @@ def discover_wide_hierarchy(table, scope, budget, docs):
 1. **宽转长不解决"哪些列是层级"**。`report_item_l2_*` 四列如果按 `lN` 前缀解包，会凭空造出"L2 实体"层级；必须先做 §9.1.1 的单序号判别。一次 LLM 调用也回答不了：它看不到全量重复率与父子一致性。
 2. **逐行 LLM 不可行，抽样又证明不了规则**。千万行宽表逐行抽取是 O(N) 调用；抽 30 行得到一个"看起来对"的规则，没有反例核验就发布，遇到缺层/多父/同码冲突就错。必须在声明范围内完成结构验证，并保留业务语义依据与未决项。
 3. **填充需要身份与约定共同验证**。重复率帮助发现模式，同码同名帮助查冲突，但二者不能单独证明跨层同义；需填充约定和已验绑定。
-4. **编码映射不可由模型"纠错"**。`2→28`、`24→2408` 是业务映射，不是数据规律；模型猜出来也无法验证，必须报告未决。
+4. **编码差异需要独立依据**。`2→28`、`24→2408` 不能靠字符串规律直接改写。Agent 可以结合查询、定义和相关知识发现潜在对应；无法确认条件或存在反证时保留未决，不要求所有映射预先由用户提供。
 5. **规则化执行减少按行调用**。依赖未变且新增数据符合已验模式时，重复事实只走SQL与程序，LLM调用为0。扫描成本仍随源规模变化；新判别值/版本/异常形态需定向复核，不能承诺模型成本永远与行数无关。
 6. **安全边界**：模型通过注册工具请求统计或只读 SQL，工具内部强制执行完整 AST 检查、授权与预算（SDD §4.2）。上下文只保留有上限的内存观察，不导入整表、不持久化样本或模型对话。
 
 ### 10.3 最小可运行 agent 工作流
 
-一个调度器 + T1～T5五类受控任务 + 一个确定性验证器；不需要多个自主 Agent 互相聊天（README §5、SDD §6）：
+一个有持久化任务账本的调度器、多个职责明确的临时 Agent 任务、独立语义复核和确定性验证器共同运行。下图只画职责，单 Agent 工具循环与跨任务反馈按 §1.4 分开：
 
 ```mermaid
 flowchart TB
@@ -1551,12 +1577,15 @@ flowchart TB
   Dv --> H
   H --> V[Deterministic Verifier<br/>算子+SQLGuard]
   V -->|反例| S
-  H -->|validated| C[RuleCompiler/Publisher]
+  H --> Sv[独立 semantic_review]
+  Sv -->|结构与语义通过| C[完整规则代际编译/发布]
+  C -->|执行反例| S
   C --> G[(图事实+支持)]
+  G --> Iv[有界身份复核/版本化裁决]
   S --> R[覆盖/未决报告]
 ```
 
-调度器伪代码：
+以下是职责示意；实际工作项恢复、无进展判定与完整代际重查由 `runtime/iteration.py`、`pipeline.py` 实现：
 
 ```python
 def run(goal, scope, docs, limits):
@@ -1584,82 +1613,34 @@ def run(goal, scope, docs, limits):
     return finish_with_coverage(store, budget)
 ```
 
-调度器不会把出错异常对象、工具返回或模型delta传给持久化日志。T5只由已记录反例/模式漂移触发；未完成分区重新取数，不从缓存恢复原始样本。
+调度器不会把出错异常对象、工具返回或模型delta传给持久化日志。定向修订只由已记录反例/模式漂移触发；未完成规则代际重新取数，不从缓存恢复原始样本。
 
-### 10.4 调用次数与预算上限估计（8 表 / 1 万行试点）
+### 10.4 调用数量与复用边界
 
-| 任务 | 次数估计 | 上限（名额） | 说明 |
-| --- | --- | --- | --- |
-| T1 表内发现 | 6–8 | 8 | 8 张试点表各 1 次初提 |
-| T2 跨表发现 | 2–4 | 4 | 仅对已识别实体键与候选引用列 |
-| T3 层级发现 | 1–2 | 2 | 2 张层级表各 1 次 |
-| T4 文档解释 | 2–4 | 4 | 按文档段落批次，不逐事实行 |
-| T5 反例修订 | 2–6 | 8 | 试点每假设 1 次修订；设计上限 2 次，第二次需扩 verify 池 |
-| explore 小计 | 11–18 | 18 | T1+T2+T3+T4 |
-| verify 小计 | 2–8 | 16 | T5 + T2/T3 复核 |
-| 合计 | 13–26 | 40 | 全局max_calls含协议/网络重试；未花配额不强制用尽 |
-| DB 查询 | 120–200 | 240 | 画像/探查/投影/分区重跑 |
-| 扫描行 | 100–1900 万 | 20M | 主要来自DISTINCT与声明范围核验 |
+每次发现工具循环、独立语义复核、图身份复核及协议重试都计入模型预算。调用数由实际任务和证据决定，不能沿用旧方案按表分配 1～2 次调用的估算。
 
-调用数是试点估计，不是客户承诺。相同schema/规则/相关文档和语义依赖未变，且新增数据符合已验模式时，重跑LLM调用为0。发现新形态时重新准入局部任务；verify预留按假设计算，不要求实际消耗达到40%。
+相同目标、schema、规则、相关文档及模式均不变时，可复用规则，普通数据实例继续走 SQL 和程序。新反例进入模式任务；相同依赖下已未决的问题不重复调用。报告分别记录模型调用、反馈轮次、工作项状态、身份复核与候选省略数量；模型调用为零只证明该次未使用模型。
 
 ## 11. (i) 最小测试夹具与验收
 
-### 11.1 目录结构
+### 11.1 实际测试映射与独立验收
 
-```text
-lightgraph/tests/fixtures/discovery/
-  catalog/
-    gauss_metadata_s12.json       # 授权元数据（表/列/类型/注释/声明键），不含数据
-  tables/                         # 源数据，构建时导入测试库（测试可用 SQLite/本地只读副本）
-    t01_report_item_flat.csv      # 销售费用四列组 + 租户
-    t02_report_tree_fill.csv      # 五级宽表：3/1/1/1/1 填充
-    t03_report_tree_siblings.csv  # 2711/2713 同父兄弟
-    t04_report_tree_prefix.csv    # 编码前缀规整的正确树（对照）
-    t05_report_tree_conflict.csv  # 2/24/26/261 vs 28/2408/2608/2610 编码系列冲突
-    t06_report_tree_gap_multi.csv # 缺层 + 多父（DAG 候选）
-    t07_dim_branch.csv            # 维度成员/层级（对照 dimension_members）
-    t08_metric_registry.csv       # 指标定义：单位/公式/口径
-    t09_alias_table.csv           # 中英别名多值
-    t10_same_code_diff_label.csv  # 同码异义
-    t11_same_name_diff_unit.csv   # 同名不同单位
-    t12_audit_noise.csv           # 排序列/审计列/事实金额列干扰
-    t13_cross_table_source.csv    # 跨表引用源：同时存编码/中文名/别名
-    t14_cross_table_target.csv    # 跨表目标：指标定义键（namespace+code+version）
-    t15_polymorphic_ref.csv       # 多态引用：ref_kind + ref_code，指向不同目标
-    t16_conditional_ref.csv       # 条件引用：仅 2% 行适用、含缺目标与多义
-    t17_shared_entity_tenants.csv # 两租户同义不同编号，指向同一共享实体
-    t18_collision_composite.csv   # 伪外键整数碰撞 + 复合键引用
-  excel/
-    sample.xlsx                   # 2 个 sheet：列组 + 宽层级，验证 Excel 通道
-  docs/
-    d01_data_dictionary.md        # 说明文档：L2 含义、末级填充约定
-    d02_analysis_handbook.md      # 分析知识：指标口径、方法
-    d03_conflicting_handbook.md   # 与 d01 冲突的旧版本/错误描述
-  devices/
-    mutate_incremental.py         # F07 增删改脚本
-    fault_inject.py               # F08 超时/截断/中断注入
-    capability_simulator.py       # F11 能力缺失模拟
-    canary_scanner.py             # F10 扫描器（或调用 CLI retain-check）
-    truth_schema.json             # truth_*.yaml 的 JSON Schema
-    export_schema.json            # 导出契约 schema
-  expected/
-    truth_nodes.yaml              # 实体真值（编码/标签/别名/层级出现位）
-    truth_edges.yaml              # 父子边真值（含"禁止出现"的边）
-    truth_conflicts.yaml          # 必须报告的冲突清单
-    expected_hypotheses.yaml      # 期望的假设种类/证据等级/状态
-    truth_delta.yaml              # F07 增删改后的期望集合
-    truth_states.yaml             # F08 失败注入后的允许状态
-    reject_cases.yaml             # F09 SQL 拒绝集
-    capability_cases.yaml         # F11 能力模拟期望
-  build.py                        # 生成测试库 + 校验 catalog 与 CSV 一致
-```
+旧规划中的 `t01`～`t18`、`d01`～`d03` 与 `truth_*.yaml` 文件树没有按原路径落地，不能列为现存夹具或已通过验收。当前合成夹具多在测试函数中内联定义，部分由 `sample.py` 生成；已有映射统一记录在 [acceptance_matrix.yaml](acceptance_matrix.yaml)。
 
-夹具要求：CSV 只存最小必要列；`t02/t03` 共享同一套 schema（模拟同一张表的分片场景）；所有编码/名称均为**合成**，不含真实客户数据；每张表 ≤ 500 行（重复倍数另由 `build.py --scale` 生成，用于增量与成本测试）。
+| 范围 | 当前工程测试 |
+| --- | --- |
+| 动态人员/组织词汇、属性和多对多实体边 | `test_dynamic_discovery.py` |
+| 目标修订、反例触发、无进展与重启 | `test_iteration_runtime.py` |
+| 独立语义复核、否定、条件、无统一编码推断 | `test_semantic_decisions.py` |
+| 完整规则代际、分区留存与旧 head 替换 | `test_rule_generations.py` |
+| 待发布全图、候选边界、归并撤销和依赖失效 | `test_graph_reconciliation.py` |
+| 图授权/来源/裁决、配置并发与工作台草稿 | `test_web_graph_review.py`、`test_web_config_revisions.py` 及前端组件测试 |
 
-F→夹具/装置与真值文件的对应表见 [US.md](US.md) §7.2 验收台账；`t13～t16` 覆盖跨表引用、多态与条件引用。真值文件的键格式、状态枚举与导出 schema 在 US §7.2 冻结，实现时以该 schema 校验。
+测试夹具只使用合成值。工程用例包含自身输入与断言，但还不能替代独立客户 Gold、真实模型发现质量、真实数据库及部署留存验收。台账中的 acceptance_status 保持 not_run，直到有相应固定输入、独立真值、执行命令和结果记录；不得从测试存在或通过自动推导场景完成。
 
-### 11.2 关键反例矩阵
+### 11.2 历史反例场景矩阵
+
+以下 t/d 编号仅保留旧场景的语义标签，不再表示仓库中的同名文件；实际输入和断言从验收台账定位。
 
 | 反例 | 夹具 | 期望行为 |
 | --- | --- | --- |
@@ -1685,7 +1666,7 @@ F→夹具/装置与真值文件的对应表见 [US.md](US.md) §7.2 验收台�
 
 ### 11.3 分开验收执行与自动发现
 
-夹具和脚本均为计划交付，文件名不表示已实现。保留US中的F01～F16编号，本节说明三道独立能力验收门：
+工程夹具和可执行命令见验收台账；独立 Gold、真实模型和真实数据库报告仍待补齐。保留 US 中的 F01～F16 编号，本节说明三道独立能力验收门：
 
 - **E：固定RuleSpec执行验收。** 人工提供小而明确的规则，验证联合DISTINCT、列组、宽层级、两类文档绑定、共享实体与属性支持、原子发布和撤回。此入口允许知道列映射，不能用于声称自动发现有效。
 - **D：自动发现验收。** 新运行只提供授权元数据、按需合成实例、目标和正常知识文档；禁止预载人工RuleSpec、expected_hypotheses、truth_*和由它们生成的提示。评测器在运行结束后才读取隐藏真值，比较生成规则及图结果。模拟模型响应只验协议，不计自动语义发现通过。
@@ -1705,7 +1686,7 @@ F→夹具/装置与真值文件的对应表见 [US.md](US.md) §7.2 验收台�
 
 数据保留检查用两组可区分标记：一组只出现在未选择源字段/样本中，所有落盘路径必须0命中；另一组是允许成为已验目标属性的值，只能在白名单图事实/支持中出现。不能把合法图结果也当作泄漏，或为整份原始响应设置放行例外。
 
-单测覆盖DSL与载荷严格校验、授权列/证据引用、SQL拒绝集、NULL语义、原始重复不造成引用歧义、缺层切段后压缩、局部键与共享身份、属性级撤回、完整分区原子发布、预算失败结算。集成集合包含t01～t18、Excel和两类Markdown；真实自动发现必须以D入口运行。
+单测覆盖DSL与载荷严格校验、授权列/证据引用、SQL拒绝集、NULL语义、原始重复不造成引用歧义、缺层切段后压缩、局部键与共享身份、属性级撤回、完整规则代际原子发布、预算失败结算。工程覆盖以验收台账中的真实测试为准；真实模型 D 评测必须另用独立 Gold，不用声明驱动的合成 D 代替。
 
 ## 12. (j) 与 route2 的复用/改造映射
 
@@ -1729,7 +1710,9 @@ F→夹具/装置与真值文件的对应表见 [US.md](US.md) §7.2 验收台�
 | 阶段版本与缓存键 | `stage_versions.py`（`STAGE_VERSIONS`）、`pipeline.py:79 _stage_cache_dir` | 阶段版本用于结构结果依赖；schema/规则/文档未变不证明数据未变，不能据此缓存原始探查结果 |
 | 测试资产 | `route2/tests/test_association_rules.py`、`test_association_budget_order.py`、`test_column_role_inference.py`、`test_dimension_members.py`、`test_discovery.py`、`test_profiling.py`、`test_metadata_graph.py`、`test_incremental.py`、`test_group_budget_publication.py`、`test_fact_schema_induction.py`、`test_declared_role_conflicts.py`、`test_formula_fragments.py` | 整套复用其断言风格（预算公平、结构角色冲突、负例拒绝）；新增 §11 夹具 |
 
-### 12.2 必须新写
+### 12.2 历史模块拆分计划
+
+下面保留 2026-10-17 的职责拆分；若路径未出现，不能据此判断能力未实现。当前代码已按 `contracts.py`、`discovery/`、`rules/`、`documents/`、`store/` 与 `runtime/iteration.py` 组织，以本轮实施记录定位。
 
 1. `contracts/hypothesis.py`：§3 DSL、状态机事件（无现成实现）。
 2. `query/`：Gauss 能力矩阵、SQL 模板编译器、AST 安全校验、只读事务管理、资源上限与取消（route2 基于 DuckDB 本地快照，不能直接用于源库）。
@@ -1754,30 +1737,31 @@ F→夹具/装置与真值文件的对应表见 [US.md](US.md) §7.2 验收台�
 
 ## 13. 附录 A：错误码
 
-本表是错误码与退出码的**唯一注册表**；SDD/US/README 只引用，不各写一套。
+本表保留早期错误分类，新增语义、迭代和归并码以源码与实施记录为准。CLI 退出码为 0（含 COMPLETED_WITH_GAPS）、2（PARTIAL）、1（失败）；早期 3/4/5 退出编码已经废止，不作为调用方契约。
 
-| 错误码 | 语义 | 处理 | 退出码 | 可重试 |
-| --- | --- | --- | --- | --- |
-| `sql_policy_rejected` | AST/策略拒绝 | 不执行，记报告 | 3 | 否（改规则后） |
-| `unsupported_dialect` | 能力矩阵不支持算子模板 | 降级或未决 | 3 | 否 |
-| `probe_not_allowed` / `probe_arg_invalid` | LLM 参数越界 | 拒绝该探查，不改假设 | 3 | 否 |
-| `probe_budget_exhausted` / `query_budget_exhausted` | 预算拒绝 | 转 DEFERRED | 4 | 是（续跑） |
-| `query_timeout` / `result_truncated` / `projection_truncated` | 超时/截断 | partial，不得据此升级证据 | 4 | 是（分区重跑） |
-| `memory_budget_exhausted` | 内存/批次上限 | 减小批次或失败，不 spill 落盘 | 4 | 是 |
-| `source_permission_denied` | 权限 | FAILED，报告 | 5 | 否 |
-| `schema_drift` | 目录与预期不符 | STALE / FAILED | 5 | 视情况 |
-| `hypothesis_schema_invalid` / `llm_schema_invalid` | 契约失败 | 拒绝，重试 ≤1 | 3 | 是（一次） |
-| `llm_citation_unresolved` | 引用悬空 | 拒绝该提案 | 3 | 是 |
-| `llm_revision_no_change` | 修订无变化 | UNRESOLVED | 0/2 | 否 |
-| `hierarchy_no_level_group` / `level_group_ambiguous` | 层级无法确认 | UNRESOLVED | 2 | 需新证据 |
-| `fill_mismatch` / `self_loop` / `hierarchy_self_loop` / `multiple_parent` / `hierarchy_cycle` / `gap_in_path` | 结构冲突 | 报告；受影响边不发布 | 2 | 视情况 |
-| `same_code_diff_label` / `same_label_diff_definition` / `cross_level_same_code` / `code_series_mismatch` / `level_count_conflict` / `code_format_conflict` / `schema_value_conflict` | 语义/编码/数据冲突 | 未决，需映射/文档/用户来源 | 2 | 需新来源 |
-| `identity_conflict` / `publish_conflict` | 身份或发布冲突 | 不覆盖，保留候选 | 2 | 视情况 |
-| `document_conflict` / `document_scope_conflict` | 文档冲突 | 双记录，不覆盖数据 | 0/2 | 否 |
-| `data_boundary_violation` | 敏感列/模型出域策略被违反 | 拒绝调用，中止相关任务 | 5 | 改配置后 |
-| `retention_policy_violation` | 检测到样本落盘 | 中止运行，报告 | 5 | 否（先修部署） |
-| `snapshot_unavailable` | 无一致读 | 结果标观察候选，禁止缺失撤回 | 2 | 是（换窗口） |
-| `unsupported_feature` | 能力/配置不支持 | 按报告中列出的缺口处理 | 3 | 否 |
+| 错误码 | 语义 | 处理 | 可重试 |
+| --- | --- | --- | --- |
+| `sql_policy_rejected` | AST/策略拒绝 | 不执行，记报告 | 否（改规则后） |
+| `unsupported_dialect` | 能力矩阵不支持算子模板 | 降级或未决 | 否 |
+| `probe_not_allowed` / `probe_arg_invalid` | LLM 参数越界 | 拒绝该探查，不改假设 | 否 |
+| `probe_budget_exhausted` / `query_budget_exhausted` | 预算拒绝 | 转 DEFERRED | 是（续跑） |
+| `query_timeout` / `result_truncated` / `projection_truncated` | 超时/截断 | partial，不得据此升级证据 | 是（完整代际重跑） |
+| `memory_budget_exhausted` | 内存/批次上限 | 减小批次或失败，不 spill 落盘 | 是 |
+| `source_permission_denied` | 权限 | FAILED，报告 | 否 |
+| `schema_drift` | 目录与预期不符 | STALE / FAILED | 视情况 |
+| `hypothesis_schema_invalid` / `llm_schema_invalid` | 契约失败 | 拒绝，重试 ≤1 | 是（一次） |
+| `llm_citation_unresolved` | 引用悬空 | 拒绝该提案 | 是 |
+| `llm_revision_no_change` | 修订无变化 | UNRESOLVED | 否 |
+| `hierarchy_no_level_group` / `level_group_ambiguous` | 层级无法确认 | UNRESOLVED | 需新证据 |
+| `fill_mismatch` / `self_loop` / `hierarchy_self_loop` / `multiple_parent` / `hierarchy_cycle` / `gap_in_path` | 结构冲突 | 报告；受影响边不发布 | 视情况 |
+| `same_code_diff_label` / `same_label_diff_definition` / `cross_level_same_code` / `code_series_mismatch` / `level_count_conflict` / `code_format_conflict` / `schema_value_conflict` | 语义/编码/数据冲突 | 未决，需映射/文档/用户来源 | 需新来源 |
+| `identity_conflict` / `publish_conflict` | 身份或发布冲突 | 不覆盖，保留候选 | 视情况 |
+| `document_conflict` / `document_scope_conflict` | 文档冲突 | 双记录，不覆盖数据 | 否 |
+| `data_boundary_violation` | 敏感列/模型出域策略被违反 | 拒绝调用，中止相关任务 | 改配置后 |
+| `retention_policy_violation` | 检测到样本落盘 | 中止运行，报告 | 否（先修部署） |
+| `snapshot_unavailable` | 无一致读 | 结果标观察候选，禁止缺失撤回 | 是（换窗口） |
+| `unsupported_feature` | 能力/配置不支持 | 按报告中列出的缺口处理 | 否 |
+
 
 ## 14. 附录 B：阈值初值汇总
 
@@ -1788,17 +1772,19 @@ F→夹具/装置与真值文件的对应表见 [US.md](US.md) §7.2 验收台�
 | 填充重复率相对阈值 | 尾层 repeat_rate ≥ 2× 前层且 ≥ 0.05 | E4 提示（非结论） |
 | 单值属性结构检查 | 完整声明范围内冲突0；NULL情况分列 | L3结构条件之一，无固定最小字典项数 |
 | 假设拒绝 | 明确反证或契约违反 | 不用样本比例推断全来源无规律 |
-| 修订轮次上限 | 设计 2 次（revision ≤3）；试点 1 次（revision ≤2） | UNRESOLVED 边界 |
+| 跨任务轮次上限 | max_discovery_rounds，默认 3，范围 1～8 | 不等同单 Agent 工具步数；耗尽标延期 |
 | 最大样本 | 32 行/表/轮；8 行反例/修订 | 上下文与保留 |
 | `distinct_projection` cap | 20,000（pilot）/200,000 | 截断与分区重跑 |
 | LLM 单次输入 | 64KB（含样本 ≤ 24KB） | 上下文预算 |
 | 优先级停止阈值 | 0.15 | 停止规则 1 |
 | 三振/边际规则 | 连续 3 probe 无变化；5 probe 无新验证 | 停止规则 2/3 |
-| 预算分配提示 | LLM验证40%、DB查询验证55%为试点初值 | 准入按资源向量预留，不要求实际消耗比例 |
+| 预算准入 | 取运行配置并预留必要检查 | 无固定探索/验证百分比；失败和重试也计费 |
 | 单查询超时 | 60s；整轮 30min | 资源 |
 | 敏感值过滤 | 沿用 `column_role_inference.py:40` 正则族 | 输入包构造 |
 
-## 15. 实施顺序（以实施计划W0～W6为准）
+## 15. 历史实施顺序（W0～W6）
+
+以下为早期拆分顺序，当前任务与剩余范围以本轮实施记录和 US 为准，不用于声明下列阶段尚未启动或已经全部完成。
 
 1. **S1 契约与安全（W0/W1）**：封闭Hypothesis载荷、RuleSpec、图事实/属性支持、关系注册表、存储白名单、SQL闸门与只读适配器。拒绝集和六路径保留检查先行。
 2. **S2 确定性算子（W2）**：先覆盖首条纵切需要的画像、FD、联合DISTINCT、path/level/reference算子；按资源向量实现准入/结算，补全部11个算子及能力缺失行为。

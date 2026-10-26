@@ -11,7 +11,7 @@ from .rules import RuleEngine
 from .metadata import publish_metadata
 from .runtime.retention import write_report,write_rules,atomic_text
 
-DISCOVERY_WORKFLOW_VERSION='agentscope_scoped_context/3'
+DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/4'
 
 # These failures mean the Agent never completed an interpretation. They are not
 # permission to retry within a turn; leave the table pending for a later run.
@@ -189,9 +189,9 @@ def _goal_violation(rule,goal,projected):
         return 'excluded_column_queried'
     if any(column_is_evidence_only(goal,rule.source,c) for c in projected):
         return 'evidence_only_column_projected'
-    if rule.identity.entity_kind not in goal.entity_kinds:return 'outside_extraction_goal'
-    if rule.relation and rule.relation.relation not in goal.relation_kinds:return 'outside_relation_goal'
-    if rule.kind in ('wide_hierarchy','long_hierarchy') and 'parent_of' not in goal.relation_kinds:return 'outside_relation_goal'
+    if goal.entity_kinds and rule.identity.entity_kind not in goal.entity_kinds:return 'outside_extraction_goal'
+    if goal.relation_kinds and rule.relation and rule.relation.relation not in goal.relation_kinds:return 'outside_relation_goal'
+    if goal.relation_kinds and rule.kind in ('wide_hierarchy','long_hierarchy') and 'parent_of' not in goal.relation_kinds:return 'outside_relation_goal'
     return None
 
 
@@ -255,18 +255,29 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         contexts={sid:{t.qualified_name:context_dependency_fingerprint(corpus,[t],config.goal)
                       for t in tables if t.source_id==sid and source_in_goal(config.goal,t)}
                   for sid in rules_by_source}
-        changed_contexts={}
+        from .runtime.iteration import IterationLedger, REVIEWABLE_CODES, rule_shape
+        from .contracts import SourceRef
+        ledger=IterationLedger(store,config.goal,config.scopes)
+        store.configure_goal(config.goal,ledger.goal_revision)
+        report.counts['goal_revision']=ledger.goal_revision
+        report.counts['feedback_rounds']=0
+        changed_contexts={};invalidating_contexts={}
         for sid in rules_by_source:
             marker=store.current_versions('discovery:'+sid)
             if marker:
                 old=_context_versions(marker)
                 changed_contexts[sid]={name for name,value in contexts[sid].items() if old.get(name)!=value}
+                # A missing completion entry can mean a data counterexample,
+                # not changed documentation. Keep that interpretation available
+                # for complete zero-model validation on the next run.
+                invalidating_contexts[sid]={name for name,value in contexts[sid].items()
+                    if name in old and old[name]!=value}
         affected_context_rules=set()
         def invalidate(rule_id, reason):
             affected_context_rules.update(store.invalidate_rule(rule_id,reason))
         if auto:
             for rule in old_rules:
-                if rule.source.schema_name+'.'+rule.source.table in changed_contexts.get(rule.source.source_id,set()):
+                if rule.source.schema_name+'.'+rule.source.table in invalidating_contexts.get(rule.source.source_id,set()):
                     invalidate(rule.rule_id,'applicable_documents_changed')
         # A changed objective makes the old interpretation stale even if the
         # model now returns no replacement. Keep history, never expose old facts
@@ -363,9 +374,13 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     store.current_versions('discovery-attempt:'+sid) or
                     not any(r.source.source_id==sid for r in allrules)):
                     need_discovery.add(sid)
-            for sid in need_discovery:
+            for sid in sorted(need_discovery):
                 selected=set(contexts[sid]) if config.rediscover else discovery_tables.get(sid,set(contexts[sid]))
+                if not config.rediscover:
+                    selected=selected-ledger.unresolved_tables(sid,contexts[sid])
                 discovery_tables[sid]=selected
+                if not selected:
+                    continue
                 # This is intent, not completion. It distinguishes a crashed
                 # automatic run from an existing manually supplied rule cache.
                 attempt=store.begin_publication('discovery-attempt:'+sid,1,'all',{
@@ -373,10 +388,17 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 prepared.append(attempt)
                 store.publish_partition(PartitionCompletion(publication_id=attempt,
                     complete=True,consistent=True,dependencies_valid=True))
+                work=[ledger.enqueue(SourceRef(source_id=sid,schema=t.schema_name,table=t.name),
+                    task='metadata_discovery',context_version=contexts[sid][t.qualified_name],force=True)
+                    for t in tables if t.source_id==sid and t.qualified_name in selected]
+                for item in work:ledger.transition(item,'running')
                 result=discover(rules_by_source[sid],config.goal,documents=corpus,model=model,
-                                table_refs=selected)
+                                table_refs=selected,iteration_context=ledger.context(work,allrules,iteration=0))
                 visited={u.source.schema_name+'.'+u.source.table for u in result.understandings}
                 discovery_completed[sid]=(visited & selected)-_deferred_tables(result,selected)
+                for item in work:
+                    name=item.source.schema_name+'.'+item.source.table
+                    ledger.transition(item,'resolved' if name in discovery_completed[sid] else 'deferred')
                 old={r.rule_id:r for r in _latest(store.get_rules(include_stale=True))}
                 for rule in result.rules:
                     if rule.rule_id in old:rule.revision=old[rule.rule_id].revision+1
@@ -389,7 +411,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             report.counts['reused_rules']=len([r for r in allrules if r.source.source_id not in need_discovery])
             report.validation['D']='model_run_unscored' if model and need_discovery else 'deterministic_or_reused_unscored'
         engine=RuleEngine(store,isolation_domain=config.isolation_domain,max_working_bytes=config.max_working_bytes,max_partitions=config.max_partitions)
-        prepared_rules=[];failed=set()
+        prepared_rules=[];failed=set();feedback={}
         allrules.sort(key=lambda r:r.kind=='reference')
         def execute(rule):
             code=None
@@ -401,6 +423,10 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             if code:
                 failed.add(rule.rule_id);report.rules_skipped.append(rule.rule_id)
                 report.issues.append({'rule_id':rule.rule_id,'code':code});return
+            previous=[r for r in prepared_rules if r.rule_id==rule.rule_id]
+            if previous:
+                _abort_staging(store,[p for p in prepared if store._publication(p)['logical_rule_id']==rule.rule_id])
+                prepared_rules[:]=[r for r in prepared_rules if r.rule_id!=rule.rule_id]
             outcome=engine.execute(adapter,rule,document_versions=document_versions,defer_publish=True)
             if outcome.prepared:
                 prepared.extend(outcome.publication_ids or [outcome.publication_id]);prepared_rules.append(rule)
@@ -411,10 +437,29 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 failed.add(rule.rule_id);report.rules_skipped.append(rule.rule_id)
                 discovery_completed.get(rule.source.source_id,set()).discard(
                     rule.source.schema_name+'.'+rule.source.table)
+                repair_codes=set(outcome.codes)&REVIEWABLE_CODES
+                if repair_codes:
+                    name=rule.source.schema_name+'.'+rule.source.table
+                    sid=rule.source.source_id
+                    need_discovery.add(sid)
+                    discovery_tables.setdefault(sid,set()).add(name)
+                    entry=feedback.setdefault((sid,name,rule.rule_id),{'rules':[],'codes':set(),'counts':{}})
+                    entry['rules'].append(rule);entry['codes'].update(repair_codes)
+                    if outcome.validation:
+                        for key in ('distinct_tuples','conflicts'):
+                            value=outcome.validation.checks.get(key,0)
+                            if type(value) is int:entry['counts'][key]=entry['counts'].get(key,0)+value
+                    # Keep the executable interpretation for zero-model rechecks,
+                    # but stop presenting its last publication as current truth.
+                    if auto:
+                        store.mark_rule_for_review(rule.rule_id,'data_pattern_requires_review')
+                        for head in store.heads():
+                            if head['valid'] and head['logical_rule_id'].startswith('document-alignment:'):
+                                store.invalidate_rule(head['logical_rule_id'],'business_requires_review')
             for code in outcome.codes:report.issues.append({'rule_id':rule.rule_id,'code':code})
         for rule in allrules:execute(rule)
         if auto and need_discovery:
-            for sid in need_discovery:
+            for sid in sorted(need_discovery):
                 endpoint_ids={r.rule_id for r in prepared_rules if r.kind!='reference'}
                 endpoints=[r for r in _latest(store.get_rules()) if r.rule_id in endpoint_ids]
                 result=discover_references(rules_by_source[sid],endpoints,documents=corpus,model=model,
@@ -426,7 +471,112 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 existing={r.rule_id:r for r in _latest(store.get_rules(include_stale=True))}
                 for rule in result.rules:
                     if rule.rule_id in existing:rule.revision=existing[rule.rule_id].revision+1
+                    allrules=[r for r in allrules if r.rule_id!=rule.rule_id]+[rule]
                     execute(rule)
+        def review_generation_constraints():
+            """Feed cross-rule conflicts back before a publication is attempted."""
+            pubs=[store._publication(p) for p in prepared if store._publication(p)['state'] in ('staging','ready')]
+            if not auto or not pubs:return
+            try:
+                store._validate_endpoints(store._prospective_publications(pubs))
+            except LightGraphError as exc:
+                if exc.code not in REVIEWABLE_CODES:return
+                topology=exc.code in ('hierarchy_cycle','hierarchy_self_loop','multiple_parent')
+                for rule in prepared_rules:
+                    if topology and rule.kind not in ('wide_hierarchy','long_hierarchy'):continue
+                    sid=rule.source.source_id;name=rule.source.schema_name+'.'+rule.source.table
+                    entry=feedback.setdefault((sid,name,rule.rule_id),{'rules':[],'codes':set(),'counts':{}})
+                    if rule.rule_id not in {r.rule_id for r in entry['rules']}:entry['rules'].append(rule)
+                    entry['codes'].add(exc.code)
+                    failed.add(rule.rule_id)
+                    need_discovery.add(sid);discovery_tables.setdefault(sid,set()).add(name)
+                    discovery_completed.get(sid,set()).discard(name)
+                    store.mark_rule_for_review(rule.rule_id,'graph_constraint_requires_review')
+                    report.issues.append({'rule_id':rule.rule_id,'code':exc.code})
+        review_generation_constraints()
+        # A new Agent task consumes structured state, never a persisted source
+        # transcript. Any revisit discards this attempt's staging and re-reads
+        # complete units; earlier snapshots are not spliced into a new generation.
+        rounds=0
+        while auto and feedback:
+            work=[]
+            for (sid,name,_),entry in sorted(feedback.items()):
+                item=ledger.enqueue(entry['rules'][0].source,codes=entry['codes'],
+                    rules=entry['rules'],context_version=contexts[sid][name],force=config.rediscover,
+                    observation_counts=entry.get('counts'))
+                if item.state in ('pending','deferred'):
+                    work.append((item,entry))
+            if not work:
+                break
+            if rounds>=config.max_discovery_rounds-1:
+                for item,_ in work:ledger.transition(item,'deferred')
+                report.issues.append({'code':'discovery_round_budget_exhausted','count':len(work)})
+                break
+            rounds+=1;report.counts['feedback_rounds']=rounds
+            _abort_staging(store,prepared)
+            prepared_rules.clear()
+            changed=False
+            for item,entry in work:
+                budget.check_time()
+                ledger.transition(item,'running')
+                sid=item.source.source_id;name=item.source.schema_name+'.'+item.source.table
+                references_only=all(r.kind=='reference' for r in entry['rules'])
+                affected_ids={r.rule_id for r in entry['rules']}
+                def in_review(rule):
+                    return rule.rule_id in affected_ids
+                prior=[r for r in allrules if in_review(r)]
+                context=ledger.context([item],allrules,iteration=rounds)
+                if references_only:
+                    endpoints=[r for r in _latest(store.get_rules()) if r.kind!='reference' and r.rule_id not in failed]
+                    result=discover_references(rules_by_source[sid],endpoints,documents=corpus,model=model,
+                        goal=config.goal,source_adapters=rules_by_source,table_refs={name},
+                        iteration_context=context,revision_rules=entry['rules'])
+                else:
+                    result=discover(rules_by_source[sid],config.goal,documents=corpus,model=model,
+                        table_refs={name},iteration_context=context,revision_rules=entry['rules'])
+                _issues(report,result.issues)
+                _write_understanding(output,result.understandings)
+                understandings.extend(result.understandings)
+                if _deferred_tables(result,{name}):
+                    ledger.transition(item,'deferred');continue
+                old_shapes={rule_shape(r) for r in prior}
+                if not result.rules or {rule_shape(r) for r in result.rules}==old_shapes:
+                    ledger.transition(item,'unresolved')
+                    report.issues.append({'code':'pattern_review_no_progress','table':name})
+                    continue
+                if not affected_ids & {r.rule_id for r in result.rules}:
+                    ledger.transition(item,'unresolved')
+                    report.issues.append({'code':'revision_rule_mapping_required','table':name})
+                    continue
+                existing={r.rule_id:r for r in _latest(store.get_rules(include_stale=True))}
+                for rule in result.rules:
+                    if rule.rule_id in existing:rule.revision=existing[rule.rule_id].revision+1
+                replacement_ids={r.rule_id for r in result.rules}
+                allrules=[r for r in allrules if r.rule_id not in replacement_ids]+result.rules
+                discovery_completed.setdefault(sid,set()).add(name)
+                report.counts['revised_rules']=report.counts.get('revised_rules',0)+len(result.rules)
+                changed=True
+            # Even an abstention interrupted this generation. Re-execute all
+            # dependency units before publishing any successful replacements.
+            failed.clear();feedback.clear()
+            report.rules_skipped=[]
+            before=len(report.issues)
+            for rule in sorted(allrules,key=lambda r:r.kind=='reference'):execute(rule)
+            review_generation_constraints()
+            failing_ids=set(failed)
+            report.issues=[issue for index,issue in enumerate(report.issues)
+                if not (index<before and issue.get('rule_id') not in failing_ids
+                        and issue.get('code') in REVIEWABLE_CODES)]
+            for item,_ in work:
+                if not any(rid in item.rule_revisions for _,_,rid in feedback):
+                    ledger.transition(item,'resolved')
+                elif item.state=='running':ledger.transition(item,'unresolved')
+            if not changed:
+                break
+        failed_tables={(r.source.source_id,r.source.schema_name,r.source.table) for r in allrules if r.rule_id in failed}
+        for rule in prepared_rules:
+            if (rule.source.source_id,rule.source.schema_name,rule.source.table) not in failed_tables:
+                ledger.resolve_table(rule.source)
         # One atomic visibility change for the current dependency set. If an old
         # dependent edge would dangle, the whole replacement remains unpublished.
         business_prepared=[p for p in prepared if store._publication(p)['state'] in ('staging','ready')]
@@ -440,7 +590,10 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                         replacement=store.begin_publication(head['logical_rule_id'],1,'all',{'refresh':report.run_id})
                         prepared.append(replacement);business_prepared.append(replacement)
                 budget.check_time()
-                store.publish_partitions([PartitionCompletion(publication_id=p,complete=True,consistent=True,dependencies_valid=True) for p in business_prepared])
+                from .identity.reconciliation import GenerationView
+                generation=GenerationView.capture(store,business_prepared,set(config.scopes),config.isolation_domain)
+                store.publish_partitions([PartitionCompletion(publication_id=p,complete=True,consistent=True,dependencies_valid=True)
+                    for p in business_prepared],expected_heads=generation.heads)
                 report.rules_published=[r.rule_id for r in prepared_rules]
                 publish_ok=True
             except LightGraphError as exc:
@@ -488,10 +641,21 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             budget.check_time()
             _publish_document_alignments(store,[d for d in documents if d.document_id not in config.removed_document_ids],config)
             _publish_alignments(store,tables,config,report)
+            from .identity.reconciliation import record_candidates
+            candidates=record_candidates(store,store.view(set(config.scopes),config.isolation_domain,
+                include_candidates=True,apply_resolutions=False),set(config.scopes),config.isolation_domain,
+                max_entities=config.max_reconciliation_entities,max_candidates=config.max_reconciliation_candidates)
+            report.counts.update({'reconciliation_'+key:value for key,value in candidates.items()})
+            from .identity.reconciliation import review_with_agent
+            reviewed,review_issues=review_with_agent(store,model,config.goal,corpus,
+                scopes=set(config.scopes),domain=config.isolation_domain,max_reviews=config.max_identity_reviews)
+            report.counts.update({'identity_'+key:value for key,value in reviewed.items()})
+            _issues(report,review_issues)
             export_graph(store,output,scopes=set(config.scopes),domain=config.isolation_domain)
         write_catalog(output,declared,semantic_catalog(declared,config.goal,understandings,
             _latest(store.get_rules()),documents,previous=previous_semantic))
         report.validation['incremental_mode']='complete_projection_reconciliation'
+        report.validation['iteration_mode']='bounded_pattern_feedback'
         if report.issues and report.status=='COMPLETED':
             partial_tokens=('budget','exhausted','timeout','truncated','unavailable','permission','incomplete','unverified','formula_cache_missing','execution_failed','dependency_rule_failed','too_large','model_http','model_response','model_transport')
             report.status='PARTIAL' if any(
@@ -506,6 +670,11 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         _abort_staging(store,prepared)
         report.status='FAILED';report.issues.append({'code':'internal_error'})
     finally:
+        if 'ledger' in locals():
+            # Pending work remains resumable after budget failures and interrupts.
+            for item in ledger.items():
+                if item.state=='running':ledger.transition(item,'deferred')
+            report.counts.update(ledger.counts())
         report.counts['elapsed_seconds']=round(time.monotonic()-started,3)
         report.counts['llm_calls']=model.usage['calls'] if model else 0
         report.counts['db_queries']=budget.snapshot()['queries'] if 'budget' in locals() else sum(a.stats.queries for a in adapters)

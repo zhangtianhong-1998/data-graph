@@ -1,0 +1,469 @@
+# This index records coverage; it is not a generated passing report.
+schema_version: 1
+updated: '2026-10-26'
+purpose: F 场景的工程覆盖索引与独立验收台账；测试存在不代表整个场景通过。
+path_base: repository_root
+baseline_commit: 66225ef3ee75278fd7d5e25700ddba11063b6d92
+allowed_acceptance_status:
+- not_run
+- partial
+- passed
+- failed
+execution_record_fields:
+- commit
+- input_revision
+- mode
+- command
+- report
+- executed_at
+- result
+- remaining_subcases
+evaluation_boundary:
+  E: 固定规则执行与失败恢复
+  D: 真实模型发现与独立 Gold；CLI verify 中不调用模型的声明驱动 D 只属工程实验
+  I: 实际数据库产品、版本、驱动与部署
+scenarios:
+- id: F01
+  title: 列组与角色
+  priority: P0
+  stories:
+  - US-07
+  - US-30
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_discovery_workflow.py::test_single_level_is_group_and_observations_do_not_expand_identity
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_workflow.py::test_single_level_is_group_and_observations_do_not_expand_identity
+  - nodeid: src/lightgraph/tests/test_rules_engine.py::test_fd_failure_never_registers_validated_rule
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_rules_engine.py::test_fd_failure_never_registers_validated_rule
+  - nodeid: src/lightgraph/tests/test_dynamic_discovery.py::test_agent_defines_people_organizations_and_materializes_many_to_many
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_dynamic_discovery.py::test_agent_defines_people_organizations_and_materializes_many_to_many
+  - nodeid: src/lightgraph/tests/test_semantic_schema.py::test_automatic_vocabulary_requires_definitions_and_does_not_admit_any_string
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_schema.py::test_automatic_vocabulary_requires_definitions_and_does_not_admit_any_string
+  independent_gold: null
+  remaining_subcases:
+  - 陌生业务与真实模型列组发现
+  - 无统一编号的对象识别
+  execution_records: []
+- id: F02
+  title: 宽表层级与跨角色身份
+  priority: P0
+  stories:
+  - US-09
+  - US-31
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_relative_hierarchy.py::test_relative_rows_share_but_keep_each_column_binding_and_position
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_relative_hierarchy.py::test_relative_rows_share_but_keep_each_column_binding_and_position
+  - nodeid: src/lightgraph/tests/test_relative_hierarchy.py::test_multiple_parent_is_contextual_and_dag_still_forbids_cycles
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_relative_hierarchy.py::test_multiple_parent_is_contextual_and_dag_still_forbids_cycles
+  - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_new_incident_relation_requires_review_before_old_merge_can_apply
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_new_incident_relation_requires_review_before_old_merge_can_apply
+  - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_merge_cannot_close_a_long_hierarchy_cycle
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_merge_cannot_close_a_long_hierarchy_cycle
+  independent_gold: null
+  remaining_subcases:
+  - 独立宽表/角色真值与真实模型修订质量
+  - 未注册业务新模式的识别覆盖
+  execution_records: []
+- id: F03
+  title: 事实重复与目标
+  priority: P0
+  stories:
+  - US-05
+  - US-08
+  - US-30
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_pipeline.py::test_full_execution_duplicates_hierarchy_references_and_retention
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_pipeline.py::test_full_execution_duplicates_hierarchy_references_and_retention
+  - nodeid: src/lightgraph/tests/test_extraction_goal.py::test_operator_goal_loads_without_table_or_field_mapping
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_extraction_goal.py::test_operator_goal_loads_without_table_or_field_mapping
+  - nodeid: src/lightgraph/tests/test_semantic_schema.py::test_goal_declared_type_and_typed_property_persist_and_reopen
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_schema.py::test_goal_declared_type_and_typed_property_persist_and_reopen
+  independent_gold: null
+  remaining_subcases:
+  - 陌生业务真实模型召回/误发现与独立 Gold
+  - 目标粒度及全量成本评估
+  execution_records: []
+- id: F04
+  title: 共享身份、冲突与权限
+  priority: P0
+  stories:
+  - US-13
+  - US-26
+  - US-32
+  - US-34
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_graph_store.py::test_shared_identity_properties_acl_search_and_withdrawal
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_store.py::test_shared_identity_properties_acl_search_and_withdrawal
+  - nodeid: src/lightgraph/tests/test_relative_hierarchy.py::test_migration_candidates_history_properties_and_remaining_source_support
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_relative_hierarchy.py::test_migration_candidates_history_properties_and_remaining_source_support
+  - nodeid: src/lightgraph/tests/test_semantic_decisions.py::test_negated_shared_definition_preserves_two_tenant_entities
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_decisions.py::test_negated_shared_definition_preserves_two_tenant_entities
+  - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_merge_preserves_parallel_relations_supports_history_and_revoke
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_merge_preserves_parallel_relations_supports_history_and_revoke
+  - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_scope_hidden_decision_cannot_change_public_identity_projection
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_scope_hidden_decision_cannot_change_public_identity_projection
+  - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_cluster_review_blocks_transitive_merge_and_explicit_cannot_link
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_cluster_review_blocks_transitive_merge_and_explicit_cannot_link
+  - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_agent_commit_cannot_replace_a_visible_human_same_decision
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_agent_commit_cannot_replace_a_visible_human_same_decision
+  independent_gold: null
+  remaining_subcases:
+  - 无统一编号真实语义归并质量
+  - 一般关系冲突裁决和完整影响预览
+  - 更大候选簇与权限组合覆盖
+  execution_records: []
+- id: F05
+  title: 物理关联与实体关系
+  priority: P0
+  stories:
+  - US-10
+  - US-33
+  - US-34
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_metadata_alignment.py::test_declared_composite_fk_is_accepted_separately_and_preserves_pairing
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_metadata_alignment.py::test_declared_composite_fk_is_accepted_separately_and_preserves_pairing
+  - nodeid: src/lightgraph/tests/test_catalog_context_pipeline.py::test_cross_source_agent_reference_is_verified_and_published
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_catalog_context_pipeline.py::test_cross_source_agent_reference_is_verified_and_published
+  - nodeid: src/lightgraph/tests/test_dynamic_discovery.py::test_agent_defines_people_organizations_and_materializes_many_to_many
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_dynamic_discovery.py::test_agent_defines_people_organizations_and_materializes_many_to_many
+  - nodeid: src/lightgraph/tests/test_semantic_decisions.py::test_agent_relation_proposal_is_refuted_by_independent_review
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_decisions.py::test_agent_relation_proposal_is_refuted_by_independent_review
+  independent_gold: null
+  remaining_subcases:
+  - 列组映射到实例关系的完整推导链
+  - 多对多与端点歧义分离
+  - 真实模型语义判断
+  execution_records: []
+- id: F06
+  title: 文档、目标上下文与主张
+  priority: P0
+  stories:
+  - US-15
+  - US-16
+  - US-29
+  - US-34
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_documents.py::test_analytical_modal_claim_and_conditions_preserved
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_documents.py::test_analytical_modal_claim_and_conditions_preserved
+  - nodeid: src/lightgraph/tests/test_call_context.py::test_agent_registers_dynamic_sections_for_final_evidence_and_next_task_starts_clean
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_call_context.py::test_agent_registers_dynamic_sections_for_final_evidence_and_next_task_starts_clean
+  - nodeid: src/lightgraph/tests/test_iteration_runtime.py::test_ledger_freezes_goal_and_recovers_interrupted_work
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_iteration_runtime.py::test_ledger_freezes_goal_and_recovers_interrupted_work
+  - nodeid: src/lightgraph/tests/test_semantic_decisions.py::test_revision_task_receives_goal_context_and_preserves_logical_rule
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_decisions.py::test_revision_task_receives_goal_context_and_preserves_logical_rule
+  - nodeid: src/lightgraph/tests/test_semantic_decisions.py::test_guidance_cannot_become_confirming_evidence_by_model_stance
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_decisions.py::test_guidance_cannot_become_confirming_evidence_by_model_stance
+  - nodeid: src/lightgraph/tests/test_semantic_decisions.py::test_metadata_only_reviewer_strips_transient_query_observations
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_decisions.py::test_metadata_only_reviewer_strips_transient_query_observations
+  independent_gold: null
+  remaining_subcases:
+  - 真实模型否定、条件与松散知识理解
+  - 完整迭代工作项可视化
+  execution_records: []
+- id: F07
+  title: 增量、修订与回滚
+  priority: P0
+  stories:
+  - US-18
+  - US-19
+  - US-23
+  - US-31
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_pipeline.py::test_incremental_repetition_stable_identity_and_fact_set
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_pipeline.py::test_incremental_repetition_stable_identity_and_fact_set
+  - nodeid: src/lightgraph/tests/test_pipeline.py::test_shared_alias_withdrawal_preserves_other_scope
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_pipeline.py::test_shared_alias_withdrawal_preserves_other_scope
+  - nodeid: src/lightgraph/tests/test_iteration_runtime.py::test_cached_data_counterexample_starts_new_agent_and_then_reuses
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_iteration_runtime.py::test_cached_data_counterexample_starts_new_agent_and_then_reuses
+  - nodeid: src/lightgraph/tests/test_iteration_runtime.py::test_unresolved_counterexample_does_not_repeat_same_agent_task
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_iteration_runtime.py::test_unresolved_counterexample_does_not_repeat_same_agent_task
+  - nodeid: src/lightgraph/tests/test_iteration_runtime.py::test_repairing_one_column_group_keeps_sibling_new_entities
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_iteration_runtime.py::test_repairing_one_column_group_keeps_sibling_new_entities
+  - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_upstream_withdrawal_deactivates_dependent_identity_without_rewriting_history
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_upstream_withdrawal_deactivates_dependent_identity_without_rewriting_history
+  independent_gold: null
+  remaining_subcases:
+  - 同错误类型/同计数但源值变化的新反例识别
+  - 真实源变更下的复核恢复与性能
+  execution_records: []
+- id: F08
+  title: 不完整读取与失败恢复
+  priority: P0
+  stories:
+  - US-17
+  - US-20
+  - US-31
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_rules_engine.py::test_later_partition_fd_failure_cannot_publish_earlier_partition
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_rules_engine.py::test_later_partition_fd_failure_cannot_publish_earlier_partition
+  - nodeid: src/lightgraph/tests/test_graph_store.py::test_crash_in_commit_keeps_old_head_and_watermark
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_store.py::test_crash_in_commit_keeps_old_head_and_watermark
+  - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_prospective_view_replaces_old_unit_without_early_publication
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_prospective_view_replaces_old_unit_without_early_publication
+  - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_agent_cannot_approve_a_generation_changed_during_review
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_agent_cannot_approve_a_generation_changed_during_review
+  - nodeid: src/lightgraph/tests/test_rule_generations.py::test_generation_detects_concurrent_change_to_another_partition
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_rule_generations.py::test_generation_detects_concurrent_change_to_another_partition
+  - nodeid: src/lightgraph/tests/test_rule_generations.py::test_generation_and_partition_of_same_rule_cannot_publish_together
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_rule_generations.py::test_generation_and_partition_of_same_rule_cannot_publish_together
+  independent_gold: null
+  remaining_subcases:
+  - 真实数据库/进程中断的一致性与部署恢复
+  - 跨来源同一时点保证不在当前实现范围
+  execution_records: []
+- id: F09
+  title: SQL 安全与拒绝路径
+  priority: P0
+  stories:
+  - US-03
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_guard_parser_retention.py::test_rejected_sql_never_enters_parser_logs
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_guard_parser_retention.py::test_rejected_sql_never_enters_parser_logs
+  independent_gold: null
+  remaining_subcases:
+  - 真实数据库与驱动拒绝集
+  - 工作台及部署日志全路径
+  execution_records: []
+- id: F10
+  title: 源数据不落盘与输出许可
+  priority: P0
+  stories:
+  - US-04
+  - US-25
+  - US-30
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_retention_lifecycle.py::test_source_success_excludes_canary_from_every_application_output
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_retention_lifecycle.py::test_source_success_excludes_canary_from_every_application_output
+  - nodeid: src/lightgraph/tests/test_retention_lifecycle.py::test_source_exception_body_is_never_reported_or_written
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_retention_lifecycle.py::test_source_exception_body_is_never_reported_or_written
+  - nodeid: src/lightgraph/tests/test_rule_generations.py::test_success_and_failure_records_never_persist_source_partition_hash
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_rule_generations.py::test_success_and_failure_records_never_persist_source_partition_hash
+  - nodeid: src/lightgraph/tests/test_rule_generations.py::test_legacy_audit_cli_is_read_only_and_does_not_echo_tokens
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_rule_generations.py::test_legacy_audit_cli_is_read_only_and_does_not_echo_tokens
+  - nodeid: src/lightgraph/tests/test_rule_generations.py::test_new_rule_export_does_not_copy_historical_source_partition_tokens
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_rule_generations.py::test_new_rule_export_does_not_copy_historical_source_partition_tokens
+  - nodeid: src/lightgraph/tests/test_semantic_schema.py::test_new_property_cannot_launder_a_restricted_source_column
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_schema.py::test_new_property_cannot_launder_a_restricted_source_column
+  - nodeid: src/lightgraph/tests/test_semantic_decisions.py::test_review_handoff_clears_captured_packets_and_nested_rows_on_every_exit
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_decisions.py::test_review_handoff_clears_captured_packets_and_nested_rows_on_every_exit
+  - nodeid: src/lightgraph/tests/test_iteration_runtime.py::test_excel_import_obeys_configured_working_memory
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_iteration_runtime.py::test_excel_import_obeys_configured_working_memory
+  independent_gold: null
+  remaining_subcases:
+  - 历史库值派生 token 的运维清理/重建
+  - 真实部署代理/模型/交换/转储留存验收
+  execution_records: []
+- id: F11
+  title: 方言、驱动与能力清单
+  priority: P0
+  stories:
+  - US-02
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_sources_gauss.py::test_unknown_runtime_capabilities_block_instance_rows
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_sources_gauss.py::test_unknown_runtime_capabilities_block_instance_rows
+  - nodeid: src/lightgraph/tests/test_sources_gauss.py::test_qualification_requires_exact_product_version_driver
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_sources_gauss.py::test_qualification_requires_exact_product_version_driver
+  - nodeid: src/lightgraph/tests/test_web_config_revisions.py::test_manifest_upload_validates_source_and_never_grants_runtime_verification
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_web_config_revisions.py::test_manifest_upload_validates_source_and_never_grants_runtime_verification
+  - nodeid: src/lightgraph/tests/test_web_config_revisions.py::test_capability_upload_accepts_real_versioned_driver_manifest
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_web_config_revisions.py::test_capability_upload_accepts_real_versioned_driver_manifest
+  independent_gold: null
+  remaining_subcases:
+  - 选定 Gauss/MySQL 产品版本真实 I 验收
+  - 真实环境能力清单生成、绑定与版本不匹配拒绝
+  execution_records: []
+- id: F12
+  title: 规模、成本与候选召回
+  priority: P0
+  stories:
+  - US-08
+  - US-22
+  - US-32
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_pipeline.py::test_small_budget_reports_partial_without_false_completion
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_pipeline.py::test_small_budget_reports_partial_without_false_completion
+  - nodeid: src/lightgraph/tests/test_metadata_alignment.py::test_bounded_generation_has_exact_deferred_counts_without_source_access
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_metadata_alignment.py::test_bounded_generation_has_exact_deferred_counts_without_source_access
+  - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_common_names_are_bounded_before_pair_generation
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_common_names_are_bounded_before_pair_generation
+  independent_gold: null
+  remaining_subcases:
+  - 大图有界候选召回率
+  - 高频值和大候选簇成本
+  - 真实模型与数据库成本
+  execution_records: []
+- id: F13
+  title: 元数据声明与解释
+  priority: P0
+  stories:
+  - US-06
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_catalog_context_pipeline.py::test_catalog_keeps_declaration_goal_revisions_and_never_observations
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_catalog_context_pipeline.py::test_catalog_keeps_declaration_goal_revisions_and_never_observations
+  - nodeid: src/lightgraph/tests/test_discovery_workflow.py::test_sample_disagreement_is_unresolved_not_silently_repaired
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_workflow.py::test_sample_disagreement_is_unresolved_not_silently_repaired
+  - nodeid: src/lightgraph/tests/test_semantic_decisions.py::test_semantic_review_allows_inference_without_explicit_statement_or_shared_code
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_decisions.py::test_semantic_review_allows_inference_without_explicit_statement_or_shared_code
+  - nodeid: src/lightgraph/tests/test_semantic_decisions.py::test_prose_never_promotes_overlap_to_accepted_relation
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_decisions.py::test_prose_never_promotes_overlap_to_accepted_relation
+  independent_gold: null
+  remaining_subcases:
+  - 独立 schema/值冲突真值
+  - 真实模型解释质量
+  execution_records: []
+- id: F14
+  title: 元数据图、实体图与支持展示
+  priority: P0
+  stories:
+  - US-14
+  - US-26
+  - US-33
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_web_metadata_views.py::test_csv_preview_ignores_unavailable_database_and_never_exports_cells
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_web_metadata_views.py::test_csv_preview_ignores_unavailable_database_and_never_exports_cells
+  - nodeid: src/lightgraph/tests/test_metadata_alignment.py::test_aligns_different_field_names_only_when_rules_share_type_and_role
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_metadata_alignment.py::test_aligns_different_field_names_only_when_rules_share_type_and_role
+  - nodeid: src/lightgraph/tests/test_web_graph_review.py::test_default_graph_excludes_candidates_and_details_authorize_each_support
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_web_graph_review.py::test_default_graph_excludes_candidates_and_details_authorize_each_support
+  - nodeid: src/lightgraph/tests/test_web_graph_review.py::test_identity_review_cas_mutability_and_revoke_preserve_original_evidence
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_web_graph_review.py::test_identity_review_cas_mutability_and_revoke_preserve_original_evidence
+  - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_agent_graph_review_uses_original_facts_and_does_not_repeat
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_agent_graph_review_uses_original_facts_and_does_not_repeat
+  independent_gold: null
+  remaining_subcases:
+  - 真实浏览器候选裁决与来源支持全链路
+  - 大图检索/分页与完整关系影响预览
+  execution_records: []
+- id: F15
+  title: 导出与互操作
+  priority: P0
+  stories:
+  - US-24
+  coverage_status: engineering_cases_present
+  acceptance_status: not_run
+  engineering_cases:
+  - nodeid: src/lightgraph/tests/test_pipeline.py::test_export_schema_and_repeat_bytes
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_pipeline.py::test_export_schema_and_repeat_bytes
+  - nodeid: src/lightgraph/tests/test_pipeline.py::test_export_import_roundtrip_preserves_graph_and_scope
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_pipeline.py::test_export_import_roundtrip_preserves_graph_and_scope
+  - nodeid: src/lightgraph/tests/test_semantic_schema.py::test_dynamic_schema_export_import_and_json_schema
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_schema.py::test_dynamic_schema_export_import_and_json_schema
+  - nodeid: src/lightgraph/tests/test_semantic_schema.py::test_failed_import_rolls_back_vocabulary_facts_and_publication
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_schema.py::test_failed_import_rolls_back_vocabulary_facts_and_publication
+  - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_merge_preserves_parallel_relations_supports_history_and_revoke
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_merge_preserves_parallel_relations_supports_history_and_revoke
+  independent_gold: null
+  remaining_subcases:
+  - 动态词汇与裁决结果的外部消费方兼容
+  - 历史发布/裁决审计的完整外部迁移契约
+  execution_records: []
+- id: F16
+  title: 可选 BI 补充
+  priority: P1
+  stories:
+  - US-28
+  coverage_status: not_implemented
+  acceptance_status: not_run
+  engineering_cases: []
+  independent_gold: null
+  remaining_subcases:
+  - BI 适配与候选质量对照
+  execution_records: []
+implementation_record: design/lightweight_graph/ITERATIVE_ENGINE_IMPLEMENTATION.md

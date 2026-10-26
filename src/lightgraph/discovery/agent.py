@@ -30,6 +30,18 @@ and probe IDs in final proposals. Newly retrieved documents are registered with
 their exact revision and scope; cite only issued document or probe IDs.
 Analytical guidance can suggest exploration but cannot confirm business semantics.
 A tool success is not business-semantic confirmation.
+Propose shared_definition identity_resolution only when the complete definition
+denotes the same object across the stated namespaces; matching labels or codes
+alone are insufficient. Hierarchy, sharing and relationship proposals undergo an
+independent semantic review of their scope, direction, conditions and counterevidence.
+No fixed phrase, universal identifier or explicit mapping sentence is required:
+you may infer a candidate from relevant metadata, probes and prior knowledge.
+When the goal entity_kinds or relation_kinds list is empty, discover relevant
+business vocabulary instead of restricting it to the initial templates. Include
+new entity, property and relationship definitions in semantic_schema. Reuse the
+issued project definitions; a name alone is not a definition. Property definitions
+must state scalar type and applicable entity kinds; relationship definitions must
+state endpoint kinds. This never grants access to excluded or evidence-only values.
 Preserve uncertainty, source scope and incomplete coverage. Output candidate rules,
 not confirmed claims. Stop when relevant structures are sufficiently supported or
 remaining uncertainty cannot be resolved within the available budget. When finished,
@@ -110,8 +122,41 @@ def _record_probe(packet: dict, result: dict, name: str) -> None:
     packet['probe_digest'].append({'probe_id':probe_id,'operator':name,'aggregates':safe})
 
 
+def _record_observation(packet: dict, result: dict, name: str) -> None:
+    """Keep a small tool page for independent review, only in this call's memory.
+
+    SQL and its parameters are omitted. Result aliases stay attached to the
+    issued probe, and a capped page can never claim full-source validation.
+    """
+    if name!='execute_readonly_sql' or result.get('status')!='ok':return
+    data=result.get('data',{}); columns=data.get('columns',[]); rows=data.get('rows',[])
+    if (not isinstance(columns,list) or not columns or len(columns)>32
+        or any(not isinstance(c,str) or len(c.encode())>200 for c in columns)
+        or len(set(columns))!=len(columns) or not isinstance(rows,list)):return
+    observations=packet.setdefault('tool_observations',[])
+    if len(observations)>=8:return
+    consumed=sum(len(canonical(row).encode()) for s in packet.get('strata_samples',[]) for row in s['rows'])
+    consumed+=sum(len(canonical(item).encode()) for item in observations)
+    observation={'probe_id':result['probe_id'],'columns':columns,'rows':[],
+        'truncated':bool(result.get('coverage',{}).get('truncated')),'full_source_validation':False}
+    for row in rows:
+        if (not isinstance(row,list) or len(row)!=len(columns)
+            or any(not isinstance(v,(str,int,float,bool,type(None)))
+                or isinstance(v,str) and len(v.encode())>200
+                or isinstance(v,float) and not math.isfinite(v) for v in row)):
+            observation['truncated']=True
+            continue
+        candidate={**observation,'rows':observation['rows']+[row]}
+        if len(observation['rows'])>=8 or consumed+len(canonical(candidate).encode())>24576:
+            observation['truncated']=True
+            break
+        observation['rows'].append(row)
+    if observation['rows'] and consumed+len(canonical(observation).encode())<=24576:
+        observations.append(observation)
+
+
 def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
-            max_tool_calls: int=16) -> ProposalBatch:
+            max_tool_calls: int=16, review_observations=None) -> ProposalBatch:
     """Run AgentScope ReActAgent with ephemeral memory and guarded Toolkit tools.
 
     The framework owns the reasoning/acting loop. Our adapters retain domain
@@ -120,6 +165,7 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
     import asyncio
     from .agentscope_runtime import run_agent
     from .llm import validate_proposal_references
+    from .observations import clear_observations
 
     checked={}
     seen=set()
@@ -127,14 +173,18 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
         if isinstance(max_steps,bool) or not 1<=max_steps<=32 or isinstance(max_tool_calls,bool) or not 1<=max_tool_calls<=64:
             raise LightGraphError('invalid_agent_limits')
         try:
-            checked=TaskPacket.model_validate(packet).model_dump(mode='json',by_alias=True)
+            transient={**packet,'tool_observations':review_observations.values()} if review_observations is not None else packet
+            checked=TaskPacket.model_validate(transient).model_dump(mode='json',by_alias=True)
         except (ValidationError,TypeError,ValueError):
             raise LightGraphError('model_packet_schema_invalid') from None
         if not client.allow_source_samples:
             checked['strata_samples']=[]
+            checked['tool_observations']=[]
         if callable(getattr(executor,'begin_context',None)):
             sources=checked.get('context_tables') or ([checked['scope']] if checked.get('scope') else [])
             executor.begin_context([SourceRef.model_validate(s) for s in sources])
+        if callable(getattr(executor,'reserve_probe_ids',None)):
+            executor.reserve_probe_ids([item['probe_id'] for item in checked['probe_digest']])
         system=AGENT_SYSTEM+'\n\n'+build_goal_instructions(checked.get('goal',{}))
         system+='\nCurrent stage: '+checked['task']+'\nSubtask: '+(checked.get('subtask') or STAGE_SUBTASKS[checked['task']])
 
@@ -155,10 +205,11 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
                 except Exception:
                     result={'status':'error','code':'tool_execution_failed','operator':name}
                 result=_visible_result(result,name,client.allow_source_samples)
-                _record_probe(checked,result,name)
             client.budget.check_deadline()
             if len(canonical(result).encode())>client.config.max_response_bytes:
                 return {'status':'error','code':'tool_response_too_large','operator':name}
+            _record_probe(checked,result,name)
+            if client.allow_source_samples:_record_observation(checked,result,name)
             return result
 
         # The pipeline and database connectors are synchronous. Keep query tools
@@ -176,8 +227,15 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
         client.budget.check_deadline()
         for key in ('probe_digest','document_snippets','document_refs','context_tables'):
             packet[key]=checked.get(key,[])
+        if review_observations is not None:
+            review_observations.replace(checked.pop('tool_observations',[]))
         return final
     finally:
+        # Never export sampled rows through the reusable caller packet, even
+        # after an exception. Only an explicitly owned review window can extend
+        # their lifetime beyond this Agent invocation.
+        packet.pop('tool_observations',None)
+        clear_observations(checked.get('tool_observations',[]))
         checked.clear()
         seen.clear()
         executor.close()

@@ -83,12 +83,14 @@ def packet_call_context(packet, stage, *, constraints=None, output_contract=None
         'table':table.get('name',table.get('table')),
         'columns':[column['name'] for column in table.get('columns',[])],
     } for table in packet.get('catalog',[])]
-    return assemble_call_context(goal=packet.get('goal'),stage=stage,
+    context=assemble_call_context(goal=packet.get('goal'),stage=stage,
         subtask=packet.get('subtask'),tables=tables,documents=docs,
         authorization_scope=authorization,
         observations=packet.get('strata_samples',[]),
         hypotheses=[packet['revision_candidate']] if packet.get('revision_candidate') else [],
         constraints=constraints,output_contract=output_contract)
+    context['iteration_context']=packet.get('iteration_context',{})
+    return context
 
 
 def initial_agent_prompt_bytes(packet, tool_specs):

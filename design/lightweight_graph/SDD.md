@@ -1,10 +1,22 @@
 # SDD：Gauss、Excel 与知识文档驱动的轻量图谱
 
-版本：1.0（2026-10-17）。状态：最终架构基线，待实现、待运行验收。本文冻结系统边界与契约；阈值和工时仍是试点初值。
+版本：1.1（2026-10-26）。本文保留架构约束，并按本轮代码更新动态词汇、语义复核、迭代任务和完整规则代际。工程实现与独立验收分别记录；不能把设计条目全部视为已完成。
 
 需求来源：客户新环境（Gauss 元数据 + 按需实例、Excel、Markdown 知识文档；只读 SQL；数据库返回数据不落盘；轻量图而非本体）以及 [README](README.md) 的核查结论。用户验收见 [US](US.md)，发现工作流的实现细节见 [DISCOVERY_WORKFLOW.md](DISCOVERY_WORKFLOW.md)，开发顺序与工时见 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)。
 
-本文的早期代码结论来自 `xiaomeng`、`route2` 两个项目的只读核查，旧代码行号以 2026-10-17 工作区为准。当前实现位于 `src/lightgraph/`；§13 和 §18 中注明的接口以源码契约及生成 Schema 为准，其余示意代码仍用于说明设计，不保证与实现逐行对应。本文是身份、图事实、关系注册表、保留策略和发布契约的唯一规范来源；发现任务与算子细节以 DISCOVERY_WORKFLOW 为准，需求验收以 US 为准。
+本文的早期代码结论来自 `xiaomeng`、`route2` 两个项目的只读核查，旧代码行号以 2026-10-17 工作区为准。当前实现位于 `src/lightgraph/`；§13 和 §18 中注明的接口以源码契约及生成 Schema 为准，其余示意代码仍用于说明设计，不保证与实现逐行对应。当前有效需求以 [US](US.md) 和用户确认的 [目标驱动迭代方案](GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md) 为准；本文与 DISCOVERY_WORKFLOW 细化安全、身份、图事实、发布和任务契约。可执行字段以 `contracts.py`、`semantic_schema.py` 及相关模块为准，早期示意 YAML 不替代运行契约。
+
+本轮实现位置与边界：
+
+| 契约 | 当前实现 | 仍需区分的边界 |
+| --- | --- | --- |
+| 目标驱动词汇 | `semantic_schema.py`、`SemanticSchema`、目标空类型列表及发现提案 | 受类型和输出许可校验；不是任意属性落盘通道 |
+| 结构与语义分离 | `discovery/semantics.py` 的独立 `semantic_review` | 模型判断经过命题/引用/反证/条件检查，仍不等于业务 Gold 验收 |
+| 跨 Agent 迭代 | `runtime/iteration.py`、`pipeline.py` | 有界模式反馈与任务恢复；不是无限自主调度或完整事件工作台 |
+| 查询分区与发布范围 | `rules/engine.py` 的完整规则代际、`partition_id=all` | 查询可分区，发布不能按源值或其哈希切分；无 CDC 精确增量承诺 |
+| 图审查与归并 | `GenerationView`、有界候选召回、版本化身份裁决 | 保留原事实/历史和多种合法关系；任意关系冲突裁决仍未完整实现 |
+
+本轮结果和剩余验收见 [迭代引擎实施记录](ITERATIVE_ENGINE_IMPLEMENTATION.md)。
 
 ## 1. 范围与设计决策
 
@@ -13,10 +25,10 @@
 构建可解释、可增量维护的轻量属性图。图中的内容分三层：
 
 1. **物理资产层**：数据库、schema、表、列、列组、上传文件/工作表；声明主键、外键、注释；表→列包含关系。
-2. **业务知识层**：指标、度量、维度、维度成员、报表项目、业务术语、分析概念、分析方法；实体之间的 `parent_of`、`member_of`、`uses_measure`、`analyzes`、`defined_by`、`verified_reference` 等关系；文档主张。
+2. **业务知识层**：由目标决定的实体、属性、业务关系和文档主张。指标、度量、维度是兼容模板；人员、组织等类别及关系可由 Agent 提出，经 `SemanticSchema` 登记后使用。
 3. **来源与规则层**：哪个列组产生哪个实体，哪条规则产生哪条边，来自哪个来源范围、哪次验证、覆盖哪些分区、何时失效。
 
-不要求 OWL 推理、完整类继承树、每个定义派生一个本体类型。`Metric`、`DimensionMember` 等是节点的类别标签，不是需要维护公理的类。类型含义不足时保留 `ReportItem` 或 `unknown`，不凭表名/字段名强制归类。
+不要求 OWL 推理、完整类继承树、每个定义派生一个本体类型。`Metric`、`DimensionMember` 等是节点的类别标签，不是需要维护公理的类。类型含义不足时保留候选或未决，不把陌生业务强制归入指标模板，也不凭表名/字段名直接确认新类型。
 
 第一阶段不抽取每条交易、订单或财务观测值。用户目标可以明确要求某些事实关系，但要单独声明粒度和规模预算。
 
@@ -102,7 +114,7 @@ flowchart TD
 
 ### 2.4 任务模型
 
-单进程 CLI/任务 runner 起步，支持中断续跑；不引入分布式调度。任务单位是“规则 × 分区”与“假设 × 探查”，不是源表全量。并发限制分两类：数据库连接并发（受客户库负载约束，初始 2）与模型并发（初始 2）。
+当前使用单进程调度与单一结果写入者。发现任务按目标修订、表、模式码和规则修订登记；单个 Agent 的工具循环结束后，执行反例可触发新的 Agent 任务。查询可在内存中分区，发布单元为逻辑规则的完整代际。中断恢复重查未完成代际，不恢复样本或最后行键；不承诺分布式调度或默认并发数。
 
 ## 3. 输入契约与数据保留
 
@@ -165,7 +177,7 @@ KnowledgeDocument:
 | 图节点、边、业务标签/编码、别名、定义（含受控候选） | 允许 | 必须属于抽取目标和输出契约；候选独立标记且不进入 accepted 视图，不能把整行塞进 properties |
 | 来源绑定、引用范围、支持关系 | 允许 | 只保存图结果所需的语义编码、范围、表列定位、规则引用 |
 | 抽取规则、数据说明、验证结论、文档主张 | 允许 | 只含模式、聚合结论、角色与冲突说明，不附样本 |
-| schema/规则/文档版本、逻辑分区检查点、发布 ID、聚合计数 | 允许 | 结果维护状态；不携带原始查询内容或逐行投影 |
+| schema/规则/文档版本、完整代际状态、发布 ID、聚合计数 | 允许 | 结果维护状态；不携带原始查询内容或逐行投影 |
 | 原始上传的 Excel/Markdown | 输入管理 | 留在客户授权上传区，按输入保留策略管理；不是结果缓存 |
 
 “允许保存的图属性”与“原始结果集”必须分类型：`EphemeralBatch` 不提供序列化/落盘接口；持久化入口只接受 `GraphFact`、`RuleSpec`、`DataUnderstanding`、`DocumentClaim`、`ValidationRecord`、`RunBatch` 等类型。
@@ -322,8 +334,8 @@ purpose: 构建经营分析所需的指标、度量和维度图谱
 include: [指标定义与计算依赖, 维度成员与上下级关系]
 exclude: [每笔交易记录, 具体业务观测值]
 discovery_guidance: [根据证据判断列组, 规则验证后对关键列去重]
-entity_kinds: [Metric, Measure, Dimension, DimensionMember, ReportItem, BusinessConcept]
-relation_kinds: [parent_of, member_of, uses_measure, verified_reference]
+entity_kinds: []                         # 空列表：按目标发现；非空：限制到指定类型
+relation_kinds: []                       # 新词汇须有 SemanticSchema 定义
 source_scope: []                         # 可选：表、schema 或来源范围
 excluded_columns: []                     # 可选：禁止查询的列
 evidence_only_columns: []                # 可选：可探查但不输出值的列
@@ -331,6 +343,8 @@ observation_values: false
 ```
 
 目标在首次发现调用前进入 Agent 的系统上下文，并贯穿探查、规则生成和输出校验。文字字段表达业务方向，类型、来源和列范围由程序检查。目标不能扩张连接器权限；来源中的元数据、样本与 Markdown 仍是待核查证据。数字列的元数据可以表示指标定义，排除观测值不能直接排除所有数值列。每个候选列区分输出用途、仅辅助理解或本次无关。系统自动产生映射规则，规则要可读、可验证、可撤销；用户已有映射也仍须验证。
+
+CLI/一般配置省略类型列表及工作台新项目都默认自动词汇；显式提供的非空类型列表仍是约束，已有配置不会被静默改写。`SemanticSchema` 定义实体类别、属性值类型/所属类别/多值性、关系两端类别。定义可由用户配置或 Agent 提案提供，程序检查冲突与范围；词汇登记不会授予源列访问或保存观测值的权限。
 
 目标全部字段参与发现依赖摘要；变更后重新发现，不复用上一目标的规则为当前目标提供覆盖证明。知识文档、数据库预算与模型预算在运行配置的对应字段提供，不混入目标权限。2026-10-19 的工具循环、配置与边界见 [发现 Agent 更新](AGENT_DISCOVERY_UPDATE.md)。
 
@@ -365,7 +379,7 @@ observation_values: false
 
 ### 6.1 角色与状态机
 
-工作流由程序调度器、五类 LLM 任务（T1 表内发现、T2 跨表发现、T3 层级发现、T4 文档解释、T5 反例修订）、一个确定性验证器组成。不是一个多 Agent 聊天系统，也不是逐表一次大 prompt。
+工作流区分三层：单个 Agent 的受控工具循环；任务之间的 `IterationLedger`；执行与发布后的图级复核。T0/T1/T2/T3/T4/T5 表示发现职责，`semantic_review` 是独立命题复核调用。执行反例进入 `review_pattern`，新 Agent 重新获得全局目标、相关文档、已验规则映射和无值计数，不继承上一任务的原始对话或样本。
 
 状态机：`DISCOVERED → SCOPED → PROFILED → HYPOTHESIS_PROPOSED → PROBING → SUPPORTED | COUNTEREXAMPLE_FOUND → REVISED → RULE_VALIDATED → CANARY_CHECKED → PUBLISHED`，旁路 `UNRESOLVED / REJECTED / DEFERRED / STALE / FAILED`。完整转移、守卫与持久化见 [DISCOVERY_WORKFLOW.md](DISCOVERY_WORKFLOW.md) §5。
 
@@ -373,11 +387,11 @@ observation_values: false
 
 假设按六类组织：`column_group`、`entity_key`、`wide_hierarchy`、`reference`、`discriminator`、`exclusion`。每个假设带：目标表列、结构化 claim、证据等级（L0 声明 → L1 观察 → L2 抽样 → L3 全范围核验 → L4 发布）、支持与反例计数、修订链、预算消耗、指纹。
 
-验证通过的假设编译为 RuleSpec（见 §9.3 与 [DISCOVERY_WORKFLOW.md](DISCOVERY_WORKFLOW.md) §8）。没有 `validation_ref` 的假设不能生成 RuleSpec。
+验证通过的假设编译为 RuleSpec（见 §9.3 与 [DISCOVERY_WORKFLOW.md](DISCOVERY_WORKFLOW.md) §8）。没有有效结构验证的提案不能发布；发现产生的层级、引用和共享身份语义还需结构化 `semantic_decision`、`semantic_status`、条件与已读上下文记录。`semantic_basis` 非空不能单独充当接受条件。
 
 ### 6.3 预算与优先级
 
-三套池：DB 成本、LLM 调用与 token、时间/内存，分开记账，不折算成同一个百分比。启动新假设前，先估算并预留其**最低验证成本**；剩余预算覆盖不了预留时，不启动新假设，转入核验或标记 `DEFERRED`。40%（LLM）/55%（DB）只是试点初值与兜底红线，不是客户数据标定过的保证。
+三套池：DB 成本、LLM 调用与 token、时间/内存，分开记账，不折算成同一个百分比。启动新假设前，先估算并预留其**最低验证成本**；剩余预算覆盖不了预留时，不启动新假设，转入核验或标记 `DEFERRED`。具体限额取运行配置；旧方案中的 40%/55% 比例和固定两轮不再作为当前约束。跨任务轮数由 `max_discovery_rounds` 限制，并与单 Agent 的工具步数、模型调用预算分开。
 
 优先级 = 目标收益 × 信息增益 × 覆盖收益 ÷ 成本；模型自评置信度只用于排序，不作为接受门槛。预算耗尽进入 `DEFERRED` 并带续跑提示，报告 `PARTIAL`。预算公式、成本模型与停止规则见 [DISCOVERY_WORKFLOW.md](DISCOVERY_WORKFLOW.md) §6。
 
@@ -386,16 +400,16 @@ observation_values: false
 | 决策/动作 | 谁做 |
 | --- | --- |
 | 列组、语义角色、实体类别、文档解释 | LLM 提议，程序校验 |
-| 层级列组分类、方向、填充判定 | 程序（列名模式 + 父子一致性 + 填充统计） |
+| 层级列组分类、方向、填充语义 | Agent/适用定义提出并独立复核；程序检查结构与覆盖 |
 | 连续重复压缩、父子边、去重、环/自环检测 | 程序 |
 | FD、值域、引用覆盖、联合 DISTINCT | 程序 |
-| 编码映射、业务口径、冲突消解 | 只有映射表/文档/用户确认；模型只能提“疑似” |
+| 编码映射、业务口径、冲突消解 | Agent 可结合元数据、查询和松散知识推断；命题复核及程序守卫通过后才接受，不要求统一编号或显式映射表 |
 | 发布图事实 | 程序单一写入者 |
 | 增量复用 | 程序按规则/结构/文档契约指纹 |
 
-### 6.5 人工提示（P1）
+### 6.5 人工提示与候选裁决（P0）
 
-用户可对未决项录入提示或裁决，附来源。提示作为 `created_by=user` 的假设进入流程，仍需数据验证；裁决作为有来源的映射，可消解冲突。人工输入可追溯、可撤回，不覆盖自动证据。没有人工输入时系统必须能完成首版（P0 优先级）范围。
+用户可对未决项录入提示或裁决，附来源。提示作为 `created_by=user` 的假设进入流程，仍需数据验证；裁决作为有来源的映射，可消解冲突。人工输入可追溯、可撤回，不覆盖原事实。工作台已有身份候选裁决；自动模式可对有充分依据的有界身份候选复核，但不能替用户覆盖已有人工裁决。缺证据允许未决，不能为了“自动完成”强制归并。
 
 ## 7. 列组、身份与投影
 
@@ -405,7 +419,7 @@ observation_values: false
 
 同一列在不同规则中可有不同作用。例如租户用于本地编码查找和引用授权，但经确认共享的指标不把租户放进全局语义身份；日期用于观测值过滤时可以忽略，用于定义版本时需要保留。
 
-确定性规则（可复用 route2 的 `column_roles.py:245-310` 思路）：敏感/排除优先；全空列；审计时间/审计元数据；技术标识；语义名/注释线索；未知。模型只提议 `in_identity`、`multi_value`、`display_order` 等，程序按列存在、FD 冲突、值形态复核。
+程序首先执行授权与排除规则；名称、类型、注释和统计只用于产生候选。Agent 可提出列组、角色、类型和类型化属性映射，程序检查列存在、FD、值类型、目标许可与语义依据。早期 route2 列角色启发式仅作参考，不作为业务含义的确定性判据。
 
 ### 7.2 三层身份
 
@@ -441,7 +455,7 @@ observation_values: false
 
 禁止先对每列单独 DISTINCT，再把集合相乘；必须对已存在的端点元组联合去重。也不能把所有实体属性都放进每个关系投影，否则无关变化会扩大关系数量。
 
-截断保护：投影结果超过 `cap`（试点 20,000，客户环境可到 200,000）时返回 `projection_truncated`，按作用域分区（租户/分类体系/时间分区）重跑；不允许把部分结果当全量。报告区分源库扫描行数、不同元组数、接收行数、最终图事实数；`DISTINCT` 可能扫描全表，不承诺成本与结果数量成正比。
+截断保护：投影结果超过 `cap`（试点 20,000，客户环境可到 200,000）时返回 `projection_truncated`，可用内存查询分区降低单次返回量，但必须在一致范围内完成整条规则的投影后发布；无法完成则延期，不把部分结果当完整代际。报告区分源库扫描行数、不同元组数、接收行数、最终图事实数；`DISTINCT` 可能扫描全表，不承诺成本与结果数量成正比。
 
 ### 7.5 共享实体与权限
 
@@ -486,7 +500,7 @@ SQL 负责投影、过滤与统计；程序在受限投影上压缩路径、查�
 | `fill_mismatch` | 重复形态与填充策略矛盾 | 关闭压缩，重新验证 |
 | `code_format_conflict` | 同层编码格式不统一 | 报告；不做隐式规范化 |
 
-编码重映射（如 `2→28`、`24→2408`）必须另有来源：映射表、数据说明文档、用户确认。模型只能提“疑似映射”并标 `mapping_source=model_hypothesis`，进入未决队列，不进入已发布边或实体编码。
+编码差异（如 `2→28`、`24→2408`）不能靠格式猜测改写。Agent 可结合授权查询、元数据和松散知识提出对应解释；独立语义复核与身份/图约束通过后才接受。缺少依据时保留候选，不要求统一编号或预先提供映射表。
 
 ### 8.4 样例边界
 
@@ -534,7 +548,9 @@ class Cursor(Protocol):
     def restart_partition(self, partition_ref: str) -> "Cursor": ...
 ```
 
-**分区与游标契约**：`enumerate_partitions(table, partition_by)` 通过元数据/字典表/时间范围枚举分区，记录分区键与行数估计；无法枚举时返回单分区并标 `partition_unknown`。无稳定键的表使用服务端游标；只能 `OFFSET` 时限制偏移上限，超出则要求按分区重跑。持久检查点只含规则、逻辑分区引用、已发布批次和完成状态。最后一行的业务键、样本或逐行哈希不能放进 token；稳定键分页位置只留内存，进程重启重查未完成分区。分区键若是允许保存的引用范围，存其 scope_ref；其余键通过授权来源重新枚举。
+**分区与游标契约**：`scope.partition_by` 只规划内存中的查询条件。分区值、最后键、键范围和它们的哈希都不进入 validation、publication、support、head、导出或检查点。当前执行器在同一来源快照内枚举并处理全部查询分区，统一使用常量 `all` 发布完整逻辑规则代际，记录分区总数等无值计数。失败或进程恢复时重新枚举并重查整个规则范围；无法保持原快照时不能从“剩余分区”拼接旧数据。业务授权 scope 与查询分区是不同概念。
+
+旧结果库可能已保存值派生 token；新代码不会继续复制它们。留存审计只报告数量/状态，不回显 token；历史库清理或重建需按运维流程另行完成，不能把一次新发布称作历史留存已清除。
 
 ### 9.2 算子目录
 
@@ -552,7 +568,7 @@ class Cursor(Protocol):
 | `level_probe` | 层级方向/排序列 | 每层基数、跨层同码、排序判别 | 是 |
 | `unpivot_probe` | 宽转长候选 | 槽位数、节点候选计数、截断 | 是 |
 | `compare_attribute_role` | 跨表属性角色 | 值交集、角色对齐计数、单位冲突计数 | 是 |
-| `enumerate_partitions` | 分区枚举 | 分区键、边界、行数估计 | 否（程序） |
+| `enumerate_partitions` | 查询分区枚举 | 条件仅内存；持久化只留总数等安全计数 | 否（程序） |
 | `estimate_plan` | 查询计划/成本 | 估算行数（不含数据） | 否 |
 | `emit_entity/emit_relation` | 图事实发出 | 变更计数 | 否 |
 | `reconcile_supports` | 支持对账 | 增删计数 | 否 |
@@ -570,12 +586,14 @@ class Cursor(Protocol):
 | `unpivot_levels` | 层级路径 → 槽位 | 固定层数、列白名单 |
 | `compress_paths` | 槽位路径 → 压缩路径 | 只压连续同身份；冲突输出 |
 | `validate_nodes` | 图事实批次 → 校验结果 | 唯一性、悬空端点、环、自环 |
-| `reconcile_supports` | 完成分区 → 支持增删 | 仅签发完成记录后撤回 |
+| `reconcile_supports` | 完整规则代际 → 支持增删 | 全部查询分区完成、依赖集合验证和 CAS 通过后撤回 |
 | `canary_check` | 暂存图事实批次 → 校验结论 | 不改变当前视图；未通过则丢弃暂存 |
 
-每个执行态算子的 `args`/`output` schema 与探查算子一样冻结在 `contracts/operators/*.json`；新增算子必须先注册并补拒绝样例。
+上表按职责说明算子；实际字段和允许值由 `contracts.py`、`rules/compiler.py` 与工具注册表校验。仓库未采用旧设计中的 `contracts/operators/*.json` 文件树，新增执行能力仍需补契约和拒绝样例。
 
 ### 9.3 RuleSpec
+
+以下 YAML 是早期字段关系示意，包含尚未采用的算子 DAG 字段，不是可直接加载的配置。当前可执行规则以 `contracts.RuleSpec` 和导出的 `rules.yaml` 为准；动态定义由 `semantic_schema` 携带。
 
 ```yaml
 rule_id: rule_report_item_l2_registry
@@ -610,7 +628,7 @@ operators:
   - {op: project_attributes, args: {from: entity_rows, single_valued: {label: report_item_l2_cn_name}}, output: properties}
   - {op: emit_alias, args: {from: entity_rows, alias: report_item_l2_en_name}, output: aliases}
 validation_ref: validation_0007
-coverage: {scope: full, partitions: [t1, t2, t3], rows_scanned: 118422, entities: 2150}
+coverage: {scope: full, partitions: [all], rows_scanned: 118422, entities: 2150}
 evidence: {hypothesis: h_2b93c07a1f5d4e88, document: [doc_001#2.1], probe_refs: [probe_8812]}
 budget: {max_db_cu: 40, max_rows_returned: 220000, max_seconds: 120}
 publish: {mode: staged, target: graph, idempotent: true}
@@ -671,9 +689,9 @@ W0 将此判别联合生成严格 JSON Schema；这里的表是规范，不能�
 
 1. 校验规则字段与算子能力；缺失能力返回 `unsupported_dialect`，不降级为“试试看”。
 2. 把受限谓词树编译为参数化 SQL 片段，与模板合并；生成只含绑定参数与目录签发标识符的 SQL；AST 校验；成本估算；超预算延期。
-3. 按分区执行：稳定排序 + 键集分页或服务端游标；每批最多 5,000 行且 65,536 字节，先到任一上限即分批；单行超限则显式拒绝或调整已批准预算，不截断身份/名称后发布。
-4. 每批写 `RunBatch`（规则版本、逻辑分区、batch 序号、seen 计数、白名单事实摘要）；没有原始行或键值指纹。
-5. 完整分区完成后才签发完成记录；失败/超时/截断不签发，不触发撤回。
+3. 在一致快照内处理全部查询分区：稳定排序 + 键集分页或服务端游标；每批最多 5,000 行且 65,536 字节，先到任一上限即分批；单行超限则显式拒绝或调整已批准预算，不截断身份/名称后发布。
+4. 每批只暂存允许输出的图事实与支持；规则执行报告记录安全计数。旧 `RunBatch` 是设计名称，不要求另写逐批账本。没有原始行、分区键或键值指纹。
+5. 全部查询分区完成后才签发 `all` 代际完成记录；失败/超时/截断不发布新代际、不按缺失撤回。已确定违反规则的旧当前结果标为待复核，保留历史。
 6. 发布顺序：节点 → 属性/别名 → 边；悬空端点进 pending，不发布。
 
 关系规则示例：`SELECT DISTINCT 源身份..., 目标身份... FROM source JOIN target_keys ON 条件 WHERE scope`。复合作用域整体比较；多态引用按判别列分区；值重合只产生 `value_overlap`，不产生确认引用。
@@ -752,7 +770,7 @@ GraphNode:
 GraphEdge:
   id: edge_stable_id
   source: parent_entity_id
-  relation: parent_of             # enum 唯一来自 §11.1.1；不在此重复维护
+  relation: parent_of             # 内置语义，或经 SemanticSchema 校验的项目关系
   target: entity_stable_id
   qualifiers: {taxonomy: report_items, valid_period: null} # 语义限定，不是 ACL scope
   status: accepted | candidate | unresolved | deprecated
@@ -764,7 +782,7 @@ GraphSupport:
   origin: catalog | database_rule | document_claim | user_input
   source_binding: binding_1
   scope_ref: authorized_business_scope
-  partition_id: partition_1
+  partition_id: all                # 当前规则完整代际；不是源值派生 token
   rule_id: report_item_registry
   rule_revision: 2
   validation_ref: validation_1
@@ -773,13 +791,13 @@ GraphSupport:
   last_seen_publication: publication_3 # 便于展示，真值由 publication_support 成员关系决定
 ```
 
-**种类与分层注册表**：business = Metric、Measure、Dimension、DimensionMember、ReportItem、AnalysisMethod、AnalysisQuestion、BusinessConcept；metadata = Database、Schema、Table、Column、ColumnGroup、SemanticSlot、Workbook、Worksheet；provenance = Document、DocumentSection、Rule、GraphFact。GraphFact 是支持查询中的事实定位对象，不再次生成业务实体；Rule 的 ID 包含修订，DocumentSection 的 ID 包含文档修订。未知业务语义使用 candidate/unresolved 的 BusinessConcept，不凭表名制造新种类。
+**内置分层与项目词汇**：Metric、Measure、Dimension 等是兼容业务词汇；metadata/provenance 保留受控基础类型。项目可用 `SemanticSchema.entity_types/properties/relations` 声明新业务类型，属性需有值类型、适用实体及多值性，关系需声明端点类型；不允许将 raw_rows、samples、prompt 等原始载荷包装成属性。GraphFact 是事实定位对象，不再次生成业务实体。未知业务含义保持候选/未决。
 
 GraphSupport 也是按 publication_id 读取的支持视图：逻辑支持身份在 fact_support，验证引用、文档修订、binding_revision、状态等在 publication_support 中不可变地保存；不能覆盖旧发布的出处。GraphNode/GraphEdge 是查询用聚合视图。底层支持账本按图事实细分：`NodeExistence`、`PropertyValue`、`Edge`、`DocumentClaim`。标签、英文名、别名、定义、业务编码等每个属性值分别关联支持。多值属性保持多值；单值属性冲突进入版本或未决策略。先按当前有效支持和调用者权限筛事实，再生成 label、aliases、properties 和状态；禁止先读取全局合并属性再遮盖来源。状态由可见 publication_support 的版本化状态计算，A 的 accepted 支持不能把 B 只有 candidate 的知识提升为 accepted。
 
-#### 11.1.1 关系类型注册表（唯一来源）
+#### 11.1.1 内置关系与项目扩展
 
-各规范文档引用同一张表；新增关系必须先在这里注册，不允许各模块自造名称。
+下表解释内置关系；实际固定词汇在输出策略中，项目业务关系可通过 `SemanticSchema` 扩展，不必修改本表或硬编码分支。动态关系仍检查端点类型、目标范围、语义依据与图约束。
 
 | 关系 | 源 → 目标 | 最小证据 | 允许状态 | 判定与拒绝 |
 | --- | --- | --- | --- | --- |
@@ -794,7 +812,7 @@ GraphSupport 也是按 publication_id 读取的支持视图：逻辑支持身份
 | `same_attribute_role` | Column ↔ Column | 两侧列组角色均验证 + 可选值域相容 | candidate/accepted | 角色相同不等于可 JOIN、不等于同一实体 |
 | `verified_reference` | Column → Column（可复合） | 源键包含 + 唯一定位率 + 作用域 + 条件覆盖 + 反例 | accepted | 无条件全连接、缺作用域、歧义/缺目标不升级 |
 | `maps_to_concept` | ColumnGroup/Column → BusinessConcept | 规则 + 文档/术语证据 | candidate/accepted | 仅名称相似不升级；冲突保留未决 |
-| `same_entity` | Entity ↔ Entity | 相容定义 + 独立同一性证据 + 允许共享范围 | candidate/accepted | 只有名称/空属性不够；accepted 后迁移绑定至规范 ID，历史重定向仅供溯源 |
+| `same_entity` | Entity ↔ Entity | 相容定义 + 独立同一性证据 + 允许共享范围 | candidate/accepted | 只有名称/空属性不够；当前视图按有效版本化裁决投影到规范 ID；原事实、来源绑定及历史发布保留 |
 | `parent_of` | Entity → Entity | 层级规则验证通过 | accepted | 缺层/多父/环按 SDD §8.3 处理 |
 | `member_of` | DimensionMember → Dimension | 成员规则验证 | accepted | 无维度证据不建 |
 | `uses_measure` | Metric → Measure | 公式/依赖 AST 有出处 | accepted | 解析不完整标 partial |
@@ -810,7 +828,7 @@ GraphSupport 也是按 publication_id 读取的支持视图：逻辑支持身份
 
 **六类跨表结论的分工**（对应 US-10）：`declared_fk` 是声明；`value_overlap` 是观察；`same_attribute_role` 是角色对齐；`verified_reference` 是可执行的引用；`maps_to_concept` 是概念映射；`same_entity` 是身份合并。前四类都不能单独推出第五、六类。
 
-- `same_entity` 判定：两侧实体都由已验证规则产生；结构签名（label、定义、单位、公式、口径、粒度）相容；还需已验证定义登记、显式映射或文档同一性证据；作用范围允许共享；无强定义冲突。只有名称或编码相同、或值域重叠时保持 candidate，不合并。
+- `same_entity` 判定：两侧实体都由已验证规则产生；结构签名（label、定义、单位、公式、口径、粒度）相容；还需独立语义判断或用户裁决，其依据可以来自文档、结构映射及已授权数据/图事实，不要求统一编码；作用范围允许共享；无强定义冲突。只有名称或编码相同、或值域重叠时保持 candidate，不合并。
 - `maps_to_concept` 判定：列组角色 + 文档/术语表/业务词条证据支持“这列表示某概念”；仅有名称相似或嵌入相似时标 candidate；概念与实体冲突时保留未决，不覆盖。
 
 **状态映射**：Hypothesis（proposed/probing/supported/counterexample/revised/validated/unresolved/rejected/deferred/stale）→ Rule（draft/validated/canary_checked/published/deprecated/rolled_back）→ GraphNode/GraphEdge（accepted/candidate/unresolved/deprecated）；DocumentClaim 使用（accepted/candidate/unresolved/deprecated）。前端聚合视图使用 GraphNode/Edge 的状态，账本另存每份支持的状态与有效性；查询“为什么有这条边”时回溯 Rule 与 ValidationRecord。
@@ -846,7 +864,7 @@ A.a ──verified_reference──> B.c        （仅当条件、覆盖、唯一
 
 ### 11.4 存储表建议
 
-采用一个事实表、一份支持账本和分区发布指针。下面是**结果库逻辑模型**，不发送到源库；字段类型、外键和迁移脚本在 W0/W1 按选定后端落实。JSON 字段必须经过类型化白名单，不能作为任意载荷容器。
+采用事实表、支持账本和当前发布指针。下面是**结果库逻辑模型**，不发送到源库；已有 SQLite 实现，精确 DDL 以 `store/sqlite.py` 和专项模块为准。JSON 字段必须经过类型化白名单，不能作为任意载荷容器。
 
 | 表/对象 | 主键与关键字段 | 约束 |
 | --- | --- | --- |
@@ -857,7 +875,7 @@ A.a ──verified_reference──> B.c        （仅当条件、覆盖、唯一
 | `publication` | publication_id；logical_rule_id、revision、partition_id、state、source_version_vector、base_generation | state=staging/ready/published/aborted；staging 不进入用户查询/导出 |
 | `publication_support` | (publication_id, support_id)；validation_ref、document_ref/revision、binding_revision、status | 一个发布的完整支持集合及不可变证据状态；origin 决定必填出处；新核验不能覆盖历史发布证据 |
 | `publication_binding` | (publication_id, binding_id, binding_revision) | 来源绑定与身份重定向按发布保留版本，历史查看不被当前合并/拆分覆盖 |
-| `partition_head` | (logical_rule_id, partition_id)；publication_id、generation、checkpoint_ref | 新修订沿用 logical_rule_id，对账替换旧支持，不能因 revision 改变新建互不覆盖的 head |
+| `partition_head` | (logical_rule_id, partition_id)；publication_id、generation | 当前规则以 `all` 替换全部旧 head；完整规则 head 集合参与 CAS，修订不改变逻辑规则身份 |
 | `rule` / `validation_record` | (rule_id,revision) / validation_id | 不可变规则修订；验证范围、语义依据、结构计数和失效依赖分开记录 |
 | `hypothesis` / `hypothesis_event` | hypothesis_id/revision / event_id | 仅经校验的结构化假设、状态变化、无值计数；未经严格输出契约与保留策略校验的模型解释不得持久化 |
 | `data_understanding` / `conflict` | understanding_id/revision / conflict_id | 派生说明与冲突类别、定位、计数、依赖；禁止反例原值和原始 quote |
@@ -868,7 +886,7 @@ A.a ──verified_reference──> B.c        （仅当条件、覆盖、唯一
 
 文档更新也用发布单元：`logical_rule_id=document_extraction_rule`、`partition_id=document_id/segment_id`，文档修订属于 publication 的来源版本。新修订替换旧支持而不保留两份“当前事实”；段落拆并要核对旧覆盖范围。删除文档或来源必须由授权输入清单确认，不能把读取失败当删除。
 
-最低存储验证包括：同事实多支持唯一性；属性值类型化去重；多范围权限读取；悬空端点约束；并发发布冲突；崩溃后 head 与检查点一致；导出只读同一发布视图。完整 DDL 随 W0 契约产出，本设计不冒充已执行迁移。
+最低存储验证包括：同事实多支持唯一性；属性值类型化去重；多范围权限读取；悬空端点约束；并发发布冲突；崩溃后 head 与检查点一致；导出只读同一发布视图。专项表还包括 `goal_revision`、`iteration_work`、`identity_candidate`、`identity_decision`、`identity_review_attempt` 与 `resolution_version`。任务只保存引用、状态与安全计数；裁决保存成员、证据/规则依赖、目标修订和来源，不保存模型原文。
 
 ### 11.5 导出
 
@@ -890,9 +908,11 @@ A.a ──verified_reference──> B.c        （仅当条件、覆盖、唯一
 - **图实体取值变化**：新成员、新指标编码、别名、父子关系变化，按现有规则执行，不默认调模型。
 - **与目标无关的事实变化**：金额、交易 ID、记录时间变化且不影响规则条件，图结果保持不变。
 
-新数据出现违反已验证规则的形态时，创建例外发现任务；不是每行调用模型。
+新数据出现已注册检查能够识别的反例时，创建模式工作项；不是每行调用模型。当前未决去重依赖上下文、规则、模式码和安全计数；数据变化但这些摘要不变时，尚不能自动区分新反例，需显式重新发现。
 
-### 12.2 三档增量
+### 12.2 源能力分级与当前实现
+
+下表前两档是适配方向，当前默认只实现第三档完整关键列投影对账；不把未来的 CDC 或行版本能力用于证明当前增量精确性。
 
 | 源能力 | 运行方式 | 保证与限制 |
 | --- | --- | --- |
@@ -902,18 +922,24 @@ A.a ──verified_reference──> B.c        （仅当条件、覆盖、唯一
 
 在只有 SELECT 的前提下，已有变更视图可以读取；主动配置 CDC 是客户的独立基础设施工作，不作为默认可用能力。
 
-### 12.3 支持账本与对账
+### 12.3 支持账本与完整规则代际
 
-1. 针对“逻辑规则 + 分区”建立 staging publication，记录旧 head 的 generation、规则修订和依赖来源版本向量。暂存只接受通过输出契约的图事实/支持，不存原始元组。未确认假设不得借暂存区保存源数据。
-2. 受限内存读取联合投影并验证，事实唯一化后写 graph_fact 与该 publication 的支持集合。候选事实仅保存受控语义表达与计数，绝不附原始反例；候选不会进入 accepted 查询视图。
-3. 读完声明的一致范围且无截断/错误后签发 PartitionCompletion。验证其规则、schema、文档和身份版本仍有效。仅缺失未证明完整时不签发；失效分区重新查询。
-4. 单一发布者在结果库事务内，以 `base_generation` 做比较并切换 partition_head，同时写完成记录和非值检查点。身份绑定迁移、端点检查与受影响依赖规则必须同一发布集合提交，或先把受影响依赖标无效；禁止短暂悬空。generation 冲突时丢弃或重验该暂存批次，不覆盖较新发布。
-5. 撤回是当前 head 的支持集合中缺少旧 support；其他规则/分区的 head 不受影响。当前可见事实必须有当前 head 下至少一份有效、可授权支持；属性、边和文档主张各自计算，不以节点仍存在为由保留旧别名。
-6. 中断/超时/截断只留下非可见 staging；恢复时重新查询未完成分区。历史发布保存的是允许持久化的图结果；可以回看，但不标成当前来源事实。
+1. 针对逻辑规则建立 `partition_id=all`、`replace_rule=True` 的 staging publication，捕获该规则已有 head 集合与依赖版本。暂存只接受允许输出的事实/支持。
+2. 在来源一致快照中处理全部内存查询分区，跨批次校验身份与单值属性。分区顺序和进程重启不改变事实/支持 ID；源值及其哈希不能成为发布分区标识。
+3. 全范围无截断、错误或未消解冲突后签发完成记录。`GenerationView` 形成包含旧未受影响结果和新代际的待发布全图，用于检查端点、依赖和层级约束。
+4. 单一发布者在同一事务中比较完整 base head 集合并替换该规则所有旧 head。依赖组一并提交，不能混合“新规则整代”与“同规则旧分区”发布；并发变化时拒绝提交。
+5. 新代际缺少的旧支持才可撤回，其他来源支持独立保留。超时/截断保留旧发布；已查实的 FD、身份或图约束反例将相应旧当前规则及依赖标待复核，历史仍可读取。
+6. 中断后重查整个未完成规则范围。可重用规则、目标修订和工作项，但不能恢复源值游标或把 Agent 等待前后的不同快照拼成完整结果。
 
-源级 CDC/更新时间水位只有在该窗口触及的全部规则与分区发布完成后才推进；一个分区成功不能跳过另一个未完成分区。分区清单要有完整枚举记录，已消失分区的撤回不能凭单次空结果或枚举失败触发。
+CDC、可验证源版本与细粒度提交代际属于后续适配能力，当前默认路径是完整投影对账，不能用未来能力解释当前完整性。
 
-并发只用于独立探查或不同分区计算，身份解析与 head 提交仍走单一写入者。依赖分区未完成时，下游不得沿用已失效的身份或删除判断。只拥有源库版本号但无法证明查询范围一致时，按 §12.4 降级，不签发用于撤回的完成记录。
+### 12.3.1 图级候选与版本化裁决
+
+生成完整图后，按名称、编码、定义和已接受邻域建立有界候选索引，限制实体数、桶大小、每实体邻居和候选总量，报告被省略的数量。相似命中只产生候选，不自动归并。
+
+身份裁决输入使用原始可见事实，而非已假设归并的图。用户可确认同一/不同对象或撤销；启用允许实例使用的模型时，Agent 可对有界候选调用独立语义复核，支持充分才申请同一对象裁决。模型不覆盖已有人工裁决，只有名称不足以接受；模型的反驳/弃权保留未决。
+
+提交检查完整候选簇、单值属性冲突、禁止归并约束、层级自环/环/多父、授权范围、目标与规则修订、证据集合以及图 generation。新增或撤回相关事实、规则或目标变化可使旧裁决进入 `needs_review`；失效裁决不再改变当前图。合法的不同关系和不同限定分别保留，同一事实的多份支持合并展示但可分别撤回。业务事实发布与模型身份裁决分两步，不在同一事务中完成；图复核阶段不自行发起额外 SQL。任意业务关系互斥裁决与完整影响预览仍未覆盖。
 
 ### 12.4 快照与并发
 
@@ -938,11 +964,12 @@ A.a ──verified_reference──> B.c        （仅当条件、覆盖、唯一
 
 ### 13.1 实际模块目录
 
-2026-10-18 的 CLI 实现按以下目录组织；接口以 `src/lightgraph/contracts.py`、生成的 JSON Schema 和命令帮助为准。运行范围及尚未验证项见 [实施记录](../../IMPLEMENTATION_STATUS.md)。
+当前 CLI 实现按以下目录组织；接口以 `src/lightgraph/contracts.py`、生成的 JSON Schema 和命令帮助为准。运行范围及尚未验证项见 [实施记录](../../IMPLEMENTATION_STATUS.md)。
 
 ```text
 src/lightgraph/
   contracts.py               # 来源、规则、图事实、支持、报告
+  semantic_schema.py         # 类型化项目词汇及合并冲突
   sources/  query/            # Gauss/Excel、内存批次、SQL、谓词、预算
   discovery/                 # 假设、验证预留、模型提案、漂移检查
   documents/                 # Markdown、说明上下文、分析主张、章节缓存
@@ -951,7 +978,7 @@ src/lightgraph/
   metadata.py                # 表列图、列组、语义槽位、引用证据
   metadata_alignment.py      # 跨表同角色列候选
   presentation/              # 图导出、导入、HTML
-  runtime/                   # 配置、运行锁、受控持久化
+  runtime/                   # 配置、运行锁、受控持久化、迭代账本、旧分区审计
   pipeline.py  cli.py         # 主流程与命令入口
   schemas/  tests/            # 输出契约与可执行验证
 ```
@@ -975,6 +1002,7 @@ output_dir: ../runs/example
 scopes: [A, B, public]
 document_scopes: [A, B]
 goal:
+  # 此示例显式限制为指标模板；省略或写 [] 时按目标发现。
   entity_kinds: [Metric, Measure, Dimension, DimensionMember, ReportItem, BusinessConcept]
   relation_kinds: [parent_of, member_of, uses_measure, verified_reference]
   excluded_columns: [private_note]
@@ -1015,7 +1043,7 @@ lightgraph rollback examples/run.yaml items 1
 lightgraph schema src/lightgraph/schemas
 ```
 
-`validate` 只验证规则契约和受控算子；源数据的完整核验发生在 `run`。`verify` 执行固定规则 E 与确定性发现 D 的合成实验，真实环境 I 单列未执行。命令返回 `0` 不替代语义验收：报告可能是 `COMPLETED_WITH_GAPS`；`PARTIAL` 返回 `2`，失败返回 `1`。
+`validate` 只验证规则契约和受控算子；源数据的完整核验发生在 `run`。`verify` 执行固定规则 E 与确定性发现 D 的合成实验，D 使用明确语义声明，不验证自然语言自动理解；真实模型 D 与真实环境 I 独立验收。命令返回 `0` 不替代语义验收：报告可能是 `COMPLETED_WITH_GAPS`；`PARTIAL` 返回 `2`，失败返回 `1`。
 
 ### 13.4 失败语义
 
@@ -1111,7 +1139,7 @@ lightgraph schema src/lightgraph/schemas
 3. 无历史快照且不保存原始数据，不能完整重现过去的单元格证据。
 4. 图谱精简取决于目标知识基数；真实需要千万条关系时，不能用无依据聚合假装只有十条。
 5. schema、值与文档三方都含糊时，系统应给出未决项，不承诺全自动得到唯一业务解释。
-6. 编码映射、业务口径、指标定义冲突必须有外部来源（映射表、文档、用户确认）；模型只能提疑似。
+6. 编码映射、业务口径和定义冲突须有独立于提案的证据；允许 Agent 从授权数据和知识推断，再经复核与程序检查。没有充分依据时保持未决。
 7. 首期只承诺一个经验证的 Gauss 产品/版本；其他版本需单独契约测试。
 
 ### 16.2 开放问题
@@ -1259,13 +1287,13 @@ YAML 只保存获准的元数据和解释产物，不含连接凭证、抽样行
 
 增量依赖至少包含：来源结构、目标、适用文档修订、解释版本、规则版本、身份策略及层级体系。表级说明变化只使受影响规则及其后续依赖失效；全局策略变化按实际依赖集合重验。另存每个任务的适用文档集合摘要，覆盖新增文档、删除文档、绑定范围变化和检索选择版本；不能只检查旧引用，否则新加入的相关说明永远不会触发复核。文档知识抽取缓存同时包含目标、子任务与上下文选择策略版本。规则和依赖未变、且新增值符合已确认模式时，由程序生成新的事实与支持。重新发现新模式与重算既有投影分别计费和报告。
 
-撤回一个来源只撤回它支持的成员记录、属性和边。其他来源仍支持的实体与关系继续存在。删除一个视图不撤回任何源事实。原有完整分区、失败不撤回和原子发布约束保持不变。
+撤回一个来源只撤回它支持的成员记录、属性和边。其他来源仍支持的实体与关系继续存在。删除一个视图不撤回任何源事实。完整规则代际、失败不按缺失撤回和原子发布约束继续有效；查询分区不能独立成为当前发布。
 
 完成标记按表保存已完成的上下文版本。失败、延期和未访问表不能登记为完成，下次运行继续尝试；成功表可复用。图事实发布后的完成标记失败单独报告，清理只处理未发布的暂存，不能把已发布结果记成回滚。强制重发现也必须重新进入相关跨表任务，不能因结构和文档未变而跳过。
 
-## 19. 工作台交互与服务接入（2026-10-20）
+## 19. 工作台交互与服务接入（更新于 2026-10-26）
 
-本轮范围为统一设计和合成可交互原型。正式 Web 服务尚未实现；规范见 [工作台交互与接入设计](WORKBENCH_DESIGN.md)，新增验收编号见 [WB 用户故事](WORKBENCH_US.md)。引擎现有 CLI、Python 接口与导出浏览页继续有效。
+FastAPI 服务与 Vue 工作台已经实现。当前入口和工程验证见 [工作台实施记录](WORKBENCH_IMPLEMENTATION.md)，需求见 [WB 用户故事](WORKBENCH_US.md)；[工作台交互与接入设计](WORKBENCH_DESIGN.md) 保留产品设计背景，不能把早期原型限制当成当前实现。界面目前按源码构建交付，wheel 尚未附带 Vue 产物。
 
 工作台必须提供独立抽取目标、混合来源管理、Markdown 默认全局或精确多表绑定、声明与解释对照、元数据图、业务图与运行记录。原声明由服务端采集并版本化；前端只提交配置草稿和语义修正建议，不能直接把修改后的 YAML 当成数据库声明。
 
@@ -1273,9 +1301,11 @@ YAML 只保存获准的元数据和解释产物，不含连接凭证、抽样行
 
 原始查询结果和模型原文不进入浏览器、项目库、任务事件或持久化日志。批次使用后释放，运行结束或取消时完成最终资源清理；清理不可确认时显式 unknown。用户主动上传的文件与通过白名单的图结果按各自策略保留，不能因清理样本而一并删除。
 
-每次运行冻结目标、来源、文档和当前图基线。任务生命周期、执行结论、依赖组发布与清理分别记录。现有引擎分阶段发布，工作台不承诺全运行单事务回滚。首期 Web 设计支持同项目、同隔离域在非空图上继续构建；跨项目继承和任意外部图的执行状态迁移留作后续 US。页面原型中的开始、取消和清理均为合成演示。
+每次运行冻结配置修订及目标、来源、文档和当前图基线。配置读取返回 ETag，修改与启动请求校验 If-Match；旧页面收到冲突时保留草稿。高级 JSON 与普通表单统一保存后才能启动、上传或刷新，不能静默覆盖未保存的修改。任务生命周期、执行结论、依赖组发布与清理分别记录。引擎分阶段发布，不承诺全运行单事务回滚；同项目、同隔离域可在非空图上继续构建。跨项目继承和任意外部图的执行状态迁移仍属后续范围。
+
+业务图默认只读 accepted 事实，用户显式打开候选后才显示候选节点和边；详情提供状态、字段映射和当前授权范围可见的支持。身份候选允许确认同一、确认不同与撤销，裁决有独立修订检查，运行期间禁止修改。数据库页面提供能力清单上传、校验与绑定，上传成功不能替代真实驱动和数据库版本的能力验证。
 
 
-## 19. AgentScope 运行时与独立模型配置（2026-10-20）
+## 20. AgentScope 运行时与独立模型配置（2026-10-20）
 
 关键列发现改用 AgentScope `ReActAgent`、`Toolkit` 和 `ChatModelBase`。所有发现工具通过参数校验、权限与 SQL 守卫后执行；支持 Chat Completions JSON 与 SSE，完整工具调用到达后才调度。独立 `agent_config` 配置模型 URL、名称、密钥来源、模式和限额；目标仍保留在运行配置 `goal`。详细调用路径、内存清理、版本约束与验证边界见 [AgentScope 接入设计](AGENTSCOPE_RUNTIME.md)。

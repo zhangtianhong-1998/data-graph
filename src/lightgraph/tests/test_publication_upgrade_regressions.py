@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 import lightgraph.pipeline as pipeline
-from lightgraph.contracts import ColumnSpec, RuleSpec, TableSpec
+from lightgraph.contracts import ColumnSpec, ExtractionGoal, RuleSpec, TableSpec
 from lightgraph.documents import load_document
 from lightgraph.errors import LightGraphError
 from lightgraph.rules import RuleEngine
@@ -108,7 +108,9 @@ def run_items(config, *, changed=False, documents=()):
 
 
 def test_workflow_upgrade_refreshes_metadata_with_old_document_alignment(tmp_path,monkeypatch):
-    config=RunConfig(sources=[],output_dir=str(tmp_path),scopes=["public"])
+    # This fixture tests publication upgrades, with its generic object type explicit.
+    config=RunConfig(sources=[],output_dir=str(tmp_path),scopes=["public"],
+        goal=ExtractionGoal(entity_kinds=["BusinessConcept"]))
     document=load_document("analysis.md",text=(
         "---\nid: analysis\npurpose: analysis_knowledge\n---\n"
         "# 分析方法\n销售费用建议分析地区结构。\n"))
@@ -149,7 +151,8 @@ def test_workflow_upgrade_refreshes_metadata_with_old_document_alignment(tmp_pat
 
 
 def test_marker_failure_preserves_published_accounting_and_cleans_staging(tmp_path,monkeypatch):
-    config=RunConfig(sources=[],output_dir=str(tmp_path),scopes=["public"])
+    config=RunConfig(sources=[],output_dir=str(tmp_path),scopes=["public"],
+        goal=ExtractionGoal(entity_kinds=["BusinessConcept"]))
     original=GraphStore.publish_partition
     failed_markers=[]
 

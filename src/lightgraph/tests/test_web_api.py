@@ -4,7 +4,7 @@ import time
 
 import pytest
 import yaml
-from fastapi.testclient import TestClient
+from lightgraph.tests.web_client import RevisionClient as TestClient
 
 from lightgraph.contracts import RuleSpec
 from lightgraph.web.app import MAX_REQUEST_BYTES, create_app

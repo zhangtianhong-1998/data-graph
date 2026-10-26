@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import math
 import re
+import copy
 from typing import Any
 
 from lightgraph.contracts import GraphFact, RuleSpec, ValidationRecord, canonical
 from lightgraph.errors import LightGraphError
+from lightgraph.semantic_schema import SemanticSchema
 
 
 class PersistenceViolation(LightGraphError):
@@ -91,6 +93,119 @@ class PersistencePolicy:
     max_fact_bytes = 32768
     max_value_characters = 8192
 
+    def __init__(self):
+        self.semantic_schema = SemanticSchema()
+        self.kinds = {layer: set(kinds) for layer, kinds in KINDS.items()}
+        self.property_definitions = {}
+        self.relation_definitions = {}
+
+    def with_schema(self, schema: SemanticSchema):
+        """Return a validated copy; rejected declarations cannot widen this policy."""
+        schema = SemanticSchema.model_validate(schema.model_dump())
+        merged = SemanticSchema.merged(self.semantic_schema, schema)
+        result = copy.deepcopy(self)
+        reserved = KINDS["metadata"] | KINDS["provenance"]
+        if any(item.name in reserved for item in merged.entity_types):
+            raise PersistenceViolation("semantic_type_conflicts_with_system_kind")
+        result.kinds["business"].update(item.name for item in merged.entity_types)
+        for item in merged.properties:
+            if not set(item.entity_kinds) <= result.kinds["business"]:
+                raise PersistenceViolation("property_kind_not_registered")
+            if item.name in PROPERTY_NAMES:
+                # Template properties have stable contracts across existing
+                # publications. Neither a narrowing nor a silent override is
+                # safe here; a new business property needs its own name.
+                raise PersistenceViolation("builtin_property_definition_forbidden")
+            result.property_definitions[item.name] = item
+        for item in merged.relations:
+            if not set(item.source_kinds + item.target_kinds) <= result.kinds["business"]:
+                raise PersistenceViolation("relation_kind_not_registered")
+            if item.name in RELATION_STATES:
+                raise PersistenceViolation("builtin_relation_definition_forbidden")
+            result.relation_definitions[item.name] = item
+        result.semantic_schema = merged
+        return result
+
+    def relation_states(self, name: str) -> set[str]:
+        if name in self.relation_definitions or name in {"parent_of", "member_of", "uses_measure"}:
+            return {"accepted", "candidate", "unresolved"}
+        return RELATION_STATES.get(name, set())
+
+    def relation_endpoint_kinds(self, name: str):
+        definition = self.relation_definitions.get(name)
+        if definition:
+            return set(definition.source_kinds), set(definition.target_kinds)
+        kinds = self.kinds["business"]
+        if name in {"parent_of", "same_entity"}:
+            return kinds, kinds
+        if name == "analyzes":
+            return {"AnalysisMethod"}, kinds
+        if name == "defined_by":
+            return kinds, {"DocumentSection", "Rule"}
+        return RELATION_ENDPOINT_KINDS.get(name)
+
+    def check_property_kind(self, name: str, kind: str) -> None:
+        definition = self.property_definitions.get(name)
+        if definition and kind not in definition.entity_kinds:
+            raise PersistenceViolation("property_entity_kind_mismatch")
+
+    def schema_for_facts(self, facts) -> SemanticSchema:
+        """Export only vocabulary used by the authorized projection, not hidden types."""
+        kinds = {fact["payload"]["kind"] for fact in facts if fact["fact_kind"] == "NodeExistence"}
+        properties = {fact["payload"]["name"] for fact in facts if fact["fact_kind"] == "PropertyValue"}
+        relations = {fact["payload"]["relation"] for fact in facts if fact["fact_kind"] == "Edge"}
+        return SemanticSchema(
+            entity_types=[entry for entry in self.semantic_schema.entity_types if entry.name in kinds],
+            properties=[entry.model_copy(update={"entity_kinds": sorted(set(entry.entity_kinds) & kinds)})
+                        for entry in self.semantic_schema.properties if entry.name in properties and set(entry.entity_kinds) & kinds],
+            relations=[entry.model_copy(update={"source_kinds": sorted(set(entry.source_kinds) & kinds),
+                                                "target_kinds": sorted(set(entry.target_kinds) & kinds)})
+                       for entry in self.semantic_schema.relations if entry.name in relations
+                       and set(entry.source_kinds) & kinds and set(entry.target_kinds) & kinds])
+
+    def check_rule(self, rule: RuleSpec, goal=None) -> None:
+        """Check vocabulary and source-column restrictions before any source value is staged."""
+        if rule.identity.entity_kind not in self.kinds["business"]:
+            raise PersistenceViolation("unregistered_node_kind")
+        attributes = set(rule.attributes.single_valued) | set(rule.attributes.multi_valued)
+        if attributes - PROPERTY_NAMES - set(self.property_definitions):
+            raise PersistenceViolation("property_not_in_output_contract")
+        for name in attributes:
+            self.check_property_kind(name, rule.identity.entity_kind)
+            definition = self.property_definitions.get(name)
+            if definition and name in rule.attributes.multi_valued and not definition.multi_valued:
+                raise PersistenceViolation("property_multiplicity_mismatch")
+        relation = rule.relation.relation if rule.relation else "parent_of" if rule.hierarchy else None
+        if relation and not self.relation_states(relation):
+            raise PersistenceViolation("unregistered_relation")
+        from ..rules.engine import RuleEngine
+        columns = RuleEngine.columns(None, rule)
+        if set(columns) & {item.column for item in rule.attributes.excluded}:
+            raise PersistenceViolation("excluded_column_projected")
+        if goal is not None:
+            from ..discovery.goal import source_in_goal, column_is_excluded, column_is_evidence_only
+            if not source_in_goal(goal, rule.source):
+                raise PersistenceViolation("outside_source_goal")
+            if goal.entity_kinds and rule.identity.entity_kind not in goal.entity_kinds:
+                raise PersistenceViolation("outside_extraction_goal")
+            if relation and goal.relation_kinds and relation not in goal.relation_kinds:
+                raise PersistenceViolation("outside_relation_goal")
+            if any(column_is_excluded(goal, rule.source, column) for column in columns):
+                raise PersistenceViolation("excluded_column_projected")
+            if any(column_is_evidence_only(goal, rule.source, column) for column in columns):
+                raise PersistenceViolation("evidence_only_column_projected")
+            def predicate_columns(value):
+                if not isinstance(value, dict):
+                    return []
+                if "not" in value:
+                    return predicate_columns(value["not"])
+                if any(key in value for key in ("all", "any", "and")):
+                    return [column for key in ("all", "any", "and") for part in value.get(key, [])
+                            for column in predicate_columns(part)]
+                return [value["column"]] if "column" in value else list(value)
+            if any(column_is_excluded(goal, rule.source, column) for column in predicate_columns(rule.scope.predicate)):
+                raise PersistenceViolation("excluded_column_queried")
+
     def check_fact(self, fact: GraphFact) -> None:
         if not isinstance(fact, GraphFact):
             raise PersistenceViolation("typed_graph_fact_required")
@@ -99,15 +214,20 @@ class PersistencePolicy:
             raise PersistenceViolation("graph_fact_too_large")
         if fact.fact_kind == "NodeExistence":
             self._keys(payload, {"entity_id", "kind", "layer"})
-            if payload["layer"] not in KINDS or payload["kind"] not in KINDS[payload["layer"]]:
+            if payload["layer"] not in self.kinds or payload["kind"] not in self.kinds[payload["layer"]]:
                 raise PersistenceViolation("unregistered_node_kind")
             self._reference(payload["entity_id"])
         elif fact.fact_kind == "PropertyValue":
             self._keys(payload, {"entity_id", "name", "value"}, {"qualifiers"})
             self._reference(payload["entity_id"])
-            if payload["name"] not in PROPERTY_NAMES:
+            if payload["name"] not in PROPERTY_NAMES and payload["name"] not in self.property_definitions:
                 raise PersistenceViolation("property_not_in_output_contract")
             self._scalar(payload["value"])
+            definition = self.property_definitions.get(payload["name"])
+            if definition and payload["value"] is not None:
+                types = {"string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,)}
+                if type(payload["value"]) not in types[definition.value_type]:
+                    raise PersistenceViolation("semantic_property_value_type_mismatch")
             if payload["name"] in {"label", "alias", "english_name"} and not isinstance(payload["value"], str):
                 raise PersistenceViolation("name_property_requires_string")
             self._qualifiers(payload.get("qualifiers", {}))
@@ -115,7 +235,7 @@ class PersistencePolicy:
             self._keys(payload, {"source", "relation", "target"}, {"qualifiers"})
             self._reference(payload["source"])
             self._reference(payload["target"])
-            if payload["relation"] not in RELATION_STATES:
+            if not self.relation_states(payload["relation"]):
                 raise PersistenceViolation("unregistered_relation")
             if payload["relation"] == "parent_of" and payload["source"] == payload["target"]:
                 raise PersistenceViolation("hierarchy_self_loop")

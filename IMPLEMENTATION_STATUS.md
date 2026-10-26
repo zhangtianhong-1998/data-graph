@@ -1,5 +1,7 @@
 # 实施与验收记录
 
+> 当前版本入口：[2026-10-26 迭代构图引擎实施记录](design/lightweight_graph/ITERATIVE_ENGINE_IMPLEMENTATION.md)。本文件以下内容保留截至 2026-10-24 的历史行为和验证快照；其中“当前”“尚未实现”及测试数量均属于各自记录日期，不代表本轮代码。动态词汇、完整规则 all 代际、独立语义复核、迭代任务、身份裁决与工作台修复以新记录为准。
+
 更新日期：2026-10-24。依据 `design/lightweight_graph/` 的 v1.0 架构、SDD §18 及发现 Agent 更新；后端、测试、JSON Schema 和 HTML 模板在 `src/lightgraph/`，Vue 工作台在 `src/workbench/`。历史验证数字按日期保留，不代表最新代码已经完成同等范围的运行验收。
 
 ## 已实现的主流程

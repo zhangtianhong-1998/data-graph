@@ -16,10 +16,10 @@ def table():
                      columns=[ColumnSpec(name="amount"), ColumnSpec(name="item")])
 
 
-def test_old_config_keeps_existing_goal_and_model_defaults():
+def test_default_goal_uses_automatic_vocabulary_without_changing_resource_limits():
     config = RunConfig(sources=[])
     assert not config.goal.observation_values
-    assert config.goal.entity_kinds == ["Metric", "Measure", "Dimension", "DimensionMember", "ReportItem", "BusinessConcept"]
+    assert config.goal.entity_kinds == config.goal.relation_kinds == []
     assert config.goal.include == config.goal.exclude == config.goal.evidence_only_columns == []
     assert config.model.max_discovery_steps == 8
     assert config.model.max_tool_calls == 16
@@ -43,6 +43,22 @@ model:
     assert "具体收入观测值" in prompt
     assert config.model.max_tool_calls == 24
     assert config.goal.source_scope == config.goal.excluded_columns == []
+    assert config.goal.entity_kinds == config.goal.relation_kinds == []
+
+
+def test_explicit_vocabulary_template_is_preserved_when_loading_config(tmp_path):
+    path = tmp_path / "run.yaml"
+    path.write_text("sources: []\ngoal:\n  entity_kinds: [Metric, Measure]\n  relation_kinds: [uses_measure]\n")
+    config = load_config(path)
+    assert config.goal.entity_kinds == ["Metric", "Measure"]
+    assert config.goal.relation_kinds == ["uses_measure"]
+
+
+def test_default_goal_does_not_force_unknown_domain_into_builtin_generic_type():
+    from lightgraph.discovery.engine import _kind
+    unknown = TableSpec(source_id="s", name="people", columns=[ColumnSpec(name="person_code"), ColumnSpec(name="person_name")])
+    assert _kind("person", unknown, ExtractionGoal(purpose="发现人员组织")) is None
+    assert _kind("person", unknown, ExtractionGoal(entity_kinds=["BusinessConcept"])) == "BusinessConcept"
 
 
 @pytest.mark.parametrize("selector", [

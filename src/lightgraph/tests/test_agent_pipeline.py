@@ -12,6 +12,7 @@ from lightgraph.runtime.config import RunConfig
 from lightgraph.runtime.retention import retain_check
 from lightgraph.sources import MemorySource
 from lightgraph.store import GraphStore
+from lightgraph.discovery.semantics import declaration_block, document_ref
 
 
 def response(content=None, call=None):
@@ -30,6 +31,14 @@ def client(monkeypatch, handler):
 def input_packet(request):
     payload=json.loads(request.content)
     return payload, json.loads(payload['messages'][1]['content'])['input']
+
+
+def supported_semantic_review(packet):
+    """Offline reviewer fixture; this verifies the contract, not model quality."""
+    return {'proposition':packet['semantic_proposition'],'decision':'supported',
+        'basis':'document_interpretation','evidence':[
+            {'reference':document_ref(d),'stance':'supports'}
+            for d in packet['document_snippets']], 'conditions':[]}
 
 
 def table(name, columns):
@@ -118,6 +127,7 @@ def test_cross_table_different_column_names_become_verified_rule(monkeypatch,tmp
     calls=[]
     def handler(request):
         _,p=input_packet(request);name=p['scope']['table'];calls.append((p['task'],name))
+        if p['task']=='semantic_review':return response(supported_semantic_review(p))
         if p['task']=='T0_discovery':
             if name=='metrics':return response(group(p,'metric_pk','title','Metric'))
             if name=='measures':return response(group(p,'measure_pk','caption','Measure'))
@@ -227,6 +237,7 @@ def test_agent_long_hierarchy_with_opaque_parent_column(monkeypatch,tmp_path):
     t=table('tree',['a','b','c'])
     def handler(request):
         _,p=input_packet(request);ids={c['name']:c['id'] for c in p['metadata_digest']['columns']}
+        if p['task']=='semantic_review':return response(supported_semantic_review(p))
         return response({'task':p['task'],'proposals':[{'kind':'long_hierarchy','claim':{
             'group_id':'tree','entity_kind_hint':'DimensionMember','key_column':ids['a'],
             'label_column':ids['b'],'parent_column':ids['c']},'evidence_cited':[ids['a']]}]})
@@ -243,8 +254,11 @@ def test_agent_preserves_documented_shared_definition(monkeypatch,tmp_path):
     t=table('registry',['area','code_x','text_y','meaning_z'])
     def handler(request):
         _,p=input_packet(request)
-        return response(group(p,'code_x','text_y',namespace='area',extra=[
-            ('meaning_z',{'role':'semantic_attribute','property_name':'definition'})]))
+        if p['task']=='semantic_review':return response(supported_semantic_review(p))
+        proposal=group(p,'code_x','text_y',namespace='area',extra=[
+            ('meaning_z',{'role':'semantic_attribute','property_name':'definition'})])
+        proposal['proposals'][0]['claim']['identity_resolution']='shared_definition'
+        return response(proposal)
     doc=load_document('registry.md',text='---\npurpose: data_description\napplies_to: [public.registry]\n---\n# 定义\nregistry 中 meaning_z 是完整定义。同一完整定义可由多个租户引用。')
     cfg=RunConfig(sources=[],output_dir=str(tmp_path/'out'),scopes=['A','B','public'])
     data={'public.registry':[('A','1','费用','完整业务定义'),('B','2','费用','完整业务定义')]}
@@ -260,7 +274,8 @@ def test_agent_mode_keeps_documented_json_reference_verifier(monkeypatch):
     from lightgraph.tests.test_discovery_workflow import _complex_source
     from lightgraph.discovery import discover_references
     source,rules=_complex_source()
-    doc=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.links]\n---\n# 引用\nlinks 记录指标使用度量，allowed_measure_codes 是允许引用度量的 JSON 数组。')
+    doc=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.links]\n---\n# 引用\nlinks 记录指标使用度量，allowed_measure_codes 是允许引用度量的 JSON 数组。\n'+declaration_block(
+        'public.links','uses_measure',['tenant_id','resource_code'],['tenant_id','allowed_measure_codes']))
     model=client(monkeypatch,lambda request:response({'task':input_packet(request)[1]['task'],'abstain':True}))
     with source:
         result=discover_references(source,rules,[doc],model=model)

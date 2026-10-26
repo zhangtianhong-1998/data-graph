@@ -54,6 +54,7 @@ class _Project(StrictModel):
     created_at: str
     updated_at: str
     files: list[FileRecord] = Field(default_factory=list)
+    config_revision: int = Field(default=0, ge=0)
 
 
 def _now() -> str:
@@ -260,9 +261,38 @@ class Workspace:
         return project
 
     def _save(self, project: dict) -> dict:
+        # A rollback of assets must never revive an earlier configuration revision.
+        current = self._read(self.project_path(project["project_id"]) / "project.yaml")
+        project["config_revision"] = max(project.get("config_revision", 0), current.get("config_revision", 0))
         project["updated_at"] = _now()
         self._write_yaml(self.project_path(project["project_id"]) / "project.yaml", project)
         return deepcopy(project)
+
+    def config_revision(self, project_id: str) -> int:
+        with self.lock(project_id):
+            return self._load(project_id)["config_revision"]
+
+    def config_etag(self, project_id: str) -> str:
+        return '"' + str(self.config_revision(project_id)) + '"'
+
+    def require_config_revision(self, project_id: str, expected: str | None) -> None:
+        """Call while holding the same project lock as the subsequent mutation."""
+        if expected is None:
+            raise LightGraphError("config_revision_required")
+        if expected != self.config_etag(project_id):
+            raise LightGraphError("config_revision_conflict")
+
+    def _write_config(self, project_id: str, value: dict) -> None:
+        """Reserve a monotonic revision before an atomic config replacement.
+
+        Callers hold the project lock. A crash between the two files may consume
+        a revision without a config change; it cannot reuse a stale revision.
+        Rollback is another write and likewise advances the revision.
+        """
+        project = self._load(project_id)
+        project["config_revision"] += 1
+        self._save(project)
+        self._write_yaml(self._path(project_id, "config.yaml"), value)
 
     def create(self, name: str, project_id: str | None = None) -> dict:
         name = _name(name)
@@ -282,9 +312,9 @@ class Workspace:
             for folder in ("files", "output", "runs"):
                 (path / folder).mkdir()
             config = RunConfig(sources=[], isolation_domain=project_id, output_dir="output",
-                               goal={"purpose": ""}).model_dump(mode="json")
-            self._write_yaml(path / "config.yaml", config)
-            return project
+                               goal={"purpose": "", "entity_kinds": [], "relation_kinds": []}).model_dump(mode="json")
+            self._write_config(project_id, config)
+            return self.get(project_id)
 
     def list_projects(self) -> list[dict]:
         _no_symlinks(self.root)
@@ -354,13 +384,13 @@ class Workspace:
                 config["documents"].append(record["relative_path"])
             try:
                 clean = self._normalize_config(project_id, config, project)
-                self._write_yaml(self._path(project_id, "config.yaml"), clean)
+                self._write_config(project_id, clean)
                 self._save(project)
             except Exception:
                 path.unlink(missing_ok=True)
                 # Restore the previous valid config if registration failed after
                 # its atomic file replacement; never leave a missing source path.
-                self._write_yaml(self._path(project_id, "config.yaml"), original_config)
+                self._write_config(project_id, original_config)
                 raise
             return record
 
@@ -445,11 +475,11 @@ class Workspace:
                 file.update(inactive_reason=None, inactive_targets=[])
             try:
                 self._atomic(path, updated.encode())
-                self._write_yaml(self._path(project_id, "config.yaml"), config)
+                self._write_config(project_id, config)
                 self._save(project)
             except Exception:
                 self._atomic(path, text.encode())
-                self._write_yaml(self._path(project_id, "config.yaml"), original_config)
+                self._write_config(project_id, original_config)
                 self._save(original_project)
                 raise
             return deepcopy(file)
@@ -507,7 +537,7 @@ class Workspace:
         with self.lock(project_id):
             project = self._load(project_id)
             clean = self._normalize_config(project_id, value, project)
-            self._write_yaml(self._path(project_id, "config.yaml"), clean)
+            self._write_config(project_id, clean)
             self._save(project)
             return clean
 

@@ -2,9 +2,10 @@
 from __future__ import annotations
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
-from ..contracts import RunReport, RuleSpec
+from ..contracts import Coverage, RunReport, RuleSpec
 from ..errors import LightGraphError
 
 
@@ -30,7 +31,16 @@ def write_rules(path, rules:list[RuleSpec]):
         raise LightGraphError("unvalidated_rule_persistence")
     from ..store.policy import PersistencePolicy
     for rule in rules:PersistencePolicy().check_record(rule)
-    atomic_text(path,yaml.safe_dump([r.model_dump(mode="json",by_alias=True) for r in rules],allow_unicode=True,sort_keys=False))
+    exported=[]
+    for rule in rules:
+        # Historical rule records remain immutable, but their source-derived
+        # partition tokens must not be copied into a newly written artifact.
+        # The writer cannot infer a fresh full validation from an old rule cache.
+        if any(re.fullmatch(r"partition_[0-9a-f]{64}", token) for token in rule.coverage.partitions):
+            rule=rule.model_copy(deep=True)
+            rule.coverage=Coverage(scope="partition", partitions=[], consistent=False)
+        exported.append(rule.model_dump(mode="json",by_alias=True))
+    atomic_text(path,yaml.safe_dump(exported,allow_unicode=True,sort_keys=False))
 
 
 def retain_check(roots, markers):

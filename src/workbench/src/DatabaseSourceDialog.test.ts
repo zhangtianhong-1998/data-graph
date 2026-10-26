@@ -6,7 +6,8 @@ import type { SourceConfig } from './types'
 import DatabaseSourceDialog from './DatabaseSourceDialog.vue'
 
 const api = vi.hoisted(() => ({ request: vi.fn(), draftRequest: vi.fn(), ensureSession: vi.fn() }))
-vi.mock('./api', () => ({
+vi.mock('./api', async importOriginal => ({
+  ...await importOriginal<typeof import('./api')>(),
   request: (path: string, options: Record<string, unknown>) => path.includes('/database/drafts/') ? api.draftRequest(path, options) : api.request(path, options),
   ensureSession: api.ensureSession,
   projectPath: (id: string) => `/projects/${id}`,
@@ -24,7 +25,7 @@ function mount(source: SourceConfig | null = null) {
   onClose = vi.fn(); onConnected = vi.fn()
   app = createApp(DatabaseSourceDialog, {
     projectId: 'dialog-test', source, sources: source ? [source] : [], files: [],
-    retentionVerified: false, busy: false, error: '', onClose, onConnected,
+    retentionVerified: false, busy: false, error: '', configRevision: '"4"', onClose, onConnected,
   })
   app.mount(root)
 }
@@ -586,5 +587,22 @@ describe('未连接成功的数据库草稿', () => {
     button('重试保存').click()
     await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('已保存到本机'))
     expect(api.draftRequest).toHaveBeenCalledTimes(2)
+  })
+})
+
+
+describe('数据库能力清单入口', () => {
+  it('上传后选中文件并保留服务端验证提示，连接提交绑定路径', async () => {
+    mount(); await fillConnection();
+    api.request.mockResolvedValueOnce({ file: { file_id: 'capability', name: 'capabilities.yaml', kind: 'yaml', relative_path: 'files/capabilities.yaml' }, runtime_ready: false, missing_capabilities: ['query_cancel'] })
+    const input = element<HTMLInputElement>('input[aria-label="上传数据库能力清单"]')
+    Object.defineProperty(input, 'files', { value: [new File(['db: {}'], 'capabilities.yaml')] })
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+    await vi.waitFor(() => expect(element<HTMLSelectElement>('#database-manifest').value).toBe('files/capabilities.yaml'))
+    const uploaded = api.request.mock.calls.find(call => call[0].includes('/database/capabilities'))!
+    expect(uploaded[0]).toContain('source_id=fake-source&kind=gauss_database')
+    expect(uploaded[1].headers).toEqual({ 'If-Match': '"4"' })
+    expect(uploaded[1].body).toBeInstanceOf(FormData)
+    expect(root.textContent).toContain('query_cancel'); expect(root.textContent).toContain('不会绕过验证')
   })
 })

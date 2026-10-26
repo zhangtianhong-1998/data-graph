@@ -9,14 +9,12 @@ import json
 import math
 import re
 from lightgraph.contracts import (RuleSpec,ScopeSpec,IdentitySpec,RelationSpec,Dependencies,
-    RuleEvidence,Coverage,digest,canonical)
+    Coverage,digest,canonical)
 from lightgraph.errors import LightGraphError,BudgetExceeded
 from .budget import Cost
 from .models import DiscoveryResult
+from .semantics import declared_evidence, rule_evidence
 
-TYPE_WORDS={'Metric':('metric','指标'),'Measure':('measure','度量'),'Dimension':('dimension','维度'),
-            'DimensionMember':('dimension member','维度成员'),'ReportItem':('report item','报表项目'),
-            'BusinessConcept':('business concept','业务概念')}
 DISCRIMINATOR=re.compile(r'(?:^|_)(?:source_type|ref_type|ref_kind|entity_type|target_type|business_type)$|引用字段来源|来源类型|引用类型',re.I)
 REF_VALUE=re.compile(r'(?:^|_)(?:ref_code|source_field|ref_value|target_code|target_id|allowed_codes|value_range)$|引用字段$|取值范围$',re.I)
 ARRAY_SUFFIX=re.compile(r'(?:_codes|_ids|_keys|_code_list|_id_list|_json|_array|取值范围)$',re.I)
@@ -50,19 +48,8 @@ def _read(adapter,table,columns,budget,*,predicate=None,limit=20000):
         return rows
     finally:budget.charge(Cost(db_cu=1,memory_bytes=min(size,1024*1024)))
 
-def _mapping_evidence(documents,table,value,target):
-    """Only explicit semantic declarations can promote a selector constant.
-
-    A value-domain overlap alone cannot supply this independent semantic evidence.
-    Document text may refer to the registered target table or its semantic kind.
-    """
-    if not isinstance(value,(str,int)) or len(str(value))>64:return []
-    words=(target.source.table,)+TYPE_WORDS.get(target.identity.entity_kind,())
-    pattern=re.compile(r'(?<![\w])'+re.escape(str(value))+r'(?![\w])'+r'["`\s：:=-]*(?:表示|代表|指向|引用|对应|means|references|maps to|->|=>|:)\s*["`]?[^。\n;；]{0,80}(?:'+'|'.join(map(re.escape,words))+r')',re.I)
-    return [d['doc_id']+'@'+d['revision']+':'+d['section_id'] for d in documents if table.name in d['text'] and pattern.search(d['text'])]
-
 def discover_complex_references(adapter,approved,corpus,budget,max_candidates=16):
-    from .engine import _source,_table_hash,_document_evidence
+    from .engine import _source,_table_hash
     result=DiscoveryResult();catalog={(t.source_id,t.schema_name,t.name):t for t in adapter.describe()}
     approved=[r for r in approved if r.kind=='column_group_entity' and r.validation_ref and r.status in ('validated','canary_checked','published')]
     count=0
@@ -111,16 +98,19 @@ def discover_complex_references(adapter,approved,corpus,budget,max_candidates=16
                             partitions=[(disc,value,[r for r in rows if canonical(r[disc])==encoded]) for encoded,value in values.items()]
                             observed_selectors.update(canonical({disc:value}) for value in values.values())
                         for disc,value,partition in partitions:
-                            if disc:
-                                evidence=_mapping_evidence(docs,table,value,target)
-                                if not evidence:
-                                    # This candidate target may not correspond to
-                                    # the selector. No raw enum value is retained.
-                                    continue
-                            else:
-                                evidence=_document_evidence(docs,table,r'JSON|数组|引用|允许|取值范围|array|reference')
-                                if not evidence:
-                                    result.issues.append({'table':table.qualified_name,'code':'array_reference_semantics_unresolved','status':'unresolved'});continue
+                            predicate={disc:value} if disc else None
+                            evidence=[];relation='verified_reference'
+                            # Exact declaration includes selector, endpoint
+                            # columns and relation. A mention of JSON or a type
+                            # name no longer authorizes this executable mapping.
+                            for relation_kind in ('uses_measure','member_of','verified_reference'):
+                                matches=declared_evidence(docs,table,relation_kind,
+                                    owner.identity.key_columns,target_namespace+[reference_column],
+                                    conditions=predicate)
+                                if matches:
+                                    evidence=matches;relation=relation_kind;break
+                            if not evidence:
+                                result.issues.append({'table':table.qualified_name,'code':'array_reference_semantics_unresolved','status':'unresolved'});continue
                             shapes={isinstance(r[reference_column],str) and r[reference_column].lstrip().startswith('[') for r in partition}
                             if len(shapes)>1:
                                 result.issues.append({'table':table.qualified_name,'code':'mixed_scalar_array_reference','status':'unresolved'});continue
@@ -135,12 +125,6 @@ def discover_complex_references(adapter,approved,corpus,budget,max_candidates=16
                             if unmatched:
                                 result.issues.append({'table':table.qualified_name,'code':'reference_missing','count':unmatched,'status':'unresolved'});continue
                             if not elements:continue
-                            relation='verified_reference'
-                            if owner.identity.entity_kind=='Metric' and target.identity.entity_kind=='Measure' and _document_evidence(docs,table,r'指标.{0,24}(使用|依赖).{0,24}度量'):
-                                relation='uses_measure'
-                            else:
-                                result.issues.append({'table':table.qualified_name,'code':'business_relation_not_registered','status':'unresolved'})
-                            predicate={disc:value} if disc else None
                             rid='rule_'+digest(table.source_id,table.qualified_name,owner.rule_id,target.rule_id,reference_column,predicate)[:24]
                             result.rules.append(RuleSpec(rule_id=rid,kind='reference',source=_source(table),
                                 scope=ScopeSpec(namespaces=owner.scope.namespaces,predicate=predicate),
@@ -149,7 +133,7 @@ def discover_complex_references(adapter,approved,corpus,budget,max_candidates=16
                                     source_columns=owner.identity.key_columns,target_columns=target_namespace+[reference_column],
                                     target_json_array_columns=[reference_column] if array else [],relation=relation),
                                 dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in docs})),
-                                evidence=RuleEvidence(semantic_basis=evidence,probe_refs=['complete_distinct_json_reference' if array else 'complete_distinct_partition_reference']),
+                                evidence=rule_evidence(evidence,probe_refs=['complete_distinct_json_reference' if array else 'complete_distinct_partition_reference']),
                                 coverage=Coverage(scope='partition' if disc else 'full',consistent=False)))
                     except LightGraphError as exc:
                         result.issues.append({'table':table.qualified_name,'code':exc.code,'status':'deferred' if isinstance(exc,BudgetExceeded) else 'unresolved'})

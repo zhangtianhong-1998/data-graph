@@ -6,12 +6,15 @@ The Agent and query tools own ephemeral observations and never persist transcrip
 from __future__ import annotations
 
 from lightgraph.contracts import (ExtractionGoal, ExcludedColumn, RuleSpec, IdentitySpec,
-    ScopeSpec, RelationSpec, Dependencies, Coverage, RuleEvidence, digest)
+    ScopeSpec, RelationSpec, Dependencies, Coverage, digest)
 from lightgraph.documents import DocumentCorpus
 from lightgraph.errors import LightGraphError, BudgetExceeded
 from .budget import BudgetAllocator, Cost
 from .goal import source_in_goal, column_is_excluded, column_is_evidence_only
 from .models import DiscoveryResult, Hypothesis, ProposalBatch
+from .semantics import declared_evidence, review_semantics, rule_evidence
+from .observations import ReviewObservations
+from lightgraph.semantic_schema import SemanticSchema
 
 
 def _catalog(adapter, goal):
@@ -33,10 +36,21 @@ def _catalog(adapter, goal):
     return result
 
 
-def _ask(model, packet, tools):
+def _ask(model, packet, tools, observations):
     return model.explore(packet, tools,
         max_steps=getattr(model.config,'max_discovery_steps',8),
-        max_tool_calls=getattr(model.config,'max_tool_calls',16))
+        max_tool_calls=getattr(model.config,'max_tool_calls',16),
+        review_observations=observations)
+
+
+def _iteration_codes(context, table):
+    context=context or {};codes=set(context.get('codes',[]))
+    for item in context.get('work_items',[]):
+        source=item.get('source',{})
+        if (source.get('source_id'),source.get('schema',source.get('schema_name','public')),source.get('table')) == (
+            table.source_id,table.schema_name,table.name):
+            codes.update(item.get('pattern_codes',[]))
+    return sorted(codes)
 
 
 def _issue(result, table, code, *, count=None):
@@ -46,7 +60,7 @@ def _issue(result, table, code, *, count=None):
     result.issues.append(entry)
 
 
-def _compile(batch, table, goal, docs, result):
+def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observations=None):
     from .engine import _compile_model, SENSITIVE
     excluded=[ExcludedColumn(column=c.name,reason='sensitive_or_excluded')
         for c in table.columns if SENSITIVE.search(c.name) or column_is_excluded(goal,table,c.name)]
@@ -64,22 +78,35 @@ def _compile(batch, table, goal, docs, result):
     for p in batch.proposals:
         if p.kind=='exclusion': continue
         try:
-            if getattr(p.claim,'entity_kind_hint',None) not in goal.entity_kinds:
+            if goal.entity_kinds and getattr(p.claim,'entity_kind_hint',None) not in goal.entity_kinds:
                 raise LightGraphError('outside_extraction_goal')
-            local=ProposalBatch(task=batch.task,proposals=exclusions+[p])
-            candidates=_compile_model(local,table,goal,docs,excluded)
+            schema=SemanticSchema.merged(goal.semantic_schema,batch.semantic_schema)
+            local=ProposalBatch(task=batch.task,proposals=exclusions+[p],semantic_schema=schema)
+            review=None
+            sharing_requested=getattr(p.claim,'identity_resolution','source_scoped')=='shared_definition'
+            if model is not None and (p.kind in ('long_hierarchy','wide_hierarchy') or sharing_requested):
+                review=review_semantics(model,{**(packet or {}),'semantic_schema':schema.model_dump(mode='json')},{
+                    'kind':p.kind,'scope':(packet or {}).get('scope'),
+                    'claim':p.claim.model_dump(mode='json')},docs,observations=observations)
+            candidates=_compile_model(local,table,goal,docs,excluded,semantic_evidence=review)
             for rule in candidates:
-                if rule.hierarchy and 'parent_of' not in goal.relation_kinds:
+                if rule.hierarchy and goal.relation_kinds and 'parent_of' not in goal.relation_kinds:
                     raise LightGraphError('outside_relation_goal')
-                # The same independent sharing declaration used by deterministic
-                # discovery applies to Agent-defined columns as well.
-                from .engine import _document_evidence
-                sharing=_document_evidence(docs,table,
-                    r'同一(?:完整|业务)?定义.{0,24}(?:多个|不同)租户.{0,12}(?:引用|共享)|same definition.{0,32}across tenants')
+                # An explicit declaration is optional. The Agent may infer
+                # sharing, but its separate review must cover this exact claim.
+                definition=rule.attributes.single_valued.get('definition')
+                sharing=(review if sharing_requested else None) or declared_evidence(
+                    docs,table,'shared_definition',[definition] if definition else [],
+                    parameters={'namespace_columns':rule.scope.namespaces})
                 if rule.kind=='column_group_entity' and sharing and rule.scope.namespaces and rule.attributes.single_valued.get('definition'):
                     rule.identity.semantic_resolution='verified_definition_registry'
-                    rule.identity.semantic_namespace='declared_definition:'+sharing[0].split('@',1)[0]+':'+rule.identity.entity_kind
-                    rule.evidence.semantic_basis.extend(sharing)
+                    # The goal defines the inferred registry's namespace; a
+                    # declaration continues to use its immutable document ID.
+                    registry=('goal:'+goal.goal_id if sharing_requested else sharing[0].split('@',1)[0])
+                    rule.identity.semantic_namespace='declared_definition:'+registry+':'+rule.identity.entity_kind
+                    rule.evidence=rule_evidence(sharing,reviewed=bool(review),documents=docs)
+                elif sharing_requested:
+                    raise LightGraphError('shared_definition_attributes_missing')
                 rules.append(rule)
         except LightGraphError as exc:
             _issue(result,table,exc.code)
@@ -132,7 +159,8 @@ def _bounded_catalog_window(table, tables, packet, model, tool_specs):
     return candidates[:low],selected
 
 
-def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=None, *, table_refs=None):
+def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=None, *,
+                        table_refs=None,iteration_context=None,revision_rules=None):
     from .engine import _source, _packet, _understanding, _table_hash, _column_id
     from .tools import ToolExecutor
     goal=goal or ExtractionGoal()
@@ -158,11 +186,22 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
         result.understandings.append(understanding)
         reservation='agent_validation_'+digest(table.qualified_name)[:16]
         tools=None
+        observations=ReviewObservations()
         try:
             # Exploration cannot consume the minimum reserved validation work.
             budget.reserve(reservation,Cost(db_cu=2))
             if len(table.columns)>256: raise LightGraphError('catalog_column_limit')
             packet=_packet(table,goal,[],docs,'T0_discovery',understanding)
+            packet['iteration_context']=dict(iteration_context or {})
+            prior=[r for r in (revision_rules or []) if r.source==_source(table)]
+            if prior:
+                # The scheduler supplies only affected rules. The full list is
+                # available as a typed knowledge summary; one candidate is the
+                # immediate revision target, and every replacement is rechecked.
+                packet.update(task='T5_revision',revision_of=prior[0].rule_id,
+                    revision_candidate=prior[0].model_dump(mode='json',by_alias=True),
+                    allowed_revision_codes=_iteration_codes(iteration_context,table))
+                packet['known_conflicts']=[{'code':code,'count':1} for code in packet['allowed_revision_codes'][:32]]
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                 allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=[table])
             window,packet=_bounded_catalog_window(table,tables,packet,model,tools.tool_specs())
@@ -170,12 +209,27 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             tools.close()
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                 allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=window)
-            batch=_ask(model,packet,tools)
+            batch=_ask(model,packet,tools,observations)
             docs=tools.context_documents()
             understanding.document_refs=sorted({d['doc_id']+'@'+d['revision'] for d in docs})
             budget.release(reservation)
             if batch.abstain: _issue(result,table,'model_abstained')
-            rules=_compile(batch,original,goal,docs,result)
+            rules=_compile(batch,original,goal,docs,result,model=model,packet=packet,observations=observations)
+            if prior and 'fd_violation' in packet.get('allowed_revision_codes',[]):
+                protected=prior[0]
+                safe=[]
+                for replacement in rules:
+                    added=set(replacement.identity.key_columns)-set(protected.identity.key_columns)
+                    attrs=protected.attributes.single_valued
+                    if (not set(protected.identity.key_columns)<=set(replacement.identity.key_columns)
+                        or added & set(attrs.values())
+                        or any(replacement.attributes.single_valued.get(k)!=v for k,v in attrs.items())):
+                        _issue(result,table,'revision_masks_counterexample');continue
+                    safe.append(replacement)
+                rules=safe
+            if len(prior)==1 and len(rules)==1:
+                rules[0].rule_id=prior[0].rule_id
+                rules[0].revision=prior[0].revision+1
             by_id={_column_id(table,c.name):c.name for c in table.columns}
             roles={by_id[m.column_id]:m.role for p in batch.proposals if p.kind=='column_group'
                    for m in p.claim.members if m.column_id in by_id}
@@ -192,9 +246,10 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
                         'allowed_revision_codes':['fd_violation']}
                     tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                         allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=window)
-                    revised_batch=_ask(model,revision,tools)
+                    observations.clear()
+                    revised_batch=_ask(model,revision,tools,observations)
                     docs=tools.context_documents()
-                    fixed=_compile(revised_batch,original,goal,docs,result)
+                    fixed=_compile(revised_batch,original,goal,docs,result,model=model,packet=revision,observations=observations)
                     accepted=[]
                     for replacement in fixed:
                         added=set(replacement.identity.key_columns)-set(rule.identity.key_columns)
@@ -226,6 +281,7 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             if isinstance(exc,BudgetExceeded):break
         finally:
             if tools is not None: tools.close()
+            observations.close()
             budget.release(reservation)
     result.stats={'tables_considered':len(result.understandings),'catalog_tables':catalog_size,
         'catalog_window_limit':64,'catalog_windows':len(window_coverage),
@@ -241,9 +297,9 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
 
 def discover_references_with_agent(adapter, validated_rules, documents=None, model=None,
                                    budget=None, goal=None, max_candidates=32,
-                                   source_adapters=None, table_refs=None):
+                                   source_adapters=None, table_refs=None,iteration_context=None,revision_rules=None):
     """Resolve differently named local endpoint columns to verified entity keys."""
-    from .engine import _source, _packet, _understanding, _table_hash, _column_id, _document_evidence
+    from .engine import _source, _packet, _understanding, _table_hash, _column_id
     from .tools import ToolExecutor
     goal=goal or ExtractionGoal();budget=budget or model.budget
     corpus=documents if isinstance(documents,DocumentCorpus) else DocumentCorpus(documents or [])
@@ -265,19 +321,30 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
             table.qualified_name,table.source_id+'.'+table.qualified_name,
             (table.source_id,table.schema_name,table.name))):continue
         tools=None
+        observations=ReviewObservations()
         docs=corpus.context_for(_source(table),table.column_names)
         try:
             if count>=max_candidates:raise LightGraphError('reference_candidate_limit')
             packet=_packet(table,goal,[],docs,'T2_cross_table',_understanding(table,[],{},docs))
+            packet['iteration_context']=dict(iteration_context or {})
+            prior=[r for r in (revision_rules or []) if r.source==_source(table)]
+            if prior:
+                packet.update(revision_of=prior[0].rule_id,
+                    revision_candidate=prior[0].model_dump(mode='json',by_alias=True),
+                    allowed_revision_codes=_iteration_codes(iteration_context,table),
+                    subtask='复核执行反例中的实体关系映射，保留端点与条件依据；不要把关联缺失伪装为完整覆盖。')
+                packet['known_conflicts']=[{'code':code,'count':1} for code in packet['allowed_revision_codes'][:32]]
             if len(tool_tables)>64:raise LightGraphError('reference_catalog_limit')
             packet['catalog']=[t.model_dump(mode='json',by_alias=True) for t in tool_tables]
             packet['authorized_entities']=list(approved)
+            packet['semantic_schema']=SemanticSchema.merged(goal.semantic_schema,
+                *(r.semantic_schema for r in approved.values())).model_dump(mode='json')
             packet['entity_bindings']=[{'rule_id':r.rule_id,'source':r.source.model_dump(by_alias=True),
                 'entity_kind':r.identity.entity_kind,'key_columns':r.identity.key_columns} for r in approved.values()]
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                 allow_source_samples=getattr(model.config,'allow_source_samples',False),
                 allowed_tables=tool_tables,source_adapters=source_adapters)
-            batch=_ask(model,packet,tools)
+            batch=_ask(model,packet,tools,observations)
             docs=tools.context_documents()
             # A final proposal can name an endpoint without using a read tool.
             # Backend verification is a read too: first let the model reconsider
@@ -305,7 +372,7 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                 tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                     allow_source_samples=getattr(model.config,'allow_source_samples',False),
                     allowed_tables=tool_tables,source_adapters=source_adapters)
-                batch=_ask(model,packet,tools)
+                batch=_ask(model,packet,tools,observations)
                 docs=tools.context_documents()
             lookup={_column_id(table,c.name):c.name for c in table.columns}
             for proposal in batch.proposals:
@@ -325,7 +392,9 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                         source=matches[0]
                     target=approved[claim.target_entity]
                     if claim.condition_ref or claim.polymorphic_by:raise LightGraphError('reference_condition_requires_registered_selector')
-                    if claim.relation_kind not in goal.relation_kinds:raise LightGraphError('outside_relation_goal')
+                    if goal.relation_kinds and claim.relation_kind not in goal.relation_kinds:raise LightGraphError('outside_relation_goal')
+                    schema=SemanticSchema.merged(goal.semantic_schema,batch.semantic_schema,
+                        source.semantic_schema,target.semantic_schema)
                     for binding,columns in ((source,local),(target,remote)):
                         destination=remote_originals.get((binding.source.source_id,binding.source.schema_name,binding.source.table))
                         target_adapter=source_adapters.get(binding.source.source_id)
@@ -346,14 +415,22 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                                 check=adapter.check_reference(originals[table.qualified_name],columns,destination,binding.identity.key_columns)
                         finally:budget.charge(cost)
                         if any(check.get(k,0) for k in ('unmatched','null_refs','ambiguous')):raise LightGraphError('reference_missing')
-                    # Overlap alone never promotes technical evidence to business semantics.
-                    evidence=_document_evidence(docs,table,r'引用|关联|使用|映射|reference|maps? to')
-                    if claim.relation_kind=='uses_measure':
-                        evidence=_document_evidence(docs,table,r'指标.{0,20}(使用|依赖).{0,20}度量')
-                    if claim.relation_kind=='member_of':
-                        evidence=_document_evidence(docs,table,r'成员.{0,20}(属于|归属).{0,20}维度')
-                    if not evidence:raise LightGraphError('technical_overlap_semantics_unresolved')
-                    result.rules.append(RuleSpec(rule_id='rule_'+digest(table.qualified_name,source.rule_id,target.rule_id,local,remote)[:24],
+                    review_packet={**packet,'semantic_schema':schema.model_dump(mode='json'),
+                        'probe_digest':list(packet.get('probe_digest',[]))+[{
+                        'probe_id':'backend_endpoint_verification','operator':'check_reference',
+                        'aggregates':{'unmatched':0,'null_refs':0,'ambiguous':0}}]}
+                    # The provider's proposal is not its own semantic evidence.
+                    # Review all endpoint context after structural verification.
+                    evidence=review_semantics(model,review_packet,{
+                        'kind':'reference','scope':packet['scope'],
+                        'claim':{**claim.model_dump(mode='json'),'source_entity':source.rule_id}},docs,
+                        observations=observations)
+                    rule_id='rule_'+digest(table.qualified_name,source.rule_id,target.rule_id,local,remote)[:24]
+                    replacement=[r for r in prior if r.relation and
+                        r.relation.source_rule_id==source.rule_id and r.relation.target_rule_id==target.rule_id]
+                    result.rules.append(RuleSpec(rule_id=replacement[0].rule_id if len(replacement)==1 else rule_id,
+                        revision=replacement[0].revision+1 if len(replacement)==1 else 1,
+                        semantic_schema=schema,
                         kind='reference',goal_refs=[goal.goal_id],source=_source(table),
                         scope=ScopeSpec(namespaces=[local[source.identity.key_columns.index(c)]
                             for c in source.scope.namespaces if c in source.identity.key_columns]),
@@ -362,7 +439,7 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                             source_columns=local,target_columns=remote,relation=claim.relation_kind),
                         dependencies=Dependencies(schema=_table_hash(originals[table.qualified_name]),
                             documents=sorted({d['doc_id']+'@'+d['revision'] for d in docs})),
-                        evidence=RuleEvidence(semantic_basis=evidence),coverage=Coverage(scope='full',consistent=False)))
+                        evidence=rule_evidence(evidence,reviewed=True,documents=docs),coverage=Coverage(scope='full',consistent=False)))
                 except BudgetExceeded:raise
                 except LightGraphError as exc:_issue(result,table,exc.code)
         except LightGraphError as exc:
@@ -370,6 +447,7 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
             if isinstance(exc,BudgetExceeded):break
         finally:
             if tools is not None:tools.close()
+            observations.close()
     result.stats={'reference_candidates':count,'rules_proposed':len(result.rules),'endpoint_rules':len(approved)}
     result.budget=budget.snapshot()
     return result

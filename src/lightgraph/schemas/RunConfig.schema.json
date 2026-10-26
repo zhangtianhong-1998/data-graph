@@ -1,5 +1,28 @@
 {
   "$defs": {
+    "EntityTypeDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description"
+      ],
+      "title": "EntityTypeDefinition",
+      "type": "object"
+    },
     "ExtractionGoal": {
       "additionalProperties": false,
       "description": "Operator intent and output scope; these never grant source permissions.",
@@ -47,15 +70,21 @@
         },
         "entity_kinds": {
           "items": {
+            "maxLength": 64,
+            "minLength": 1,
             "type": "string"
           },
+          "maxItems": 64,
           "title": "Entity Kinds",
           "type": "array"
         },
         "relation_kinds": {
           "items": {
+            "maxLength": 64,
+            "minLength": 1,
             "type": "string"
           },
+          "maxItems": 128,
           "title": "Relation Kinds",
           "type": "array"
         },
@@ -84,6 +113,9 @@
           "default": false,
           "title": "Observation Values",
           "type": "boolean"
+        },
+        "semantic_schema": {
+          "$ref": "#/$defs/SemanticSchema"
         }
       },
       "title": "ExtractionGoal",
@@ -208,6 +240,55 @@
       "title": "ModelConfig",
       "type": "object"
     },
+    "PropertyDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "value_type": {
+          "default": "string",
+          "enum": [
+            "string",
+            "integer",
+            "number",
+            "boolean"
+          ],
+          "title": "Value Type",
+          "type": "string"
+        },
+        "entity_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Entity Kinds",
+          "type": "array"
+        },
+        "multi_valued": {
+          "default": false,
+          "title": "Multi Valued",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "entity_kinds"
+      ],
+      "title": "PropertyDefinition",
+      "type": "object"
+    },
     "QueryLimits": {
       "additionalProperties": false,
       "properties": {
@@ -243,6 +324,80 @@
         }
       },
       "title": "QueryLimits",
+      "type": "object"
+    },
+    "RelationDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "source_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Source Kinds",
+          "type": "array"
+        },
+        "target_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Target Kinds",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "source_kinds",
+        "target_kinds"
+      ],
+      "title": "RelationDefinition",
+      "type": "object"
+    },
+    "SemanticSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "entity_types": {
+          "items": {
+            "$ref": "#/$defs/EntityTypeDefinition"
+          },
+          "maxItems": 64,
+          "title": "Entity Types",
+          "type": "array"
+        },
+        "properties": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PropertyDefinition"
+          },
+          "maxItems": 256,
+          "title": "Properties"
+        },
+        "relations": {
+          "items": {
+            "$ref": "#/$defs/RelationDefinition"
+          },
+          "maxItems": 128,
+          "title": "Relations",
+          "type": "array"
+        }
+      },
+      "title": "SemanticSchema",
       "type": "object"
     },
     "SourceConfig": {
@@ -539,6 +694,34 @@
       "maximum": 4096,
       "minimum": 1,
       "title": "Max Partitions",
+      "type": "integer"
+    },
+    "max_discovery_rounds": {
+      "default": 3,
+      "maximum": 8,
+      "minimum": 1,
+      "title": "Max Discovery Rounds",
+      "type": "integer"
+    },
+    "max_reconciliation_entities": {
+      "default": 5000,
+      "maximum": 100000,
+      "minimum": 1,
+      "title": "Max Reconciliation Entities",
+      "type": "integer"
+    },
+    "max_reconciliation_candidates": {
+      "default": 256,
+      "maximum": 4096,
+      "minimum": 1,
+      "title": "Max Reconciliation Candidates",
+      "type": "integer"
+    },
+    "max_identity_reviews": {
+      "default": 8,
+      "maximum": 64,
+      "minimum": 0,
+      "title": "Max Identity Reviews",
       "type": "integer"
     },
     "max_run_seconds": {

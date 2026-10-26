@@ -122,7 +122,7 @@ def test_uploaded_file_catalog_survives_reload_without_reopening_source(tmp_path
 
 
 def test_selected_metadata_yaml_is_scoped_and_never_opens_sources(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
+    from lightgraph.tests.web_client import RevisionClient as TestClient
     from lightgraph.web.app import create_app
 
     workspace = project(tmp_path)

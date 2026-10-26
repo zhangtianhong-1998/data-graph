@@ -219,7 +219,7 @@ class StructuredModelClient:
 
     def complete(self, task: str, packet: dict, response_model: type[T]) -> T:
         if not self.config.allow_source_samples and task != 'T4_document':
-            packet={**packet,'strata_samples':[]}
+            packet={**packet,'strata_samples':[],'tool_observations':[]}
         context=packet_call_context(packet,task,output_contract={'schema_ref':'output_schema'})
         packet={**packet,'goal':context['goal'],'stage':task,'call_context':context}
         content = canonical({'task':task,'input':packet,'output_schema':response_model.model_json_schema()})
@@ -331,12 +331,13 @@ class StructuredModelClient:
         raise LightGraphError(last_code) from None
 
     def explore(self, packet: dict, tool_executor, *, max_steps: int | None = None,
-                max_tool_calls: int | None = None) -> ProposalBatch:
+                max_tool_calls: int | None = None, review_observations=None) -> ProposalBatch:
         """Run the bounded tool/observation loop without retaining its transcript."""
         from .agent import explore
         return explore(self,packet,tool_executor,
             max_steps=self.config.max_discovery_steps if max_steps is None else max_steps,
-            max_tool_calls=self.config.max_tool_calls if max_tool_calls is None else max_tool_calls)
+            max_tool_calls=self.config.max_tool_calls if max_tool_calls is None else max_tool_calls,
+            review_observations=review_observations)
 
     def propose(self, packet: dict) -> ProposalBatch:
         try:

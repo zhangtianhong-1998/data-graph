@@ -3,7 +3,7 @@ import json
 import os
 
 import pytest
-from fastapi.testclient import TestClient
+from lightgraph.tests.web_client import RevisionClient as TestClient
 
 from lightgraph.contracts import ColumnSpec, TableSpec
 from lightgraph.errors import LightGraphError

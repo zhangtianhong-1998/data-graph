@@ -13,7 +13,7 @@ from lightgraph.runtime.config import RunConfig
 from lightgraph.runtime.retention import retain_check
 from lightgraph.sources import MemorySource
 from lightgraph.store import GraphStore
-from lightgraph.tests.test_agent_pipeline import client, input_packet, response, group
+from lightgraph.tests.test_agent_pipeline import client, input_packet, response, group, supported_semantic_review
 
 
 def table(name, source="s", columns=("key", "label", "amount")):
@@ -118,6 +118,7 @@ def test_cross_source_agent_reference_is_verified_and_published(tmp_path, monkey
         "# 含义\n指标使用度量。指标表的 measure_ref 引用度量表的 code。"))
     def handler(request):
         _,p=input_packet(request)
+        if p['task']=='semantic_review':return response(supported_semantic_review(p))
         if p["task"]=="T0_discovery":
             if p["scope"]["source_id"]=="database":
                 return response(group(p,"metric","title",kind="Metric"))

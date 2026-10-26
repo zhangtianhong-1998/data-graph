@@ -12,6 +12,9 @@ def export_graph(store,output,*,scopes,domain='default',include_candidates=True)
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     graph=store.view(scopes,domain=domain,include_candidates=include_candidates)
     graph.update(format_version='1.0',isolation_domain=domain,scopes=sorted(scopes))
+    from .schema import snapshot_schema
+    atomic_text(output/'graph.schema.json',json.dumps(snapshot_schema(graph.get('semantic_schema')),
+                                                     ensure_ascii=False,sort_keys=True,indent=2))
     atomic_text(output/'graph.json',json.dumps(graph,ensure_ascii=False,sort_keys=True,indent=2))
     atomic_text(output/'graph.yaml',yaml.safe_dump(graph,allow_unicode=True,sort_keys=True))
     for key in ('nodes','edges'):

@@ -1,6 +1,6 @@
 """Partially entered connections survive refresh without becoming live sources."""
 import pytest
-from fastapi.testclient import TestClient
+from lightgraph.tests.web_client import RevisionClient as TestClient
 
 from lightgraph.web.app import create_app
 

@@ -236,6 +236,11 @@ def proposal_fixture():
         "namespace_columns":[_column_id(t,"tenant")],"path_semantics":"relative_path","identity_domain":"items",
         "identity_evidence":[ref],"attribute_evidence":[ref],"taxonomy":"finance","taxonomy_evidence":[ref],
         "position_semantics":"ordinal_slots","position_evidence":[ref],"ordering_evidence":[ref]}
+    from lightgraph.discovery.semantics import declaration_block
+    doc['text']+='\n'+declaration_block('public.items','relative_identity',['l1_code','l2_code'],parameters={
+        'identity_domain':'items','identity_scope':'namespace_local','taxonomy':'finance',
+        'position_semantics':'ordinal_slots','context_qualifiers':{},'allow_dag':False})
+    doc['text']+='\n'+declaration_block('public.items','ordered_hierarchy',['l1_code','l2_code'])
     batch=ProposalBatch.model_validate({"task":"T3_hierarchy","proposals":[
         {"kind":"wide_hierarchy","evidence_cited":[ref],"claim":claim}]})
     return t,doc,batch

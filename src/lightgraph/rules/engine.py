@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import json
 import math
+import uuid
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -79,8 +80,9 @@ class RuleEngine:
     def _partitions(self, adapter, table, rule):
         """Enumerate a complete, bounded partition set in the caller's snapshot.
 
-        Values and predicates remain in this call's memory. Only opaque logical
-        partition references enter publication records; these are not CDC keys.
+        Values, predicates and ordinal batch references stay in this call's
+        memory. All batches belong to one complete rule publication, never to
+        durable partitions identified by a source value or its hash.
         """
         columns = rule.scope.partition_by
         if not columns:
@@ -93,13 +95,13 @@ class RuleEngine:
         try:
             from ..query.predicate import combine_scope_predicates
             partitions = []
-            for row in sorted(rows, key=canonical):
+            for index, row in enumerate(sorted(rows, key=canonical)):
                 values = [row[c] for c in columns]
                 filters = [{"column": c, "op": "is_null"} if value is None else
                            {"column": c, "op": "eq", "value": value}
                            for c, value in zip(columns, values)]
                 predicate = combine_scope_predicates(rule.scope.predicate, {"all": filters})
-                partitions.append(("partition_" + digest(columns, values), predicate))
+                partitions.append((f"batch_{index}", predicate))
             # An empty full scope still needs a completed publication and rule
             # record. This empty read also validates the source snapshot before
             # withdrawing any formerly observed partitions.
@@ -109,6 +111,19 @@ class RuleEngine:
 
     def _validate(self, rule, rows):
         codes=[]
+        evidence = rule.evidence
+        requires_semantics = (rule.kind in {"reference", "wide_hierarchy", "long_hierarchy"}
+                              or rule.identity.semantic_resolution != "source_scoped")
+        if getattr(evidence, "origin", "user_rule") == "discovery" and requires_semantics:
+            # An extractor's arbitrary nonempty string is not approval. Explicit
+            # configured rules remain user decisions; discoveries need a scoped
+            # affirmative review and must carry no unresolved counter-evidence.
+            status = getattr(evidence, "semantic_status", "unresolved")
+            if (status != "supported" or
+                    getattr(evidence, "semantic_decision", "unreviewed") not in {"explicit_declaration", "model_review"} or
+                    not getattr(evidence, "conditions_satisfied", False) or
+                    getattr(evidence, "refuting_refs", [])):
+                return ["semantic_evidence_refuted" if status == "refuted" else "semantic_evidence_unresolved"]
         if rule.kind == "reference":
             if not rule.evidence.semantic_basis:
                 codes.append("semantic_evidence_missing")
@@ -152,6 +167,7 @@ class RuleEngine:
         rule = RuleSpec.model_validate(rule.model_dump(mode="json", by_alias=True))
         outcome = ExecutionResult(rule.rule_id)
         prior_bindings = dict(self.bindings)
+        prior_policy = self.store.policy
         self.bindings = {key: value for key, value in self.bindings.items() if key[0] != rule.rule_id}
         publications = []
         partitions = []
@@ -172,6 +188,7 @@ class RuleEngine:
                 raise LightGraphError("document_dependency_stale")
             from .compiler import validate_plan
             validate_plan(rule)
+            self.store.policy = self.store.preview_rule_semantics(rule)
             if any(adapter.capabilities().capabilities.get(c) != "verified" for c in rule.required_capabilities):
                 raise LightGraphError("unsupported_dialect")
             rule = rule.model_copy(deep=True)
@@ -181,12 +198,11 @@ class RuleEngine:
                 excluded = {"status", "validation_ref", "coverage"}
                 if canonical(existing.model_dump(exclude=excluded)) != canonical(rule.model_dump(exclude=excluded)):
                     raise LightGraphError("rule_revision_conflict")
-            old_heads = {h["partition_id"]: h for h in self.store.heads() if h["logical_rule_id"] == rule.rule_id}
             versions = {"schema": rule.dependencies.schema_ref, "operator": rule.dependencies.operator_version,
                         "documents": rule.dependencies.documents,
                         "identity": digest(rule.identity.model_dump()),
                         "hierarchy": digest(rule.hierarchy.model_dump() if rule.hierarchy else None)}
-            validation = ValidationRecord(validation_id="v_" + digest(rule.rule_id, rule.revision, time.time_ns())[:24],
+            validation = ValidationRecord(validation_id="v_" + uuid.uuid4().hex,
                 rule_id=rule.rule_id, checks={"distinct_tuples": 0, "conflicts": 0},
                 coverage=Coverage(scope="full", consistent=False), status="validated", codes=[])
             outcome.validation = validation
@@ -196,12 +212,15 @@ class RuleEngine:
                 if not adapter.capabilities().consistent_snapshot:
                     raise LightGraphError("snapshot_unavailable")
                 partitions, enumerated = self._partitions(adapter, table, rule)
-                validation.coverage = Coverage(scope="partition" if rule.scope.partition_by else "full",
-                    partitions=[pid for pid, _ in partitions], consistent=True)
+                validation.coverage = Coverage(scope="full", partitions=["all"], consistent=False)
                 rule.coverage = validation.coverage
                 outcome.counts["partitions_enumerated"] = enumerated
+                publication = self.store.begin_publication(rule.rule_id, rule.revision, "all", versions,
+                                                           replace_rule=True)
+                publications.append(publication)
+                outcome.active_publication_ids.append(publication)
                 all_codes = set()
-                for partition_id, predicate in partitions:
+                for _, predicate in partitions:
                     if time.monotonic() - started > rule.budget.max_seconds:
                         raise LightGraphError("query_timeout")
                     rows = self._rows(adapter, table, cols, rule, predicate=predicate)
@@ -211,10 +230,6 @@ class RuleEngine:
                         outcome.codes = codes
                         validation.status = "rejected"
                         raise LightGraphError("rule_partition_validation_failed")
-                    publication = self.store.begin_publication(rule.rule_id, rule.revision, partition_id, versions,
-                        base_generation=old_heads.get(partition_id, {}).get("generation", 0))
-                    publications.append(publication)
-                    outcome.active_publication_ids.append(publication)
                     if rule.kind == "reference":
                         counts, codes = self._references(publication, rule, rows)
                     elif rule.kind == "wide_hierarchy":
@@ -237,16 +252,15 @@ class RuleEngine:
                         raise LightGraphError("memory_budget_exhausted")
                     if time.monotonic() - started > rule.budget.max_seconds:
                         raise LightGraphError("query_timeout")
-                active = {pid for pid, _ in partitions}
-                retired = set(old_heads) - active
-                outcome.counts["partitions_withdrawn"] = len(retired)
-                for partition_id in sorted(retired):
-                    publications.append(self.store.begin_publication(rule.rule_id, rule.revision, partition_id, versions,
-                        base_generation=old_heads[partition_id]["generation"]))
+                # Source batches are not persistent identities. Withdrawals are
+                # reconciled over the complete replacement's support set.
+                outcome.counts["rule_generations_prepared"] = 1
                 outcome.codes = sorted(all_codes)
             # An outer snapshot exit failure invalidates the entire enumeration,
             # including partitions read and staged successfully before the failure.
+            validation.coverage.consistent = True
             validation.codes = outcome.codes
+            self.store.register_rule_semantics(rule)
             self.store.put_validation(validation)
             validation_persisted = True
             if not existing:
@@ -282,7 +296,7 @@ class RuleEngine:
                     # Never rewrite a successful immutable validation merely
                     # because the later visibility/CAS step was rejected.
                     validation = validation.model_copy(deep=True)
-                    validation.validation_id = "v_" + digest(validation.validation_id, "publication_failure", time.time_ns())[:24]
+                    validation.validation_id = "v_" + uuid.uuid4().hex
                     outcome.validation = validation
                 if validation.status == "validated":
                     validation.status = "unresolved"
@@ -293,6 +307,7 @@ class RuleEngine:
         finally:
             if not outcome.published and not outcome.prepared:
                 self.bindings = prior_bindings
+                self.store.policy = prior_policy
             rows.clear()
             partitions.clear()
 
@@ -314,8 +329,9 @@ class RuleEngine:
                               self._support(rule,binding,scope,partition_id))
 
     def _identity(self, rule, row, key, *, extra_definition=None, binding_columns=None):
+        from ..identity.registry import DEFINITION_FIELDS
         definition={k:row.get(c) for k,c in rule.attributes.single_valued.items()
-                    if k not in ("label","business_code") and row.get(c) is not None}
+                    if k in DEFINITION_FIELDS and k not in ("label","business_code") and row.get(c) is not None}
         if extra_definition:definition.update(extra_definition)
         if rule.identity.semantic_key_columns:
             definition["definition"] = canonical([row.get(c) for c in rule.identity.semantic_key_columns])
@@ -489,11 +505,10 @@ class RuleEngine:
         return {"entities":len(ids),"edges":len(records),"projected_tuples":len(rows)},codes
 
     def _references(self,pub,rule,rows):
-        from ..store.policy import RELATION_ENDPOINT_KINDS
         endpoint_rules={r.rule_id:r for r in self.store.get_rules()}
         source_rule=endpoint_rules.get(rule.relation.source_rule_id)
         target_rule=endpoint_rules.get(rule.relation.target_rule_id)
-        allowed=RELATION_ENDPOINT_KINDS.get(rule.relation.relation)
+        allowed=self.store.policy.relation_endpoint_kinds(rule.relation.relation)
         if not source_rule or not target_rule:
             return {"edges":0},["reference_rule_not_validated"]
         if not allowed or source_rule.identity.entity_kind not in allowed[0] or target_rule.identity.entity_kind not in allowed[1]:

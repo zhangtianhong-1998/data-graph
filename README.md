@@ -1,16 +1,16 @@
 # data-graph · 轻量知识图谱
 
-从 Gauss、MySQL 数据库、Excel 和 CSV 中发现实体列组、层级和引用规则，再用规则生成图谱。一次运行可以混合这些来源。Markdown 可以提供全局说明、表列定义和带出处与条件的分析知识。图中分开显示业务实体、表与列、文档来源。
+根据用户填写的抽取目标，从 Gauss、MySQL、Excel 和 CSV 中发现表内实体、跨表关系，并将已确认的规则应用到数据，生成图谱。对象可以由多个字段共同定义；字段关系作为实体关系的推导依据保留。Markdown 提供全局说明、表列定义和带出处与条件的分析知识。图中分开显示业务实体、表与列、文档来源。
 
 **所有源码均在 `src/`：Python 后端与引擎位于 `src/lightgraph/`，Vue 3 工作台位于 `src/workbench/`。** 本项目不需要图数据库。SQLite 只保存抽取结果、规则、来源支持和发布记录；数据库查询返回的行、抽样、模型请求和响应不会进入结果库。
 
 依赖的本轮实测版本记录在 `requirements.lock`；需要复现环境时先安装该文件，再安装项目。
 
-当前运行能力与验证边界见 [实施与验收记录](IMPLEMENTATION_STATUS.md)。架构依据是 [设计 v1.0](design/lightweight_graph/README.md)。
+当前运行能力与验证边界见 [实施与验收记录](IMPLEMENTATION_STATUS.md)。当前需求见 [用户故事](design/lightweight_graph/US.md) 和 [目标驱动迭代方案](design/lightweight_graph/GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)；[设计索引](design/lightweight_graph/README.md) 保留各项约束与历史边界。
 
 ## 启动 Vue 工作台
 
-工作台通过 FastAPI 管理项目、上传文件、配置目标和 Markdown 范围，并调用现有抽取引擎。先安装下面的 Python 依赖，再构建前端（Node.js 22.12+ 的 22.x、24.x 或 26+）：
+当前工作台按源码 checkout 交付，Python wheel 尚未包含 Vue 构建产物。单独安装 wheel 不会得到完整页面。以下命令在仓库根目录运行：先安装下面的 Python 依赖，再构建前端（Node.js 22.12+ 的 22.x、24.x 或 26+）：
 
 ```bash
 npm --prefix src/workbench ci
@@ -24,14 +24,22 @@ npm --prefix src/workbench run build
 
 ```text
 workspace/<项目编号>/
-  project.yaml         # 项目信息和文件清单
+  project.yaml         # 项目信息、配置修订和文件清单
   config.yaml          # 目标、来源、模型和预算配置
   files/               # 上传的 Excel、CSV、YAML、Markdown
   output/              # 元数据 YAML、图谱与引擎报告
   runs/                # 历次任务状态和安全报告
 ```
 
-上传文件是用户提供的项目资产，可以保存；数据库检索结果仍只在运行内存中使用。`workspace/` 不提交 Git。YAML 配置只允许引用本项目登记的文件，Markdown 默认全局，可绑定读取到的具体表。MySQL/Gauss 可以直接填写连接信息并测试、读取表清单，也支持手动输入表名或导入 Excel 表清单。数据库连接可以按项目加密保存在本机，刷新页面或重启服务后加载；取消保存则仅保留在会话内存。模型 API key 仍只在当前会话内使用。明文凭据不进入配置、导出的 YAML 或运行记录。已有 `api_key_env` / `dsn_env` 配置仍可使用。高级列权限和 CSV 格式可通过完整配置编辑器或上传的运行 YAML 设置。元数据提供 tables.yaml、constraints.yaml 和 foreign_keys.yaml 的预览与下载；本轮不开放物理声明的在线改写。
+上传文件是用户提供的项目资产，可以保存；数据库检索结果仍只在运行内存中使用。`workspace/` 不提交 Git。YAML 配置只允许引用本项目登记的文件，Markdown 默认全局，可绑定读取到的具体表。MySQL/Gauss 可以直接填写连接信息并测试、读取表清单，也支持手动输入表名或导入 Excel 表清单。数据库连接可以按项目加密保存在本机，刷新页面或重启服务后加载；取消保存则仅保留在会话内存。模型 API key 仍只在当前会话内使用。明文凭据不进入配置、导出的 YAML 或运行记录。已有 `api_key_env` / `dsn_env` 配置仍可使用。高级列权限和 CSV 格式通过“Agent 与模型”中的完整 JSON 配置编辑器设置，保存后由服务端写成 YAML。普通数据上传入口接收 Excel/CSV，文档入口接收 Markdown，不提供通用运行 YAML 上传按钮。元数据提供 tables.yaml、constraints.yaml 和 foreign_keys.yaml 的预览与下载；本轮不开放物理声明的在线改写。
+
+新项目及省略类型列表的 CLI/一般配置默认“由 Agent 根据目标发现”对象与关系类型，支持人员、组织或用户定义的业务对象；显式指定的非空类型列表继续限制范围，已有配置保留。关闭模型时只执行已有规则和可核验的声明，结构匹配或自然语言关键词不能自动证明业务关系。启用模型后，发现与独立语义复核分别检查提案、条件、反证和出处。用户无需编写 JSON 声明，也无需预先提供统一编号；无模型合成实验中的结构化声明仅用于固定验收输入。
+
+配置保存带持久化修订号。高级 JSON 会在启动、上传或刷新元数据前保存；若普通表单和 JSON 同时修改，页面要求明确选择，不能静默覆盖。其他页面已保存新版本时，旧页面收到冲突并保留草稿；运行记录显示启动时冻结的配置修订。
+
+业务图默认只显示已接受事实，可显式打开候选与未决视图。点击节点或边可查看状态、规则、来源绑定、文档及字段映射。归并候选面板展示原始对象与依据，允许确认为同一对象、确认为不同对象以及撤销裁决。裁决按版本保存，合法的多种业务关系分别保留；原始事实与历史不改写，相关依据变化后需要重新检查。当前面板不提供任意关系冲突的完整裁决工具，也不替代客户语义验收。
+
+数据库连接窗口的“运行权限与高级选项”提供能力清单生成指引、YAML 上传和绑定。先在获准环境用 `lightgraph connect-check <运行配置.yaml> --verify-runtime --output capabilities.yaml` 生成与来源对应的结果，再上传选择。上传只校验清单格式；实际运行仍核对数据库产品、版本、驱动、一致快照和所需能力。读取元数据不代表实例抽取已通过验证。
 
 服务默认只监听本机，每个 workspace 只允许一个服务。页面按秒轮询真实任务状态；不向浏览器传送查询样本、模型原文，也不虚构进度百分比。详细接口、当前范围和启动方式见 [Vue 工作台实现](design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md)。原 [交互设计](design/lightweight_graph/WORKBENCH_DESIGN.md) 和 [用户故事](design/lightweight_graph/WORKBENCH_US.md) 中的后续能力仍单独列出。旧合成原型保留在 `src/lightgraph/workbench_prototype/`，不再作为实际工作台入口。
 
@@ -52,7 +60,7 @@ python3 -m venv .venv
 
 Windows 的安装、测试与启动命令见 [Windows 兼容说明](design/lightweight_graph/WINDOWS_COMPATIBILITY.md)。输出目录和工作台服务使用跨进程文件锁；Windows 不会跳过单写者检查。
 
-`verify` 分别执行固定规则实验 E 和自动发现实验 D，并核对共享实体、缺层、同层兄弟节点、指标与度量关系、重复运行及输出中不含排除列内容。它使用合成数据，不调用模型。真实 Gauss 和真实模型验收单独记为未执行。
+`verify` 分别执行固定规则实验 E 和声明驱动的确定性发现实验 D，并核对共享实体、缺层、同层兄弟节点、指标与度量关系、重复运行及输出中不含排除列内容。它使用合成数据与明确语义声明，不调用模型；不能证明自然语言理解质量或客户业务正确性。真实 Gauss/MySQL 接入、真实模型发现质量、客户 Gold 对照与部署留存分别验收。F 场景的已有测试映射及剩余验收见 [验收台账](design/lightweight_graph/acceptance_matrix.yaml)。
 
 结果位于 `runs/acceptance/acceptance.json`，两份可视化在 `runs/acceptance/E/viewer.html` 和 `runs/acceptance/D/viewer.html`。验收目录必须为空，避免把两次实验混在一起。
 
@@ -66,7 +74,7 @@ Windows 的安装、测试与启动命令见 [Windows 兼容说明](design/light
 .venv/bin/lightgraph run examples/discovery.yaml
 ```
 
-`run.yaml` 使用已写好的规则；`discovery.yaml` 根据数据和说明文档发现规则。两者使用不同结果目录。只发现并验证规则、暂不保存图谱时：
+`run.yaml` 使用已写好的规则；`discovery.yaml` 根据数据和合成说明文档中的明确声明发现规则。两者使用不同结果目录。只发现并验证规则、暂不保存图谱时：
 
 ```bash
 .venv/bin/lightgraph discover examples/discovery.yaml
@@ -144,7 +152,7 @@ goal:
 
 启用模型后，每次发现、元数据解释、反例修订和文档抽取调用都携带目标、阶段和子任务。Agent 提出假设、调用工具、读取临时结果，再决定继续查询还是提交结构化规则候选；程序随后验证规则并批量构图。工具根据参数和 SQL AST 更新实际涉及表，下一轮调用使用相应说明；切换任务时重新组装上下文。Agent 路径不要求列名匹配预设的 `_code`、`_name` 等模式。`model.mode: disabled` 保留确定性发现，适合离线合成实验，不能据此判断任意业务数据的语义发现效果。
 
-`include`、`exclude` 和 `discovery_guidance` 是文字指引；`entity_kinds`、`relation_kinds`、`source_scope`、`excluded_columns` 和 `evidence_only_columns` 是程序检查的范围。`excluded_columns` 不允许查询或投影；`evidence_only_columns` 可以辅助探查，但不能成为输出的实体键、名称、属性或关系端点。无需为每个任务手写列清单，发现阶段也会提出各列的用途。数值列的定义可以代表指标或度量，排除观测值不等于丢弃这些列的元数据。目标配置变更会使发现依赖失效，重新发现规则。
+`include`、`exclude` 和 `discovery_guidance` 是文字指引；`entity_kinds`、`relation_kinds`、`source_scope`、`excluded_columns` 和 `evidence_only_columns` 是程序检查的范围。两个类型列表省略或为空表示按目标发现，非空时只接受指定类别；新类别仍须经过 SemanticSchema 的类型、属性和关系端点检查。`excluded_columns` 不允许查询或投影；`evidence_only_columns` 可以辅助探查，但不能成为输出的实体键、名称、属性或关系端点。无需为每个任务手写列清单，发现阶段也会提出各列的用途。数值列的定义可以代表指标或度量，排除观测值不等于丢弃这些列的元数据。目标配置变更会使发现依赖失效，重新发现规则。
 
 目标不能放宽数据库权限、SQL 策略或数据保留要求。工具返回值、模型对话和查询参数只在当前运行的内存中使用；结果库保存通过验证的规则和图事实。完整流程及限制见 [发现 Agent 更新](design/lightweight_graph/AGENT_DISCOVERY_UPDATE.md)。
 

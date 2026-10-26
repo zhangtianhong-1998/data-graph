@@ -35,6 +35,14 @@ def test_safe_sql_reads_actual_authorized_values_with_bound_parameter():
     tools.close(); adapter.close()
 
 
+def test_reopened_executor_does_not_reuse_packet_evidence_ids():
+    adapter,tools=fixture()
+    tools.reserve_probe_ids(['probe_0001','probe_0002','full_fd_check'])
+    result=tools.execute('execute_readonly_sql',{'sql':'SELECT code FROM public.items'})
+    assert result['status']=='ok' and result['probe_id']=='probe_0003'
+    tools.close();adapter.close()
+
+
 @pytest.mark.parametrize("sql", [
     "DELETE FROM public.items", "UPDATE public.items SET label = 'x'",
     "INSERT INTO public.items(code) VALUES ('x')", "SELECT code FROM public.items; SELECT code FROM public.items",

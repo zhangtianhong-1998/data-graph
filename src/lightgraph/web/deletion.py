@@ -357,7 +357,7 @@ def delete_input(workspace, pid, *, fid=None, sid=None, table=None):
             raise LightGraphError('workspace_path_forbidden')
     backups = {p: p.read_bytes() if p.exists() else None for p in [*writes, *deletions]}
     try:
-        workspace._write_yaml(workspace._path(pid, 'config.yaml'), clean)
+        workspace._write_config(pid, clean)
         workspace._save(project)
         for path, value in writes.items():
             path.parent.mkdir(mode=0o700, exist_ok=True)
@@ -365,7 +365,7 @@ def delete_input(workspace, pid, *, fid=None, sid=None, table=None):
         for path in deletions:
             path.unlink(missing_ok=True)
     except Exception:
-        workspace._write_yaml(workspace._path(pid, 'config.yaml'), original_config)
+        workspace._write_config(pid, original_config)
         workspace._save(original_project)
         for path, value in backups.items():
             if value is None:

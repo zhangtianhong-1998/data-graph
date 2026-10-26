@@ -189,7 +189,7 @@ class RunManager:
             if self.active(pid):
                 raise LightGraphError("project_run_active")
             project, runs = self._paths(pid)
-            config = self.workspace.resolved_config(pid)
+            config = self.workspace.resolved_config(pid).model_copy(deep=True)
             if not config.goal.purpose.strip():
                 raise LightGraphError("extraction_purpose_required")
             if not config.sources and not config.documents:
@@ -205,7 +205,7 @@ class RunManager:
                       "created_at": _now(), "finished_at": None, "report": None,
                       "error_code": None, "cleanup_status": "pending",
                       "dependencies": payload["dependencies"],
-                      "config_revision": digest(config.model_dump(mode="json", by_alias=True))}
+                      "config_revision": self.workspace.config_revision(pid)}
             _save(runs / (rid + ".json"), record)
             env = os.environ.copy()
             source_root = str(Path(__file__).resolve().parents[2])
@@ -263,7 +263,8 @@ class RunManager:
         if not entry["cancel_requested"]:
             try:
                 changed = (_input_manifest(entry["config"], self.workspace.project_path(pid)) != record["dependencies"]
-                           or digest(self.workspace.resolved_config(pid).model_dump(mode="json", by_alias=True)) != record["config_revision"])
+                           or self.workspace.config_revision(pid) != record["config_revision"]
+                           or self.workspace.resolved_config(pid) != entry["config"])
             except LightGraphError:
                 changed = True
             if changed and record["status"] in {"completed", "partial"}:
@@ -353,7 +354,7 @@ def _bounded_view(view, layer):
             "limits": {"nodes": MAX_GRAPH_NODES, "edges": MAX_GRAPH_EDGES}}
 
 
-def read_graph(workspace, pid, layer="business"):
+def read_graph(workspace, pid, layer="business", *, include_candidates=False):
     """Publication heads, not stale graph.json exports, determine current results."""
     from ..store import GraphStore
     if layer == "metadata":
@@ -363,10 +364,107 @@ def read_graph(workspace, pid, layer="business"):
     if path.is_symlink():
         raise LightGraphError("workspace_path_invalid")
     if not path.exists():
-        return _bounded_view({}, layer)
+        return {**_bounded_view({}, layer), "include_candidates": include_candidates}
     with GraphStore(path) as store:
-        view = store.view(set(config.scopes), domain=config.isolation_domain, include_candidates=True)
-    return _bounded_view(view, layer)
+        view = store.view(set(config.scopes), domain=config.isolation_domain, include_candidates=include_candidates)
+    result = _bounded_view(view, layer)
+    result["include_candidates"] = include_candidates
+    return result
+
+
+def read_graph_details(workspace, pid, *, entity_id=None, fact_id=None, include_candidates=False, offset=0):
+    """Return bounded fact-level provenance only after support authorization."""
+    from ..store import GraphStore
+    if bool(entity_id) == bool(fact_id) or offset < 0:
+        raise LightGraphError("graph_selection_invalid")
+    config = workspace.resolved_config(pid)
+    path = Path(config.output_dir) / "graph.sqlite"
+    if path.is_symlink():
+        raise LightGraphError("workspace_path_invalid")
+    if not path.exists():
+        raise LightGraphError("graph_item_not_found")
+    with GraphStore(path) as store:
+        view = store.view(set(config.scopes), domain=config.isolation_domain, include_candidates=include_candidates)
+        if entity_id:
+            if not any(n["id"] == entity_id for n in view["nodes"]):
+                raise LightGraphError("graph_item_not_found")
+            selected = [f for f in view["facts"] if f["payload"].get("entity_id") == entity_id
+                        or entity_id in (f["payload"].get("source"), f["payload"].get("target"))]
+        else:
+            selected = [f for f in view["facts"] if f["id"] == fact_id]
+            if not selected:
+                raise LightGraphError("graph_item_not_found")
+        # Page facts, rather than silently discarding all provenance beyond the canvas cap.
+        facts = selected[offset:offset + 50]
+        ids = {f["id"] for f in facts}
+        supports = [v for v in view["supports"] if v["fact_id"] in ids]
+        visible_rules = {(v["rule_id"], v["rule_revision"]) for v in supports}
+        rules = []
+        for rule in store.get_rules(include_stale=True):
+            if (rule.rule_id, rule.revision) not in visible_rules:
+                continue
+            # Source column mappings and evidence references, never runtime samples or predicates.
+            rules.append({"rule_id": rule.rule_id, "revision": rule.revision, "kind": rule.kind,
+                "source": rule.source.model_dump(mode="json", by_alias=True),
+                "identity_columns": list(rule.identity.key_columns) if rule.identity else [],
+                "attribute_columns": rule.attributes.model_dump(mode="json") if rule.attributes else {},
+                "semantic_basis": list(rule.evidence.semantic_basis)})
+    return {"facts": facts, "supports": supports[:500], "rules": rules,
+            "total_facts": len(selected), "total_supports": len(supports),
+            "supports_truncated": len(supports) > 500,
+            "next_offset": offset + len(facts) if offset + len(facts) < len(selected) else None,
+            "include_candidates": include_candidates}
+
+
+def identity_review(workspace, pid, *, offset=0, decision_offset=0):
+    """Show original endpoints and authorized evidence before identity decisions."""
+    from ..store import GraphStore
+    from ..identity.reconciliation import list_candidates
+    if offset < 0 or decision_offset < 0:
+        raise LightGraphError("graph_selection_invalid")
+    config = workspace.resolved_config(pid)
+    path = Path(config.output_dir) / "graph.sqlite"
+    if path.is_symlink():
+        raise LightGraphError("workspace_path_invalid")
+    if not path.exists():
+        return {"revision": 0, "candidates": [], "decisions": [], "total_candidates": 0, "next_offset": None, "total_decisions": 0, "next_decision_offset": None}
+    with GraphStore(path) as store:
+        scopes = set(config.scopes)
+        listing = list_candidates(store, scopes, config.isolation_domain)
+        graph = store.view(scopes, domain=config.isolation_domain, include_candidates=True, apply_resolutions=False)
+        nodes = {n["id"]: n for n in graph["nodes"]}
+        facts = {f["id"]: f for f in graph["facts"]}
+        candidates = []
+        for item in listing["candidates"][offset:offset + 50]:
+            evidence = set(item["evidence"])
+            supports = [s for s in graph["supports"] if s["fact_id"] in evidence]
+            candidates.append({**item, "has_active_decision": any(d["candidate_id"] == item["candidate_id"] and d["status"] == "active" for d in listing["decisions"]), "supports_truncated": len(supports) > 500, "nodes": [nodes[e] for e in item["members"] if e in nodes],
+                "facts": [facts[f] for f in item["evidence"] if f in facts],
+                "supports": supports[:500]})
+        decisions = [{**d, "nodes": [nodes[e] for e in d["members"] if e in nodes]}
+                     for d in list(reversed(listing["decisions"]))[decision_offset:decision_offset + 50]]
+    total = len(listing["candidates"])
+    return {"revision": listing["revision"], "candidates": candidates, "decisions": decisions,
+            "total_candidates": total, "next_offset": offset + len(candidates) if offset + len(candidates) < total else None,
+            "total_decisions": len(listing["decisions"]),
+            "next_decision_offset": decision_offset + len(decisions) if decision_offset + len(decisions) < len(listing["decisions"]) else None}
+
+
+def resolve_identity(workspace, pid, *, candidate_id=None, verdict=None, decision_id=None, expected_revision):
+    """The caller serializes this mutation with runs and project configuration."""
+    from ..store import GraphStore
+    from ..identity.reconciliation import decide, revoke
+    config = workspace.resolved_config(pid)
+    path = Path(config.output_dir) / "graph.sqlite"
+    if path.is_symlink():
+        raise LightGraphError("workspace_path_invalid")
+    if not path.exists():
+        raise LightGraphError("identity_candidate_not_found")
+    with GraphStore(path) as store:
+        options = {"scopes": set(config.scopes), "domain": config.isolation_domain, "expected_revision": expected_revision}
+        if decision_id:
+            return revoke(store, decision_id, **options)
+        return decide(store, candidate_id, verdict, **options)
 
 
 def _metadata_context(config, project_path):

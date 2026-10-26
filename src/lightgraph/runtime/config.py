@@ -90,6 +90,10 @@ class RunConfig(StrictModel):
     max_working_bytes: int = Field(default=32*1024*1024, gt=0)
     max_db_queries: int = Field(default=240, gt=0)
     max_partitions: int = Field(default=256, ge=1, le=4096)
+    max_discovery_rounds: int = Field(default=3, ge=1, le=8)
+    max_reconciliation_entities: int = Field(default=5000, ge=1, le=100000)
+    max_reconciliation_candidates: int = Field(default=256, ge=1, le=4096)
+    max_identity_reviews: int = Field(default=8, ge=0, le=64)
     max_run_seconds: float = Field(default=1800, gt=0)
     # Customer deployment must attest all external retention paths before live instance access.
     deployment_retention_verified: bool = False
@@ -176,7 +180,8 @@ def open_sources(config, *, metadata_only=False, source_credentials=None):
             if s.kind=="excel_workbook":
                 if not s.path:raise LightGraphError("config_invalid")
                 sources.append(ExcelSource(s.path,source_id=s.id,limits=config.limits,
-                    header_row=s.header_row,include_hidden=s.include_hidden,query_budget=budget))
+                    header_row=s.header_row,include_hidden=s.include_hidden,query_budget=budget,
+                    max_memory_bytes=config.max_working_bytes))
             elif s.kind=="csv_file":
                 sources.append(CSVSource(s.path,source_id=s.id,limits=config.limits,
                     encoding=s.encoding,delimiter=s.delimiter,header=s.header,

@@ -90,7 +90,7 @@ describe('删除项目与输入', () => {
     expect(dialog()?.textContent).toContain('外部数据表和已有图谱结果保留')
     button('确认删除').click()
     await vi.waitFor(() => expect(root.querySelector('.input-item.active')?.textContent).toContain('public.people'))
-    expect(deletes()[0]).toEqual(['/projects/first/sources/db/tables', { method: 'DELETE', body: JSON.stringify({ table: 'public.metrics' }) }])
+    expect(deletes()[0]).toEqual(['/projects/first/sources/db/tables', { method: 'DELETE', body: JSON.stringify({ table: 'public.metrics' }), headers: {} }])
     expect(root.querySelector('.input-metadata')?.textContent).not.toContain('metrics_name')
     button('知识文档').click(); await nextTick(); expect(root.textContent).toContain('未参与抽取')
   })

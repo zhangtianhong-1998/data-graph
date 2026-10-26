@@ -61,10 +61,8 @@ def plan_identity_migration(store, publication_ids):
     plans = []
     for new_id in publication_ids:
         new_pub = store._publication(new_id)
-        previous = store.connection.execute(
-            "SELECT publication_id FROM partition_head WHERE logical_rule_id=? AND partition_id=?",
-            (new_pub["logical_rule_id"], new_pub["partition_id"])).fetchone()
-        if not previous or previous[0] == new_id:
+        previous = store.replaced_publications(new_id)
+        if not previous:
             continue
         definition = store.connection.execute(
             "SELECT payload FROM rule WHERE rule_id=? AND revision=?",
@@ -133,25 +131,27 @@ def plan_identity_migration(store, publication_ids):
                     item["properties"].setdefault(payload["name"], set()).add(canonical(payload["value"]))
             return result
 
-        old_bindings, new_bindings = bindings(previous[0]), bindings(new_id)
-        for (old_key, old_binding, old_entity), old in old_bindings.items():
-            matches = [(key, item) for key, item in new_bindings.items()
-                       if key[0] == old_key and old["source_columns"] & item["source_columns"]]
-            targets = {key[2] for key, _ in matches}
-            for (_, new_binding, new_entity), new in matches:
-                if old_entity == new_entity:
-                    continue
-                conflicts = []
-                if len(targets) > 1:
-                    conflicts.append("ambiguous_identity_migration")
-                if old["kind"] and new["kind"] and old["kind"] != new["kind"]:
-                    conflicts.append("migration_entity_kind_conflict")
-                for name in old["properties"].keys() & new["properties"].keys():
-                    if old["properties"][name] != new["properties"][name]:
-                        conflicts.append("migration_attribute_conflict")
-                plans.append(BindingMigration(previous[0], new_id, old_binding, new_binding,
-                    old_entity, new_entity, identity["identity_domain"], evidence,
-                    "unresolved" if conflicts else "verified", tuple(sorted(set(conflicts)))))
+        new_bindings = bindings(new_id)
+        for previous_id in previous:
+            old_bindings = bindings(previous_id)
+            for (old_key, old_binding, old_entity), old in old_bindings.items():
+                matches = [(key, item) for key, item in new_bindings.items()
+                           if key[0] == old_key and old["source_columns"] & item["source_columns"]]
+                targets = {key[2] for key, _ in matches}
+                for (_, new_binding, new_entity), new in matches:
+                    if old_entity == new_entity:
+                        continue
+                    conflicts = []
+                    if len(targets) > 1:
+                        conflicts.append("ambiguous_identity_migration")
+                    if old["kind"] and new["kind"] and old["kind"] != new["kind"]:
+                        conflicts.append("migration_entity_kind_conflict")
+                    for name in old["properties"].keys() & new["properties"].keys():
+                        if old["properties"][name] != new["properties"][name]:
+                            conflicts.append("migration_attribute_conflict")
+                    plans.append(BindingMigration(previous_id, new_id, old_binding, new_binding,
+                        old_entity, new_entity, identity["identity_domain"], evidence,
+                        "unresolved" if conflicts else "verified", tuple(sorted(set(conflicts)))))
     return plans
 
 

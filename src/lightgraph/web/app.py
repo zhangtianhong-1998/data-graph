@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import uuid
 import re
+from typing import Literal
 
 import yaml
 from fastapi import FastAPI, File, Header, UploadFile
@@ -23,7 +24,7 @@ from starlette.staticfiles import StaticFiles
 
 from lightgraph.errors import LightGraphError
 from .workspace import Workspace
-from .execution import RunManager, read_graph, read_metadata
+from .execution import RunManager, read_graph, read_graph_details, read_metadata, identity_review, resolve_identity
 from .credentials import SessionCredentials
 from .saved_connections import SavedConnections
 from .connection_drafts import SaveConnectionDraft
@@ -40,6 +41,8 @@ def error_response(code: str, status: int=400) -> JSONResponse:
 
 
 def error_status(code: str) -> int:
+    if code == 'config_revision_required':
+        return 428
     if code.endswith(('_not_found','_missing')) or code in {'project_not_found','file_not_found','run_not_found'}:
         return 404
     if 'too_large' in code or 'size_limit' in code:
@@ -131,6 +134,15 @@ class DeleteTable(InputModel):
     table: str = Field(min_length=1, max_length=512)
 
 
+class IdentityRevision(InputModel):
+    revision: int = Field(ge=0,le=9007199254740991)
+
+
+class IdentityDecision(IdentityRevision):
+    candidate_id: str = Field(min_length=1,max_length=128)
+    verdict: Literal['same','different']
+
+
 class DatabaseRequest(InputModel):
     connection: ConnectionSpec
 
@@ -165,7 +177,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     app.state.saved_connections=saved_connections
     app.add_middleware(CORSMiddleware,allow_origins=sorted(ALLOWED_ORIGINS),
         allow_methods=['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-        allow_headers=['Content-Type','X-Workbench-Session'],allow_credentials=False)
+        allow_headers=['Content-Type','X-Workbench-Session','If-Match'],expose_headers=['ETag'],allow_credentials=False)
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver'])
     app.add_middleware(RequestBoundary)
 
@@ -180,6 +192,9 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     @app.exception_handler(HTTPException)
     async def http_error(request,exc):
         return error_response('not_found' if exc.status_code==404 else 'request_invalid',exc.status_code)
+
+    def versioned(pid, value, status=200):
+        return JSONResponse(value, status_code=status, headers={"ETag": workspace.config_etag(pid)})
 
     def mutable(pid):
         workspace.get(pid)
@@ -239,36 +254,38 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return workspace.rename(pid,data.name)
 
     @app.delete('/api/projects/{pid}')
-    def remove_project(pid: str, x_workbench_session: str | None = Header(default=None)):
+    def remove_project(pid: str, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
         from .deletion import delete_project
         with workspace.lock(pid):
             mutable(pid)
             credentials.require(pid, x_workbench_session)
+            workspace.require_config_revision(pid, if_match)
             result = delete_project(workspace, pid)
             credentials.clear_project(pid)
             return result
 
-    def remove_input(pid, token, **selection):
+    def remove_input(pid, token, expected, **selection):
         from .deletion import delete_input
         with workspace.lock(pid):
             mutable(pid)
             credentials.require(pid, token)
+            workspace.require_config_revision(pid, expected)
             result = delete_input(workspace, pid, **selection)
             for sid in result['removed_source_ids']:
                 credentials.clear_source_sessions(pid, sid)
-            return result
+            return versioned(pid, result)
 
     @app.delete('/api/projects/{pid}/files/{fid}')
-    def remove_file(pid: str, fid: str, x_workbench_session: str | None = Header(default=None)):
-        return remove_input(pid, x_workbench_session, fid=fid)
+    def remove_file(pid: str, fid: str, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+        return remove_input(pid, x_workbench_session, if_match, fid=fid)
 
     @app.delete('/api/projects/{pid}/sources/{sid}')
-    def remove_source(pid: str, sid: str, x_workbench_session: str | None = Header(default=None)):
-        return remove_input(pid, x_workbench_session, sid=sid)
+    def remove_source(pid: str, sid: str, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+        return remove_input(pid, x_workbench_session, if_match, sid=sid)
 
     @app.delete('/api/projects/{pid}/sources/{sid}/tables')
-    def remove_table(pid: str, sid: str, data: DeleteTable, x_workbench_session: str | None = Header(default=None)):
-        return remove_input(pid, x_workbench_session, sid=sid, table=data.table)
+    def remove_table(pid: str, sid: str, data: DeleteTable, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+        return remove_input(pid, x_workbench_session, if_match, sid=sid, table=data.table)
 
     @app.post('/api/projects/{pid}/session',status_code=201)
     def create_session(pid:str):
@@ -324,10 +341,11 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             await file.close()
 
     @app.post('/api/projects/{pid}/database/connect')
-    def database_connect(pid:str,data:ConnectDatabase,x_workbench_session:str|None=Header(default=None)):
+    def database_connect(pid:str,data:ConnectDatabase,x_workbench_session:str|None=Header(default=None),if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             credentials.require(pid,x_workbench_session)
+            workspace.require_config_revision(pid,if_match)
             old_config=workspace.get_config(pid)
             old_resolved=workspace.resolved_config(pid)
             old_secrets,_=credentials.resolve(pid,x_workbench_session,old_resolved)
@@ -377,8 +395,8 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
                 raise
             from .metadata_views import _yaml_files
             metadata['files']=_yaml_files(metadata['tables'],metadata.get('sources'))
-            return {'config':workspace.get_config(pid),'metadata':metadata,
-                    'credentials':credential_status(pid,x_workbench_session)}
+            return versioned(pid, {'config':workspace.get_config(pid),'metadata':metadata,
+                    'credentials':credential_status(pid,x_workbench_session)})
 
     def draft_source(pid, key):
         if key == 'new':
@@ -448,8 +466,48 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             credentials.clear_source_sessions(pid,sid)
             return {'saved':False}
 
+    @app.post('/api/projects/{pid}/database/capabilities',status_code=201)
+    async def upload_capabilities(pid:str,source_id:str,kind:str,file:UploadFile=File(...),if_match:str|None=Header(default=None)):
+        from ..contracts import CapabilityManifest
+        from .workspace import safe_yaml
+        from ..sources.gauss import REQUIRED_RUNTIME
+        try:
+            content=await file.read(2*1024*1024+1)
+            if len(content)>2*1024*1024:
+                raise LightGraphError('file_too_large')
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}',source_id):
+                raise LightGraphError('source_id_invalid')
+            drivers={'gauss_database':r'(?:psycopg_dbapi|psycopg/[0-9][A-Za-z0-9.+_-]*)',
+                     'mysql_database':r'(?:pymysql_dbapi|PyMySQL/[0-9][A-Za-z0-9.+_-]*)'}
+            try:
+                records=safe_yaml(content.decode('utf-8'))
+                manifest=CapabilityManifest.model_validate(records[source_id])
+                if not re.fullmatch(drivers[kind],manifest.driver):
+                    raise ValueError
+            except Exception:
+                raise LightGraphError('capability_manifest_invalid') from None
+            def save():
+                with workspace.lock(pid):
+                    mutable(pid)
+                    workspace.require_config_revision(pid,if_match)
+                    # Save only the validated selected manifest; no extra YAML payload survives.
+                    clean=yaml.safe_dump({source_id:manifest.model_dump(mode='json')},allow_unicode=True).encode()
+                    uploaded=workspace.add_file(pid,file.filename or 'capabilities.yaml',clean)
+                    if uploaded['kind']!='yaml':
+                        raise LightGraphError('capability_manifest_invalid')
+                    missing=sorted(k for k in REQUIRED_RUNTIME if manifest.capabilities.get(k)!='verified')
+                    ready=(not missing and manifest.consistent_snapshot and manifest.actual_database_verified
+                           and manifest.product not in ('','unknown') and manifest.version not in ('','unknown'))
+                    return versioned(pid,{'file':uploaded,'source_id':source_id,'runtime_ready':ready,
+                        'missing_capabilities':missing,'version_matching_required':True},201)
+            if not (file.filename or '').lower().endswith(('.yaml','.yml')):
+                raise LightGraphError('capability_manifest_invalid')
+            return await run_in_threadpool(save)
+        finally:
+            await file.close()
+
     @app.post('/api/projects/{pid}/files',status_code=201)
-    async def upload(pid:str,file:UploadFile=File(...)):
+    async def upload(pid:str,file:UploadFile=File(...),if_match:str|None=Header(default=None)):
         try:
             content=await file.read(20*1024*1024+1)
             if len(content)>20*1024*1024:
@@ -457,7 +515,8 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             def save():
                 with workspace.lock(pid):
                     mutable(pid)
-                    return workspace.add_file(pid,file.filename or '',content)
+                    workspace.require_config_revision(pid,if_match)
+                    return versioned(pid,workspace.add_file(pid,file.filename or '',content),201)
             return await run_in_threadpool(save)
         finally:
             await file.close()
@@ -474,26 +533,30 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return preview_file_metadata(workspace,pid,fid)
 
     @app.patch('/api/projects/{pid}/files/{fid}/binding')
-    def binding(pid:str,fid:str,data:DocumentBinding):
+    def binding(pid:str,fid:str,data:DocumentBinding,if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
-            return workspace.document_binding(pid,fid,data.purpose,data.scope)
+            workspace.require_config_revision(pid,if_match)
+            return versioned(pid,workspace.document_binding(pid,fid,data.purpose,data.scope))
 
     @app.get('/api/projects/{pid}/config')
     def config(pid:str):
-        return workspace.get_config(pid)
+        with workspace.lock(pid):
+            return versioned(pid,workspace.get_config(pid))
 
     @app.put('/api/projects/{pid}/config')
-    def save_config(pid:str,data:dict):
+    def save_config(pid:str,data:dict,if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
-            return workspace.save_config(pid,data)
+            workspace.require_config_revision(pid,if_match)
+            return versioned(pid,workspace.save_config(pid,data))
 
     @app.post('/api/projects/{pid}/config/import')
-    def import_config(pid:str,data:ImportConfig):
+    def import_config(pid:str,data:ImportConfig,if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
-            return workspace.import_config(pid,data.file_id)
+            workspace.require_config_revision(pid,if_match)
+            return versioned(pid,workspace.import_config(pid,data.file_id))
 
     @app.get('/api/projects/{pid}/config/export')
     def export_config(pid:str):
@@ -523,11 +586,39 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return read_metadata(workspace,pid,refresh=True,**options)
 
     @app.get('/api/projects/{pid}/graph')
-    def graph(pid:str,layer:str='business'):
+    def graph(pid:str,layer:str='business',include_candidates:bool=False):
         if layer not in ('business','metadata'):raise LightGraphError('graph_layer_invalid')
         with workspace.lock(pid):
             workspace.get(pid)
-            return read_graph(workspace,pid,layer)
+            return read_graph(workspace,pid,layer,include_candidates=include_candidates)
+
+    @app.get('/api/projects/{pid}/graph/details')
+    def graph_details(pid:str,entity_id:str|None=None,fact_id:str|None=None,include_candidates:bool=False,offset:int=0):
+        with workspace.lock(pid):
+            workspace.get(pid)
+            return read_graph_details(workspace,pid,entity_id=entity_id,fact_id=fact_id,
+                                      include_candidates=include_candidates,offset=offset)
+
+    @app.get('/api/projects/{pid}/graph/identity-candidates')
+    def identity_candidates(pid:str,offset:int=0,decision_offset:int=0):
+        with workspace.lock(pid):
+            workspace.get(pid)
+            return identity_review(workspace,pid,offset=offset,decision_offset=decision_offset)
+
+    @app.post('/api/projects/{pid}/graph/identity-decisions')
+    def identity_decision(pid:str,data:IdentityDecision,if_match:str|None=Header(default=None)):
+        with workspace.lock(pid):
+            mutable(pid)
+            workspace.require_config_revision(pid,if_match)
+            return resolve_identity(workspace,pid,candidate_id=data.candidate_id,verdict=data.verdict,
+                                    expected_revision=data.revision)
+
+    @app.post('/api/projects/{pid}/graph/identity-decisions/{decision_id}/revoke')
+    def revoke_identity(pid:str,decision_id:str,data:IdentityRevision,if_match:str|None=Header(default=None)):
+        with workspace.lock(pid):
+            mutable(pid)
+            workspace.require_config_revision(pid,if_match)
+            return resolve_identity(workspace,pid,decision_id=decision_id,expected_revision=data.revision)
 
     @app.get('/api/projects/{pid}/runs')
     def runs(pid:str):
@@ -535,10 +626,11 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return {'runs':manager.list(pid)}
 
     @app.post('/api/projects/{pid}/runs',status_code=202)
-    def start_run(pid:str,x_workbench_session:str|None=Header(default=None)):
+    def start_run(pid:str,x_workbench_session:str|None=Header(default=None),if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             sources,model=resolved_credentials(pid,x_workbench_session)
+            workspace.require_config_revision(pid,if_match)
             options={}
             if sources:options['source_credentials']=sources
             if model is not None:options['model_api_key']=model

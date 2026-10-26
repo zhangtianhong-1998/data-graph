@@ -5,6 +5,18 @@ const messages: Record<string, string> = {
   project_not_found: '项目不存在，请重新选择。', project_exists: '项目编号已存在，请更换编号。',
   invalid_project_id: '项目编号只能包含字母、数字、短横线和下划线。',
   invalid_project_or_file_id: '项目编号须以字母或数字开头，其余只能包含字母、数字、短横线和下划线。',
+  config_revision_required: '请重新读取项目配置后再操作。',
+  config_revision_conflict: '配置已被其他页面修改，本地草稿已保留。请检查服务器配置后重新加载。',
+  capability_manifest_invalid: '能力清单格式无效，或不包含当前来源编号。',
+  runtime_capability_unverified: '数据库实例处理能力尚未验证，请上传并绑定对应版本的能力清单。',
+  resolution_revision_conflict: '候选裁决已被其他页面修改，请刷新候选后核对。',
+  resolution_cluster_review_required: '这组候选涉及已归并对象，请先撤销相关裁决，再完整检查对象组。',
+  resolution_attribute_conflict: '对象的定义属性存在冲突，暂不能确认为同一对象。',
+  resolution_type_conflict: '对象类型不同，暂不能归并。',
+  resolution_cannot_link_conflict: '这组对象已有不同对象裁决，请先核对并撤销冲突裁决。',
+  resolution_hierarchy_self_loop: '归并会使上下级关系指向自身，请重新检查。',
+  resolution_requires_accepted_endpoints: '候选对象尚未接受，请先完成语义确认。',
+  resolution_evidence_changed: '候选的来源依据已变化，请重新运行并检查。',
   config_invalid: '配置未通过校验，请检查来源、模型和抽取范围。',
   model_credential_missing: '请在 Agent 与模型中填写当前会话的 API key，或配置服务器环境变量。', source_credential_missing: '请重新连接数据库，或检查服务器的连接环境变量。',
   session_required: '连接会话已失效，请刷新页面后重新填写凭据。', session_invalid: '连接会话已失效，请刷新页面后重新填写凭据。',
@@ -78,6 +90,11 @@ export async function ensureSession(projectId: string): Promise<void> {
   pendingSessions.set(id, pending)
   return pending
 }
+// Revision metadata belongs to the response object, never the editable config.
+const responseRevisions = new WeakMap<object, string>()
+export function responseRevision(value: unknown): string | undefined {
+  return value !== null && typeof value === 'object' ? responseRevisions.get(value) : undefined
+}
 export type RequestOptions = RequestInit & { timeoutMs?: number }
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { timeoutMs = 60000, signal, ...init } = options
@@ -98,6 +115,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       // Render only the short public error code; never reflect raw server errors or HTML.
       throw new ApiError(typeof code === 'string' && /^[a-zA-Z0-9_.:-]{1,100}$/.test(code) ? code : `http_${response.status}`, response.status)
     }
+    if (data !== null && typeof data === 'object' && response.headers.get('etag')) responseRevisions.set(data, response.headers.get('etag')!)
     return data as T
   } catch (error) {
     if (timedOut) throw new ApiError('request_timeout')

@@ -77,14 +77,14 @@ workspace/
 
    Gauss 适配器使用保存点探测可选的 `lock_timeout`，仅遇到已知“不支持参数”错误时恢复保存点并继续，保留已开启的只读事务及快照。接入层与正式抽取共用严格 UTF-8 元数据解码；非法编码会报错，不替换标识符。表发现跳过名称含点号的表并返回 `skipped_count`，仍按扫描数判断截断，不把其余异常目录行静默忽略。移除额外的 `search_path` 设置，固定目录对象和函数使用限定名；原查询已是 `information_schema.tables`，不能据此宣称原来“看不到 information_schema”（参见 [PostgreSQL 说明](https://www.postgresql.org/docs/17/infoschema-schema.html)）。错误诊断保留安全类别与 SQLSTATE，不记录驱动原文或原始异常链。
 
-   当前 macOS 后端全量 1,093 项、前端 105 项测试及构建通过。SSL 模式覆盖分项、原生 DSN、JDBC、选表、元数据读取后的会话传递，以及正式抽取适配器传参。浏览器通过 4173 代理验证了尚未填写来源编号、尚未测试或提交时的草稿自动保存和刷新恢复；连接测试失败后刷新也保留输入。成功连接流程使用模拟接口或驱动验证，客户数据库的真实连通性仍需有效配置验证。
+   该轮 macOS 历史验证为后端 1,093 项、前端 105 项测试及构建通过；不代表本次修订的验收数量。SSL 模式覆盖分项、原生 DSN、JDBC、选表、元数据读取后的会话传递，以及正式抽取适配器传参。浏览器通过 4173 代理验证了尚未填写来源编号、尚未测试或提交时的草稿自动保存和刷新恢复；连接测试失败后刷新也保留输入。成功连接流程使用模拟接口或驱动验证，客户数据库的真实连通性仍需有效配置验证。
 
    GitHub run `39908319887` 的 macOS 失败来自取消探测单测的定时器调度竞争。测试已改为确定性控制顺序，覆盖取消成功、驱动异常、取消无效、取消晚到及未发出；仍拒绝把单纯超时当作取消成功。生产取消机制和 CI 超时未调整。
 4. 元数据提供 `tables.yaml`、`constraints.yaml`、`foreign_keys.yaml` 预览与下载。主键、唯一键、外键来自连接器声明；未读取的 CHECK/default 等保持 unknown。文件来源没有声明外键时不会凭名称自动补上。导出和打开缓存不连接数据库；全项目“读取元数据”是显式操作。
 5. 上传 Markdown 后加入 documents；无范围声明时默认全局，已有 frontmatter 范围保留。可选择数据说明、分析知识、混合或待分类，以及全局或具体表范围。绑定写回实际 frontmatter；表标识为 `source_id.schema.table`。
-6. 填写抽取目的、包含/排除内容和探索提示。在 Agent 配置中填写 URL、模型名与流式开关，API key 可直接输入为会话凭据；原有环境变量方式继续支持。
-7. 开始抽取时先保存配置，再创建后台 worker。worker 使用固定配置调用真实 pipeline，来源与文档依赖指纹在前后检查。页面每秒查询任务状态，完成后可查看元数据图、业务图与运行记录。
-8. 业务图以 GraphStore 当前发布为准。原图非空时后续运行继续使用同一结果库，实现同项目增量。
+6. 填写抽取目的、包含/排除内容和探索提示。新项目默认由 Agent 发现对象与关系类型；也可选择指定类型并逐行填写，已有项目保留原类型列表。自动语义发现需要启用模型，关闭模型时不能仅凭关键词接受业务关系。在 Agent 配置中填写 URL、模型名与流式开关，API key 可直接输入为会话凭据；原有环境变量方式继续支持。
+7. 开始抽取时先保存当前编辑器草稿，再创建后台 worker。普通表单与完整 JSON 同时修改时要求明确选择；JSON 语法错误或修订冲突时保留草稿并停止后续操作。worker 使用冻结配置与整数配置修订调用 pipeline，来源与文档依赖在前后检查。页面每秒查询任务状态，完成后可查看元数据图、业务图与运行记录。
+8. 业务图以 GraphStore 当前有效发布为准，默认只显示已接受事实，可打开候选开关。点击节点或边读取权限过滤后的事实、支持和字段映射；对象归并面板可查看原节点、确认同一/不同对象并撤销裁决。原图非空时后续运行继续使用同一结果库，实现同项目增量。
 
 运行期间不允许从 API 修改正式项目输入。连接草稿独立存储，不影响正在运行的来源配置。当前没有“当前运行快照 + 下一轮可编辑配置”双版本界面。手工在磁盘修改输入会报告 `partial/input_dependency_changed`；已经发布的完整分区不会因此自动回滚。
 
@@ -119,21 +119,28 @@ workspace/
 | GET /projects/{pid}/metadata/yaml | 已缓存的元数据 YAML；可用 source_id、schema、table 限定当前选择，交叉筛选无匹配时返回空列表，不回退到全项目；不连接源库 |
 | GET /projects/{pid}/files/{fid}/content | Markdown/YAML 原文预览，重新检查 YAML 凭据 |
 | PATCH /projects/{pid}/files/{fid}/binding | Markdown purpose 与 scope |
-| GET /projects/{pid}/config；PUT 同路径 | 当前完整 RunConfig |
+| GET /projects/{pid}/config；PUT 同路径 | 当前完整 RunConfig；GET 返回 ETag，PUT 要求 If-Match |
 | POST /projects/{pid}/config/import | 将指定上传 YAML 导入为配置 |
 | GET /projects/{pid}/config/export | 导出无密钥配置 YAML |
 | GET /projects/{pid}/metadata | 已读取的元数据；未读取或配置变更时提示刷新 |
 | POST /projects/{pid}/metadata/refresh | 显式刷新授权目录并保存元数据 YAML |
-| GET /projects/{pid}/graph?layer=business\|metadata | 当前图；元数据层走同一缓存权限检查 |
+| GET /projects/{pid}/graph?layer=business\|metadata | 当前图；include_candidates 默认为 false；元数据层走同一缓存权限检查 |
+| GET /projects/{pid}/graph/details | entity_id 或 fact_id 二选一，按 offset 分页读取授权事实与支持 |
+| GET /projects/{pid}/graph/identity-candidates | 原始候选节点、依据、独立裁决修订及历史；offset/decision_offset 分别分页 |
+| POST /projects/{pid}/graph/identity-decisions | candidate_id、same/different 与裁决 revision；还需配置 If-Match |
+| POST /projects/{pid}/graph/identity-decisions/{id}/revoke | 撤销指定裁决，请求携带裁决 revision 和配置 If-Match |
+| POST /projects/{pid}/database/capabilities | 带 source_id/kind 上传对应能力 YAML；校验后返回资产和缺项，不跳过实际版本验证 |
 | GET /projects/{pid}/runs；POST 同路径 | 列出任务、启动真实抽取 |
 | GET /projects/{pid}/runs/{rid} | 任务实际状态和安全报告 |
 | POST /projects/{pid}/runs/{rid}/cancel | 请求取消并等待有界清理 |
+
+修改配置、上传文件、绑定文档、删除输入/项目、接入数据库和启动运行均要求 `If-Match`，值取自最近一次由本页面读取或保存的配置 ETag。缺失返回 428，过期返回 409；不能自动取最新版本再覆盖。计数保存在 project.yaml，失败回滚也不能倒退。裁决另有独立 revision，运行期间禁止裁决写入。
 
 上传单文件 20 MiB，Markdown/YAML 2 MiB，请求体上限 21 MiB。YAML 禁止 alias、anchor、自定义 tag、重复键；持久化配置禁止明文 API key、密码和 DSN；直接输入走单独的会话接口，环境变量方式仍可使用。API 不提供任意 SQL 执行入口；Agent 工具仍经过内部 SQL 守卫。
 
 元数据缓存绑定来源、允许表列范围和上传输入摘要。变更后不把旧授权目录继续作为当前目录返回。刷新声明时，仅当引擎元数据的来源全集与各 schema 版本都吻合，才合入它的验证关系；否则返回新声明和 `stale_engine_metadata` 提示，等待重新运行。
 
-图接口最多返回 1,000 节点、3,000 边，并标记真实总数与截断状态。前端一次绘制最多 240 个筛选后节点。搜索只覆盖已返回集合；本期不是全图分页或大规模图检索服务。
+图接口最多返回 1,000 节点、3,000 边，并标记真实总数与截断状态。来源详情每页 50 条事实、最多 500 条支持；支持超限明确提示。归并候选和裁决各自按 50 条分页，候选支持超过 500 条时显示截断。前端一次绘制最多 240 个筛选后节点。搜索只覆盖已返回集合；本期不是全图分页或大规模图检索服务。
 
 ## 项目与输入删除
 
@@ -182,7 +189,7 @@ workspace/
 
 实际具备项目隔离、文件持久化、目标/文档配置、真实后台执行、增量结果读取、两类图、取消与状态恢复。浏览器刷新后重新从 API 读取，不依赖 localStorage，也不预置合成结果。
 
-尚未实现：多用户登录/RBAC、跨项目继承、运行间图差异视图、文件替换界面、在线 Markdown 正文编辑、物理元数据 YAML 在线改写、全图服务端搜索、细粒度 Agent 事件/SSE。当前是监听本机的单用户工作台；来源权限仍由数据库账号与表列白名单决定。不能将它直接当作公网多租户服务部署。
+尚未实现：任意关系冲突的完整裁决与影响预览、多用户登录/RBAC、跨项目继承、运行间图差异视图、文件替换界面、在线 Markdown 正文编辑、物理元数据 YAML 在线改写、全图服务端搜索、细粒度 Agent 事件/SSE。当前是监听本机的单用户工作台；来源权限仍由数据库账号与表列白名单决定。不能将它直接当作公网多租户服务部署。
 
 用户填写模型配置或数据库连接配置，不等于相应环境已验收。真实模型发现质量、真实 MySQL/Gauss 权限与取消、服务端日志和部署级不落盘要求另行验证。当前实测结果汇总在 [实施与验收记录](../../IMPLEMENTATION_STATUS.md)。
 

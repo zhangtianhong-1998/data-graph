@@ -4,7 +4,7 @@ from io import BytesIO
 
 import openpyxl
 import pytest
-from fastapi.testclient import TestClient
+from lightgraph.tests.web_client import RevisionClient as TestClient
 
 from lightgraph.web.app import create_app
 from lightgraph.web.execution import read_metadata

@@ -252,10 +252,10 @@ def test_partition_enumeration_and_projection_share_one_outer_snapshot():
         result = RuleEngine(store).execute(source, partitioned_rule())
         assert result.published, result.codes
         assert result.counts["partitions_enumerated"] == 2
-        assert len(result.publication_ids) == len(result.active_publication_ids) == 2
+        assert len(result.publication_ids) == len(result.active_publication_ids) == 1
         assert source.entered == 1 and source.depth_seen == [1, 1, 1]
         assert len(store.view({"A", "B"})["nodes"]) == 2
-        assert all(h["partition_id"].startswith("partition_") for h in store.heads())
+        assert {h["partition_id"] for h in store.heads()} == {"all"}
         saved = store.get_rules()[0]
         assert saved.scope.predicate is None and saved.scope.partition_by == ["tenant"]
 
@@ -289,8 +289,8 @@ def test_partition_all_migration_replaces_old_heads_atomically():
             first_ids = first_ids or current
             assert current == first_ids
             assert {s["rule_revision"] for s in store.view({"A", "B"})["supports"]} == {revision}
-            if revision > 1:
-                assert len(result.publication_ids) > len(result.active_publication_ids)
+            assert len(result.publication_ids) == len(result.active_publication_ids) == 1
+            assert len(store.heads()) == 1
 
 
 def test_partition_enumeration_over_limit_cannot_retract_previous_partitions():

@@ -69,6 +69,7 @@ class ToolExecutor:
         self.documents = documents if isinstance(documents, DocumentCorpus) else DocumentCorpus(documents or ())
         self._closed = False
         self._sequence = 0
+        self._reserved_probe_ids = set()
         self._max_rows = min(128, adapter.limits.max_result_rows)
         self._max_bytes = min(65536, adapter.limits.max_result_bytes, budget.limits.memory_bytes)
         self.source_adapters=dict(source_adapters or {})
@@ -194,10 +195,17 @@ class ToolExecutor:
                        "max_rows": {"type": "integer", "minimum": 1, "maximum": self._max_rows}}, ("sql",)),
         ]
 
+    def reserve_probe_ids(self, identifiers):
+        """A fresh Agent may still see earlier evidence in the same packet."""
+        self._reserved_probe_ids.update(identifiers)
+
     def execute(self, name: str, arguments: dict[str, Any]) -> dict:
         """Return only bounded data or allowlisted error codes; never echo inputs."""
         self._sequence += 1
         probe_id = f"probe_{self._sequence:04d}"
+        while probe_id in self._reserved_probe_ids:
+            self._sequence += 1
+            probe_id = f"probe_{self._sequence:04d}"
         names = {tool["function"]["name"] for tool in self.tool_specs()}
         operator = name if isinstance(name, str) and name in names else "unknown"
         try:
@@ -412,4 +420,5 @@ class ToolExecutor:
         self.compiler.tables.clear()
         self.compiler.guard.tables.clear()
         self._table_aliases.clear()
+        self._reserved_probe_ids.clear()
         self.source_adapters.clear()

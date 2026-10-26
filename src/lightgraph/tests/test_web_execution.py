@@ -44,6 +44,9 @@ class ProjectWorkspace:
         self.project_path(pid)
         return self.configs[pid]
 
+    def config_revision(self, pid):
+        return 1
+
     def lock(self, pid):
         self.project_path(pid)
         return self.locks.setdefault(pid, threading.RLock())
@@ -494,6 +497,7 @@ class W:
     def __init__(self): self.root=root; self.l=threading.RLock()
     def project_path(self,p): return root/p
     def lock(self,p): return self.l
+    def config_revision(self,p): return 1
     def resolved_config(self,p): return RunConfig(sources=[],documents=[str(root/p/'analysis.md')],output_dir=str(root/p/'output'))
 real=subprocess.Popen
 import lightgraph.web.execution as ex

@@ -4,6 +4,7 @@ import hashlib
 import json
 from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from .semantic_schema import SemanticSchema
 
 Scalar = str | int | float | bool | None
 Status = Literal["accepted", "candidate", "unresolved", "deprecated"]
@@ -75,14 +76,17 @@ class ExtractionGoal(StrictModel):
     include: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=16)
     exclude: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=16)
     discovery_guidance: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=16)
-    entity_kinds: list[str] = Field(default_factory=lambda: ["Metric", "Measure", "Dimension", "DimensionMember", "ReportItem", "BusinessConcept"])
-    relation_kinds: list[str] = Field(default_factory=lambda: ["parent_of", "member_of", "uses_measure", "verified_reference"])
+    entity_kinds: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(default_factory=list, max_length=64)
+    relation_kinds: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(default_factory=list, max_length=128)
     source_scope: list[str] = Field(default_factory=list)
     excluded_columns: list[str] = Field(default_factory=list)
     # Unlike excluded_columns, these can be read to test a hypothesis but their
     # values must not become entity identities, properties or relationship ends.
     evidence_only_columns: list[str] = Field(default_factory=list)
     observation_values: bool = False
+    # Empty kind lists let the Agent propose a bounded, explicitly defined
+    # vocabulary. They do not expand table/column or value-output permissions.
+    semantic_schema: SemanticSchema = Field(default_factory=SemanticSchema)
 
 class ScopeSpec(StrictModel):
     namespaces: list[str] = Field(default_factory=list)
@@ -198,6 +202,14 @@ class RuleEvidence(StrictModel):
     document: list[str] = Field(default_factory=list)
     probe_refs: list[str] = Field(default_factory=list)
     semantic_basis: list[str] = Field(default_factory=list)
+    # Legacy explicitly supplied RuleSpecs remain operator-approved input.
+    # Generated rules must record a checked decision, not merely nonempty text.
+    origin: Literal['user_rule', 'discovery'] = 'user_rule'
+    semantic_decision: Literal['unreviewed', 'explicit_declaration', 'model_review'] = 'unreviewed'
+    semantic_status: Literal['supported', 'refuted', 'unresolved'] = 'unresolved'
+    reviewed_context_refs: list[str] = Field(default_factory=list, max_length=128)
+    refuting_refs: list[str] = Field(default_factory=list, max_length=128)
+    conditions_satisfied: bool = False
 
 class RuleBudget(StrictModel):
     max_db_cu: float = Field(default=40, gt=0)
@@ -214,6 +226,7 @@ class RuleSpec(StrictModel):
     revision: int = Field(default=1, ge=1)
     kind: Literal["column_group_entity", "wide_hierarchy", "long_hierarchy", "reference"]
     goal_refs: list[str] = Field(default_factory=list)
+    semantic_schema: SemanticSchema = Field(default_factory=SemanticSchema)
     source: SourceRef
     scope: ScopeSpec = Field(default_factory=ScopeSpec)
     identity: IdentitySpec
