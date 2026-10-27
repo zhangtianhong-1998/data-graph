@@ -6,7 +6,7 @@
 
 依赖的本轮实测版本记录在 `requirements.lock`；需要复现环境时先安装该文件，再安装项目。
 
-当前运行能力与验证边界见 [实施与验收记录](IMPLEMENTATION_STATUS.md)。当前需求见 [用户故事](design/lightweight_graph/US.md) 和 [目标驱动迭代方案](design/lightweight_graph/GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)；[设计索引](design/lightweight_graph/README.md) 保留各项约束与历史边界。
+当前运行能力与验证边界见 [实施与验收记录](IMPLEMENTATION_STATUS.md)。最新的语义审查协议、提案修复和宽层级关系端点改动见[真实数据反馈修复记录](design/lightweight_graph/REAL_DATA_DISCOVERY_REPAIR.md)；本轮验证使用离线模型替身，用户原数据仍待复跑。当前需求见 [用户故事](design/lightweight_graph/US.md) 和 [目标驱动迭代方案](design/lightweight_graph/GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)；[设计索引](design/lightweight_graph/README.md) 保留各项约束与历史边界。
 
 ## 启动 Vue 工作台
 

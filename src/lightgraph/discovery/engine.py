@@ -12,7 +12,7 @@ from .budget import BudgetAllocator, Cost
 from .models import (DiscoveryResult, Hypothesis, DataUnderstanding, ColumnUnderstanding,
                      ProposalBatch, ColumnGroupProposal, EntityKeyProposal, HierarchyProposal)
 from .semantics import declared_evidence, rule_evidence
-from lightgraph.semantic_schema import SemanticSchema
+from lightgraph.semantic_schema import SemanticSchema, EntityTypeDefinition
 
 SENSITIVE = re.compile(r'password|secret|token|private|phone|email|identity_card|id_card|身份证|手机号|密码|密钥',re.I)
 AUDIT = re.compile(r'^(created|updated|deleted)_(at|by|time)$|^create_time$|^update_time$|^审计|^更新时间$',re.I)
@@ -205,10 +205,31 @@ def _relative_hierarchy_contract(claim, documents, scopes, levels, table, review
         allow_dag=claim.allow_dag)
 
 
+def _normalize_business_code_mapping(single, multi, key_columns):
+    """The engine already emits the final identity component as business_code.
+
+    Accept the model's redundant mapping only when it names that same column;
+    otherwise the executor would silently overwrite a different source value.
+    """
+    for mapping in (single, multi):
+        column = mapping.get('business_code')
+        if column is None:
+            continue
+        if not key_columns or column != key_columns[-1]:
+            raise LightGraphError('business_code_mapping_conflict')
+        del mapping['business_code']
+
+
 def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=None):
+    from lightgraph.store.policy import PersistencePolicy, SOURCE_PROPERTY_NAMES, KINDS
     lookup={_column_id(table,c.name):c.name for c in table.columns}
     semantic_schema=SemanticSchema.merged(goal.semantic_schema,batch.semantic_schema)
-    properties={'label','alias','english_name','description','definition','unit','formula'} | {
+    declared_names={entry.name for entry in semantic_schema.entity_types}
+    operator_types=SemanticSchema(entity_types=[EntityTypeDefinition(name=name,
+        description=f'User-declared output type: {name}')
+        for name in sorted(set(goal.entity_kinds)-KINDS['business']-declared_names)])
+    semantic_schema=SemanticSchema.merged(semantic_schema,operator_types)
+    properties=SOURCE_PROPERTY_NAMES | {
         definition.name for definition in semantic_schema.properties}
     from .goal import column_is_excluded, column_is_evidence_only
     # Name patterns are fallback hints only. Explicit model roles and operator
@@ -234,7 +255,8 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
         claim=proposal.claim
         if proposal.kind=='column_group':
             if goal.entity_kinds and claim.entity_kind_hint not in goal.entity_kinds:continue
-            keys=[lookup[m.column_id] for m in claim.members if m.in_identity and m.role=='identity_code']
+            keys=list(dict.fromkeys(lookup[m.column_id] for m in claim.members if m.in_identity
+                and (m.role=='identity_code' or (m.role=='semantic_attribute' and m.property_name=='business_code'))))
             namespaces=[lookup[m.column_id] for m in claim.members if m.role=='namespace']
             if not keys:continue
             if (excluded_names|identity_excluded) & set(keys+namespaces):raise LightGraphError('excluded_column_in_identity')
@@ -252,8 +274,12 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
                 if member.role!='semantic_attribute' or lookup[member.column_id] in excluded_names:continue
                 if member.property_name not in properties:
                     raise LightGraphError('unregistered_attribute_semantics')
-                if member.property_name in single or member.property_name in multi:raise LightGraphError('ambiguous_primary_attribute')
+                existing=single.get(member.property_name,multi.get(member.property_name))
+                if existing is not None:
+                    if existing==lookup[member.column_id]:continue
+                    raise LightGraphError('ambiguous_primary_attribute')
                 (multi if member.multi_value else single)[member.property_name]=lookup[member.column_id]
+            _normalize_business_code_mapping(single,multi,list(dict.fromkeys(namespaces+keys)))
             results.append(RuleSpec(rule_id='rule_'+digest(table.source_id,table.qualified_name,'model_group',keys)[:24],kind='column_group_entity',
                 goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=namespaces),
                 identity=IdentitySpec(key_columns=list(dict.fromkeys(namespaces+keys)),entity_kind=claim.entity_kind_hint),
@@ -285,6 +311,7 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
                 property_name=explicit.get(column,('alias','english_name')[index])
                 if property_name in single_map or property_name in multi_map:raise LightGraphError('ambiguous_primary_attribute')
                 multi_map[property_name]=column
+            _normalize_business_code_mapping(single_map,multi_map,keys)
             results.append(RuleSpec(rule_id='rule_'+digest(table.source_id,table.qualified_name,'model_key',keys)[:24],kind='column_group_entity',
                 goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=namespaces),
                 identity=IdentitySpec(key_columns=keys,entity_kind=claim.entity_kind_hint),
@@ -333,7 +360,16 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
                 hierarchy=HierarchySpec(levels=levels,fill_semantics_confirmed=bool(fill),order_evidence=order,**hierarchy_fields),
                 dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in documents})),
                 coverage=Coverage(scope='sampled'),evidence=rule_evidence(order,reviewed=bool(semantic_evidence),documents=documents)))
-    for rule in results:rule.semantic_schema=semantic_schema
+    for rule in results:
+        used_properties=set(rule.attributes.single_valued)|set(rule.attributes.multi_valued)|{'business_code'}
+        if rule.hierarchy:
+            used_properties.update({'label','alias'})
+        relation=rule.relation.relation if rule.relation else 'parent_of' if rule.hierarchy else None
+        local_schema=semantic_schema.for_usage(entity_kinds={rule.identity.entity_kind},
+            properties=used_properties,relations={relation} if relation else set())
+        # Store only new contracts. Compatible built-in declarations are
+        # references to existing contracts, not schema redefinitions.
+        rule.semantic_schema=PersistencePolicy().with_schema(local_schema).semantic_schema
     return results
 
 

@@ -1,5 +1,7 @@
 # 2026-10-26 迭代构图引擎实施记录
 
+> 本文记录 `81d04b2` 的实现与验证。后续根据真实运行反馈所做的协议、提案修复和宽层级关系端点改动见[发现引擎修复记录](REAL_DATA_DISCOVERY_REPAIR.md)；下述验证数字属于本轮历史快照。
+
 本轮从 `66225ef3ee75278fd7d5e25700ddba11063b6d92` 开始，在 `codex/iterative-graph-engine` 分支实施，按用户要求合入 GitHub `main`。需求依据为 [US](US.md)、[工作台 US](WORKBENCH_US.md) 和[目标驱动的迭代构图设计](GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)。
 
 本轮打通了“目标与知识 → 发现规则 → 完整投影 → 反例 → 新 Agent 修订 → 重新执行 → 发布 → 图级候选复核”的工程流程。真实模型推理质量、实际数据库部署和客户业务真值仍未验收。

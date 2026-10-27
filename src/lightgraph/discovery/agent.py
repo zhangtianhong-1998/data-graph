@@ -42,6 +42,19 @@ new entity, property and relationship definitions in semantic_schema. Reuse the
 issued project definitions; a name alone is not a definition. Property definitions
 must state scalar type and applicable entity kinds; relationship definitions must
 state endpoint kinds. This never grants access to excluded or evidence-only values.
+Built-in properties are already registered: reference label, alias, english_name,
+description, definition, unit or formula without redefining them in semantic_schema.
+Use identity_code with in_identity=true for identifying business codes; do not
+invent a property definition to make a code column an identity. Custom business
+attributes must have a property definition with value_type, entity_kinds and
+multi_valued matching the mapping. Nonempty goal type lists remain constraints.
+Each wide-hierarchy entity_binding has a level and its own key_columns. A reference
+to that rule must select source_level or target_level and map all its listed key
+columns in order; ordinary groups and long hierarchies have no level selector.
+When proposal_repairs is supplied, repair only those rejected proposals using the
+fixed compiler guidance. Valid independent proposals have already been retained.
+Recheck evidence when needed; do not turn a semantic rejection into acceptance by
+renaming it. If no supported repair exists, abstain within the remaining budget.
 Preserve uncertainty, source scope and incomplete coverage. Output candidate rules,
 not confirmed claims. Stop when relevant structures are sufficiently supported or
 remaining uncertainty cannot be resolved within the available budget. When finished,

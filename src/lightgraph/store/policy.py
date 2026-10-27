@@ -68,6 +68,15 @@ PROPERTY_NAMES = frozenset({
     "normalization", "semantic_namespace", "aggregation", "document_ref", "section_ref",
     "column_position", "qualified_name", "name", "kind", "scope", "rule_ref", "revision", "source_position",
 })
+# Properties a discovery proposal may map from authorized business columns.
+# System provenance, source positions and physical metadata are emitted by the
+# engine; a model cannot re-label source values as those system properties.
+SOURCE_PROPERTY_NAMES = frozenset({
+    "label", "alias", "english_name", "business_code", "description", "definition", "unit",
+    "formula", "period", "caliber", "granularity", "dimension", "frequency", "domain",
+    "normalization", "aggregation",
+})
+BUSINESS_RELATION_REFERENCES = frozenset({"parent_of", "same_entity", "member_of", "uses_measure", "analyzes"})
 QUALIFIER_NAMES = frozenset({
     "taxonomy", "valid_period", "period", "caliber", "granularity", "unit", "level", "source_level",
     "target_level", "relation_group", "namespace", "condition", "role", "technical_status",
@@ -102,26 +111,42 @@ class PersistencePolicy:
     def with_schema(self, schema: SemanticSchema):
         """Return a validated copy; rejected declarations cannot widen this policy."""
         schema = SemanticSchema.model_validate(schema.model_dump())
-        merged = SemanticSchema.merged(self.semantic_schema, schema)
         result = copy.deepcopy(self)
         reserved = KINDS["metadata"] | KINDS["provenance"]
-        if any(item.name in reserved for item in merged.entity_types):
+        if any(item.name in reserved for item in schema.entity_types):
             raise PersistenceViolation("semantic_type_conflicts_with_system_kind")
-        result.kinds["business"].update(item.name for item in merged.entity_types)
-        for item in merged.properties:
+        result.kinds["business"].update(item.name for item in schema.entity_types)
+        properties = []
+        for item in schema.properties:
             if not set(item.entity_kinds) <= result.kinds["business"]:
                 raise PersistenceViolation("property_kind_not_registered")
             if item.name in PROPERTY_NAMES:
-                # Template properties have stable contracts across existing
-                # publications. Neither a narrowing nor a silent override is
-                # safe here; a new business property needs its own name.
-                raise PersistenceViolation("builtin_property_definition_forbidden")
-            result.property_definitions[item.name] = item
-        for item in merged.relations:
+                # Models commonly repeat the properties they use. Treat a
+                # compatible declaration as a reference, never an override of
+                # the global type, applicability or multiplicity contract.
+                if (item.name not in SOURCE_PROPERTY_NAMES
+                    or item.name in {"label", "alias", "english_name"} and item.value_type != "string"
+                    or item.multi_valued and item.name not in {"alias", "english_name", "business_code"}):
+                    raise PersistenceViolation("builtin_property_definition_forbidden")
+                continue
+            properties.append(item)
+        relations = []
+        for item in schema.relations:
             if not set(item.source_kinds + item.target_kinds) <= result.kinds["business"]:
                 raise PersistenceViolation("relation_kind_not_registered")
             if item.name in RELATION_STATES:
-                raise PersistenceViolation("builtin_relation_definition_forbidden")
+                endpoints = result.relation_endpoint_kinds(item.name)
+                if (item.name not in BUSINESS_RELATION_REFERENCES or not endpoints
+                    or not set(item.source_kinds) <= endpoints[0]
+                    or not set(item.target_kinds) <= endpoints[1]):
+                    raise PersistenceViolation("builtin_relation_definition_forbidden")
+                continue
+            relations.append(item)
+        normalized = SemanticSchema(entity_types=schema.entity_types, properties=properties, relations=relations)
+        merged = SemanticSchema.merged(self.semantic_schema, normalized)
+        for item in merged.properties:
+            result.property_definitions[item.name] = item
+        for item in merged.relations:
             result.relation_definitions[item.name] = item
         result.semantic_schema = merged
         return result

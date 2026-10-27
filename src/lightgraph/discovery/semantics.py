@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from typing import Literal
 
 from pydantic import Field, ValidationError
@@ -43,7 +44,12 @@ class ConditionReview(StrictModel):
 
 
 class SemanticReview(StrictModel):
-    proposition: dict
+    # The compiler binds the full proposition; copying a large hierarchy claim
+    # back through the model is unnecessary and prone to omitted defaults.
+    proposition_ref: str | None = Field(default=None, max_length=96,
+        description='Copy semantic_proposition_ref from the input. Do not restate the proposition.')
+    proposition: dict | None = Field(default=None,
+        description='Legacy response only. Omit this field when returning proposition_ref.')
     decision: Literal['supported', 'refuted', 'unresolved']
     basis: Literal['explicit_declaration', 'document_interpretation', 'data_inference']
     evidence: list[EvidenceInterpretation] = Field(default_factory=list, max_length=128)
@@ -108,6 +114,49 @@ def rule_evidence(refs=(), *, reviewed=False, documents=(), probe_refs=()):
         conditions_satisfied=bool(refs))
 
 
+_REPAIRABLE_REVIEW_CODES = frozenset({
+    'semantic_review_proposition_mismatch', 'semantic_review_proposition_missing',
+    'semantic_review_reference_mismatch', 'semantic_review_unissued_evidence',
+    'semantic_review_incomplete_context', 'llm_schema_invalid',
+})
+
+
+def _check_review(reviewed, *, proposition_ref, expected_proposition, docs, doc_refs, issued):
+    """Validate one judgment without interpreting a model echo as the claim."""
+    # A negative or undecided judgment is not a formatting problem to retry
+    # until it turns positive, even when other fields are malformed.
+    if reviewed.decision == 'refuted' or any(item.stance == 'refutes' for item in reviewed.evidence):
+        raise LightGraphError('semantic_claim_refuted')
+    if reviewed.decision != 'supported':
+        raise LightGraphError('semantic_claim_unresolved')
+    for condition in reviewed.conditions:
+        if condition.state != 'satisfied' or not condition.evidence_refs:
+            raise LightGraphError('semantic_condition_unresolved')
+        if set(condition.evidence_refs) - issued:
+            raise LightGraphError('semantic_review_unissued_evidence')
+    if reviewed.proposition_ref is not None:
+        if reviewed.proposition_ref != proposition_ref:
+            raise LightGraphError('semantic_review_reference_mismatch')
+    elif reviewed.proposition is None:
+        raise LightGraphError('semantic_review_proposition_missing')
+    # Older callers can still echo the complete claim. If a response supplies
+    # both forms, a conflicting echo must not be hidden by a correct reference.
+    if reviewed.proposition is not None and canonical(reviewed.proposition) != expected_proposition:
+        raise LightGraphError('semantic_review_proposition_mismatch')
+    references = [item.reference for item in reviewed.evidence]
+    if len(references) != len(set(references)) or set(references) - issued:
+        raise LightGraphError('semantic_review_unissued_evidence')
+    if not doc_refs <= set(references):
+        raise LightGraphError('semantic_review_incomplete_context')
+    ineligible = {document_ref(d) for d in docs
+        if d.get('evidence_role') != 'definition_evidence'
+        or d.get('read_state', 'complete') != 'complete' or d.get('derived', False)}
+    supporting = [item.reference for item in reviewed.evidence if item.stance == 'supports']
+    if not supporting or set(supporting) & ineligible:
+        raise LightGraphError('semantic_review_missing_support')
+    return ['semantic_review:' + reviewed.basis] + sorted(set(supporting))
+
+
 def review_semantics(model, packet, proposition, documents, *, observations=None):
     """Review a compiler-issued proposition independently of the proposal.
 
@@ -123,11 +172,17 @@ def review_semantics(model, packet, proposition, documents, *, observations=None
     entities = set(packet.get('authorized_entities', []))
     doc_refs = {document_ref(item) for item in docs}
     issued = columns | probes | entities | doc_refs
+    expected_proposition = canonical(proposition)
+    proposition_ref = 'proposition_' + uuid.uuid4().hex
     review_packet = {**packet, 'task': 'semantic_review', 'document_snippets': docs,
-        'semantic_proposition': proposition,
+        'semantic_proposition': json.loads(expected_proposition),
+        'semantic_proposition_ref': proposition_ref,
         'subtask': (
             'Independently review this exact proposition, not the proposer confidence. '
-            'Copy semantic_proposition exactly to proposition. Classify EVERY supplied '
+            'The compiler owns semantic_proposition, including its endpoints, order, '
+            'scope and conditions. Return its semantic_proposition_ref as proposition_ref; '
+            'omit proposition rather than copying or rewriting the full claim. '
+            'Classify EVERY supplied '
             'document section using doc_id@revision:section_id, including irrelevant and '
             'contradicting sections. Interpret negation, direction, endpoint meaning, '
             'scope, historical statements and conditions. Include issued schema/probe '
@@ -137,37 +192,34 @@ def review_semantics(model, packet, proposition, documents, *, observations=None
             'Analytical guidance is context only, never independent confirmation. '
             'Report all applicable conditions; unknown or unsatisfied conditions block '
             'acceptance. Never copy observed row values into the response.')}
-    if observations is not None:
-        review_packet['tool_observations']=observations.values()
     try:
-        reviewed = model.complete('semantic_review', review_packet, SemanticReview)
+        # One correction is sufficient for a transportable contract. Each call
+        # uses the normal model budget; exhaustion/timeout is never retried here.
+        for attempt in range(2):
+            if observations is not None:
+                review_packet['tool_observations']=observations.values()
+            try:
+                reviewed = model.complete('semantic_review', review_packet, SemanticReview)
+                return _check_review(reviewed, proposition_ref=proposition_ref,
+                    expected_proposition=expected_proposition, docs=docs, doc_refs=doc_refs, issued=issued)
+            except LightGraphError as exc:
+                if attempt or exc.code not in _REPAIRABLE_REVIEW_CODES:
+                    raise
+                # Only compiler-issued references and a fixed error code return
+                # to the model. Never reflect a bad response or source values.
+                review_packet['semantic_review_repair'] = {
+                    'attempt': 1, 'error_code': exc.code,
+                    'proposition_ref': proposition_ref,
+                    'allowed_evidence_refs': sorted(issued),
+                    'required_document_refs': sorted(doc_refs),
+                    'instruction': 'Correct the response contract for this same proposition. '
+                        'Return proposition_ref and omit proposition. Reassess the evidence; '
+                        'do not change a negative or uncertain judgment to satisfy validation.',
+                }
+            finally:
+                review_packet.pop('tool_observations',None)
     finally:
         review_packet.pop('tool_observations',None)
-    if canonical(reviewed.proposition) != canonical(proposition):
-        raise LightGraphError('semantic_review_proposition_mismatch')
-    references = [item.reference for item in reviewed.evidence]
-    if len(references) != len(set(references)) or set(references) - issued:
-        raise LightGraphError('semantic_review_unissued_evidence')
-    if not doc_refs <= set(references):
-        raise LightGraphError('semantic_review_incomplete_context')
-    if reviewed.decision == 'refuted' or any(item.stance == 'refutes' for item in reviewed.evidence):
-        raise LightGraphError('semantic_claim_refuted')
-    if reviewed.decision != 'supported':
-        raise LightGraphError('semantic_claim_unresolved')
-    for condition in reviewed.conditions:
-        if condition.state != 'satisfied' or not condition.evidence_refs:
-            raise LightGraphError('semantic_condition_unresolved')
-        if set(condition.evidence_refs) - issued:
-            raise LightGraphError('semantic_review_unissued_evidence')
-    # A model cannot turn analysis guidance into a definition by assigning a
-    # stronger stance. All evidence still obeys its registered role and scope.
-    ineligible = {document_ref(d) for d in docs
-        if d.get('evidence_role') != 'definition_evidence'
-        or d.get('read_state', 'complete') != 'complete' or d.get('derived', False)}
-    supporting = [item.reference for item in reviewed.evidence if item.stance == 'supports']
-    if not supporting or set(supporting) & ineligible:
-        raise LightGraphError('semantic_review_missing_support')
-    return ['semantic_review:' + reviewed.basis] + sorted(set(supporting))
 
 
 def declaration_block(table, predicate, source_columns=(), target_columns=(), **kwargs):

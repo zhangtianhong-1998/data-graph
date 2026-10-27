@@ -71,3 +71,19 @@ class SemanticSchema(BaseModel):
 
     def is_empty(self) -> bool:
         return not (self.entity_types or self.properties or self.relations)
+
+    def for_usage(self, *, entity_kinds=(), properties=(), relations=()) -> "SemanticSchema":
+        """Keep one proposal's vocabulary and its declared type dependencies.
+
+        A batch can describe several independent objects. An unused definition
+        must not invalidate an otherwise valid sibling proposal, nor silently
+        register extra output vocabulary through that sibling.
+        """
+        selected_properties = [entry for entry in self.properties if entry.name in properties]
+        selected_relations = [entry for entry in self.relations if entry.name in relations]
+        kinds = set(entity_kinds)
+        kinds.update(kind for entry in selected_properties for kind in entry.entity_kinds)
+        kinds.update(kind for entry in selected_relations for kind in entry.source_kinds + entry.target_kinds)
+        return SemanticSchema(
+            entity_types=[entry for entry in self.entity_types if entry.name in kinds],
+            properties=selected_properties, relations=selected_relations)

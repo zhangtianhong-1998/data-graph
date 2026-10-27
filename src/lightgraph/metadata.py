@@ -105,10 +105,11 @@ def stage_rule_metadata(store,publication_id,rule,allrules,domain,entities=()):
     for entity in sorted(set(entities)) if rule.identity.entity_kind=='BusinessConcept' else ():
         emit('Edge',{'source':group,'relation':'maps_to_concept','target':entity})
     if rule.relation:
+        from .rules.endpoints import endpoint_columns
         endpoint_rules={r.rule_id:r for r in allrules}
-        for rid,cols in [(rule.relation.source_rule_id,rule.relation.source_columns),
-                         (rule.relation.target_rule_id,rule.relation.target_columns)]:
+        for rid,cols,level in [(rule.relation.source_rule_id,rule.relation.source_columns,rule.relation.source_level),
+                              (rule.relation.target_rule_id,rule.relation.target_columns,rule.relation.target_level)]:
             target=endpoint_rules.get(rid)
             if not target:continue
-            for c,key in zip(cols,target.identity.key_columns):
+            for c,key in zip(cols,endpoint_columns(target,level)):
                 emit('Edge',{'source':column(rule,c),'relation':'verified_reference','target':column(target,key)})

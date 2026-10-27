@@ -103,6 +103,8 @@ class Reference(StrictModel):
     source_entity: str | None = Field(default=None,description='Verified source entity rule ID from entity_bindings.')
     source_columns: list[str] = Field(min_length=1,max_length=16,description='Issued column IDs on the CURRENT table, ordered to match source_entity key_columns.')
     target_entity: str
+    source_level: int | None = Field(default=None,gt=0,description='Required selected level for a wide-hierarchy source binding; omit for ordinary groups and long hierarchies.')
+    target_level: int | None = Field(default=None,gt=0,description='Required selected level for a wide-hierarchy target binding; omit for ordinary groups and long hierarchies.')
     target_columns: list[str] = Field(min_length=1,max_length=16,description='Issued foreign-key column IDs on the CURRENT table, ordered to match target_entity key_columns. Do not use remote-table IDs.')
     direction: Literal['source_to_target'] = 'source_to_target'
     cardinality_hint: Literal['n_to_1','1_to_n','n_to_m','1_to_1','unknown'] = 'unknown'
@@ -278,6 +280,13 @@ class EntityBinding(StrictModel):
     source: SourceRef
     entity_kind: str
     key_columns: list[str]
+    level: int | None = Field(default=None,gt=0)
+
+class ProposalRepair(StrictModel):
+    """A rejected schema-only proposal and a compiler-issued repair instruction."""
+    code: str
+    guidance: str = Field(max_length=700)
+    proposal: Proposal
 
 class TaskPacket(StrictModel):
     packet_version: Literal['1.0'] = '1.0'
@@ -301,6 +310,8 @@ class TaskPacket(StrictModel):
     revision_of: str | None = None
     allowed_revision_codes: list[str] = Field(default_factory=list,max_length=32)
     revision_candidate: RuleSpec | None = None
+    proposal_repair_round: int = Field(default=0,ge=0,le=2)
+    proposal_repairs: list[ProposalRepair] = Field(default_factory=list,max_length=6)
     # Schema only. Query rows and tool transcripts never enter a stored packet.
     catalog: list[TableSpec] = Field(default_factory=list,max_length=64)
     entity_bindings: list[EntityBinding] = Field(default_factory=list,max_length=64)

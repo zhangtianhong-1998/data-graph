@@ -171,6 +171,10 @@ class RelationSpec(StrictModel):
     target_rule_id: str
     source_columns: list[str] = Field(min_length=1)
     target_columns: list[str] = Field(min_length=1)
+    # A wide hierarchy has several physical endpoint keys. Selecting a level
+    # is a mapping decision, not permission to infer parent/child semantics.
+    source_level: int | None = Field(default=None, gt=0)
+    target_level: int | None = Field(default=None, gt=0)
     relation: str = "verified_reference"
     qualifiers: dict[str, Scalar] = Field(default_factory=dict)
     source_json_array_columns: list[str] = Field(default_factory=list, max_length=1)

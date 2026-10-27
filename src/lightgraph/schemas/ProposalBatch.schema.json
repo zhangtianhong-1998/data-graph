@@ -952,6 +952,34 @@
           "title": "Target Entity",
           "type": "string"
         },
+        "source_level": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Required selected level for a wide-hierarchy source binding; omit for ordinary groups and long hierarchies.",
+          "title": "Source Level"
+        },
+        "target_level": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Required selected level for a wide-hierarchy target binding; omit for ordinary groups and long hierarchies.",
+          "title": "Target Level"
+        },
         "target_columns": {
           "description": "Issued foreign-key column IDs on the CURRENT table, ordered to match target_entity key_columns. Do not use remote-table IDs.",
           "items": {

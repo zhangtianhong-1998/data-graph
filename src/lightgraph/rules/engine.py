@@ -505,6 +505,7 @@ class RuleEngine:
         return {"entities":len(ids),"edges":len(records),"projected_tuples":len(rows)},codes
 
     def _references(self,pub,rule,rows):
+        from .endpoints import endpoint_columns, endpoint_identity_key
         endpoint_rules={r.rule_id:r for r in self.store.get_rules()}
         source_rule=endpoint_rules.get(rule.relation.source_rule_id)
         target_rule=endpoint_rules.get(rule.relation.target_rule_id)
@@ -513,6 +514,12 @@ class RuleEngine:
             return {"edges":0},["reference_rule_not_validated"]
         if not allowed or source_rule.identity.entity_kind not in allowed[0] or target_rule.identity.entity_kind not in allowed[1]:
             return {"edges":0},["relation_endpoint_kind_mismatch"]
+        for endpoint, columns, level in (
+            (source_rule, rule.relation.source_columns, rule.relation.source_level),
+            (target_rule, rule.relation.target_columns, rule.relation.target_level),
+        ):
+            if len(columns) != len(endpoint_columns(endpoint, level)):
+                raise LightGraphError('reference_arity_mismatch')
         count=0;expanded=0;codes=[];emitted=set()
         for row in rows:
             sources=self._reference_keys(row,rule.relation.source_columns,rule.relation.source_json_array_columns,rule.relation.max_array_elements)
@@ -524,11 +531,18 @@ class RuleEngine:
                     expanded+=1
                     if expanded>rule.budget.max_rows_returned:
                         raise LightGraphError("reference_expansion_limit")
-                    akey=canonical(source);bkey=canonical(target)
+                    akey=canonical(endpoint_identity_key(source_rule,source,rule.relation.source_level))
+                    bkey=canonical(endpoint_identity_key(target_rule,target,rule.relation.target_level))
                     a=self.bindings.get((rule.relation.source_rule_id,akey));b=self.bindings.get((rule.relation.target_rule_id,bkey))
                     if not a or not b:
                         codes.append("reference_missing");continue
-                    scope=self._scope(rule,row)
+                    # Connection-table aliases are physical column names. The
+                    # edge inherits the source object's logical namespace,
+                    # otherwise renamed composite keys create an invisible scope.
+                    source_values=dict(zip(endpoint_columns(source_rule,rule.relation.source_level),source))
+                    if not set(source_rule.scope.namespaces)<=source_values.keys():
+                        raise LightGraphError('reference_namespace_not_in_identity')
+                    scope=self._scope(source_rule,source_values)
                     if (a,b,scope) in emitted:continue
                     emitted.add((a,b,scope))
                     binding="rel_"+digest(rule.rule_id,a,b)[:24]

@@ -1,10 +1,17 @@
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { assertNoCredentials, isActive, splitLines } from './state'
+import { assertNoCredentials, graphOutcome, isActive, splitLines } from './state'
 import { ApiError, request } from './api'
 import type { Run } from './types'
 
 afterEach(() => vi.unstubAllGlobals())
 describe('运行和配置边界', () => {
+  it('业务产出与运行状态分开，元数据不冒充业务图', () => {
+    expect(graphOutcome({ status: 'COMPLETED_WITH_GAPS', validation: { business_graph: 'empty' }, counts: { tables: 1 } })).toContain('没有已发布的业务实体')
+    expect(graphOutcome({ validation: { business_graph: 'entities_only' }, counts: { business_nodes: 2, business_edges: 0 } })).toContain('2 个业务实体，尚未确认实体间关系')
+    expect(graphOutcome({ validation: { business_graph: 'entities_and_relations' }, counts: { business_nodes: 9, business_edges: 10 } })).toContain('9 个业务实体、10 条业务关系')
+    expect(graphOutcome({ validation: { business_graph: 'candidates_only' } })).toContain('只有候选')
+    expect(graphOutcome({ status: 'completed' })).toBe('')
+  })
   it('只有后端 queued/running 状态触发轮询', () => {
     for (const status of ['completed', 'partial', 'failed', 'cancelled', 'interrupted']) expect(isActive({ status } as Run)).toBe(false)
     expect(isActive({ status: 'running' } as Run)).toBe(true)

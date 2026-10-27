@@ -29,6 +29,7 @@ scenarios:
   stories:
   - US-07
   - US-30
+  - US-11
   coverage_status: engineering_cases_present
   acceptance_status: not_run
   engineering_cases:
@@ -44,6 +45,18 @@ scenarios:
   - nodeid: src/lightgraph/tests/test_semantic_schema.py::test_automatic_vocabulary_requires_definitions_and_does_not_admit_any_string
     fixture_and_assertions: inline_test
     command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_schema.py::test_automatic_vocabulary_requires_definitions_and_does_not_admit_any_string
+  - nodeid: src/lightgraph/tests/test_property_proposal_compatibility.py::test_model_builtin_references_and_code_attribute_produce_actual_entities
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_property_proposal_compatibility.py::test_model_builtin_references_and_code_attribute_produce_actual_entities
+  - nodeid: src/lightgraph/tests/test_property_proposal_compatibility.py::test_unused_invalid_schema_cannot_block_or_register_through_valid_sibling
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_property_proposal_compatibility.py::test_unused_invalid_schema_cannot_block_or_register_through_valid_sibling
+  - nodeid: src/lightgraph/tests/test_property_proposal_compatibility.py::test_unknown_property_still_requires_a_definition
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_property_proposal_compatibility.py::test_unknown_property_still_requires_a_definition
+  - nodeid: src/lightgraph/tests/test_discovery_repair.py::test_contract_failure_repairs_only_rejected_group_and_retains_valid_sibling
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_repair.py::test_contract_failure_repairs_only_rejected_group_and_retains_valid_sibling
   independent_gold: null
   remaining_subcases:
   - 陌生业务与真实模型列组发现
@@ -55,6 +68,7 @@ scenarios:
   stories:
   - US-09
   - US-31
+  - US-11
   coverage_status: engineering_cases_present
   acceptance_status: not_run
   engineering_cases:
@@ -70,6 +84,15 @@ scenarios:
   - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_merge_cannot_close_a_long_hierarchy_cycle
     fixture_and_assertions: inline_test
     command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_merge_cannot_close_a_long_hierarchy_cycle
+  - nodeid: src/lightgraph/tests/test_wide_table_recovery.py::test_repair_wide_table_then_discover_hierarchy_to_center_parallel_relations
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_wide_table_recovery.py::test_repair_wide_table_then_discover_hierarchy_to_center_parallel_relations
+  - nodeid: src/lightgraph/tests/test_semantic_review_protocol.py::test_five_level_claim_is_reviewed_by_reference_without_model_echo
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_review_protocol.py::test_five_level_claim_is_reviewed_by_reference_without_model_echo
+  - nodeid: src/lightgraph/tests/test_semantic_review_protocol.py::test_omitted_legacy_default_gets_one_directed_contract_correction
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_review_protocol.py::test_omitted_legacy_default_gets_one_directed_contract_correction
   independent_gold: null
   remaining_subcases:
   - 独立宽表/角色真值与真实模型修订质量
@@ -159,6 +182,21 @@ scenarios:
   - nodeid: src/lightgraph/tests/test_semantic_decisions.py::test_agent_relation_proposal_is_refuted_by_independent_review
     fixture_and_assertions: inline_test
     command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_decisions.py::test_agent_relation_proposal_is_refuted_by_independent_review
+  - nodeid: src/lightgraph/tests/test_hierarchy_endpoints.py::test_same_code_at_two_levels_resolves_exact_occurrence
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_hierarchy_endpoints.py::test_same_code_at_two_levels_resolves_exact_occurrence
+  - nodeid: src/lightgraph/tests/test_hierarchy_endpoints.py::test_hierarchy_without_a_valid_level_is_never_guessed
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_hierarchy_endpoints.py::test_hierarchy_without_a_valid_level_is_never_guessed
+  - nodeid: src/lightgraph/tests/test_hierarchy_endpoints.py::test_level_selector_cannot_change_a_nonhierarchical_endpoint
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_hierarchy_endpoints.py::test_level_selector_cannot_change_a_nonhierarchical_endpoint
+  - nodeid: src/lightgraph/tests/test_discovery_repair.py::test_hierarchy_endpoint_contract_is_repaired_with_registered_binding
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_repair.py::test_hierarchy_endpoint_contract_is_repaired_with_registered_binding
+  - nodeid: src/lightgraph/tests/test_wide_table_recovery.py::test_repair_wide_table_then_discover_hierarchy_to_center_parallel_relations
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_wide_table_recovery.py::test_repair_wide_table_then_discover_hierarchy_to_center_parallel_relations
   independent_gold: null
   remaining_subcases:
   - 列组映射到实例关系的完整推导链
@@ -228,6 +266,12 @@ scenarios:
   - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_upstream_withdrawal_deactivates_dependent_identity_without_rewriting_history
     fixture_and_assertions: inline_test
     command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_upstream_withdrawal_deactivates_dependent_identity_without_rewriting_history
+  - nodeid: src/lightgraph/tests/test_wide_table_recovery.py::test_unrepaired_contract_is_not_cached_as_completed_and_next_run_recovers
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_wide_table_recovery.py::test_unrepaired_contract_is_not_cached_as_completed_and_next_run_recovers
+  - nodeid: src/lightgraph/tests/test_discovery_repair.py::test_contract_repair_cannot_erase_original_fd_counterexample
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_repair.py::test_contract_repair_cannot_erase_original_fd_counterexample
   independent_gold: null
   remaining_subcases:
   - 同错误类型/同计数但源值变化的新反例识别
@@ -240,6 +284,7 @@ scenarios:
   - US-17
   - US-20
   - US-31
+  - US-11
   coverage_status: engineering_cases_present
   acceptance_status: not_run
   engineering_cases:
@@ -261,6 +306,15 @@ scenarios:
   - nodeid: src/lightgraph/tests/test_rule_generations.py::test_generation_and_partition_of_same_rule_cannot_publish_together
     fixture_and_assertions: inline_test
     command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_rule_generations.py::test_generation_and_partition_of_same_rule_cannot_publish_together
+  - nodeid: src/lightgraph/tests/test_discovery_repair.py::test_unchanged_contract_failure_is_bounded_and_keeps_usable_sibling
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_repair.py::test_unchanged_contract_failure_is_bounded_and_keeps_usable_sibling
+  - nodeid: src/lightgraph/tests/test_discovery_repair.py::test_repair_budget_exhaustion_preserves_independent_valid_rule
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_repair.py::test_repair_budget_exhaustion_preserves_independent_valid_rule
+  - nodeid: src/lightgraph/tests/test_discovery_repair.py::test_same_rule_id_conflicting_repair_does_not_choose_first_interpretation
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_repair.py::test_same_rule_id_conflicting_repair_does_not_choose_first_interpretation
   independent_gold: null
   remaining_subcases:
   - 真实数据库/进程中断的一致性与部署恢复
@@ -316,6 +370,18 @@ scenarios:
   - nodeid: src/lightgraph/tests/test_iteration_runtime.py::test_excel_import_obeys_configured_working_memory
     fixture_and_assertions: inline_test
     command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_iteration_runtime.py::test_excel_import_obeys_configured_working_memory
+  - nodeid: src/lightgraph/tests/test_property_proposal_compatibility.py::test_dynamic_property_and_builtin_reference_do_not_bypass_output_scope
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_property_proposal_compatibility.py::test_dynamic_property_and_builtin_reference_do_not_bypass_output_scope
+  - nodeid: src/lightgraph/tests/test_discovery_repair.py::test_repair_cannot_reintroduce_original_fact_value_as_business_attribute
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_repair.py::test_repair_cannot_reintroduce_original_fact_value_as_business_attribute
+  - nodeid: src/lightgraph/tests/test_discovery_repair.py::test_new_exclusion_removes_previously_compiled_sibling
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_repair.py::test_new_exclusion_removes_previously_compiled_sibling
+  - nodeid: src/lightgraph/tests/test_semantic_review_protocol.py::test_bad_review_text_is_not_reflected_in_repair_or_accepted_result
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_review_protocol.py::test_bad_review_text_is_not_reflected_in_repair_or_accepted_result
   independent_gold: null
   remaining_subcases:
   - 历史库值派生 token 的运维清理/重建
@@ -365,6 +431,9 @@ scenarios:
   - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_common_names_are_bounded_before_pair_generation
     fixture_and_assertions: inline_test
     command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_common_names_are_bounded_before_pair_generation
+  - nodeid: src/lightgraph/tests/test_semantic_review_protocol.py::test_contract_correction_uses_existing_call_budget
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_review_protocol.py::test_contract_correction_uses_existing_call_budget
   independent_gold: null
   remaining_subcases:
   - 大图有界候选召回率
@@ -391,6 +460,24 @@ scenarios:
   - nodeid: src/lightgraph/tests/test_semantic_decisions.py::test_prose_never_promotes_overlap_to_accepted_relation
     fixture_and_assertions: inline_test
     command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_decisions.py::test_prose_never_promotes_overlap_to_accepted_relation
+  - nodeid: src/lightgraph/tests/test_semantic_review_protocol.py::test_reference_never_accepts_wrong_binding_or_conflicting_echo
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_review_protocol.py::test_reference_never_accepts_wrong_binding_or_conflicting_echo
+  - nodeid: src/lightgraph/tests/test_semantic_review_protocol.py::test_a_previous_review_reference_cannot_be_replayed_for_reversed_endpoints
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_review_protocol.py::test_a_previous_review_reference_cannot_be_replayed_for_reversed_endpoints
+  - nodeid: src/lightgraph/tests/test_semantic_review_protocol.py::test_negative_or_undecided_review_is_not_retried_until_positive
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_review_protocol.py::test_negative_or_undecided_review_is_not_retried_until_positive
+  - nodeid: src/lightgraph/tests/test_semantic_review_protocol.py::test_repair_must_still_classify_all_documents_and_reject_denial
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_semantic_review_protocol.py::test_repair_must_still_classify_all_documents_and_reject_denial
+  - nodeid: src/lightgraph/tests/test_discovery_repair.py::test_semantic_refutation_does_not_enter_contract_repair
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_repair.py::test_semantic_refutation_does_not_enter_contract_repair
+  - nodeid: src/lightgraph/tests/test_wide_table_recovery.py::test_rejected_hierarchy_does_not_hide_independent_entities
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_wide_table_recovery.py::test_rejected_hierarchy_does_not_hide_independent_entities
   independent_gold: null
   remaining_subcases:
   - 独立 schema/值冲突真值
@@ -421,6 +508,9 @@ scenarios:
   - nodeid: src/lightgraph/tests/test_graph_reconciliation.py::test_agent_graph_review_uses_original_facts_and_does_not_repeat
     fixture_and_assertions: inline_test
     command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_graph_reconciliation.py::test_agent_graph_review_uses_original_facts_and_does_not_repeat
+  - nodeid: src/lightgraph/tests/test_wide_table_recovery.py::test_no_business_graph_is_reported_separately_from_metadata
+    fixture_and_assertions: inline_test
+    command: .venv/bin/python -m pytest -q src/lightgraph/tests/test_wide_table_recovery.py::test_no_business_graph_is_reported_separately_from_metadata
   independent_gold: null
   remaining_subcases:
   - 真实浏览器候选裁决与来源支持全链路
@@ -466,4 +556,5 @@ scenarios:
   remaining_subcases:
   - BI 适配与候选质量对照
   execution_records: []
-implementation_record: design/lightweight_graph/ITERATIVE_ENGINE_IMPLEMENTATION.md
+implementation_record: design/lightweight_graph/REAL_DATA_DISCOVERY_REPAIR.md
+latest_repair_base_commit: 81d04b2dde8f4c203a9d0f1ad672cd9be89f1bc0

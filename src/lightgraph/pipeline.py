@@ -11,7 +11,7 @@ from .rules import RuleEngine
 from .metadata import publish_metadata
 from .runtime.retention import write_report,write_rules,atomic_text
 
-DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/4'
+DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/5'
 
 # These failures mean the Agent never completed an interpretation. They are not
 # permission to retry within a turn; leave the table pending for a later run.
@@ -59,6 +59,33 @@ def _deferred_tables(result, selected=()):
             any(token in str(issue.get('code','')) for token in tokens)):
             failed.update([issue['table']] if issue.get('table') else selected)
     return failed
+
+
+def _discovery_counts(report, result):
+    for key in ('compile_repair_rounds', 'recovered_proposals', 'deferred_proposals'):
+        value = result.stats.get(key, 0)
+        if type(value) is int:
+            report.counts[key] = report.counts.get(key, 0) + value
+
+
+def _graph_outcome(report, store, config, *, discover_only):
+    """Report visible business output separately from metadata and process status."""
+    if discover_only:
+        report.validation['business_graph'] = 'not_requested'
+        return
+    graph = store.view(set(config.scopes), config.isolation_domain, include_candidates=True)
+    business = {n['id']: n for n in graph['nodes'] if n['layer'] == 'business'}
+    edges = [e for e in graph['edges'] if e['source'] in business and e['target'] in business]
+    report.counts.update(
+        business_nodes=sum(n['status'] == 'accepted' for n in business.values()),
+        business_edges=sum(e['status'] == 'accepted' for e in edges),
+        candidate_business_nodes=sum(n['status'] != 'accepted' for n in business.values()),
+        candidate_business_edges=sum(e['status'] != 'accepted' for e in edges),
+    )
+    report.validation['business_graph'] = (
+        'entities_and_relations' if report.counts['business_edges'] else
+        'entities_only' if report.counts['business_nodes'] else
+        'candidates_only' if business else 'empty')
 
 
 def load_rules(paths):
@@ -162,6 +189,8 @@ def _issues(report, items):
     for issue in items:
         if hasattr(issue,'model_dump'):issue=issue.model_dump()
         safe={k:v for k,v in issue.items() if k in ('code','table','rule_id','count') and isinstance(v,(str,int))}
+        if issue.get('status') in ('unresolved','deferred','partial','resolved','rejected'):
+            safe['status']=issue['status']
         if safe:report.issues.append(safe)
 
 
@@ -405,6 +434,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 allrules=[r for r in allrules if r.source.source_id!=sid
                           or r.source.schema_name+'.'+r.source.table not in selected]+result.rules
                 _issues(report,result.issues)
+                _discovery_counts(report,result)
                 report.counts['discovered_rules']=report.counts.get('discovered_rules',0)+len(result.rules)
                 _write_understanding(output,result.understandings)
                 understandings.extend(result.understandings)
@@ -468,6 +498,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 discovery_completed.get(sid,set()).difference_update(
                     _deferred_tables(result,discovery_tables.get(sid,set(contexts[sid]))))
                 _issues(report,result.issues)
+                _discovery_counts(report,result)
                 existing={r.rule_id:r for r in _latest(store.get_rules(include_stale=True))}
                 for rule in result.rules:
                     if rule.rule_id in existing:rule.revision=existing[rule.rule_id].revision+1
@@ -535,6 +566,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     result=discover(rules_by_source[sid],config.goal,documents=corpus,model=model,
                         table_refs={name},iteration_context=context,revision_rules=entry['rules'])
                 _issues(report,result.issues)
+                _discovery_counts(report,result)
                 _write_understanding(output,result.understandings)
                 understandings.extend(result.understandings)
                 if _deferred_tables(result,{name}):
@@ -659,7 +691,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         if report.issues and report.status=='COMPLETED':
             partial_tokens=('budget','exhausted','timeout','truncated','unavailable','permission','incomplete','unverified','formula_cache_missing','execution_failed','dependency_rule_failed','too_large','model_http','model_response','model_transport')
             report.status='PARTIAL' if any(
-                _agent_execution_failure(str(i.get('code',''))) or
+                i.get('status') in ('deferred','partial') or _agent_execution_failure(str(i.get('code',''))) or
                 any(t in str(i.get('code','')) for t in partial_tokens)
                 for i in report.issues) else 'COMPLETED_WITH_GAPS'
     except (LightGraphError,KeyboardInterrupt) as exc:
@@ -670,11 +702,19 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         _abort_staging(store,prepared)
         report.status='FAILED';report.issues.append({'code':'internal_error'})
     finally:
+        try:
+            _graph_outcome(report,store,config,discover_only=discover_only)
+        except Exception:
+            # Do not replace the original extraction failure with a reporting
+            # failure, or mistake unavailable graph state for an empty graph.
+            report.validation['business_graph']='unavailable'
         if 'ledger' in locals():
             # Pending work remains resumable after budget failures and interrupts.
             for item in ledger.items():
                 if item.state=='running':ledger.transition(item,'deferred')
             report.counts.update(ledger.counts())
+            if report.counts.get('work_deferred',0) and report.status in ('COMPLETED','COMPLETED_WITH_GAPS'):
+                report.status='PARTIAL'
         report.counts['elapsed_seconds']=round(time.monotonic()-started,3)
         report.counts['llm_calls']=model.usage['calls'] if model else 0
         report.counts['db_queries']=budget.snapshot()['queries'] if 'budget' in locals() else sum(a.stats.queries for a in adapters)

@@ -532,6 +532,32 @@
           "title": "Target Columns",
           "type": "array"
         },
+        "source_level": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Level"
+        },
+        "target_level": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Level"
+        },
         "relation": {
           "default": "verified_reference",
           "title": "Relation",

@@ -68,7 +68,7 @@ def test_automatic_vocabulary_requires_definitions_and_does_not_admit_any_string
         assert defined.published, defined.codes
 
 
-@pytest.mark.parametrize("property_name,value_type", [("level_no", "integer"), ("label", "string"), ("source_ref", "string")])
+@pytest.mark.parametrize("property_name,value_type", [("level_no", "integer"), ("label", "integer"), ("source_ref", "string")])
 def test_dynamic_schema_cannot_override_builtin_property_contract(property_name, value_type):
     schema = vocabulary()
     schema.properties[0].name = property_name
@@ -102,20 +102,34 @@ def test_custom_property_and_builtin_properties_export_with_distinct_contracts(t
 
 
 @pytest.mark.parametrize("relation_name", ["parent_of", "same_entity"])
-def test_dynamic_schema_cannot_silently_narrow_builtin_relation_endpoints(relation_name):
+def test_builtin_relation_reference_does_not_narrow_existing_endpoints(relation_name):
     schema = SemanticSchema.model_validate({
         "entity_types": [{"name": "Person", "description": "A person."}],
         "relations": [{"name": relation_name, "description": "A user-specified relation.",
                        "source_kinds": ["Person"], "target_kinds": ["Person"]}],
     })
     with GraphStore() as store:
-        with pytest.raises(PersistenceViolation, match="builtin_relation_definition_forbidden"):
-            store.configure_goal(ExtractionGoal(entity_kinds=[], relation_kinds=[], semantic_schema=schema))
-        with pytest.raises(PersistenceViolation, match="builtin_relation_definition_forbidden"):
-            snapshot_schema(schema.model_dump())
+        store.configure_goal(ExtractionGoal(entity_kinds=[], relation_kinds=[], semantic_schema=schema))
+        snapshot_schema(schema.model_dump())
         assert not store.policy.relation_definitions
-        assert "Person" not in store.policy.kinds["business"]
-        assert store.connection.execute("SELECT COUNT(*) FROM semantic_catalog").fetchone()[0] == 0
+        sources,targets=store.policy.relation_endpoint_kinds(relation_name)
+        assert {"Person","Metric","Measure"}<=sources & targets
+        assert store.policy.semantic_schema.relations==[]
+
+
+@pytest.mark.parametrize("relation_name,sources,targets", [
+    ("uses_measure", ["Measure"], ["Metric"]),
+    ("member_of", ["Dimension"], ["DimensionMember"]),
+    ("table_has_column", ["Metric"], ["Measure"]),
+])
+def test_builtin_relation_reference_cannot_change_direction_or_system_semantics(relation_name,sources,targets):
+    schema=SemanticSchema.model_validate({'relations':[{'name':relation_name,'description':'A proposed usage.',
+        'source_kinds':sources,'target_kinds':targets}]})
+    with GraphStore() as store:
+        with pytest.raises(PersistenceViolation,match='builtin_relation_definition_forbidden'):
+            store.register_import_schema(schema)
+        assert not store.policy.relation_definitions
+        assert store.connection.execute("SELECT COUNT(*) FROM semantic_catalog").fetchone()[0]==0
 
 
 @pytest.mark.parametrize("restriction", ["excluded_columns", "evidence_only_columns"])

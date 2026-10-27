@@ -90,7 +90,16 @@ def test_transient_model_failure_is_retried_without_redoing_completed_table(tmp_
 def test_automatic_cross_source_verification_honors_512_byte_memory_budget(monkeypatch):
     left = _table("mapping", "A", ("key", "ref"))
     right = _table("codes", "B", ("code",))
-    model = client(monkeypatch, lambda request: response(_reference_packet(input_packet(request)[1])))
+    def propose(request):
+        packet = _reference_packet(input_packet(request)[1])
+        # A valid business relation must reach the memory check; the metadata
+        # default verified_reference is now correctly rejected before querying.
+        packet['proposals'][0]['claim']['relation_kind'] = 'catalog_link'
+        packet['semantic_schema'] = {'relations': [{'name':'catalog_link',
+            'description':'A business reference between catalog objects.',
+            'source_kinds':['ReportItem'], 'target_kinds':['ReportItem']}]}
+        return response(packet)
+    model = client(monkeypatch, propose)
     budget = BudgetAllocator(Cost(db_cu=20, llm_calls=4, llm_tokens=100000,
                                   memory_bytes=512, seconds=60))
     model.budget = budget
