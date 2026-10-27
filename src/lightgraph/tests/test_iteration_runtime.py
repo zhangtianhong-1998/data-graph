@@ -47,7 +47,8 @@ def test_cached_data_counterexample_starts_new_agent_and_then_reuses(monkeypatch
         return response({'task':p['task'],'abstain':True})
     with MemorySource([t],{'public.opaque':[('K','First','A')]}) as source:
         first=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert first.status=='COMPLETED'
+    assert first.status=='COMPLETED_WITH_GAPS'
+    assert any(i['code']=='unexplained_columns' for i in first.issues)
     packets.clear()
     rows=[('K','First','A'),('K','Second','B')]
     with MemorySource([t],{'public.opaque':rows}) as source:
@@ -82,18 +83,20 @@ def test_unresolved_counterexample_does_not_repeat_same_agent_task(monkeypatch,t
     rows=[('K','First','A'),('K','Second','B')]
     with MemorySource([t],{'public.opaque':rows}) as source:
         failed=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert failed.counts['work_unresolved']==1,failed.model_dump()
+    assert failed.counts['work_unresolved']==2,failed.model_dump()  # FD review and remaining realm column
     packets.clear()
     with MemorySource([t],{'public.opaque':rows}) as source:
         repeated=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert not packets,repeated.model_dump()
+    assert not packets,repeated.model_dump()  # failed entities need T5; unchanged unresolved work is not re-asked
     with GraphStore(tmp_path/'out/graph.sqlite') as store:
         assert not [n for n in store.view({'public'})['nodes'] if n['layer']=='business']
         assert any(not h['valid'] for h in store.heads() if not h['logical_rule_id'].startswith(('catalog:','discovery:')))
     # The old interpretation may become valid again without an Agent call.
+    packets.clear()
     with MemorySource([t],{'public.opaque':[('K','First','A')]}) as source:
         recovered=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert not packets and recovered.counts['work_unresolved']==0,recovered.model_dump()
+    assert [p['task'] for p in packets]==['T1_table_discovery']
+    assert recovered.counts['work_unresolved']==1,recovered.model_dump()  # only coverage remains open
 
 
 def test_excel_import_obeys_configured_working_memory(tmp_path):
@@ -123,7 +126,8 @@ def test_repairing_one_column_group_keeps_sibling_new_entities(monkeypatch,tmp_p
         return response({'task':p['task'],'abstain':True})
     with MemorySource([t],{'public.multi':[('X','old','A','Y1','first-y')]}) as source:
         initial=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert initial.status=='COMPLETED'
+    assert initial.status=='COMPLETED_WITH_GAPS'
+    assert any(i['code']=='relation_discovery_pending' for i in initial.issues)
     rows=[('X','old','A','Y1','first-y'),('X','changed','B','Y2','new-y')]
     calls.clear()
     with MemorySource([t],{'public.multi':rows}) as source:
@@ -136,4 +140,4 @@ def test_repairing_one_column_group_keeps_sibling_new_entities(monkeypatch,tmp_p
     calls.clear()
     with MemorySource([t],{'public.multi':rows}) as source:
         repeated=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert not calls,repeated.model_dump()
+    assert calls==['T2_cross_table'],repeated.model_dump()  # entity rules are reused; abstained relations remain open

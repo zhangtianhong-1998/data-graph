@@ -371,11 +371,14 @@ class GraphStore:
                     publication["logical_rule_id"], publication["revision"], publication["partition_id"]):
                 raise StoreError("support_publication_mismatch")
             self._validate_support_binding(fact, support)
+            # The fact is unchanged throughout this call; reuse its canonical
+            # identifier instead of serializing and hashing the payload thrice.
+            fact_id = fact.fact_id
             self.connection.execute("INSERT OR IGNORE INTO graph_fact VALUES(?,?,?,?)",
-                                    (fact.fact_id, fact.isolation_domain, fact.fact_kind, canonical(fact.payload)))
-            support_id = support.support_id(fact.fact_id)
+                                    (fact_id, fact.isolation_domain, fact.fact_kind, canonical(fact.payload)))
+            support_id = support.support_id(fact_id)
             self.connection.execute("INSERT OR IGNORE INTO fact_support VALUES(?,?,?,?,?,?,?,?)", (
-                support_id, fact.fact_id, support.origin, support.source_binding, support.scope_ref,
+                support_id, fact_id, support.origin, support.source_binding, support.scope_ref,
                 support.partition_id, support.rule_id, support.rule_revision,
             ))
             existing = self.connection.execute(

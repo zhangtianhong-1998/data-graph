@@ -26,7 +26,7 @@ _RECOVERABLE = frozenset({
     "cross_source_snapshot_unverified", "cross_source_source_changed",
     "cross_source_value_unsupported", "invalid_aggregate_shape",
 })
-_COUNT_FIELDS = ("source_ref_tuples", "null_refs", "unmatched", "ambiguous", "unique_matches")
+_COUNT_FIELDS = ("source_ref_tuples", "null_refs", "partial_null_refs", "unmatched", "ambiguous", "unique_matches")
 
 
 def _registered_table(adapter, requested):
@@ -195,7 +195,7 @@ def check_cross_source_reference(
     def collect_source(row):
         encoded = _key(row)
         reserve(sys.getsizeof(encoded) + 256)
-        source_keys[encoded] = any(value is None for value in row)
+        source_keys[encoded] = (any(value is None for value in row), all(value is None for value in row))
 
     def collect_target(row):
         key_values = tuple(row[index] for index in target_key_indexes)
@@ -236,9 +236,10 @@ def check_cross_source_reference(
                     raise LightGraphError("cross_source_source_changed")
             counts = dict.fromkeys(_COUNT_FIELDS, 0)
             counts["source_ref_tuples"] = len(source_keys)
-            for encoded, missing in source_keys.items():
+            for encoded, (missing, entirely_null) in source_keys.items():
                 if missing:
                     counts["null_refs"] += 1
+                    counts["partial_null_refs"] += not entirely_null
                     continue
                 matches = len(target_bindings.get(encoded, ()))
                 counts["unmatched" if not matches else "ambiguous" if matches > 1 else "unique_matches"] += 1

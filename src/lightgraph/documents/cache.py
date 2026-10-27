@@ -13,7 +13,7 @@ from lightgraph.context import CONTEXT_SELECTION_VERSION, STAGE_SUBTASKS, goal_p
 from .core import (KnowledgeDocument, DocumentSection, DocumentClaim, DocumentReference,
                    ClaimAlignment, DocumentScope, Purpose, _extract_uncached)
 
-OPERATOR_VERSION='document_claim_extraction/3'
+OPERATOR_VERSION='document_claim_extraction/4'
 BoundedCondition=Annotated[str,Field(max_length=1024)]
 
 class CachedClaim(StrictModel):
@@ -39,7 +39,7 @@ class CachedSection(StrictModel):
     scope: DocumentScope
     section_hash: str = Field(pattern=r'^[0-9a-f]{64}$')
     ancestor_context_hash: str = Field(pattern=r'^[0-9a-f]{64}$')
-    operator_version: Literal['document_claim_extraction/2','document_claim_extraction/3'] = OPERATOR_VERSION
+    operator_version: Literal['document_claim_extraction/2','document_claim_extraction/3','document_claim_extraction/4'] = OPERATOR_VERSION
     extractor_fingerprint: str = Field(pattern=r'^[0-9a-f]{64}$')
     context_fingerprint: str = Field(default_factory=lambda:digest('legacy_document_context'),pattern=r'^[0-9a-f]{64}$')
     complete: Literal[True] = True

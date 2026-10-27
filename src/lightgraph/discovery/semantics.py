@@ -50,6 +50,7 @@ class SemanticReview(StrictModel):
         description='Copy semantic_proposition_ref from the input. Do not restate the proposition.')
     proposition: dict | None = Field(default=None,
         description='Legacy response only. Omit this field when returning proposition_ref.')
+    decision_scope: Literal['proposition','document_window'] = 'proposition'
     decision: Literal['supported', 'refuted', 'unresolved']
     basis: Literal['explicit_declaration', 'document_interpretation', 'data_inference']
     evidence: list[EvidenceInterpretation] = Field(default_factory=list, max_length=128)
@@ -121,13 +122,16 @@ _REPAIRABLE_REVIEW_CODES = frozenset({
 })
 
 
-def _check_review(reviewed, *, proposition_ref, expected_proposition, docs, doc_refs, issued):
+def _check_review(reviewed, *, proposition_ref, expected_proposition, docs, doc_refs, issued,
+                  allow_no_support=False, complete_collection=False):
     """Validate one judgment without interpreting a model echo as the claim."""
     # A negative or undecided judgment is not a formatting problem to retry
     # until it turns positive, even when other fields are malformed.
     if reviewed.decision == 'refuted' or any(item.stance == 'refutes' for item in reviewed.evidence):
         raise LightGraphError('semantic_claim_refuted')
-    if reviewed.decision != 'supported':
+    neutral_window=(allow_no_support and reviewed.decision_scope=='document_window'
+        and all(item.stance in ('context','irrelevant') for item in reviewed.evidence))
+    if reviewed.decision != 'supported' and not neutral_window:
         raise LightGraphError('semantic_claim_unresolved')
     for condition in reviewed.conditions:
         if condition.state != 'satisfied' or not condition.evidence_refs:
@@ -150,14 +154,15 @@ def _check_review(reviewed, *, proposition_ref, expected_proposition, docs, doc_
         raise LightGraphError('semantic_review_incomplete_context')
     ineligible = {document_ref(d) for d in docs
         if d.get('evidence_role') != 'definition_evidence'
-        or d.get('read_state', 'complete') != 'complete' or d.get('derived', False)}
+        or d.get('read_state', 'complete') != 'complete' and not complete_collection or d.get('derived', False)}
     supporting = [item.reference for item in reviewed.evidence if item.stance == 'supports']
-    if not supporting or set(supporting) & ineligible:
+    if (not supporting and not allow_no_support) or set(supporting) & ineligible:
         raise LightGraphError('semantic_review_missing_support')
-    return ['semantic_review:' + reviewed.basis] + sorted(set(supporting))
+    return ['semantic_review:' + reviewed.basis] + sorted(set(supporting)) if supporting else []
 
 
-def review_semantics(model, packet, proposition, documents, *, observations=None):
+def _review_semantics_window(model, packet, proposition, documents, *, observations=None,
+                             batch=None):
     """Review a compiler-issued proposition independently of the proposal.
 
     The reviewer sees every applicable section and may use schema and probe
@@ -175,6 +180,7 @@ def review_semantics(model, packet, proposition, documents, *, observations=None
     expected_proposition = canonical(proposition)
     proposition_ref = 'proposition_' + uuid.uuid4().hex
     review_packet = {**packet, 'task': 'semantic_review', 'document_snippets': docs,
+        'document_refs':[],
         'semantic_proposition': json.loads(expected_proposition),
         'semantic_proposition_ref': proposition_ref,
         'subtask': (
@@ -192,6 +198,17 @@ def review_semantics(model, packet, proposition, documents, *, observations=None
             'Analytical guidance is context only, never independent confirmation. '
             'Report all applicable conditions; unknown or unsatisfied conditions block '
             'acceptance. Never copy observed row values into the response.')}
+    if batch is not None:
+        review_packet['document_batch']=batch
+        review_packet['subtask'] += (' This is one bounded window of a complete document collection. '
+            'Partial sections have explicit character locators; do not assume omitted text is absent. '
+            'Classify only the supplied portions. Set decision_scope=document_window when the decision '
+            'only describes this window; a context-only or irrelevant window may be unresolved '
+            'because it supplies no support. Use decision_scope=proposition for genuine unresolved '
+            'semantics, and always report unknown conditions. A supported decision with no supporting references '
+            'means this window adds no support or contradiction; the compiler still requires support '
+            'and successful review of every other window. Any uncertain condition or possible '
+            'contradiction remains unresolved. Never infer support merely from batching.')
     try:
         # One correction is sufficient for a transportable contract. Each call
         # uses the normal model budget; exhaustion/timeout is never retried here.
@@ -201,7 +218,8 @@ def review_semantics(model, packet, proposition, documents, *, observations=None
             try:
                 reviewed = model.complete('semantic_review', review_packet, SemanticReview)
                 return _check_review(reviewed, proposition_ref=proposition_ref,
-                    expected_proposition=expected_proposition, docs=docs, doc_refs=doc_refs, issued=issued)
+                    expected_proposition=expected_proposition, docs=docs, doc_refs=doc_refs, issued=issued,
+                    allow_no_support=batch is not None, complete_collection=batch is not None)
             except LightGraphError as exc:
                 if attempt or exc.code not in _REPAIRABLE_REVIEW_CODES:
                     raise
@@ -220,6 +238,32 @@ def review_semantics(model, packet, proposition, documents, *, observations=None
                 review_packet.pop('tool_observations',None)
     finally:
         review_packet.pop('tool_observations',None)
+
+
+def review_semantics(model, packet, proposition, documents, *, observations=None):
+    """Every document window must pass before any positive decision escapes.
+
+    Text stays in memory and each provider call keeps the original budget.
+    A contradiction or unknown condition in a later chunk blocks all earlier
+    support. Exhaustion never publishes a result from the processed prefix.
+    """
+    from lightgraph.context import document_batches
+    documents=list(documents)
+    if any(d.get('read_state','complete')!='complete' for d in documents):
+        raise LightGraphError('semantic_review_incomplete_context')
+    if len({document_ref(d) for d in documents})>128:
+        raise LightGraphError('semantic_review_document_limit')
+    windows=list(document_batches(documents)) or [[]]
+    if len(windows)==1 and not any(d.get('read_state')=='partial' for d in windows[0]):
+        return _review_semantics_window(model,packet,proposition,windows[0],observations=observations)
+    evidence=[]
+    for index, window in enumerate(windows):
+        evidence.extend(_review_semantics_window(model,packet,proposition,window,
+            observations=observations,batch={'index':index+1,'total':len(windows),
+                'acceptance_requires_all_windows':True}))
+    if not any(not ref.startswith('semantic_review:') for ref in evidence):
+        raise LightGraphError('semantic_review_missing_support')
+    return sorted(set(evidence))
 
 
 def declaration_block(table, predicate, source_columns=(), target_columns=(), **kwargs):

@@ -80,7 +80,9 @@ def test_new_table_document_rediscovers_only_affected_table(tmp_path, monkeypatc
         seen.clear()
         third=run_pipeline(config,[source],model=model,documents=[doc])
         assert third.counts["reused_rules"]==2,third.issues
-        assert not seen
+        assert seen==[('T2_cross_table','a'),('T2_cross_table','b'),
+                      ('T1_table_discovery','a'),('T1_table_discovery','b')]
+        assert any(i['code']=='unexplained_columns' for i in third.issues)
 
 
 def test_composite_constraints_keep_order_and_group(tmp_path):

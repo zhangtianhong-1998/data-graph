@@ -6,7 +6,7 @@
 
 依赖的本轮实测版本记录在 `requirements.lock`；需要复现环境时先安装该文件，再安装项目。
 
-当前运行能力与验证边界见 [实施与验收记录](IMPLEMENTATION_STATUS.md)。最新的语义审查协议、提案修复和宽层级关系端点改动见[真实数据反馈修复记录](design/lightweight_graph/REAL_DATA_DISCOVERY_REPAIR.md)；本轮验证使用离线模型替身，用户原数据仍待复跑。当前需求见 [用户故事](design/lightweight_graph/US.md) 和 [目标驱动迭代方案](design/lightweight_graph/GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)；[设计索引](design/lightweight_graph/README.md) 保留各项约束与历史边界。
+当前运行能力与验证边界见 [实施与验收记录](IMPLEMENTATION_STATUS.md)。最新的持续发现、可选关系、整组身份复核与运行指导改动见[两份评审后的继续修复](design/lightweight_graph/REVIEW_CONTINUATION_20261027.md)，上一轮协议修复见[真实数据反馈记录](design/lightweight_graph/REAL_DATA_DISCOVERY_REPAIR.md)。工程验证使用合成输入和离线模型替身，用户另一台机器上的真实数据仍待复跑。当前需求见 [用户故事](design/lightweight_graph/US.md) 和 [目标驱动迭代方案](design/lightweight_graph/GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)；[设计索引](design/lightweight_graph/README.md) 保留各项约束与历史边界。
 
 ## 启动 Vue 工作台
 
@@ -35,6 +35,8 @@ workspace/<项目编号>/
 
 新项目及省略类型列表的 CLI/一般配置默认“由 Agent 根据目标发现”对象与关系类型，支持人员、组织或用户定义的业务对象；显式指定的非空类型列表继续限制范围，已有配置保留。关闭模型时只执行已有规则和可核验的声明，结构匹配或自然语言关键词不能自动证明业务关系。启用模型后，发现与独立语义复核分别检查提案、条件、反证和出处。用户无需编写 JSON 声明，也无需预先提供统一编号；无模型合成实验中的结构化声明仅用于固定验收输入。
 
+目标中的运行指导可分别作用于全局、普通任务、每轮发现或语义复核，并限定具体阶段。新 Agent 会按本次冻结配置重新获得适用指导；上传 Markdown 继续作为有出处的知识证据，不自动改写运行指令。对象发现、剩余列覆盖和关系发现分别记录进度，弃权或空结果不代表后续运行无需再探索。图谱已经发布但后续处理失败时，收尾仍尝试导出当前可见结果；运行状态、业务节点/边和导出状态分别查看。
+
 配置保存带持久化修订号。高级 JSON 会在启动、上传或刷新元数据前保存；若普通表单和 JSON 同时修改，页面要求明确选择，不能静默覆盖。其他页面已保存新版本时，旧页面收到冲突并保留草稿；运行记录显示启动时冻结的配置修订。
 
 业务图默认只显示已接受事实，可显式打开候选与未决视图。点击节点或边可查看状态、规则、来源绑定、文档及字段映射。归并候选面板展示原始对象与依据，允许确认为同一对象、确认为不同对象以及撤销裁决。裁决按版本保存，合法的多种业务关系分别保留；原始事实与历史不改写，相关依据变化后需要重新检查。当前面板不提供任意关系冲突的完整裁决工具，也不替代客户语义验收。
@@ -61,6 +63,16 @@ python3 -m venv .venv
 Windows 的安装、测试与启动命令见 [Windows 兼容说明](design/lightweight_graph/WINDOWS_COMPATIBILITY.md)。输出目录和工作台服务使用跨进程文件锁；Windows 不会跳过单写者检查。
 
 `verify` 分别执行固定规则实验 E 和声明驱动的确定性发现实验 D，并核对共享实体、缺层、同层兄弟节点、指标与度量关系、重复运行及输出中不含排除列内容。它使用合成数据与明确语义声明，不调用模型；不能证明自然语言理解质量或客户业务正确性。真实 Gauss/MySQL 接入、真实模型发现质量、客户 Gold 对照与部署留存分别验收。F 场景的已有测试映射及剩余验收见 [验收台账](design/lightweight_graph/acceptance_matrix.yaml)。
+
+前端验证及本轮发现调度的定向回归可直接执行：
+
+```bash
+npm --prefix src/workbench test
+npm --prefix src/workbench run build
+.venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_continuation.py
+```
+
+可选关系、身份整组复核、角色反馈、统计传递和运行指导的完整回归入口见[继续修复记录中的复跑命令](design/lightweight_graph/REVIEW_CONTINUATION_20261027.md#复跑命令)。
 
 结果位于 `runs/acceptance/acceptance.json`，两份可视化在 `runs/acceptance/E/viewer.html` 和 `runs/acceptance/D/viewer.html`。验收目录必须为空，避免把两次实验混在一起。
 

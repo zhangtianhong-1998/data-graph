@@ -166,12 +166,14 @@ class QueryCompiler:
         complete = " AND ".join(c + " IS NOT NULL" for c in tc)
         bindings = ", ".join(dict.fromkeys(tc + dc))
         missing = " OR ".join(f"s.{c} IS NULL" for c in sc)
+        populated = " OR ".join(f"s.{c} IS NOT NULL" for c in sc)
         join = " AND ".join(f"s.{a} = t.{b}" for a, b in zip(sc, tc))
         binding_alias = "_lg_bindings"
         while binding_alias in target_columns: binding_alias = "_" + binding_alias
         binding_count = "t." + self.ident(binding_alias)
         sql = f"""SELECT COUNT(*) AS source_ref_tuples,
           COALESCE(SUM(CASE WHEN {missing} THEN 1 ELSE 0 END), 0) AS null_refs,
+          COALESCE(SUM(CASE WHEN ({missing}) AND ({populated}) THEN 1 ELSE 0 END), 0) AS partial_null_refs,
           COALESCE(SUM(CASE WHEN NOT ({missing}) AND {binding_count} IS NULL THEN 1 ELSE 0 END), 0) AS unmatched,
           COALESCE(SUM(CASE WHEN {binding_count} > 1 THEN 1 ELSE 0 END), 0) AS ambiguous,
           COALESCE(SUM(CASE WHEN {binding_count} = 1 THEN 1 ELSE 0 END), 0) AS unique_matches

@@ -62,7 +62,7 @@ def test_reference_duplicates_not_ambiguity(table):
     refs=TableSpec(source_id="s",name="refs",columns=[ColumnSpec(name=c) for c in ["tenant","ref"]])
     with MemorySource([table,refs],{"public.items":[{"tenant":"A","code":"1","name":"X"}]*20 + [{"tenant":"B","code":"1","name":"Y"},{"tenant":"B","code":"1","name":"Z"}],"public.refs":[{"tenant":"A","ref":"1"},{"tenant":"B","ref":"1"},{"tenant":"A","ref":"2"}]}) as s:
         result=s.check_reference(refs,["tenant","ref"],table,["tenant","code"],discriminator_columns=["name"])
-        assert result == {"source_ref_tuples":3,"null_refs":0,"unmatched":1,"ambiguous":1,"unique_matches":1}
+        assert result == {"source_ref_tuples":3,"null_refs":0,"partial_null_refs":0,"unmatched":1,"ambiguous":1,"unique_matches":1}
 
 @pytest.mark.parametrize("sql",[
     "SELECT code FROM public.items; DELETE FROM public.items",

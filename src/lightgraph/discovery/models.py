@@ -183,7 +183,7 @@ class ProposalBatch(StrictModel):
     @model_validator(mode='after')
     def guard(self):
         allowed = {'T0_discovery': {'column_group','entity_key','exclusion','wide_hierarchy','long_hierarchy'},
-                   'T1_table_discovery': {'column_group','entity_key','exclusion'},
+                   'T1_table_discovery': {'column_group','entity_key','exclusion','wide_hierarchy','long_hierarchy'},
                    'T2_cross_table': {'reference','discriminator'}, 'T3_hierarchy': {'wide_hierarchy','long_hierarchy'},
                    'T4_document': set(), 'T5_revision': {'column_group','entity_key','exclusion','reference','discriminator','wide_hierarchy','long_hierarchy'}}
         if self.abstain and self.proposals: raise ValueError('abstain_with_proposals')
@@ -230,6 +230,7 @@ class DiscoveryResult(StrictModel):
     issues: list[dict[str,str|int]] = Field(default_factory=list)
     stats: dict[str,int|float|str] = Field(default_factory=dict)
     budget: dict = Field(default_factory=dict)
+    relation_table_outcomes: dict[str, Literal['resolved','unresolved','deferred']] = Field(default_factory=dict)
 
 class PacketColumn(StrictModel):
     id: str
@@ -242,7 +243,7 @@ class MetadataDigest(StrictModel):
 class PacketProbe(StrictModel):
     probe_id: str
     operator: str
-    aggregates: dict[str,int|float|bool|None] = Field(default_factory=dict)
+    aggregates: dict[str,int|float|bool|None|dict[str,int|float|bool|None]] = Field(default_factory=dict)
 class PacketStratum(StrictModel):
     stratum: str
     selection: str = 'bounded_sample'
@@ -265,7 +266,7 @@ class PacketDocument(StrictModel):
     purpose: Literal['data_description','analysis_knowledge','mixed','unresolved'] = 'data_description'
     scope: dict = Field(default_factory=dict)
     sources: list[SourceRef] = Field(default_factory=list)
-    read_state: Literal['complete'] = 'complete'
+    read_state: Literal['complete','partial'] = 'complete'
     evidence_role: Literal['definition_evidence','exploration_guidance'] = 'definition_evidence'
 class PacketConflict(StrictModel):
     code: str

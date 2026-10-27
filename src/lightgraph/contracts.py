@@ -69,6 +69,26 @@ class QueryLimits(StrictModel):
     max_result_bytes: int = Field(default=16777216, gt=0)
     timeout_ms: int = Field(default=60000, gt=0)
 
+class RuntimeGuidance(StrictModel):
+    """Explicit operator instructions, selected for each ephemeral Agent call."""
+    text: str = Field(min_length=1, max_length=4000)
+    injection: Literal['global', 'task', 'iteration', 'semantic_review'] = 'global'
+    stages: list[Literal['T0_discovery', 'T1_table_discovery', 'T2_cross_table',
+        'T3_hierarchy', 'T4_document', 'T5_revision', 'semantic_review']] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode='after')
+    def usable_stage(self):
+        if not self.text.strip():
+            raise ValueError('empty_runtime_guidance')
+        discovery={'T0_discovery','T1_table_discovery','T2_cross_table','T3_hierarchy','T5_revision'}
+        allowed={'global':discovery|{'T4_document','semantic_review'},
+                 'task':discovery|{'T4_document'},'iteration':discovery,
+                 'semantic_review':{'semantic_review'}}[self.injection]
+        if set(self.stages)-allowed:
+            raise ValueError('runtime_guidance_stage_mismatch')
+        return self
+
+
 class ExtractionGoal(StrictModel):
     """Operator intent and output scope; these never grant source permissions."""
     goal_id: str = "analysis_knowledge"
@@ -76,6 +96,7 @@ class ExtractionGoal(StrictModel):
     include: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=16)
     exclude: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=16)
     discovery_guidance: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=16)
+    runtime_guidance: list[RuntimeGuidance] = Field(default_factory=list, max_length=16)
     entity_kinds: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(default_factory=list, max_length=64)
     relation_kinds: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(default_factory=list, max_length=128)
     source_scope: list[str] = Field(default_factory=list)
@@ -175,6 +196,9 @@ class RelationSpec(StrictModel):
     # is a mapping decision, not permission to infer parent/child semantics.
     source_level: int | None = Field(default=None, gt=0)
     target_level: int | None = Field(default=None, gt=0)
+    # An entirely NULL endpoint means that an optional relationship is absent.
+    # Partial composite keys and non-NULL missing bindings always fail closed.
+    require_full_coverage: bool = False
     relation: str = "verified_reference"
     qualifiers: dict[str, Scalar] = Field(default_factory=dict)
     source_json_array_columns: list[str] = Field(default_factory=list, max_length=1)

@@ -1,6 +1,6 @@
 # 实施与验收记录
 
-> 当前版本入口：[真实数据反馈后的发现引擎修复](design/lightweight_graph/REAL_DATA_DISCOVERY_REPAIR.md)。上一轮的目标驱动构图能力见 [2026-10-26 迭代构图引擎实施记录](design/lightweight_graph/ITERATIVE_ENGINE_IMPLEMENTATION.md)。本文件以下内容保留截至 2026-10-24 的历史行为和验证快照；其中“当前”“尚未实现”及测试数量均属于各自记录日期，不代表本轮代码。真实模型和客户数据复跑状态按最新记录单独说明。
+> 当前版本入口：[两份评审后的继续修复](design/lightweight_graph/REVIEW_CONTINUATION_20261027.md)，包含持续发现、可选关系、整组身份复核和运行指导。2026-10-26 的协议修复见[真实数据反馈记录](design/lightweight_graph/REAL_DATA_DISCOVERY_REPAIR.md)。上一轮的目标驱动构图能力见 [2026-10-26 迭代构图引擎实施记录](design/lightweight_graph/ITERATIVE_ENGINE_IMPLEMENTATION.md)。本文件以下内容保留截至 2026-10-24 的历史行为和验证快照；其中“当前”“尚未实现”及测试数量均属于各自记录日期，不代表本轮代码。真实模型和客户数据复跑状态按最新记录单独说明。
 
 更新日期：2026-10-24。依据 `design/lightweight_graph/` 的 v1.0 架构、SDD §18 及发现 Agent 更新；后端、测试、JSON Schema 和 HTML 模板在 `src/lightgraph/`，Vue 工作台在 `src/workbench/`。历史验证数字按日期保留，不代表最新代码已经完成同等范围的运行验收。
 

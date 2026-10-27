@@ -347,6 +347,9 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
                     revision_candidate=prior[0].model_dump(mode='json',by_alias=True),
                     allowed_revision_codes=original_revision_codes)
                 packet['known_conflicts']=[{'code':code,'count':1} for code in packet['allowed_revision_codes'][:32]]
+            elif iteration_context and iteration_context.get('coverage_columns'):
+                packet.update(task='T1_table_discovery',
+                    subtask='继续检查 iteration_context.coverage_columns 中尚未解释的列；参考已有规则，补充有依据的对象或排除说明，不重复提交已有对象。')
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                 allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=[table])
             window,packet=_bounded_catalog_window(table,tables,packet,model,tools.tool_specs())
@@ -480,6 +483,8 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
             (table.source_id,table.schema_name,table.name))):continue
         tools=None
         observations=ReviewObservations()
+        issue_start=len(result.issues);rule_start=len(result.rules)
+        result.relation_table_outcomes[table.qualified_name]='deferred'
         docs=corpus.context_for(_source(table),table.column_names)
         try:
             if count>=max_candidates:raise LightGraphError('reference_candidate_limit')
@@ -504,6 +509,8 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                 allowed_tables=tool_tables,source_adapters=source_adapters)
             batch=_ask(model,packet,tools,observations)
             docs=tools.context_documents()
+            if batch.abstain:_issue(result,table,'model_abstained')
+            elif not batch.proposals:_issue(result,table,'no_confirmable_relation')
             repair_round=0;seen_repairs=set()
             while True:
                 failures=[]
@@ -563,6 +570,7 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                             claim.relation_kind,goal)
                         source_keys=endpoint_columns(source,claim.source_level)
                         target_keys=endpoint_columns(target,claim.target_level)
+                        endpoint_checks=[]
                         for binding,columns,keys in ((source,local,source_keys),(target,remote,target_keys)):
                             destination=remote_originals.get((binding.source.source_id,binding.source.schema_name,binding.source.table))
                             target_adapter=source_adapters.get(binding.source.source_id)
@@ -582,11 +590,17 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                                 else:
                                     check=adapter.check_reference(originals[table.qualified_name],columns,destination,keys)
                             finally:budget.charge(cost)
-                            if any(check.get(k,0) for k in ('unmatched','null_refs','ambiguous')):raise LightGraphError('reference_missing')
+                            if check.get('partial_null_refs',0):raise LightGraphError('reference_partial_null')
+                            if claim.require_full_coverage and check.get('null_refs',0):
+                                raise LightGraphError('reference_null_endpoint')
+                            if any(check.get(k,0) for k in ('unmatched','ambiguous')):raise LightGraphError('reference_missing')
+                            if not check.get('unique_matches',0):raise LightGraphError('reference_no_populated_endpoint')
+                            endpoint_checks.append(check)
                         review_packet={**packet,'semantic_schema':schema.model_dump(mode='json'),
                             'probe_digest':list(packet.get('probe_digest',[]))+[{
                             'probe_id':'backend_endpoint_verification','operator':'check_reference',
-                            'aggregates':{'unmatched':0,'null_refs':0,'ambiguous':0}}]}
+                            'aggregates':{field:sum(check.get(field,0) for check in endpoint_checks)
+                                for field in ('unmatched','null_refs','partial_null_refs','ambiguous','unique_matches')}}]}
                         # The provider's proposal is not its own semantic evidence.
                         # Review all endpoint context after structural verification.
                         evidence=review_semantics(model,review_packet,{
@@ -609,7 +623,8 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                             identity=IdentitySpec(key_columns=local,entity_kind=source.identity.entity_kind),
                             relation=RelationSpec(source_rule_id=source.rule_id,target_rule_id=target.rule_id,
                                 source_columns=local,target_columns=remote,relation=claim.relation_kind,
-                                source_level=claim.source_level,target_level=claim.target_level),
+                                source_level=claim.source_level,target_level=claim.target_level,
+                                require_full_coverage=claim.require_full_coverage),
                             dependencies=Dependencies(schema=_table_hash(originals[table.qualified_name]),
                                 documents=sorted({d['doc_id']+'@'+d['revision'] for d in docs})),
                             evidence=rule_evidence(evidence,reviewed=True,documents=docs),coverage=Coverage(scope='full',consistent=False))
@@ -652,6 +667,12 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
             _issue(result,table,exc.code)
             if isinstance(exc,BudgetExceeded):break
         finally:
+            table_issues=result.issues[issue_start:]
+            if any(issue.get('status')=='deferred' for issue in table_issues):
+                result.relation_table_outcomes[table.qualified_name]='deferred'
+            elif table_issues or len(result.rules)==rule_start:
+                result.relation_table_outcomes[table.qualified_name]='unresolved'
+            else:result.relation_table_outcomes[table.qualified_name]='resolved'
             if tools is not None:tools.close()
             observations.close()
     result.stats.update({'reference_candidates':count,'rules_proposed':len(result.rules),'endpoint_rules':len(approved)})

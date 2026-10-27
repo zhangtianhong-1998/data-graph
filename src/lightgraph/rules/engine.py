@@ -240,6 +240,9 @@ class RuleEngine:
                         counts, codes = self._entities(publication, rule, rows)
                     for name, count in counts.items():
                         outcome.counts[name] = outcome.counts.get(name, 0) + count
+                    if rule.kind == "reference":
+                        for name in ("null_endpoints_skipped", "empty_arrays_skipped"):
+                            validation.checks[name] = validation.checks.get(name, 0) + counts.get(name, 0)
                     all_codes.update(codes)
                     if set(codes) - {"gap_in_path"}:
                         outcome.codes = sorted(all_codes)
@@ -520,10 +523,23 @@ class RuleEngine:
         ):
             if len(columns) != len(endpoint_columns(endpoint, level)):
                 raise LightGraphError('reference_arity_mismatch')
-        count=0;expanded=0;codes=[];emitted=set()
+        count=0;expanded=0;codes=[];emitted=set();null_skipped=0;empty_skipped=0
         for row in rows:
+            endpoints=[tuple(row.get(column) for column in columns) for columns in
+                       (rule.relation.source_columns, rule.relation.target_columns)]
+            null_flags=[(any(value is None for value in key),all(value is None for value in key)) for key in endpoints]
+            if any(some and not all_null for some,all_null in null_flags):
+                codes.append("reference_partial_null");continue
+            if any(all_null for _,all_null in null_flags):
+                if rule.relation.require_full_coverage:codes.append("reference_null_endpoint")
+                else:null_skipped+=1
+                continue
             sources=self._reference_keys(row,rule.relation.source_columns,rule.relation.source_json_array_columns,rule.relation.max_array_elements)
             targets=self._reference_keys(row,rule.relation.target_columns,rule.relation.target_json_array_columns,rule.relation.max_array_elements)
+            if not sources or not targets:
+                if rule.relation.require_full_coverage:codes.append("reference_null_endpoint")
+                else:empty_skipped+=1
+                continue
             # The contract permits an array on only one endpoint; this product
             # expands one existing reference list, never two independent domains.
             for source in sources:
@@ -549,7 +565,8 @@ class RuleEngine:
                     self._stage(pub,rule,binding,scope,"Edge",{"source":a,"target":b,"relation":rule.relation.relation,
                         "qualifiers":rule.relation.qualifiers})
                     count+=1
-        return {"edges":count,"expanded_references":expanded,"projected_tuples":len(rows)},sorted(set(codes))
+        return {"edges":count,"expanded_references":expanded,"projected_tuples":len(rows),
+                "null_endpoints_skipped":null_skipped,"empty_arrays_skipped":empty_skipped},sorted(set(codes))
 
     @staticmethod
     def _reference_keys(row,columns,array_columns,max_elements):

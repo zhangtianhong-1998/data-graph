@@ -179,8 +179,9 @@ class ToolExecutor:
         return [
             _function("get_metadata", "Read authorized table declarations and stable column IDs. Declarations are hypotheses, not observed semantics.",
                       {"table": _STRING}),
-            _function("search_knowledge", "Read applicable complete descriptions and analytical guidance. Use source_id:schema.table when names overlap. Guidance is not confirmation.",
-                      {"table": _STRING, "columns": _COLUMNS}, ("table",)),
+            _function("search_knowledge", "Read an applicable document window. Use the returned next_page to read remaining context. Partial sections cannot independently confirm semantics. Use source_id:schema.table when names overlap.",
+                      {"table": _STRING, "columns": _COLUMNS,
+                       "page": {"type":"integer","minimum":0}}, ("table",)),
             _function("profile_columns", "Compute exact aggregate statistics for authorized columns. This may scan a full table; it does not infer business roles.",
                       {"table": _STRING, "columns": _COLUMNS}, ("table", "columns")),
             _function("check_fd", "Check key-to-attribute functional dependencies over the authorized table. Statistical correspondence is not semantic identity.",
@@ -224,8 +225,10 @@ class ToolExecutor:
                 raise LightGraphError("metadata_only_query_forbidden")
             response = getattr(self, "_" + name)(**arguments)
             if self._context_tables:
-                response['context']={'tables':self.context_tables(),'documents':self.context_documents(),
-                                     'document_refs':self.document_refs()}
+                from lightgraph.context import bounded_document_window
+                visible=bounded_document_window(self.context_documents(),max_bytes=min(12000,self._max_bytes//3))
+                response['context']={'tables':self.context_tables(),'documents':visible,
+                                     'document_refs':[document_reference(section) for section in visible]}
             response.update(status="ok", operator=operator, probe_id=probe_id)
             size = len(canonical(response).encode())
             if size > self._max_bytes:
@@ -275,13 +278,20 @@ class ToolExecutor:
             entries.append(value)
         return {"data": {"tables": entries}, "coverage": {"source_scope": "authorized_metadata", "result_complete": True, "truncated": False}}
 
-    def _search_knowledge(self, table, columns=None):
+    def _search_knowledge(self, table, columns=None, page=0):
         source = self._table(table)
         names = self._columns(source, columns) if columns is not None else source.column_names
         self._activate_tables([source.model_copy(update={'columns':[c for c in source.columns if c.name in names]})])
-        sections = self.context_documents()
-        return {"data": {"sections": sections}, "coverage": {"source_scope": "scoped_documents", "result_complete": False,
-                "truncated": False, "selection": "bounded_complete_sections"}}
+        from lightgraph.context import document_batches
+        if type(page) is not int or page < 0:
+            raise LightGraphError('invalid_tool_arguments')
+        pages=list(document_batches(self.context_documents(),max_bytes=min(12000,self._max_bytes//3))) or [[]]
+        if page >= len(pages):
+            raise LightGraphError('invalid_tool_arguments')
+        return {"data": {"sections": pages[page], "page":page,
+                "next_page":page+1 if page+1<len(pages) else None},
+                "coverage": {"source_scope": "scoped_documents", "result_complete": len(pages)==1,
+                "truncated": len(pages)>1, "selection": "document_window"}}
 
     def _query(self, query, *, row_limit):
         # Both compiler and this executor use the narrowed catalog. The adapter
@@ -316,7 +326,8 @@ class ToolExecutor:
         names = self._columns(source, columns)
         with self.adapter.snapshot():
             results = {name: self._aggregate(self.compiler.profile_column(source, name)) for name in names}
-        return {"aggregates": results, "coverage": self._aggregate_coverage()}
+        return {"aggregates": results, "aggregate_columns": self._aggregate_columns(source, names),
+                "coverage": self._aggregate_coverage()}
 
     def _check_fd(self, table, keys, values):
         source = self._table(table)
@@ -325,7 +336,13 @@ class ToolExecutor:
         with self.adapter.snapshot():
             nulls = self._aggregate(self.compiler.profile_column_group(source, keys)).get("null_key_rows", 0)
             results = {value: {**self._aggregate(self.compiler.check_fd(source, keys, value)), "null_key_rows": nulls} for value in values}
-        return {"aggregates": results, "coverage": self._aggregate_coverage()}
+        return {"aggregates": results, "aggregate_columns": self._aggregate_columns(source, values),
+                "coverage": self._aggregate_coverage()}
+
+    @staticmethod
+    def _aggregate_columns(source, names):
+        return {name: 'c_' + digest(source.source_id, source.qualified_name, name)[:16]
+                for name in names}
 
     def _check_reference(self, source_table, source_columns, target_table, target_columns):
         source, target = self._table(source_table), self._table(target_table)
@@ -348,7 +365,7 @@ class ToolExecutor:
                     max_working_bytes=self._max_bytes,metadata_only=not self.allow_source_samples)
             finally:
                 self.budget.charge(Cost(db_cu=sum(max(0,a.stats.queries-n) for a,n in zip(adapters,before))))
-            counts={'source_ref_tuples','null_refs','unmatched','ambiguous','unique_matches'}
+            counts={'source_ref_tuples','null_refs','partial_null_refs','unmatched','ambiguous','unique_matches'}
             return {'aggregates':{k:v for k,v in result.items() if k in counts},
                     'coverage':{k:v for k,v in result.items() if k not in counts|{'sample','rows'}}}
         query = self.compiler.check_reference(source, source_columns, target, target_columns)

@@ -17,7 +17,7 @@ from agentscope.memory import InMemoryMemory
 from agentscope.message import Msg
 from agentscope.model import ChatModelBase, ChatResponse
 
-from lightgraph.context import packet_call_context
+from lightgraph.context import packet_call_context, bounded_discovery_packet
 from lightgraph.contracts import canonical
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from .models import ProposalBatch
@@ -58,9 +58,10 @@ class DiscoveryFormatter(FormatterBase):
             self.packet['document_snippets']=self.executor.context_documents()
             self.packet['document_refs']=self.executor.document_refs()
             self.packet['context_tables']=self.executor.context_tables()
-        context=packet_call_context(self.packet,self.packet['task'],
+        visible=bounded_discovery_packet(self.packet)
+        context=packet_call_context(visible,visible['task'],
                                    output_contract={'schema_ref':'output_schema'})
-        packet_text=canonical({'task':self.packet['task'],'input':self.packet,
+        packet_text=canonical({'task':visible['task'],'input':visible,
             'call_context':context,'output_schema':ProposalBatch.model_json_schema()})
         output=[]
         for msg in msgs:

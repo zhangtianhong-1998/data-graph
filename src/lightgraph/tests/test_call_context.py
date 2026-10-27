@@ -97,8 +97,12 @@ def test_dependency_set_detects_additions_removal_goal_and_binding_changes_only_
 
 def test_complete_document_conditions_are_not_silently_dropped_at_budget_boundary():
     corpus=DocumentCorpus([document('global','首段定义。\n## 例外\n仅在同一体系内成立。')])
-    with pytest.raises(LightGraphError,match='document_context_too_large'):
-        corpus.context_for(SourceRef(source_id='s',table='a'),['code'],max_bytes=20)
+    from lightgraph.context import document_batches
+    sections=corpus.context_for(SourceRef(source_id='s',table='a'),['code'],max_bytes=20)
+    windows=list(document_batches(sections,max_bytes=20))
+    assert len(windows)>1
+    assert ''.join(d['text'] for batch in windows for d in batch)==''.join(d['text'] for d in sections)
+    assert any('仅在' in d['text'] for batch in windows for d in batch)
 
 
 def test_section_scope_and_purpose_inherit_and_can_only_narrow():

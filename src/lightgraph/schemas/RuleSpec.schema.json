@@ -558,6 +558,11 @@
           "default": null,
           "title": "Target Level"
         },
+        "require_full_coverage": {
+          "default": false,
+          "title": "Require Full Coverage",
+          "type": "boolean"
+        },
         "relation": {
           "default": "verified_reference",
           "title": "Relation",

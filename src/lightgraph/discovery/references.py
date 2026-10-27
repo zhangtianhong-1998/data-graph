@@ -48,12 +48,15 @@ def _read(adapter,table,columns,budget,*,predicate=None,limit=20000):
         return rows
     finally:budget.charge(Cost(db_cu=1,memory_bytes=min(size,1024*1024)))
 
-def discover_complex_references(adapter,approved,corpus,budget,max_candidates=16):
+def discover_complex_references(adapter,approved,corpus,budget,max_candidates=16,*,table_refs=None):
     from .engine import _source,_table_hash
     result=DiscoveryResult();catalog={(t.source_id,t.schema_name,t.name):t for t in adapter.describe()}
     approved=[r for r in approved if r.kind=='column_group_entity' and r.validation_ref and r.status in ('validated','canary_checked','published')]
     count=0
     for table in catalog.values():
+        if table_refs is not None and not any(key in table_refs for key in (
+            table.qualified_name,table.source_id+'.'+table.qualified_name,
+            (table.source_id,table.schema_name,table.name))):continue
         if count>=max_candidates:break
         docs=corpus.context_for(_source(table),table.column_names)
         observed_selectors=set()

@@ -5,12 +5,13 @@ import IdentityCandidates from './IdentityCandidates.vue'
 import DatabaseSourceDialog from './DatabaseSourceDialog.vue'
 import DataInputs from './DataInputs.vue'
 import ConfirmDelete from './ConfirmDelete.vue'
+import RuntimeGuidanceEditor from './RuntimeGuidanceEditor.vue'
 import { configurationTabs, resultTabs, isResultTab } from './onboarding'
 import type { ConfigurationTab, ResultTab, WorkbenchTab } from './onboarding'
 import { ApiError, ensureSession, clearSessions, clearSession, json, projectPath, request, responseRevision } from './api'
 import { assertNoCredentials, graphOutcome, isActive, runLabels, splitLines, stageLabel } from './state'
 import { WorkbenchLocation } from './workbenchLocation'
-import type { DocumentScope, Graph, Metadata, Project, ProjectFile, Run, RunConfig, SourceConfig } from './types'
+import type { DocumentScope, Graph, Metadata, Project, ProjectFile, Run, RunConfig, SourceConfig, RuntimeGuidance } from './types'
 
 
 const projects = ref<Project[]>([])
@@ -36,6 +37,8 @@ const busy = ref(false)
 const error = ref('')
 const toast = ref('')
 const purpose = ref(''), includes = ref(''), excludes = ref(''), guidance = ref('')
+const runtimeGuidance = ref<RuntimeGuidance[]>([])
+const runtimeGuidanceDirty = computed(() => JSON.stringify(runtimeGuidance.value) !== JSON.stringify(config.value.goal?.runtime_guidance || []))
 const vocabularyMode = ref<'automatic' | 'specified'>('automatic'), entityKinds = ref(''), relationKinds = ref('')
 const vocabularyDirty = computed(() => JSON.stringify(vocabularyMode.value === 'automatic' ? [] : splitLines(entityKinds.value)) !== JSON.stringify(config.value.goal?.entity_kinds || []) || JSON.stringify(vocabularyMode.value === 'automatic' ? [] : splitLines(relationKinds.value)) !== JSON.stringify(config.value.goal?.relation_kinds || []))
 const model = ref<NonNullable<RunConfig['model']>>({})
@@ -67,7 +70,7 @@ let toastTimer: ReturnType<typeof setTimeout> | undefined
 const activeRun = computed(() => runs.value.find(isActive))
 const locked = computed(() => busy.value || loading.value || !!activeRun.value)
 const path = computed(() => projectPath(project.value?.project_id || ''))
-const formDirty = computed(() => vocabularyDirty.value || purpose.value !== (config.value.goal?.purpose || '') || includes.value !== (config.value.goal?.include || []).join('\n') || excludes.value !== (config.value.goal?.exclude || []).join('\n') || guidance.value !== (config.value.goal?.discovery_guidance || []).join('\n') || JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}))
+const formDirty = computed(() => runtimeGuidanceDirty.value || vocabularyDirty.value || purpose.value !== (config.value.goal?.purpose || '') || includes.value !== (config.value.goal?.include || []).join('\n') || excludes.value !== (config.value.goal?.exclude || []).join('\n') || guidance.value !== (config.value.goal?.discovery_guidance || []).join('\n') || JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}))
 const dirty = computed(() => !!modelKey.value || formDirty.value)
 const advancedDirty = computed(() => advanced.value !== JSON.stringify(config.value, null, 2))
 const deletionTitle = computed(() => deletion.value?.kind === 'project' ? '删除项目' : deletion.value?.kind === 'source' ? '删除数据库来源' : deletion.value?.kind === 'table' ? '移除数据表' : '删除文件')
@@ -90,12 +93,13 @@ function fillForms(value: RunConfig) {
   configRevision.value = responseRevision(value) || configRevision.value
   configurationConflict.value = false
   config.value = value
+  runtimeGuidance.value = structuredClone(value.goal?.runtime_guidance || [])
   purpose.value = value.goal?.purpose || ''; includes.value = (value.goal?.include || []).join('\n'); excludes.value = (value.goal?.exclude || []).join('\n'); guidance.value = (value.goal?.discovery_guidance || []).join('\n')
   entityKinds.value = (value.goal?.entity_kinds || []).join('\n'); relationKinds.value = (value.goal?.relation_kinds || []).join('\n'); vocabularyMode.value = entityKinds.value || relationKinds.value ? 'specified' : 'automatic'
   model.value = structuredClone(value.model || {}); advanced.value = JSON.stringify(value, null, 2)
 }
 function formConfig(): RunConfig {
-  const value: RunConfig = { ...config.value, goal: { ...config.value.goal, purpose: purpose.value, include: splitLines(includes.value), exclude: splitLines(excludes.value), discovery_guidance: splitLines(guidance.value), entity_kinds: vocabularyMode.value === 'automatic' ? [] : splitLines(entityKinds.value), relation_kinds: vocabularyMode.value === 'automatic' ? [] : splitLines(relationKinds.value) } }
+  const value: RunConfig = { ...config.value, goal: { ...config.value.goal, runtime_guidance: JSON.parse(JSON.stringify(runtimeGuidance.value)), purpose: purpose.value, include: splitLines(includes.value), exclude: splitLines(excludes.value), discovery_guidance: splitLines(guidance.value), entity_kinds: vocabularyMode.value === 'automatic' ? [] : splitLines(entityKinds.value), relation_kinds: vocabularyMode.value === 'automatic' ? [] : splitLines(relationKinds.value) } }
   if (!value.agent_config) value.model = { ...model.value }
   assertNoCredentials(value)
   return value
@@ -151,11 +155,13 @@ function applyProjectConfig(nextProject: Project, nextConfig: RunConfig, preserv
     guidance: guidance.value !== (config.value.goal?.discovery_guidance || []).join('\n') ? guidance.value : undefined,
     model: JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}) ? JSON.parse(JSON.stringify(model.value)) as typeof model.value : undefined,
   } : null
+  const runtimeDraft = preserveEdits && runtimeGuidanceDirty.value ? JSON.parse(JSON.stringify(runtimeGuidance.value)) as RuntimeGuidance[] : null
   const vocabularyDraft = preserveEdits && vocabularyDirty.value ? { mode: vocabularyMode.value, entities: entityKinds.value, relations: relationKinds.value } : null
   const draft = preserveEdits && advancedDirty.value ? advanced.value : undefined
   const draftRevision = configRevision.value
   const agentConfigRemoved = preserveEdits && !!config.value.agent_config && !nextConfig.agent_config
   project.value = nextProject; fillForms(nextConfig)
+  if (runtimeDraft) runtimeGuidance.value = runtimeDraft
   if (vocabularyDraft) { vocabularyMode.value = vocabularyDraft.mode; entityKinds.value = vocabularyDraft.entities; relationKinds.value = vocabularyDraft.relations }
   if (draft !== undefined) { advanced.value = draft; configRevision.value = draftRevision }
   if (agentConfigRemoved) modelKey.value = ''
@@ -404,7 +410,7 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
           <div v-if="activeRun" class="run-banner"><span class="spinner tiny"></span><div><strong>{{ runLabels[activeRun.status] }}</strong><span>{{ stageLabel(activeRun.stage) }} · {{ activeRun.run_id }}</span></div><button class="btn small" :disabled="busy" @click="cancelRun(activeRun)">取消运行</button></div>
           <template v-if="tab === 'goal'">
             <div class="intro"><div><h2>这次希望发现什么？</h2></div></div>
-            <div class="layout-two"><section class="panel"><div class="panel-head"><h2>抽取目标</h2><span class="badge">全流程生效</span></div><div class="panel-body"><div class="field"><label for="purpose">分析目的</label><textarea id="purpose" v-model="purpose" :disabled="locked" class="goal-input" placeholder="例如：构建经营分析所需的指标、度量和组织层级关系，不抽取逐笔交易金额。"/></div><div class="two-fields"><div class="field"><label for="includes">重点关注</label><textarea id="includes" v-model="includes" :disabled="locked" placeholder="每行一个目标，例如：&#10;指标编码与中英文名称&#10;组织上下级关系"/></div><div class="field"><label for="excludes">排除内容</label><textarea id="excludes" v-model="excludes" :disabled="locked" placeholder="每行一项，例如：&#10;逐笔业务金额&#10;展示排序字段"/></div></div><div class="field"><label for="vocabulary-mode">对象与关系类型</label><select id="vocabulary-mode" v-model="vocabularyMode" :disabled="locked"><option value="automatic">由 Agent 根据目标发现</option><option value="specified">使用指定类型</option></select><p class="field-hint">自动发现需要启用模型；关闭模型时保留结构候选，业务含义仍需确认。</p></div><div v-if="vocabularyMode === 'specified'" class="two-fields"><div class="field"><label for="entity-kinds">对象类型（每行一个）</label><textarea id="entity-kinds" v-model="entityKinds" :disabled="locked"/></div><div class="field"><label for="relation-kinds">关系类型（每行一个）</label><textarea id="relation-kinds" v-model="relationKinds" :disabled="locked"/></div></div><div class="field"><label for="guidance">发现提示</label><textarea id="guidance" v-model="guidance" :disabled="locked" placeholder="可补充业务经验，例如：同一对象在不同分析范围中可能处于不同层级，不要仅凭列位置确定全局层级。"/></div></div><div class="panel-footer"><span>修改只在保存后写入项目配置</span><button class="btn primary" :disabled="locked" @click="action(async () => { await saveForms(); notify('抽取目标已保存') })">保存目标</button></div></section><aside class="stack"><section class="panel"><div class="panel-head"><h2>项目概况</h2></div><div class="panel-body"><div class="scope-row"><span>数据来源</span><strong>{{ config.sources?.length || 0 }}</strong></div><div class="scope-row"><span>知识文档</span><strong>{{ documentFiles.length }}</strong></div><div class="scope-row"><span>已读取的表</span><strong>{{ metadata.tables.length }}</strong></div><div class="scope-row"><span>业务图节点</span><strong>{{ business.nodes.length }}</strong></div></div></section></aside></div>
+            <div class="layout-two"><section class="panel"><div class="panel-head"><h2>抽取目标</h2><span class="badge">全流程生效</span></div><div class="panel-body"><div class="field"><label for="purpose">分析目的</label><textarea id="purpose" v-model="purpose" :disabled="locked" class="goal-input" placeholder="例如：构建经营分析所需的指标、度量和组织层级关系，不抽取逐笔交易金额。"/></div><div class="two-fields"><div class="field"><label for="includes">重点关注</label><textarea id="includes" v-model="includes" :disabled="locked" placeholder="每行一个目标，例如：&#10;指标编码与中英文名称&#10;组织上下级关系"/></div><div class="field"><label for="excludes">排除内容</label><textarea id="excludes" v-model="excludes" :disabled="locked" placeholder="每行一项，例如：&#10;逐笔业务金额&#10;展示排序字段"/></div></div><div class="field"><label for="vocabulary-mode">对象与关系类型</label><select id="vocabulary-mode" v-model="vocabularyMode" :disabled="locked"><option value="automatic">由 Agent 根据目标发现</option><option value="specified">使用指定类型</option></select><p class="field-hint">自动发现需要启用模型；关闭模型时保留结构候选，业务含义仍需确认。</p></div><div v-if="vocabularyMode === 'specified'" class="two-fields"><div class="field"><label for="entity-kinds">对象类型（每行一个）</label><textarea id="entity-kinds" v-model="entityKinds" :disabled="locked"/></div><div class="field"><label for="relation-kinds">关系类型（每行一个）</label><textarea id="relation-kinds" v-model="relationKinds" :disabled="locked"/></div></div><div class="field"><label for="guidance">发现提示</label><textarea id="guidance" v-model="guidance" :disabled="locked" placeholder="可补充业务经验，例如：同一对象在不同分析范围中可能处于不同层级，不要仅凭列位置确定全局层级。"/></div><RuntimeGuidanceEditor v-model="runtimeGuidance" :disabled="locked"/></div><div class="panel-footer"><span>修改只在保存后写入项目配置</span><button class="btn primary" :disabled="locked" @click="action(async () => { await saveForms(); notify('抽取目标已保存') })">保存目标</button></div></section><aside class="stack"><section class="panel"><div class="panel-head"><h2>项目概况</h2></div><div class="panel-body"><div class="scope-row"><span>数据来源</span><strong>{{ config.sources?.length || 0 }}</strong></div><div class="scope-row"><span>知识文档</span><strong>{{ documentFiles.length }}</strong></div><div class="scope-row"><span>已读取的表</span><strong>{{ metadata.tables.length }}</strong></div><div class="scope-row"><span>业务图节点</span><strong>{{ business.nodes.length }}</strong></div></div></section></aside></div>
           </template>
           <template v-if="tab === 'inputs'">
             <input ref="uploadInput" type="file" hidden multiple accept=".xlsx,.csv" @change="upload"/>

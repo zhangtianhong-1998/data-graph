@@ -43,6 +43,18 @@ beforeEach(() => {
 afterEach(() => { app?.unmount(); root?.remove(); vi.unstubAllGlobals(); vi.restoreAllMocks(); clearSessions(); sessionStorage.clear() })
 
 describe('完整配置与修订', () => {
+  it('运行时指导按位置保存，刷新后恢复 Markdown 原文和阶段', async () => {
+    await ready(); button('抽取目标').click(); await nextTick(); button('添加指导').click(); await nextTick()
+    await edit('#guidance-text-0', '# 复核要求\n保留未决并核对反证。')
+    const select = root.querySelector<HTMLSelectElement>('#guidance-injection-0')!
+    select.value = 'semantic_review'; select.dispatchEvent(new Event('change', { bubbles: true })); await nextTick()
+    button('保存目标').click(); await vi.waitFor(() => expect(writes()).toHaveLength(1))
+    expect(config.goal!.runtime_guidance).toEqual([{ text: '# 复核要求\n保留未决并核对反证。', injection: 'semantic_review', stages: [] }])
+    await vi.waitFor(() => expect(button('保存目标').disabled).toBe(false))
+    expect(root.querySelector<HTMLTextAreaElement>('#guidance-text-0')!.value).toBe('# 复核要求\n保留未决并核对反证。')
+    expect(root.querySelector<HTMLSelectElement>('#guidance-injection-0')!.value).toBe('semantic_review')
+  })
+
   it('保存高级 JSON 后按新 ETag 启动，保留 goal 与 scopes', async () => {
     await ready(); const draft = { ...config, goal: { ...config.goal, purpose: '对象关系新目标' }, scopes: ['public', 'approved'] }
     await editAdvanced(draft); button('保存并开始抽取').click()

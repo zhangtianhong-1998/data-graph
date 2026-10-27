@@ -377,18 +377,32 @@ def review_with_agent(store, model, goal, corpus, *, scopes, domain='default', m
     facts={f['id']:f for f in graph['facts']};incident=_incident_facts(graph['facts'])
     listing=list_candidates(store,scopes,domain)
     known_rules={r.rule_id:r for r in store.get_rules(scopes=scopes,domain=domain)}
+    reviewed_groups=set()
     for candidate in listing['candidates']:
         if canonical(base_heads)!=canonical(store.heads()) or base_goal!=_goal_revision(store):
             counts['deferred']+=1;issues.append({'code':'graph_generation_changed'});break
-        prior=[d for d in listing['decisions'] if d['candidate_id']==candidate['candidate_id'] and d['active']]
+        # Earlier decisions in this loop can have enlarged either endpoint's
+        # group. Review all original members and their evidence together; a
+        # pairwise approval cannot authorize a transitive whole-group merge.
+        current=list_candidates(store,scopes,domain)
+        effective=[d for d in current['decisions'] if d['active'] and d['status']=='active']
+        mapping=_mapping([{**d,'members':canonical(d['members'])} for d in effective])
+        targets={mapping.get(e,e) for e in candidate['members']}
+        if len(targets)==1:continue
+        members=sorted(set(candidate['members']) | {e for e,target in mapping.items() if target in targets})
+        prior=[d for d in current['decisions'] if d['candidate_id']==candidate['candidate_id'] and d['active']]
         if any(d['origin']=='user' or d['status']=='active' for d in prior):continue
-        relevant=set().union(*(incident[e] for e in candidate['members']))
+        group_key=tuple(members)
+        if group_key in reviewed_groups:continue
+        reviewed_groups.add(group_key)
+        relevant=set().union(*(incident[e] for e in members))
         docs={};source_rules={s['rule_id'] for s in graph['supports'] if s['fact_id'] in relevant}
         for rid in sorted(source_rules):
             rule=known_rules.get(rid)
             if rule:
                 for document in corpus.context_for(rule.source):docs[document_ref(document)]=document
-        dependencies=canonical([_goal_revision(store),sorted(relevant),sorted(docs),
+        dependencies=canonical(['whole_cluster_review/2',_goal_revision(store),members,sorted(relevant),sorted(docs),
+            sorted((d['decision_id'],d['revision']) for d in effective if set(d['members']) & set(members)),
             sorted((rid,known_rules[rid].revision,known_rules[rid].dependencies.schema_ref)
                    for rid in source_rules if rid in known_rules)])
         previous=store.connection.execute('SELECT * FROM identity_review_attempt WHERE candidate_id=?',(candidate['candidate_id'],)).fetchone()
@@ -397,18 +411,19 @@ def review_with_agent(store, model, goal, corpus, *, scopes, domain='default', m
             counts['deferred']+=1;continue
         outcome='unresolved'
         try:
-            if len(relevant)>64:raise LightGraphError('identity_review_evidence_limit')
+            if len(members)>64 or len(relevant)>64:raise LightGraphError('identity_review_evidence_limit')
             # These are approved graph facts, not source samples. The registry of
             # references prevents a reviewer inventing unseen evidence.
             selected=[facts[fid] for fid in sorted(relevant)]
             packet={'goal':goal.model_dump(mode='json'),'scope':None,
-                'authorized_entities':candidate['members'],
+                'authorized_entities':members,
                 'graph_facts':[{'reference':'graph_fact_'+f['id'],'fact_kind':f['fact_kind'],'payload':f['payload']} for f in selected],
                 'probe_digest':[{'probe_id':'graph_fact_'+f['id'],'operator':'published_graph_fact','aggregates':{}} for f in selected],
                 'iteration_context':{'goal_revision':_goal_revision(store),'stage':'graph_reconcile'},
-                'subtask':'Decide whether these occurrences denote the same business object. Roles and codes may differ. Names alone are insufficient.'}
+                'subtask':'Decide whether ALL authorized occurrences denote the same business object, including every member of previously accepted groups. Roles and codes may differ. Names alone are insufficient.'}
             proposition={'predicate':'same_entity','source_entity':candidate['members'][0],
                          'target_entity':candidate['members'][1]}
+            if len(members)>2:proposition['members']=members
             counts['reviewed']+=1
             review_heads=store.heads()
             review_revision=list_candidates(store,scopes,domain)['revision']
@@ -419,11 +434,13 @@ def review_with_agent(store, model, goal, corpus, *, scopes, domain='default', m
             meaningful.update(docs)
             if not meaningful.intersection(refs):raise LightGraphError('identity_review_only_names')
             decide(store,candidate['candidate_id'],'same',scopes=scopes,domain=domain,
-                   expected_revision=review_revision,origin='agent',expected_heads=review_heads,
+                   expected_revision=review_revision,members=members,origin='agent',expected_heads=review_heads,
                    expected_evidence=relevant,expected_goal_revision=review_goal)
             counts['accepted']+=1;outcome='accepted'
         except LightGraphError as exc:
-            deferred=any(part in exc.code for part in ('budget','timeout','limit','too_large','model_'))
+            deferred=(exc.code in {'graph_generation_changed','resolution_revision_conflict',
+                'resolution_evidence_changed','resolution_cluster_review_required','stale_goal_revision'}
+                or any(part in exc.code for part in ('budget','timeout','limit','too_large','model_')))
             counts['deferred' if deferred else 'unresolved']+=1
             outcome='deferred' if deferred else exc.code
             issues.append({'code':exc.code,'count':1})

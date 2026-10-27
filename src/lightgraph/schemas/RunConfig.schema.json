@@ -68,6 +68,14 @@
           "title": "Discovery Guidance",
           "type": "array"
         },
+        "runtime_guidance": {
+          "items": {
+            "$ref": "#/$defs/RuntimeGuidance"
+          },
+          "maxItems": 16,
+          "title": "Runtime Guidance",
+          "type": "array"
+        },
         "entity_kinds": {
           "items": {
             "maxLength": 64,
@@ -367,6 +375,51 @@
         "target_kinds"
       ],
       "title": "RelationDefinition",
+      "type": "object"
+    },
+    "RuntimeGuidance": {
+      "additionalProperties": false,
+      "description": "Explicit operator instructions, selected for each ephemeral Agent call.",
+      "properties": {
+        "text": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        },
+        "injection": {
+          "default": "global",
+          "enum": [
+            "global",
+            "task",
+            "iteration",
+            "semantic_review"
+          ],
+          "title": "Injection",
+          "type": "string"
+        },
+        "stages": {
+          "items": {
+            "enum": [
+              "T0_discovery",
+              "T1_table_discovery",
+              "T2_cross_table",
+              "T3_hierarchy",
+              "T4_document",
+              "T5_revision",
+              "semantic_review"
+            ],
+            "type": "string"
+          },
+          "maxItems": 8,
+          "title": "Stages",
+          "type": "array"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "title": "RuntimeGuidance",
       "type": "object"
     },
     "SemanticSchema": {

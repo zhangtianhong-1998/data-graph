@@ -1,6 +1,6 @@
 # 轻量知识图谱架构设计
 
-当前需求与验收基线为 2026-10-26 更新的 [US](US.md) 和 [工作台 US](WORKBENCH_US.md)。新增运行流程见[目标驱动的迭代构图方案](GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)，历史缺陷证据见[审查复核](AUDIT_REVIEW_20261025.md)。最新修复见[真实数据反馈修复记录](REAL_DATA_DISCOVERY_REPAIR.md)，上一轮能力见[迭代引擎实施记录](ITERATIVE_ENGINE_IMPLEMENTATION.md)，更早的验证保留在[历史实施记录](../../IMPLEMENTATION_STATUS.md)。
+当前需求与验收基线为 2026-10-27 更新的 [US](US.md) 和 [工作台 US](WORKBENCH_US.md)。新增运行流程见[目标驱动的迭代构图方案](GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)，历史缺陷证据见[审查复核](AUDIT_REVIEW_20261025.md)。最新修复见[两份评审后的继续修复](REVIEW_CONTINUATION_20261027.md)，2026-10-26 协议修复见[真实数据反馈记录](REAL_DATA_DISCOVERY_REPAIR.md)，更早能力见[迭代引擎实施记录](ITERATIVE_ENGINE_IMPLEMENTATION.md)，更早的验证保留在[历史实施记录](../../IMPLEMENTATION_STATUS.md)。
 
 本文保留整体架构与有效约束。旧的 W0～W6 计划、AgentScope 接入和 Markdown/层级增补用于解释历史实现，不再重复充当当前进度说明。
 

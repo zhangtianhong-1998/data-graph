@@ -12,27 +12,28 @@ REVIEWABLE_CODES = frozenset({
     'fd_violation', 'null_key', 'identity_definition_conflict',
     'shared_identity_attribute_conflict', 'shared_attribute_conflict',
     'reference_unmatched', 'reference_ambiguous', 'unmatched_reference',
-    'ambiguous_reference', 'hierarchy_cycle', 'multiple_parents',
+    'ambiguous_reference', 'reference_partial_null', 'reference_null_endpoint', 'hierarchy_cycle', 'multiple_parents',
     'new_discriminator_partition', 'discriminator_cardinality_drift',
     'same_code_label_conflict', 'unexplained_role_occurrence',
     'same_code_diff_label', 'cross_level_code_reuse', 'non_contiguous_level_code',
     'fill_mismatch', 'reference_missing', 'multiple_parent', 'hierarchy_self_loop',
     'identity_domain_attribute_conflict', 'identity_migration_conflict',
 })
-WorkState = Literal['pending', 'running', 'resolved', 'unresolved', 'deferred']
+WorkState = Literal['pending', 'running', 'resolved', 'unresolved', 'deferred', 'superseded']
 
 
 class WorkItem(StrictModel):
     work_id: str
     goal_revision: int
     source: SourceRef
-    task: Literal['metadata_discovery', 'review_pattern']
+    task: Literal['metadata_discovery', 'relation_discovery', 'coverage_discovery', 'review_pattern']
     pattern_codes: list[str] = Field(default_factory=list)
     rule_revisions: dict[str, int] = Field(default_factory=dict)
     context_version: str
     state: WorkState = 'pending'
     attempts: int = 0
     observation_counts: dict[str, int] = Field(default_factory=dict)
+    column_refs: list[str] = Field(default_factory=list)
 
 
 def rule_shape(rule: RuleSpec) -> str:
@@ -60,6 +61,8 @@ class IterationLedger:
         columns={r[1] for r in self.connection.execute('PRAGMA table_info(iteration_work)')}
         if 'observation_counts' not in columns:
             self.connection.execute("ALTER TABLE iteration_work ADD COLUMN observation_counts TEXT NOT NULL DEFAULT '{}' ")
+        if 'column_refs' not in columns:
+            self.connection.execute("ALTER TABLE iteration_work ADD COLUMN column_refs TEXT NOT NULL DEFAULT '[]'")
         payload = canonical({'goal': goal.model_dump(mode='json'), 'scopes': sorted(scopes)})
         with store._transaction():
             latest = self.connection.execute(
@@ -75,10 +78,10 @@ class IterationLedger:
             source=SourceRef.model_validate(json.loads(row['source_ref'])), task=row['task'],
             context_version=row['context_version'], pattern_codes=json.loads(row['pattern_codes']),
             rule_revisions=json.loads(row['rule_revisions']), state=row['state'], attempts=row['attempts'],
-            observation_counts=json.loads(row['observation_counts']))
+            observation_counts=json.loads(row['observation_counts']),column_refs=json.loads(row['column_refs']))
 
     def enqueue(self, source: SourceRef, *, task='review_pattern', codes=(),
-                rules=(), context_version: str, force=False, observation_counts=None) -> WorkItem:
+                rules=(), context_version: str, force=False, observation_counts=None, column_refs=()) -> WorkItem:
         codes = sorted(set(codes))
         if set(codes) - REVIEWABLE_CODES:
             raise LightGraphError('unregistered_iteration_pattern')
@@ -86,7 +89,8 @@ class IterationLedger:
         if set(counts)-{'distinct_tuples','conflicts'} or any(type(v) is not int or v<0 for v in counts.values()):
             raise LightGraphError('invalid_iteration_aggregates')
         revisions = {r.rule_id: r.revision for r in rules}
-        for ref in [context_version, *revisions]:
+        column_refs=sorted(set(column_refs))
+        for ref in [context_version, *revisions, *column_refs]:
             self.store.policy._reference(ref)
         source_ref = canonical(source.model_dump(mode='json', by_alias=True))
         with self.store._transaction():
@@ -95,22 +99,22 @@ class IterationLedger:
                 ORDER BY rowid DESC''', (self.goal_revision, source_ref, task, context_version)).fetchall()
             for row in rows:
                 if (json.loads(row['pattern_codes']) == codes and json.loads(row['rule_revisions']) == revisions
-                    and json.loads(row['observation_counts'])==counts):
+                    and json.loads(row['observation_counts'])==counts and json.loads(row['column_refs'])==column_refs):
                     item = self._item(row)
-                    if force or item.state in ('deferred', 'resolved'):
+                    if force or item.state in ('deferred','superseded') or (item.state == 'resolved' and task == 'review_pattern'):
                         self.connection.execute("UPDATE iteration_work SET state='pending' WHERE work_id=?", (item.work_id,))
                         item.state = 'pending'
                     return item
             item = WorkItem(work_id='work_' + uuid.uuid4().hex, goal_revision=self.goal_revision,
                 source=source, task=task, pattern_codes=codes, rule_revisions=revisions, context_version=context_version,
-                observation_counts=counts)
-            self.connection.execute('INSERT INTO iteration_work VALUES(?,?,?,?,?,?,?,?,?,?)',
+                observation_counts=counts,column_refs=column_refs)
+            self.connection.execute('INSERT INTO iteration_work(work_id,goal_revision,source_ref,task,context_version,pattern_codes,rule_revisions,state,attempts,observation_counts,column_refs) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                 (item.work_id, self.goal_revision, source_ref, task, context_version,
-                 canonical(codes), canonical(revisions), item.state, item.attempts,canonical(counts)))
+                 canonical(codes), canonical(revisions), item.state, item.attempts,canonical(counts),canonical(column_refs)))
             return item
 
     def transition(self, item: WorkItem, state: WorkState):
-        if state not in ('running', 'resolved', 'unresolved', 'deferred'):
+        if state not in ('running', 'resolved', 'unresolved', 'deferred', 'superseded'):
             raise LightGraphError('invalid_work_transition')
         if item.goal_revision != self.goal_revision:
             raise LightGraphError('stale_goal_revision')
@@ -123,11 +127,26 @@ class IterationLedger:
             self.connection.execute('UPDATE iteration_work SET state=?,attempts=? WHERE work_id=?',
                                     (state, item.attempts, item.work_id))
 
+    def supersede_previous(self, item: WorkItem):
+        """An endpoint/coverage revision replaces older exploration tasks."""
+        with self.store._transaction():
+            self.connection.execute("""UPDATE iteration_work SET state='superseded'
+                WHERE goal_revision=? AND source_ref=? AND task=? AND work_id!=?
+                AND state!='superseded' """, (item.goal_revision,
+                canonical(item.source.model_dump(mode='json',by_alias=True)),item.task,item.work_id))
+
+    def resolve_exploration(self, source: SourceRef, task: str):
+        with self.store._transaction():
+            self.connection.execute("""UPDATE iteration_work SET state='resolved'
+                WHERE goal_revision=? AND source_ref=? AND task=? AND state!='superseded'""",
+                (self.goal_revision,canonical(source.model_dump(mode='json',by_alias=True)),task))
+
     def resolve_table(self, source: SourceRef):
         """Successful full validation resolves prior failures without model calls."""
         with self.store._transaction():
             self.connection.execute('''UPDATE iteration_work SET state='resolved'
-                WHERE goal_revision=? AND source_ref=? AND task='review_pattern' ''',
+                WHERE goal_revision=? AND source_ref=? AND task='review_pattern'
+                AND pattern_codes NOT LIKE '%unexplained_role_occurrence%' ''',
                 (self.goal_revision, canonical(source.model_dump(mode='json', by_alias=True))))
 
     def unresolved_tables(self, source_id: str, contexts: dict[str, str]) -> set[str]:
@@ -154,7 +173,7 @@ class IterationLedger:
                 'knowledge_truncated': len(relevant) > len(known)}
 
     def counts(self) -> dict[str, int]:
-        result = {f'work_{s}': 0 for s in ('pending', 'running', 'resolved', 'unresolved', 'deferred')}
+        result = {f'work_{s}': 0 for s in ('pending', 'running', 'resolved', 'unresolved', 'deferred', 'superseded')}
         for item in self.items():
             result['work_' + item.state] += 1
         return result

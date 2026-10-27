@@ -80,7 +80,7 @@ def test_transient_model_failure_is_retried_without_redoing_completed_table(tmp_
         assert not any(issue["code"] == "no_confirmable_entity_group" for issue in second.issues)
         calls.clear()
         third = run_pipeline(config, [source], model=model(False))
-        assert not calls
+        assert calls==[('T2_cross_table','a'),('T2_cross_table','b')]
         assert third.counts["reused_rules"] == 2
     with GraphStore(tmp_path / "out" / "graph.sqlite") as store:
         business = [node for node in store.view({"public"})["nodes"] if node["layer"] == "business"]

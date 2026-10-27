@@ -1556,8 +1556,11 @@
           "type": "array"
         },
         "read_state": {
-          "const": "complete",
           "default": "complete",
+          "enum": [
+            "complete",
+            "partial"
+          ],
           "title": "Read State",
           "type": "string"
         },
@@ -1604,6 +1607,25 @@
               },
               {
                 "type": "boolean"
+              },
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "object"
               },
               {
                 "type": "null"
@@ -2150,6 +2172,11 @@
           ],
           "default": null,
           "title": "Target Level"
+        },
+        "require_full_coverage": {
+          "default": false,
+          "title": "Require Full Coverage",
+          "type": "boolean"
         },
         "relation": {
           "default": "verified_reference",

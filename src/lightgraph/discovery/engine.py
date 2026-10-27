@@ -28,6 +28,19 @@ SEMANTIC = {'definition':'definition','description':'description','unit':'unit',
 def _source(table): return SourceRef(source_id=table.source_id,schema=table.schema_name,table=table.name)
 def _table_hash(table): return digest(table.model_dump(mode='json',by_alias=True))
 def _column_id(table,name): return 'c_'+digest(table.source_id,table.qualified_name,name)[:16]
+def _logical_entity_rule_id(table, kind, entity_kind, keys, namespaces=(), *, topology=None):
+    """Encode a physical interpretation, not a claim of semantic equivalence.
+
+    Type and namespace distinguish different objects over the same columns.
+    Ordered composite keys remain ordered because endpoint tuples use that
+    contract. Attribute changes are revisions of this identity, not new IDs;
+    the compiler still rejects contradictory mappings of one logical rule.
+    """
+    logical_key={'source':_source(table).model_dump(mode='json',by_alias=True),
+                 'rule_kind':kind,'entity_kind':entity_kind,'identity_columns':list(keys),
+                 'namespace_columns':sorted(namespaces),'topology':topology}
+    return 'rule_'+digest(logical_key)[:24]
+
 def _comment_quality(name,comment):
     if not comment or not comment.strip(): return 'empty'
     if comment.strip().casefold()==name.strip().casefold(): return 'echo'
@@ -280,7 +293,7 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
                     raise LightGraphError('ambiguous_primary_attribute')
                 (multi if member.multi_value else single)[member.property_name]=lookup[member.column_id]
             _normalize_business_code_mapping(single,multi,list(dict.fromkeys(namespaces+keys)))
-            results.append(RuleSpec(rule_id='rule_'+digest(table.source_id,table.qualified_name,'model_group',keys)[:24],kind='column_group_entity',
+            results.append(RuleSpec(rule_id=_logical_entity_rule_id(table,'column_group_entity',claim.entity_kind_hint,list(dict.fromkeys(namespaces+keys)),namespaces),kind='column_group_entity',
                 goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=namespaces),
                 identity=IdentitySpec(key_columns=list(dict.fromkeys(namespaces+keys)),entity_kind=claim.entity_kind_hint),
                 attributes=AttributeSpec(single_valued=single,
@@ -312,7 +325,7 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
                 if property_name in single_map or property_name in multi_map:raise LightGraphError('ambiguous_primary_attribute')
                 multi_map[property_name]=column
             _normalize_business_code_mapping(single_map,multi_map,keys)
-            results.append(RuleSpec(rule_id='rule_'+digest(table.source_id,table.qualified_name,'model_key',keys)[:24],kind='column_group_entity',
+            results.append(RuleSpec(rule_id=_logical_entity_rule_id(table,'column_group_entity',claim.entity_kind_hint,keys,namespaces),kind='column_group_entity',
                 goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=namespaces),
                 identity=IdentitySpec(key_columns=keys,entity_kind=claim.entity_kind_hint),
                 attributes=AttributeSpec(single_valued=single_map,
@@ -329,7 +342,7 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
             if set(scopes+[key,parent]+([label] if label else [])+aliases)&excluded_names:
                 raise LightGraphError('excluded_column_projected')
             order=semantic_evidence or declared_evidence(documents,table,'parent_column',[key],[parent])
-            results.append(RuleSpec(rule_id='rule_'+digest(table.source_id,table.qualified_name,'model_parent',scopes,key,parent)[:24],
+            results.append(RuleSpec(rule_id=_logical_entity_rule_id(table,'long_hierarchy',claim.entity_kind_hint,scopes+[key],scopes,topology={'parent':parent}),
                 kind='long_hierarchy',goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=scopes),
                 identity=IdentitySpec(key_columns=scopes+[key],entity_kind=claim.entity_kind_hint),
                 attributes=AttributeSpec(single_valued={'label':label} if label else {},
@@ -354,7 +367,7 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
             if claim.path_semantics == "relative_path":
                 identity,hierarchy_fields=_relative_hierarchy_contract(claim,documents,scopes,levels,table,semantic_evidence)
                 if not order:raise LightGraphError("hierarchy_order_evidence_unresolved")
-            results.append(RuleSpec(rule_id='rule_'+digest(table.source_id,table.qualified_name,'model_hierarchy',[l.code for l in levels])[:24],
+            results.append(RuleSpec(rule_id=_logical_entity_rule_id(table,'wide_hierarchy',claim.entity_kind_hint,identity.key_columns,scopes,topology=[{'level':l.level,'code':l.code} for l in levels]),
                 kind='wide_hierarchy',goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=scopes),
                 identity=identity,
                 hierarchy=HierarchySpec(levels=levels,fill_semantics_confirmed=bool(fill),order_evidence=order,**hierarchy_fields),
@@ -610,7 +623,8 @@ def discover_references(adapter,validated_rules,documents=None,model=None,budget
             remaining=max_candidates-int(result.stats.get('reference_candidates',0))
             if remaining>0:
                 scoped=GoalScopedSource(adapter,goal or ExtractionGoal())
-                try:extra=discover_complex_references(scoped,validated_rules,corpus,active_budget,max_candidates=remaining)
+                try:extra=discover_complex_references(scoped,validated_rules,corpus,active_budget,
+                    max_candidates=remaining,table_refs=table_refs)
                 finally:scoped.close()
                 result.rules.extend(extra.rules);result.issues.extend(extra.issues);result.stats.update(extra.stats)
                 result.stats['rules_proposed']=len(result.rules);result.budget=active_budget.snapshot()
@@ -622,6 +636,9 @@ def discover_references(adapter,validated_rules,documents=None,model=None,budget
     approved=[r for r in validated_rules if r.status in ('validated','canary_checked','published') and r.validation_ref and r.kind=='column_group_entity']
     seen=set();count=0
     for table in tables:
+        if table_refs is not None and not any(key in table_refs for key in (
+            table.qualified_name,table.source_id+'.'+table.qualified_name,
+            (table.source_id,table.schema_name,table.name))):continue
         if count>=max_candidates:break
         refs=[]
         for rule in approved:
@@ -654,8 +671,12 @@ def discover_references(adapter,validated_rules,documents=None,model=None,budget
                             checks.append(adapter.check_reference(table,binding.identity.key_columns,target,binding.identity.key_columns))
                         finally:budget.charge(Cost(db_cu=1),reservation)
                     stats=[{k:v for k,v in check.items() if isinstance(v,(int,float,bool))} for check in checks]
-                    if any(check.get('unmatched',0) or check.get('null_refs',0) or check.get('ambiguous',0) for check in checks):
+                    if any(check.get('partial_null_refs',0) for check in checks):
+                        result.issues.append({'table':table.qualified_name,'code':'reference_partial_null','status':'unresolved'});continue
+                    if any(check.get('unmatched',0) or check.get('ambiguous',0) for check in checks):
                         result.issues.append({'table':table.qualified_name,'code':'reference_missing','status':'unresolved'});continue
+                    if any(not check.get('unique_matches',0) for check in checks):
+                        result.issues.append({'table':table.qualified_name,'code':'reference_no_populated_endpoint','status':'unresolved'});continue
                     relation='verified_reference'
                     evidence=[]
                     # No NLP is attempted by the no-model execution path.
@@ -700,7 +721,8 @@ def discover_references(adapter,validated_rules,documents=None,model=None,budget
     if count>=max_candidates:
         result.issues.append({'code':'reference_candidate_limit','status':'partial'})
     from .references import discover_complex_references
-    complex_result=discover_complex_references(adapter,approved,corpus,budget,max_candidates=max(1,max_candidates-count))
+    complex_result=discover_complex_references(adapter,approved,corpus,budget,
+        max_candidates=max(0,max_candidates-count),table_refs=table_refs)
     result.rules.extend(complex_result.rules);result.issues.extend(complex_result.issues)
     result.stats={'reference_candidates':count,'rules_proposed':len(result.rules),'endpoint_rules':len(approved),**complex_result.stats}
     result.budget=budget.snapshot();return result

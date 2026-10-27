@@ -520,7 +520,7 @@ def test_json_reference_expansion_preserves_zeroes_deduplicates_and_empty_retrac
     ('[NaN]','non_scalar_json_reference'),
     ('["01","missing"]','reference_missing'),
     ('[1]','reference_missing'),
-    (None,'json_reference_requires_text'),
+    (None,'reference_partial_null'),
 ])
 def test_invalid_json_reference_never_partially_replaces_existing_edges(value,code):
     with GraphStore() as store:
