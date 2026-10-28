@@ -9,8 +9,9 @@ from lightgraph.errors import BudgetExceeded
 @dataclass(frozen=True)
 class Cost:
     db_cu: float = 0
-    llm_calls: int = 0
-    llm_tokens: int = 0
+    # None is valid only in limits, never in a reservation or measured charge.
+    llm_calls: int | None = 0
+    llm_tokens: int | None = 0
     memory_bytes: int = 0
     seconds: float = 0
 
@@ -60,13 +61,16 @@ class BudgetAllocator:
 
     def _check(self, cost: Cost, excluding: str | None = None) -> None:
         values = asdict(cost)
-        if any(v < 0 for v in values.values()):
+        if any(v is None or v < 0 for v in values.values()):
             raise ValueError("negative_budget_cost")
         if cost.seconds > self.remaining_seconds():
             raise BudgetExceeded("wall_time_budget_exhausted")
         for name in ("db_cu", "llm_calls", "llm_tokens"):
+            limit = getattr(self.limits, name)
+            if limit is None:
+                continue
             reserved = sum(getattr(c, name) for k, c in self._reserved.items() if k != excluding)
-            if getattr(self.used, name) + reserved + getattr(cost, name) > getattr(self.limits, name):
+            if getattr(self.used, name) + reserved + getattr(cost, name) > limit:
                 raise BudgetExceeded(f"{name}_budget_exhausted")
         if cost.memory_bytes > self.limits.memory_bytes:
             raise BudgetExceeded("memory_budget_exhausted")
@@ -86,7 +90,7 @@ class BudgetAllocator:
 
     def charge(self, cost: Cost, reservation_id: str | None = None) -> None:
         with self._lock:
-            if any(v < 0 for v in asdict(cost).values()):
+            if any(v is None or v < 0 for v in asdict(cost).values()):
                 raise ValueError("negative_budget_cost")
             if reservation_id and reservation_id not in self._reserved:
                 raise ValueError("unknown_budget_reservation")
@@ -103,7 +107,8 @@ class BudgetAllocator:
             try:
                 self.check_deadline()
                 for name in ("db_cu", "llm_calls", "llm_tokens", "memory_bytes"):
-                    if getattr(self.used, name) > getattr(self.limits, name):
+                    limit = getattr(self.limits, name)
+                    if limit is not None and getattr(self.used, name) > limit:
                         raise BudgetExceeded(f"{name}_budget_exhausted")
             except BudgetExceeded:
                 # A failed charge must not pin an unusable reservation. The

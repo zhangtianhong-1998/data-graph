@@ -51,7 +51,8 @@ class MemorySource(SourceAdapter):
             self._db.close()
             if isinstance(e, LightGraphError): raise
             raise LightGraphError("memory_source_initialization_failed") from None
-        self.compiler = QueryCompiler(self._tables, dialect="sqlite")
+        self.compiler = QueryCompiler(self._tables, dialect="sqlite",
+            physical_columns={t.qualified_name:t.column_names for t in self._tables})
 
     def _authorize(self, action, arg1, arg2, db, trigger):
         allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_TRANSACTION}

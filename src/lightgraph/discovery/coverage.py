@@ -61,8 +61,7 @@ def discover_uncovered(*,tables,contexts,adapters,goal,engine,rules,understandin
                 stats[key]=stats.get(key,0)+int(result.stats.get(key,0))
             issues.extend(result.issues)
             understandings.extend(result.understandings)
-            if _deferred_tables(result,{table.qualified_name}):
-                ledger.transition(item,'deferred');break
+            deferred=bool(_deferred_tables(result,{table.qualified_name}))
             existing={r.rule_id:r for r in rules}
             for rule in result.rules:
                 if rule.rule_id in existing:
@@ -72,6 +71,13 @@ def discover_uncovered(*,tables,contexts,adapters,goal,engine,rules,understandin
                 rules.append(rule);existing[rule.rule_id]=rule
                 execute(rule)
             after=unexplained_columns(table,validated_rules,understandings,goal,engine)
+            if deferred:
+                # Compilation retained independent valid siblings. Run their
+                # normal publication gates before leaving other work deferred.
+                # A partial batch still cannot certify exploration complete.
+                remaining=after
+                unfinished.add((table.source_id,table.qualified_name))
+                ledger.transition(item,'deferred');break
             if not after:
                 ledger.transition(item,'resolved');remaining=[];break
             if after==remaining:

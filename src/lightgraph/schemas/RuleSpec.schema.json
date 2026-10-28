@@ -494,6 +494,12 @@
           "minItems": 1,
           "title": "Target Kinds",
           "type": "array"
+        },
+        "allow_self_links": {
+          "default": false,
+          "description": "Whether an object may relate to itself. False unless explicitly permitted by the business meaning and independently reviewed; matching endpoint values alone never grant this permission.",
+          "title": "Allow Self Links",
+          "type": "boolean"
         }
       },
       "required": [

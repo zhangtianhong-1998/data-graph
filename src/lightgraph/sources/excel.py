@@ -139,7 +139,8 @@ class ExcelSource(MemorySource):
                 finally:
                     cursor.close(); self._db.set_progress_handler(None, 0)
                     self.stats.elapsed_seconds += time.monotonic() - began
-        self.compiler = QueryCompiler(self._tables, dialect="sqlite")
+        self.compiler = QueryCompiler(self._tables, dialect="sqlite",
+            physical_columns={table.qualified_name: table.column_names for table in self._tables})
 
     def project(self, table, columns, predicate=None, distinct=True, limit=None):
         required=set(columns)
@@ -178,7 +179,8 @@ class ExcelSource(MemorySource):
                 missing = self._pending_formula_columns.get(table.qualified_name, set())
                 table.columns = [column for column in table.columns if column.name not in missing]
             try:
-                SQLGuard(tables, dialect="sqlite").validate(query.sql, query.parameters)
+                SQLGuard(tables, dialect="sqlite", physical_columns=self.compiler.guard.physical_columns).validate(
+                    query.sql, query.parameters)
             except LightGraphError as exc:
                 if exc.code == "unauthorized_column":
                     raise LightGraphError("formula_cache_missing_in_projection") from None

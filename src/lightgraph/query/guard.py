@@ -6,7 +6,7 @@ syntax and custom functions fail closed; catalog types must be trusted built-ins
 from __future__ import annotations
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
@@ -44,9 +44,43 @@ class ValidatedQuery:
         raise LightGraphError("ephemeral_serialization_forbidden")
 
 class SQLGuard:
-    def __init__(self, tables: Iterable[TableSpec], *, dialect: str = "postgres"):
+    def __init__(self, tables: Iterable[TableSpec], *, dialect: str = "postgres",
+                 physical_columns: Mapping[str, Iterable[str]] | None = None):
         self.tables = {t.qualified_name: t for t in tables}
         self.dialect = dialect
+        # Kept separate from the authorized projection. GROUP BY resolves an
+        # input column before a SELECT alias, including columns hidden by the
+        # application allowlist. An incomplete catalog cannot prove no clash.
+        self.physical_columns = {name: frozenset(columns) for name, columns in
+                                 (physical_columns or {}).items() if name in self.tables}
+
+    def _output_alias(self, column, scope):
+        if column.table or scope.expression.named_selects.count(column.name) != 1:
+            return False
+        parent = column.parent
+        if (isinstance(parent, exp.Ordered) and parent.this is column
+                and isinstance(parent.parent, exp.Order)
+                and parent.parent.parent is scope.expression):
+            # Bare ORDER BY output aliases bind the already-authorized result,
+            # including compound SELECT output. Expressions such as LENGTH(x)
+            # do not inherit this exception.
+            return True
+        if not (isinstance(parent, exp.Group) and parent.parent is scope.expression):
+            return False
+        for _, source in scope.selected_sources.values():
+            if isinstance(source, exp.Table):
+                name = f"{source.db}.{source.name}" if source.db else source.name
+                physical = self.physical_columns.get(name)
+                # SQLite/MySQL resolve column names without case, and Postgres
+                # folds unquoted names. A case variant of a hidden input must
+                # never become an apparent output alias. Conservatively cover
+                # quoted variants as well rather than infer server collation.
+                if physical is None or column.name.casefold() in {name.casefold() for name in physical}:
+                    return False
+            elif column.name.casefold() in {name.casefold() for name in
+                                           (source.outer_columns or source.expression.named_selects)}:
+                return False
+        return True
 
     def validate(self, sql: str, parameters: dict[str, Any] | None = None, *, operator: str = "select", result_columns: Iterable[str] = ()) -> ValidatedQuery:
         try:
@@ -103,6 +137,7 @@ class SQLGuard:
 
     def _authorize(self, tree: exp.Expression) -> None:
         validated_joins = set()
+        validated_columns = set()
         for scope in traverse_scope(tree):
             from_clause = scope.expression.args.get("from_") or scope.expression.args.get("from")
             bound = {from_clause.this.alias_or_name} if from_clause is not None else set()
@@ -136,23 +171,26 @@ class SQLGuard:
                         raise LightGraphError("unauthorized_object")
                     # Type checks apply to referenced columns below. An unrelated
                     # custom-type column must not disable safe text projections.
-            columns = list(scope.columns)
+            # Scalar-subquery scopes can propagate unqualified child columns as
+            # apparent external references before SQLGlot resolves names. Child
+            # scopes are visited first, so skip only the exact AST nodes already
+            # authorized there. A genuinely unbound/correlated child reference
+            # still fails its own authorization; names alone never grant reuse.
+            own_columns = list(scope.find_all(exp.Column))
+            columns = [column for column in scope.columns if id(column) not in validated_columns
+                       and not self._output_alias(column, scope)]
             checked_ids = {id(column) for column in columns}
-            for column in scope.find_all(exp.Column):
+            for column in own_columns:
                 if id(column) in checked_ids:
                     continue
                 # sqlglot's optimizer view omits unqualified HAVING columns and
                 # apparent output aliases inside ORDER/DISTINCT expressions.
                 # Those expressions can bind physical input columns instead;
                 # authorization must inspect them even when optimization does
-                # not. Only a bare ORDER BY output alias is safely resolved by
-                # the already-authorized projection. HAVING aliases must repeat
-                # their expression (or use an outer SELECT) in this SQL subset.
-                parent = column.parent
-                bare_order_alias = (not column.table and column.name in scope.expression.named_selects
-                    and isinstance(parent, exp.Ordered) and parent.this is column
-                    and isinstance(parent.parent, exp.Order) and parent.parent.parent is scope.expression)
-                if not bare_order_alias:
+                # not. Bare ORDER/GROUP aliases need the scope-specific checks
+                # above. HAVING aliases must repeat their expression (or use an
+                # outer SELECT) in this SQL subset.
+                if not self._output_alias(column, scope):
                     columns.append(column)
             for column in columns:
                 if column.is_star:
@@ -174,7 +212,13 @@ class SQLGuard:
                             raise LightGraphError("untrusted_column_type")
                         matches.append(selected is not None)
                     else:
-                        matches.append(column.name in source.expression.named_selects)
+                        # A CTE/derived-table column list renames the inner
+                        # projection. Its source columns were authorized in
+                        # the child scope; only the exposed names are visible
+                        # here. Ignoring this list rejects ordinary unpivot
+                        # queries such as WITH items(code) AS (SELECT l1_code…).
+                        exposed = source.outer_columns or source.expression.named_selects
+                        matches.append(column.name in exposed)
                 if not any(matches):
                     # Output aliases are already resolved/excluded by Scope;
                     # never treat an arbitrary selected name as authorization.
@@ -185,6 +229,7 @@ class SQLGuard:
                 # COUNT(*) is the only admitted wildcard; SELECT * exposes columns.
                 if not isinstance(star.parent, exp.Count):
                     raise LightGraphError("wildcard_projection_forbidden")
+            validated_columns.update(id(column) for column in own_columns)
 
         if any(id(join) not in validated_joins for join in tree.find_all(exp.Join)):
             raise LightGraphError("unsupported_join_shape")

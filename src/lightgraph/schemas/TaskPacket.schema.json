@@ -90,7 +90,7 @@
         },
         "rationale": {
           "default": "",
-          "maxLength": 600,
+          "maxLength": 8192,
           "title": "Rationale",
           "type": "string"
         },
@@ -332,7 +332,7 @@
         },
         "rationale": {
           "default": "",
-          "maxLength": 600,
+          "maxLength": 8192,
           "title": "Rationale",
           "type": "string"
         },
@@ -508,7 +508,7 @@
         },
         "rationale": {
           "default": "",
-          "maxLength": 600,
+          "maxLength": 8192,
           "title": "Rationale",
           "type": "string"
         },
@@ -686,7 +686,7 @@
         },
         "rationale": {
           "default": "",
-          "maxLength": 600,
+          "maxLength": 8192,
           "title": "Rationale",
           "type": "string"
         },
@@ -794,7 +794,7 @@
         },
         "rationale": {
           "default": "",
-          "maxLength": 600,
+          "maxLength": 8192,
           "title": "Rationale",
           "type": "string"
         },
@@ -1255,7 +1255,7 @@
         },
         "rationale": {
           "default": "",
-          "maxLength": 600,
+          "maxLength": 8192,
           "title": "Rationale",
           "type": "string"
         },
@@ -1416,9 +1416,9 @@
           "type": "integer"
         },
         "max_rationale_chars": {
-          "default": 600,
+          "default": 8192,
           "exclusiveMinimum": 0,
-          "maximum": 600,
+          "maximum": 8192,
           "title": "Max Rationale Chars",
           "type": "integer"
         }
@@ -2035,7 +2035,7 @@
         },
         "rationale": {
           "default": "",
-          "maxLength": 600,
+          "maxLength": 8192,
           "title": "Rationale",
           "type": "string"
         },
@@ -2109,6 +2109,12 @@
           "minItems": 1,
           "title": "Target Kinds",
           "type": "array"
+        },
+        "allow_self_links": {
+          "default": false,
+          "description": "Whether an object may relate to itself. False unless explicitly permitted by the business meaning and independently reviewed; matching endpoint values alone never grant this permission.",
+          "title": "Allow Self Links",
+          "type": "boolean"
         }
       },
       "required": [
@@ -2770,6 +2776,20 @@
           "title": "Path Semantics",
           "type": "string"
         },
+        "identity_resolution": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional explicit identity policy: source_scoped for legacy paths, verified_identity_domain for relative_path. namespace_local limits namespace values within a verified domain and is not source isolation. Unsupported or inconsistent policies require proposal repair and independent semantic review.",
+          "title": "Identity Resolution"
+        },
         "identity_domain": {
           "default": "",
           "title": "Identity Domain",
@@ -3062,6 +3082,14 @@
       },
       "maxItems": 6,
       "title": "Proposal Repairs",
+      "type": "array"
+    },
+    "hierarchy_identity_requests": {
+      "items": {
+        "$ref": "#/$defs/ProposalRepair"
+      },
+      "maxItems": 12,
+      "title": "Hierarchy Identity Requests",
       "type": "array"
     },
     "catalog": {

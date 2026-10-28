@@ -108,6 +108,7 @@ class MySQLSource(SourceAdapter):
         self._closed = self._broken = self._cancelled = False
         self._data_closed = False
         self._tables = []
+        self._physical_column_names = {}
         self._connection = self._control = None
         self._connection_id = None
         self._manifest = CapabilityManifest(driver="pymysql_dbapi", capabilities={
@@ -155,7 +156,8 @@ class MySQLSource(SourceAdapter):
             raise LightGraphError("database_connection_failed") from None
         finally:
             options.clear()
-        self.compiler = QueryCompiler(self._tables, dialect="mysql")
+        self.compiler = QueryCompiler(self._tables, dialect="mysql",
+            physical_columns=self._physical_column_names)
 
     def __repr__(self):
         return f"MySQLSource(source_id={self.source_id!r}, product={self._manifest.product!r})"
@@ -292,7 +294,9 @@ class MySQLSource(SourceAdapter):
                 raise LightGraphError("metadata_size_limit")
             cursor.execute("SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s ORDER BY ORDINAL_POSITION", (schema, name))
             columns = []
+            self._physical_column_names[qualified] = set()
             for cname, dtype, nullable, annotation in cursor.fetchall():
+                self._physical_column_names[qualified].add(cname)
                 if qualified in self.allowed_columns and cname not in self.allowed_columns[qualified]:
                     continue
                 if len((annotation or "").encode("utf-8")) > self.limits.max_batch_bytes:

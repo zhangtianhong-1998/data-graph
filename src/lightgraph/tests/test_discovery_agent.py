@@ -203,7 +203,7 @@ def test_tool_budget_requests_final_then_rejects_additional_call(monkeypatch):
     def handler(request):
         body=json.loads(request.content);turns.append(1)
         if len(turns)==2:
-            assert body['tool_choice']=='none'
+            assert 'tools' not in body
         return response(tool='get_metadata')
     model=client(monkeypatch,handler);tools=Toolbox()
     with pytest.raises(BudgetExceeded,match='discovery_tool_calls_exhausted'):
@@ -228,7 +228,7 @@ def test_final_reference_check_remains_required(monkeypatch,evidence):
     assert tools.closed
 
 
-def test_final_json_retry_and_invalid_packet_cleanup(monkeypatch):
+def test_unverifiable_final_json_correction_and_invalid_packet_cleanup(monkeypatch):
     turns=[]
     def handler(request):
         turns.append(1)
@@ -236,7 +236,10 @@ def test_final_json_retry_and_invalid_packet_cleanup(monkeypatch):
             return httpx.Response(200,json={'choices':[{'message':{'content':'bad'}}]})
         return response(final())
     model=client(monkeypatch,handler);tools=Toolbox()
-    assert model.explore(input_packet(),tools).proposals
+    # An unparseable candidate cannot prove that a second business claim kept
+    # its exclusions/conditions. The retry must not silently replace its meaning.
+    with pytest.raises(LightGraphError,match='llm_schema_invalid'):
+        model.explore(input_packet(),tools)
     assert model.usage['calls']==2 and tools.closed
     tools=Toolbox()
     with pytest.raises(LightGraphError,match='model_packet_schema_invalid'):

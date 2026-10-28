@@ -1,8 +1,38 @@
 """Safe compiler diagnostics for bounded proposal repair, never source values."""
 
+
+def compiled_contract_error(error):
+    """Translate only known proposal-to-rule contract mismatches.
+
+    Pydantic diagnostics may contain source input. Inspect the fixed validator
+    code without formatting the exception, and let unexpected failures escape.
+    """
+    if error.title != 'HierarchySpec':
+        return None
+    details=error.errors(include_url=False,include_input=False)
+    if len(details)!=1 or details[0].get('type')!='value_error':
+        return None
+    cause=details[0].get('ctx',{}).get('error')
+    arguments=getattr(cause,'args',())
+    if len(arguments)==1 and isinstance(arguments[0],str) and arguments[0] in {
+            'invalid_hierarchy_context','empty_hierarchy_context'}:
+        return arguments[0]
+    return None
+
 # Semantic judgments are deliberately absent: a rejected meaning is not a
 # formatting error to keep asking away. These codes describe fixable contracts.
+HIERARCHY_IDENTITY_REPAIR_CODES = frozenset({
+    'hierarchy_identity_resolution_unsupported',
+    'hierarchy_identity_resolution_conflict',
+    'hierarchy_identity_resolution_required',
+})
+
 PROPOSAL_REPAIR_GUIDANCE = {
+    'hierarchy_position_semantics_missing': 'A relative_path hierarchy must explicitly provide a nonempty identity_domain, nonempty taxonomy and position_semantics (ordinal_slots or ordered_slots). Derive each interpretation from the goal and issued evidence; do not invent defaults, copy row values, or drop relative_path or its restrictions just to pass compilation. Preserve the original scope, conditions and evidence. If these meanings cannot be established, abstain. The complete repaired claim still requires independent semantic review, and FD success does not supply semantic confirmation.',
+    'hierarchy_identity_resolution_unsupported': 'Wide hierarchy supports explicit source_scoped with legacy paths or verified_identity_domain with relative_path. shared_definition and unknown policies are not aliases for either. Preserve the original identity request and its evidence in hierarchy_identity_requests; resolve the meaning explicitly or abstain. Do not omit or null identity_resolution. The repaired full claim still requires independent semantic review.',
+    'hierarchy_identity_resolution_conflict': 'Align the explicit identity_resolution, path_semantics and identity_scope using evidence. source_scoped requires legacy paths and cannot mean domain_global; relative_path requires verified_identity_domain. namespace_local limits namespace values within a verified domain and can share across sources; it is not source isolation. Preserve the original request, conditions and evidence; do not drop or null the policy to bypass the conflict. Repair the meaning explicitly or abstain; independent semantic review is still required.',
+    'hierarchy_identity_resolution_required': 'A previous hierarchy identity request remains unresolved in hierarchy_identity_requests. State an explicit supported identity_resolution consistent with path_semantics and identity_scope, preserving the original request and evidence. Omitting or nulling the policy, or renaming the proposal, cannot resolve the conflict. Resolve the meaning explicitly or abstain; the repaired full claim still requires independent semantic review.',
+    'unbound_attribute_property': 'Every entity_key property_names key must also appear in attributes.single_valued or attributes.multi_valued. Explicitly classify evidence-supported attributes or correct unsupported mappings; do not add columns to identity to bypass this contract. Preserve all exclusions and semantic evidence.',
     'unregistered_attribute_semantics': 'Use an issued built-in property or declare the custom property type and entity kinds in semantic_schema. Identity code columns use identity_code with in_identity=true.',
     'builtin_property_definition_forbidden': 'Reference built-in properties without redefining their contracts. Declare a new name only when it represents a different permitted business attribute.',
     'builtin_relation_definition_forbidden': 'Reuse the built-in relationship without redefining its endpoint or validation contract.',
@@ -29,6 +59,8 @@ PROPOSAL_REPAIR_GUIDANCE = {
     'reference_hierarchy_level_unknown': 'Choose a level actually listed in entity_bindings.',
     'reference_level_on_nonhierarchy': 'Omit the level selector for ordinary entity groups and long hierarchies.',
     'reference_arity_mismatch': 'Map each current-table endpoint column, in order, to every key column of the selected entity binding.',
+    'invalid_hierarchy_context': 'context_qualifiers supports only condition, valid_period, period and hierarchy_version. Put source namespace columns in namespace_columns, not context_qualifiers. Preserve all actual conditions; if they cannot be represented, abstain rather than silently removing them. Never copy row values into rule constants.',
+    'empty_hierarchy_context': 'Hierarchy context qualifier values must be nonempty. Use an empty context_qualifiers mapping only when no actual condition is required; otherwise provide an evidence-supported permitted condition or abstain. Do not invent a value to satisfy the contract.',
 }
 REPAIRABLE_PROPOSAL_CODES = frozenset(PROPOSAL_REPAIR_GUIDANCE)
 

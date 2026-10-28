@@ -69,7 +69,8 @@ class GoalScopedSource(SourceAdapter):
             # Keep a zero-column table to permit COUNT(*) without exposing any
             # excluded column. Other projections still fail column authorization.
             tables.append(filtered)
-        guard = SQLGuard(tables, dialect=self.compiler.dialect)
+        guard = SQLGuard(tables, dialect=self.compiler.dialect,
+                         physical_columns=self.compiler.guard.physical_columns)
         return guard.validate(query.sql, query.parameters, operator=query.operator,
                               result_columns=query.result_columns)
 

@@ -51,6 +51,7 @@ class GaussSource(SourceAdapter):
         self.stats = QueryStats(); self._lock = threading.RLock(); self._depth = 0
         self.query_budget = query_budget or QueryBudget()
         self._closed = False; self._cancelled = False; self._tables = []
+        self._physical_column_names = {}
         self._lock_timeout_supported = None
         self._manifest = CapabilityManifest(driver="psycopg_dbapi", capabilities={k: "unknown" for k in REQUIRED_RUNTIME | {"cursor_paging", "cte", "union_all"}})
         # Qualification records are bound to actual product/version/driver.
@@ -75,7 +76,8 @@ class GaussSource(SourceAdapter):
         except Exception as exc:
             if hasattr(self, "_connection"): self._connection.close()
             raise LightGraphError("database_connection_failed") from safe_database_cause(exc, logging.getLogger(__name__))
-        self.compiler = QueryCompiler(self._tables, dialect="postgres")
+        self.compiler = QueryCompiler(self._tables, dialect="postgres",
+            physical_columns=self._physical_column_names)
 
     def __repr__(self): return f"GaussSource(source_id={self.source_id!r}, product={self._manifest.product!r})"
 
@@ -186,8 +188,10 @@ class GaussSource(SourceAdapter):
             # Base tables only: a view could invoke a privileged/volatile UDF.
             cursor.execute("SELECT c.column_name, c.data_type, c.is_nullable FROM information_schema.columns c JOIN information_schema.tables t ON c.table_schema=t.table_schema AND c.table_name=t.table_name WHERE c.table_schema=%s AND c.table_name=%s AND t.table_type='BASE TABLE' ORDER BY c.ordinal_position", (schema, table))
             columns = []
+            self._physical_column_names[name] = set()
             for row in cursor.fetchall():
                 col, dtype, nullable = (catalog_value(value) for value in row)
+                self._physical_column_names[name].add(col)
                 if name in self.allowed_columns and col not in self.allowed_columns[name]: continue
                 columns.append(ColumnSpec(name=col, data_type=dtype, nullable=nullable == "YES"))
             if not columns: raise LightGraphError("authorized_table_unavailable_or_view")

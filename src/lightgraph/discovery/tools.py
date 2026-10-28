@@ -20,6 +20,7 @@ from lightgraph.documents import DocumentCorpus
 from lightgraph.context import document_reference
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.query import QueryCompiler
+from lightgraph.query.compiler import ident, render_select
 from lightgraph.sources.base import aggregate_count
 from .budget import BudgetAllocator, Cost
 from .goal import column_is_excluded, source_in_goal
@@ -115,7 +116,8 @@ class ToolExecutor:
                                  if set(fk.columns) <= set(table.column_names)
                                  and (target := self.tables.get(f"{table.source_id}:{fk.target_schema}.{fk.target_table}")) is not None
                                  and set(fk.target_columns) <= set(target.column_names)]
-        self.compiler = QueryCompiler([t for t in tables if t.source_id in self._local_source_ids], dialect=adapter.compiler.dialect)
+        self.compiler = QueryCompiler([t for t in tables if t.source_id in self._local_source_ids],
+            dialect=adapter.compiler.dialect, physical_columns=adapter.compiler.guard.physical_columns)
 
     def begin_context(self, tables=()):
         """Start a new task with fresh scope and no previous observations/references."""
@@ -177,7 +179,7 @@ class ToolExecutor:
 
     def tool_specs(self) -> list[dict]:
         return [
-            _function("get_metadata", "Read authorized table declarations and stable column IDs. Declarations are hypotheses, not observed semantics.",
+            _function("get_metadata", "Read authorized table declarations, tool_table_id, quoted sql_table/sql_identifier and stable column IDs. Use tool_table_id in table tool arguments, column.name in column tool arguments, quoted SQL identifiers in SQL, and column.id in proposal references. Declarations are hypotheses, not observed semantics.",
                       {"table": _STRING}),
             _function("search_knowledge", "Read an applicable document window. Use the returned next_page to read remaining context. Partial sections cannot independently confirm semantics. Use source_id:schema.table when names overlap.",
                       {"table": _STRING, "columns": _COLUMNS,
@@ -190,7 +192,7 @@ class ToolExecutor:
                       {"source_table": _STRING, "source_columns": _COLUMNS,
                        "target_table": _STRING, "target_columns": _COLUMNS},
                       ("source_table", "source_columns", "target_table", "target_columns")),
-            _function("execute_readonly_sql", f"Execute a single guarded SELECT/CTE in the {self.compiler.dialect} dialect over authorized objects on this source. Use that dialect's identifier quoting, name columns explicitly, and use named :parameters for values. No arbitrary functions, writes, cross joins or OFFSET. Cross-source comparisons use check_reference, not federated SQL. Rows are ephemeral and bounded; LIMIT does not bound scan cost. Tool results cannot authorize graph publication.",
+            _function("execute_readonly_sql", f"Execute a single guarded SELECT/CTE in the {self.compiler.dialect} dialect over authorized objects on this source. Copy the quoted sql_table and column sql_identifier from get_metadata; tool_table_id and opaque column.id are not SQL identifiers. Name columns explicitly and use named :parameters for values. No arbitrary functions, writes, cross joins or OFFSET. In HAVING repeat the aggregate expression or use an outer SELECT instead of a projection alias. To count distinct tuples use SELECT COUNT(*) FROM (SELECT DISTINCT col1,col2 FROM table) AS tuples; SQLite does not support COUNT(DISTINCT col1,col2) or COUNT(DISTINCT (col1,col2)). Cross-source comparisons use check_reference, not federated SQL. Rows are ephemeral and bounded; LIMIT does not bound scan cost. Tool results cannot authorize graph publication.",
                       {"sql": {"type": "string", "minLength": 1, "maxLength": 20000},
                        "parameters": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean", "null"]}},
                        "max_rows": {"type": "integer", "minimum": 1, "maximum": self._max_rows}}, ("sql",)),
@@ -243,7 +245,25 @@ class ToolExecutor:
             code = error.code if isinstance(error, LightGraphError) and error.code in _SAFE_ERRORS else "tool_execution_failed"
             if isinstance(error, (TypeError, ValueError, KeyError)):
                 code = "invalid_tool_arguments"
-            return {"status": "error", "operator": operator, "probe_id": probe_id, "code": code}
+            result = {"status": "error", "operator": operator, "probe_id": probe_id, "code": code}
+            if operator == "execute_readonly_sql" and code in {"unauthorized_object", "unauthorized_column", "ambiguous_column"}:
+                # Fixed protocol help, never the rejected SQL, its identifiers,
+                # or parameters. The narrowed metadata tool owns visibility.
+                result["guidance"] = (
+                    "Read get_metadata for the authorized sql_table and each column's sql_identifier. "
+                    "Use those quoted names in SQL, not tool_table_id, source IDs or opaque column IDs. "
+                    "Qualify physical tables with their schema and qualify ambiguous columns with a table alias. "
+                    "For HAVING, repeat the aggregate expression or filter an outer SELECT. "
+                    "Unknown objects remain forbidden; do not infer permission from this error."
+                )
+            elif code in {"unauthorized_object", "unauthorized_column", "ambiguous_column"}:
+                result["guidance"] = (
+                    "Call get_metadata with no table argument to list the authorized catalog. "
+                    "Copy tool_table_id into table arguments and column.name into column arguments; "
+                    "opaque column.id belongs only in proposal references. "
+                    "Unknown objects and excluded columns remain forbidden."
+                )
+            return result
 
     def _table(self, table: str) -> TableSpec:
         if not isinstance(table,str):
@@ -272,11 +292,20 @@ class ToolExecutor:
             value["qualified_name"] = entry.qualified_name
             value["tool_table_id"] = f'{entry.source_id}:{entry.qualified_name}'
             source_adapter = self.source_adapters.get(entry.source_id)
-            value["sql_dialect"] = source_adapter.compiler.dialect if source_adapter else self.compiler.dialect
+            dialect = source_adapter.compiler.dialect if source_adapter else self.compiler.dialect
+            value["sql_dialect"] = dialect
+            value["sql_table"] = f'{ident(entry.schema_name,dialect)}.{ident(entry.name,dialect)}'
+            value["sql_readable_on_current_source"] = entry.source_id in self._local_source_ids
             for column in value["columns"]:
                 column["id"] = "c_" + digest(entry.source_id, entry.qualified_name, column["name"])[:16]
+                column["sql_identifier"] = ident(column["name"], dialect)
             entries.append(value)
-        return {"data": {"tables": entries}, "coverage": {"source_scope": "authorized_metadata", "result_complete": True, "truncated": False}}
+        return {"data": {"tables": entries, "identifier_usage": {
+                    "table_arguments": "Use tool_table_id in metadata, profile, FD and reference tool table arguments.",
+                    "column_arguments": "Use column.name in profile, FD and reference tool column arguments.",
+                    "sql": "Use sql_table and column.sql_identifier for SQL; only tables marked sql_readable_on_current_source are available.",
+                    "proposal_references": "Use the issued column.id in proposal column references, never a SQL identifier or table argument.",
+                }}, "coverage": {"source_scope": "authorized_metadata", "result_complete": True, "truncated": False}}
 
     def _search_knowledge(self, table, columns=None, page=0):
         source = self._table(table)
@@ -406,7 +435,7 @@ class ToolExecutor:
         effective_limit = min(cap + 1, requested_limit) if requested_limit is not None else cap + 1
         # Only the result page limit is narrowed. Never remove clauses, alter
         # predicates or pretend a capped page validates a full source table.
-        bounded = tree.limit(effective_limit, copy=True).sql(dialect=self.compiler.dialect)
+        bounded = render_select(tree.limit(effective_limit, copy=True), self.compiler.dialect)
         query = self.compiler.finish(bounded, parameters, "agent_select")
         rows, columns, byte_count, truncated = [], [], 0, False
         stream = self._query(query, row_limit=cap + 1)
@@ -436,6 +465,7 @@ class ToolExecutor:
         self.tables.clear()
         self.compiler.tables.clear()
         self.compiler.guard.tables.clear()
+        self.compiler.guard.physical_columns.clear()
         self._table_aliases.clear()
         self._reserved_probe_ids.clear()
         self.source_adapters.clear()

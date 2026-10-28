@@ -11,6 +11,7 @@ from typing import Any
 from ..contracts import (RuleSpec, TableSpec, GraphFact, SupportSpec, PartitionCompletion,
                          ValidationRecord, Coverage, canonical, digest)
 from ..errors import LightGraphError
+from ..semantic_schema import REFERENCE_SELF_LINK_CONTRACT_VERSION
 
 @dataclass
 class ExecutionResult:
@@ -127,6 +128,12 @@ class RuleEngine:
         if rule.kind == "reference":
             if not rule.evidence.semantic_basis:
                 codes.append("semantic_evidence_missing")
+            if self.store.policy.relation_allows_self_links(rule.relation.relation) and (
+                evidence.semantic_status != 'supported' or evidence.semantic_decision != 'model_review'
+                or not evidence.conditions_satisfied or evidence.refuting_refs
+                or 'semantic_review:allow_self_links' not in evidence.semantic_basis
+            ):
+                codes.append('reference_self_link_semantics_unreviewed')
             return codes
         # FD checks happen over the complete joint projection, never over physical-row uniqueness.
         by_key=defaultdict(list)
@@ -202,6 +209,8 @@ class RuleEngine:
                         "documents": rule.dependencies.documents,
                         "identity": digest(rule.identity.model_dump()),
                         "hierarchy": digest(rule.hierarchy.model_dump() if rule.hierarchy else None)}
+            if rule.kind == 'reference':
+                versions['reference_self_links'] = REFERENCE_SELF_LINK_CONTRACT_VERSION
             validation = ValidationRecord(validation_id="v_" + uuid.uuid4().hex,
                 rule_id=rule.rule_id, checks={"distinct_tuples": 0, "conflicts": 0},
                 coverage=Coverage(scope="full", consistent=False), status="validated", codes=[])
@@ -552,6 +561,10 @@ class RuleEngine:
                     a=self.bindings.get((rule.relation.source_rule_id,akey));b=self.bindings.get((rule.relation.target_rule_id,bkey))
                     if not a or not b:
                         codes.append("reference_missing");continue
+                    # Check resolved identities, including identity reuse across
+                    # columns and levels. One forbidden self link rejects this
+                    # rule's complete publication, not just the offending row.
+                    self.store.policy.check_relation_self_link(rule.relation.relation,a,b,reference=True)
                     # Connection-table aliases are physical column names. The
                     # edge inherits the source object's logical namespace,
                     # otherwise renamed composite keys create an invisible scope.

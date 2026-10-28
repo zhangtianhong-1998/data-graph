@@ -153,6 +153,15 @@
           "title": "Model",
           "type": "string"
         },
+        "response_format": {
+          "default": "json_schema",
+          "enum": [
+            "json_schema",
+            "json_object"
+          ],
+          "title": "Response Format",
+          "type": "string"
+        },
         "api_key": {
           "anyOf": [
             {
@@ -188,16 +197,30 @@
           "type": "boolean"
         },
         "max_calls": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": 40,
-          "minimum": 0,
-          "title": "Max Calls",
-          "type": "integer"
+          "title": "Max Calls"
         },
         "max_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": 120000,
-          "minimum": 0,
-          "title": "Max Tokens",
-          "type": "integer"
+          "title": "Max Tokens"
         },
         "max_discovery_steps": {
           "default": 8,
@@ -366,6 +389,12 @@
           "minItems": 1,
           "title": "Target Kinds",
           "type": "array"
+        },
+        "allow_self_links": {
+          "default": false,
+          "description": "Whether an object may relate to itself. False unless explicitly permitted by the business meaning and independently reviewed; matching endpoint values alone never grant this permission.",
+          "title": "Allow Self Links",
+          "type": "boolean"
         }
       },
       "required": [

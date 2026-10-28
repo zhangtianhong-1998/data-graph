@@ -17,7 +17,8 @@ from agentscope.memory import InMemoryMemory
 from agentscope.message import Msg
 from agentscope.model import ChatModelBase, ChatResponse
 
-from lightgraph.context import packet_call_context, bounded_discovery_packet
+from lightgraph.context import (packet_call_context, bounded_discovery_packet,
+                                with_discovery_runtime_control)
 from lightgraph.contracts import canonical
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from .models import ProposalBatch
@@ -87,13 +88,26 @@ class DiscoveryFormatter(FormatterBase):
 
 
 class DiscoveryChatModel(ChatModelBase):
-    """AgentScope model interface backed by bounded JSON/SSE transport."""
+    """Reserve a submission turn within the configured discovery allowance.
 
-    def __init__(self, client, max_tool_calls: int):
+    Providers may return multiple tools even when parallel calls are disabled.
+    An oversized batch executes nothing; its remaining turn is used to submit
+    the evidence already obtained, without increasing either allowance.
+    """
+
+    def __init__(self, client, max_tool_calls: int, max_steps: int):
         super().__init__(model_name=client.config.model,stream=client.config.stream)
         self.client=client
         self.max_tool_calls=max_tool_calls
+        self.max_steps=max_steps
         self.total_calls=0
+        self.steps=0
+        self.submission_reason=None
+
+    def _request_context(self, messages, reason):
+        """Add runtime-owned counters, never tool arguments or source values."""
+        return with_discovery_runtime_control(messages,turn=self.steps+1,max_turns=self.max_steps,
+            remaining_tool_calls=self.max_tool_calls-self.total_calls,submission_reason=reason)
 
     async def __call__(self, messages: list[dict], tools=None, tool_choice=None, **kwargs):
         from .agent import _message
@@ -101,8 +115,45 @@ class DiscoveryChatModel(ChatModelBase):
         _check_runtime_policy()
         self.client.budget.check_deadline()
         try:
-            parsed=self.client._request(messages,_message,tools,
-                tool_choice='none' if self.total_calls>=self.max_tool_calls else 'auto')
+            while True:
+                if self.steps>=self.max_steps:
+                    raise BudgetExceeded('discovery_steps_exhausted')
+                reason=self.submission_reason
+                if reason is None and self.total_calls>=self.max_tool_calls:
+                    reason='tool_allowance_exhausted'
+                if reason is None and self.steps==self.max_steps-1:
+                    reason='last_turn'
+                if reason is None and tool_choice=='none':
+                    reason='caller_requested'
+                request_messages=self._request_context(messages,reason)
+                self.steps+=1
+                try:
+                    # Omit definitions as well as selecting none. A provider
+                    # ignoring this instruction still cannot execute a tool.
+                    parsed=self.client._request(request_messages,_message,None if reason else tools,
+                        tool_choice='none' if reason else (tool_choice or 'auto'))
+                finally:
+                    request_messages.clear()
+                if 'final' in parsed:
+                    break
+                calls=parsed['calls']
+                if reason:
+                    if reason in {'tool_allowance_exhausted','tool_batch_rejected'}:
+                        raise BudgetExceeded('discovery_tool_calls_exhausted')
+                    if reason=='last_turn':
+                        raise BudgetExceeded('discovery_steps_exhausted')
+                    raise LightGraphError('discovery_final_response_required')
+                if self.total_calls+len(calls)<=self.max_tool_calls:
+                    break
+                # The last turn was reserved before the request. Reject the
+                # entire oversized batch instead of executing a changed subset.
+                self.submission_reason='tool_batch_rejected'
+                messages.append({'role':'user','content':canonical({'runtime_feedback':{
+                    'code':'tool_batch_exceeds_remaining_allowance','executed_tools':0,
+                    'requested_tools':len(calls),
+                    'remaining_tool_calls':self.max_tool_calls-self.total_calls,
+                    'next_action':'Submit ProposalBatch using existing evidence or abstain.'}})})
+                parsed.clear()
         finally:
             # HTTP has finished or failed. Formatted prompts must not outlive it.
             messages.clear()
@@ -110,8 +161,6 @@ class DiscoveryChatModel(ChatModelBase):
             content=[{'type':'text','text':parsed['final'].model_dump_json()}]
         else:
             calls=parsed['calls']
-            if self.total_calls+len(calls)>self.max_tool_calls:
-                raise BudgetExceeded('discovery_tool_calls_exhausted')
             content=[]
             for call in calls:
                 self.total_calls+=1
@@ -171,7 +220,8 @@ class DiscoveryReActAgent(ReActAgent):
     async def _summarizing(self) -> Msg:
         if getattr(self,'_terminal_failure',None) is not None:
             raise self._terminal_failure
-        # Framework's default summary would spend one extra LLM request.
+        # The model reserves its final configured turn for submission. Never
+        # add the framework's unbudgeted summary if the provider ignores it.
         raise BudgetExceeded('discovery_steps_exhausted')
 
 
@@ -181,7 +231,7 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
     _check_runtime_policy()
     memory=EphemeralMemory()
     toolkit=create_toolkit(executor,dispatch)
-    model=DiscoveryChatModel(client,max_tool_calls)
+    model=DiscoveryChatModel(client,max_tool_calls,max_steps)
     agent=DiscoveryReActAgent(name=client.config.agent_name,sys_prompt=system,
         model=model,formatter=DiscoveryFormatter(packet,executor),toolkit=toolkit,
         memory=memory,max_iters=max_steps,parallel_tool_calls=False,

@@ -6,6 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .errors import LightGraphError
 
+REFERENCE_SELF_LINK_CONTRACT_VERSION = 'explicit_permission_v1'
+
 
 class Definition(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
@@ -36,6 +38,10 @@ class PropertyDefinition(Definition):
 class RelationDefinition(Definition):
     source_kinds: list[str] = Field(min_length=1, max_length=64)
     target_kinds: list[str] = Field(min_length=1, max_length=64)
+    allow_self_links: bool = Field(default=False, strict=True,
+        description='Whether an object may relate to itself. False unless explicitly permitted '
+        'by the business meaning and independently reviewed; matching endpoint values alone '
+        'never grant this permission.')
 
 
 class SemanticSchema(BaseModel):

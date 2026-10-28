@@ -365,7 +365,7 @@ def review_with_agent(store, model, goal, corpus, *, scopes, domain='default', m
     checks. Human decisions are not silently overridden. Unchanged unresolved
     evidence is remembered as references so ordinary re-runs do not ask again.
     """
-    counts={'reviewed':0,'accepted':0,'unresolved':0,'deferred':0};issues=[]
+    counts={'reviewed':0,'accepted':0,'rejected':0,'unresolved':0,'deferred':0};issues=[]
     if not max_reviews or not callable(getattr(model,'complete',None)) or not getattr(model,'allow_source_samples',False):
         return counts,issues
     _initialize(store)
@@ -375,7 +375,28 @@ def review_with_agent(store, model, goal, corpus, *, scopes, domain='default', m
     if canonical(base_heads)!=canonical(store.heads()):
         return {**counts,'deferred':1},[{'code':'graph_generation_changed'}]
     facts={f['id']:f for f in graph['facts']};incident=_incident_facts(graph['facts'])
-    listing=list_candidates(store,scopes,domain)
+    cached_listing=None;listing_stamp=None
+    def current_listing():
+        """Reuse only this call's unchanged read; every store write invalidates it.
+
+        total_changes covers this connection, including review-attempt writes;
+        data_version covers commits by other connections, including user votes.
+        The caller also checks heads and goal on every candidate. A write during
+        the listing read prevents reuse even if the captured result is returned.
+        Commit-time evidence and whole-cluster checks remain authoritative.
+        """
+        nonlocal cached_listing,listing_stamp
+        with store._lock:
+            before=(store.connection.total_changes,
+                    store.connection.execute('PRAGMA data_version').fetchone()[0])
+            if cached_listing is not None and listing_stamp==before:
+                return cached_listing
+            cached_listing=list_candidates(store,scopes,domain)
+            after=(store.connection.total_changes,
+                   store.connection.execute('PRAGMA data_version').fetchone()[0])
+            listing_stamp=before if before==after else None
+            return cached_listing
+    listing=current_listing()
     known_rules={r.rule_id:r for r in store.get_rules(scopes=scopes,domain=domain)}
     reviewed_groups=set()
     for candidate in listing['candidates']:
@@ -384,7 +405,7 @@ def review_with_agent(store, model, goal, corpus, *, scopes, domain='default', m
         # Earlier decisions in this loop can have enlarged either endpoint's
         # group. Review all original members and their evidence together; a
         # pairwise approval cannot authorize a transitive whole-group merge.
-        current=list_candidates(store,scopes,domain)
+        current=current_listing()
         effective=[d for d in current['decisions'] if d['active'] and d['status']=='active']
         mapping=_mapping([{**d,'members':canonical(d['members'])} for d in effective])
         targets={mapping.get(e,e) for e in candidate['members']}
@@ -426,7 +447,7 @@ def review_with_agent(store, model, goal, corpus, *, scopes, domain='default', m
             if len(members)>2:proposition['members']=members
             counts['reviewed']+=1
             review_heads=store.heads()
-            review_revision=list_candidates(store,scopes,domain)['revision']
+            review_revision=current_listing()['revision']
             review_goal=_goal_revision(store)
             refs=review_semantics(model,packet,proposition,list(docs.values()))
             meaningful={'graph_fact_'+f['id'] for f in selected if f['fact_kind']=='Edge' or (
@@ -441,9 +462,12 @@ def review_with_agent(store, model, goal, corpus, *, scopes, domain='default', m
             deferred=(exc.code in {'graph_generation_changed','resolution_revision_conflict',
                 'resolution_evidence_changed','resolution_cluster_review_required','stale_goal_revision'}
                 or any(part in exc.code for part in ('budget','timeout','limit','too_large','model_')))
-            counts['deferred' if deferred else 'unresolved']+=1
+            rejected=exc.code=='semantic_claim_refuted'
+            # Reject this proposed merge, without asserting every member differs
+            # or creating a cannot-link decision from an early negative review.
+            counts['rejected' if rejected else 'deferred' if deferred else 'unresolved']+=1
             outcome='deferred' if deferred else exc.code
-            issues.append({'code':exc.code,'count':1})
+            issues.append({'code':exc.code,'count':1,**({'status':'rejected'} if rejected else {})})
         with store._transaction():
             store.connection.execute('INSERT OR REPLACE INTO identity_review_attempt VALUES(?,?,?)',
                                      (candidate['candidate_id'],dependencies,outcome))

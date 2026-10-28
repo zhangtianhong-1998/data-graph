@@ -28,11 +28,19 @@ Source rows and all tool observations are ephemeral; never copy them into ration
 notes, exception lists, output constants or rules. Use issued column/document/entity
 and probe IDs in final proposals. Newly retrieved documents are registered with
 their exact revision and scope; cite only issued document or probe IDs.
+Document section citations use the exact doc_id@revision:section_id shown in context;
+failed tool calls are not registered evidence. Do not cite an unregistered probe.
 Analytical guidance can suggest exploration but cannot confirm business semantics.
 A tool success is not business-semantic confirmation.
-Propose shared_definition identity_resolution only when the complete definition
-denotes the same object across the stated namespaces; matching labels or codes
-alone are insufficient. Hierarchy, sharing and relationship proposals undergo an
+For column_group and entity_key only, propose shared_definition identity_resolution
+when the complete definition denotes the same object across the stated namespaces;
+matching labels or codes alone are insufficient. A wide_hierarchy may explicitly
+request source_scoped identity_resolution with legacy paths or
+verified_identity_domain with relative_path. The latter still requires identity
+evidence and independent semantic review. namespace_local within a verified identity
+domain can share across sources; it is not source_scoped isolation. Never use
+shared_definition for a wide_hierarchy or omit a conflicting policy to bypass repair.
+Hierarchy, sharing and relationship proposals undergo an
 independent semantic review of their scope, direction, conditions and counterevidence.
 No fixed phrase, universal identifier or explicit mapping sentence is required:
 you may infer a candidate from relevant metadata, probes and prior knowledge.
@@ -41,7 +49,11 @@ business vocabulary instead of restricting it to the initial templates. Include
 new entity, property and relationship definitions in semantic_schema. Reuse the
 issued project definitions; a name alone is not a definition. Property definitions
 must state scalar type and applicable entity kinds; relationship definitions must
-state endpoint kinds. This never grants access to excluded or evidence-only values.
+state endpoint kinds. Business reference relations forbid self-links by default.
+Declare allow_self_links=true only when the precise business meaning permits an
+object to relate to itself; matching endpoint values alone do not justify it.
+That permission is part of an independent semantic review before execution.
+This never grants access to excluded or evidence-only values.
 Built-in properties are already registered: reference label, alias, english_name,
 description, definition, unit or formula without redefining them in semantic_schema.
 Use identity_code with in_identity=true for identifying business codes; do not
@@ -190,7 +202,7 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
     """
     import asyncio
     from .agentscope_runtime import run_agent
-    from .llm import validate_proposal_references
+    from .reference_validation import validate_or_repair
     from .observations import clear_observations
 
     checked={}
@@ -249,7 +261,7 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
             raise LightGraphError('agent_sync_entrypoint_inside_event_loop')
         final=asyncio.run(run_agent(client,checked,executor,dispatch,system,
                                    max_steps=max_steps,max_tool_calls=max_tool_calls))
-        validate_proposal_references(final,checked)
+        final=validate_or_repair(client,final,checked)
         client.budget.check_deadline()
         for key in ('probe_digest','document_snippets','document_refs','context_tables'):
             packet[key]=checked.get(key,[])

@@ -87,6 +87,21 @@ def test_safe_projection_alias_and_cte_columns_still_work(source):
         assert collect(scoped.execute(query)) == [("A",)]
 
 
+def test_group_alias_uses_full_inventory_through_goal_scope(source):
+    scoped = GoalScopedSource(source, ExtractionGoal(excluded_columns=["amount"]))
+    query = source.compiler.finish(
+        "SELECT code AS item, COUNT(*) AS n FROM public.items GROUP BY item", {}, "select")
+    assert collect(scoped.execute(query)) == [("A", 1)]
+    # The backing adapter permits amount, but this borrowed view excludes it.
+    # Its complete inventory must still identify the alias/input name clash.
+    query = source.compiler.finish(
+        "SELECT code AS amount, COUNT(*) AS n FROM public.items GROUP BY amount", {}, "select")
+    before = source.stats.queries
+    with pytest.raises(LightGraphError, match="unauthorized_column"):
+        collect(scoped.execute(query))
+    assert source.stats.queries == before
+
+
 def test_borrowed_adapter_lifecycle_and_budget_delegation(source):
     scoped = GoalScopedSource(source, ExtractionGoal())
     budget = QueryBudget(max_queries=100)

@@ -138,7 +138,8 @@ class PersistencePolicy:
                 endpoints = result.relation_endpoint_kinds(item.name)
                 if (item.name not in BUSINESS_RELATION_REFERENCES or not endpoints
                     or not set(item.source_kinds) <= endpoints[0]
-                    or not set(item.target_kinds) <= endpoints[1]):
+                    or not set(item.target_kinds) <= endpoints[1]
+                    or item.allow_self_links):
                     raise PersistenceViolation("builtin_relation_definition_forbidden")
                 continue
             relations.append(item)
@@ -168,6 +169,20 @@ class PersistencePolicy:
         if name == "defined_by":
             return kinds, {"DocumentSection", "Rule"}
         return RELATION_ENDPOINT_KINDS.get(name)
+
+    def relation_allows_self_links(self, name: str) -> bool:
+        definition = self.relation_definitions.get(name)
+        return bool(definition and definition.allow_self_links)
+
+    def check_relation_self_link(self, name: str, source: str, target: str, *, reference=False) -> None:
+        # Existing metadata predicates may describe a column mapped to itself.
+        # The new contract covers business reference rules and custom business
+        # predicates; it does not redefine those metadata operators.
+        if not reference and name!='parent_of' and name not in self.relation_definitions:
+            return
+        if source == target and not self.relation_allows_self_links(name):
+            raise PersistenceViolation('hierarchy_self_loop' if name == 'parent_of'
+                                       else 'reference_self_link_forbidden')
 
     def check_property_kind(self, name: str, kind: str) -> None:
         definition = self.property_definitions.get(name)
@@ -262,8 +277,7 @@ class PersistencePolicy:
             self._reference(payload["target"])
             if not self.relation_states(payload["relation"]):
                 raise PersistenceViolation("unregistered_relation")
-            if payload["relation"] == "parent_of" and payload["source"] == payload["target"]:
-                raise PersistenceViolation("hierarchy_self_loop")
+            self.check_relation_self_link(payload['relation'], payload['source'], payload['target'])
             self._qualifiers(payload.get("qualifiers", {}))
         else:
             self._keys(payload, {"id", "subject", "predicate", "object", "modality", "conditions"})

@@ -209,6 +209,8 @@ llm:
 .venv/bin/lightgraph discover examples/agentscope_discovery.yaml
 ```
 
+模型默认使用 `response_format: json_schema`，把完整输出契约交给支持严格结构化输出的服务端；本地格式、引用、语义和发布验证仍会继续执行。若网关不支持该模式，须显式设置 `response_format: json_object` 使用兼容模式；程序不会静默降级或删除约束。严格输出中的 Schema 也计入请求容量和用量估算。火山端点的能力应以实际模型与配置验证，不能只凭兼容接口名称判断；参见[官方结构化输出说明](https://docs.volcengine.com/docs/ark/structured-output-beta?lang=zh)。
+
 `stream: true` 使用模型 SSE 流，`false` 接收完整 JSON；旧配置默认 `false`。两种模式使用相同的工具和输出校验，工具名称与参数完整到达后才执行工具，不执行半截参数。`stream_options_include_usage` 控制是否请求流末尾的 token 用量；网关不支持该选项时设为 `false`，缺少用量时按保守预算记账。这里的流式指模型传输；Vue 工作台采用 HTTP 轮询显示真实任务状态，尚不提供逐工具事件流，也不显示模型原文。
 
 远端默认要求 HTTPS。客户的可信内网网关只有 HTTP 时，可以显式设置 `allow_insecure_http: true`；该设置不改变数据查询权限或允许发送的内容。
@@ -222,6 +224,14 @@ llm:
 ## 结果、范围和增量
 
 正常 `run` 生成 `report.json`、`graph.sqlite`、`graph.json`、`graph.yaml`、节点/边 CSV 和独立 HTML 浏览页；`discover` 输出验证后的规则与报告，不保存业务图结果库。两种流程都输出 `metadata.yaml`，并在 `metadata/declarations/` 与 `metadata/interpretations/` 保留不可变修订。报告区分完成、有缺口、部分完成与失败；E/D/I 的验证状态独立列出。
+
+排查空图时，先看 `validation.business_graph` 和业务节点、边计数。只有元数据图不代表已生成业务图。若 `business_graph_reason` 为 `scope_filtered`，表示本次已发布的业务支持不在请求的结果范围中，应检查 `scopes` 是否包含已获授权的结果标签。当前规则把身份命名空间值同时用作这些标签；系统不会自动把它们加入可见范围，也不会在诊断中公开被过滤的值。结果范围不能替代数据库行权限。
+
+需要取消 API 累计上限时，可把 `model.max_calls`、`model.max_tokens` 分别设为 `null`；默认上限和 `0` 的含义不变。每个 Agent 仍保留提交回合和无进展边界，SQL 权限、内存和运行超时继续生效。报告中的 `schema_repairs_succeeded`、`reference_repairs_succeeded` 和 `column_references_normalized` 分别记录格式纠正、引用纠正和精确列名规范的次数；这些过程不等于业务语义已确认。
+
+发现工作流升级到 `goal_driven_iterations/8` 后，旧发现缓存会重新审核。旧发布保留在历史中，不能绕过新的对象粒度和语义检查直接作为当前结果。
+
+引用规则默认禁止实体指向自身。自定义关系确实允许反身语义时，须在关系定义中显式声明 `allow_self_links: true`，并通过独立语义复核；换一个关系名不会自动获得许可。升级后，缺少新版自环验证标记的旧引用发布会退出当前视图，下一次运行重新验证；正确的实体、宽层级及历史记录保留。已有合法缓存可直接重验，发现反例则进入关系复核。
 
 `metadata.yaml` 中的 `declared` 保留表列、原注释、主键/唯一键/组合外键，以及连接器能力和约束读取范围；`type_origin` 区分数据库声明、Excel 解析推断和 CSV 文本类型。`semantic_annotations` 单独记录目标相关的列角色、冲突代码、覆盖范围、规则和文档依赖，状态为 `candidate` 或 `rule_validated`。目标变化不会改写原声明。目录不保存样本、原始值域、SQL 参数或模型对话，也不会把派生解释当成独立业务依据。
 

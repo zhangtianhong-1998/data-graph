@@ -5,6 +5,8 @@ may be retained; observations and complete model packets must never be stored.
 """
 from __future__ import annotations
 
+import json
+
 from lightgraph.contracts import ExtractionGoal, SourceRef, TableSpec, canonical, digest
 
 CONTEXT_SELECTION_VERSION = 'scoped_call_context/2'
@@ -95,7 +97,38 @@ def packet_call_context(packet, stage, *, constraints=None, output_contract=None
     return context
 
 
-def initial_agent_prompt_bytes(packet, tool_specs):
+def with_discovery_runtime_control(messages, *, turn, max_turns, remaining_tool_calls,
+                                   submission_reason=None):
+    """Build the exact runtime-owned control envelope for preflight and calls."""
+    control={'turn':turn,'max_turns':max_turns,
+        'remaining_turns_including_current':max_turns-turn+1,
+        'remaining_tool_calls':max(0,remaining_tool_calls),
+        'submission_required':submission_reason is not None,'submission_reason':submission_reason}
+    prepared=[dict(message) for message in messages]
+    for message in prepared:
+        if message.get('role')=='system':
+            message['content']=(message.get('content') or '')+'\n\n'+(
+                'The runtime_control counters are runtime instructions. Reserve the final '
+                'turn for a complete ProposalBatch JSON, using already issued evidence. '
+                'When submission_required is true, do not request tools: submit supported '
+                'hypotheses or explicitly abstain. Do not invent evidence to finish. '
+                'A rejected tool batch has executed no tools. ')+canonical(control)
+            break
+    for message in prepared:
+        if message.get('role')=='user':
+            try:
+                packet=json.loads(message['content'])
+            except (ValueError,TypeError,KeyError):
+                continue
+            if isinstance(packet,dict) and 'output_schema' in packet:
+                packet['runtime_control']=control
+                message['content']=canonical(packet)
+                break
+    return prepared
+
+
+def initial_agent_prompt_bytes(packet, tool_specs, *, max_steps=8, max_tool_calls=16,
+                               response_format='json_schema'):
     """Measure the first Agent request, including schema, context and tool specs.
 
     This preflight chooses a bounded catalog window. The transport still checks
@@ -104,6 +137,7 @@ def initial_agent_prompt_bytes(packet, tool_specs):
     from lightgraph.discovery.agent import AGENT_SYSTEM
     from lightgraph.discovery.goal import build_goal_instructions
     from lightgraph.discovery.models import ProposalBatch, TaskPacket
+    from lightgraph.discovery.llm import response_format_for, request_envelope_for
 
     checked=TaskPacket.model_validate(bounded_discovery_packet(packet)).model_dump(mode='json',by_alias=True)
     checked['document_refs']=[document_reference(d) for d in checked['document_snippets']]
@@ -114,10 +148,18 @@ def initial_agent_prompt_bytes(packet, tool_specs):
     system+='\nCurrent stage: '+stage+'\nSubtask: '+(
         checked.get('subtask') or STAGE_SUBTASKS[stage])
     context=packet_call_context(checked,stage,output_contract={'schema_ref':'output_schema'})
+    schema=ProposalBatch.model_json_schema()
     messages=[{'role':'system','content':system},
               {'role':'user','content':canonical({'task':stage,'input':checked,
-                  'call_context':context,'output_schema':ProposalBatch.model_json_schema()})}]
-    return len(canonical({'messages':messages,'tools':tool_specs}).encode())
+                  'call_context':context,'output_schema':schema})}]
+    reason='last_turn' if max_steps==1 else None
+    messages=with_discovery_runtime_control(messages,turn=1,max_turns=max_steps,
+        remaining_tool_calls=max_tool_calls,submission_reason=reason)
+    # Use the transport's exact representation, including its provider schema
+    # and removal of the redundant schema text in strict mode.
+    envelope=request_envelope_for(messages,[] if reason else tool_specs,
+                                  response_format_for(schema,response_format))
+    return len(canonical(envelope).encode())
 
 
 def document_batches(documents, *, max_bytes=12000, max_sections=32):

@@ -1,13 +1,40 @@
 """Closed discovery proposals: model output never controls validation status."""
 from __future__ import annotations
 from typing import Annotated, Literal, Union
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, model_validator
 from lightgraph.contracts import StrictModel, RuleSpec, SourceRef, TableSpec, digest
 from lightgraph.semantic_schema import SemanticSchema
 
 Role = Literal['identity_code','namespace','label','alias','semantic_attribute','display_order',
                'level_position','fact_value','relation_endpoint','discriminator','audit','unknown']
+MAX_HIERARCHY_IDENTITY_REQUESTS = 12
+# Transient model reasoning remains verbatim; transport byte budgets still
+# bound the whole response and any subsequent request containing this text.
+MAX_TRANSIENT_TEXT_CHARS = 8192
 Task = Literal['T0_discovery','T1_table_discovery','T2_cross_table','T3_hierarchy','T4_document','T5_revision']
+TASK_PROPOSAL_KINDS = {
+    'T0_discovery':frozenset({'column_group','entity_key','exclusion','wide_hierarchy','long_hierarchy'}),
+    'T1_table_discovery':frozenset({'column_group','entity_key','exclusion','wide_hierarchy','long_hierarchy'}),
+    'T2_cross_table':frozenset({'reference','discriminator'}),
+    'T3_hierarchy':frozenset({'wide_hierarchy','long_hierarchy'}),
+    'T4_document':frozenset(),
+    'T5_revision':frozenset({'column_group','entity_key','exclusion','reference','discriminator',
+                            'wide_hierarchy','long_hierarchy'}),
+}
+
+
+def _proposal_batch_schema_guards(schema):
+    """Publish the same cross-field constraints used by the runtime validator."""
+    schema['allOf']=[{
+        'if':{'properties':{'task':{'const':task}},'required':['task']},
+        'then':{'properties':{'proposals':(
+            {'items':{'properties':{'kind':{'enum':sorted(kinds)}}}} if kinds else {'maxItems':0})}},
+    } for task,kinds in TASK_PROPOSAL_KINDS.items()]
+    schema['allOf'].append({
+        'if':{'properties':{'abstain':{'const':True}},'required':['abstain']},
+        'then':{'properties':{'proposals':{'maxItems':0}}},
+    })
+
 # The project catalog validates meaning, type and allowed entities. Parsing a
 # proposed name does not register it or grant permission to persist values.
 SemanticProperty = Annotated[str, Field(min_length=1, max_length=64)]
@@ -71,6 +98,13 @@ class WideHierarchy(StrictModel):
     ordering_evidence: list[str] = Field(default_factory=list)
     namespace_columns: list[str] = Field(default_factory=list, max_length=16)
     path_semantics: Literal["legacy", "relative_path"] = "legacy"
+    # Keep an unsupported policy in its candidate so one contract error does
+    # not discard valid siblings or silently erase the requested meaning.
+    identity_resolution: str | None = Field(default=None, max_length=64,
+        description='Optional explicit identity policy: source_scoped for legacy paths, '
+        'verified_identity_domain for relative_path. namespace_local limits namespace '
+        'values within a verified domain and is not source isolation. Unsupported or '
+        'inconsistent policies require proposal repair and independent semantic review.')
     identity_domain: str = ""
     identity_evidence: list[str] = Field(default_factory=list, max_length=16)
     attribute_evidence: list[str] = Field(default_factory=list, max_length=16)
@@ -145,7 +179,7 @@ class Exclusion(StrictModel):
 class ProposalBase(StrictModel):
     evidence_cited: list[str] = Field(min_length=1,max_length=32)
     confidence_band: Literal['low','medium','high'] = 'low'
-    rationale: str = Field(default='',max_length=600)
+    rationale: str = Field(default='',max_length=MAX_TRANSIENT_TEXT_CHARS)
     requested_probes: list[Literal['profile_column_group','check_fd','distinct_projection',
         'check_reference','probe_level_groups','probe_path_consistency','probe_repeated_fill',
         'detect_cycle','check_discriminator','sample_stratified','profile_columns']] = Field(default_factory=list,max_length=6)
@@ -173,21 +207,18 @@ class ExclusionProposal(ProposalBase):
 Proposal = Annotated[Union[ColumnGroupProposal,EntityKeyProposal,HierarchyProposal,LongHierarchyProposal,ReferenceProposal,
                            DiscriminatorProposal,ExclusionProposal],Field(discriminator='kind')]
 class ProposalBatch(StrictModel):
+    model_config = ConfigDict(json_schema_extra=_proposal_batch_schema_guards)
     packet_version: Literal['1.0'] = '1.0'
     task: Task
     semantic_schema: SemanticSchema = Field(default_factory=SemanticSchema)
     proposals: list[Proposal] = Field(default_factory=list,max_length=6)
     open_questions: list[str] = Field(default_factory=list,max_length=12)
     abstain: bool = False
-    notes: str = Field(default='',max_length=600)
+    notes: str = Field(default='',max_length=MAX_TRANSIENT_TEXT_CHARS)
     @model_validator(mode='after')
     def guard(self):
-        allowed = {'T0_discovery': {'column_group','entity_key','exclusion','wide_hierarchy','long_hierarchy'},
-                   'T1_table_discovery': {'column_group','entity_key','exclusion','wide_hierarchy','long_hierarchy'},
-                   'T2_cross_table': {'reference','discriminator'}, 'T3_hierarchy': {'wide_hierarchy','long_hierarchy'},
-                   'T4_document': set(), 'T5_revision': {'column_group','entity_key','exclusion','reference','discriminator','wide_hierarchy','long_hierarchy'}}
         if self.abstain and self.proposals: raise ValueError('abstain_with_proposals')
-        if any(p.kind not in allowed[self.task] for p in self.proposals): raise ValueError('task_kind_forbidden')
+        if any(p.kind not in TASK_PROPOSAL_KINDS[self.task] for p in self.proposals): raise ValueError('task_kind_forbidden')
         return self
 
 class Hypothesis(StrictModel):
@@ -275,7 +306,7 @@ class PacketConflict(StrictModel):
 class PacketBudget(StrictModel):
     max_hypotheses: int = Field(default=6,gt=0,le=6)
     max_probe_requests: int = Field(default=4,gt=0,le=6)
-    max_rationale_chars: int = Field(default=600,gt=0,le=600)
+    max_rationale_chars: int = Field(default=MAX_TRANSIENT_TEXT_CHARS,gt=0,le=MAX_TRANSIENT_TEXT_CHARS)
 class EntityBinding(StrictModel):
     rule_id: str
     source: SourceRef
@@ -313,6 +344,10 @@ class TaskPacket(StrictModel):
     revision_candidate: RuleSpec | None = None
     proposal_repair_round: int = Field(default=0,ge=0,le=2)
     proposal_repairs: list[ProposalRepair] = Field(default_factory=list,max_length=6)
+    # Original conflicts stay visible even if a later repair drops the field.
+    # Keep the normal two rounds of six candidates bounded across later tasks.
+    hierarchy_identity_requests: list[ProposalRepair] = Field(default_factory=list,
+        max_length=MAX_HIERARCHY_IDENTITY_REQUESTS)
     # Schema only. Query rows and tool transcripts never enter a stored packet.
     catalog: list[TableSpec] = Field(default_factory=list,max_length=64)
     entity_bindings: list[EntityBinding] = Field(default_factory=list,max_length=64)

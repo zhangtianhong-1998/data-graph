@@ -21,20 +21,25 @@ class RoleOccurrence:
     code: str = 'unexplained_role_occurrence'
 
 
+def _role_applicable(rule):
+    # Relative-path/fill policies have already resolved positional identity;
+    # their bindings do not carry the per-occurrence position needed here.
+    return rule.kind in ('column_group_entity', 'long_hierarchy') or (
+        rule.kind == 'wide_hierarchy' and rule.identity.level_policy == 'level_qualified')
+
+
 def _role(rule, key):
     """Extract a comparable key without conflating tenant or positional scopes."""
+    if not _role_applicable(rule):
+        return None
     namespaces = list(rule.scope.namespaces)
     if rule.kind == 'wide_hierarchy':
-        # Other policies already resolve within a verified domain or validate
-        # repeated fills. Their binding index has no per-occurrence position.
-        if rule.identity.level_policy != 'level_qualified' or len(key) != len(namespaces) + 2:
+        if len(key) != len(namespaces) + 2:
             return None
         level = next((item for item in rule.hierarchy.levels if item.level == key[-2]), None)
         if level is None:
             return None
         return namespaces, key[:len(namespaces)], [level.code], [key[-1]]
-    if rule.kind not in ('column_group_entity', 'long_hierarchy'):
-        return None
     columns = list(rule.identity.key_columns)
     if len(key) != len(columns) or not set(namespaces) <= set(columns):
         return None
@@ -58,7 +63,10 @@ def detect_role_occurrences(rules: list[RuleSpec], bindings: dict, *, max_bindin
     limits = (max_bindings, max_roles_per_key, max_events, max_working_bytes)
     if any(type(value) is not int or value < 1 for value in limits):
         raise ValueError('invalid_role_detection_limit')
-    by_id = {r.rule_id: r for r in rules}
+    # Only candidates for this detector consume its bounded work/index budget.
+    # Counting known-inapplicable bindings makes already verified hierarchies
+    # report incomplete role discovery and can starve actual column-group roles.
+    by_id = {r.rule_id: r for r in rules if _role_applicable(r)}
     index = defaultdict(list)
     events = {}
     coverage = {'bindings_checked': 0, 'binding_limit_omissions': 0,

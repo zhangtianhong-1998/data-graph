@@ -11,7 +11,7 @@ from .rules import RuleEngine
 from .metadata import publish_metadata
 from .runtime.retention import write_report,write_rules,atomic_text
 
-DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/6'
+DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/8'
 
 # These failures mean the Agent never completed an interpretation. They are not
 # permission to retry within a turn; leave the table pending for a later run.
@@ -19,6 +19,8 @@ _AGENT_EXECUTION_FAILURES = frozenset({
     'agent_source_tracing_forbidden', 'agent_source_persistence_forbidden',
     'agent_tracing_forbidden', 'agent_nontext_tool_response',
     'agent_sync_entrypoint_inside_event_loop', 'invalid_tool_schema',
+    'model_structured_output_rejected', 'model_output_schema_missing',
+    'model_response_format_invalid',
 })
 
 
@@ -86,6 +88,14 @@ def _graph_outcome(report, store, config, *, discover_only):
         'entities_and_relations' if report.counts['business_edges'] else
         'entities_only' if report.counts['business_nodes'] else
         'candidates_only' if business else 'empty')
+    if not business and store._has_scope_filtered_business_support(
+            report.rules_published, set(config.scopes), config.isolation_domain):
+        report.validation['business_graph_reason'] = 'scope_filtered'
+        report.issues.append({'code':'business_graph_filtered_by_scopes',
+            'message':'Published business support is outside the requested result scopes. '
+                      'Review the configured authorized result scopes; permissions were not changed.'})
+        if report.status == 'COMPLETED':
+            report.status = 'COMPLETED_WITH_GAPS'
 
 
 def load_rules(paths):
@@ -109,6 +119,7 @@ def make_model(config):
     from .discovery.budget import BudgetAllocator, Cost
     client = StructuredModelClient(ModelConfig(
         base_url=settings.base_url, model=settings.model, agent_name=config.agent_name,
+        response_format=settings.response_format,
         api_key=settings.api_key, api_key_env=settings.api_key_env,
         stream=settings.stream, stream_options_include_usage=settings.stream_options_include_usage,
         allow_insecure_http=settings.allow_insecure_http, timeout_seconds=settings.timeout_seconds,
@@ -832,6 +843,11 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 report.status='PARTIAL'
         report.counts['elapsed_seconds']=round(time.monotonic()-started,3)
         report.counts['llm_calls']=model.usage['calls'] if model else 0
+        for counter in ('reference_repair_attempts','reference_repairs_succeeded','reference_repair_abstentions',
+                        'column_references_normalized','schema_repair_attempts','schema_repairs_succeeded',
+                        'schema_repair_abstentions','json_syntax_recoveries','json_bom_recoveries',
+                        'json_fence_recoveries','json_control_char_recoveries','json_trailing_comma_recoveries'):
+            report.counts[counter]=model.usage.get(counter,0) if model else 0
         report.counts['db_queries']=budget.snapshot()['queries'] if 'budget' in locals() else sum(a.stats.queries for a in adapters)
         report.counts['returned_rows']=budget.snapshot()['returned_rows'] if 'budget' in locals() else sum(a.stats.returned_rows for a in adapters)
         report.counts['returned_bytes']=budget.snapshot()['returned_bytes'] if 'budget' in locals() else sum(a.stats.returned_bytes for a in adapters)

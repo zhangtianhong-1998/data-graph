@@ -5,19 +5,24 @@ The Agent and query tools own ephemeral observations and never persist transcrip
 """
 from __future__ import annotations
 
+from pydantic import ValidationError
+
 from lightgraph.contracts import (ExtractionGoal, ExcludedColumn, RuleSpec, IdentitySpec,
-    ScopeSpec, RelationSpec, Dependencies, Coverage, digest)
+    ScopeSpec, RelationSpec, HierarchySpec, Dependencies, Coverage, digest)
 from lightgraph.documents import DocumentCorpus
 from lightgraph.errors import LightGraphError, BudgetExceeded
 from .budget import BudgetAllocator, Cost
 from .goal import source_in_goal, column_is_excluded, column_is_evidence_only
-from .models import DiscoveryResult, Hypothesis, ProposalBatch
-from .semantics import declared_evidence, review_semantics, rule_evidence
+from .models import DiscoveryResult, Hypothesis, ProposalBatch, MAX_HIERARCHY_IDENTITY_REQUESTS
+from .semantics import (declared_evidence, review_semantics, rule_evidence,
+    hierarchy_identity_context, entity_granularity_identity, entity_granularity_context,
+    entity_granularity_context_signatures, review_entity_granularity)
 from .observations import ReviewObservations
 from lightgraph.semantic_schema import SemanticSchema, EntityTypeDefinition
 from lightgraph.rules.endpoints import endpoint_columns
 from .repair import (REPAIRABLE_PROPOSAL_CODES, SEMANTIC_REVIEW_PROTOCOL_CODES,
-    PROPOSAL_REPAIR_GUIDANCE, MAX_PROPOSAL_REPAIR_ROUNDS)
+    PROPOSAL_REPAIR_GUIDANCE, MAX_PROPOSAL_REPAIR_ROUNDS, compiled_contract_error,
+    HIERARCHY_IDENTITY_REPAIR_CODES)
 
 
 def _catalog(adapter, goal):
@@ -97,6 +102,17 @@ def _reference_schema(schema,source_kind,target_kind,relation,goal):
     return policy.semantic_schema
 
 
+def _reference_relation_contract(schema, relation):
+    """Bind the executable relation contract into the exact review proposition."""
+    from lightgraph.store.policy import PersistencePolicy
+    policy=PersistencePolicy().with_schema(schema)
+    definition=policy.relation_definitions.get(relation)
+    if definition is not None:return definition.model_dump(mode='json')
+    source_kinds,target_kinds=policy.relation_endpoint_kinds(relation)
+    return {'name':relation,'source_kinds':sorted(source_kinds),'target_kinds':sorted(target_kinds),
+        'allow_self_links':False,'definition_origin':'builtin'}
+
+
 def _proposal_guards(batch, table, goal):
     from .engine import _column_id
     lookup={_column_id(table,c.name):c.name for c in table.columns}
@@ -122,9 +138,38 @@ def _identity_columns(rule):
     return columns
 
 
+def _hierarchy_request_matches(proposal, request):
+    """A renamed or narrowed overlapping identity still sees its old request."""
+    previous=request['proposal']
+    return (proposal.kind=='wide_hierarchy' and previous['kind']=='wide_hierarchy'
+        and proposal.claim.entity_kind_hint==previous['claim']['entity_kind_hint']
+        and bool({level.key for level in proposal.claim.levels}
+                 & {level['key'] for level in previous['claim']['levels']}))
+
+
+def _proposal_repair_record(proposal, code):
+    clean=proposal.model_copy(update={'rationale':'','requested_probes':[]})
+    return {'code':code,'guidance':PROPOSAL_REPAIR_GUIDANCE[code],
+            'proposal':clean.model_dump(mode='json')}
+
+
 def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observations=None,failures=None,
-             projection_excluded=(),identity_excluded=(),conflicted_ids=None):
-    from .engine import _compile_model, SENSITIVE
+             projection_excluded=(),identity_excluded=(),conflicted_ids=None,
+             hierarchy_rules=(),granularity_rejections=None,hierarchy_context=(),
+             compiled_proposals=None,identity_requests=None,policy_reviews=None):
+    from .engine import _compile_model, _check_hierarchy_identity_resolution, SENSITIVE
+    from lightgraph.contracts import canonical
+    # Inspect the whole batch before reviewing any sibling. Otherwise a renamed
+    # default-policy sibling could be accepted before its explicit conflict.
+    requests={canonical(item):item for item in [*(identity_requests or []),
+        *(packet or {}).get('hierarchy_identity_requests',[])]}
+    for proposal in batch.proposals:
+        if proposal.kind!='wide_hierarchy':continue
+        try:_check_hierarchy_identity_resolution(proposal.claim)
+        except LightGraphError as exc:
+            item=_proposal_repair_record(proposal,exc.code)
+            requests.setdefault(canonical(item),item)
+    if identity_requests is not None:identity_requests[:]=requests.values()
     excluded=[ExcludedColumn(column=c.name,reason='sensitive_or_excluded')
         for c in table.columns if SENSITIVE.search(c.name) or column_is_excluded(goal,table,c.name)]
     excluded.extend(ExcludedColumn(column=name,reason='proposal_exclusion') for name in sorted(projection_excluded))
@@ -138,6 +183,9 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
             excluded.extend(ExcludedColumn(column=lookup[m.column_id],reason=m.role)
                 for m in p.claim.members if m.exclude_from_projection or m.role in ('display_order','audit')
                 or (m.role=='fact_value' and not goal.observation_values))
+    hierarchies=list({canonical(context):context for context in [*hierarchy_context,
+        *hierarchy_identity_context(batch,table,hierarchy_rules)]}.values())
+    granularity_rejections={} if granularity_rejections is None else granularity_rejections
     rules=[]
     for p in batch.proposals:
         if p.kind=='exclusion': continue
@@ -146,10 +194,49 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                 raise LightGraphError('outside_extraction_goal')
             schema=SemanticSchema.merged(goal.semantic_schema,batch.semantic_schema)
             local=ProposalBatch(task=batch.task,proposals=exclusions+[p],semantic_schema=schema)
+            related_requests=[item for item in requests.values() if _hierarchy_request_matches(p,item)]
+            review_packet=packet or {}
+            if p.kind=='wide_hierarchy':
+                if related_requests and len(requests)>MAX_HIERARCHY_IDENTITY_REQUESTS:
+                    raise LightGraphError('hierarchy_identity_repair_context_limit')
+                _check_hierarchy_identity_resolution(p.claim,require_explicit=bool(
+                    related_requests or not requests and HIERARCHY_IDENTITY_REPAIR_CODES
+                    & set((packet or {}).get('allowed_revision_codes',[]))))
+                review_packet={**review_packet,'hierarchy_identity_requests':related_requests}
+            if p.kind=='wide_hierarchy' and p.claim.path_semantics=='relative_path':
+                # Missing executable semantics are a repairable proposal
+                # contract, not a reason to pay for an incomplete review.
+                if not p.claim.identity_domain or not p.claim.taxonomy or p.claim.position_semantics is None:
+                    raise LightGraphError('hierarchy_position_semantics_missing')
+                # The exploratory proposal permits arbitrary context keys;
+                # check the executable contract before paying for a review.
+                HierarchySpec(context_qualifiers=p.claim.context_qualifiers)
             review=None
-            sharing_requested=getattr(p.claim,'identity_resolution','source_scoped')=='shared_definition'
+            granularity_review=None
+            # A rejected identity cannot become eligible merely because its
+            # competing hierarchy failed compilation or vanished from a repair.
+            grain_key=entity_granularity_identity(p)
+            if grain_key is not None and grain_key in granularity_rejections:
+                raise LightGraphError(granularity_rejections[grain_key])
+            grain_context=entity_granularity_context(p,hierarchies)
+            if grain_context:
+                # A negative grain judgment remains terminal across sibling
+                # repairs; changing a group ID or attribute cannot solicit a
+                # different vote for the same entity identity.
+                try:
+                    granularity_review=review_entity_granularity(model,
+                        {**(packet or {}),'goal':goal.model_dump(mode='json'),
+                         'semantic_schema':schema.model_dump(mode='json')},
+                        p,grain_context,docs,observations=observations)
+                except LightGraphError as exc:
+                    if exc.code in ('semantic_claim_refuted','semantic_claim_unresolved',
+                                    'semantic_condition_unresolved'):
+                        granularity_rejections[grain_key]=exc.code
+                    raise
+            sharing_requested=(p.kind in {'column_group','entity_key'}
+                and p.claim.identity_resolution=='shared_definition')
             if model is not None and (p.kind in ('long_hierarchy','wide_hierarchy') or sharing_requested):
-                review=review_semantics(model,{**(packet or {}),'semantic_schema':schema.model_dump(mode='json')},{
+                review=review_semantics(model,{**review_packet,'semantic_schema':schema.model_dump(mode='json')},{
                     'kind':p.kind,'scope':(packet or {}).get('scope'),
                     'claim':p.claim.model_dump(mode='json')},docs,observations=observations)
             candidates=_compile_model(local,table,goal,docs,excluded,semantic_evidence=review)
@@ -175,12 +262,25 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                     rule.evidence=rule_evidence(sharing,reviewed=bool(review),documents=docs)
                 elif sharing_requested:
                     raise LightGraphError('shared_definition_attributes_missing')
+                if granularity_review:
+                    previous=(rule.evidence.semantic_basis if rule.evidence.semantic_status=='supported' else [])
+                    rule.evidence=rule_evidence(sorted(set(previous+granularity_review)),
+                        reviewed=True,documents=docs,probe_refs=rule.evidence.probe_refs)
                 _preflight(rule,goal)
                 rules.append(rule)
-        except LightGraphError as exc:
-            if failures is not None and exc.code in REPAIRABLE_PROPOSAL_CODES:
-                failures.append((p,exc.code))
-            else:_issue(result,table,exc.code)
+                if compiled_proposals is not None:
+                    compiled_proposals[rule.rule_id]=(p.model_copy(deep=True),schema.model_copy(deep=True),
+                        entity_granularity_context_signatures(grain_context) if granularity_review else set())
+                if policy_reviews is not None and p.kind=='wide_hierarchy' and review:
+                    policy_reviews[rule.rule_id]={canonical(item) for item in related_requests}
+        except (LightGraphError,ValidationError) as exc:
+            code=(exc.code if isinstance(exc,LightGraphError) else compiled_contract_error(exc)
+                  if p.kind=='wide_hierarchy' and p.claim.path_semantics=='relative_path' else None)
+            if code is None:
+                raise
+            if failures is not None and code in REPAIRABLE_PROPOSAL_CODES:
+                failures.append((p,code))
+            else:_issue(result,table,code)
     unique={}
     conflicts=set()
     for rule in rules:
@@ -196,23 +296,34 @@ def _repair_packet(packet, batch, failures, round_number, *, task='T5_revision')
     """Only typed schema claims and fixed diagnostics enter a fresh Agent task."""
     repairs=[]
     for proposal,code in failures:
-        clean=proposal.model_copy(update={'rationale':'','requested_probes':[]})
-        repairs.append({'code':code,'guidance':PROPOSAL_REPAIR_GUIDANCE[code],
-                        'proposal':clean.model_dump(mode='json')})
+        repairs.append(_proposal_repair_record(proposal,code))
+    from lightgraph.contracts import canonical
+    identity_requests={canonical(item):item for item in packet.get('hierarchy_identity_requests',[])}
+    for item in repairs:
+        if item['code'] in HIERARCHY_IDENTITY_REPAIR_CODES:
+            identity_requests.setdefault(canonical(item),item)
+    if len(identity_requests)>MAX_HIERARCHY_IDENTITY_REQUESTS:
+        raise LightGraphError('hierarchy_identity_repair_context_limit')
     codes=sorted({code for _,code in failures})
     return {**packet,'task':task,'semantic_schema':batch.semantic_schema.model_dump(mode='json'),
         'proposal_repair_round':round_number,'proposal_repairs':repairs,
+        'hierarchy_identity_requests':list(identity_requests.values()),
         'allowed_revision_codes':sorted(set(packet.get('allowed_revision_codes',[])) | set(codes)),
         'known_conflicts':[{'code':code,'count':sum(value==code for _,value in failures)} for code in codes],
         'subtask':'Repair only the rejected proposals described in proposal_repairs. Previously compiled independent groups are retained. Preserve the goal, exclusions, observed meaning and issued references. Fix contracts or abstain; a compiler failure does not justify weakening semantic evidence. Supply all definitions needed by your repaired proposals.'}
 
 
 def _compile_with_repairs(batch,table,goal,docs,result,*,model,packet,observations,tool_factory,
-                          projection_excluded=(),identity_excluded=()):
+                          projection_excluded=(),identity_excluded=(),hierarchy_rules=(),
+                          granularity_rejections=None,observed_hierarchies=None):
     """Keep valid siblings while giving malformed proposals bounded fresh tasks."""
     from lightgraph.contracts import canonical
     from lightgraph.rules import RuleEngine
     accepted={};blocked=set();seen=set();round_number=0
+    compiled_proposals={}
+    identity_requests=list(packet.get('hierarchy_identity_requests',[]));policy_reviews={}
+    granularity_rejections={} if granularity_rejections is None else granularity_rejections
+    observed_hierarchies={} if observed_hierarchies is None else observed_hierarchies
     projection_excluded=set(projection_excluded);identity_excluded=set(identity_excluded)
     while True:
         projection,identity=_proposal_guards(batch,table,goal)
@@ -223,9 +334,17 @@ def _compile_with_repairs(batch,table,goal,docs,result,*,model,packet,observatio
                 del accepted[rule_id]
                 _issue(result,table,'proposal_exclusion_conflict')
         failures=[]
+        # Keep even uncompiled hypotheses as competing structural context.
+        # Their original state remains proposed; retention does not approve them.
+        observed_hierarchies.update((canonical(context),context) for context in
+            hierarchy_identity_context(batch,table,[*hierarchy_rules,*accepted.values()]))
         rules=_compile(batch,table,goal,docs,result,model=model,packet=packet,
             observations=observations,failures=failures,projection_excluded=projection_excluded,
-            identity_excluded=identity_excluded,conflicted_ids=blocked)
+            identity_excluded=identity_excluded,conflicted_ids=blocked,
+            hierarchy_rules=[*hierarchy_rules,*accepted.values()],
+            granularity_rejections=granularity_rejections,
+            hierarchy_context=list(observed_hierarchies.values()),compiled_proposals=compiled_proposals,
+            identity_requests=identity_requests,policy_reviews=policy_reviews)
         for rule_id in blocked:accepted.pop(rule_id,None)
         for rule in rules:
             if rule.rule_id in blocked:continue
@@ -243,7 +362,16 @@ def _compile_with_repairs(batch,table,goal,docs,result,*,model,packet,observatio
             result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
             break
         seen.add(signature);round_number+=1
-        packet=_repair_packet(packet,batch,failures,round_number)
+        try:
+            packet=_repair_packet({**packet,'hierarchy_identity_requests':identity_requests},batch,failures,round_number)
+        except LightGraphError as exc:
+            if exc.code!='hierarchy_identity_repair_context_limit':raise
+            # A bounded history must not erase original constraints or discard
+            # independent rules that already passed their checks.
+            _issue(result,table,exc.code)
+            for _,code in failures:_issue(result,table,code)
+            result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
+            break
         result.stats['compile_repair_rounds']=result.stats.get('compile_repair_rounds',0)+1
         observations.clear()
         tools=tool_factory()
@@ -261,6 +389,54 @@ def _compile_with_repairs(batch,table,goal,docs,result,*,model,packet,observatio
             for _,code in failures:_issue(result,table,code)
             result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
             break
+    # A hierarchy can first appear in a later repair after an unrelated entity
+    # has already been retained. Check the final set against every observed
+    # hypothesis, using the original candidate, before any rule may escape.
+    observed_hierarchies.update((canonical(context),context) for context in
+        hierarchy_identity_context(ProposalBatch(task=batch.task),table,[*hierarchy_rules,*accepted.values()]))
+    final_context=list(observed_hierarchies.values())
+    for rule_id,rule in list(accepted.items()):
+        if rule.kind=='wide_hierarchy':
+            proposal,schema,_=compiled_proposals[rule_id]
+            related={canonical(item) for item in identity_requests if _hierarchy_request_matches(proposal,item)}
+            if not related or (proposal.claim.identity_resolution is not None
+                and related<=policy_reviews.get(rule_id,set())):
+                continue
+            checked=_compile(ProposalBatch(task=batch.task,proposals=[proposal],semantic_schema=schema),
+                table,goal,docs,result,model=model,
+                packet={**packet,'hierarchy_identity_requests':identity_requests},observations=observations,
+                projection_excluded=projection_excluded,identity_excluded=identity_excluded,
+                identity_requests=identity_requests,policy_reviews=policy_reviews)
+            replacement=next((candidate for candidate in checked if candidate.rule_id==rule_id),None)
+            if replacement is None:del accepted[rule_id]
+            else:accepted[rule_id]=replacement
+            continue
+        if rule.kind!='column_group_entity':
+            continue
+        proposal,schema,reviewed_context=compiled_proposals[rule_id]
+        identity=entity_granularity_identity(proposal)
+        grain_context=entity_granularity_context(proposal,final_context)
+        if identity not in granularity_rejections and (
+            not grain_context or entity_granularity_context_signatures(grain_context)<=reviewed_context):
+            continue
+        checked=_compile(ProposalBatch(task=batch.task,proposals=[proposal],semantic_schema=schema),
+            table,goal,docs,result,model=model,packet=packet,observations=observations,
+            projection_excluded=projection_excluded,identity_excluded=identity_excluded,
+            granularity_rejections=granularity_rejections,hierarchy_context=final_context)
+        replacement=next((candidate for candidate in checked if candidate.rule_id==rule_id),None)
+        if replacement is None:
+            del accepted[rule_id]
+        else:
+            accepted[rule_id]=replacement
+    # Empty or unrelated repairs cannot turn an unresolved policy into success.
+    # Only an explicit accepted claim reviewed against this request resolves it.
+    unresolved=[item for item in identity_requests if not any(
+        rule.kind=='wide_hierarchy' and compiled_proposals[rid][0].claim.identity_resolution is not None
+        and canonical(item) in policy_reviews.get(rid,set())
+        for rid,rule in accepted.items())]
+    present={issue['code'] for issue in result.issues if issue.get('table')==table.qualified_name}
+    for code in sorted({item['code'] for item in unresolved}-present):
+        _issue(result,table,code)
     return list(accepted.values()),docs,batch,packet,(projection_excluded,identity_excluded)
 
 
@@ -283,6 +459,9 @@ def _bounded_catalog_window(table, tables, packet, model, tool_specs):
     candidates=[table]+[t for t in tables
         if (t.source_id,t.qualified_name)!=(table.source_id,table.qualified_name)][:63]
     limit=getattr(model.config,'max_prompt_bytes',65536)
+    control={'max_steps':getattr(model.config,'max_discovery_steps',8),
+             'max_tool_calls':getattr(model.config,'max_tool_calls',16),
+             'response_format':getattr(model.config,'response_format','json_schema')}
     def candidate(size):
         return {**packet,
             'catalog':[t.model_dump(mode='json',by_alias=True) for t in candidates[:size]],
@@ -290,13 +469,13 @@ def _bounded_catalog_window(table, tables, packet, model, tool_specs):
                 f' Catalog coverage: {size} of {len(tables)} authorized tables are visible '
                 'in this call; the task table is included. Unlisted tables have not been examined.')}
     selected=candidate(1)
-    if initial_agent_prompt_bytes(selected,tool_specs)>limit:
+    if initial_agent_prompt_bytes(selected,tool_specs,**control)>limit:
         raise LightGraphError('model_packet_too_large')
     low,high=1,len(candidates)
     while low<high:
         middle=(low+high+1)//2
         trial=candidate(middle)
-        if initial_agent_prompt_bytes(trial,tool_specs)<=limit:
+        if initial_agent_prompt_bytes(trial,tool_specs,**control)<=limit:
             low=middle
             selected=trial
         else:high=middle-1
@@ -363,12 +542,16 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             budget.release(reservation)
             if batch.abstain: _issue(result,table,'model_abstained')
             initial_batch=batch
+            granularity_rejections={}
+            observed_hierarchies={}
             def fresh_tools():
                 return ToolExecutor(adapter,goal,budget,documents=corpus,
                     allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=window)
             rules,docs,batch,packet,guards=_compile_with_repairs(batch,original,goal,docs,result,
                 model=model,packet=packet,observations=observations,tool_factory=fresh_tools,
-                projection_excluded={entry.column for prior_rule in prior for entry in prior_rule.attributes.excluded})
+                projection_excluded={entry.column for prior_rule in prior for entry in prior_rule.attributes.excluded},
+                hierarchy_rules=prior,granularity_rejections=granularity_rejections,
+                observed_hierarchies=observed_hierarchies)
             if prior and 'fd_violation' in original_revision_codes:
                 protected=prior[0]
                 safe=[]
@@ -401,11 +584,22 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
                     tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                         allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=window)
                     observations.clear()
-                    revised_batch=_ask(model,revision,tools,observations)
-                    docs=tools.context_documents()
+                    try:
+                        revised_batch=_ask(model,revision,tools,observations)
+                        docs=tools.context_documents()
+                    except LightGraphError as exc:
+                        # This rule failed FD validation. A failed repair cannot
+                        # discard independent siblings already compiled and
+                        # reviewed, regardless of their order in the batch.
+                        _issue(result,table,exc.code)
+                        continue
+                    finally:
+                        tools.close()
                     fixed,docs,_,revision,guards=_compile_with_repairs(revised_batch,original,goal,docs,result,
                         model=model,packet=revision,observations=observations,tool_factory=fresh_tools,
-                        projection_excluded=guards[0],identity_excluded=guards[1])
+                        projection_excluded=guards[0],identity_excluded=guards[1],
+                        hierarchy_rules=[*prior,*rules],granularity_rejections=granularity_rejections,
+                        observed_hierarchies=observed_hierarchies)
                     accepted=[]
                     for replacement in fixed:
                         added=set(replacement.identity.key_columns)-set(rule.identity.key_columns)
@@ -603,10 +797,16 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                                 for field in ('unmatched','null_refs','partial_null_refs','ambiguous','unique_matches')}}]}
                         # The provider's proposal is not its own semantic evidence.
                         # Review all endpoint context after structural verification.
+                        relation_contract=_reference_relation_contract(schema,claim.relation_kind)
                         evidence=review_semantics(model,review_packet,{
                             'kind':'reference','scope':packet['scope'],
+                            'relation_definition':relation_contract,
                             'claim':{**claim.model_dump(mode='json'),'source_entity':source.rule_id}},docs,
                             observations=observations)
+                        if relation_contract['allow_self_links']:
+                            # Only this exact, independently supported contract
+                            # grants the executor permission for reflexive edges.
+                            evidence=[*evidence,'semantic_review:allow_self_links']
                         rule_id='rule_'+digest(table.source_id,table.qualified_name,source.rule_id,target.rule_id,
                             claim.source_level,claim.target_level,claim.relation_kind,local,remote)[:24]
                         replacement=[r for r in prior if r.relation and

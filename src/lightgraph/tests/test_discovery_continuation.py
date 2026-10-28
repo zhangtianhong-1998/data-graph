@@ -1,5 +1,6 @@
 """Offline regressions for open discovery work and committed graph export."""
 import json
+import pytest
 
 from lightgraph.errors import LightGraphError
 from lightgraph.pipeline import run_pipeline
@@ -219,3 +220,33 @@ def test_failed_followup_rule_cannot_complete_column_coverage(monkeypatch,tmp_pa
     with GraphStore(tmp_path/'graph.sqlite') as store:
         states=[r['state'] for r in store.connection.execute("SELECT state FROM iteration_work WHERE task='coverage_discovery'")]
         assert states and 'resolved' not in states
+
+
+@pytest.mark.parametrize('code', [
+    'model_structured_output_rejected', 'model_output_schema_missing',
+    'model_response_format_invalid',
+])
+def test_structured_output_failure_remains_pending_for_later_run(monkeypatch, tmp_path, code):
+    t = table('format_retry', ['key', 'label'])
+    tasks = []
+    def failed(request):
+        _, packet = input_packet(request)
+        tasks.append(packet['task'])
+        raise LightGraphError(code)
+    config = RunConfig(sources=[], output_dir=str(tmp_path), max_identity_reviews=0)
+    rows = {'public.format_retry': [('K', 'Name')]}
+    with MemorySource([t], rows) as source:
+        first = run_pipeline(config, [source], model=client(monkeypatch, failed))
+    assert first.status == 'PARTIAL'
+    assert first.counts['business_nodes'] == 0
+    assert first.counts['work_deferred'] == 1
+    assert any(issue['code'] == code for issue in first.issues)
+    tasks.clear()
+    def recovered(request):
+        _, packet = input_packet(request)
+        tasks.append(packet['task'])
+        return response(group(packet, 'key', 'label'))
+    with MemorySource([t], rows) as source:
+        second = run_pipeline(config, [source], model=client(monkeypatch, recovered))
+    assert tasks == ['T0_discovery']
+    assert second.counts['business_nodes'] == 1

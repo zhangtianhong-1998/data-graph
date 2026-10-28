@@ -11,8 +11,9 @@ from agentscope.agent import AgentBase, ReActAgent
 from agentscope.memory import InMemoryMemory
 from agentscope.tool import Toolkit
 
-from lightgraph.discovery.agentscope_runtime import EphemeralMemory, run_agent
-from lightgraph.discovery.models import TaskPacket
+from lightgraph.discovery.agentscope_runtime import DiscoveryChatModel, EphemeralMemory, run_agent
+from lightgraph.discovery.budget import BudgetAllocator, Cost
+from lightgraph.discovery.models import TaskPacket, ProposalBatch
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.tests.test_discovery_agent import CANARY, Toolbox, final, input_packet
 from lightgraph.tests.test_model_streaming import model, streamed, wire
@@ -109,8 +110,8 @@ def test_batch_failure_drains_pending_actions_without_execution_or_extra_model(
     toolbox=FailingTools()
     client=model(lambda request:reply_for(tool_message('get_metadata','profile_columns'),stream),stream=stream)
     with pytest.raises(failure):
-        # On the last iteration _summarizing must preserve the original failure.
-        client.explore(input_packet(),toolbox,max_steps=1)
+        # A failed exploration action must not spend the reserved final turn.
+        client.explore(input_packet(),toolbox,max_steps=2)
     assert toolbox.executed==['get_metadata'] and toolbox.closed
     assert framework_spy['tool_names']==['get_metadata'] and client.usage['calls']==1
     assert_cleared(framework_spy)
@@ -217,13 +218,118 @@ def test_framework_agent_and_memory_cannot_be_serialized(framework_spy):
             obj.load_state_dict({})
 
 
-def test_model_batch_above_tool_budget_never_reaches_toolkit(framework_spy):
+def test_model_batch_above_tool_budget_submits_without_executing_batch(framework_spy):
     toolbox=Toolbox()
-    client=model(lambda request:reply_for(tool_message('get_metadata','profile_columns'),False),stream=False)
-    with pytest.raises(BudgetExceeded,match='discovery_tool_calls_exhausted'):
-        client.explore(input_packet(),toolbox,max_tool_calls=1)
+    turns=[]
+    def handler(request):
+        body=json.loads(request.content);turns.append(body)
+        if len(turns)==1:
+            return reply_for(tool_message('get_metadata','profile_columns'),False)
+        assert 'tools' not in body
+        feedback=json.loads(body['messages'][-1]['content'])['runtime_feedback']
+        assert feedback=={'code':'tool_batch_exceeds_remaining_allowance','executed_tools':0,
+            'requested_tools':2,'remaining_tool_calls':1,
+            'next_action':'Submit ProposalBatch using existing evidence or abstain.'}
+        return reply_for({'content':json.dumps(final())},False)
+    client=model(handler,stream=False)
+    assert client.explore(input_packet(),toolbox,max_tool_calls=1,max_steps=2).proposals
+    assert client.usage['calls']==2
     assert toolbox.executed==[] and toolbox.closed
     assert framework_spy['tool_names']==[]
+    assert_cleared(framework_spy)
+
+
+@pytest.mark.parametrize('stream',[False,True])
+def test_last_allowed_turn_submits_with_updated_runtime_counters(stream,framework_spy):
+    seen=[]
+    def handler(request):
+        body=json.loads(request.content)
+        packet=json.loads(next(m['content'] for m in body['messages'] if m['role']=='user'))
+        seen.append(packet['runtime_control'])
+        if len(seen)==1:
+            assert 'tools' in body and body['tool_choice']=='auto'
+            return reply_for(tool_message('get_metadata'),stream)
+        assert 'tools' not in body
+        assert json.loads(body['messages'][-1]['content'])['probe_id']=='probe_0001'
+        return reply_for({'content':json.dumps(final(evidence='probe_0001'))},stream)
+    client=model(handler,stream=stream);toolbox=Toolbox()
+    assert client.explore(input_packet(),toolbox,max_steps=2,max_tool_calls=4).proposals
+    assert seen==[
+        {'turn':1,'max_turns':2,'remaining_turns_including_current':2,'remaining_tool_calls':4,
+         'submission_required':False,'submission_reason':None},
+        {'turn':2,'max_turns':2,'remaining_turns_including_current':1,'remaining_tool_calls':3,
+         'submission_required':True,'submission_reason':'last_turn'}]
+    assert client.usage['calls']==2 and toolbox.executed==['get_metadata']
+    assert_cleared(framework_spy)
+
+
+def test_nineteen_tools_then_oversized_pair_still_submits_within_turn_limit(framework_spy):
+    class UniqueTools(Toolbox):
+        def execute(self,name,args):
+            self.executed.append(name)
+            return {'status':'ok','operator':name,'probe_id':f'probe_{len(self.executed):04d}',
+                    'aggregates':{'rows':1}}
+    turns=[]
+    def handler(request):
+        body=json.loads(request.content);turns.append(body)
+        if len(turns)==1:
+            message=tool_message(*(['get_metadata']*19))
+            for i,call in enumerate(message['tool_calls']):
+                call['function']['arguments']=json.dumps({'index':i})
+            return reply_for(message,False)
+        if len(turns)==2:
+            return reply_for(tool_message('profile_columns','execute_readonly_sql'),False)
+        control=json.loads(body['messages'][1]['content'])['runtime_control']
+        assert control['turn']==3 and control['remaining_turns_including_current']==1
+        assert control['remaining_tool_calls']==1 and control['submission_reason']=='tool_batch_rejected'
+        assert 'tools' not in body
+        return reply_for({'content':json.dumps(final(evidence='probe_0019'))},False)
+    client=model(handler,stream=False);toolbox=UniqueTools()
+    assert client.explore(input_packet(),toolbox,max_steps=3,max_tool_calls=20).proposals
+    assert len(toolbox.executed)==19 and client.usage['calls']==3
+    assert_cleared(framework_spy)
+
+
+@pytest.mark.parametrize('respond_with_tool',[False,True])
+def test_callers_none_is_honored_and_provider_cannot_override_it(respond_with_tool):
+    seen=[]
+    def handler(request):
+        body=json.loads(request.content);seen.append(body)
+        assert 'tools' not in body
+        return reply_for(tool_message('get_metadata') if respond_with_tool
+            else {'content':json.dumps(final())},False)
+    client=model(handler,stream=False)
+    adapter=DiscoveryChatModel(client,max_tool_calls=4,max_steps=4)
+    messages=[{'role':'system','content':'test'},{'role':'user','content':json.dumps({
+        'input':{'task':'T1_table_discovery'},'output_schema':ProposalBatch.model_json_schema()})}]
+    call=adapter(messages,tools=Toolbox().tool_specs(),tool_choice='none')
+    if respond_with_tool:
+        with pytest.raises(LightGraphError,match='discovery_final_response_required'):
+            asyncio.run(call)
+    else:
+        assert asyncio.run(call).content[0]['type']=='text'
+    assert len(seen)==1 and adapter.total_calls==0 and messages==[]
+
+
+def test_submission_recovery_does_not_exceed_global_model_allowance(framework_spy):
+    client=model(lambda request:reply_for(tool_message('get_metadata','profile_columns'),False),stream=False)
+    client.budget=BudgetAllocator(Cost(db_cu=100,llm_calls=1,llm_tokens=1000000,
+                                      memory_bytes=1000000,seconds=60))
+    toolbox=Toolbox()
+    with pytest.raises(BudgetExceeded,match='llm_calls_budget_exhausted'):
+        client.explore(input_packet(),toolbox,max_tool_calls=1,max_steps=2)
+    assert client.usage['calls']==1 and toolbox.executed==[] and toolbox.closed
+    assert_cleared(framework_spy)
+
+
+def test_one_turn_task_is_submission_only_and_never_executes_provider_tool(framework_spy):
+    def handler(request):
+        assert 'tools' not in json.loads(request.content)
+        return reply_for(tool_message('get_metadata'),False)
+    client=model(handler,stream=False);toolbox=Toolbox()
+    with pytest.raises(BudgetExceeded,match='discovery_steps_exhausted'):
+        client.explore(input_packet(),toolbox,max_steps=1)
+    assert client.usage['calls']==1 and toolbox.executed==[] and toolbox.closed
     assert_cleared(framework_spy)
 
 

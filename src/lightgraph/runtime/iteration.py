@@ -17,6 +17,7 @@ REVIEWABLE_CODES = frozenset({
     'same_code_label_conflict', 'unexplained_role_occurrence',
     'same_code_diff_label', 'cross_level_code_reuse', 'non_contiguous_level_code',
     'fill_mismatch', 'reference_missing', 'multiple_parent', 'hierarchy_self_loop',
+    'reference_self_link_forbidden', 'reference_self_link_semantics_unreviewed',
     'identity_domain_attribute_conflict', 'identity_migration_conflict',
 })
 WorkState = Literal['pending', 'running', 'resolved', 'unresolved', 'deferred', 'superseded']

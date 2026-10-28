@@ -106,6 +106,7 @@ def test_model_client_receives_all_agent_settings_and_budgets(tmp_path, monkeypa
     settings = {
         "mode": "in_environment", "base_url": "http://gateway.internal/v1", "model": "offline",
         "api_key": CANARY, "api_key_env": "OFFLINE_AGENT_KEY", "stream": True,
+        "response_format": "json_schema",
         "stream_options_include_usage": False, "allow_insecure_http": True,
         "timeout_seconds": 32, "max_output_tokens": 800, "max_prompt_bytes": 9000,
         "max_response_bytes": 10000, "retries": 0, "max_calls": 9,
@@ -130,6 +131,7 @@ def test_legacy_inline_defaults_and_disabled_mode_remain_compatible():
     config = RunConfig(sources=[])
     assert config.resolved_model is config.model
     assert config.resolved_model.stream is False
+    assert config.resolved_model.response_format == 'json_schema'
     assert config.resolved_model.allow_insecure_http is False
     assert make_model(config) is None
 
@@ -151,6 +153,7 @@ def test_loaded_configuration_drives_transport_and_key_precedence(tmp_path, monk
     monkeypatch.setenv("CONFIG_TEST_ENV_KEY", "offline-environment-key")
     config = load_config(write_config(tmp_path, agent={"llm": {
         "mode": "metadata_only", "model": "offline", "base_url": "https://model.invalid/v1",
+        "response_format": "json_object",
         "api_key": direct_key, "api_key_env": "CONFIG_TEST_ENV_KEY", "stream": stream,
         "stream_options_include_usage": False,
     }}))

@@ -20,7 +20,7 @@ from lightgraph.contracts import GraphFact, PartitionCompletion, RuleSpec, Suppo
 from lightgraph.identity import IdentityRegistry
 from lightgraph.errors import LightGraphError
 from .policy import PersistencePolicy, PersistenceViolation, KINDS
-from lightgraph.semantic_schema import SemanticSchema, EntityTypeDefinition
+from lightgraph.semantic_schema import SemanticSchema, EntityTypeDefinition, REFERENCE_SELF_LINK_CONTRACT_VERSION
 
 
 class StoreError(LightGraphError):
@@ -52,6 +52,27 @@ class GraphStore:
         for row in self.connection.execute("SELECT payload FROM semantic_catalog ORDER BY catalog_id"):
             self.policy = self.policy.with_schema(SemanticSchema.model_validate_json(row[0]))
         self.identity = IdentityRegistry(self.connection)
+        self._review_legacy_reference_self_links()
+
+    def _review_legacy_reference_self_links(self) -> None:
+        """Retire unverified business references without rewriting their history.
+
+        Old schemas parse with the new restrictive default, but that does not
+        prove old publications passed the new identity-level check. Retain the
+        executable rule for ordinary source revalidation. A successful new
+        generation carries its validation version and is not retired again.
+        """
+        rules={(rule.rule_id,rule.revision):rule for rule in self.get_rules(include_stale=True)}
+        affected=set()
+        for head in self.connection.execute('''SELECT h.logical_rule_id,p.revision,p.source_versions
+            FROM partition_head h JOIN publication p ON p.publication_id=h.publication_id
+            WHERE h.valid=1'''):
+            rule=rules.get((head['logical_rule_id'],head['revision']))
+            if (rule is not None and rule.kind=='reference'
+                and json.loads(head['source_versions']).get('reference_self_links')!=REFERENCE_SELF_LINK_CONTRACT_VERSION):
+                affected.add(rule.rule_id)
+        for rule_id in sorted(affected):
+            self.mark_rule_for_review(rule_id,'reference_self_link_contract_changed')
 
     def close(self) -> None:
         self.connection.close()
@@ -541,6 +562,7 @@ class GraphStore:
             payload = json.loads(row["payload"])
             domain = row["isolation_domain"]
             if row["fact_kind"] == "Edge":
+                self.policy.check_relation_self_link(payload['relation'],payload['source'],payload['target'])
                 source, target = (domain, payload["source"]), (domain, payload["target"])
                 required_nodes = accepted_nodes if row["status"] == "accepted" else nodes
                 if source not in required_nodes or target not in required_nodes:
@@ -584,6 +606,27 @@ class GraphStore:
           ps.binding_revision,ps.status FROM publication_support ps
           JOIN fact_support fs USING(support_id) JOIN graph_fact gf USING(fact_id)
           WHERE ps.publication_id IN ({placeholders}) ORDER BY gf.fact_id,fs.support_id,ps.publication_id""", publication_ids))
+
+    def _has_scope_filtered_business_support(self, rule_ids, scopes, domain):
+        """Return an operator-run diagnostic only, never hidden values or counts.
+
+        Limit the check to the run's published rules and their current valid
+        heads. Historical, staging and other-domain facts are not this run's
+        business output. This does not create a less restricted graph view.
+        """
+        with self._lock:
+            for rule_id in set(rule_ids):
+                rows = self.connection.execute("""SELECT fs.scope_ref,gf.payload
+                  FROM partition_head h JOIN publication p USING(publication_id)
+                  JOIN publication_support ps USING(publication_id)
+                  JOIN fact_support fs USING(support_id) JOIN graph_fact gf USING(fact_id)
+                  WHERE h.logical_rule_id=? AND h.valid=1 AND p.state='published'
+                    AND gf.isolation_domain=? AND gf.fact_kind='NodeExistence'
+                    AND ps.status IN ('accepted','candidate','unresolved')""", (rule_id, domain))
+                for row in rows:
+                    if row['scope_ref'] not in scopes and json.loads(row['payload']).get('layer') == 'business':
+                        return True
+        return False
 
     def view(self, scopes: set[str], domain: str = "default", publication_id: str | None = None,
              include_candidates: bool = False, apply_resolutions: bool = True) -> dict[str, Any]:

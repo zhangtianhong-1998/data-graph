@@ -110,7 +110,7 @@ def test_fragmented_unicode_multiple_tool_indices_and_no_usage_option():
     def handler(request):
         assert 'stream_options' not in json.loads(request.content)
         return streamed(wire(message,newline='\r',usage=False))
-    client=model(handler,stream_options_include_usage=False)
+    client=model(handler,stream_options_include_usage=False,response_format='json_object')
     result=client._request([{'role':'user','content':'test'}],lambda value:value)
     assert result['tool_calls']==message['tool_calls']
     assert client.usage['output_tokens']==client.config.max_output_tokens
@@ -168,7 +168,7 @@ def test_malformed_complete_tool_arguments_are_not_executed():
 def test_total_stream_limit_counts_ignored_comments_after_done():
     value=wire({'content':'{"ok":true}'})
     client=model(lambda request:streamed(value+b': '+CANARY.encode()*30+b'\n'),
-                 max_response_bytes=len(value)+10)
+                 max_response_bytes=len(value)+10,response_format='json_object')
     parsed=[]
     with pytest.raises(LightGraphError,match='model_response_too_large'):
         client._request([],lambda message:parsed.append(message))
@@ -184,7 +184,8 @@ def test_stream_deadline_checks_each_chunk(monkeypatch):
             yield event(delta({'content':'{"ok":true}'}))
             now[0]+=2
             yield event(delta(reason='stop'))+event('[DONE]')
-    client=model(lambda request:httpx.Response(200,stream=SlowChunks()),budget=allocation)
+    client=model(lambda request:httpx.Response(200,stream=SlowChunks()),budget=allocation,
+                 response_format='json_object')
     parsed=[]
     with pytest.raises(BudgetExceeded,match='wall_time_budget_exhausted'):
         client._request([],lambda message:parsed.append(message))
@@ -196,7 +197,7 @@ def test_schema_retry_preserves_stream_mode_and_charges_each_attempt():
     def handler(request):
         requests.append(json.loads(request.content)['stream'])
         return streamed(wire({'content':'not JSON '+CANARY}))
-    client=model(handler,retries=1)
+    client=model(handler,retries=1,response_format='json_object')
     with pytest.raises(LightGraphError,match='llm_schema_invalid') as error:
         client._request([],lambda message:json.loads(message['content']))
     assert requests==[True,True] and client.budget.used.llm_tokens==100
@@ -210,7 +211,7 @@ def test_explicit_key_is_excluded_from_serialization_and_empty_key_uses_env(monk
         seen.append(request.headers['authorization'])
         return streamed(wire({'content':'{}'}))
     for configured in ('configured-secret',''):
-        client=model(handler,api_key=configured,api_key_env='KEY_TEST')
+        client=model(handler,api_key=configured,api_key_env='KEY_TEST',response_format='json_object')
         assert 'api_key' not in client.config.model_dump()
         assert 'configured-secret' not in repr(client.config)
         client._request([],lambda message:json.loads(message['content']))

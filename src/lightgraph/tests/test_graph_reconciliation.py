@@ -201,11 +201,53 @@ def test_agent_graph_review_uses_original_facts_and_does_not_repeat(monkeypatch,
             'evidence':[{'reference':support,'stance':'supports' if verdict=='supported' else 'refutes' if verdict=='refuted' else 'context'}]})
     with GraphStore() as store:
         review_graph(store);model=client(monkeypatch,handler)
-        counts,_=review_with_agent(store,model,ExtractionGoal(purpose='Find business objects'),DocumentCorpus([]),scopes={'public'})
+        counts,issues=review_with_agent(store,model,ExtractionGoal(purpose='Find business objects'),DocumentCorpus([]),scopes={'public'})
         assert counts['reviewed']==1 and len(store.view({'public'})['nodes'])==expected_nodes
+        assert counts['rejected']==int(verdict=='refuted')
+        assert counts['unresolved']==int(verdict=='unresolved')
+        if verdict=='refuted':
+            assert issues==[{'code':'semantic_claim_refuted','count':1,'status':'rejected'}]
+            assert not list_candidates(store,{'public'})['decisions']
         review_with_agent(store,model,ExtractionGoal(),DocumentCorpus([]),scopes={'public'})
         assert len(seen)==1
         assert seen[0]['goal']['purpose']=='Find business objects'
+
+
+def test_rejected_merge_is_cached_only_until_evidence_changes(monkeypatch):
+    from lightgraph.tests.test_agent_pipeline import client,input_packet,response
+    from lightgraph.identity.reconciliation import review_with_agent
+    from lightgraph.documents import DocumentCorpus
+    from lightgraph.contracts import ExtractionGoal
+    verdict='refuted';seen=[]
+    def handler(request):
+        _,packet=input_packet(request);seen.append(packet)
+        evidence=next(f['reference'] for f in packet['graph_facts'] if f['payload'].get('name')=='definition')
+        return response({'proposition_ref':packet['semantic_proposition_ref'],'decision':verdict,
+            'basis':'data_inference','evidence':[{'reference':evidence,
+                'stance':'refutes' if verdict=='refuted' else 'supports'}]})
+    with GraphStore() as store:
+        review_graph(store);before=store.view({'public'});model=client(monkeypatch,handler)
+        args=(store,model,ExtractionGoal(),DocumentCorpus([]))
+        first,_=review_with_agent(*args,scopes={'public'})
+        assert first['rejected']==1 and first['unresolved']==0
+        assert store.view({'public'})==before
+        assert not list_candidates(store,{'public'})['decisions']
+        verdict='supported'
+        repeated,issues=review_with_agent(*args,scopes={'public'})
+        assert repeated['reviewed']==0 and not issues and len(seen)==1
+        publication=store.begin_publication('additional_context',1,'all',{})
+        store.stage_fact(publication,GraphFact(fact_kind='PropertyValue',payload={
+            'entity_id':'a','name':'description','value':'New approved evidence for review'}),
+            SupportSpec(origin='user_input',source_binding='additional_context',scope_ref='public',
+                partition_id='all',rule_id='additional_context',rule_revision=1))
+        store.publish_partition(PartitionCompletion(publication_id=publication,complete=True,
+            consistent=True,dependencies_valid=True))
+        reviewed,issues=review_with_agent(*args,scopes={'public'})
+        assert reviewed['reviewed']==reviewed['accepted']==1 and reviewed['rejected']==0
+        assert len(seen)==2 and not issues
+        assert any(f['payload'].get('name')=='description' for f in seen[-1]['graph_facts'])
+        assert len(store.view({'public'})['nodes'])==1
+        assert [d['verdict'] for d in list_candidates(store,{'public'})['decisions']]==['same']
 
 
 def test_agent_cannot_approve_a_generation_changed_during_review(monkeypatch):

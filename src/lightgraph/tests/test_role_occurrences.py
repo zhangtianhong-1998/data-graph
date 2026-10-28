@@ -1,6 +1,8 @@
 """New physical roles are bounded work references, never identity decisions."""
 from dataclasses import asdict
 
+import pytest
+
 from lightgraph.contracts import ColumnSpec, RuleSpec, TableSpec, canonical
 from lightgraph.identity.role_occurrences import detect_role_occurrences
 from lightgraph.rules import RuleEngine
@@ -75,3 +77,41 @@ def test_common_key_and_memory_are_bounded_before_pair_expansion():
     limited, coverage = detect_role_occurrences(rules, bindings, max_bindings=2)
     assert len(limited) == 1 and coverage['binding_limit_omissions'] == 98
     assert detect_role_occurrences(rules, bindings, max_working_bytes=1)[1]['memory_limit_reached'] == 1
+
+
+def inapplicable_rule(policy):
+    if policy == 'reference':
+        return RuleSpec(rule_id='resolved', kind='reference', source={'source_id': 's', 'table': 'paths'},
+            identity={'key_columns': ['l1']}, relation={'source_rule_id': 'left', 'target_rule_id': 'right',
+                'source_columns': ['l1'], 'target_columns': ['l2']})
+    identity = {'key_columns': ['l1'], 'entity_kind': 'ReportItem', 'level_policy': policy}
+    if policy == 'relative_path':
+        identity.update(semantic_resolution='verified_identity_domain', identity_domain='items',
+                        identity_evidence=['approved:identity'])
+    return RuleSpec(rule_id='resolved', kind='wide_hierarchy', source={'source_id': 's', 'table': 'paths'},
+        identity=identity, hierarchy={'levels': [{'level': 1, 'code': 'l1'}, {'level': 2, 'code': 'l2'}],
+                                    'order_evidence': ['approved:order']})
+
+
+@pytest.mark.parametrize('policy', ['relative_path', 'code_with_fill_merge', 'reference'])
+@pytest.mark.parametrize('limits', [{'max_bindings': 1}, {'max_working_bytes': 1}])
+def test_inapplicable_bindings_do_not_create_false_coverage_gaps(policy, limits):
+    rule = inapplicable_rule(policy)
+    bindings = {(rule.rule_id, canonical([code])): f'entity_{code}' for code in ['A', 'B']}
+    events, coverage = detect_role_occurrences([rule], bindings, **limits)
+    assert events == []
+    assert all(value == 0 for value in coverage.values())
+
+
+def test_inapplicable_bindings_cannot_starve_bounded_column_role_detection():
+    resolved = inapplicable_rule('relative_path')
+    rules = [group(f'r{i}', f'column_{i}') for i in range(3)]
+    bindings = {(resolved.rule_id, canonical(['A'])): 'IGNORED_CANARY' * 100}
+    bindings.update({(rule.rule_id, canonical(['A'])): f'entity_{i}' for i, rule in enumerate(rules)})
+    events, coverage = detect_role_occurrences([resolved, *rules], bindings,
+                                               max_bindings=2, max_working_bytes=512)
+    assert len(events) == 1 and events[0].rule_ids == ('r0', 'r1')
+    assert coverage['bindings_checked'] == 2
+    assert coverage['binding_limit_omissions'] == 1  # The third applicable role is still bounded.
+    assert coverage['memory_limit_reached'] == 0
+    assert 'IGNORED_CANARY' not in str([asdict(event) for event in events]) + str(coverage)

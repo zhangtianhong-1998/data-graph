@@ -10,7 +10,8 @@ from lightgraph.errors import LightGraphError, BudgetExceeded
 from lightgraph.documents import DocumentCorpus
 from .budget import BudgetAllocator, Cost
 from .models import (DiscoveryResult, Hypothesis, DataUnderstanding, ColumnUnderstanding,
-                     ProposalBatch, ColumnGroupProposal, EntityKeyProposal, HierarchyProposal)
+                     ProposalBatch, ColumnGroupProposal, EntityKeyProposal, HierarchyProposal,
+                     MAX_TRANSIENT_TEXT_CHARS)
 from .semantics import declared_evidence, rule_evidence
 from lightgraph.semantic_schema import SemanticSchema, EntityTypeDefinition
 
@@ -149,7 +150,7 @@ def _packet(table,goal,rows,documents,task,understanding):
             'goal':goal.model_dump(),'metadata_digest':{'columns':columns},'probe_digest':[],
             'strata_samples':[{'stratum':'bounded_distinct_page','selection':'first_distinct_page','count':len(safe_rows),'rows':safe_rows}],
             'document_snippets':documents,'known_conflicts':[],
-            'budget':{'max_hypotheses':6,'max_probe_requests':4,'max_rationale_chars':600}}
+            'budget':{'max_hypotheses':6,'max_probe_requests':4,'max_rationale_chars':MAX_TRANSIENT_TEXT_CHARS}}
 
 
 def _draft(table,group,scope,semantic,excluded,goal,documents):
@@ -187,6 +188,24 @@ def _definition_document(document, table=None):
     return (applicable and document.get("evidence_role", "definition_evidence") == "definition_evidence"
         and document.get("read_state", "complete") == "complete"
         and not document.get("derived", False))
+
+
+def _check_hierarchy_identity_resolution(claim, *, require_explicit=False, actual=None):
+    """Check the requested policy without equating source and namespace scope.
+
+    None retains the pre-existing inferred policy. A failed explicit request
+    must be resolved explicitly in its repair; deletion is not a resolution.
+    """
+    requested=claim.identity_resolution
+    if requested is not None and requested not in {'source_scoped','verified_identity_domain'}:
+        raise LightGraphError('hierarchy_identity_resolution_unsupported')
+    expected='verified_identity_domain' if claim.path_semantics=='relative_path' else 'source_scoped'
+    if ((requested is not None and requested!=expected)
+        or (expected=='source_scoped' and claim.identity_scope=='domain_global')
+        or (actual is not None and actual!=expected)):
+        raise LightGraphError('hierarchy_identity_resolution_conflict')
+    if require_explicit and requested is None:
+        raise LightGraphError('hierarchy_identity_resolution_required')
 
 
 def _relative_hierarchy_contract(claim, documents, scopes, levels, table, reviewed_evidence=None):
@@ -302,6 +321,9 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
                 coverage=Coverage(scope='sampled'),evidence=RuleEvidence(origin='discovery',semantic_basis=['model_column_group_candidate'])))
         elif proposal.kind=='entity_key':
             if goal.entity_kinds and claim.entity_kind_hint not in goal.entity_kinds:continue
+            mapped=set(claim.attributes.single_valued+claim.attributes.multi_valued)
+            if set(claim.attributes.property_names)-mapped:
+                raise LightGraphError('unbound_attribute_property')
             single=[lookup[c] for c in claim.attributes.single_valued]
             explicit={lookup[c]:name for c,name in claim.attributes.property_names.items()}
             if set(explicit.values())-properties:raise LightGraphError('unregistered_attribute_semantics')
@@ -352,6 +374,7 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
                 coverage=Coverage(scope='sampled'),evidence=rule_evidence(order,reviewed=bool(semantic_evidence),documents=documents)))
         elif proposal.kind=='wide_hierarchy':
             if goal.entity_kinds and claim.entity_kind_hint not in goal.entity_kinds:continue
+            _check_hierarchy_identity_resolution(claim)
             levels=[LevelSpec(level=l.position,code=lookup[l.key],label=lookup.get(l.label),aliases=[lookup[l.alias]] if l.alias else []) for l in claim.levels]
             scopes=[lookup[c] for c in claim.namespace_columns]
             if identity_excluded & set(scopes+[l.code for l in levels]):raise LightGraphError('excluded_column_in_identity')
@@ -367,6 +390,7 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
             if claim.path_semantics == "relative_path":
                 identity,hierarchy_fields=_relative_hierarchy_contract(claim,documents,scopes,levels,table,semantic_evidence)
                 if not order:raise LightGraphError("hierarchy_order_evidence_unresolved")
+            _check_hierarchy_identity_resolution(claim,actual=identity.semantic_resolution)
             results.append(RuleSpec(rule_id=_logical_entity_rule_id(table,'wide_hierarchy',claim.entity_kind_hint,identity.key_columns,scopes,topology=[{'level':l.level,'code':l.code} for l in levels]),
                 kind='wide_hierarchy',goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=scopes),
                 identity=identity,

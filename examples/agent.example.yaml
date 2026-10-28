@@ -15,6 +15,8 @@ llm:
   # Direct keys never enter config dumps. Prefer the environment variable.
   api_key: ""
   api_key_env: LIGHTGRAPH_API_KEY
+  # Use json_object explicitly only when the gateway lacks strict schema output.
+  response_format: json_schema
   stream: true
   # Set false if the model gateway rejects stream_options.include_usage.
   stream_options_include_usage: true
@@ -25,6 +27,7 @@ llm:
   max_prompt_bytes: 65536
   max_response_bytes: 262144
   retries: 1
+  # Explicit null removes the corresponding API total, while retaining usage counters.
   max_calls: 40
   max_tokens: 120000
   max_discovery_steps: 8

@@ -1,9 +1,11 @@
 """Compile bounded, catalog-bound operators. Values are always driver parameters."""
 from __future__ import annotations
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 import re
 import sqlglot
+from sqlglot import exp
 from sqlglot.dialects.mysql import MySQL
+from sqlglot.dialects.sqlite import SQLite
 from lightgraph.contracts import TableSpec
 from lightgraph.errors import LightGraphError
 from .guard import SQLGuard, ValidatedQuery
@@ -11,6 +13,27 @@ from .guard import SQLGuard, ValidatedQuery
 def ident(value: str, dialect: str = "postgres") -> str:
     quote = "`" if dialect == "mysql" else '"'
     return quote + value.replace(quote, quote + quote) + quote
+
+
+def render_select(tree: exp.Expression, dialect: str) -> str:
+    """Render a validated query without dropping SQLite's CTE column names.
+
+    SQLGlot disables ordinary derived-table column aliases for SQLite, but its
+    generic TableAlias renderer also strips supported WITH name(columns) lists.
+    Preserve that specific syntax when narrowing a model query's result limit.
+    """
+    if dialect != "sqlite":
+        return tree.sql(dialect=dialect)
+
+    class CTEColumnsGenerator(SQLite.Generator):
+        def tablealias_sql(self, expression):
+            if isinstance(expression.parent, exp.CTE):
+                alias = self.sql(expression, "this")
+                columns = self.expressions(expression, key="columns", flat=True)
+                return f"{alias}({columns})" if columns else alias
+            return super().tablealias_sql(expression)
+
+    return CTEColumnsGenerator(dialect="sqlite").generate(tree)
 
 
 def mysql_driver_sql(query: ValidatedQuery) -> str:
@@ -43,9 +66,10 @@ def mysql_driver_sql(query: ValidatedQuery) -> str:
         raise LightGraphError("unsafe_sql") from None
 
 class QueryCompiler:
-    def __init__(self, tables: Iterable[TableSpec], *, dialect: str = "postgres"):
+    def __init__(self, tables: Iterable[TableSpec], *, dialect: str = "postgres",
+                 physical_columns: Mapping[str, Iterable[str]] | None = None):
         self.tables = {t.qualified_name: t for t in tables}
-        self.guard = SQLGuard(self.tables.values(), dialect=dialect)
+        self.guard = SQLGuard(self.tables.values(), dialect=dialect, physical_columns=physical_columns)
         self.dialect = dialect
 
     def ident(self, value: str) -> str:

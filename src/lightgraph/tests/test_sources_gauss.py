@@ -60,6 +60,30 @@ def test_unknown_runtime_capabilities_block_instance_rows():
         with pytest.raises(LightGraphError,match="runtime_capability_unverified"):
             list(source.project(source.describe()[0],["code"]))
 
+
+def test_group_alias_cannot_shadow_column_removed_by_source_allowlist():
+    from lightgraph.contracts import ExtractionGoal
+    from lightgraph.discovery.budget import BudgetAllocator
+    from lightgraph.discovery.tools import ToolExecutor
+
+    db = Connection()
+    with GaussSource("SECRET_DSN", source_id="s", allowed_tables=["public.items"],
+                     allowed_columns={"public.items": ["code"]}, connect_factory=lambda _: db) as source:
+        assert source.describe()[0].column_names == ["code"]
+        tools = ToolExecutor(source, ExtractionGoal(), BudgetAllocator())
+        metadata = tools.execute("get_metadata", {})["data"]
+        assert [c["name"] for c in metadata["tables"][0]["columns"]] == ["code"]
+        assert "physical_columns" not in metadata
+        before = len(db.executed)
+        for guard in (source.compiler.guard, tools.compiler.guard):
+            with pytest.raises(LightGraphError, match="unauthorized_column"):
+                guard.validate('SELECT code AS name, COUNT(*) FROM public.items GROUP BY name')
+            with pytest.raises(LightGraphError, match="unauthorized_column"):
+                guard.validate('SELECT code AS NAME, COUNT(*) FROM public.items GROUP BY NAME')
+            assert guard.validate('SELECT code AS grouped_code, COUNT(*) FROM public.items GROUP BY grouped_code')
+        assert len(db.executed) == before
+        tools.close()
+
 def test_driver_parameters_server_cursor_and_snapshot_lifetime():
     db=Connection()
     with GaussSource("SECRET_DSN",source_id="s",allowed_tables=["public.items"],connect_factory=lambda _:db, verified_capabilities={"product":"openGauss", "version":"6.0.0", "driver":"psycopg_dbapi", "capabilities":{"statement_timeout":"verified","query_cancel":"verified"}}) as source:

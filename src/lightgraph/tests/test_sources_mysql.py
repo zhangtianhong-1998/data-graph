@@ -208,6 +208,29 @@ def test_scoped_columns_do_not_project_partial_keys_or_foreign_keys():
         assert not any(c.primary_key for c in table.columns)
 
 
+def test_group_alias_cannot_shadow_column_removed_by_source_allowlist():
+    from lightgraph.contracts import ExtractionGoal
+    from lightgraph.discovery.budget import BudgetAllocator
+    from lightgraph.discovery.tools import ToolExecutor
+
+    driver = Driver()
+    with source(driver, allowed_columns={'analytics.items': ['code']}) as adapter:
+        assert adapter.describe()[0].column_names == ['code']
+        tools = ToolExecutor(adapter, ExtractionGoal(), BudgetAllocator())
+        metadata = tools.execute('get_metadata', {})['data']
+        assert [c['name'] for c in metadata['tables'][0]['columns']] == ['code']
+        assert 'physical_columns' not in metadata
+        before = len(driver.main.executed)
+        for guard in (adapter.compiler.guard, tools.compiler.guard):
+            with pytest.raises(LightGraphError, match='unauthorized_column'):
+                guard.validate('SELECT code AS tenant, COUNT(*) FROM analytics.items GROUP BY tenant')
+            with pytest.raises(LightGraphError, match='unauthorized_column'):
+                guard.validate('SELECT code AS TENANT, COUNT(*) FROM analytics.items GROUP BY TENANT')
+            assert guard.validate('SELECT code AS grouped_code, COUNT(*) FROM analytics.items GROUP BY grouped_code')
+        assert len(driver.main.executed) == before
+        tools.close()
+
+
 def test_parameter_binding_snapshot_and_ephemeral_cleanup():
     driver = Driver()
     with source(driver, verified_capabilities=QUALIFIED) as adapter:

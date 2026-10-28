@@ -50,13 +50,15 @@ class ModelConfig(StrictModel):
     mode: Literal["disabled", "metadata_only", "in_environment", "approved_external"] = "disabled"
     base_url: str = ""
     model: str = ""
+    response_format: Literal["json_schema", "json_object"] = "json_schema"
     api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
     api_key_env: str = "LIGHTGRAPH_API_KEY"
     stream: bool = False
     stream_options_include_usage: bool = True
     allow_insecure_http: bool = False
-    max_calls: int = Field(default=40, ge=0)
-    max_tokens: int = Field(default=120000, ge=0)
+    # Explicit null disables only this API total; counters and other limits remain.
+    max_calls: int | None = Field(default=40, ge=0)
+    max_tokens: int | None = Field(default=120000, ge=0)
     max_discovery_steps: int = Field(default=8, ge=1, le=32)
     max_tool_calls: int = Field(default=16, ge=1, le=64)
     timeout_seconds: float = Field(default=60, gt=0)
