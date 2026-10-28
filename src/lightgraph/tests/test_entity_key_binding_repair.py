@@ -8,6 +8,8 @@ from lightgraph.discovery.models import ProposalBatch
 from lightgraph.discovery.reference_validation import validate_proposal_references
 from lightgraph.errors import LightGraphError
 from lightgraph.sources import MemorySource
+from lightgraph.rules import RuleEngine
+from lightgraph.store import GraphStore
 from lightgraph.tests.test_agent_pipeline import client, input_packet, response, table
 from lightgraph.tests.test_compiled_proposal_contract import hierarchy
 
@@ -42,43 +44,41 @@ def test_issued_unbound_mapping_is_authorized_but_not_compilable():
         _compile_model(batch, t, ExtractionGoal(), [], [])
 
 
-@pytest.mark.parametrize('repair_outcome', ['fixed', 'unchanged', 'excluded_attribute'])
-def test_bad_attribute_binding_keeps_valid_hierarchy_and_global_exclusion(monkeypatch, repair_outcome):
-    t = table('objects', ['a', 'b', 'c', 'd', 'e', 'f', 'g'])
-    tasks = []
+@pytest.mark.parametrize('binding',['unbound','valid','excluded_attribute'])
+def test_attribute_binding_and_exclusion_are_checked_once_with_valid_hierarchy_preserved(monkeypatch,binding):
+    t=table('objects',['a','b','c','d','e','f','g']);tasks=[]
     def handler(request):
-        _, packet = input_packet(request); tasks.append(packet['task'])
-        if packet['task'] == 'semantic_review':
-            return response({'proposition_ref': packet['semantic_proposition_ref'],
-                'decision': 'supported', 'basis': 'data_inference', 'evidence': [{
-                    'reference': packet['metadata_digest']['columns'][2]['id'], 'stance': 'supports'}]})
-        if packet['task'] == 'T0_discovery':
-            proposals = [entity(packet), hierarchy(packet, {}), {'kind': 'exclusion',
-                'claim': {'exclusions': [{'column_id': 'f', 'reason': 'out_of_goal',
-                    'affects': ['identity', 'projection']}]},
-                'evidence_cited': [packet['metadata_digest']['columns'][5]['id']]}]
-        else:
-            assert packet['task'] == 'T5_revision'
-            assert [failure['code'] for failure in packet['proposal_repairs']] == ['unbound_attribute_property']
-            proposals = [entity(packet, fixed=repair_outcome != 'unchanged',
-                               excluded_attribute=repair_outcome == 'excluded_attribute')]
-        return response({'task': packet['task'], 'proposals': proposals})
-    model = client(monkeypatch, handler)
-    with MemorySource([t], {'public.objects': [('A', 'Alpha', 'P', 'C', 'Alias', 'Hidden', 'Text')]}) as source:
-        result = discover(source, model=model)
-    assert tasks == ['T0_discovery', 'semantic_review', 'T5_revision']
+        _,packet=input_packet(request);tasks.append(packet['task'])
+        if packet['task']=='semantic_review':
+            return response({'proposition_ref':packet['semantic_proposition_ref'],
+                'decision':'supported','basis':'data_inference','evidence':[{
+                    'reference':packet['metadata_digest']['columns'][2]['id'],'stance':'supports'}]})
+        assert packet['task']=='T0_discovery'
+        proposals=[entity(packet,fixed=binding!='unbound',excluded_attribute=binding=='excluded_attribute'),
+            hierarchy(packet,{}),{'kind':'exclusion',
+                'claim':{'exclusions':[{'column_id':'f','reason':'out_of_goal',
+                    'affects':['identity','projection']}]},
+                'evidence_cited':[packet['metadata_digest']['columns'][5]['id']]}]
+        return response({'task':packet['task'],'proposals':proposals})
+    model=client(monkeypatch,handler)
+    with MemorySource([t],{'public.objects':[('A','Alpha','P','C','Alias','Hidden','Text')]}) as source,GraphStore() as store:
+        result=discover(source,model=model)
+        assert [rule.kind for rule in result.rules].count('wide_hierarchy')==1,result.issues
+        for rule in result.rules:
+            assert RuleEngine(store).execute(source,rule).published
+            assert 'f' not in rule.identity.key_columns
+            assert 'f' not in rule.attributes.single_valued.values()
+            if rule.kind=='column_group_entity':
+                assert 'f' in {excluded.column for excluded in rule.attributes.excluded}
+        graph=store.view({'public'})
+        assert len(graph['nodes'])==(3 if binding=='valid' else 2)
+        assert len(graph['edges'])==1 and graph['edges'][0]['relation']=='parent_of'
+        assert all('Hidden' not in node['properties'].values() for node in graph['nodes'])
+    assert tasks==['T0_discovery','semantic_review']
     assert 'reference_repair_attempts' not in model.usage
-    assert result.stats['compile_repair_rounds'] == 1
-    assert [rule.kind for rule in result.rules].count('wide_hierarchy') == 1, result.issues
-    if repair_outcome == 'fixed':
-        assert {rule.kind for rule in result.rules} == {'wide_hierarchy', 'column_group_entity'}
-        assert result.stats['recovered_proposals'] == 1 and not result.issues
+    if binding=='valid':assert not result.issues
     else:
-        assert len(result.rules) == 1
-        expected = 'unbound_attribute_property' if repair_outcome == 'unchanged' else 'excluded_column_projected'
-        assert any(issue['code'] == expected for issue in result.issues)
-    for rule in result.rules:
-        if rule.kind == 'column_group_entity':
-            assert 'f' in {excluded.column for excluded in rule.attributes.excluded}
-        assert 'f' not in rule.identity.key_columns
-        assert 'f' not in rule.attributes.single_valued.values()
+        expected='unbound_attribute_property' if binding=='unbound' else 'excluded_column_projected'
+        assert any(issue['code']==expected for issue in result.issues)
+        if binding=='unbound':
+            assert any(issue['code']==expected and issue['status']=='deferred' for issue in result.issues)

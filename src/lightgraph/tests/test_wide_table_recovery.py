@@ -1,6 +1,6 @@
 """Realistic provider-shaped responses on a five-level, 16-column wide table.
 
-The provider is offline: these cases prove recovery and graph materialization,
+The provider is offline: these cases prove sibling isolation and graph materialization,
 not the accuracy of a real model on customer data.
 """
 from copy import deepcopy
@@ -45,7 +45,7 @@ def proposals(packet, *, missing_definition=False):
     return {'task':packet['task'], 'semantic_schema':schema, 'proposals':[hierarchy, center]}
 
 
-def test_repair_wide_table_then_discover_hierarchy_to_center_parallel_relations(monkeypatch, tmp_path):
+def test_wide_hierarchy_publishes_while_invalid_center_contract_is_deferred(monkeypatch, tmp_path):
     table, rows = wide_fixture()
     calls=[]
     def handler(request):
@@ -55,11 +55,7 @@ def test_repair_wide_table_then_discover_hierarchy_to_center_parallel_relations(
             if len(payload['messages'])==2:
                 return response(call={'sql':'SELECT '+', '.join(table.column_names)+' FROM public.report_paths', 'max_rows':3})
             return response(proposals(packet, missing_definition=True))
-        if packet['task']=='T5_revision':
-            fixed=proposals(packet)
-            # A correction for one group need not resubmit its valid sibling.
-            fixed['proposals']=fixed['proposals'][1:]
-            return response(fixed)
+        assert packet['task']!='T5_revision'
         if packet['task']=='semantic_review':
             if 'semantic_review_repair' in packet:
                 return response({'replacements':[{'invalid_reference':'unissued_column',
@@ -73,42 +69,33 @@ def test_repair_wide_table_then_discover_hierarchy_to_center_parallel_relations(
                 'basis':'data_inference', 'evidence':[{
                     'reference':packet['metadata_digest']['columns'][0]['id'], 'stance':'supports'}]})
         if packet['task']=='T2_cross_table':
-            ids={c['name']:c['id'] for c in packet['metadata_digest']['columns']}
-            hierarchy=next(b for b in packet['entity_bindings'] if b.get('level')==5)
-            center=next(b for b in packet['entity_bindings'] if b['entity_kind']=='Dimension')
-            relations=['assigned_to','classified_by']
-            return response({'task':packet['task'], 'semantic_schema':{'relations':[
-                {'name':name,'description':'An explicit business link supported by this table interpretation.',
-                 'source_kinds':['ReportItem'],'target_kinds':['Dimension']} for name in relations]},
-                'proposals':[{'kind':'reference','claim':{
-                    'source_entity':hierarchy['rule_id'], 'source_level':5,
-                    'target_entity':center['rule_id'], 'source_columns':[ids['L5_CODE']],
-                    'target_columns':[ids['RESPONSIBILITY_CENTER']], 'relation_kind':name,
-                    'cardinality_hint':'n_to_1'},'evidence_cited':[ids['L5_CODE']]} for name in relations]})
+            assert not any(b['entity_kind']=='Dimension' for b in packet['entity_bindings'])
         return response({'task':packet['task'],'abstain':True})
     config=RunConfig(sources=[],output_dir=str(tmp_path/'out'),max_identity_reviews=0,
         goal=ExtractionGoal(purpose='发现报表项目层级和责任中心关系'))
     with MemorySource([table],rows) as source:
         report=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert report.status=='COMPLETED',report.model_dump()
-    assert len(report.rules_published)==4 and not report.rules_skipped
-    assert report.counts['business_nodes']==9 and report.counts['business_edges']==10
+    assert report.status=='PARTIAL',report.model_dump()
+    assert len(report.rules_published)==1 and not report.rules_skipped
+    assert report.counts['business_nodes']==7 and report.counts['business_edges']==6
     assert report.validation['business_graph']=='entities_and_relations'
-    assert report.counts['recovered_proposals']>=1 and 'T5_revision' in calls
+    assert report.counts.get('recovered_proposals',0)==0 and 'T5_revision' not in calls
+    assert any(i['code']=='unregistered_attribute_semantics' and i.get('status')=='deferred'
+               for i in report.issues)
     with GraphStore(tmp_path/'out/graph.sqlite') as store:
         graph=store.view({'public'})
         edges=[e for e in graph['edges'] if e['relation'] in ('parent_of','assigned_to','classified_by')]
         assert sum(e['relation']=='parent_of' for e in edges)==6
-        assert sum(e['relation']=='assigned_to' for e in edges)==2
-        assert sum(e['relation']=='classified_by' for e in edges)==2
+        assert sum(e['relation']=='assigned_to' for e in edges)==0
+        assert sum(e['relation']=='classified_by' for e in edges)==0
         references=[r for r in store.get_rules() if r.kind=='reference']
-        assert len({r.rule_id for r in references})==2
-        assert all(r.relation.source_level==5 for r in references)
+        assert references==[]
         assert any('Item E1' in n['aliases'] for n in graph['nodes'] if n['layer']=='business')
     before=len(calls)
     with MemorySource([table],rows) as source:
         reused=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert len(calls)==before and reused.counts['business_edges']==10
+    assert len(calls)>before and reused.counts['business_edges']==6
+    assert reused.status=='PARTIAL' and 'T5_revision' not in calls
 
 
 def test_rejected_hierarchy_does_not_hide_independent_entities(monkeypatch,tmp_path):

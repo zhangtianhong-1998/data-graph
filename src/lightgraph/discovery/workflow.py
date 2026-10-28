@@ -308,153 +308,52 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
     return [rule for rid,rule in unique.items() if rid not in conflicts]
 
 
-def _repair_packet(packet, batch, failures, round_number, *, task='T5_revision'):
-    """Only typed schema claims and fixed diagnostics enter a fresh Agent task."""
-    repairs=[]
-    for proposal,code in failures:
-        repairs.append(_proposal_repair_record(proposal,code))
-    from lightgraph.contracts import canonical
-    identity_requests={canonical(item):item for item in packet.get('hierarchy_identity_requests',[])}
-    for item in repairs:
-        if item['code'] in HIERARCHY_IDENTITY_REPAIR_CODES:
-            identity_requests.setdefault(canonical(item),item)
-    if len(identity_requests)>MAX_HIERARCHY_IDENTITY_REQUESTS:
-        raise LightGraphError('hierarchy_identity_repair_context_limit')
-    codes=sorted({code for _,code in failures})
-    return {**packet,'task':task,'semantic_schema':batch.semantic_schema.model_dump(mode='json'),
-        'proposal_repair_round':round_number,'proposal_repairs':repairs,
-        'hierarchy_identity_requests':list(identity_requests.values()),
-        'allowed_revision_codes':sorted(set(packet.get('allowed_revision_codes',[])) | set(codes)),
-        'known_conflicts':[{'code':code,'count':sum(value==code for _,value in failures)} for code in codes],
-        'subtask':'Repair only the rejected proposals described in proposal_repairs. Previously compiled independent groups are retained. Preserve the goal, exclusions, observed meaning and issued references. Fix contracts or abstain; a compiler failure does not justify weakening semantic evidence. Supply all definitions needed by your repaired proposals.'}
+def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations,
+                        tool_factory=None,projection_excluded=(),identity_excluded=(),
+                        hierarchy_rules=(),granularity_rejections=None,observed_hierarchies=None):
+    """Check one submitted batch; a malformed sibling never starts another Agent.
 
-
-def _compile_with_repairs(batch,table,goal,docs,result,*,model,packet,observations,tool_factory,
-                          projection_excluded=(),identity_excluded=(),hierarchy_rules=(),
-                          granularity_rejections=None,observed_hierarchies=None):
-    """Keep valid siblings while giving malformed proposals bounded fresh tasks."""
+    Semantic judgments and full data validation remain separate. Actual data
+    counterexamples use the scheduler's existing revision path; formatting or
+    vocabulary errors stay explicit pending work rather than spawning repairs.
+    """
     from lightgraph.contracts import canonical
-    from lightgraph.rules import RuleEngine
-    accepted={};blocked=set();seen=set();round_number=0
-    compiled_proposals={}
-    identity_requests=list(packet.get('hierarchy_identity_requests',[]));policy_reviews={}
-    granularity_rejections={} if granularity_rejections is None else granularity_rejections
+    projection,identity=_proposal_guards(batch,table,goal)
+    projection_excluded=set(projection_excluded)|projection
+    identity_excluded=set(identity_excluded)|identity
     observed_hierarchies={} if observed_hierarchies is None else observed_hierarchies
-    projection_excluded=set(projection_excluded);identity_excluded=set(identity_excluded)
-    while True:
-        projection,identity=_proposal_guards(batch,table,goal)
-        projection_excluded.update(projection);identity_excluded.update(identity)
-        for rule_id,rule in list(accepted.items()):
-            if (set(RuleEngine.columns(None,rule)) & projection_excluded
-                or _identity_columns(rule) & identity_excluded):
-                del accepted[rule_id]
-                _issue(result,table,'proposal_exclusion_conflict')
-        failures=[]
-        # Keep even uncompiled hypotheses as competing structural context.
-        # Their original state remains proposed; retention does not approve them.
-        observed_hierarchies.update((canonical(context),context) for context in
-            hierarchy_identity_context(batch,table,[*hierarchy_rules,*accepted.values()]))
-        rules=_compile(batch,table,goal,docs,result,model=model,packet=packet,
-            observations=observations,failures=failures,projection_excluded=projection_excluded,
-            identity_excluded=identity_excluded,conflicted_ids=blocked,
-            hierarchy_rules=[*hierarchy_rules,*accepted.values()],
-            granularity_rejections=granularity_rejections,
-            hierarchy_context=list(observed_hierarchies.values()),compiled_proposals=compiled_proposals,
-            identity_requests=identity_requests,policy_reviews=policy_reviews)
-        for rule_id in blocked:accepted.pop(rule_id,None)
-        for rule in rules:
-            if rule.rule_id in blocked:continue
-            if rule.rule_id not in accepted:
-                accepted[rule.rule_id]=rule
-                if round_number:result.stats['recovered_proposals']=result.stats.get('recovered_proposals',0)+1
-            elif accepted[rule.rule_id]!=rule:
-                _issue(result,table,'conflicting_rule_proposals')
-                del accepted[rule.rule_id];blocked.add(rule.rule_id)
-        if not failures:break
-        signature=canonical([batch.semantic_schema.model_dump(mode='json'),[
-            (proposal.kind,proposal.claim.model_dump(mode='json'),code) for proposal,code in failures]])
-        if round_number>=MAX_PROPOSAL_REPAIR_ROUNDS or signature in seen:
-            for _,code in failures:_issue(result,table,code)
-            result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
-            break
-        seen.add(signature);round_number+=1
-        try:
-            packet=_repair_packet({**packet,'hierarchy_identity_requests':identity_requests},batch,failures,round_number)
-        except LightGraphError as exc:
-            if exc.code!='hierarchy_identity_repair_context_limit':raise
-            # A bounded history must not erase original constraints or discard
-            # independent rules that already passed their checks.
-            _issue(result,table,exc.code)
-            for _,code in failures:_issue(result,table,code)
-            result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
-            break
-        result.stats['compile_repair_rounds']=result.stats.get('compile_repair_rounds',0)+1
-        observations.clear()
-        tools=tool_factory()
-        try:
-            batch=_ask(model,packet,tools,observations)
-            _record_submission_state(result, table, batch)
-            docs=tools.context_documents()
-        except LightGraphError as exc:
-            _issue(result,table,exc.code)
-            for _,code in failures:_issue(result,table,code)
-            result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
-            break
-        finally:tools.close()
-        if batch.abstain:
-            _issue(result,table,'model_abstained')
-            for _,code in failures:_issue(result,table,code)
-            result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
-            break
-    # A hierarchy can first appear in a later repair after an unrelated entity
-    # has already been retained. Check the final set against every observed
-    # hypothesis, using the original candidate, before any rule may escape.
     observed_hierarchies.update((canonical(context),context) for context in
-        hierarchy_identity_context(ProposalBatch(task=batch.task),table,[*hierarchy_rules,*accepted.values()]))
-    final_context=list(observed_hierarchies.values())
-    for rule_id,rule in list(accepted.items()):
-        if rule.kind=='wide_hierarchy':
-            proposal,schema,_=compiled_proposals[rule_id]
-            related={canonical(item) for item in identity_requests if _hierarchy_request_matches(proposal,item)}
-            if not related or (proposal.claim.identity_resolution is not None
-                and related<=policy_reviews.get(rule_id,set())):
-                continue
-            checked=_compile(ProposalBatch(task=batch.task,proposals=[proposal],semantic_schema=schema),
-                table,goal,docs,result,model=model,
-                packet={**packet,'hierarchy_identity_requests':identity_requests},observations=observations,
-                projection_excluded=projection_excluded,identity_excluded=identity_excluded,
-                identity_requests=identity_requests,policy_reviews=policy_reviews)
-            replacement=next((candidate for candidate in checked if candidate.rule_id==rule_id),None)
-            if replacement is None:del accepted[rule_id]
-            else:accepted[rule_id]=replacement
+        hierarchy_identity_context(batch,table,hierarchy_rules))
+    failures=[]
+    requests=list(packet.get('hierarchy_identity_requests',[]))
+    policy_reviews={}
+    compiled_proposals={}
+    granularity_rejections={} if granularity_rejections is None else granularity_rejections
+    rules=_compile(batch,table,goal,docs,result,model=model,packet=packet,
+        observations=observations,failures=failures,
+        projection_excluded=projection_excluded,identity_excluded=identity_excluded,
+        hierarchy_rules=hierarchy_rules,hierarchy_context=list(observed_hierarchies.values()),
+        granularity_rejections=granularity_rejections,identity_requests=requests,
+        policy_reviews=policy_reviews,compiled_proposals=compiled_proposals)
+    # A later sibling can reject an identity already compiled in this batch.
+    # Apply that existing judgment to every matching draft without another review.
+    rules=[rule for rule in rules if entity_granularity_identity(
+        compiled_proposals[rule.rule_id][0]) not in granularity_rejections]
+    # A complete alternative in this same batch can explicitly resolve an
+    # identity-policy request. No new proposal or second Agent is solicited.
+    resolved=set().union(*(policy_reviews.get(rule.rule_id,set()) for rule in rules))
+    unresolved=[]
+    for proposal,code in failures:
+        if (code in HIERARCHY_IDENTITY_REPAIR_CODES and
+                canonical(_proposal_repair_record(proposal,code)) in resolved):
             continue
-        if rule.kind!='column_group_entity':
-            continue
-        proposal,schema,reviewed_context=compiled_proposals[rule_id]
-        identity=entity_granularity_identity(proposal)
-        grain_context=entity_granularity_context(proposal,final_context)
-        if identity not in granularity_rejections and (
-            not grain_context or entity_granularity_context_signatures(grain_context)<=reviewed_context):
-            continue
-        checked=_compile(ProposalBatch(task=batch.task,proposals=[proposal],semantic_schema=schema),
-            table,goal,docs,result,model=model,packet=packet,observations=observations,
-            projection_excluded=projection_excluded,identity_excluded=identity_excluded,
-            granularity_rejections=granularity_rejections,hierarchy_context=final_context)
-        replacement=next((candidate for candidate in checked if candidate.rule_id==rule_id),None)
-        if replacement is None:
-            del accepted[rule_id]
-        else:
-            accepted[rule_id]=replacement
-    # Empty or unrelated repairs cannot turn an unresolved policy into success.
-    # Only an explicit accepted claim reviewed against this request resolves it.
-    unresolved=[item for item in identity_requests if not any(
-        rule.kind=='wide_hierarchy' and compiled_proposals[rid][0].claim.identity_resolution is not None
-        and canonical(item) in policy_reviews.get(rid,set())
-        for rid,rule in accepted.items())]
-    present={issue['code'] for issue in result.issues if issue.get('table')==table.qualified_name}
-    for code in sorted({item['code'] for item in unresolved}-present):
+        unresolved.append(code)
+    unresolved.extend(request['code'] for request in requests if canonical(request) not in resolved)
+    for code in dict.fromkeys(unresolved):
         _issue(result,table,code)
-    return list(accepted.values()),docs,batch,packet,(projection_excluded,identity_excluded)
+    if unresolved:
+        result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
+    return rules,docs,batch,packet,(projection_excluded,identity_excluded)
 
 
 def _verify_fd(adapter, table, rule, budget):
@@ -565,7 +464,7 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             def fresh_tools():
                 return ToolExecutor(adapter,goal,budget,documents=corpus,
                     allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=window)
-            rules,docs,batch,packet,guards=_compile_with_repairs(batch,original,goal,docs,result,
+            rules,docs,batch,packet,guards=_compile_candidates(batch,original,goal,docs,result,
                 model=model,packet=packet,observations=observations,tool_factory=fresh_tools,
                 projection_excluded={entry.column for prior_rule in prior for entry in prior_rule.attributes.excluded},
                 hierarchy_rules=prior,granularity_rejections=granularity_rejections,
@@ -614,7 +513,7 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
                         continue
                     finally:
                         tools.close()
-                    fixed,docs,_,revision,guards=_compile_with_repairs(revised_batch,original,goal,docs,result,
+                    fixed,docs,_,revision,guards=_compile_candidates(revised_batch,original,goal,docs,result,
                         model=model,packet=revision,observations=observations,tool_factory=fresh_tools,
                         projection_excluded=guards[0],identity_excluded=guards[1],
                         hierarchy_rules=[*prior,*rules],granularity_rejections=granularity_rejections,
@@ -667,7 +566,7 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
 def discover_references_with_agent(adapter, validated_rules, documents=None, model=None,
                                    budget=None, goal=None, max_candidates=32,
                                    source_adapters=None, table_refs=None,iteration_context=None,revision_rules=None):
-    """Resolve differently named local endpoint columns to verified entity keys."""
+    """Check one candidate batch; only missing endpoint context can reopen discovery."""
     from .engine import _source, _packet, _understanding, _table_hash, _column_id
     from .tools import ToolExecutor
     goal=goal or ExtractionGoal();budget=budget or model.budget
@@ -723,168 +622,137 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
             batch=_ask(model,packet,tools,observations)
             _record_submission_state(result, table, batch)
             docs=tools.context_documents()
-            if batch.abstain:_issue(result,table,'model_abstained')
-            elif not batch.proposals:_issue(result,table,'no_confirmable_relation')
-            repair_round=0;seen_repairs=set()
-            while True:
-                failures=[]
-                # A final proposal can name an endpoint without using a read tool.
-                # Backend verification is a read too: first let the model reconsider
-                # with every endpoint's applicable context, before querying it.
-                authorized_tables={(t.source_id,t.schema_name,t.name):t for t in tool_tables}
-                for context_round in range(3):
-                    involved={(ref['source_id'],ref.get('schema','public'),ref['table'])
-                              for ref in tools.context_tables()}
-                    for proposal in batch.proposals:
-                        if proposal.kind!='reference':continue
-                        for endpoint in (proposal.claim.source_entity,proposal.claim.target_entity):
-                            binding=approved.get(endpoint)
-                            if binding:
-                                involved.add((binding.source.source_id,binding.source.schema_name,binding.source.table))
-                    needed=corpus.contexts_for([authorized_tables[key] for key in sorted(involved)
-                                               if key in authorized_tables])
-                    def section_keys(sections):
-                        return {(d['doc_id'],d['revision'],d['section_id']) for d in sections}
-                    if section_keys(needed)<=section_keys(docs):break
-                    if context_round==2:raise LightGraphError('endpoint_context_revision_limit')
-                    packet={**packet,'document_snippets':needed,
-                            'context_tables':[_source(authorized_tables[key]).model_dump(mode='json',by_alias=True)
-                                              for key in sorted(involved) if key in authorized_tables],
-                            'subtask':'依据新增的端点表说明重新判断关系；不满足说明中的条件时撤回提案。'}
-                    tools.close()
-                    tools=ToolExecutor(adapter,goal,budget,documents=corpus,
-                        allow_source_samples=getattr(model.config,'allow_source_samples',False),
-                        allowed_tables=tool_tables,source_adapters=source_adapters)
-                    batch=_ask(model,packet,tools,observations)
-                    _record_submission_state(result, table, batch)
-                    docs=tools.context_documents()
-                lookup={_column_id(table,c.name):c.name for c in table.columns}
+            # A final proposal can name an endpoint without using a read tool.
+            # Backend verification is a read too: first let the model reconsider
+            # with every endpoint's applicable context, before querying it.
+            authorized_tables={(t.source_id,t.schema_name,t.name):t for t in tool_tables}
+            for context_round in range(3):
+                involved={(ref['source_id'],ref.get('schema','public'),ref['table'])
+                          for ref in tools.context_tables()}
                 for proposal in batch.proposals:
-                    if proposal.kind!='reference':
-                        _issue(result,table,'discriminator_requires_registered_selectors');continue
-                    count+=1
-                    if count>max_candidates:raise LightGraphError('reference_candidate_limit')
-                    claim=proposal.claim
-                    try:
-                        local=[lookup[c] for c in claim.source_columns];remote=[lookup[c] for c in claim.target_columns]
-                        if any(column_is_evidence_only(goal,table,c) for c in local+remote):
-                            raise LightGraphError('evidence_only_column_projected')
-                        source=approved.get(claim.source_entity)
-                        if source is None:
-                            matches=[r for r in approved.values() if r.source==_source(table)
-                                and any(binding['rule_id']==r.rule_id and binding['level']==claim.source_level
-                                        and binding['key_columns']==local for binding in bindings)]
-                            if len(matches)!=1:raise LightGraphError('reference_source_binding_ambiguous')
-                            source=matches[0]
-                        target=approved[claim.target_entity]
-                        if claim.condition_ref or claim.polymorphic_by:raise LightGraphError('reference_condition_requires_registered_selector')
-                        if goal.relation_kinds and claim.relation_kind not in goal.relation_kinds:raise LightGraphError('outside_relation_goal')
-                        schema=SemanticSchema.merged(goal.semantic_schema,batch.semantic_schema,
-                            source.semantic_schema,target.semantic_schema)
-                        schema=_reference_schema(schema,source.identity.entity_kind,target.identity.entity_kind,
-                            claim.relation_kind,goal)
-                        source_keys=endpoint_columns(source,claim.source_level)
-                        target_keys=endpoint_columns(target,claim.target_level)
-                        endpoint_checks=[]
-                        for binding,columns,keys in ((source,local,source_keys),(target,remote,target_keys)):
-                            destination=remote_originals.get((binding.source.source_id,binding.source.schema_name,binding.source.table))
-                            target_adapter=source_adapters.get(binding.source.source_id)
-                            if destination is None or target_adapter is None:raise LightGraphError('unavailable_reference_target')
-                            if len(columns)!=len(keys):raise LightGraphError('reference_arity_mismatch')
-                            cross_source=binding.source.source_id!=table.source_id
-                            cost=Cost(db_cu=6 if cross_source else 1)
-                            budget.admit(cost)
-                            try:
-                                if cross_source:
-                                    from lightgraph.cross_source import check_cross_source_reference
-                                    check=check_cross_source_reference(adapter,originals[table.qualified_name],columns,
-                                        target_adapter,destination,keys,
-                                        max_working_bytes=budget.limits.memory_bytes)
-                                    if not check['complete'] or not check['consistent']:
-                                        raise LightGraphError('cross_source_reference_incomplete')
-                                else:
-                                    check=adapter.check_reference(originals[table.qualified_name],columns,destination,keys)
-                            finally:budget.charge(cost)
-                            if check.get('partial_null_refs',0):raise LightGraphError('reference_partial_null')
-                            if claim.require_full_coverage and check.get('null_refs',0):
-                                raise LightGraphError('reference_null_endpoint')
-                            if any(check.get(k,0) for k in ('unmatched','ambiguous')):raise LightGraphError('reference_missing')
-                            if not check.get('unique_matches',0):raise LightGraphError('reference_no_populated_endpoint')
-                            endpoint_checks.append(check)
-                        review_packet={**packet,'semantic_schema':schema.model_dump(mode='json'),
-                            'probe_digest':list(packet.get('probe_digest',[]))+[{
-                            'probe_id':'backend_endpoint_verification','operator':'check_reference',
-                            'aggregates':{field:sum(check.get(field,0) for check in endpoint_checks)
-                                for field in ('unmatched','null_refs','partial_null_refs','ambiguous','unique_matches')}}]}
-                        # The provider's proposal is not its own semantic evidence.
-                        # Review all endpoint context after structural verification.
-                        relation_contract=_reference_relation_contract(schema,claim.relation_kind)
-                        evidence=review_semantics(model,review_packet,{
-                            'kind':'reference','scope':packet['scope'],
-                            'relation_definition':relation_contract,
-                            'claim':{**claim.model_dump(mode='json'),'source_entity':source.rule_id}},docs,
-                            observations=observations)
-                        if relation_contract['allow_self_links']:
-                            # Only this exact, independently supported contract
-                            # grants the executor permission for reflexive edges.
-                            evidence=[*evidence,'semantic_review:allow_self_links']
-                        rule_id='rule_'+digest(table.source_id,table.qualified_name,source.rule_id,target.rule_id,
-                            claim.source_level,claim.target_level,claim.relation_kind,local,remote)[:24]
-                        replacement=[r for r in prior if r.relation and
-                            r.relation.source_rule_id==source.rule_id and r.relation.target_rule_id==target.rule_id
-                            and r.relation.source_level==claim.source_level and r.relation.target_level==claim.target_level
-                            and r.relation.relation==claim.relation_kind]
-                        compiled=RuleSpec(rule_id=replacement[0].rule_id if len(replacement)==1 else rule_id,
-                            revision=replacement[0].revision+1 if len(replacement)==1 else 1,
-                            semantic_schema=schema.for_usage(entity_kinds={source.identity.entity_kind,target.identity.entity_kind},
-                                relations={claim.relation_kind}),
-                            kind='reference',goal_refs=[goal.goal_id],source=_source(table),
-                            scope=ScopeSpec(namespaces=[local[source_keys.index(c)]
-                                for c in source.scope.namespaces if c in source_keys]),
-                            identity=IdentitySpec(key_columns=local,entity_kind=source.identity.entity_kind),
-                            relation=RelationSpec(source_rule_id=source.rule_id,target_rule_id=target.rule_id,
-                                source_columns=local,target_columns=remote,relation=claim.relation_kind,
-                                source_level=claim.source_level,target_level=claim.target_level,
-                                require_full_coverage=claim.require_full_coverage),
-                            dependencies=Dependencies(schema=_table_hash(originals[table.qualified_name]),
-                                documents=sorted({d['doc_id']+'@'+d['revision'] for d in docs})),
-                            evidence=rule_evidence(evidence,reviewed=True,documents=docs),coverage=Coverage(scope='full',consistent=False))
-                        _preflight(compiled,goal)
-                        if not any(old.rule_id==compiled.rule_id for old in result.rules):
-                            result.rules.append(compiled)
-                            if repair_round:result.stats['recovered_proposals']=result.stats.get('recovered_proposals',0)+1
-                    except BudgetExceeded:raise
-                    except LightGraphError as exc:
-                        if exc.code in REPAIRABLE_PROPOSAL_CODES:failures.append((proposal,exc.code))
-                        else:_issue(result,table,exc.code)
-                if not failures:break
-                from lightgraph.contracts import canonical
-                signature=canonical([batch.semantic_schema.model_dump(mode='json'),[
-                    (proposal.kind,proposal.claim.model_dump(mode='json'),code) for proposal,code in failures]])
-                if repair_round>=MAX_PROPOSAL_REPAIR_ROUNDS or signature in seen_repairs:
-                    for _,code in failures:_issue(result,table,code)
-                    result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
-                    break
-                seen_repairs.add(signature);repair_round+=1
-                packet=_repair_packet(packet,batch,failures,repair_round,task='T2_cross_table')
-                result.stats['compile_repair_rounds']=result.stats.get('compile_repair_rounds',0)+1
-                observations.clear();tools.close()
+                    if proposal.kind!='reference':continue
+                    for endpoint in (proposal.claim.source_entity,proposal.claim.target_entity):
+                        binding=approved.get(endpoint)
+                        if binding:
+                            involved.add((binding.source.source_id,binding.source.schema_name,binding.source.table))
+                needed=corpus.contexts_for([authorized_tables[key] for key in sorted(involved)
+                                           if key in authorized_tables])
+                def section_keys(sections):
+                    return {(d['doc_id'],d['revision'],d['section_id']) for d in sections}
+                if section_keys(needed)<=section_keys(docs):break
+                if context_round==2:raise LightGraphError('endpoint_context_revision_limit')
+                packet={**packet,'document_snippets':needed,
+                        'context_tables':[_source(authorized_tables[key]).model_dump(mode='json',by_alias=True)
+                                          for key in sorted(involved) if key in authorized_tables],
+                        'subtask':'依据新增的端点表说明重新判断关系；不满足说明中的条件时撤回提案。'}
+                tools.close()
                 tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                     allow_source_samples=getattr(model.config,'allow_source_samples',False),
                     allowed_tables=tool_tables,source_adapters=source_adapters)
+                batch=_ask(model,packet,tools,observations)
+                _record_submission_state(result, table, batch)
+                docs=tools.context_documents()
+            if batch.abstain:_issue(result,table,'model_abstained')
+            elif not batch.proposals:_issue(result,table,'no_confirmable_relation')
+            lookup={_column_id(table,c.name):c.name for c in table.columns}
+            for proposal in batch.proposals:
+                if proposal.kind!='reference':
+                    _issue(result,table,'discriminator_requires_registered_selectors');continue
+                count+=1
+                if count>max_candidates:raise LightGraphError('reference_candidate_limit')
+                claim=proposal.claim
                 try:
-                    batch=_ask(model,packet,tools,observations)
-                    _record_submission_state(result, table, batch)
-                    docs=tools.context_documents()
-                except LightGraphError:
-                    for _,code in failures:_issue(result,table,code)
-                    result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
-                    raise
-                if batch.abstain:
-                    _issue(result,table,'model_abstained')
-                    for _,code in failures:_issue(result,table,code)
-                    result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
-                    break
+                    local=[lookup[c] for c in claim.source_columns];remote=[lookup[c] for c in claim.target_columns]
+                    if any(column_is_evidence_only(goal,table,c) for c in local+remote):
+                        raise LightGraphError('evidence_only_column_projected')
+                    source=approved.get(claim.source_entity)
+                    if source is None:
+                        matches=[r for r in approved.values() if r.source==_source(table)
+                            and any(binding['rule_id']==r.rule_id and binding['level']==claim.source_level
+                                    and binding['key_columns']==local for binding in bindings)]
+                        if len(matches)!=1:raise LightGraphError('reference_source_binding_ambiguous')
+                        source=matches[0]
+                    target=approved[claim.target_entity]
+                    if claim.condition_ref or claim.polymorphic_by:raise LightGraphError('reference_condition_requires_registered_selector')
+                    if goal.relation_kinds and claim.relation_kind not in goal.relation_kinds:raise LightGraphError('outside_relation_goal')
+                    schema=SemanticSchema.merged(goal.semantic_schema,batch.semantic_schema,
+                        source.semantic_schema,target.semantic_schema)
+                    schema=_reference_schema(schema,source.identity.entity_kind,target.identity.entity_kind,
+                        claim.relation_kind,goal)
+                    source_keys=endpoint_columns(source,claim.source_level)
+                    target_keys=endpoint_columns(target,claim.target_level)
+                    endpoint_checks=[]
+                    for binding,columns,keys in ((source,local,source_keys),(target,remote,target_keys)):
+                        destination=remote_originals.get((binding.source.source_id,binding.source.schema_name,binding.source.table))
+                        target_adapter=source_adapters.get(binding.source.source_id)
+                        if destination is None or target_adapter is None:raise LightGraphError('unavailable_reference_target')
+                        if len(columns)!=len(keys):raise LightGraphError('reference_arity_mismatch')
+                        cross_source=binding.source.source_id!=table.source_id
+                        cost=Cost(db_cu=6 if cross_source else 1)
+                        budget.admit(cost)
+                        try:
+                            if cross_source:
+                                from lightgraph.cross_source import check_cross_source_reference
+                                check=check_cross_source_reference(adapter,originals[table.qualified_name],columns,
+                                    target_adapter,destination,keys,
+                                    max_working_bytes=budget.limits.memory_bytes)
+                                if not check['complete'] or not check['consistent']:
+                                    raise LightGraphError('cross_source_reference_incomplete')
+                            else:
+                                check=adapter.check_reference(originals[table.qualified_name],columns,destination,keys)
+                        finally:budget.charge(cost)
+                        if check.get('partial_null_refs',0):raise LightGraphError('reference_partial_null')
+                        if claim.require_full_coverage and check.get('null_refs',0):
+                            raise LightGraphError('reference_null_endpoint')
+                        if any(check.get(k,0) for k in ('unmatched','ambiguous')):raise LightGraphError('reference_missing')
+                        if not check.get('unique_matches',0):raise LightGraphError('reference_no_populated_endpoint')
+                        endpoint_checks.append(check)
+                    review_packet={**packet,'semantic_schema':schema.model_dump(mode='json'),
+                        'probe_digest':list(packet.get('probe_digest',[]))+[{
+                        'probe_id':'backend_endpoint_verification','operator':'check_reference',
+                        'aggregates':{field:sum(check.get(field,0) for check in endpoint_checks)
+                            for field in ('unmatched','null_refs','partial_null_refs','ambiguous','unique_matches')}}]}
+                    # The provider's proposal is not its own semantic evidence.
+                    # Review all endpoint context after structural verification.
+                    relation_contract=_reference_relation_contract(schema,claim.relation_kind)
+                    evidence=review_semantics(model,review_packet,{
+                        'kind':'reference','scope':packet['scope'],
+                        'relation_definition':relation_contract,
+                        'claim':{**claim.model_dump(mode='json'),'source_entity':source.rule_id}},docs,
+                        observations=observations)
+                    if relation_contract['allow_self_links']:
+                        # Only this exact, independently supported contract
+                        # grants the executor permission for reflexive edges.
+                        evidence=[*evidence,'semantic_review:allow_self_links']
+                    rule_id='rule_'+digest(table.source_id,table.qualified_name,source.rule_id,target.rule_id,
+                        claim.source_level,claim.target_level,claim.relation_kind,local,remote)[:24]
+                    replacement=[r for r in prior if r.relation and
+                        r.relation.source_rule_id==source.rule_id and r.relation.target_rule_id==target.rule_id
+                        and r.relation.source_level==claim.source_level and r.relation.target_level==claim.target_level
+                        and r.relation.relation==claim.relation_kind]
+                    compiled=RuleSpec(rule_id=replacement[0].rule_id if len(replacement)==1 else rule_id,
+                        revision=replacement[0].revision+1 if len(replacement)==1 else 1,
+                        semantic_schema=schema.for_usage(entity_kinds={source.identity.entity_kind,target.identity.entity_kind},
+                            relations={claim.relation_kind}),
+                        kind='reference',goal_refs=[goal.goal_id],source=_source(table),
+                        scope=ScopeSpec(namespaces=[local[source_keys.index(c)]
+                            for c in source.scope.namespaces if c in source_keys]),
+                        identity=IdentitySpec(key_columns=local,entity_kind=source.identity.entity_kind),
+                        relation=RelationSpec(source_rule_id=source.rule_id,target_rule_id=target.rule_id,
+                            source_columns=local,target_columns=remote,relation=claim.relation_kind,
+                            source_level=claim.source_level,target_level=claim.target_level,
+                            require_full_coverage=claim.require_full_coverage),
+                        dependencies=Dependencies(schema=_table_hash(originals[table.qualified_name]),
+                            documents=sorted({d['doc_id']+'@'+d['revision'] for d in docs})),
+                        evidence=rule_evidence(evidence,reviewed=True,documents=docs),coverage=Coverage(scope='full',consistent=False))
+                    _preflight(compiled,goal)
+                    if not any(old.rule_id==compiled.rule_id for old in result.rules):
+                        result.rules.append(compiled)
+                except BudgetExceeded:raise
+                except LightGraphError as exc:
+                    _issue(result,table,exc.code)
+                    if exc.code in REPAIRABLE_PROPOSAL_CODES:
+                        result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+1
         except LightGraphError as exc:
             _issue(result,table,exc.code)
             if isinstance(exc,BudgetExceeded):break

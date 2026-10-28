@@ -1,4 +1,4 @@
-"""An unavailable repair must not erase independently validated graph rules."""
+"""Invalid candidates and data revisions preserve independently validated rules."""
 import pytest
 
 from lightgraph.discovery import discover
@@ -81,7 +81,15 @@ def test_deferred_coverage_executes_valid_sibling_but_keeps_pending_work(monkeyp
     assert report.counts['business_edges']==(2 if guard=='none' else 0)
     assert report.status!='COMPLETED'
     assert tasks.count('T1_table_discovery')==1
-    assert any(issue['code']=='llm_schema_invalid' for issue in report.issues)
+    assert any(issue['code']=='unregistered_attribute_semantics' and issue['status']=='deferred'
+               for issue in report.issues)
+    if guard=='cycle':
+        # Only the actual data cycle can schedule a revision Agent.
+        assert tasks.count('T5_revision')==1
+        assert any(issue['code']=='llm_schema_invalid' for issue in report.issues)
+    else:
+        assert 'T5_revision' not in tasks
+        assert not any(issue['code']=='llm_schema_invalid' for issue in report.issues)
     assert any(issue['code']=='unexplained_columns' and issue['status']=='deferred'
                and issue['count']==(3 if guard=='none' else 5) for issue in report.issues)
     with GraphStore(tmp_path/'graph.sqlite') as store:
