@@ -22,6 +22,8 @@ from lightgraph.context import (packet_call_context, bounded_discovery_packet,
 from lightgraph.contracts import canonical
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from .models import ProposalBatch
+from .proposal_session import (DiscoveryFinish, ProposalSession, proposal_tool_specs,
+                               MAX_SUBMISSION_CALLS)
 
 
 def _check_runtime_policy() -> None:
@@ -63,7 +65,7 @@ class DiscoveryFormatter(FormatterBase):
         context=packet_call_context(visible,visible['task'],
                                    output_contract={'schema_ref':'output_schema'})
         packet_text=canonical({'task':visible['task'],'input':visible,
-            'call_context':context,'output_schema':ProposalBatch.model_json_schema()})
+            'call_context':context,'output_schema':DiscoveryFinish.model_json_schema()})
         output=[]
         for msg in msgs:
             if msg.role=='user':
@@ -95,19 +97,23 @@ class DiscoveryChatModel(ChatModelBase):
     the evidence already obtained, without increasing either allowance.
     """
 
-    def __init__(self, client, max_tool_calls: int, max_steps: int):
+    def __init__(self, client, max_tool_calls: int, max_steps: int, submission_names=()):
         super().__init__(model_name=client.config.model,stream=client.config.stream)
         self.client=client
         self.max_tool_calls=max_tool_calls
         self.max_steps=max_steps
         self.total_calls=0
+        self.source_calls=0
+        self.submission_calls=0
+        self.submission_names=set(submission_names)
         self.steps=0
         self.submission_reason=None
 
     def _request_context(self, messages, reason):
         """Add runtime-owned counters, never tool arguments or source values."""
         return with_discovery_runtime_control(messages,turn=self.steps+1,max_turns=self.max_steps,
-            remaining_tool_calls=self.max_tool_calls-self.total_calls,submission_reason=reason)
+            remaining_tool_calls=self.max_tool_calls-self.source_calls,submission_reason=reason,
+            remaining_submission_calls=MAX_SUBMISSION_CALLS-self.submission_calls)
 
     async def __call__(self, messages: list[dict], tools=None, tool_choice=None, **kwargs):
         from .agent import _message
@@ -119,7 +125,7 @@ class DiscoveryChatModel(ChatModelBase):
                 if self.steps>=self.max_steps:
                     raise BudgetExceeded('discovery_steps_exhausted')
                 reason=self.submission_reason
-                if reason is None and self.total_calls>=self.max_tool_calls:
+                if reason is None and self.source_calls>=self.max_tool_calls:
                     reason='tool_allowance_exhausted'
                 if reason is None and self.steps==self.max_steps-1:
                     reason='last_turn'
@@ -127,23 +133,36 @@ class DiscoveryChatModel(ChatModelBase):
                     reason='caller_requested'
                 request_messages=self._request_context(messages,reason)
                 self.steps+=1
+                available=tools or []
+                if reason:
+                    available=[spec for spec in available
+                        if spec['function']['name'] in self.submission_names]
+                if self.submission_calls>=MAX_SUBMISSION_CALLS:
+                    available=[spec for spec in available
+                        if spec['function']['name'] not in self.submission_names]
+                if tool_choice=='none':
+                    available=[]
                 try:
-                    # Omit definitions as well as selecting none. A provider
-                    # ignoring this instruction still cannot execute a tool.
-                    parsed=self.client._request(request_messages,_message,None if reason else tools,
-                        tool_choice='none' if reason else (tool_choice or 'auto'))
+                    # Source access ends at its configured allowance or final
+                    # turn. Bounded local submissions can still preserve work.
+                    parsed=self.client._request(request_messages,_message,available or None,
+                        tool_choice=(tool_choice or 'auto') if available else 'none')
                 finally:
                     request_messages.clear()
-                if 'final' in parsed:
+                if 'final' in parsed or 'finish' in parsed:
                     break
                 calls=parsed['calls']
-                if reason:
+                source_count=sum(call['name'] not in self.submission_names for call in calls)
+                local_count=len(calls)-source_count
+                if tool_choice=='none' or reason and source_count:
                     if reason in {'tool_allowance_exhausted','tool_batch_rejected'}:
                         raise BudgetExceeded('discovery_tool_calls_exhausted')
                     if reason=='last_turn':
                         raise BudgetExceeded('discovery_steps_exhausted')
                     raise LightGraphError('discovery_final_response_required')
-                if self.total_calls+len(calls)<=self.max_tool_calls:
+                if self.submission_calls+local_count>MAX_SUBMISSION_CALLS:
+                    raise BudgetExceeded('discovery_tool_calls_exhausted')
+                if self.source_calls+source_count<=self.max_tool_calls:
                     break
                 # The last turn was reserved before the request. Reject the
                 # entire oversized batch instead of executing a changed subset.
@@ -151,19 +170,21 @@ class DiscoveryChatModel(ChatModelBase):
                 messages.append({'role':'user','content':canonical({'runtime_feedback':{
                     'code':'tool_batch_exceeds_remaining_allowance','executed_tools':0,
                     'requested_tools':len(calls),
-                    'remaining_tool_calls':self.max_tool_calls-self.total_calls,
-                    'next_action':'Submit ProposalBatch using existing evidence or abstain.'}})})
+                    'remaining_tool_calls':self.max_tool_calls-self.source_calls,
+                    'next_action':'Finish retained drafts or abstain using the small final response.'}})})
                 parsed.clear()
         finally:
             # HTTP has finished or failed. Formatted prompts must not outlive it.
             messages.clear()
-        if 'final' in parsed:
-            content=[{'type':'text','text':parsed['final'].model_dump_json()}]
+        if 'final' in parsed or 'finish' in parsed:
+            content=[{'type':'text','text':parsed.get('final',parsed.get('finish')).model_dump_json()}]
         else:
             calls=parsed['calls']
             content=[]
             for call in calls:
                 self.total_calls+=1
+                if call['name'] in self.submission_names:self.submission_calls+=1
+                else:self.source_calls+=1
                 try:
                     args=json.loads(call['arguments'])
                 except (ValueError,TypeError):
@@ -202,10 +223,14 @@ class DiscoveryReActAgent(ReActAgent):
         if getattr(self,'_terminal_failure',None) is not None:
             raise self._terminal_failure
         _check_runtime_policy()
+        if getattr(self,'_proposal_session',None) is not None and self._proposal_session.finished:
+            return Msg(self.name,DiscoveryFinish(action='finish_discovery').model_dump_json(),'assistant')
         return await super()._reasoning(tool_choice)
 
     async def _acting(self, tool_call):
         if getattr(self,'_terminal_failure',None) is not None:
+            return None
+        if getattr(self,'_proposal_session',None) is not None and self._proposal_session.finished:
             return None
         try:
             _check_runtime_policy()
@@ -220,6 +245,8 @@ class DiscoveryReActAgent(ReActAgent):
     async def _summarizing(self) -> Msg:
         if getattr(self,'_terminal_failure',None) is not None:
             raise self._terminal_failure
+        if getattr(self,'_proposal_session',None) is not None and self._proposal_session.finished:
+            return Msg(self.name,DiscoveryFinish(action='finish_discovery').model_dump_json(),'assistant')
         # The model reserves its final configured turn for submission. Never
         # add the framework's unbudgeted summary if the provider ignores it.
         raise BudgetExceeded('discovery_steps_exhausted')
@@ -230,18 +257,68 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
 
     _check_runtime_policy()
     memory=EphemeralMemory()
-    toolkit=create_toolkit(executor,dispatch)
-    model=DiscoveryChatModel(client,max_tool_calls,max_steps)
+    session=ProposalSession(packet)
+    class CombinedTools:
+        def tool_specs(self):
+            return [*executor.tool_specs(),*proposal_tool_specs(packet['task'])]
+
+    def combined_dispatch(name,arguments):
+        if name in session.names:
+            client.budget.check_deadline()
+            return session.execute(name,arguments)
+        return dispatch(name,arguments)
+
+    toolkit=create_toolkit(CombinedTools(),combined_dispatch)
+    toolkit.invalid_argument_handler=lambda name: session.reject() if name in session.names else None
+    model=DiscoveryChatModel(client,max_tool_calls,max_steps,session.names)
     agent=DiscoveryReActAgent(name=client.config.agent_name,sys_prompt=system,
         model=model,formatter=DiscoveryFormatter(packet,executor),toolkit=toolkit,
         memory=memory,max_iters=max_steps,parallel_tool_calls=False,
         enable_meta_tool=False,print_hint_msg=False)
     agent.set_console_output_enabled(False)
+    agent._proposal_session=session
     reply=None
     try:
         # The actual AgentScope loop, not the former hand-written while loop.
-        reply=await agent.reply(Msg('user','discovery task','user'))
-        return ProposalBatch.model_validate_json(reply.get_text_content())
+        try:
+            reply=await agent.reply(Msg('user','discovery task','user'))
+        except LightGraphError as exc:
+            # Recover only transport/shape/allowance failures. Authorization,
+            # tracing policy changes and cancellation still terminate the run.
+            recoverable=(exc.code.startswith(('llm_','model_transport_','model_json_','model_stream_')) or exc.code in {
+                'model_packet_too_large','model_response_too_large','discovery_steps_exhausted',
+                'discovery_tool_calls_exhausted','discovery_final_response_required',
+                'model_schema_invalid','model_response_invalid','model_response_truncated',
+                'model_stream_invalid','model_http_error','model_rate_limited'})
+            if not session.drafts or not recoverable:
+                raise
+            return session.batch(pending_code='discovery_submission_incomplete')
+        if session.finished:
+            return session.batch()
+        raw=json.loads(reply.get_text_content())
+        if isinstance(raw,dict) and 'action' in raw:
+            finish=DiscoveryFinish.model_validate(raw)
+            session.pending=finish.pending
+            session.finished=True
+            return session.batch(abstain=finish.action=='abstain')
+        legacy=ProposalBatch.model_validate(raw)
+        if legacy.abstain:
+            # Legacy global abstention is also a withdrawal, never a request
+            # to finish and publish the previously staged candidates.
+            return session.batch(abstain=True)
+        if not session.drafts and session.schema.is_empty() and not session.invalid_count:
+            return legacy
+        # A legacy final cannot replace staged exclusions or silently drop an
+        # earlier valid hypothesis. Union all locally valid drafts instead.
+        if legacy.task!=session.task:
+            session.reject('model_task_mismatch')
+        else:
+            session.execute('declare_semantic_schema',legacy.semantic_schema.model_dump(mode='json'))
+            for proposal in legacy.proposals:
+                session.execute('submit_'+proposal.kind,proposal.model_dump(mode='json',exclude={'kind'}))
+            session.pending=legacy.abstain
+        session.finished=True
+        return session.batch()
     finally:
         # InMemoryMemory stores copies; clear originals as well as the returned
         # message, and remove closures retaining the executor or packet.
@@ -254,6 +331,9 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
             reply.content=[]
         toolkit.tools.clear()
         toolkit._argument_validators.clear()
+        toolkit.invalid_argument_handler=None
+        session.clear()
+        agent._proposal_session=None
         agent._terminal_failure=None
         agent._sys_prompt=''
         agent.formatter.packet={}

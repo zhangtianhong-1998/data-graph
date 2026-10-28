@@ -278,7 +278,7 @@ def _reference_type_slot(path, contract):
         return (len(tail)==3 and tail[0]=='attributes' and
                 tail[1] in {'single_valued','multi_valued','display_only'} and type(tail[2]) is int)
     name=getattr(contract,'__name__','')
-    if name=='SemanticReview':
+    if name in {'SemanticReview','BoundSemanticVerdict'}:
         return (path==('proposition_ref',) or
             len(path)==3 and path[0]=='evidence' and type(path[1]) is int and path[2]=='reference' or
             len(path)==4 and path[0]=='conditions' and type(path[1]) is int and
@@ -434,14 +434,29 @@ class ModelConfig(StrictModel):
                    api_key_env=os.environ.get('LIGHTGRAPH_API_KEY_ENV','LIGHTGRAPH_API_KEY'))
 
 
+def _stream_transport_limit(max_response_bytes, max_output_tokens):
+    """Bound framing separately from decoded content, including ignored fields.
+
+    JSON string escaping can use six wire bytes for one decoded byte. The
+    additional per-token allowance bounds SSE framing and provider metadata or
+    reasoning events without treating them as the final application response.
+    """
+    return 6*max_response_bytes + 2048*max_output_tokens + 65536
+
+
 class _ChatCompletionStream:
     """Assemble one bounded SSE turn; no partial call is exposed to the agent.
 
-    The HTTP reader bounds all received bytes, including ignored event fields.
+    The HTTP reader separately bounds all wire bytes, including ignored fields.
+    Decoded actionable strings and each in-flight SSE event have their own caps.
     A finish reason and [DONE] are both required, so a disconnected provider
     cannot accidentally execute an otherwise syntactically complete tool call.
     """
-    def __init__(self):
+    def __init__(self,max_response_bytes):
+        self.max_response_bytes=max_response_bytes
+        self.max_event_bytes=6*max_response_bytes+65536
+        self.content_bytes=0
+        self.data_bytes=0
         self.decoder=codecs.getincrementaldecoder('utf-8')()
         self.pending=''
         self.data=[]
@@ -454,6 +469,8 @@ class _ChatCompletionStream:
     def feed(self,chunk: bytes) -> None:
         self.pending+=self.decoder.decode(chunk)
         self._lines()
+        if len(self.pending.encode('utf-8'))>self.max_event_bytes:
+            raise LightGraphError('model_stream_event_too_large')
 
     def _lines(self, *, final: bool=False) -> None:
         # SSE accepts LF, CRLF, and CR. Hold a final CR until the next chunk so
@@ -470,17 +487,29 @@ class _ChatCompletionStream:
             self._line(line)
 
     def _line(self,line: str) -> None:
+        if len(line.encode('utf-8'))>self.max_event_bytes:
+            raise LightGraphError('model_stream_event_too_large')
         if not line:
             if self.data:
                 data='\n'.join(self.data)
                 self.data.clear()
+                self.data_bytes=0
                 self._event(data)
             return
         if line.startswith(':'):
             return
         field,_,value=line.partition(':')
         if field=='data':
-            self.data.append(value[1:] if value.startswith(' ') else value)
+            value=value[1:] if value.startswith(' ') else value
+            self.data_bytes+=len(value.encode('utf-8'))+bool(self.data)
+            if self.data_bytes>self.max_event_bytes:
+                raise LightGraphError('model_stream_event_too_large')
+            self.data.append(value)
+
+    def _count_content(self,value):
+        self.content_bytes+=len(value.encode('utf-8'))
+        if self.content_bytes>self.max_response_bytes:
+            raise LightGraphError('model_response_too_large')
 
     def _event(self,data: str) -> None:
         if self.done:
@@ -511,7 +540,8 @@ class _ChatCompletionStream:
         if content is not None:
             if not isinstance(content,str):
                 raise LightGraphError('model_stream_invalid')
-            self.content.append(content)
+            self._count_content(content)
+            if content:self.content.append(content)
         if delta.get('refusal'):
             raise LightGraphError('model_response_refused')
         calls=delta.get('tool_calls') or []
@@ -529,6 +559,7 @@ class _ChatCompletionStream:
             if part.get('id') is not None:
                 if not isinstance(part['id'],str):
                     raise LightGraphError('model_stream_invalid')
+                self._count_content(part['id'])
                 call['id']+=part['id']
             function=part.get('function') or {}
             if not isinstance(function,dict):
@@ -538,6 +569,7 @@ class _ChatCompletionStream:
                 if value is not None:
                     if not isinstance(value,str):
                         raise LightGraphError('model_stream_invalid')
+                    self._count_content(value)
                     call['function'][field]+=value
         reason=choice.get('finish_reason')
         if reason is not None:
@@ -575,6 +607,8 @@ class _ChatCompletionStream:
         self.content.clear()
         self.calls.clear()
         self.usage={}
+        self.content_bytes=0
+        self.data_bytes=0
         self.decoder.reset()
 
 class StructuredModelClient:
@@ -603,19 +637,47 @@ class StructuredModelClient:
         return self.config.allow_source_samples
 
     def complete(self, task: str, packet: dict, response_model: type[T]) -> T:
+        messages=self._complete_messages(task,packet,response_model)
+        return self._request(messages,lambda message:response_model.model_validate(_strict_json_loads(message['content'])),
+                             semantic_review=task=='semantic_review',correction_contract=response_model)
+
+    def _complete_messages(self,task,packet,response_model):
         if not self.config.allow_source_samples and task != 'T4_document':
             packet={**packet,'strata_samples':[],'tool_observations':[]}
         context=packet_call_context(packet,task,output_contract={'schema_ref':'output_schema'})
         packet={**packet,'goal':context['goal'],'stage':task,'call_context':context}
         content = canonical({'task':task,'input':packet,'output_schema':response_model.model_json_schema()})
-        messages=[{'role':'system','content':SYSTEM+'\n\n'+build_goal_instructions(context['goal'],stage=task)},
-                  {'role':'user','content':content}]
-        return self._request(messages,lambda message:response_model.model_validate(_strict_json_loads(message['content'])),
-                             semantic_review=task=='semantic_review',correction_contract=response_model)
+        return [{'role':'system','content':SYSTEM+'\n\n'+build_goal_instructions(context['goal'],stage=task)},
+                {'role':'user','content':content}]
+
+    def complete_bound_review(self, packet, *, proposition_ref, allow_schema_repair=True):
+        """Bind compact verdicts locally; never overwrite a legacy response's echo."""
+        from .semantics import BoundSemanticVerdict, SemanticReview
+        if packet.get('semantic_proposition_ref')!=proposition_ref or not isinstance(packet.get('semantic_proposition'),dict):
+            raise LightGraphError('semantic_review_reference_mismatch')
+        def parse(message):
+            value=_strict_json_loads(message['content'])
+            if isinstance(value,dict) and {'proposition_ref','proposition','basis'} & set(value):
+                return SemanticReview.model_validate(value)
+            return BoundSemanticVerdict.model_validate(value).bind(proposition_ref)
+        return self._request(self._complete_messages('semantic_review',packet,BoundSemanticVerdict),parse,
+            semantic_review=True,correction_contract=BoundSemanticVerdict,allow_schema_repair=allow_schema_repair)
+
+    def complete_reference_patch(self, packet, response_model):
+        """One locator correction; never start a nested schema-repair turn."""
+        try:
+            return self._request(self._complete_messages('semantic_review',packet,response_model),
+                lambda message:response_model.model_validate(_strict_json_loads(message['content'])),
+                correction_contract=response_model,allow_schema_repair=False)
+        except LightGraphError as exc:
+            if exc.code == 'llm_schema_invalid':
+                raise LightGraphError('semantic_review_patch_invalid') from None
+            raise
 
     def _request(self, messages: list[dict], parse_message: Callable[[dict],T],
                  tool_specs: list[dict] | None = None, *, tool_choice: str = 'auto',
-                 semantic_review: bool = False, correction_contract: type[BaseModel] | None = None) -> T:
+                 semantic_review: bool = False, correction_contract: type[BaseModel] | None = None,
+                 allow_schema_repair: bool = True) -> T:
         """One bounded provider turn. Only counters survive the call, never messages."""
         schema=_request_schema(messages)
         response_format=response_format_for(schema,self.config.response_format)
@@ -638,7 +700,8 @@ class StructuredModelClient:
         correction_anchor=None
         original_candidate=None
         last_code = 'model_failed'
-        for attempt in range(self.config.retries + 1):
+        retry_limit=self.config.retries if allow_schema_repair else 0
+        for attempt in range(retry_limit + 1):
             correcting=feedback is not None
             request_messages=([*messages,{'role':'user','content':canonical(feedback)}]
                               if correcting else messages)
@@ -657,7 +720,9 @@ class StructuredModelClient:
             counted = False
             request_started = False
             raw = bytearray()
-            stream = _ChatCompletionStream() if self.config.stream else None
+            stream = _ChatCompletionStream(self.config.max_response_bytes) if self.config.stream else None
+            transport_limit=(_stream_transport_limit(self.config.max_response_bytes,self.config.max_output_tokens)
+                if stream is not None else self.config.max_response_bytes)
             received = 0
             payload = envelope = value = candidate_message = None
             try:
@@ -692,10 +757,16 @@ class StructuredModelClient:
                         for chunk in response.iter_bytes():
                             self.budget.check_deadline()
                             received+=len(chunk)
-                            if received>self.config.max_response_bytes:
-                                raise LightGraphError('model_response_too_large')
+                            if received>transport_limit:
+                                raise LightGraphError('model_stream_transport_too_large' if stream is not None
+                                                      else 'model_response_too_large')
                             if stream is not None:
-                                stream.feed(chunk)
+                                # Check every received chunk before locally
+                                # slicing it. HTTPX chunk_size would buffer a
+                                # slow drip and delay the total deadline check.
+                                for start in range(0,len(chunk),65536):
+                                    self.budget.check_deadline()
+                                    stream.feed(chunk[start:start+65536])
                             else:
                                 raw.extend(chunk)
                 self.budget.check_deadline()
@@ -715,6 +786,10 @@ class StructuredModelClient:
                 if choice.get('finish_reason') == 'content_filter':
                     raise LightGraphError('model_response_refused')
                 candidate_message=choice['message']
+                if correcting:
+                    # Count received protocol corrections, not network retries
+                    # which returned no judgment and consumed no semantic vote.
+                    self.usage['schema_repair_responses']=self.usage.get('schema_repair_responses',0)+1
                 if (correcting or final_only) and isinstance(candidate_message,dict) and candidate_message.get('tool_calls'):
                     # A review must not use the outer protocol retry to turn
                     # an ambiguous or negative tool-bearing response positive.
@@ -743,7 +818,10 @@ class StructuredModelClient:
                 if semantic_review:
                     terminal=_invalid_review_terminal(candidate_message)
                     if terminal:raise LightGraphError(terminal) from None
-                if attempt<self.config.retries:
+                    # A second malformed verdict cannot earn another model
+                    # judgment even if transport retries are configured higher.
+                    if correcting:raise LightGraphError(last_code) from None
+                if attempt<retry_limit:
                     if correction_anchor is None:
                         correction_anchor=_schema_correction_anchor(candidate_message,correction_contract,exc)
                         if request_task is not None:correction_anchor['request_task']=request_task

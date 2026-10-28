@@ -1,7 +1,7 @@
 """Closed discovery proposals: model output never controls validation status."""
 from __future__ import annotations
 from typing import Annotated, Literal, Union
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, PrivateAttr, model_validator
 from lightgraph.contracts import StrictModel, RuleSpec, SourceRef, TableSpec, digest
 from lightgraph.semantic_schema import SemanticSchema
 
@@ -207,6 +207,8 @@ class ExclusionProposal(ProposalBase):
 Proposal = Annotated[Union[ColumnGroupProposal,EntityKeyProposal,HierarchyProposal,LongHierarchyProposal,ReferenceProposal,
                            DiscriminatorProposal,ExclusionProposal],Field(discriminator='kind')]
 class ProposalBatch(StrictModel):
+    _runtime_pending_codes: list[str] = PrivateAttr(default_factory=list)
+    _runtime_invalid_drafts: int = PrivateAttr(default=0)
     model_config = ConfigDict(json_schema_extra=_proposal_batch_schema_guards)
     packet_version: Literal['1.0'] = '1.0'
     task: Task

@@ -30,12 +30,14 @@ def test_initial_prompt_exact_threshold_includes_runtime_controls(steps,tool_cal
         assert control['max_turns']==steps
         assert control['remaining_tool_calls']==tool_calls
         assert control['submission_required'] is (steps==1)
-        assert bool(payload.get('tools')) is (steps>1)
+        assert payload.get('tools')
+        if steps==1:
+            assert all(item['function']['name'].startswith(('submit_', 'declare_', 'finish_')) for item in payload['tools'])
         assert payload['response_format']['type']==response_format
         if response_format=='json_schema':
-            from lightgraph.discovery.models import ProposalBatch
+            from lightgraph.discovery.proposal_session import DiscoveryFinish
             assert payload['response_format']['json_schema']['strict'] is True
-            assert payload['response_format']['json_schema']['schema']==ProposalBatch.model_json_schema()
+            assert payload['response_format']['json_schema']['schema']==DiscoveryFinish.model_json_schema()
             assert json.loads(payload['messages'][1]['content'])['output_schema']['schema_ref']==(
                 'response_format.json_schema.schema')
         return response(final())

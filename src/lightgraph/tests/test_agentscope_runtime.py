@@ -225,11 +225,11 @@ def test_model_batch_above_tool_budget_submits_without_executing_batch(framework
         body=json.loads(request.content);turns.append(body)
         if len(turns)==1:
             return reply_for(tool_message('get_metadata','profile_columns'),False)
-        assert 'tools' not in body
+        assert all(item['function']['name'].startswith(('submit_', 'declare_', 'finish_')) for item in body.get('tools', []))
         feedback=json.loads(body['messages'][-1]['content'])['runtime_feedback']
         assert feedback=={'code':'tool_batch_exceeds_remaining_allowance','executed_tools':0,
             'requested_tools':2,'remaining_tool_calls':1,
-            'next_action':'Submit ProposalBatch using existing evidence or abstain.'}
+            'next_action':'Finish retained drafts or abstain using the small final response.'}
         return reply_for({'content':json.dumps(final())},False)
     client=model(handler,stream=False)
     assert client.explore(input_packet(),toolbox,max_tool_calls=1,max_steps=2).proposals
@@ -249,15 +249,15 @@ def test_last_allowed_turn_submits_with_updated_runtime_counters(stream,framewor
         if len(seen)==1:
             assert 'tools' in body and body['tool_choice']=='auto'
             return reply_for(tool_message('get_metadata'),stream)
-        assert 'tools' not in body
+        assert all(item['function']['name'].startswith(('submit_', 'declare_', 'finish_')) for item in body.get('tools', []))
         assert json.loads(body['messages'][-1]['content'])['probe_id']=='probe_0001'
         return reply_for({'content':json.dumps(final(evidence='probe_0001'))},stream)
     client=model(handler,stream=stream);toolbox=Toolbox()
     assert client.explore(input_packet(),toolbox,max_steps=2,max_tool_calls=4).proposals
     assert seen==[
-        {'turn':1,'max_turns':2,'remaining_turns_including_current':2,'remaining_tool_calls':4,
+        {'turn':1,'max_turns':2,'remaining_turns_including_current':2,'remaining_tool_calls':4,'remaining_submission_calls':16,
          'submission_required':False,'submission_reason':None},
-        {'turn':2,'max_turns':2,'remaining_turns_including_current':1,'remaining_tool_calls':3,
+        {'turn':2,'max_turns':2,'remaining_turns_including_current':1,'remaining_tool_calls':3,'remaining_submission_calls':16,
          'submission_required':True,'submission_reason':'last_turn'}]
     assert client.usage['calls']==2 and toolbox.executed==['get_metadata']
     assert_cleared(framework_spy)
@@ -282,7 +282,7 @@ def test_nineteen_tools_then_oversized_pair_still_submits_within_turn_limit(fram
         control=json.loads(body['messages'][1]['content'])['runtime_control']
         assert control['turn']==3 and control['remaining_turns_including_current']==1
         assert control['remaining_tool_calls']==1 and control['submission_reason']=='tool_batch_rejected'
-        assert 'tools' not in body
+        assert all(item['function']['name'].startswith(('submit_', 'declare_', 'finish_')) for item in body.get('tools', []))
         return reply_for({'content':json.dumps(final(evidence='probe_0019'))},False)
     client=model(handler,stream=False);toolbox=UniqueTools()
     assert client.explore(input_packet(),toolbox,max_steps=3,max_tool_calls=20).proposals
@@ -324,7 +324,7 @@ def test_submission_recovery_does_not_exceed_global_model_allowance(framework_sp
 
 def test_one_turn_task_is_submission_only_and_never_executes_provider_tool(framework_spy):
     def handler(request):
-        assert 'tools' not in json.loads(request.content)
+        assert all(item['function']['name'].startswith(('submit_', 'declare_', 'finish_')) for item in json.loads(request.content).get('tools', []))
         return reply_for(tool_message('get_metadata'),False)
     client=model(handler,stream=False);toolbox=Toolbox()
     with pytest.raises(BudgetExceeded,match='discovery_steps_exhausted'):

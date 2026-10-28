@@ -56,9 +56,50 @@ class SemanticReview(StrictModel):
         description='Legacy response only. Omit this field when returning proposition_ref.')
     decision_scope: Literal['proposition','document_window'] = 'proposition'
     decision: Literal['supported', 'refuted', 'unresolved']
-    basis: Literal['explicit_declaration', 'document_interpretation', 'data_inference']
+    basis: Literal['explicit_declaration', 'document_interpretation', 'data_inference','bound_model_review']
     evidence: list[EvidenceInterpretation] = Field(default_factory=list, max_length=128)
     conditions: list[ConditionReview] = Field(default_factory=list, max_length=16)
+
+
+class BoundEvidence(StrictModel):
+    reference: str = Field(description='One issued evidence reference; no copied source text.')
+    stance: Literal['supports', 'refutes', 'context', 'irrelevant']
+
+
+class BoundCondition(StrictModel):
+    state: Literal['satisfied', 'unsatisfied', 'unknown']
+    evidence_refs: list[str] = Field(default_factory=list,max_length=16)
+    condition: str = Field(min_length=1,max_length=MAX_TRANSIENT_TEXT_CHARS,
+        description='One concise business condition per entry. No reasoning narrative, '
+        'source values or multiple conditions in one entry.')
+
+
+class BoundSemanticVerdict(StrictModel):
+    """The caller owns the proposition; the model supplies only its verdict."""
+    decision_scope: Literal['proposition','document_window'] = 'proposition'
+    decision: Literal['supported','refuted','unresolved']
+    evidence: list[BoundEvidence] = Field(default_factory=list,max_length=128,
+        description='Classify every supplied document section, including counterevidence.')
+    conditions: list[BoundCondition] = Field(default_factory=list,max_length=16,
+        description='All actual applicability conditions; keep unknown or unsatisfied states.')
+
+    def bind(self, proposition_ref):
+        return SemanticReview(proposition_ref=proposition_ref,decision_scope=self.decision_scope,
+            decision=self.decision,basis='bound_model_review',
+            evidence=[item.model_dump() for item in self.evidence],
+            conditions=[{'state':item.state,'evidence_refs':item.evidence_refs,
+                         'explanation':item.condition} for item in self.conditions])
+
+
+class EvidenceReferenceReplacement(StrictModel):
+    invalid_reference: str
+    issued_reference: str
+
+
+class SemanticReferencePatch(StrictModel):
+    """Repair locators without asking for a second semantic judgment."""
+    replacements: list[EvidenceReferenceReplacement] = Field(default_factory=list,max_length=384)
+    document_classifications: list[BoundEvidence] = Field(default_factory=list,max_length=128)
 
 
 def document_ref(document):
@@ -224,9 +265,7 @@ def review_entity_granularity(model, packet, proposal, context, documents, *, ob
 
 
 _REPAIRABLE_REVIEW_CODES = frozenset({
-    'semantic_review_proposition_mismatch', 'semantic_review_proposition_missing',
-    'semantic_review_reference_mismatch', 'semantic_review_unissued_evidence',
-    'semantic_review_incomplete_context', 'llm_schema_invalid',
+    'semantic_review_unissued_evidence', 'semantic_review_incomplete_context',
 })
 
 
@@ -241,9 +280,9 @@ def _check_review(reviewed, *, proposition_ref, expected_proposition, docs, doc_
         and all(item.stance in ('context','irrelevant') for item in reviewed.evidence))
     if reviewed.decision != 'supported' and not neutral_window:
         raise LightGraphError('semantic_claim_unresolved')
+    if any(item.state!='satisfied' or not item.evidence_refs for item in reviewed.conditions):
+        raise LightGraphError('semantic_condition_unresolved')
     for condition in reviewed.conditions:
-        if condition.state != 'satisfied' or not condition.evidence_refs:
-            raise LightGraphError('semantic_condition_unresolved')
         if set(condition.evidence_refs) - issued:
             raise LightGraphError('semantic_review_unissued_evidence')
     if reviewed.proposition_ref is not None:
@@ -296,6 +335,37 @@ def _review_stage_contract(proposition):
         'programmatic_checks':{'state':'pending_if_rule_compiles','checks':checks}}
 
 
+def _review_reference_state(reviewed, issued, doc_refs):
+    references={item.reference for item in reviewed.evidence}
+    condition_refs={ref for item in reviewed.conditions for ref in item.evidence_refs}
+    return (references | condition_refs) - issued, doc_refs - references
+
+
+def _apply_reference_patch(reviewed, patch, *, issued, doc_refs):
+    """Only invalid locators and absent document classifications are writable."""
+    invalid,missing_docs=_review_reference_state(reviewed,issued,doc_refs)
+    replacements={item.invalid_reference:item.issued_reference for item in patch.replacements}
+    added=[item.reference for item in patch.document_classifications]
+    if (len(replacements)!=len(patch.replacements) or set(replacements)-invalid
+            or set(replacements.values())-issued or len(added)!=len(set(added))
+            or set(added)-missing_docs):
+        raise LightGraphError('semantic_review_patch_invalid')
+    repaired=reviewed.model_copy(deep=True)
+    for item in repaired.evidence:
+        item.reference=replacements.get(item.reference,item.reference)
+    for item in repaired.conditions:
+        item.evidence_refs=[replacements.get(ref,ref) for ref in item.evidence_refs]
+    repaired.evidence.extend(EvidenceInterpretation(**item.model_dump())
+        for item in patch.document_classifications)
+    # The same invalid locator can be an alias of an existing classification.
+    # Collapse identical entries only; conflicting stances still fail validation.
+    repaired.evidence=list({canonical(item.model_dump()):item for item in repaired.evidence}.values())
+    try:
+        return SemanticReview.model_validate(repaired.model_dump())
+    except ValidationError:
+        raise LightGraphError('semantic_review_patch_invalid') from None
+
+
 def _review_semantics_window(model, packet, proposition, documents, *, observations=None,
                              batch=None):
     """Review a compiler-issued proposition independently of the proposal.
@@ -304,7 +374,9 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
     evidence when no direct statement exists. It cannot mint a source reference
     or grant permission. A second model vote alone never passes these checks.
     """
-    if not callable(getattr(model, 'complete', None)):
+    bound_complete=getattr(model,'complete_bound_review',None)
+    bound=callable(bound_complete)
+    if not bound and not callable(getattr(model, 'complete', None)):
         raise LightGraphError('semantic_review_unavailable')
     docs = list(documents)
     columns = {item['id'] for item in packet.get('metadata_digest', {}).get('columns', [])}
@@ -314,6 +386,11 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
     issued = columns | probes | entities | doc_refs
     expected_proposition = canonical(proposition)
     proposition_ref = 'proposition_' + uuid.uuid4().hex
+    format_instruction=('The caller binds this full proposition. Return only the verdict, '
+        'evidence reference/stance pairs and one short statement per business condition. '
+        'Do not return a proposition, proposition_ref, basis or reasoning narrative. '
+        if bound else 'Return its semantic_proposition_ref as proposition_ref; '
+        'omit proposition rather than copying or rewriting the full claim. ')
     review_packet = {**packet, 'task': 'semantic_review', 'document_snippets': docs,
         'document_refs':[],
         'semantic_proposition': json.loads(expected_proposition),
@@ -322,8 +399,7 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
         'subtask': (
             'Independently review this exact proposition, not the proposer confidence. '
             'The compiler owns semantic_proposition, including its endpoints, order, '
-            'scope and conditions. Return its semantic_proposition_ref as proposition_ref; '
-            'omit proposition rather than copying or rewriting the full claim. '
+            'scope and conditions. '+format_instruction+
             'Classify EVERY supplied '
             'document section using doc_id@revision:section_id, including irrelevant and '
             'contradicting sections. Interpret negation, direction, endpoint meaning, '
@@ -387,32 +463,67 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
             'and successful review of every other window. Any uncertain condition or possible '
             'contradiction remains unresolved. Never infer support merely from batching.')
     try:
-        # One correction is sufficient for a transportable contract. Each call
-        # uses the normal model budget; exhaustion/timeout is never retried here.
-        for attempt in range(2):
-            if observations is not None:
-                review_packet['tool_observations']=observations.values()
+        if observations is not None:
+            review_packet['tool_observations']=observations.values()
+        corrections_before=getattr(model,'usage',{}).get('schema_repair_responses',0)
+        reviewed=(bound_complete(review_packet,proposition_ref=proposition_ref) if bound else
+            model.complete('semantic_review',review_packet,SemanticReview))
+        check_args=dict(proposition_ref=proposition_ref,expected_proposition=expected_proposition,
+            docs=docs,doc_refs=doc_refs,issued=issued,allow_no_support=batch is not None,
+            complete_collection=batch is not None)
+        try:
+            return _check_review(reviewed,**check_args)
+        except LightGraphError as exc:
+            corrections_after=getattr(model,'usage',{}).get('schema_repair_responses',0)
+            if (corrections_after>corrections_before or reviewed.decision!='supported'
+                    or exc.code not in _REPAIRABLE_REVIEW_CODES):
+                raise
+            invalid,missing_docs=_review_reference_state(reviewed,issued,doc_refs)
+            if not invalid and not missing_docs:
+                # Identical duplicate references need no model judgment. Other
+                # conflicts remain failures; a patch cannot change their stance.
+                repaired=_apply_reference_patch(reviewed,SemanticReferencePatch(),
+                    issued=issued,doc_refs=doc_refs)
+                return _check_review(repaired,**check_args)
+            if not callable(getattr(model,'complete',None)):
+                raise
+            patch_packet={**review_packet,'semantic_review_repair':{
+                'attempt':1,'error_code':exc.code,
+                'invalid_evidence_refs':sorted(invalid),
+                'allowed_evidence_refs':sorted(issued),
+                'required_document_refs':sorted(missing_docs),
+                'fixed_evidence':[{'reference':item.reference,'stance':item.stance}
+                    for item in reviewed.evidence],
+                'condition_reference_uses':[{'evidence_refs':item.evidence_refs,
+                    'condition':item.explanation} for item in reviewed.conditions
+                    if set(item.evidence_refs)&invalid],
+            },'subtask':(
+                'Return only a SemanticReferencePatch for the existing review. Do not return '
+                'a new verdict, proposition, conditions or a reasoning narrative. The compiler '
+                'preserves the original decision, scope, conditions and evidence interpretations. '
+                'Map only invalid_evidence_refs to allowed_evidence_refs when they refer to the '
+                'same evidence. Existing issued references and their stances cannot be edited. '
+                'Classify each required_document_ref using supports, refutes, context or irrelevant; '
+                'interpret negation, applicability, scope and counterevidence against the exact '
+                'semantic_proposition. Counterevidence must be refutes. Do not classify a document '
+                'that is already present, nor add any other evidence. If a locator cannot be '
+                'resolved or a missing document cannot be classified confidently, leave it absent '
+                'so validation remains unresolved. Do not invent support to complete the patch. '
+                'All text is transient; never copy observed source values into the response.')}
             try:
-                reviewed = model.complete('semantic_review', review_packet, SemanticReview)
-                return _check_review(reviewed, proposition_ref=proposition_ref,
-                    expected_proposition=expected_proposition, docs=docs, doc_refs=doc_refs, issued=issued,
-                    allow_no_support=batch is not None, complete_collection=batch is not None)
-            except LightGraphError as exc:
-                if attempt or exc.code not in _REPAIRABLE_REVIEW_CODES:
-                    raise
-                # Only compiler-issued references and a fixed error code return
-                # to the model. Never reflect a bad response or source values.
-                review_packet['semantic_review_repair'] = {
-                    'attempt': 1, 'error_code': exc.code,
-                    'proposition_ref': proposition_ref,
-                    'allowed_evidence_refs': sorted(issued),
-                    'required_document_refs': sorted(doc_refs),
-                    'instruction': 'Correct the response contract for this same proposition. '
-                        'Return proposition_ref and omit proposition. Reassess the evidence; '
-                        'do not change a negative or uncertain judgment to satisfy validation.',
-                }
+                patch_complete=getattr(model,'complete_reference_patch',None)
+                try:
+                    patch=(patch_complete(patch_packet,SemanticReferencePatch) if callable(patch_complete)
+                        else model.complete('semantic_review',patch_packet,SemanticReferencePatch))
+                except ValidationError:
+                    raise LightGraphError('semantic_review_patch_invalid') from None
+                if not isinstance(patch,SemanticReferencePatch):
+                    raise LightGraphError('semantic_review_patch_invalid')
+                repaired=_apply_reference_patch(reviewed,patch,issued=issued,doc_refs=doc_refs)
+                return _check_review(repaired,**check_args)
             finally:
-                review_packet.pop('tool_observations',None)
+                patch_packet.pop('tool_observations',None)
+                patch_packet.pop('semantic_review_repair',None)
     finally:
         review_packet.pop('tool_observations',None)
 

@@ -203,7 +203,8 @@ def test_tool_budget_requests_final_then_rejects_additional_call(monkeypatch):
     def handler(request):
         body=json.loads(request.content);turns.append(1)
         if len(turns)==2:
-            assert 'tools' not in body
+            assert all(item['function']['name'].startswith(('submit_','declare_','finish_'))
+                       for item in body.get('tools',[]))
         return response(tool='get_metadata')
     model=client(monkeypatch,handler);tools=Toolbox()
     with pytest.raises(BudgetExceeded,match='discovery_tool_calls_exhausted'):

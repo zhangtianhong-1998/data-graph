@@ -17,6 +17,15 @@ from lightgraph.tests.test_discovery_agent import client, input_packet, response
 CANARY = 'UNKNOWN_FIELD_SOURCE_VALUE_4926'
 
 
+def legacy_batch(model, packet, tools):
+    """Exercise the legacy batch transport; AgentScope now submits one draft per tool."""
+    try:
+        return model.complete(packet['task'], packet, ProposalBatch)
+    finally:
+        tools.close()
+
+
+
 def malformed_hierarchy():
     return {'task': 'T1_table_discovery', 'proposals': [{'kind': 'wide_hierarchy',
         'claim': {'group_id': 'tree', 'levels': [{'position': 1, 'key': 'c_a'},
@@ -53,7 +62,7 @@ def test_extra_fields_get_directed_correction_preserving_candidate_and_budget(mo
         reservations.append(cost); reserve(identifier, cost)
     model.budget.reserve = record_reservation
     tools = Toolbox()
-    result = model.explore(input_packet(), tools)
+    result = legacy_batch(model, input_packet(), tools)
     assert result == ProposalBatch.model_validate(corrected_hierarchy(original))
     assert raw == original and tools.closed and not tools.executed
     assert len(calls) == model.usage['calls'] == 2
@@ -77,7 +86,7 @@ def test_unknown_field_values_are_absent_from_diagnostics_and_failures(monkeypat
         return response(raw)
     model = client(monkeypatch, handler); tools = Toolbox()
     with pytest.raises(LightGraphError, match='llm_schema_invalid') as caught:
-        model.explore(input_packet(), tools)
+        legacy_batch(model, input_packet(), tools)
     assert len(calls) == 2 and tools.closed
     assert CANARY not in str(caught.value) + json.dumps(model.usage) + capsys.readouterr().out + caplog.text
     assert not list(tmp_path.iterdir()) and model.budget.snapshot()['reserved'] == {}
@@ -118,7 +127,7 @@ def test_schema_correction_cannot_execute_a_tool(monkeypatch):
         return response(malformed_hierarchy()) if len(calls) == 1 else response(tool='get_metadata')
     model = client(monkeypatch, handler); tools = Toolbox()
     with pytest.raises(LightGraphError, match='llm_schema_invalid'):
-        model.explore(input_packet(), tools)
+        legacy_batch(model, input_packet(), tools)
     assert len(calls) == 2 and not tools.executed and tools.closed
 
 
@@ -139,7 +148,7 @@ def test_schema_correction_stays_within_original_limits(monkeypatch, constraint)
     code = {'calls': 'llm_calls_budget_exhausted', 'prompt': 'model_packet_too_large',
             'tokens': 'llm_tokens_budget_exhausted'}[constraint]
     with pytest.raises((LightGraphError, BudgetExceeded), match=code):
-        model.explore(input_packet(), tools)
+        legacy_batch(model, input_packet(), tools)
     assert len(calls) == model.usage['calls'] == 1 and tools.closed
     assert model.budget.snapshot()['reserved'] == {}
 
@@ -185,7 +194,7 @@ def test_schema_correction_cannot_change_claims_or_valid_siblings(monkeypatch, c
         return response(original if len(calls) == 1 else corrected)
     model = client(monkeypatch, handler); tools = Toolbox()
     with pytest.raises(LightGraphError, match='llm_schema_invalid'):
-        if entrypoint == 'explore': model.explore(input_packet(), tools)
+        if entrypoint == 'explore': legacy_batch(model, input_packet(), tools)
         else: model.propose(input_packet())
     assert len(calls) == 2 and not tools.executed
     assert model.usage.get('schema_repairs_succeeded', 0) == 0
@@ -204,7 +213,7 @@ def test_schema_correction_cannot_guess_unknown_evidence_semantics(monkeypatch):
         return response(original if len(calls) == 1 else corrected)
     model = client(monkeypatch, handler)
     with pytest.raises(LightGraphError, match='llm_schema_invalid'):
-        model.explore(input_packet(), Toolbox())
+        legacy_batch(model, input_packet(), Toolbox())
     assert len(calls) == 2 and model.usage.get('schema_repairs_succeeded', 0) == 0
 
 
@@ -216,7 +225,7 @@ def test_unverifiable_schema_correction_can_abstain_from_whole_batch(monkeypatch
         calls.append(1)
         return response(original if len(calls) == 1 else {'task': original['task'], 'abstain': True})
     model = client(monkeypatch, handler)
-    result = model.explore(input_packet(), Toolbox())
+    result = legacy_batch(model, input_packet(), Toolbox())
     assert result.abstain and not result.proposals
     assert model.usage['schema_repair_abstentions'] == 1
     assert model.usage.get('schema_repairs_succeeded', 0) == 0
@@ -230,7 +239,7 @@ def test_unparseable_candidate_can_only_abstain_in_requested_task(monkeypatch):
             return httpx.Response(200, json={'choices': [{'message': {'content': 'not parseable JSON'}}]})
         return response({'task': 'T1_table_discovery', 'abstain': True})
     model = client(monkeypatch, handler)
-    result = model.explore(input_packet(), Toolbox())
+    result = legacy_batch(model, input_packet(), Toolbox())
     assert result.abstain and not result.proposals
     assert model.usage['schema_repair_abstentions'] == 1
     assert model.usage.get('schema_repairs_succeeded', 0) == 0
@@ -250,7 +259,7 @@ def test_correction_transport_failure_cannot_start_an_unconstrained_attempt(monk
         return response(changed)
     model = client(monkeypatch, handler)
     with pytest.raises(LightGraphError, match='model_http_error'):
-        model.explore(input_packet(), Toolbox())
+        legacy_batch(model, input_packet(), Toolbox())
     assert len(calls) == 2 and model.usage['schema_repair_attempts'] == 1
     assert model.usage.get('schema_repairs_succeeded', 0) == 0
     assert model.budget.snapshot()['reserved'] == {}
@@ -294,7 +303,7 @@ def test_only_invalid_slots_are_repaired_without_losing_valid_hierarchy_or_exclu
             assert 'tools' not in body
         return response(original if len(calls) == 1 else corrected)
     model = client(monkeypatch, handler)
-    result = (model.explore(input_packet(), Toolbox()) if entrypoint == 'explore' else model.propose(input_packet()))
+    result = (legacy_batch(model, input_packet(), Toolbox()) if entrypoint == 'explore' else model.propose(input_packet()))
     assert result == ProposalBatch.model_validate(corrected)
     assert [p.kind for p in result.proposals] == ['wide_hierarchy', 'exclusion', 'column_group']
     assert len(calls) == 2 and model.usage['schema_repairs_succeeded'] == 1
@@ -324,7 +333,7 @@ def test_invalid_slot_permission_cannot_change_other_meaning(monkeypatch, change
         return response(original if len(calls) == 1 else corrected)
     model = client(monkeypatch, handler)
     with pytest.raises(LightGraphError, match='llm_schema_invalid'):
-        model.explore(input_packet(), Toolbox())
+        legacy_batch(model, input_packet(), Toolbox())
     assert len(calls) == 2 and model.usage.get('schema_repairs_succeeded', 0) == 0
 
 
@@ -337,7 +346,7 @@ def test_appending_hierarchy_level_cannot_replace_existing_level(monkeypatch):
         return response(original if len(calls) == 1 else corrected)
     model = client(monkeypatch, handler)
     with pytest.raises(LightGraphError, match='llm_schema_invalid'):
-        model.explore(input_packet(), Toolbox())
+        legacy_batch(model, input_packet(), Toolbox())
     assert len(calls) == 2
 
 
@@ -348,7 +357,7 @@ def test_repair_can_reorder_but_not_remove_issued_evidence(monkeypatch):
     def handler(request):
         calls.append(1)
         return response(original if len(calls) == 1 else corrected)
-    result = client(monkeypatch, handler).explore(input_packet(), Toolbox())
+    result = legacy_batch(client(monkeypatch, handler), input_packet(), Toolbox())
     assert result.proposals[0].evidence_cited == ['c_b', 'c_a']
 
 
@@ -383,12 +392,13 @@ def test_later_schema_errors_cannot_expand_first_invalid_slot_plan(monkeypatch):
     # constructor's one-retry maximum or making any network call.
     model.config.retries = 2
     with pytest.raises(LightGraphError, match='llm_schema_invalid'):
-        model.explore(input_packet(), Toolbox())
+        legacy_batch(model, input_packet(), Toolbox())
     assert len(calls) == 3 and model.usage.get('schema_repairs_succeeded', 0) == 0
 
 
 @pytest.mark.parametrize('change', ['none', 'remove_condition', 'change_condition_explanation'])
 def test_missing_review_slot_never_unlocks_existing_conditions(monkeypatch, change):
+    from types import SimpleNamespace
     calls = []
     def handler(request):
         body = json.loads(request.content); calls.append(body)
@@ -402,7 +412,9 @@ def test_missing_review_slot_never_unlocks_existing_conditions(monkeypatch, chan
             if change == 'remove_condition': answer['conditions'] = []
             if change == 'change_condition_explanation': answer['conditions'][0]['explanation'] = ''
         return response(answer)
-    model = client(monkeypatch, handler)
+    # This fixture exercises an older client whose response has a required
+    # basis. The production compact protocol has no model-authored basis.
+    model = SimpleNamespace(complete=client(monkeypatch, handler).complete)
     if change == 'none':
         assert review_semantics(model, {'probe_digest': [{'probe_id': 'probe_1'}]}, {'kind': 'wide_hierarchy'}, [])
     else:

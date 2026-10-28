@@ -45,6 +45,7 @@ class GuardedToolkit(Toolkit):
             "lightgraph_tool_budget_failure", default=None,
         )
         self._argument_validators: dict[str, Draft202012Validator] = {}
+        self.invalid_argument_handler = None
 
     def _valid_arguments(self, name: str, arguments: Any) -> bool:
         """Validate without formatting JSON Schema errors containing source data."""
@@ -71,6 +72,8 @@ class GuardedToolkit(Toolkit):
                 return
             arguments = tool_call.get("input", {})
             if not self._valid_arguments(name, arguments):
+                if self.invalid_argument_handler is not None:
+                    self.invalid_argument_handler(name)
                 yield _error("invalid_tool_arguments", name)
                 return
             failures: list[BudgetExceeded] = []

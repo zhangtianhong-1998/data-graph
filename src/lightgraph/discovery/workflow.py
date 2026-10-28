@@ -69,6 +69,22 @@ def _issue(result, table, code, *, count=None):
     result.issues.append(entry)
 
 
+def _record_submission_state(result, table, batch):
+    """Keep valid drafts while reporting an unfinished Agent submission truthfully."""
+    allowed = {'discovery_submission_incomplete', 'discovery_submission_pending',
+               'discovery_invalid_drafts'}
+    pending = set(getattr(batch, '_runtime_pending_codes', ())) & allowed
+    invalid = getattr(batch, '_runtime_invalid_drafts', 0)
+    invalid = invalid if type(invalid) is int and invalid >= 0 else 0
+    if invalid:
+        pending.add('discovery_invalid_drafts')
+        result.stats['discovery_invalid_drafts'] = result.stats.get('discovery_invalid_drafts', 0) + invalid
+    for code in sorted(pending):
+        result.issues.append({'table': table.qualified_name, 'code': code, 'status': 'deferred'})
+    if pending:
+        result.stats['discovery_pending_submissions'] = result.stats.get('discovery_pending_submissions', 0) + 1
+
+
 def _preflight(rule, goal):
     """Check the same output contract as execution without registering anything."""
     from lightgraph.store.policy import PersistencePolicy, KINDS
@@ -377,6 +393,7 @@ def _compile_with_repairs(batch,table,goal,docs,result,*,model,packet,observatio
         tools=tool_factory()
         try:
             batch=_ask(model,packet,tools,observations)
+            _record_submission_state(result, table, batch)
             docs=tools.context_documents()
         except LightGraphError as exc:
             _issue(result,table,exc.code)
@@ -537,6 +554,7 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                 allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=window)
             batch=_ask(model,packet,tools,observations)
+            _record_submission_state(result, table, batch)
             docs=tools.context_documents()
             understanding.document_refs=sorted({d['doc_id']+'@'+d['revision'] for d in docs})
             budget.release(reservation)
@@ -586,6 +604,7 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
                     observations.clear()
                     try:
                         revised_batch=_ask(model,revision,tools,observations)
+                        _record_submission_state(result, table, revised_batch)
                         docs=tools.context_documents()
                     except LightGraphError as exc:
                         # This rule failed FD validation. A failed repair cannot
@@ -702,6 +721,7 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                 allow_source_samples=getattr(model.config,'allow_source_samples',False),
                 allowed_tables=tool_tables,source_adapters=source_adapters)
             batch=_ask(model,packet,tools,observations)
+            _record_submission_state(result, table, batch)
             docs=tools.context_documents()
             if batch.abstain:_issue(result,table,'model_abstained')
             elif not batch.proposals:_issue(result,table,'no_confirmable_relation')
@@ -736,6 +756,7 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                         allow_source_samples=getattr(model.config,'allow_source_samples',False),
                         allowed_tables=tool_tables,source_adapters=source_adapters)
                     batch=_ask(model,packet,tools,observations)
+                    _record_submission_state(result, table, batch)
                     docs=tools.context_documents()
                 lookup={_column_id(table,c.name):c.name for c in table.columns}
                 for proposal in batch.proposals:
@@ -853,6 +874,7 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                     allowed_tables=tool_tables,source_adapters=source_adapters)
                 try:
                     batch=_ask(model,packet,tools,observations)
+                    _record_submission_state(result, table, batch)
                     docs=tools.context_documents()
                 except LightGraphError:
                     for _,code in failures:_issue(result,table,code)

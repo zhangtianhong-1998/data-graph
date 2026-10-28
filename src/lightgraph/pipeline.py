@@ -11,7 +11,7 @@ from .rules import RuleEngine
 from .metadata import publish_metadata
 from .runtime.retention import write_report,write_rules,atomic_text
 
-DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/8'
+DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/9'
 
 # These failures mean the Agent never completed an interpretation. They are not
 # permission to retry within a turn; leave the table pending for a later run.
@@ -64,7 +64,8 @@ def _deferred_tables(result, selected=()):
 
 
 def _discovery_counts(report, result):
-    for key in ('compile_repair_rounds', 'recovered_proposals', 'deferred_proposals'):
+    for key in ('compile_repair_rounds', 'recovered_proposals', 'deferred_proposals',
+                'discovery_invalid_drafts', 'discovery_pending_submissions'):
         value = result.stats.get(key, 0)
         if type(value) is int:
             report.counts[key] = report.counts.get(key, 0) + value

@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from lightgraph.discovery.budget import BudgetAllocator, Cost
-from lightgraph.discovery.llm import ModelConfig, StructuredModelClient
+from lightgraph.discovery.llm import ModelConfig, StructuredModelClient, _stream_transport_limit
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.tests.test_discovery_agent import Toolbox, final, input_packet
 
@@ -167,10 +167,70 @@ def test_malformed_complete_tool_arguments_are_not_executed():
 
 def test_total_stream_limit_counts_ignored_comments_after_done():
     value=wire({'content':'{"ok":true}'})
-    client=model(lambda request:streamed(value+b': '+CANARY.encode()*30+b'\n'),
-                 max_response_bytes=len(value)+10,response_format='json_object')
+    limit=_stream_transport_limit(64,1)
+    flood=value+(b': ignored heartbeat\n'*(limit//20+1))
+    assert len(flood)>limit
+    client=model(lambda request:httpx.Response(200,stream=Chunks(flood,size=8192)),
+                 max_response_bytes=64,max_output_tokens=1,response_format='json_object')
     parsed=[]
-    with pytest.raises(LightGraphError,match='model_response_too_large'):
+    with pytest.raises(LightGraphError,match='model_stream_transport_too_large'):
+        client._request([],lambda message:parsed.append(message))
+    assert parsed==[] and client.budget.snapshot()['reserved']=={}
+
+
+@pytest.mark.parametrize('response_budget',[4096,1048576])
+def test_compact_response_survives_large_reasoning_and_sse_framing_without_retaining_it(response_budget,capsys,caplog):
+    content=json.dumps({'decision':'supported','evidence':[],'conditions':[]})
+    reasoning=event({'id':'provider-event','object':'chat.completion.chunk',
+        **delta({'reasoning_content':CANARY,'reasoning':CANARY})})*8192
+    value=reasoning+wire({'content':content})
+    assert len(value)>1048576 and len(content.encode())<response_budget
+    client=model(lambda request:httpx.Response(200,stream=Chunks(value,size=8192)),
+        max_response_bytes=response_budget,max_output_tokens=16384,response_format='json_object')
+    result=client._request([],lambda message:message)
+    assert result=={'role':'assistant','content':content}
+    assert CANARY not in str(result)+str(client.usage)+capsys.readouterr().out+caplog.text
+    assert set(vars(client))=={'config','budget','transport','usage'}
+    assert client.usage['calls']==1 and client.budget.snapshot()['reserved']=={}
+
+
+@pytest.mark.parametrize('overflow',[False,True])
+def test_decoded_unicode_content_uses_actual_utf8_budget_without_truncation(overflow):
+    content=json.dumps({'text':'秘密\\"'},ensure_ascii=False)
+    client=model(lambda request:streamed(wire({'content':content})),
+        max_response_bytes=len(content.encode())-int(overflow),response_format='json_object')
+    parsed=[]
+    if overflow:
+        with pytest.raises(LightGraphError,match='model_response_too_large'):
+            client._request([],lambda message:parsed.append(message))
+        assert not parsed
+    else:assert client._request([],lambda message:message)['content']==content
+
+
+@pytest.mark.parametrize('overflow',[False,True])
+def test_all_actionable_tool_strings_share_the_decoded_response_budget(overflow):
+    call={'id':'call-one','type':'function','function':{
+        'name':'get_metadata','arguments':json.dumps({'query':'秘密'},ensure_ascii=False)}}
+    size=sum(len(text.encode()) for text in (call['id'],*call['function'].values()))
+    client=model(lambda request:streamed(wire({'tool_calls':[call]})),
+        max_response_bytes=size-int(overflow),response_format='json_object')
+    parsed=[]
+    if overflow:
+        with pytest.raises(LightGraphError,match='model_response_too_large'):
+            client._request([],lambda message:parsed.append(message))
+        assert not parsed
+    else:assert client._request([],lambda message:message)['tool_calls']==[call]
+
+
+@pytest.mark.parametrize('multiline',[False,True])
+def test_single_incomplete_sse_event_cannot_accumulate_the_transport_budget(multiline):
+    event_limit=6*128+65536
+    value=(b'data: '+b'x'*1024+b'\n')*65 if multiline else b'data: '+b'x'*(event_limit+1)
+    assert len(value)<_stream_transport_limit(128,1)
+    client=model(lambda request:httpx.Response(200,stream=Chunks(value,size=4096)),
+        max_response_bytes=128,max_output_tokens=1,response_format='json_object')
+    parsed=[]
+    with pytest.raises(LightGraphError,match='model_stream_event_too_large'):
         client._request([],lambda message:parsed.append(message))
     assert parsed==[] and client.budget.snapshot()['reserved']=={}
 
@@ -190,6 +250,24 @@ def test_stream_deadline_checks_each_chunk(monkeypatch):
     with pytest.raises(BudgetExceeded,match='wall_time_budget_exhausted'):
         client._request([],lambda message:parsed.append(message))
     assert parsed==[] and allocation.snapshot()['reserved']=={}
+
+
+def test_slow_drip_checks_deadline_before_httpx_can_accumulate_a_large_chunk(monkeypatch):
+    now=[100.0];received=[]
+    monkeypatch.setattr('lightgraph.discovery.budget.time.monotonic',lambda:now[0])
+    allocation=BudgetAllocator(Cost(llm_calls=10,llm_tokens=1000000,seconds=1))
+    class SlowDrip(httpx.SyncByteStream):
+        def __iter__(self):
+            for index in range(100):
+                now[0]+=.4;received.append(index)
+                yield b': heartbeat\n'
+    client=model(lambda request:httpx.Response(200,stream=SlowDrip()),budget=allocation,
+        response_format='json_object')
+    parsed=[]
+    with pytest.raises(BudgetExceeded,match='wall_time_budget_exhausted'):
+        client._request([],lambda message:parsed.append(message))
+    assert received==[0,1,2] and parsed==[]
+    assert allocation.snapshot()['reserved']=={}
 
 
 def test_schema_retry_preserves_stream_mode_and_charges_each_attempt():

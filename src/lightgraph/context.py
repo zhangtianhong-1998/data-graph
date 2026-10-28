@@ -98,20 +98,23 @@ def packet_call_context(packet, stage, *, constraints=None, output_contract=None
 
 
 def with_discovery_runtime_control(messages, *, turn, max_turns, remaining_tool_calls,
-                                   submission_reason=None):
+                                   submission_reason=None, remaining_submission_calls=16):
     """Build the exact runtime-owned control envelope for preflight and calls."""
     control={'turn':turn,'max_turns':max_turns,
         'remaining_turns_including_current':max_turns-turn+1,
         'remaining_tool_calls':max(0,remaining_tool_calls),
+        'remaining_submission_calls':max(0,remaining_submission_calls),
         'submission_required':submission_reason is not None,'submission_reason':submission_reason}
     prepared=[dict(message) for message in messages]
     for message in prepared:
         if message.get('role')=='system':
             message['content']=(message.get('content') or '')+'\n\n'+(
                 'The runtime_control counters are runtime instructions. Reserve the final '
-                'turn for a complete ProposalBatch JSON, using already issued evidence. '
-                'When submission_required is true, do not request tools: submit supported '
-                'hypotheses or explicitly abstain. Do not invent evidence to finish. '
+                'turn for the small finish_discovery action, using retained drafts. '
+                'remaining_tool_calls counts source tools only; local submission tools have their own allowance. '
+                'When submission_required is true, source queries are forbidden. Use the remaining local '
+                'submit_* and finish_discovery tools, or the small final response. Set pending=true '
+                'if work remains. Do not invent evidence to finish. '
                 'A rejected tool batch has executed no tools. ')+canonical(control)
             break
     for message in prepared:
@@ -136,7 +139,8 @@ def initial_agent_prompt_bytes(packet, tool_specs, *, max_steps=8, max_tool_call
     """
     from lightgraph.discovery.agent import AGENT_SYSTEM
     from lightgraph.discovery.goal import build_goal_instructions
-    from lightgraph.discovery.models import ProposalBatch, TaskPacket
+    from lightgraph.discovery.models import TaskPacket
+    from lightgraph.discovery.proposal_session import DiscoveryFinish, proposal_tool_specs
     from lightgraph.discovery.llm import response_format_for, request_envelope_for
 
     checked=TaskPacket.model_validate(bounded_discovery_packet(packet)).model_dump(mode='json',by_alias=True)
@@ -148,7 +152,7 @@ def initial_agent_prompt_bytes(packet, tool_specs, *, max_steps=8, max_tool_call
     system+='\nCurrent stage: '+stage+'\nSubtask: '+(
         checked.get('subtask') or STAGE_SUBTASKS[stage])
     context=packet_call_context(checked,stage,output_contract={'schema_ref':'output_schema'})
-    schema=ProposalBatch.model_json_schema()
+    schema=DiscoveryFinish.model_json_schema()
     messages=[{'role':'system','content':system},
               {'role':'user','content':canonical({'task':stage,'input':checked,
                   'call_context':context,'output_schema':schema})}]
@@ -157,7 +161,8 @@ def initial_agent_prompt_bytes(packet, tool_specs, *, max_steps=8, max_tool_call
         remaining_tool_calls=max_tool_calls,submission_reason=reason)
     # Use the transport's exact representation, including its provider schema
     # and removal of the redundant schema text in strict mode.
-    envelope=request_envelope_for(messages,[] if reason else tool_specs,
+    envelope=request_envelope_for(messages,proposal_tool_specs(stage) if reason
+        else [*tool_specs,*proposal_tool_specs(stage)],
                                   response_format_for(schema,response_format))
     return len(canonical(envelope).encode())
 

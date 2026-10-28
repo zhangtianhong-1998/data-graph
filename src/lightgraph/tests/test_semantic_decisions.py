@@ -100,7 +100,8 @@ def review_fixture():
 ])
 def test_semantic_review_rejects_structurally_invalid_or_unresolved_claim(change,code):
     docs,packet,proposition,review=review_fixture();change(review)
-    model=SimpleNamespace(complete=lambda *args:SemanticReview.model_validate(review))
+    model=SimpleNamespace(complete=lambda task,payload,schema:
+        schema.model_validate(review if schema is SemanticReview else {}))
     with pytest.raises(LightGraphError,match=code):review_semantics(model,packet,proposition,docs)
 
 

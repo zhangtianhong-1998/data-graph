@@ -61,11 +61,14 @@ def test_repair_wide_table_then_discover_hierarchy_to_center_parallel_relations(
             fixed['proposals']=fixed['proposals'][1:]
             return response(fixed)
         if packet['task']=='semantic_review':
-            if packet['semantic_proposition'].get('kind')=='wide_hierarchy' and 'semantic_review_repair' not in packet:
-                echo=deepcopy(packet['semantic_proposition'])
-                echo['claim'].pop('gap_policy')
-                return response({'proposition':echo, 'decision':'supported', 'basis':'data_inference',
-                    'evidence':[{'reference':packet['metadata_digest']['columns'][0]['id'], 'stance':'supports'}]})
+            if 'semantic_review_repair' in packet:
+                return response({'replacements':[{'invalid_reference':'unissued_column',
+                    'issued_reference':packet['metadata_digest']['columns'][0]['id']}],
+                    'document_classifications':[]})
+            if packet['semantic_proposition'].get('kind')=='wide_hierarchy':
+                return response({'proposition_ref':packet['semantic_proposition_ref'],
+                    'decision':'supported', 'basis':'data_inference',
+                    'evidence':[{'reference':'unissued_column', 'stance':'supports'}]})
             return response({'proposition_ref':packet['semantic_proposition_ref'], 'decision':'supported',
                 'basis':'data_inference', 'evidence':[{
                     'reference':packet['metadata_digest']['columns'][0]['id'], 'stance':'supports'}]})

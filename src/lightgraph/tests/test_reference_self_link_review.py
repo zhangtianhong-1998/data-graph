@@ -104,7 +104,9 @@ def test_legacy_echo_cannot_review_a_different_reflexive_policy(monkeypatch):
         assert not result.rules
         assert any(issue['code']=='semantic_review_proposition_mismatch' for issue in result.issues)
         assert not store.view({'public'})['edges']
-    assert [p['task'] for p in packets]==['T2_cross_table','semantic_review','semantic_review']
+    # A review of a different permission is rejected immediately; locator
+    # patches cannot change the proposition or solicit another semantic vote.
+    assert [p['task'] for p in packets]==['T2_cross_table','semantic_review']
 
 
 def test_builtin_relation_review_uses_actual_closed_contract():

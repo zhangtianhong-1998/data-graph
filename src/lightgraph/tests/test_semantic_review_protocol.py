@@ -36,25 +36,18 @@ def test_five_level_claim_is_reviewed_by_reference_without_model_echo(monkeypatc
     assert len(seen) == model.usage['calls'] == 1 and claim == original
 
 
-def test_omitted_legacy_default_gets_one_directed_contract_correction(monkeypatch):
-    seen = []
-    proposition = {'predicate': 'parent_of', 'source': 'L1', 'target': 'L2',
-                   'conditions': {}, 'gap_policy': 'split'}
+def test_omitted_legacy_default_is_not_rebound_as_a_locator_patch(monkeypatch):
+    seen=[]
+    proposition={'predicate':'parent_of','source':'L1','target':'L2','gap_policy':'split'}
     def handler(request):
-        _, packet = input_packet(request); seen.append(packet)
-        if len(seen) == 1:
-            echo = dict(packet['semantic_proposition']); echo.pop('gap_policy')
-            return response({'proposition': echo, 'decision': 'supported', 'basis': 'data_inference',
-                             'evidence': [{'reference': 'probe_1', 'stance': 'supports'}]})
-        repair = packet['semantic_review_repair']
-        assert repair['error_code'] == 'semantic_review_proposition_mismatch'
-        assert repair['allowed_evidence_refs'] == ['probe_1']
-        assert packet['semantic_proposition'] == proposition
-        assert packet['semantic_proposition_ref'] == seen[0]['semantic_proposition_ref']
-        return response(reference_response(packet))
-    model = client(monkeypatch, handler)
-    assert review_semantics(model, {'probe_digest': [{'probe_id': 'probe_1'}]}, proposition, [])
-    assert len(seen) == model.usage['calls'] == 2
+        _,packet=input_packet(request);seen.append(packet)
+        echo=dict(packet['semantic_proposition']);echo.pop('gap_policy')
+        return response({'proposition':echo,'decision':'supported','basis':'data_inference',
+            'evidence':[{'reference':'probe_1','stance':'supports'}]})
+    model=client(monkeypatch,handler)
+    with pytest.raises(LightGraphError,match='semantic_review_proposition_mismatch'):
+        review_semantics(model,{'probe_digest':[{'probe_id':'probe_1'}]},proposition,[])
+    assert len(seen)==model.usage['calls']==1
 
 
 @pytest.mark.parametrize('change,code', [
@@ -74,7 +67,7 @@ def test_reference_never_accepts_wrong_binding_or_conflicting_echo(change, code)
     with pytest.raises(LightGraphError, match=code):
         review_semantics(SimpleNamespace(complete=complete),
             {'probe_digest': [{'probe_id': 'probe_1'}]}, {'source': 'A', 'target': 'B'}, [])
-    assert len(calls) == 2 and calls[0] == calls[1]
+    assert len(calls) == 1
 
 
 def test_a_previous_review_reference_cannot_be_replayed_for_reversed_endpoints():
@@ -90,7 +83,7 @@ def test_a_previous_review_reference_cannot_be_replayed_for_reversed_endpoints()
     assert review_semantics(model, packet, {'source': 'A', 'target': 'B'}, [])
     with pytest.raises(LightGraphError, match='semantic_review_reference_mismatch'):
         review_semantics(model, packet, {'source': 'B', 'target': 'A'}, [])
-    assert len(calls) == 3 and calls[0] != calls[1] == calls[2]
+    assert len(calls) == 2 and calls[0] != calls[1]
 
 
 @pytest.mark.parametrize('override,code', [
@@ -119,7 +112,7 @@ def test_repair_must_still_classify_all_documents_and_reject_denial():
         answer = reference_response(payload)
         if len(calls) == 2:
             assert payload['semantic_review_repair']['required_document_refs'] == ['context@1:rules']
-            answer['evidence'].append({'reference': 'context@1:rules', 'stance': 'refutes'})
+            answer={'document_classifications':[{'reference':'context@1:rules','stance':'refutes'}]}
         return schema.model_validate(answer)
     with pytest.raises(LightGraphError, match='semantic_claim_refuted'):
         review_semantics(SimpleNamespace(complete=complete), packet, proposition, docs)
@@ -130,7 +123,7 @@ def test_contract_correction_uses_existing_call_budget(monkeypatch):
     calls = []
     def handler(request):
         _, packet = input_packet(request); calls.append(packet)
-        return response(reference_response(packet, proposition_ref='wrong'))
+        return response(reference_response(packet,evidence=[{'reference':'not_issued','stance':'supports'}]))
     model = client(monkeypatch, handler)
     model.budget = BudgetAllocator(Cost(llm_calls=1, llm_tokens=1000000, seconds=60))
     with pytest.raises(BudgetExceeded, match='llm_calls_budget_exhausted'):
@@ -139,16 +132,17 @@ def test_contract_correction_uses_existing_call_budget(monkeypatch):
     assert model.budget.snapshot()['reserved'] == {}
 
 
-def test_bad_review_text_is_not_reflected_in_repair_or_accepted_result():
-    marker = 'PRIVATE_BAD_REVIEW_TEXT'; calls = []
-    def complete(task, packet, schema):
+def test_evidence_explanation_is_preserved_without_repeating_it_in_patch_prompt():
+    marker='PRIVATE_BAD_REVIEW_TEXT';calls=[]
+    def complete(task,packet,schema):
         calls.append(deepcopy(packet))
-        answer = reference_response(packet)
-        if len(calls) == 1:
-            answer['proposition_ref'] = marker
-            answer['evidence'][0]['explanation'] = marker
+        if len(calls)==2:
+            return schema.model_validate({'replacements':[
+                {'invalid_reference':'not_issued','issued_reference':'probe_1'}]})
+        answer=reference_response(packet,evidence=[
+            {'reference':'not_issued','stance':'supports','explanation':marker}])
         return schema.model_validate(answer)
-    refs = review_semantics(SimpleNamespace(complete=complete),
-        {'probe_digest': [{'probe_id': 'probe_1'}]}, {'predicate': 'parent_of'}, [])
-    assert marker not in str(calls) + str(refs)
-    assert len(calls) == 2
+    refs=review_semantics(SimpleNamespace(complete=complete),
+        {'probe_digest':[{'probe_id':'probe_1'}]},{'predicate':'parent_of'},[])
+    assert marker not in str(calls)+str(refs)
+    assert len(calls)==2

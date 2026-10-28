@@ -217,7 +217,7 @@ llm:
 
 `metadata_only` 只向模型提供授权元数据与相关知识文档；模型工具拒绝实例查询，包括统计、只读 SQL 和跨源核验。后续程序端的规则验证仍受来源权限和查询预算约束。`in_environment` 或 `approved_external` 表示相应数据使用条件已确认，允许发送经过列过滤、长度限制的内存样本。外部服务自身的日志与保留策略必须在客户环境验证；本地测试无法证明这一点。
 
-`max_discovery_steps` 限制单次探索的模型轮数（1～32），`max_tool_calls` 限制工具调用数（1～64）；全程仍受 `max_calls`、`max_tokens`、查询预算和运行截止时间约束。到达上限时保留覆盖缺口，不将未验证提案当作完成。`max_prompt_bytes`、`max_response_bytes` 和 `max_output_tokens` 分别限制请求、响应和生成长度。完整字段见配置示例及 [AgentConfig Schema](src/lightgraph/schemas/AgentConfig.schema.json)。
+`max_discovery_steps` 限制单次探索的模型轮数（1～32），`max_tool_calls` 限制源数据工具调用数（1～64）；全程仍受 `max_calls`、`max_tokens`、查询预算和运行截止时间约束。到达上限时保留覆盖缺口，不将未验证提案当作完成。`max_prompt_bytes`、`max_response_bytes` 和 `max_output_tokens` 分别限制请求、响应和生成长度。完整字段见配置示例及 [AgentConfig Schema](src/lightgraph/schemas/AgentConfig.schema.json)。
 
 具体调用路径和实现边界见 [AgentScope 接入设计](design/lightweight_graph/AGENTSCOPE_RUNTIME.md)。
 
@@ -227,9 +227,11 @@ llm:
 
 排查空图时，先看 `validation.business_graph` 和业务节点、边计数。只有元数据图不代表已生成业务图。若 `business_graph_reason` 为 `scope_filtered`，表示本次已发布的业务支持不在请求的结果范围中，应检查 `scopes` 是否包含已获授权的结果标签。当前规则把身份命名空间值同时用作这些标签；系统不会自动把它们加入可见范围，也不会在诊断中公开被过滤的值。结果范围不能替代数据库行权限。
 
+Agent 现在通过提交工具逐条保存内存草稿，再用简短的结束信号提交结果；单条提案失败不会清空其他草稿。层级计划只填写对象、列映射、身份范围、位置含义和关系选择，程序统一生成执行字段。源工具额度耗尽或进入最后一步后仍可提交本地草稿，本地提交最多 16 次、保留最多 6 条草稿。中途失败会标明发现未完成，只有通过原语义和完整数据验证的规则才可发布；显式全局弃权则撤回本轮草稿。语义复核由调用程序绑定原提案，模型无需抄写提案或引用编号，只返回判断、证据及条件。 引用补正只返回引用映射及缺失的文档分类，程序保留首答的结论和业务条件。流式传输分别限制实际回复内容、单个事件和总传输量，协议封装及推理事件不再占用实际回复的大小额度。
+
 需要取消 API 累计上限时，可把 `model.max_calls`、`model.max_tokens` 分别设为 `null`；默认上限和 `0` 的含义不变。每个 Agent 仍保留提交回合和无进展边界，SQL 权限、内存和运行超时继续生效。报告中的 `schema_repairs_succeeded`、`reference_repairs_succeeded` 和 `column_references_normalized` 分别记录格式纠正、引用纠正和精确列名规范的次数；这些过程不等于业务语义已确认。
 
-发现工作流升级到 `goal_driven_iterations/8` 后，旧发现缓存会重新审核。旧发布保留在历史中，不能绕过新的对象粒度和语义检查直接作为当前结果。
+发现工作流升级到 `goal_driven_iterations/9` 后，旧发现缓存会重新审核。旧发布保留在历史中，不能绕过新的对象粒度和语义检查直接作为当前结果。
 
 引用规则默认禁止实体指向自身。自定义关系确实允许反身语义时，须在关系定义中显式声明 `allow_self_links: true`，并通过独立语义复核；换一个关系名不会自动获得许可。升级后，缺少新版自环验证标记的旧引用发布会退出当前视图，下一次运行重新验证；正确的实体、宽层级及历史记录保留。已有合法缓存可直接重验，发现反例则进入关系复核。
 

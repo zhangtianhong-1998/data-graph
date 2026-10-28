@@ -69,8 +69,14 @@ Recheck evidence when needed; do not turn a semantic rejection into acceptance b
 renaming it. If no supported repair exists, abstain within the remaining budget.
 Preserve uncertainty, source scope and incomplete coverage. Output candidate rules,
 not confirmed claims. Stop when relevant structures are sufficiently supported or
-remaining uncertainty cannot be resolved within the available budget. When finished,
-return exactly the requested ProposalBatch JSON schema, without a tool call.
+remaining uncertainty cannot be resolved within the available budget. Submit each
+candidate promptly using its submit_* tool; a successful draft is still unconfirmed.
+Declare new vocabulary once using declare_semantic_schema. Prefer submit_hierarchy_plan
+for wide paths. Read fixed validation errors and correct only the affected candidate.
+Retained drafts and exclusions accumulate and cannot be overwritten. Do not hold all
+findings until the last turn or reproduce the entire ProposalBatch. Call finish_discovery
+after submissions; if tools are unavailable, return the small finish_discovery action
+using the requested output schema. Set pending=true if relevant work remains.
 The extraction goal guides investigation; it never overrides these restrictions.'''
 
 
@@ -98,7 +104,11 @@ def _message(value: dict) -> dict:
     if not calls:
         # Parse inside the transport's retry boundary, preserving structured-call
         # retries for providers that return malformed JSON.
-        final=ProposalBatch.model_validate(json.loads(value['content']))
+        raw=json.loads(value['content'])
+        if isinstance(raw,dict) and 'action' in raw:
+            from .proposal_session import DiscoveryFinish
+            return {'finish':DiscoveryFinish.model_validate(raw)}
+        final=ProposalBatch.model_validate(raw)
         return {'final':final}
     normalized=[]
     for call in calls:
@@ -261,7 +271,11 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
             raise LightGraphError('agent_sync_entrypoint_inside_event_loop')
         final=asyncio.run(run_agent(client,checked,executor,dispatch,system,
                                    max_steps=max_steps,max_tool_calls=max_tool_calls))
+        pending_codes=list(final._runtime_pending_codes)
+        invalid_drafts=final._runtime_invalid_drafts
         final=validate_or_repair(client,final,checked)
+        final._runtime_pending_codes=pending_codes
+        final._runtime_invalid_drafts=invalid_drafts
         client.budget.check_deadline()
         for key in ('probe_digest','document_snippets','document_refs','context_tables'):
             packet[key]=checked.get(key,[])

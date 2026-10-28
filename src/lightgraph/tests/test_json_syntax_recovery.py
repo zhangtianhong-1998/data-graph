@@ -11,7 +11,7 @@ from lightgraph.discovery.semantics import review_semantics
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.tests.test_discovery_agent import client, input_packet, Toolbox, response
 from lightgraph.tests.test_schema_protocol_correction import (malformed_hierarchy,
-    corrected_hierarchy, invalid_slot_batch)
+    corrected_hierarchy, invalid_slot_batch, legacy_batch)
 
 
 CANARY='UNRETAINED_JSON_TEXT_3629'
@@ -39,12 +39,13 @@ def candidate():
 
 
 @pytest.mark.parametrize('kind',['fence','bom','comma','control','combined'])
-def test_cosmetic_final_recovers_on_last_step_without_tools_or_extra_call(monkeypatch,kind,capsys,caplog):
+def test_cosmetic_legacy_final_recovers_on_last_step_without_source_tools_or_extra_call(monkeypatch,kind,capsys,caplog):
     value=candidate();calls=[]
     def handler(request):
         calls.append(1)
         body=json.loads(request.content)
-        assert not body.get('tools')
+        assert all(item['function']['name'].startswith(('submit_','declare_','finish_'))
+                   for item in body.get('tools',[]))
         return wire(decorate(value,kind))
     model=client(monkeypatch,handler);tools=Toolbox()
     checked=model.explore(input_packet(),tools,max_steps=1)
@@ -73,9 +74,9 @@ def test_cosmetic_recovery_then_schema_repair_locks_valid_siblings_and_exclusion
     model=client(monkeypatch,handler)
     if drop_exclusion:
         with pytest.raises(LightGraphError,match='llm_schema_invalid'):
-            model.explore(input_packet(),Toolbox(),max_steps=1)
+            legacy_batch(model,input_packet(),Toolbox())
     else:
-        assert model.explore(input_packet(),Toolbox(),max_steps=1)==ProposalBatch.model_validate(fixed)
+        assert legacy_batch(model,input_packet(),Toolbox())==ProposalBatch.model_validate(fixed)
     assert calls==[1,1] and model.usage['json_syntax_recoveries']==1
 
 

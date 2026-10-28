@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from lightgraph.contracts import canonical
 from lightgraph.discovery.llm import ModelConfig, response_format_for, request_envelope_for
 from lightgraph.discovery.models import ProposalBatch
+from lightgraph.discovery.proposal_session import DiscoveryFinish
 from lightgraph.discovery.semantics import review_semantics
 from lightgraph.errors import LightGraphError
 from lightgraph.pipeline import make_model
@@ -37,8 +38,8 @@ def test_mode_defaults_and_runtime_configuration_pass_through_without_secret_dum
     with pytest.raises(ValidationError):RuntimeModelConfig(response_format='auto')
 
 
-def test_full_untouched_schema_is_sent_on_tool_turn_and_final_submission(monkeypatch):
-    calls=[];schema=ProposalBatch.model_json_schema()
+def test_small_finish_schema_is_sent_while_submissions_remain_typed_tools(monkeypatch):
+    calls=[];schema=DiscoveryFinish.model_json_schema()
     def handler(request):
         body=json.loads(request.content);calls.append(body)
         assert_strict(body,schema)
@@ -47,12 +48,14 @@ def test_full_untouched_schema_is_sent_on_tool_turn_and_final_submission(monkeyp
         if len(calls)==1:
             assert body.get('tools')
             return response(tool='get_metadata')
-        assert not body.get('tools')
+        assert body.get('tools') and all(item['function']['name'].startswith(
+            ('submit_','declare_','finish_')) for item in body['tools'])
         return response(final())
     model=client(monkeypatch,handler);tools=Toolbox()
     assert model.explore(input_packet(),tools,max_steps=2).proposals
     assert len(calls)==2 and tools.executed==['get_metadata']
-    assert schema['allOf'] and schema['$defs']  # No unsupported-keyword stripping.
+    assert set(schema['properties'])=={'action','pending'}
+    assert calls[0]['tools'][0]['function']['name']=='get_metadata'
 
 
 def test_correction_uses_same_strict_schema_without_tool_definitions(monkeypatch):
@@ -64,7 +67,7 @@ def test_correction_uses_same_strict_schema_without_tool_definitions(monkeypatch
         assert not body.get('tools')
         return response(corrected_hierarchy(original))
     model=client(monkeypatch,handler)
-    assert model.explore(input_packet(),Toolbox()).proposals
+    assert model.complete('T1_table_discovery',input_packet(),ProposalBatch).proposals
     assert len(calls)==2 and model.usage['schema_repairs_succeeded']==1
 
 
@@ -82,7 +85,7 @@ def test_strict_semantic_response_still_rejects_negative_judgment(monkeypatch):
     calls=[]
     def handler(request):
         body=json.loads(request.content);calls.append(body)
-        assert body['response_format']['json_schema']['name']=='SemanticReview'
+        assert body['response_format']['json_schema']['name']=='BoundSemanticVerdict'
         packet=json.loads(body['messages'][1]['content'])['input']
         return response({'proposition_ref':packet['semantic_proposition_ref'],'decision':'refuted',
             'basis':'data_inference','evidence':[{'reference':'probe_1','stance':'refutes'}]})

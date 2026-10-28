@@ -13,6 +13,8 @@ from lightgraph.tests.test_agent_pipeline import client, group, input_packet, re
 @pytest.mark.parametrize("failure_code", [
     "model_stream_invalid",
     "model_stream_incomplete",
+    "model_stream_event_too_large",
+    "model_stream_transport_too_large",
     "agent_source_tracing_forbidden",
     "agent_source_persistence_forbidden",
     "agent_tracing_forbidden",
