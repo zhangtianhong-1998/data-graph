@@ -125,7 +125,7 @@ def test_real_runtime_stages_then_finishes_without_full_batch(finish_tool,framew
     bodies=[]
     def handler(request):
         body=json.loads(request.content);bodies.append(body)
-        assert body['response_format']['json_schema']['schema']==DiscoveryFinish.model_json_schema()
+        assert 'response_format' not in body  # Tool turns have no competing final-output contract.
         if len(bodies)==1:
             return response(tool='submit_column_group',args=group())
         assert json.loads(body['messages'][-1]['content'])['draft_id']=='draft_1'
@@ -151,10 +151,35 @@ def test_invalid_submission_recovers_next_tool_and_retains_valid_sibling(framewo
     client=model(handler,stream=False);tools=Toolbox()
     batch=client.explore(input_packet(),tools,max_steps=5)
     assert len(batch.proposals)==1 and batch._runtime_invalid_drafts==1
-    assert batch._runtime_pending_codes==['discovery_invalid_drafts']
+    assert batch._runtime_pending_codes==[]  # Explicit finish withdraws the rejected attempt.
     assert client.usage['calls']==3 and tools.executed==[]
     assert_cleared(framework_spy)
     assert CANARY not in capsys.readouterr().out+caplog.text
+
+
+def test_reserved_submission_window_allows_field_repair_before_final_turn(framework_spy):
+    controls=[]
+    def handler(request):
+        body=json.loads(request.content)
+        control=json.loads(body['messages'][1]['content'])['runtime_control']
+        controls.append(control)
+        if len(controls)<=2:
+            return response(tool='get_metadata' if len(controls)==1 else 'profile_columns')
+        names={item['function']['name'] for item in body['tools']}
+        assert names and not (names & {'get_metadata','profile_columns','execute_readonly_sql'})
+        if len(controls)==3:
+            assert control['submission_reason']=='submission_window'
+            return response(tool='submit_column_group',args={'claim':{'invalid':CANARY}})
+        assert control['submission_reason']=='last_turn'
+        feedback=json.loads(body['messages'][-1]['content'])
+        assert feedback['code']=='invalid_tool_arguments' and feedback['diagnostics']
+        return tools_response(('submit_column_group',group()),('finish_discovery',{}))
+    client=model(handler,stream=False);tools=Toolbox()
+    batch=client.explore(input_packet(),tools,max_steps=4,max_tool_calls=16)
+    assert len(batch.proposals)==1 and not batch._runtime_pending_codes
+    assert batch._runtime_invalid_drafts==1
+    assert client.usage['calls']==4 and tools.executed==['get_metadata','profile_columns']
+    assert_cleared(framework_spy)
 
 
 @pytest.mark.parametrize('failure',['malformed','transport','ignored_none','truncated','duplicate',

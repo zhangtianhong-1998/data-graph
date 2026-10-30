@@ -18,6 +18,7 @@ from .semantics import (declared_evidence, review_semantics, rule_evidence,
     hierarchy_identity_context, entity_granularity_identity, entity_granularity_context,
     entity_granularity_context_signatures, review_entity_granularity)
 from .observations import ReviewObservations
+from .semantic_revision import SemanticReviewFailure, candidate_record, revise_once
 from lightgraph.semantic_schema import SemanticSchema, EntityTypeDefinition
 from lightgraph.rules.endpoints import endpoint_columns
 from .repair import (REPAIRABLE_PROPOSAL_CODES, SEMANTIC_REVIEW_PROTOCOL_CODES,
@@ -77,7 +78,6 @@ def _record_submission_state(result, table, batch):
     invalid = getattr(batch, '_runtime_invalid_drafts', 0)
     invalid = invalid if type(invalid) is int and invalid >= 0 else 0
     if invalid:
-        pending.add('discovery_invalid_drafts')
         result.stats['discovery_invalid_drafts'] = result.stats.get('discovery_invalid_drafts', 0) + invalid
     for code in sorted(pending):
         result.issues.append({'table': table.qualified_name, 'code': code, 'status': 'deferred'})
@@ -172,7 +172,7 @@ def _proposal_repair_record(proposal, code):
 def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observations=None,failures=None,
              projection_excluded=(),identity_excluded=(),conflicted_ids=None,
              hierarchy_rules=(),granularity_rejections=None,hierarchy_context=(),
-             compiled_proposals=None,identity_requests=None,policy_reviews=None):
+             compiled_proposals=None,identity_requests=None,policy_reviews=None,semantic_failures=None):
     from .engine import _compile_model, _check_hierarchy_identity_resolution, SENSITIVE
     from lightgraph.contracts import canonical
     # Inspect the whole batch before reviewing any sibling. Otherwise a renamed
@@ -235,6 +235,10 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
             if grain_key is not None and grain_key in granularity_rejections:
                 raise LightGraphError(granularity_rejections[grain_key])
             grain_context=entity_granularity_context(p,hierarchies)
+            if not grain_context and (packet or {}).get('semantic_revision_guard') and p.kind in ('column_group','entity_key'):
+                # Narrowing the key cannot make an obligatory review disappear.
+                grain_context={'identity_columns':sorted(entity_granularity_identity(p)[-1])
+                    if isinstance(entity_granularity_identity(p),tuple) else [], 'hierarchies':hierarchies}
             if grain_context:
                 # A negative grain judgment remains terminal across sibling
                 # repairs; changing a group ID or attribute cannot solicit a
@@ -251,7 +255,11 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                     raise
             sharing_requested=(p.kind in {'column_group','entity_key'}
                 and p.claim.identity_resolution=='shared_definition')
-            if model is not None and (p.kind in ('long_hierarchy','wide_hierarchy') or sharing_requested):
+            domain_requested=(p.kind in {'column_group','entity_key'}
+                and p.claim.identity_resolution=='verified_identity_domain')
+            scope_revision_review='namespace_scope_missing' in (packet or {}).get('allowed_revision_codes',[])
+            if model is not None and (p.kind in ('long_hierarchy','wide_hierarchy','concept_mapping')
+                                     or sharing_requested or domain_requested or scope_revision_review):
                 review=review_semantics(model,{**review_packet,'semantic_schema':schema.model_dump(mode='json')},{
                     'kind':p.kind,'scope':(packet or {}).get('scope'),
                     'claim':p.claim.model_dump(mode='json')},docs,observations=observations)
@@ -269,7 +277,7 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                 sharing=(review if sharing_requested else None) or declared_evidence(
                     docs,table,'shared_definition',[definition] if definition else [],
                     parameters={'namespace_columns':rule.scope.namespaces})
-                if rule.kind=='column_group_entity' and sharing and rule.scope.namespaces and rule.attributes.single_valued.get('definition'):
+                if rule.kind=='column_group_entity' and not domain_requested and sharing and rule.scope.namespaces and rule.attributes.single_valued.get('definition'):
                     rule.identity.semantic_resolution='verified_definition_registry'
                     # The goal defines the inferred registry's namespace; a
                     # declaration continues to use its immutable document ID.
@@ -278,6 +286,9 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                     rule.evidence=rule_evidence(sharing,reviewed=bool(review),documents=docs)
                 elif sharing_requested:
                     raise LightGraphError('shared_definition_attributes_missing')
+                if scope_revision_review and review:
+                    rule.evidence=rule_evidence(review,reviewed=True,documents=docs,
+                                               probe_refs=rule.evidence.probe_refs)
                 if granularity_review:
                     previous=(rule.evidence.semantic_basis if rule.evidence.semantic_status=='supported' else [])
                     rule.evidence=rule_evidence(sorted(set(previous+granularity_review)),
@@ -294,6 +305,11 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                   if p.kind=='wide_hierarchy' and p.claim.path_semantics=='relative_path' else None)
             if code is None:
                 raise
+            if isinstance(exc, SemanticReviewFailure):
+                candidate = candidate_record(p, table, packet or {}, docs, exc)
+                result.pending_candidates.append(candidate)
+                if semantic_failures is not None:
+                    semantic_failures.append({'candidate':candidate,'proposal':p,'failure':exc})
             if failures is not None and code in REPAIRABLE_PROPOSAL_CODES:
                 failures.append((p,code))
             else:_issue(result,table,code)
@@ -311,7 +327,7 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
 def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations,
                         tool_factory=None,projection_excluded=(),identity_excluded=(),
                         hierarchy_rules=(),granularity_rejections=None,observed_hierarchies=None):
-    """Check one submitted batch; a malformed sibling never starts another Agent.
+    """Preserve valid siblings and allow one structurally changed semantic alternative.
 
     Semantic judgments and full data validation remain separate. Actual data
     counterexamples use the scheduler's existing revision path; formatting or
@@ -328,13 +344,32 @@ def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations
     requests=list(packet.get('hierarchy_identity_requests',[]))
     policy_reviews={}
     compiled_proposals={}
+    semantic_failures=[]
     granularity_rejections={} if granularity_rejections is None else granularity_rejections
     rules=_compile(batch,table,goal,docs,result,model=model,packet=packet,
         observations=observations,failures=failures,
         projection_excluded=projection_excluded,identity_excluded=identity_excluded,
         hierarchy_rules=hierarchy_rules,hierarchy_context=list(observed_hierarchies.values()),
         granularity_rejections=granularity_rejections,identity_requests=requests,
-        policy_reviews=policy_reviews,compiled_proposals=compiled_proposals)
+        policy_reviews=policy_reviews,compiled_proposals=compiled_proposals,semantic_failures=semantic_failures)
+    alternatives,docs=revise_once(semantic_failures,model=model,packet=packet,
+        tool_factory=tool_factory,ask=_ask,observations=observations,result=result,table=table,documents=docs)
+    for item,proposal,schema,repair_packet in alternatives:
+        revised_packet={**repair_packet,'semantic_revision_guard':{
+            **item['failure'].feedback(), 'prior_proposal':item['proposal'].model_dump(
+                mode='json',exclude={'rationale','requested_probes'})}}
+        revised=ProposalBatch(task='T5_revision',proposals=[proposal],
+            semantic_schema=SemanticSchema.merged(batch.semantic_schema,schema))
+        replacements=_compile(revised,table,goal,docs,result,model=model,packet=revised_packet,
+            observations=observations,projection_excluded=projection_excluded,identity_excluded=identity_excluded,
+            hierarchy_rules=hierarchy_rules,hierarchy_context=list(observed_hierarchies.values()),
+            granularity_rejections=granularity_rejections,identity_requests=requests,
+            policy_reviews=policy_reviews,compiled_proposals=compiled_proposals)
+        if replacements:
+            rules.extend(replacements)
+            cid=item['candidate'].candidate_id
+            result.resolved_candidate_ids.append(cid)
+            result.candidate_replacement_rules[cid]=[r.rule_id for r in replacements]
     # A later sibling can reject an identity already compiled in this batch.
     # Apply that existing judgment to every matching draft without another review.
     rules=[rule for rule in rules if entity_granularity_identity(
@@ -374,28 +409,71 @@ def _bounded_catalog_window(table, tables, packet, model, tool_specs):
     from lightgraph.context import initial_agent_prompt_bytes, STAGE_SUBTASKS
     candidates=[table]+[t for t in tables
         if (t.source_id,t.qualified_name)!=(table.source_id,table.qualified_name)][:63]
-    limit=getattr(model.config,'max_prompt_bytes',65536)
+    limit=getattr(model.config,'max_prompt_bytes',131072)
+    byte_limit=limit
+    # The transport conservatively reserves one token per request byte plus
+    # output. A larger prompt cap must not pack optional tables past the actual
+    # remaining model budget before the first request even starts.
+    if getattr(model,'budget',None) is not None:
+        allowance=model.budget.snapshot()
+        tokens=allowance['limits']['llm_tokens']
+        if tokens is not None:
+            available=tokens-allowance['used']['llm_tokens']-sum(
+                cost['llm_tokens'] for cost in allowance['reserved'].values())
+            limit=min(limit,available-getattr(model.config,'max_output_tokens',4096))
     control={'max_steps':getattr(model.config,'max_discovery_steps',8),
              'max_tool_calls':getattr(model.config,'max_tool_calls',16),
              'response_format':getattr(model.config,'response_format','json_schema')}
     def candidate(size):
         return {**packet,
             'catalog':[t.model_dump(mode='json',by_alias=True) for t in candidates[:size]],
-            'subtask':STAGE_SUBTASKS[packet['task']]+(
+            'subtask':(packet.get('subtask') or STAGE_SUBTASKS[packet['task']])+(
                 f' Catalog coverage: {size} of {len(tables)} authorized tables are visible '
                 'in this call; the task table is included. Unlisted tables have not been examined.')}
     selected=candidate(1)
-    if initial_agent_prompt_bytes(selected,tool_specs,**control)>limit:
-        raise LightGraphError('model_packet_too_large')
+    required=initial_agent_prompt_bytes(selected,tool_specs,**control)
+    if required>byte_limit:raise LightGraphError('model_packet_too_large')
+    if required>limit:raise BudgetExceeded('llm_tokens_budget_exhausted')
+    # Optional catalog entries must leave room for tools and refreshed evidence.
+    # Keep the mandatory task table even if it alone consumes this headroom.
+    window_limit=max(required,limit-min(65536,limit//4))
     low,high=1,len(candidates)
     while low<high:
         middle=(low+high+1)//2
         trial=candidate(middle)
-        if initial_agent_prompt_bytes(trial,tool_specs,**control)<=limit:
+        if initial_agent_prompt_bytes(trial,tool_specs,**control)<=window_limit:
             low=middle
             selected=trial
         else:high=middle-1
     return candidates[:low],selected
+
+
+def _identity_domain_context(rules):
+    """Share earlier code-domain hypotheses, never values or publication claims.
+
+    Each later table must obtain its own scoped evidence and independent review.
+    Without this small catalog, independent sessions can name the same documented
+    domain differently and the executor correctly keeps duplicate interpretations.
+    """
+    domains=[]
+    for rule in rules:
+        entries=[]
+        if rule.kind=='column_group_entity' and rule.identity.semantic_resolution=='verified_identity_domain':
+            entries.append({'entity_kind':rule.identity.entity_kind,'identity_domain':rule.identity.identity_domain,
+                'key_columns':[c for c in rule.identity.key_columns if c not in rule.scope.namespaces],
+                'namespace_columns':rule.scope.namespaces if rule.identity.identity_scope=='namespace_local' else []})
+        if rule.concept_mapping:
+            entries.extend({'entity_kind':c.entity_kind,'identity_domain':c.identity_domain,
+                'key_columns':[c.key_column],'namespace_columns':rule.scope.namespaces
+                    if c.namespace_columns is None else c.namespace_columns}
+                for c in rule.concept_mapping.components if c.identity_domain)
+        for entry in entries:
+            domains.append({**entry,'source':rule.source.model_dump(mode='json',by_alias=True),
+                'rule_id':rule.rule_id,'document_versions':rule.dependencies.documents,
+                'semantic_schema':rule.semantic_schema.for_usage(entity_kinds={entry['entity_kind']},
+                    properties=set(),relations=set()).model_dump(mode='json'),
+                'status':'hypothesis_requires_local_review'})
+    return {'items':domains[:32],'total':len(domains),'truncated':len(domains)>32}
 
 
 def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=None, *,
@@ -432,6 +510,7 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             if len(table.columns)>256: raise LightGraphError('catalog_column_limit')
             packet=_packet(table,goal,[],docs,'T0_discovery',understanding)
             packet['iteration_context']=dict(iteration_context or {})
+            packet['iteration_context']['prior_identity_domains']=_identity_domain_context(result.rules)
             prior=[r for r in (revision_rules or []) if r.source==_source(table)]
             original_revision_codes=_iteration_codes(iteration_context,table)
             if prior:
@@ -442,9 +521,20 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
                     revision_candidate=prior[0].model_dump(mode='json',by_alias=True),
                     allowed_revision_codes=original_revision_codes)
                 packet['known_conflicts']=[{'code':code,'count':1} for code in packet['allowed_revision_codes'][:32]]
+                if 'namespace_scope_missing' in original_revision_codes:
+                    packet['subtask']=('修订 iteration_context.namespace_revision 指定规则的身份范围。'
+                        '原规则遗漏了候选范围列，需要核实这些列是否限定对象身份及来源权限。'
+                        '提交一份完整替换提案，保留原有对象键、层级和属性映射，仅增加有证据的命名空间。'
+                        '独立语义审查与全量执行通过后才能替换；不得仅添加一个属性或并存一条新规则。')
             elif iteration_context and iteration_context.get('coverage_columns'):
                 packet.update(task='T1_table_discovery',
-                    subtask='继续检查 iteration_context.coverage_columns 中尚未解释的列；参考已有规则，补充有依据的对象或排除说明，不重复提交已有对象。')
+                    subtask='继续检查 iteration_context.coverage_columns 中尚未解释的列。'
+                    'known_rules 含已有规则的身份键、命名空间和每层 code/label/aliases 映射。'
+                    '若列是已有对象的英文名、别名或其他属性，可重提保留原有身份与层级的完整提案并补映射；'
+                    '程序将作为已有规则的新修订完整验证，不另建实体。不要把属性当作身份键。'
+                    '若列表达遗漏的身份范围，提出保留对象键与层级并增加命名空间的完整候选；'
+                    '程序会另开 T5 身份修订和独立语义审查，不以属性增补代替范围更改。'
+                    '只有独立业务对象才提出新实体；无法说明的列保留未决，不得仅为完成覆盖而排除。')
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                 allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=[table])
             window,packet=_bounded_catalog_window(table,tables,packet,model,tools.tool_specs())
@@ -681,6 +771,14 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                         claim.relation_kind,goal)
                     source_keys=endpoint_columns(source,claim.source_level)
                     target_keys=endpoint_columns(target,claim.target_level)
+                    relation_contract=_reference_relation_contract(schema,claim.relation_kind)
+                    # Identical rule, occurrence level and ordered mapping can
+                    # only resolve to the same entity. Reject that closed-contract
+                    # violation before source probes or a paid semantic review.
+                    # Different levels/mappings still need ordinary validation.
+                    if (source.rule_id==target.rule_id and claim.source_level==claim.target_level
+                            and local==remote and not relation_contract['allow_self_links']):
+                        raise LightGraphError('reference_self_link_forbidden')
                     endpoint_checks=[]
                     for binding,columns,keys in ((source,local,source_keys),(target,remote,target_keys)):
                         destination=remote_originals.get((binding.source.source_id,binding.source.schema_name,binding.source.table))
@@ -714,7 +812,6 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                             for field in ('unmatched','null_refs','partial_null_refs','ambiguous','unique_matches')}}]}
                     # The provider's proposal is not its own semantic evidence.
                     # Review all endpoint context after structural verification.
-                    relation_contract=_reference_relation_contract(schema,claim.relation_kind)
                     evidence=review_semantics(model,review_packet,{
                         'kind':'reference','scope':packet['scope'],
                         'relation_definition':relation_contract,
@@ -751,6 +848,8 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                 except BudgetExceeded:raise
                 except LightGraphError as exc:
                     _issue(result,table,exc.code)
+                    if isinstance(exc, SemanticReviewFailure):
+                        result.pending_candidates.append(candidate_record(proposal,table,review_packet,docs,exc))
                     if exc.code in REPAIRABLE_PROPOSAL_CODES:
                         result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+1
         except LightGraphError as exc:

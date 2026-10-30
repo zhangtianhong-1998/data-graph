@@ -70,7 +70,7 @@ def test_valid_legacy_verdict_still_uses_its_original_binding(monkeypatch,legacy
 @pytest.mark.parametrize('change,code',[
     ('wrong_ref','semantic_review_reference_mismatch'),
     ('changed_echo','semantic_review_proposition_mismatch'),
-    ('compact_with_replacement','llm_schema_invalid'),
+    ('compact_with_replacement','semantic_review_protocol_invalid'),
 ])
 def test_response_cannot_replace_caller_proposition_or_hide_legacy_mismatch(monkeypatch,change,code):
     calls=[]
@@ -123,7 +123,7 @@ def test_protocol_repair_is_at_most_one_call_across_transport_and_review(monkeyp
         elif len(calls)==2:value['conditions']=[{'state':'satisfied','evidence_refs':['probe_1']}]
         assert 'tools' not in body
         return response(value)
-    with pytest.raises(LightGraphError,match='semantic_review_unissued_evidence|llm_schema_invalid|semantic_review_patch_invalid'):
+    with pytest.raises(LightGraphError,match='semantic_review_unissued_evidence|semantic_review_protocol_invalid|semantic_review_patch_invalid'):
         review_semantics(client(monkeypatch,handler),PACKET,PROPOSITION,[])
     assert len(calls)==2
 
@@ -140,7 +140,7 @@ def test_missing_compact_slot_cannot_unlock_existing_conditions(monkeypatch,drop
         return response(value)
     model=client(monkeypatch,handler)
     if drop_condition:
-        with pytest.raises(LightGraphError,match='semantic_claim_unresolved'):
+        with pytest.raises(LightGraphError,match='semantic_review_protocol_invalid'):
             review_semantics(model,PACKET,PROPOSITION,[])
     else:assert review_semantics(model,PACKET,PROPOSITION,[])
     assert len(calls)==2
@@ -189,7 +189,7 @@ def test_higher_transport_retry_limit_does_not_allow_two_schema_corrections(monk
         if len(calls)<3:del value['evidence'][0]['reference']
         return response(value)
     model=client(monkeypatch,handler);model.config.retries=3
-    with pytest.raises(LightGraphError,match='llm_schema_invalid'):
+    with pytest.raises(LightGraphError,match='semantic_review_protocol_invalid'):
         review_semantics(model,PACKET,PROPOSITION,[])
     assert len(calls)==2 and model.usage['schema_repair_attempts']==1
 

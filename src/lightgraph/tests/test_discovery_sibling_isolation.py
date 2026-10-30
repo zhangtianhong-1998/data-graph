@@ -48,7 +48,7 @@ def test_fd_repair_failure_preserves_only_independently_reviewed_hierarchy(monke
         assert all(node['kind']!='Metric' for node in graph['nodes'])
     assert any(issue['code']=='fd_violation' for issue in result.issues)
     assert any(issue['code']=='llm_schema_invalid' for issue in result.issues)
-    assert tasks.count('T5_revision')==1
+    assert tasks.count('T5_revision')==(1 if decision=='supported' else 2)
     assert model.budget.snapshot()['reserved']=={}
 
 
@@ -83,8 +83,8 @@ def test_deferred_coverage_executes_valid_sibling_but_keeps_pending_work(monkeyp
     assert tasks.count('T1_table_discovery')==1
     assert any(issue['code']=='unregistered_attribute_semantics' and issue['status']=='deferred'
                for issue in report.issues)
-    if guard=='cycle':
-        # Only the actual data cycle can schedule a revision Agent.
+    if guard in ('cycle','refuted'):
+        # Structural failures and semantic alternatives each get one bounded revision.
         assert tasks.count('T5_revision')==1
         assert any(issue['code']=='llm_schema_invalid' for issue in report.issues)
     else:

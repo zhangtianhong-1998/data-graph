@@ -144,7 +144,7 @@ def test_retry_accounting_for_invalid_json(monkeypatch):
     n=[]
     def handler(request):
         n.append(1)
-        return httpx.Response(200,json={'choices':[{'message':{'content':'bad'}}],'usage':{'prompt_tokens':20,'completion_tokens':10}})
+        return httpx.Response(200,json={'choices':[{'message':{'content':'bad'},'finish_reason':'stop'}],'usage':{'prompt_tokens':20,'completion_tokens':10}})
     client=StructuredModelClient(ModelConfig(base_url='https://model.example/v1',model='fake',api_key_env='TEST_LG_KEY'),transport=httpx.MockTransport(handler))
     with pytest.raises(LightGraphError,match='llm_schema_invalid'):client.propose(packet())
     assert len(n)==2 and client.usage['calls']==2
@@ -305,7 +305,7 @@ def test_structured_model_can_propose_opaque_column_group_without_retaining_rati
         response={'task':data['task'],'proposals':[{'kind':'column_group','claim':{'group_id':'opaque','entity_kind_hint':'ReportItem',
             'members':[{'column_id':ids['field_a'],'role':'identity_code','in_identity':True},{'column_id':ids['field_b'],'role':'label'}]},
             'evidence_cited':[ids['field_a'],ids['field_b']],'rationale':'DO_NOT_PERSIST_MODEL_TEXT'}]}
-        return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(response)}}],'usage':{'prompt_tokens':20,'completion_tokens':20}})
+        return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(response)},'finish_reason':'stop'}],'usage':{'prompt_tokens':20,'completion_tokens':20}})
     model=StructuredModelClient(ModelConfig(base_url='https://model.example/v1',model='mock',api_key_env='TEST_LG_KEY'),transport=httpx.MockTransport(handler))
     result=discover(a,model=model)
     assert len(result.rules)==1 and result.rules[0].identity.key_columns==['field_a']

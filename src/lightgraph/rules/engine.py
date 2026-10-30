@@ -48,6 +48,10 @@ class RuleEngine:
 
     def columns(self, rule):
         cols = list(rule.scope.namespaces) + list(rule.scope.partition_by) + list(rule.identity.key_columns)
+        if rule.concept_mapping:
+            cols += [component.column for component in rule.concept_mapping.components]
+            cols += [c.key_column for c in rule.concept_mapping.components if c.key_column]
+            cols += [name for c in rule.concept_mapping.components for name in (c.namespace_columns or [])]
         cols += list(rule.identity.semantic_key_columns)
         cols += list(rule.attributes.single_valued.values()) + list(rule.attributes.multi_valued.values())
         if rule.hierarchy:
@@ -113,7 +117,7 @@ class RuleEngine:
     def _validate(self, rule, rows):
         codes=[]
         evidence = rule.evidence
-        requires_semantics = (rule.kind in {"reference", "wide_hierarchy", "long_hierarchy"}
+        requires_semantics = (rule.kind in {"reference", "wide_hierarchy", "long_hierarchy", "concept_mapping"}
                               or rule.identity.semantic_resolution != "source_scoped")
         if getattr(evidence, "origin", "user_rule") == "discovery" and requires_semantics:
             # An extractor's arbitrary nonempty string is not approval. Explicit
@@ -245,6 +249,9 @@ class RuleEngine:
                         counts, codes = self._wide(publication, rule, rows)
                     elif rule.kind == "long_hierarchy":
                         counts, codes = self._long(publication, rule, rows)
+                    elif rule.kind == "concept_mapping":
+                        from .concepts import emit_concepts
+                        counts, codes = emit_concepts(self, publication, rule, rows)
                     else:
                         counts, codes = self._entities(publication, rule, rows)
                     for name, count in counts.items():
@@ -340,7 +347,7 @@ class RuleEngine:
         self.store.stage_fact(pub,GraphFact(isolation_domain=self.domain,fact_kind=kind,payload=payload),
                               self._support(rule,binding,scope,partition_id))
 
-    def _identity(self, rule, row, key, *, extra_definition=None, binding_columns=None):
+    def _identity(self, rule, row, key, *, extra_definition=None, binding_columns=None, binding_context=None):
         from ..identity.registry import DEFINITION_FIELDS
         definition={k:row.get(c) for k,c in rule.attributes.single_valued.items()
                     if k in DEFINITION_FIELDS and k not in ("label","business_code") and row.get(c) is not None}
@@ -358,6 +365,10 @@ class RuleEngine:
             "namespace_values": [row.get(c) for c in rule.scope.namespaces],
             "key_columns": binding_columns or rule.identity.key_columns,
         }
+        if binding_context is not None:
+            # Projection contexts distinguish independent joint assignments for
+            # one source key; they are supplied only by trusted rule operators.
+            lookup_namespace['projection_context']=binding_context
         domain_args = {}
         if rule.identity.semantic_resolution == "verified_identity_domain":
             verified_scope = ([row.get(c) for c in rule.scope.namespaces]
@@ -374,14 +385,15 @@ class RuleEngine:
             semantic_namespace=rule.identity.semantic_namespace, **domain_args)
         return resolution
 
-    def _emit_entity(self,pub,rule,row,key, *, label=None,aliases=None,extra_definition=None,binding_columns=None):
+    def _emit_entity(self,pub,rule,row,key, *, label=None,aliases=None,extra_definition=None,binding_columns=None,binding_context=None):
         if rule.identity.semantic_resolution == "verified_identity_domain":
             extra_definition = dict(extra_definition or {})
             if label is not None:
                 extra_definition["label"] = label
             elif rule.attributes.single_valued.get("label"):
                 extra_definition["label"] = row.get(rule.attributes.single_valued["label"])
-        r=self._identity(rule,row,key,extra_definition=extra_definition,binding_columns=binding_columns)
+        r=self._identity(rule,row,key,extra_definition=extra_definition,binding_columns=binding_columns,
+                         binding_context=binding_context)
         scope=self._scope(rule,row)
         self._stage(pub,rule,r.binding_id,scope,"NodeExistence",{"entity_id":r.entity_id,"kind":rule.identity.entity_kind,"layer":"business"})
         attrs={k:row.get(col) for k,col in rule.attributes.single_valued.items()}

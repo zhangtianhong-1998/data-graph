@@ -18,7 +18,7 @@ from lightgraph.discovery.semantics import declaration_block, document_ref
 def response(content=None, call=None):
     message={'content':json.dumps(content)} if content is not None else {'content':None,'tool_calls':[
         {'id':'provider_call','type':'function','function':{'name':'execute_readonly_sql','arguments':json.dumps(call)}}]}
-    return httpx.Response(200,json={'choices':[{'message':message,'finish_reason':'stop' if content else 'tool_calls'}],
+    return httpx.Response(200,json={'choices':[{'message':message,'finish_reason':'stop' if content is not None else 'tool_calls'}],
         'usage':{'prompt_tokens':30,'completion_tokens':30}})
 
 

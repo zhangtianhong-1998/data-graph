@@ -399,6 +399,7 @@ def review_with_agent(store, model, goal, corpus, *, scopes, domain='default', m
     listing=current_listing()
     known_rules={r.rule_id:r for r in store.get_rules(scopes=scopes,domain=domain)}
     reviewed_groups=set()
+    exhausted=False
     for candidate in listing['candidates']:
         if canonical(base_heads)!=canonical(store.heads()) or base_goal!=_goal_revision(store):
             counts['deferred']+=1;issues.append({'code':'graph_generation_changed'});break
@@ -428,10 +429,16 @@ def review_with_agent(store, model, goal, corpus, *, scopes, domain='default', m
                    for rid in source_rules if rid in known_rules)])
         previous=store.connection.execute('SELECT * FROM identity_review_attempt WHERE candidate_id=?',(candidate['candidate_id'],)).fetchone()
         if previous and previous['dependencies']==dependencies and previous['outcome']!='deferred':continue
-        if counts['reviewed']>=max_reviews:
+        if exhausted or counts['reviewed']>=max_reviews:
             counts['deferred']+=1;continue
         outcome='unresolved'
         try:
+            # An exhausted shared model allowance applies to the entire queue,
+            # not one candidate. Do not count blocked calls as completed reviews.
+            allowance=getattr(model,'budget',None)
+            if allowance is not None:
+                from lightgraph.discovery.budget import Cost
+                allowance.admit(Cost(llm_calls=1,llm_tokens=1))
             if len(members)>64 or len(relevant)>64:raise LightGraphError('identity_review_evidence_limit')
             # These are approved graph facts, not source samples. The registry of
             # references prevents a reviewer inventing unseen evidence.
@@ -459,6 +466,8 @@ def review_with_agent(store, model, goal, corpus, *, scopes, domain='default', m
                    expected_evidence=relevant,expected_goal_revision=review_goal)
             counts['accepted']+=1;outcome='accepted'
         except LightGraphError as exc:
+            if exc.code in ('wall_time_budget_exhausted','llm_calls_budget_exhausted','llm_tokens_budget_exhausted'):
+                exhausted=True
             deferred=(exc.code in {'graph_generation_changed','resolution_revision_conflict',
                 'resolution_evidence_changed','resolution_cluster_review_required','stale_goal_revision'}
                 or any(part in exc.code for part in ('budget','timeout','limit','too_large','model_')))

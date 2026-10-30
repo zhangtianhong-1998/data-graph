@@ -25,7 +25,9 @@ def export_graph(store,output,*,scopes,domain='default',include_candidates=True)
             values={k:json.dumps(v,ensure_ascii=False,sort_keys=True) if isinstance(v,(dict,list)) else v for k,v in row.items()}
             writer.writerow({k:("'"+v if isinstance(v,str) and v.lstrip().startswith(('=','+','-','@')) else v) for k,v in values.items()})
         atomic_text(output/(key+'.csv'),buf.getvalue())
-    payload=json.dumps(graph,ensure_ascii=False).replace('<','\\u003c').replace('\u2028','\\u2028').replace('\u2029','\\u2029')
+    preview={k:v for k,v in graph.items() if k not in ('facts','supports')}
+    preview['provenance_location']='graph.json'
+    payload=json.dumps(preview,ensure_ascii=False).replace('<','\\u003c').replace('\u2028','\\u2028').replace('\u2029','\\u2029')
     template=files('lightgraph').joinpath('presentation/viewer.html').read_text()
     atomic_text(output/'viewer.html',template.replace('/*GRAPH_DATA*/{}',payload))
     return graph

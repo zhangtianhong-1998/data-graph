@@ -2,7 +2,7 @@
 from __future__ import annotations
 from typing import Annotated, Literal, Union
 from pydantic import ConfigDict, Field, PrivateAttr, model_validator
-from lightgraph.contracts import StrictModel, RuleSpec, SourceRef, TableSpec, digest
+from lightgraph.contracts import StrictModel, RuleSpec, SourceRef, TableSpec, ConceptMappingSpec, digest
 from lightgraph.semantic_schema import SemanticSchema
 
 Role = Literal['identity_code','namespace','label','alias','semantic_attribute','display_order',
@@ -21,6 +21,8 @@ TASK_PROPOSAL_KINDS = {
     'T5_revision':frozenset({'column_group','entity_key','exclusion','reference','discriminator',
                             'wide_hierarchy','long_hierarchy'}),
 }
+for _task in ('T0_discovery', 'T1_table_discovery', 'T5_revision'):
+    TASK_PROPOSAL_KINDS[_task] = TASK_PROPOSAL_KINDS[_task] | {'concept_mapping'}
 
 
 def _proposal_batch_schema_guards(schema):
@@ -40,23 +42,51 @@ def _proposal_batch_schema_guards(schema):
 SemanticProperty = Annotated[str, Field(min_length=1, max_length=64)]
 
 class Member(StrictModel):
-    column_id: str
-    role: Role
+    column_id: str = Field(description='Issued column reference, not a sample value or invented field name.')
+    role: Role = Field(description=
+        'Column function from this enum, not a business object type: identity_code identifies '
+        'an object; label names it; semantic_attribute supplies a registered property; '
+        'fact_value is an observation. Do not translate or invent role values.')
     in_identity: bool = False
     multi_value: bool = False
     exclude_from_projection: bool = False
-    property_name: SemanticProperty | None = None
+    property_name: SemanticProperty | None = Field(default=None, description=
+        'Property identifier from the semantic schema. A new property needs an explicit '
+        'compatible definition; a source value or display label is not a property identifier.')
     @model_validator(mode='after')
     def guard(self):
         if self.role in ('display_order','audit','fact_value') and self.in_identity:
             raise ValueError('excluded_role_in_identity')
         return self
 
-class ColumnGroup(StrictModel):
+class IdentityDomainClaim(StrictModel):
+    """Explicit code-domain sharing is a reviewed claim, never inferred from labels."""
+    identity_resolution: Literal['source_scoped', 'shared_definition', 'verified_identity_domain'] = 'source_scoped'
+    identity_domain: str = Field(default='', max_length=256, description=
+        'Business-code domain shared only when independent evidence proves identical meaning across sources.')
+    identity_evidence: list[str] = Field(default_factory=list, max_length=16)
+    attribute_evidence: list[str] = Field(default_factory=list, max_length=16)
+    identity_scope: Literal['namespace_local', 'domain_global'] = 'namespace_local'
+    global_scope_evidence: list[str] = Field(default_factory=list, max_length=16)
+
+    @model_validator(mode='after')
+    def check_domain_claim(self):
+        if self.identity_resolution == 'verified_identity_domain':
+            if not self.identity_domain.strip() or not self.identity_evidence:
+                raise ValueError('verified_identity_domain_evidence_required')
+            if self.identity_scope == 'domain_global' and not self.global_scope_evidence:
+                raise ValueError('global_identity_scope_evidence_required')
+        elif self.identity_domain or self.identity_evidence or self.attribute_evidence or self.global_scope_evidence or self.identity_scope != 'namespace_local':
+            raise ValueError('identity_domain_policy_conflict')
+        return self
+
+
+class ColumnGroup(IdentityDomainClaim):
     group_id: str
-    entity_kind_hint: str
+    entity_kind_hint: str = Field(description=
+        'Business entity type identifier from the goal or semantic schema, not a column '
+        'role or source value. New types require a definition; naming a type does not confirm it.')
     members: list[Member] = Field(min_length=1, max_length=64)
-    identity_resolution: Literal['source_scoped', 'shared_definition'] = 'source_scoped'
 
 class KeyAttributes(StrictModel):
     single_valued: list[str] = Field(default_factory=list)
@@ -65,15 +95,16 @@ class KeyAttributes(StrictModel):
     # Issued column ID -> registered property, never guessed from a field suffix.
     property_names: dict[str, SemanticProperty] = Field(default_factory=dict)
 
-class EntityKey(StrictModel):
+class EntityKey(IdentityDomainClaim):
     group_id: str
-    entity_kind_hint: str
+    entity_kind_hint: str = Field(description=
+        'Business entity type identifier from the goal or semantic schema. New types '
+        'require a definition; never replace business meaning merely to satisfy the schema.')
     key_columns: list[str] = Field(min_length=1, max_length=16)
     attributes: KeyAttributes
     namespace_columns: list[str] = Field(default_factory=list, max_length=16)
     level_policy: Literal['not_applicable','level_qualified','code_with_fill_merge'] = 'not_applicable'
     normalization: Literal['identity'] = 'identity'
-    identity_resolution: Literal['source_scoped', 'shared_definition'] = 'source_scoped'
     @model_validator(mode='after')
     def guard(self):
         if len(set(self.key_columns)) != len(self.key_columns): raise ValueError('duplicate_key_column')
@@ -176,6 +207,13 @@ class Exclusion(StrictModel):
         if set(self.not_excluded) & {x.column_id for x in self.exclusions}: raise ValueError('exclusion_conflict')
         return self
 
+class ConceptMappingClaim(ConceptMappingSpec):
+    group_id: str
+    entity_kind_hint: str = Field(description='Registered type for the joint context, distinct from every concept type.')
+    key_columns: list[str] = Field(min_length=1, max_length=16, description='Issued source-item identity column IDs.')
+    namespace_columns: list[str] = Field(default_factory=list, max_length=16)
+
+
 class ProposalBase(StrictModel):
     evidence_cited: list[str] = Field(min_length=1,max_length=32)
     confidence_band: Literal['low','medium','high'] = 'low'
@@ -204,8 +242,11 @@ class DiscriminatorProposal(ProposalBase):
 class ExclusionProposal(ProposalBase):
     kind: Literal['exclusion']
     claim: Exclusion
+class ConceptMappingProposal(ProposalBase):
+    kind: Literal['concept_mapping']
+    claim: ConceptMappingClaim
 Proposal = Annotated[Union[ColumnGroupProposal,EntityKeyProposal,HierarchyProposal,LongHierarchyProposal,ReferenceProposal,
-                           DiscriminatorProposal,ExclusionProposal],Field(discriminator='kind')]
+                           DiscriminatorProposal,ExclusionProposal,ConceptMappingProposal],Field(discriminator='kind')]
 class ProposalBatch(StrictModel):
     _runtime_pending_codes: list[str] = PrivateAttr(default_factory=list)
     _runtime_invalid_drafts: int = PrivateAttr(default=0)
@@ -256,6 +297,23 @@ class DataUnderstanding(StrictModel):
     rule_refs: list[str] = Field(default_factory=list)
     document_refs: list[str] = Field(default_factory=list)
     unknowns: list[str] = Field(default_factory=list)
+class PendingCandidate(StrictModel):
+    """Value-free review work; a candidate never grants publication authority."""
+    candidate_id: str = Field(pattern=r'^candidate_[a-f0-9]{24}$')
+    source: SourceRef
+    proposal_kind: Literal['column_group','entity_key','wide_hierarchy','long_hierarchy','reference','concept_mapping']
+    failure_code: Literal['semantic_claim_refuted','semantic_claim_unresolved',
+        'semantic_condition_unresolved','semantic_review_missing_support','semantic_review_incomplete_context',
+        'semantic_revision_no_progress','semantic_revision_constraints_changed']
+    column_refs: list[str] = Field(default_factory=list, max_length=256)
+    document_refs: list[str] = Field(default_factory=list, max_length=128)
+    rule_refs: list[str] = Field(default_factory=list, max_length=64)
+    blocking_evidence_refs: list[str] = Field(default_factory=list, max_length=128)
+    required_evidence_refs: list[str] = Field(default_factory=list, max_length=128)
+    review_stage: Literal['entity_granularity','entity_definition','hierarchy','reference','concept_mapping']
+    status: Literal['pending'] = 'pending'
+
+
 class DiscoveryResult(StrictModel):
     rules: list[RuleSpec] = Field(default_factory=list)
     hypotheses: list[Hypothesis] = Field(default_factory=list)
@@ -264,6 +322,9 @@ class DiscoveryResult(StrictModel):
     stats: dict[str,int|float|str] = Field(default_factory=dict)
     budget: dict = Field(default_factory=dict)
     relation_table_outcomes: dict[str, Literal['resolved','unresolved','deferred']] = Field(default_factory=dict)
+    pending_candidates: list[PendingCandidate] = Field(default_factory=list)
+    resolved_candidate_ids: list[str] = Field(default_factory=list)
+    candidate_replacement_rules: dict[str,list[str]] = Field(default_factory=dict)
 
 class PacketColumn(StrictModel):
     id: str

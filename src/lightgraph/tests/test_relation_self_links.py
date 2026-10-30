@@ -230,7 +230,7 @@ def test_pipeline_self_link_counterexample_reaches_fresh_t2_without_source_value
     model=pipeline_model(monkeypatch,packets)
     with MemorySource([wide_table(2)],{'public.items':[path(marker,'Child'),path(marker,marker)]}) as source:
         report=run_pipeline(RunConfig(sources=[],output_dir=str(tmp_path),scopes=['A','public'],
-                                     max_identity_reviews=0),[source],model=model)
+                                     max_identity_reviews=0,goal={'relation_kinds':['parent_of','related_to']}),[source],model=model)
     revisions=[packet for packet in packets if packet['task']=='T2_cross_table' and packet.get('revision_of')]
     assert len(revisions)==1,report.model_dump()
     packet=revisions[0]
@@ -256,7 +256,7 @@ def test_same_goal_pipeline_restores_valid_legacy_reference_without_model_calls(
     from lightgraph.pipeline import run_pipeline
     from lightgraph.runtime.config import RunConfig
     from lightgraph.tests.test_agent_pipeline import client
-    config=RunConfig(sources=[],output_dir=str(tmp_path),scopes=['A','public'],max_identity_reviews=0)
+    config=RunConfig(sources=[],output_dir=str(tmp_path),scopes=['A','public'],max_identity_reviews=0,goal={'relation_kinds':['parent_of','related_to']})
     packets=[]
     with MemorySource([wide_table(2)],{'public.items':[path('A','B')]}) as source:
         first=run_pipeline(config,[source],model=pipeline_model(monkeypatch,packets))

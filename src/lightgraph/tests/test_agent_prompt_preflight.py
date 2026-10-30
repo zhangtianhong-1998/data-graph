@@ -23,7 +23,7 @@ def test_initial_prompt_exact_threshold_includes_runtime_controls(steps,tool_cal
     def handle(request):
         payload=json.loads(request.content)
         actual=len(canonical({'messages':payload['messages'],
-            'tools':payload.get('tools',[]),'response_format':payload['response_format']}).encode())
+            'tools':payload.get('tools',[])}).encode())
         requests.append(actual)
         assert actual==estimate
         control=json.loads(payload['messages'][1]['content'])['runtime_control']
@@ -33,13 +33,8 @@ def test_initial_prompt_exact_threshold_includes_runtime_controls(steps,tool_cal
         assert payload.get('tools')
         if steps==1:
             assert all(item['function']['name'].startswith(('submit_', 'declare_', 'finish_')) for item in payload['tools'])
-        assert payload['response_format']['type']==response_format
-        if response_format=='json_schema':
-            from lightgraph.discovery.proposal_session import DiscoveryFinish
-            assert payload['response_format']['json_schema']['strict'] is True
-            assert payload['response_format']['json_schema']['schema']==DiscoveryFinish.model_json_schema()
-            assert json.loads(payload['messages'][1]['content'])['output_schema']['schema_ref']==(
-                'response_format.json_schema.schema')
+        assert 'response_format' not in payload
+        assert json.loads(payload['messages'][1]['content'])['output_schema']['type']=='object'
         return response(final())
 
     client=model(handle,stream=False,max_prompt_bytes=estimate,
@@ -79,17 +74,31 @@ def test_catalog_window_counts_provider_schema_and_honors_compatibility_mode():
          'subtask':full['subtask'].replace('2 of 2 authorized tables','1 of 2 authorized tables')}
     full_sizes={mode:initial_agent_prompt_bytes(full,tools,response_format=mode)
                 for mode in ('json_schema','json_object')}
-    smaller,larger=sorted(full_sizes,key=full_sizes.get)
-    assert full_sizes[smaller]<full_sizes[larger]
-    threshold=full_sizes[smaller]
-    assert initial_agent_prompt_bytes(one,tools,response_format=larger)<threshold
-    configuration.max_prompt_bytes=threshold;configuration.response_format=smaller
+    assert full_sizes['json_schema']==full_sizes['json_object']
+    configuration.max_prompt_bytes=full_sizes['json_schema']
+    selected,_=_bounded_catalog_window(primary,[primary,other],input_packet(),client,tools)
+    assert selected==[primary]  # Optional tables leave space for later tool replies.
+    configuration.max_prompt_bytes=full_sizes['json_schema']*2
     selected,_=_bounded_catalog_window(primary,[primary,other],input_packet(),client,tools)
     assert selected==[primary,other]
-    configuration.response_format=larger
+    threshold=initial_agent_prompt_bytes(one,tools)
+    configuration.max_prompt_bytes=threshold
     selected,packet=_bounded_catalog_window(primary,[primary,other],input_packet(),client,tools)
     assert selected==[primary]
-    minimum=initial_agent_prompt_bytes(packet,tools,response_format=larger)
-    configuration.max_prompt_bytes=minimum-1
+    configuration.max_prompt_bytes=threshold-1
     with pytest.raises(LightGraphError,match='model_packet_too_large'):
+        _bounded_catalog_window(primary,[primary,other],input_packet(),client,tools)
+
+    # Optional metadata must also fit the actual unreserved token allowance,
+    # even if the configured prompt byte ceiling is substantially larger.
+    from lightgraph.discovery.budget import BudgetAllocator,Cost
+    from lightgraph.errors import BudgetExceeded
+    configuration.max_prompt_bytes=1000000
+    configuration.max_output_tokens=4096
+    client.budget=BudgetAllocator(Cost(llm_tokens=threshold+4096+1000,seconds=60))
+    client.budget.reserve('other_work',Cost(llm_tokens=1000))
+    selected,_=_bounded_catalog_window(primary,[primary,other],input_packet(),client,tools)
+    assert selected==[primary]
+    client.budget.charge(Cost(llm_tokens=1))
+    with pytest.raises(BudgetExceeded,match='llm_tokens_budget_exhausted'):
         _bounded_catalog_window(primary,[primary,other],input_packet(),client,tools)

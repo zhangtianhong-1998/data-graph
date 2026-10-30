@@ -7,6 +7,33 @@ import { fitCamera, zoomCamera } from './graphViewport'
 const props = defineProps<{ graph: Graph; layer: string; loading?: boolean; projectId?: string; includeCandidates?: boolean }>()
 const search = ref('')
 const selectedKind = ref('')
+const page = ref(0)
+const remote = ref<Graph | null>(null), pageLoading = ref(false), pageError = ref('')
+const graph = computed(() => remote.value ?? props.graph)
+const serverPaging = computed(() => !!props.projectId && props.graph.page_size !== undefined)
+let pageGeneration = 0, searchTimer: ReturnType<typeof setTimeout> | undefined
+const matchedCount = computed(() => serverPaging.value ? Number(graph.value.matched_nodes ?? 0) : filtered.value.length)
+const pageOffset = computed(() => serverPaging.value ? Number(graph.value.offset ?? 0) : page.value * 240)
+const hasNext = computed(() => serverPaging.value ? graph.value.next_offset != null : (page.value + 1) * 240 < filtered.value.length)
+async function loadPage(start: number) {
+  const epoch = ++pageGeneration
+  pageLoading.value = true; pageError.value = ''; clearSelection()
+  const params = new URLSearchParams({ layer: props.layer, include_candidates: String(props.includeCandidates === true), offset: String(start), limit: '240', q: search.value, kind: selectedKind.value })
+  try {
+    let value = await request<Graph>(`${projectPath(props.projectId!)}/graph?${params}`)
+    if (epoch !== pageGeneration) return
+    if (start && value.generation !== graph.value.generation) {
+      params.set('offset', '0')
+      value = await request<Graph>(`${projectPath(props.projectId!)}/graph?${params}`)
+    }
+    if (epoch === pageGeneration) { remote.value = value; reset() }
+  } catch (e) { if (epoch === pageGeneration) pageError.value = e instanceof Error ? e.message : '图谱读取失败' }
+  finally { if (epoch === pageGeneration) pageLoading.value = false }
+}
+function changePage(delta: number) {
+  if (serverPaging.value) void loadPage(delta > 0 ? Number(graph.value.next_offset) : Math.max(0, pageOffset.value - 240))
+  else page.value += delta
+}
 const selected = ref<GraphNode | null>(null)
 const selectedEdge = ref<GraphEdge | null>(null)
 type Provenance = { facts: Array<{ id: string; fact_kind: string; status: string; payload: Record<string, unknown> }>; supports: Array<{ id: string; fact_id: string; status: string; origin: string; source_binding: string; rule_id: string; rule_revision: number; publication_id: string; document_ref?: string; scope_ref: string }>; rules: unknown[]; next_offset: number | null; supports_truncated: boolean }
@@ -37,10 +64,10 @@ const canvas = ref<HTMLElement | null>(null)
 const viewport = ref({ width: 820, height: 480 })
 let observer: ResizeObserver | undefined
 let drag: { x: number; y: number; ox: number; oy: number; factor: number } | null = null
-const kinds = computed(() => [...new Set(props.graph.nodes.map(n => String(n.kind || n.layer || '节点')))].sort())
-const filtered = computed(() => props.graph.nodes.filter(n => (!selectedKind.value || (n.kind || n.layer || '节点') === selectedKind.value)
+const kinds = computed(() => serverPaging.value && Array.isArray(graph.value.kinds) ? graph.value.kinds as string[] : [...new Set(graph.value.nodes.map(n => String(n.kind || n.layer || '节点')))].sort())
+const filtered = computed(() => serverPaging.value ? graph.value.nodes : graph.value.nodes.filter(n => (!selectedKind.value || (n.kind || n.layer || '节点') === selectedKind.value)
   && (!search.value || `${n.label || n.name || ''} ${n.id}`.toLowerCase().includes(search.value.toLowerCase()))))
-const visible = computed(() => filtered.value.slice(0, 240))
+const visible = computed(() => serverPaging.value ? filtered.value : filtered.value.slice(page.value * 240, (page.value + 1) * 240))
 const columns = computed(() => {
   const desired = Math.max(1, Math.min(visible.value.length, Math.ceil(Math.sqrt(visible.value.length * 1.7))))
   return Math.min(desired, Math.max(1, Math.floor(viewport.value.width / 190)))
@@ -56,9 +83,10 @@ const points = computed(() => {
     return [node.id, { x: (width.value - (inRow - 1) * 190) / 2 + i % columns.value * 190, y: top + row * 118 }]
   }))
 })
-const edges = computed(() => props.graph.edges.filter(edge => points.value.has(edge.source) && points.value.has(edge.target)))
-const adjacent = computed(() => selected.value ? props.graph.edges.filter(edge => edge.source === selected.value!.id || edge.target === selected.value!.id) : [])
+const edges = computed(() => graph.value.edges.filter(edge => points.value.has(edge.source) && points.value.has(edge.target)))
+const adjacent = computed(() => selected.value ? graph.value.edges.filter(edge => edge.source === selected.value!.id || edge.target === selected.value!.id) : [])
 const display = (node: GraphNode) => String(node.label || node.name || node.id)
+const scopeLabel = (node: GraphNode) => Array.isArray(node.scopes) ? node.scopes.join('、') : ''
 const shortLabel = (node: GraphNode) => { const text = display(node); return text.length > 15 ? text.slice(0, 14) + '…' : text }
 const kindColor = (node: GraphNode) => ['#407ff2', '#20a27e', '#9a6add', '#da9b37', '#54a6bc'][Math.max(0, kinds.value.indexOf(String(node.kind || node.layer || '节点'))) % 5]
 function reset() { zoom.value = 1; offset.value = { x: 0, y: 0 } }
@@ -77,8 +105,9 @@ function start(event: PointerEvent) {
   drag = { x: event.clientX, y: event.clientY, ox: offset.value.x, oy: offset.value.y, factor: Math.max(viewport.value.width / rect.width, viewport.value.height / rect.height) }
   ;(event.currentTarget as Element).setPointerCapture(event.pointerId)
 }
-watch(() => props.graph, () => { clearSelection(); reset() })
-watch([search, selectedKind], () => { clearSelection(); reset() })
+watch(() => props.graph, () => { pageGeneration++; remote.value = null; pageLoading.value = false; page.value = 0; search.value = ''; selectedKind.value = ''; clearSelection(); reset() })
+watch([search, selectedKind], () => { pageGeneration++; clearTimeout(searchTimer); page.value = 0; clearSelection(); reset(); if (serverPaging.value) searchTimer = setTimeout(() => { void loadPage(0) }, 200) })
+watch(page, () => { clearSelection(); reset() })
 watch(canvas, element => {
   observer?.disconnect()
   if (!element) return
@@ -88,7 +117,7 @@ watch(canvas, element => {
   })
   observer.observe(element)
 }, { flush: 'post' })
-onUnmounted(() => observer?.disconnect())
+onUnmounted(() => { pageGeneration++; clearTimeout(searchTimer); observer?.disconnect() })
 </script>
 
 <template>
@@ -98,8 +127,9 @@ onUnmounted(() => observer?.disconnect())
         <div class="actions"><input v-model="search" class="graph-search" aria-label="搜索图节点" placeholder="搜索名称或编号"/><select v-model="selectedKind" aria-label="筛选节点类型"><option value="">全部类型</option><option v-for="kind in kinds" :key="kind">{{ kind }}</option></select></div>
         <div class="actions"><button class="btn small" aria-label="缩小图谱" @click="setZoom(zoom / 1.2)">−</button><span class="muted">{{ Math.round(zoom * 100) }}%</span><button class="btn small" aria-label="放大图谱" @click="setZoom(zoom * 1.2)">+</button><button class="btn small" @click="fit">适配全图</button><button class="btn small" @click="reset">原始大小</button></div>
       </div>
-      <div v-if="loading" class="empty-state"><div class="spinner"></div>正在读取图谱</div>
-      <div v-else-if="!graph.nodes.length" class="empty-state graph-empty"><div class="empty-graphic">◇</div><h3>{{ layer === 'metadata' ? '还没有元数据图' : '还没有业务图谱' }}</h3><p>{{ layer === 'metadata' ? '上传数据并读取元数据后，这里会展示真实的表、列及其关系。' : '完成抽取后，这里会展示已发布的实体与关系。现有图谱会在后续运行中保留并更新。' }}</p></div>
+      <p v-if="pageError" role="alert">{{ pageError }}</p>
+      <div v-if="loading || pageLoading" class="empty-state"><div class="spinner"></div>正在读取图谱</div>
+      <div v-else-if="!graph.nodes.length && !search && !selectedKind" class="empty-state graph-empty"><div class="empty-graphic">◇</div><h3>{{ layer === 'metadata' ? '还没有元数据图' : '还没有业务图谱' }}</h3><p>{{ layer === 'metadata' ? '上传数据并读取元数据后，这里会展示真实的表、列及其关系。' : '完成抽取后，这里会展示已发布的实体与关系。现有图谱会在后续运行中保留并更新。' }}</p></div>
       <div v-else-if="!visible.length" class="empty-state">没有匹配的节点，请调整搜索或类型。</div>
       <div v-else ref="canvas" class="graph-canvas">
         <svg :viewBox="`0 0 ${viewport.width} ${viewport.height}`" role="group" :aria-label="layer === 'metadata' ? '元数据关联图' : '业务知识图谱'" @pointerdown="start" @pointermove="move" @pointerup="drag = null" @pointercancel="drag = null" @lostpointercapture="drag = null">
@@ -111,12 +141,12 @@ onUnmounted(() => observer?.disconnect())
             </g>
             <g v-for="node in visible" :key="node.id" class="graph-node" :class="{ selected: selected?.id === node.id, candidate: node.status === 'candidate', unresolved: node.status === 'unresolved' }" :transform="`translate(${points.get(node.id)!.x} ${points.get(node.id)!.y})`" tabindex="0" role="button" :aria-label="display(node)" @click="selectNode(node)" @keydown.enter="selectNode(node)" @keydown.space.prevent="selectNode(node)">
               <circle r="22" :fill="kindColor(node) + '18'" :stroke="kindColor(node)"/><circle r="5" :fill="kindColor(node)"/>
-              <text class="node-label" y="43">{{ shortLabel(node) }}</text><text class="node-kind" y="59">{{ node.kind || node.layer || '' }} · {{ statusName(node.status) }}</text><title>{{ display(node) }} · {{ statusName(node.status) }}</title>
+              <text class="node-label" y="43">{{ shortLabel(node) }}</text><text class="node-kind" y="59">{{ node.kind || node.layer || '' }} · {{ scopeLabel(node) || statusName(node.status) }}</text><title>{{ display(node) }} · {{ statusName(node.status) }} · {{ scopeLabel(node) }}</title>
             </g>
           </g>
         </svg>
       </div>
-      <div class="panel-footer"><span>{{ graph.total_nodes ?? graph.nodes.length }} 个节点 · {{ graph.total_edges ?? graph.edges.length }} 条关系</span><span v-if="graph.truncated">服务端返回部分图谱（{{ graph.nodes.length }} 个节点），搜索仅覆盖已返回数据</span><span v-else-if="filtered.length > 240">当前展示前 240 个匹配节点，请搜索以缩小范围</span><span v-else>点击节点查看详情 · 拖动空白处平移</span></div>
+      <div class="panel-footer"><span>当前展示 {{ visible.length }} / 匹配 {{ matchedCount }} / 全图 {{ graph.total_nodes ?? graph.nodes.length }} 个节点 · {{ graph.total_edges ?? graph.edges.length }} 条关系</span><span v-if="graph.truncated">服务端返回部分图谱（{{ graph.nodes.length }} 个节点），搜索与翻页仅覆盖已返回数据</span><span v-else-if="serverPaging">检索覆盖全图 · 当前页外关联 {{ graph.boundary_edges ?? 0 }} 条</span><span v-else>点击节点查看详情 · 拖动空白处平移</span><div v-if="matchedCount > 240" class="actions"><button class="btn small" :disabled="pageOffset === 0 || pageLoading" @click="changePage(-1)">上一页节点</button><span>{{ Math.floor(pageOffset / 240) + 1 }} / {{ Math.ceil(matchedCount / 240) }}</span><button class="btn small" :disabled="!hasNext || pageLoading" @click="changePage(1)">下一页节点</button></div></div>
     </section>
     <aside class="panel graph-detail">
       <div class="panel-head"><h2>{{ selectedEdge ? '关系详情' : '节点详情' }}</h2></div>

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import threading
 import time
+from contextlib import contextmanager
 from lightgraph.errors import BudgetExceeded, LightGraphError
 
 class QueryBudget:
@@ -15,6 +16,30 @@ class QueryBudget:
         self._absorbed_budgets: dict[int, QueryBudget] = {}
     def check_time(self):
         if time.monotonic() > self.deadline: raise BudgetExceeded("run_time_budget_exhausted")
+    @contextmanager
+    def exploration(self, *, deadline: float, query_limit: int):
+        """Apply a smaller phase ceiling without resetting consumed resources.
+
+        The run orchestrator is sequential. All source adapters share this
+        object, so tool queries and database cancellation see the same deadline.
+        Restoring the ceiling releases the reserved capacity to validation.
+        """
+        previous_deadline, previous_limit = self.deadline, self.max_queries
+        self.deadline = min(previous_deadline, deadline)
+        self.max_queries = min(previous_limit, query_limit)
+        try:
+            self.check_time()
+            if self.queries >= self.max_queries:
+                raise BudgetExceeded('discovery_query_budget_exhausted')
+            yield
+        except BudgetExceeded as exc:
+            if exc.code == 'run_time_budget_exhausted':
+                raise BudgetExceeded('discovery_time_budget_exhausted') from None
+            if exc.code == 'query_budget_exhausted':
+                raise BudgetExceeded('discovery_query_budget_exhausted') from None
+            raise
+        finally:
+            self.deadline, self.max_queries = previous_deadline, previous_limit
     def charge_query(self):
         with self._lock:
             self.check_time()

@@ -1,6 +1,6 @@
 # AgentScope 接入与模型配置
 
-更新日期：2026-10-20。本次把关键列发现的多轮循环迁入 AgentScope；抽取目标、Markdown 作用域、SQL 守卫、规则核验和发布流程沿用现有契约。
+更新日期：2026-10-29。发现循环使用 AgentScope；模型请求、SSE 解码与工具分片累计改由固定版本 OpenAI SDK 承担。抽取目标、Markdown 作用域、SQL 守卫、规则核验和发布流程沿用现有契约。
 
 ## 运行路径
 
@@ -9,7 +9,7 @@
   → T0/T1/T2/T3/T4/T5 任务包
   → AgentScope ReActAgent.reply
       → DiscoveryFormatter：目标、阶段、适用文档、当前观察
-      → DiscoveryChatModel：调用受限 Chat Completions 传输
+      → DiscoveryChatModel：预算/字节/完整性包装 → OpenAI SDK Chat Completions
       → Toolkit：校验并执行工具，返回 ToolResponse
       → ReActAgent 读取观察，继续推理或提交 ProposalBatch
   → 引用检查 → 独立规则核验 → 受控执行与图谱发布
@@ -41,18 +41,24 @@
 独立配置文件示例见 [`agent.example.yaml`](../../examples/agent.example.yaml)，完整用法见 [README](../../README.md#agentscope-与模型配置)。运行文件通过 `agent_config` 引用它。分析目的保留在运行 YAML 的 `goal`，不和模型连接参数混在一起。
 
 - `llm.stream: false`：接收完整 Chat Completions JSON。
-- `llm.stream: true`：接收 SSE，逐片解析 UTF-8、正文、按 index 分片的工具参数及末尾用量。
+- `llm.stream: true`：由 OpenAI SDK 解码 SSE，并用其 `ChatCompletionStreamState` 累计正文、工具参数及末尾用量。
 - 流式必须收到完成标志和 `[DONE]`，并通过响应与参数校验后才允许执行工具。传输层在内存中组装完整响应，再以 AgentScope 的流式响应接口交付一次完整 `ChatResponse`。
 - 两种模式共用字节限制、截止时间、重试次数和 token 预算；不自动从流式降为非流式。不完整流、生成截断、超限或连接中断都不能触发工具。
 - 这次支持的是模型接口的流式传输。没有新增浏览器 SSE、实时 token 展示或工作台后端。
 
 网关需支持 OpenAI 兼容的 `tools/tool_calls`、`tool_choice` 和 JSON 输出。只支持文本生成的端点不能执行自主发现。配置允许直填 `api_key` 或读取环境变量；直填非空值优先，密钥不进入配置序列化和运行报告。
 
+`sdk_transport.py` 使用 `openai==3.35.1`。为了在调用工具前拦截超限事件、缺少结束标志和断流，适配层使用了该版本的 SSE 解码器及累计器接口，其中部分是 SDK 内部接口；升级 SDK 必须重跑协议和留存测试。SDK 自带重试关闭，外层每次重试都计入调用预算。工具回合不附 `response_format`；无工具结构化任务继续使用严格 Schema 或显式 JSON 兼容模式。对象形式的非流式 arguments 会规范化，字符串参数的重复键拒绝执行。缺少 `finish_reason` 的非流式响应也不执行工具。
+
+SDK 对不符合类型的响应可能只给序列化警告，默认警告会包含输入值。适配层关闭这类原值警告并显式验证消息和分片类型，只返回固定错误码；开启 OpenAI 调试日志时拒绝发送请求。
+
 ## 上下文、限额与清理
 
 每次模型调用重新构建任务上下文；工具探索了另一张表后，下一轮补入该表适用的说明。原始元数据、样本和 Markdown 均作为证据，不能修改系统权限。最终提案仍须引用已发放的列、文档、实体或探查 ID。
 
 `max_discovery_steps` 限制框架推理轮数，`max_tool_calls` 限制单次探索的工具数。达到上限时禁止框架额外调用模型做总结。HTTP 重试也消耗全局调用和 token 预算。发现流程版本已更新，旧版本的完成标记不能直接跳过新的发现路径。
+
+至少四回合的任务在总回合数内预留最后两回合，用于本地提交、字段反馈和结束操作；短任务保留最后一回合。来源查询不能占用提交阶段。提示字节默认上限为 128 KiB，可显式配置；目录窗口还受剩余 token 额度约束，保留当前任务表并缩减可选表。配置增大不会取消任何额度检查。
 
 内存使用 `EphemeralMemory`，禁止 `state_dict` 和会话恢复；不启用长期记忆、自动压缩、Studio、模型原文打印或原文事件队列。如果宿主开启 AgentScope tracing，在原文交给 tracing 前拒绝运行。成功、异常和取消均清理消息及工具闭包，再关闭发现执行器。查询数据只短期存在于进程内存，不进入结果库或运行文件；外部模型服务和客户数据库的日志策略仍需部署侧验证。
 

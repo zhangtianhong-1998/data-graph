@@ -1,6 +1,5 @@
 """Bounded OpenAI-compatible structured calls; request/response bodies stay in memory."""
 from __future__ import annotations
-import codecs
 import json
 import math
 import os
@@ -172,8 +171,8 @@ def request_envelope_for(messages, tool_specs, response_format):
     uploaded documents, source observations and previous responses are untouched.
     """
     sent=[]
-    provider_schema=(response_format.get('json_schema',{}).get('schema')
-                     if response_format.get('type')=='json_schema' else None)
+    provider_schema=((response_format or {}).get('json_schema',{}).get('schema')
+                     if (response_format or {}).get('type')=='json_schema' else None)
     for message in messages:
         copy=dict(message)
         if provider_schema is not None and message.get('role')=='user' and isinstance(message.get('content'),str):
@@ -184,7 +183,7 @@ def request_envelope_for(messages, tool_specs, response_format):
                 copy['content']=canonical({**packet,'output_schema':{
                     'schema_ref':'response_format.json_schema.schema'}})
         sent.append(copy)
-    return {'messages':sent,'tools':tool_specs or [],'response_format':response_format}
+    return {'messages':sent,'tools':tool_specs or [],**({'response_format':response_format} if response_format else {})}
 
 
 def _request_task(messages):
@@ -387,19 +386,20 @@ def _invalid_review_terminal(message):
     try:
         value=_strict_json_loads(message['content'])
     except (KeyError,TypeError,ValueError,LightGraphError):
-        return 'semantic_claim_unresolved'
-    if not isinstance(value,dict):return 'semantic_claim_unresolved'
+        return 'semantic_review_protocol_invalid'
+    if not isinstance(value,dict):return 'semantic_review_protocol_invalid'
     evidence=value.get('evidence',[])
     items=evidence if isinstance(evidence,list) else [evidence]
     if value.get('decision')=='refuted' or any(
             isinstance(item,dict) and item.get('stance')=='refutes' for item in items):
         return 'semantic_claim_refuted'
-    if value.get('decision')!='supported':return 'semantic_claim_unresolved'
+    if value.get('decision')=='unresolved':return 'semantic_claim_unresolved'
+    if value.get('decision')!='supported':return 'semantic_review_protocol_invalid'
     if not isinstance(evidence,list) or any(not isinstance(item,dict) or
             item.get('stance') not in {'supports','refutes','context','irrelevant'} for item in evidence):
-        return 'semantic_claim_unresolved'
+        return 'semantic_review_protocol_invalid'
     conditions=value.get('conditions',[])
-    if not isinstance(conditions,list):return 'semantic_condition_unresolved'
+    if not isinstance(conditions,list):return 'semantic_review_protocol_invalid'
     if any(not isinstance(item,dict) or item.get('state')!='satisfied'
            or not isinstance(item.get('evidence_refs'),list) or not item['evidence_refs']
            for item in conditions):
@@ -420,7 +420,7 @@ class ModelConfig(StrictModel):
     allow_insecure_http: bool = False
     timeout_seconds: float = 45
     max_response_bytes: int = 262144
-    max_prompt_bytes: int = 65536
+    max_prompt_bytes: int = 131072
     max_output_tokens: int = 4096
     retries: int = 1
     allow_source_samples: bool = False
@@ -434,182 +434,8 @@ class ModelConfig(StrictModel):
                    api_key_env=os.environ.get('LIGHTGRAPH_API_KEY_ENV','LIGHTGRAPH_API_KEY'))
 
 
-def _stream_transport_limit(max_response_bytes, max_output_tokens):
-    """Bound framing separately from decoded content, including ignored fields.
+from .sdk_transport import request_completion, stream_transport_limit as _stream_transport_limit
 
-    JSON string escaping can use six wire bytes for one decoded byte. The
-    additional per-token allowance bounds SSE framing and provider metadata or
-    reasoning events without treating them as the final application response.
-    """
-    return 6*max_response_bytes + 2048*max_output_tokens + 65536
-
-
-class _ChatCompletionStream:
-    """Assemble one bounded SSE turn; no partial call is exposed to the agent.
-
-    The HTTP reader separately bounds all wire bytes, including ignored fields.
-    Decoded actionable strings and each in-flight SSE event have their own caps.
-    A finish reason and [DONE] are both required, so a disconnected provider
-    cannot accidentally execute an otherwise syntactically complete tool call.
-    """
-    def __init__(self,max_response_bytes):
-        self.max_response_bytes=max_response_bytes
-        self.max_event_bytes=6*max_response_bytes+65536
-        self.content_bytes=0
-        self.data_bytes=0
-        self.decoder=codecs.getincrementaldecoder('utf-8')()
-        self.pending=''
-        self.data=[]
-        self.content=[]
-        self.calls={}
-        self.usage={}
-        self.finish_reason=None
-        self.done=False
-
-    def feed(self,chunk: bytes) -> None:
-        self.pending+=self.decoder.decode(chunk)
-        self._lines()
-        if len(self.pending.encode('utf-8'))>self.max_event_bytes:
-            raise LightGraphError('model_stream_event_too_large')
-
-    def _lines(self, *, final: bool=False) -> None:
-        # SSE accepts LF, CRLF, and CR. Hold a final CR until the next chunk so
-        # CRLF split at a network boundary does not become two line endings.
-        while self.pending:
-            positions=[i for c in ('\n','\r') if (i:=self.pending.find(c))>=0]
-            if not positions:
-                break
-            end=min(positions)
-            if self.pending[end]=='\r' and end==len(self.pending)-1 and not final:
-                break
-            width=2 if self.pending[end:end+2]=='\r\n' else 1
-            line,self.pending=self.pending[:end],self.pending[end+width:]
-            self._line(line)
-
-    def _line(self,line: str) -> None:
-        if len(line.encode('utf-8'))>self.max_event_bytes:
-            raise LightGraphError('model_stream_event_too_large')
-        if not line:
-            if self.data:
-                data='\n'.join(self.data)
-                self.data.clear()
-                self.data_bytes=0
-                self._event(data)
-            return
-        if line.startswith(':'):
-            return
-        field,_,value=line.partition(':')
-        if field=='data':
-            value=value[1:] if value.startswith(' ') else value
-            self.data_bytes+=len(value.encode('utf-8'))+bool(self.data)
-            if self.data_bytes>self.max_event_bytes:
-                raise LightGraphError('model_stream_event_too_large')
-            self.data.append(value)
-
-    def _count_content(self,value):
-        self.content_bytes+=len(value.encode('utf-8'))
-        if self.content_bytes>self.max_response_bytes:
-            raise LightGraphError('model_response_too_large')
-
-    def _event(self,data: str) -> None:
-        if self.done:
-            raise LightGraphError('model_stream_invalid')
-        if data=='[DONE]':
-            self.done=True
-            return
-        event=json.loads(data)
-        if not isinstance(event,dict) or event.get('error'):
-            raise LightGraphError('model_stream_invalid')
-        usage=event.get('usage')
-        if usage is not None:
-            if not isinstance(usage,dict):
-                raise LightGraphError('model_stream_invalid')
-            self.usage=usage
-        choices=event.get('choices')
-        if not isinstance(choices,list) or len(choices)>1:
-            raise LightGraphError('model_stream_invalid')
-        if not choices:
-            return
-        choice=choices[0]
-        if not isinstance(choice,dict) or choice.get('index',0)!=0:
-            raise LightGraphError('model_stream_invalid')
-        delta=choice.get('delta',{})
-        if not isinstance(delta,dict) or self.finish_reason is not None:
-            raise LightGraphError('model_stream_invalid')
-        content=delta.get('content')
-        if content is not None:
-            if not isinstance(content,str):
-                raise LightGraphError('model_stream_invalid')
-            self._count_content(content)
-            if content:self.content.append(content)
-        if delta.get('refusal'):
-            raise LightGraphError('model_response_refused')
-        calls=delta.get('tool_calls') or []
-        if not isinstance(calls,list):
-            raise LightGraphError('model_stream_invalid')
-        for part in calls:
-            if not isinstance(part,dict):
-                raise LightGraphError('model_stream_invalid')
-            index=part.get('index')
-            if isinstance(index,bool) or not isinstance(index,int) or not 0<=index<64:
-                raise LightGraphError('model_stream_invalid')
-            call=self.calls.setdefault(index,{'id':'','type':'function','function':{'name':'','arguments':''}})
-            if part.get('type','function')!='function':
-                raise LightGraphError('model_stream_invalid')
-            if part.get('id') is not None:
-                if not isinstance(part['id'],str):
-                    raise LightGraphError('model_stream_invalid')
-                self._count_content(part['id'])
-                call['id']+=part['id']
-            function=part.get('function') or {}
-            if not isinstance(function,dict):
-                raise LightGraphError('model_stream_invalid')
-            for field in ('name','arguments'):
-                value=function.get(field)
-                if value is not None:
-                    if not isinstance(value,str):
-                        raise LightGraphError('model_stream_invalid')
-                    self._count_content(value)
-                    call['function'][field]+=value
-        reason=choice.get('finish_reason')
-        if reason is not None:
-            if reason not in ('stop','tool_calls','length','content_filter'):
-                raise LightGraphError('model_stream_invalid')
-            self.finish_reason=reason
-
-    def finish(self) -> dict:
-        self.pending+=self.decoder.decode(b'',final=True)
-        self._lines(final=True)
-        # The terminal event need not have a trailing blank line.
-        if self.pending:
-            self._line(self.pending)
-            self.pending=''
-        self._line('')
-        if not self.done or self.finish_reason is None:
-            raise LightGraphError('model_stream_incomplete')
-        if self.calls and self.finish_reason not in ('tool_calls','length','content_filter'):
-            raise LightGraphError('model_stream_invalid')
-        if not self.calls and self.finish_reason=='tool_calls':
-            raise LightGraphError('model_stream_invalid')
-        message={'role':'assistant','content':''.join(self.content) if self.content else None}
-        if self.calls:
-            if sorted(self.calls)!=list(range(len(self.calls))):
-                raise LightGraphError('model_stream_invalid')
-            message['tool_calls']=[self.calls[index] for index in sorted(self.calls)]
-            for call in message['tool_calls']:
-                if not call['id'] or not call['function']['name']:
-                    raise LightGraphError('model_stream_invalid')
-        return {'choices':[{'message':message,'finish_reason':self.finish_reason}],'usage':self.usage}
-
-    def clear(self) -> None:
-        self.pending=''
-        self.data.clear()
-        self.content.clear()
-        self.calls.clear()
-        self.usage={}
-        self.content_bytes=0
-        self.data_bytes=0
-        self.decoder.reset()
 
 class StructuredModelClient:
     """A transport can be injected for offline acceptance tests; no retries by SDK.
@@ -680,9 +506,11 @@ class StructuredModelClient:
                  allow_schema_repair: bool = True) -> T:
         """One bounded provider turn. Only counters survive the call, never messages."""
         schema=_request_schema(messages)
-        response_format=response_format_for(schema,self.config.response_format)
+        response_format=None if tool_specs else response_format_for(schema,self.config.response_format)
         content = canonical(request_envelope_for(messages,tool_specs,response_format))
         if len(content.encode()) > self.config.max_prompt_bytes:
+            self.usage['prompt_packets_rejected']=self.usage.get('prompt_packets_rejected',0)+1
+            self.usage['prompt_rejected_peak_bytes']=max(self.usage.get('prompt_rejected_peak_bytes',0),len(content.encode()))
             raise LightGraphError('model_packet_too_large')
         key = self.config.api_key.get_secret_value() if self.config.api_key else ''
         key = key or os.environ.get(self.config.api_key_env)
@@ -706,9 +534,13 @@ class StructuredModelClient:
             request_messages=([*messages,{'role':'user','content':canonical(feedback)}]
                               if correcting else messages)
             request_tools=None if correcting else tool_specs
-            request_envelope=request_envelope_for(request_messages,request_tools,response_format)
+            request_format=(response_format_for(schema,self.config.response_format)
+                            if correcting and response_format is None else response_format)
+            request_envelope=request_envelope_for(request_messages,request_tools,request_format)
             content=canonical(request_envelope)
             if len(content.encode())>self.config.max_prompt_bytes:
+                self.usage['prompt_packets_rejected']=self.usage.get('prompt_packets_rejected',0)+1
+                self.usage['prompt_rejected_peak_bytes']=max(self.usage.get('prompt_rejected_peak_bytes',0),len(content.encode()))
                 if correcting:request_messages.clear()
                 raise LightGraphError('model_packet_too_large')
             # Correction text and the transient candidate consume the same
@@ -719,11 +551,6 @@ class StructuredModelClient:
             self.budget.reserve(reserved,cost)
             counted = False
             request_started = False
-            raw = bytearray()
-            stream = _ChatCompletionStream(self.config.max_response_bytes) if self.config.stream else None
-            transport_limit=(_stream_transport_limit(self.config.max_response_bytes,self.config.max_output_tokens)
-                if stream is not None else self.config.max_response_bytes)
-            received = 0
             payload = envelope = value = candidate_message = None
             try:
                 self.budget.admit(cost,reserved)
@@ -733,44 +560,15 @@ class StructuredModelClient:
                 if correcting:
                     self.usage['schema_repair_attempts']=self.usage.get('schema_repair_attempts',0)+1
                 payload = {'model':self.config.model,'messages':request_envelope['messages'],
-                    'response_format':response_format,
+                    **({'response_format':request_format} if request_format else {}),
                     'max_tokens':self.config.max_output_tokens,'temperature':0,'stream':self.config.stream}
                 if self.config.stream and self.config.stream_options_include_usage:
                     payload['stream_options']={'include_usage':True}
                 if request_tools:
                     payload.update(tools=request_tools,tool_choice=tool_choice,parallel_tool_calls=False)
-                with httpx.Client(transport=self.transport, timeout=self.config.timeout_seconds,
-                                  follow_redirects=False, trust_env=False) as client:
-                    timeout = min(self.config.timeout_seconds,self.budget.remaining_seconds())
-                    request_started = True
-                    with client.stream('POST',self.config.base_url.rstrip('/')+'/chat/completions',
-                        headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'},json=payload,
-                        timeout=timeout) as response:
-                        # Socket timeouts are per I/O operation, not a total run
-                        # deadline; injected transports may ignore them entirely.
-                        self.budget.check_deadline()
-                        if response.status_code != 200:
-                            if self.config.response_format=='json_schema' and response.status_code in (400,422):
-                                raise LightGraphError('model_structured_output_rejected')
-                            last_code = 'model_rate_limited' if response.status_code == 429 else 'model_http_error'
-                            raise LightGraphError(last_code,retryable=response.status_code in (429,500,502,503,504))
-                        for chunk in response.iter_bytes():
-                            self.budget.check_deadline()
-                            received+=len(chunk)
-                            if received>transport_limit:
-                                raise LightGraphError('model_stream_transport_too_large' if stream is not None
-                                                      else 'model_response_too_large')
-                            if stream is not None:
-                                # Check every received chunk before locally
-                                # slicing it. HTTPX chunk_size would buffer a
-                                # slow drip and delay the total deadline check.
-                                for start in range(0,len(chunk),65536):
-                                    self.budget.check_deadline()
-                                    stream.feed(chunk[start:start+65536])
-                            else:
-                                raw.extend(chunk)
+                request_started = True
+                envelope = request_completion(self.config, self.budget, self.transport, key, payload)
                 self.budget.check_deadline()
-                envelope = stream.finish() if stream is not None else json.loads(raw)
                 usage = envelope.get('usage') or {}
                 if not isinstance(usage,dict):
                     raise LightGraphError('llm_schema_invalid')
@@ -794,7 +592,7 @@ class StructuredModelClient:
                     # A review must not use the outer protocol retry to turn
                     # an ambiguous or negative tool-bearing response positive.
                     raise LightGraphError((_invalid_review_terminal(candidate_message)
-                        or 'semantic_claim_unresolved') if semantic_review else 'llm_schema_invalid')
+                        or 'semantic_review_protocol_invalid') if semantic_review else 'llm_schema_invalid')
                 candidate_message=_recover_final_json(candidate_message,self.usage,self.config.max_response_bytes)
                 result = parse_message(candidate_message)
                 self.budget.check_deadline()
@@ -803,7 +601,7 @@ class StructuredModelClient:
                         terminal=_invalid_review_terminal(candidate_message)
                         if terminal:raise LightGraphError(terminal)
                     if not _schema_correction_matches(correction_anchor,candidate_message,correction_contract):
-                        raise LightGraphError('semantic_claim_unresolved' if semantic_review else 'llm_schema_invalid')
+                        raise LightGraphError('semantic_review_protocol_invalid' if semantic_review else 'llm_schema_invalid')
                     final=(result.get('final') if isinstance(result,dict) else result)
                     counter=('schema_repair_abstentions' if isinstance(final,ProposalBatch) and final.abstain
                              else 'schema_repairs_succeeded')
@@ -813,7 +611,7 @@ class StructuredModelClient:
                 self.usage['failures'] += 1
                 raise
             except (ValidationError,KeyError,IndexError,TypeError,ValueError,json.JSONDecodeError) as exc:
-                last_code = 'llm_schema_invalid'
+                last_code = 'semantic_review_protocol_invalid' if semantic_review else 'llm_schema_invalid'
                 self.usage['failures'] += 1
                 if semantic_review:
                     terminal=_invalid_review_terminal(candidate_message)
@@ -843,9 +641,6 @@ class StructuredModelClient:
                         self.budget.charge(Cost(llm_tokens=estimate),reserved)
                 finally:
                     self.budget.release(reserved)
-                    raw.clear()
-                    if stream is not None:
-                        stream.clear()
                     if correcting:request_messages.clear()
                     request_envelope['messages'].clear()
                     payload = envelope = value = candidate_message = None

@@ -166,7 +166,7 @@ def test_schema_correction_cannot_discard_unknown_review_meaning(monkeypatch):
             assert json.loads(body['messages'][-1]['content'])['schema_protocol_correction']
         return response(answer)
     model = client(monkeypatch, handler)
-    with pytest.raises(LightGraphError, match='semantic_claim_unresolved') as caught:
+    with pytest.raises(LightGraphError, match='semantic_review_protocol_invalid') as caught:
         review_semantics(model, {'probe_digest': [{'probe_id': 'probe_1'}]}, {'kind': 'wide_hierarchy'}, [])
     assert CANARY not in str(caught.value)
     assert len(calls) == 2 and model.usage.get('schema_repairs_succeeded', 0) == 0
@@ -236,7 +236,7 @@ def test_unparseable_candidate_can_only_abstain_in_requested_task(monkeypatch):
     def handler(request):
         calls.append(1)
         if len(calls) == 1:
-            return httpx.Response(200, json={'choices': [{'message': {'content': 'not parseable JSON'}}]})
+            return httpx.Response(200, json={'choices': [{'message': {'content': 'not parseable JSON'},'finish_reason':'stop'}]})
         return response({'task': 'T1_table_discovery', 'abstain': True})
     model = client(monkeypatch, handler)
     result = legacy_batch(model, input_packet(), Toolbox())
@@ -418,6 +418,6 @@ def test_missing_review_slot_never_unlocks_existing_conditions(monkeypatch, chan
     if change == 'none':
         assert review_semantics(model, {'probe_digest': [{'probe_id': 'probe_1'}]}, {'kind': 'wide_hierarchy'}, [])
     else:
-        with pytest.raises(LightGraphError, match='semantic_claim_unresolved'):
+        with pytest.raises(LightGraphError, match='semantic_review_protocol_invalid'):
             review_semantics(model, {'probe_digest': [{'probe_id': 'probe_1'}]}, {'kind': 'wide_hierarchy'}, [])
     assert len(calls) == 2

@@ -42,9 +42,9 @@ def test_small_finish_schema_is_sent_while_submissions_remain_typed_tools(monkey
     calls=[];schema=DiscoveryFinish.model_json_schema()
     def handler(request):
         body=json.loads(request.content);calls.append(body)
-        assert_strict(body,schema)
+        assert 'response_format' not in body
         envelope=json.loads(body['messages'][1]['content'])
-        assert envelope['output_schema']=={'schema_ref':'response_format.json_schema.schema'}
+        assert envelope['output_schema']==schema
         if len(calls)==1:
             assert body.get('tools')
             return response(tool='get_metadata')
@@ -102,7 +102,7 @@ def test_strict_provider_rejection_is_fixed_and_never_silently_downgrades(monkey
         calls.append(json.loads(request.content)['response_format']['type'])
         return httpx.Response(status,text='UNRETAINED_PROVIDER_ERROR_BODY')
     with pytest.raises(LightGraphError,match='model_structured_output_rejected') as caught:
-        client(monkeypatch,handler).explore(input_packet(),Toolbox())
+        client(monkeypatch,handler).complete('T1_table_discovery',input_packet(),ProposalBatch)
     assert calls==['json_schema']
     assert 'UNRETAINED_PROVIDER_ERROR_BODY' not in str(caught.value)+capsys.readouterr().out+caplog.text
 
@@ -114,7 +114,7 @@ def test_explicit_json_object_preserves_compatibility_transport(monkeypatch):
         assert body['response_format']=={'type':'json_object'}
         return response(final())
     model=client(monkeypatch,handler);model.config.response_format='json_object'
-    assert model.explore(input_packet(),Toolbox()).proposals and len(calls)==1
+    assert model.complete('T1_table_discovery',input_packet(),ProposalBatch).proposals and len(calls)==1
 
 
 def test_exact_prompt_threshold_includes_entire_response_format(monkeypatch):

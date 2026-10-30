@@ -18,7 +18,9 @@ REVIEWABLE_CODES = frozenset({
     'same_code_diff_label', 'cross_level_code_reuse', 'non_contiguous_level_code',
     'fill_mismatch', 'reference_missing', 'multiple_parent', 'hierarchy_self_loop',
     'reference_self_link_forbidden', 'reference_self_link_semantics_unreviewed',
+    'reference_arity_mismatch',
     'identity_domain_attribute_conflict', 'identity_migration_conflict',
+    'namespace_scope_missing',
 })
 WorkState = Literal['pending', 'running', 'resolved', 'unresolved', 'deferred', 'superseded']
 
@@ -48,7 +50,11 @@ def rule_shape(rule: RuleSpec) -> str:
 class IterationLedger:
     def __init__(self, store, goal: ExtractionGoal, scopes: list[str]):
         self.store, self.connection = store, store.connection
+        self.candidate_queue = None
         self.connection.executescript('''
+        CREATE TABLE IF NOT EXISTS discovery_feedback (
+          goal_revision INTEGER NOT NULL, source_ref TEXT NOT NULL, task TEXT NOT NULL, codes TEXT NOT NULL,
+          PRIMARY KEY(goal_revision,source_ref,task));
         CREATE TABLE IF NOT EXISTS goal_revision (
           revision INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS iteration_work (
@@ -147,7 +153,8 @@ class IterationLedger:
         with self.store._transaction():
             self.connection.execute('''UPDATE iteration_work SET state='resolved'
                 WHERE goal_revision=? AND source_ref=? AND task='review_pattern'
-                AND pattern_codes NOT LIKE '%unexplained_role_occurrence%' ''',
+                AND pattern_codes NOT LIKE '%unexplained_role_occurrence%'
+                AND pattern_codes NOT LIKE '%namespace_scope_missing%' ''',
                 (self.goal_revision, canonical(source.model_dump(mode='json', by_alias=True))))
 
     def unresolved_tables(self, source_id: str, contexts: dict[str, str]) -> set[str]:
@@ -159,6 +166,24 @@ class IterationLedger:
         return [self._item(row) for row in self.connection.execute(
             'SELECT * FROM iteration_work WHERE goal_revision=? ORDER BY rowid', (self.goal_revision,))]
 
+    def record_discovery_feedback(self, sources, issues, *, task):
+        """Persist only fixed failure categories, never rejected proposal bodies."""
+        if task not in ('metadata_discovery','relation_discovery','coverage_discovery','review_pattern'):
+            raise LightGraphError('unregistered_discovery_feedback_task')
+        from lightgraph.discovery.repair import REPAIRABLE_PROPOSAL_CODES, SEMANTIC_REVIEW_PROTOCOL_CODES
+        allowed=set(REPAIRABLE_PROPOSAL_CODES)|set(SEMANTIC_REVIEW_PROTOCOL_CODES)|{
+            'semantic_claim_unresolved','semantic_claim_refuted','semantic_condition_unresolved',
+            'discovery_invalid_drafts','discovery_submission_incomplete','discovery_submission_pending',
+            'no_confirmable_entity_group','model_abstained','model_response_truncated'}
+        allowed.add('namespace_scope_missing')
+        with self.store._transaction():
+            for source in sources:
+                name=source.schema_name+'.'+source.table
+                codes=sorted({i['code'] for i in issues if i.get('code') in allowed
+                              and i.get('table',name)==name})[:32]
+                self.connection.execute('INSERT OR REPLACE INTO discovery_feedback VALUES(?,?,?,?)',
+                    (self.goal_revision,canonical(source.model_dump(mode='json',by_alias=True)),task,canonical(codes)))
+
     def context(self, items, rules, *, iteration: int) -> dict:
         selected = {(i.source.source_id, i.source.schema_name, i.source.table) for i in items}
         relevant = [r for r in rules if (r.source.source_id, r.source.schema_name, r.source.table) in selected]
@@ -167,8 +192,24 @@ class IterationLedger:
                   'source': r.source.model_dump(mode='json', by_alias=True),
                   'entity_kind': r.identity.entity_kind, 'key_columns': r.identity.key_columns,
                   'attributes': r.attributes.model_dump(mode='json'),
-                  'level_policy': r.identity.level_policy} for r in relevant[:24]]
+                  'level_policy': r.identity.level_policy,
+                  'namespace_columns': list(r.scope.namespaces),
+                  'identity_contract': r.identity.model_dump(mode='json'),
+                  'hierarchy_contract': r.hierarchy.model_dump(mode='json') if r.hierarchy else None,
+                  'hierarchy_levels': [level.model_dump(mode='json') for level in r.hierarchy.levels]
+                      if r.hierarchy else []} for r in relevant[:24]]
+        failures=[]
+        for source_id,schema,table in sorted(selected):
+            source=SourceRef(source_id=source_id,schema=schema,table=table)
+            rows=self.connection.execute('SELECT task,codes FROM discovery_feedback WHERE goal_revision=? AND source_ref=? ORDER BY task',
+                (self.goal_revision,canonical(source.model_dump(mode='json',by_alias=True)))).fetchall()
+            for task,codes in rows:
+                if json.loads(codes):
+                    failures.append({'source':source.model_dump(mode='json',by_alias=True),
+                                     'task':task,'codes':json.loads(codes)})
         return {'goal_revision': self.goal_revision, 'iteration': iteration,
+                'pending_candidates':self.candidate_queue.context(selected) if self.candidate_queue else [],
+                'prior_discovery_feedback':failures,
                 'work_items': [i.model_dump(mode='json', by_alias=True) for i in items[:32]],
                 'known_rules': known, 'known_rules_total': len(relevant),
                 'knowledge_truncated': len(relevant) > len(known)}

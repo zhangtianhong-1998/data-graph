@@ -41,7 +41,7 @@ def test_long_proposal_text_is_verbatim_without_schema_retry(monkeypatch,length,
     assert checked.proposals[0].rationale==original['proposals'][0]['rationale']
     assert calls==[1] and model.usage['calls']==1
     assert model.usage.get('schema_repair_attempts',0)==0
-    assert model.config.max_prompt_bytes==65536 and model.config.max_response_bytes==262144
+    assert model.config.max_prompt_bytes==131072 and model.config.max_response_bytes==262144
     assert tools.closed and not tools.executed
     assert CANARY not in json.dumps(model.usage)+capsys.readouterr().out+caplog.text
 

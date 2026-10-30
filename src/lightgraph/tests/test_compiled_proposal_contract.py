@@ -111,6 +111,7 @@ def test_complete_relative_claim_still_requires_semantic_review(monkeypatch,deci
                 'decision':decision,'basis':'data_inference','evidence':[{
                     'reference':packet['metadata_digest']['columns'][2]['id'],
                     'stance':'supports' if decision=='supported' else 'refutes' if decision=='refuted' else 'context'}]})
+        if packet['task']=='T5_revision':return response({'task':'T5_revision','abstain':True})
         assert packet['task']=='T0_discovery'
         value=group(packet,'a','b');value['proposals'].append(hierarchy(packet,{}))
         return response(value)
@@ -120,7 +121,7 @@ def test_complete_relative_claim_still_requires_semantic_review(monkeypatch,deci
         graph=store.view({'public'})
         assert len(graph['nodes'])==(3 if decision=='supported' else 1)
         assert len(graph['edges'])==(1 if decision=='supported' else 0)
-    assert tasks==['T0_discovery','semantic_review']
+    assert tasks==['T0_discovery','semantic_review']+([] if decision=='supported' else ['T5_revision'])
     if decision=='supported':assert not result.issues
     else:assert any(issue['code']=='semantic_claim_'+decision for issue in result.issues)
 

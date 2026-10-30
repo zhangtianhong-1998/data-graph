@@ -67,6 +67,7 @@ REPAIRABLE_PROPOSAL_CODES = frozenset(PROPOSAL_REPAIR_GUIDANCE)
 # review_semantics already retries these once against its frozen proposition.
 # Exhaustion must remain retryable on a later run, not cached as discovery done.
 SEMANTIC_REVIEW_PROTOCOL_CODES = frozenset({
+    'semantic_review_protocol_invalid',
     'semantic_review_proposition_mismatch', 'semantic_review_reference_mismatch',
     'semantic_review_proposition_missing', 'semantic_review_unissued_evidence',
     'semantic_review_incomplete_context', 'llm_schema_invalid',

@@ -28,6 +28,199 @@
       "title": "AttributeSpec",
       "type": "object"
     },
+    "ConceptComponent": {
+      "additionalProperties": false,
+      "description": "One declared concept; definition identity is independent of row context.",
+      "properties": {
+        "role": {
+          "description": "Stable business role within this joint context, for example metric, product or channel; unique among components. This is not the column-role enum. Do not put row values or combined labels here. Role and definition_ref distinguish concept identities.",
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Role",
+          "type": "string"
+        },
+        "entity_kind": {
+          "description": "Registered business type of this independent concept, distinct from the joint-context type. It must preserve the definition grain; a repeated name alone does not prove that two business definitions are the same.",
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Entity Kind",
+          "type": "string"
+        },
+        "column": {
+          "description": "Issued column ID in an Agent proposal; authorized physical column name in a compiled rule. Prefer a separate concept column. This column supplies the concept value, not the identity of the full source row or path.",
+          "minLength": 1,
+          "title": "Column",
+          "type": "string"
+        },
+        "key_column": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Independent business-code column for this concept. When present, identity uses this code and column supplies only the label. Same labels with different codes remain different objects. Null retains the explicitly declared value identity.",
+          "title": "Key Column"
+        },
+        "namespace_columns": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 16,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Null inherits the joint-context namespaces. An explicit subset selects this concept identity scope; [] permits cross-context reuse only with scope_evidence_ref. Source support permissions still follow the original row context.",
+          "title": "Namespace Columns"
+        },
+        "scope_evidence_ref": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Issued document section establishing the narrower concept identity namespace. Required whenever namespace_columns differs from the joint-context scope.",
+          "title": "Scope Evidence Ref"
+        },
+        "definition_ref": {
+          "description": "Issued definition-section reference exactly as doc_id@revision:section_id. It must define this concept and its grain; never use a bare name, invented reference or sample value. Different definitions must not share identity merely because labels match.",
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Definition Ref",
+          "type": "string"
+        },
+        "identity_domain": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional explicitly verified business-code domain shared with other entity rules. Requires key_column and identity_evidence; the same type, domain, namespace values and code then identify one object across tables. Null keeps definition-local identity.",
+          "title": "Identity Domain"
+        },
+        "identity_evidence": {
+          "description": "Issued document-section references proving this code belongs to identity_domain. Equal labels or overlapping codes alone do not establish a common code domain.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Identity Evidence",
+          "type": "array"
+        },
+        "relation": {
+          "description": "Registered relation from the joint-context entity to this concept type. Preserve the source item binding so separate product and channel edges do not invent combinations.",
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Relation",
+          "type": "string"
+        },
+        "delimiter": {
+          "anyOf": [
+            {
+              "maxLength": 8,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Null for a separate concept column. Otherwise the exact literal separator explicitly supported by the cited document, never guessed from punctuation. Declare position and segment_count together. No regex, trimming or implicit fallback is applied.",
+          "title": "Delimiter"
+        },
+        "position": {
+          "anyOf": [
+            {
+              "maximum": 15,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Zero-based segment position established by the cited definition. Required only with delimiter and segment_count; must be smaller than segment_count. Null for a separate column.",
+          "title": "Position"
+        },
+        "segment_count": {
+          "anyOf": [
+            {
+              "maximum": 16,
+              "minimum": 2,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Exact total number of segments established by the cited document. Every projected value must have this count and nonempty segments; mismatches fail validation instead of guessing a different split. Null for a separate concept column.",
+          "title": "Segment Count"
+        }
+      },
+      "required": [
+        "role",
+        "entity_kind",
+        "column",
+        "definition_ref",
+        "relation"
+      ],
+      "title": "ConceptComponent",
+      "type": "object"
+    },
+    "ConceptMappingSpec": {
+      "additionalProperties": false,
+      "description": "Explicit semantic declaration, never inferred from punctuation alone.",
+      "properties": {
+        "evidence_ref": {
+          "description": "Issued document version exactly as doc_id@revision, without section suffix. The document must support decomposing this source into independent concepts and retaining their joint binding; any delimiter, segment order and grain require explicit evidence. The reference alone grants no semantic approval and must remain a rule dependency.",
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Evidence Ref",
+          "type": "string"
+        },
+        "components": {
+          "description": "Independent concepts assigned together by one source-item context. Each component needs its own role, definition and permitted context-to-concept relation. Do not encode the whole product/channel/metric combination as a single concept identity.",
+          "items": {
+            "$ref": "#/$defs/ConceptComponent"
+          },
+          "maxItems": 16,
+          "minItems": 2,
+          "title": "Components",
+          "type": "array"
+        }
+      },
+      "required": [
+        "evidence_ref",
+        "components"
+      ],
+      "title": "ConceptMappingSpec",
+      "type": "object"
+    },
     "Coverage": {
       "additionalProperties": false,
       "properties": {
@@ -852,7 +1045,8 @@
         "column_group_entity",
         "wide_hierarchy",
         "long_hierarchy",
-        "reference"
+        "reference",
+        "concept_mapping"
       ],
       "title": "Kind",
       "type": "string"
@@ -894,6 +1088,17 @@
       "anyOf": [
         {
           "$ref": "#/$defs/RelationSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "concept_mapping": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ConceptMappingSpec"
         },
         {
           "type": "null"

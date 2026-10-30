@@ -15,14 +15,17 @@ from lightgraph.errors import LightGraphError
 from lightgraph.semantic_schema import SemanticSchema
 from .models import (ProposalBatch, TASK_PROPOSAL_KINDS, ColumnGroupProposal,
     EntityKeyProposal, HierarchyProposal, LongHierarchyProposal, ReferenceProposal,
-    DiscriminatorProposal, ExclusionProposal)
+    DiscriminatorProposal, ExclusionProposal, ConceptMappingProposal)
 from .reference_validation import normalize_column_references, validate_proposal_references
+from .validation_feedback import model_diagnostics
 
 
 class DiscoveryFinish(StrictModel):
     """Small final response; hypotheses have already been submitted as tools."""
     action: Literal['finish_discovery', 'abstain']
-    pending: bool = False
+    pending: bool = Field(default=False, description=
+        'Set true if relevant work remains. False acknowledges rejected attempts '
+        'have been corrected or withdrawn; only retained valid drafts proceed to validation.')
 
 
 PROPOSAL_MODELS = {
@@ -30,6 +33,7 @@ PROPOSAL_MODELS = {
     'wide_hierarchy': HierarchyProposal, 'long_hierarchy': LongHierarchyProposal,
     'reference': ReferenceProposal, 'discriminator': DiscriminatorProposal,
     'exclusion': ExclusionProposal,
+    'concept_mapping': ConceptMappingProposal,
 }
 MAX_SUBMISSION_CALLS = 16
 
@@ -53,7 +57,9 @@ def proposal_tool_specs(task):
         schema['required'].remove('kind')
         specs.append(_spec('submit_' + kind,
             'Validate and retain one candidate. This does not confirm semantics or publish it. '
-            'Use issued references; an error leaves prior drafts intact.', schema))
+            'Use issued references; an error leaves prior drafts intact and does not retain '
+            'the rejected input. Correct the diagnosed fields and resubmit, or withdraw '
+            'the rejected attempt when finishing.', schema))
     if 'wide_hierarchy' in TASK_PROPOSAL_KINDS[task]:
         from .hierarchy_plan import hierarchy_plan_tool_schema
         specs.insert(0,hierarchy_plan_tool_schema())
@@ -62,8 +68,10 @@ def proposal_tool_specs(task):
         SemanticSchema.model_json_schema()))
     specs.append(_spec('finish_discovery',
         'Finish using all retained drafts. Set pending=true if relevant work remains. '
-        'Never resubmit the full batch.',
-        {'type':'object','properties':{'pending':{'type':'boolean','default':False}},
+        'pending=false acknowledges all rejected attempts have been corrected or withdrawn. '
+        'Never resubmit the full batch; finishing does not approve semantics.',
+        {'type':'object','properties':{'pending':{'type':'boolean','default':False,
+            'description':DiscoveryFinish.model_json_schema()['properties']['pending']['description']}},
          'additionalProperties':False}))
     return specs
 
@@ -82,24 +90,32 @@ class ProposalSession:
         self.invalid_codes = set()
         self.names = {item['function']['name'] for item in proposal_tool_specs(self.task)}
 
-    def reject(self, code='invalid_proposal_arguments'):
+    def reject(self, code='invalid_proposal_arguments', *, diagnostics=None):
         self.invalid_count += 1
         self.invalid_codes.add(code)
-        return {'status':'error', 'code':code,
-                'retained_drafts':len(self.drafts), 'confirmed':False}
+        result = {'status':'error', 'code':code,
+                  'retained_drafts':len(self.drafts), 'confirmed':False}
+        if diagnostics:
+            result['diagnostics'] = diagnostics
+        return result
 
     def execute(self, name, arguments):
         if self.finished:
             return self.reject('discovery_session_finished')
+        contract = None
+        payload = arguments
         try:
             if name == 'finish_discovery':
-                command = DiscoveryFinish.model_validate({'action':name, **arguments})
+                contract = DiscoveryFinish
+                payload = {'action':name, **arguments}
+                command = contract.model_validate(payload)
                 self.pending = command.pending
                 self.finished = True
                 return {'status':'ok','finished':True,'retained_drafts':len(self.drafts),
                         'confirmed':False,'pending':self.pending}
             if name == 'declare_semantic_schema':
-                incoming = SemanticSchema.model_validate(arguments)
+                contract = SemanticSchema
+                incoming = contract.model_validate(arguments)
                 # Unlike project schema merging, session declarations must not
                 # rewrite even descriptions: earlier constraints remain intact.
                 for field in ('entity_types','properties','relations'):
@@ -110,7 +126,8 @@ class ProposalSession:
                 self.schema = SemanticSchema.merged(self.schema,incoming)
                 return {'status':'ok','schema_declared':True,'confirmed':False}
             if name == 'submit_hierarchy_plan':
-                from .hierarchy_plan import compile_hierarchy_plan
+                from .hierarchy_plan import HierarchyPlan, compile_hierarchy_plan
+                contract = HierarchyPlan
                 converted = compile_hierarchy_plan(arguments,self.packet)
                 # The adapter supplies only a fallback entity description.
                 # Reuse issued or explicitly declared vocabulary verbatim;
@@ -129,7 +146,9 @@ class ProposalSession:
             kind = name.removeprefix('submit_')
             if kind not in TASK_PROPOSAL_KINDS[self.task]:
                 return self.reject('task_kind_forbidden')
-            proposal = PROPOSAL_MODELS[kind].model_validate({'kind':kind, **arguments})
+            contract = PROPOSAL_MODELS[kind]
+            payload = {'kind':kind, **arguments}
+            proposal = contract.model_validate(payload)
             candidate = ProposalBatch(task=self.task,proposals=[proposal])
             candidate, _ = normalize_column_references(candidate,self.packet)
             validate_proposal_references(candidate,self.packet)
@@ -142,8 +161,9 @@ class ProposalSession:
                 return self.reject('proposal_draft_limit')
             self.drafts.append(proposal)
             return {'status':'ok','draft_id':f'draft_{len(self.drafts)}','confirmed':False}
-        except ValidationError:
-            return self.reject('invalid_proposal_arguments')
+        except ValidationError as exc:
+            return self.reject('invalid_proposal_arguments', diagnostics=(
+                model_diagnostics(exc, contract.model_json_schema(), payload) if contract else None))
         except LightGraphError as exc:
             return self.reject(exc.code)
 
@@ -160,7 +180,10 @@ class ProposalSession:
             codes.add(pending_code)
         if self.pending:
             codes.add('discovery_submission_pending')
-        if self.invalid_count:
+        # Count rejected attempts for telemetry, but an explicit completed
+        # session acknowledges they were corrected or withdrawn. No rejected
+        # payload is retained or promoted by that acknowledgment.
+        if self.invalid_count and not abstain and (not self.finished or self.pending):
             codes.add('discovery_invalid_drafts')
         batch._runtime_pending_codes = sorted(codes)
         batch._runtime_invalid_drafts = self.invalid_count

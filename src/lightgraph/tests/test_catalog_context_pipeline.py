@@ -80,8 +80,8 @@ def test_new_table_document_rediscovers_only_affected_table(tmp_path, monkeypatc
         seen.clear()
         third=run_pipeline(config,[source],model=model,documents=[doc])
         assert third.counts["reused_rules"]==2,third.issues
-        assert seen==[('T2_cross_table','a'),('T2_cross_table','b'),
-                      ('T1_table_discovery','a'),('T1_table_discovery','b')]
+        assert seen==[('T1_table_discovery','a'),('T1_table_discovery','b'),
+                      ('T2_cross_table','a'),('T2_cross_table','b')]
         assert any(i['code']=='unexplained_columns' for i in third.issues)
 
 
@@ -121,6 +121,7 @@ def test_cross_source_agent_reference_is_verified_and_published(tmp_path, monkey
     def handler(request):
         _,p=input_packet(request)
         if p['task']=='semantic_review':return response(supported_semantic_review(p))
+        if p['task']=='T1_table_discovery':return response({'task':p['task'],'abstain':True})
         if p["task"]=="T0_discovery":
             if p["scope"]["source_id"]=="database":
                 return response(group(p,"metric","title",kind="Metric"))

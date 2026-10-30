@@ -249,10 +249,95 @@ class OperatorSpec(StrictModel):
     args: dict[str, Any] = Field(default_factory=dict)
     output: str = ""
 
+class ConceptComponent(StrictModel):
+    """One declared concept; definition identity is independent of row context."""
+    role: str = Field(min_length=1, max_length=64, description=
+        'Stable business role within this joint context, for example metric, product or channel; '
+        'unique among components. This is not the column-role enum. Do not put row values or '
+        'combined labels here. Role and definition_ref distinguish concept identities.')
+    entity_kind: str = Field(min_length=1, max_length=64, description=
+        'Registered business type of this independent concept, distinct from the joint-context '
+        'type. It must preserve the definition grain; a repeated name alone does not prove '
+        'that two business definitions are the same.')
+    column: str = Field(min_length=1, description=
+        'Issued column ID in an Agent proposal; authorized physical column name in a compiled '
+        'rule. Prefer a separate concept column. This column supplies the concept value, '
+        'not the identity of the full source row or path.')
+    key_column: str | None = Field(default=None, min_length=1, description=
+        'Independent business-code column for this concept. When present, identity uses '
+        'this code and column supplies only the label. Same labels with different codes '
+        'remain different objects. Null retains the explicitly declared value identity.')
+    namespace_columns: list[str] | None = Field(default=None, max_length=16, description=
+        'Null inherits the joint-context namespaces. An explicit subset selects this '
+        'concept identity scope; [] permits cross-context reuse only with scope_evidence_ref. '
+        'Source support permissions still follow the original row context.')
+    scope_evidence_ref: str | None = Field(default=None, min_length=1, max_length=256, description=
+        'Issued document section establishing the narrower concept identity namespace. '
+        'Required whenever namespace_columns differs from the joint-context scope.')
+    definition_ref: str = Field(min_length=1, max_length=256, description=
+        'Issued definition-section reference exactly as doc_id@revision:section_id. It must '
+        'define this concept and its grain; never use a bare name, invented reference or '
+        'sample value. Different definitions must not share identity merely because labels match.')
+    identity_domain: str | None = Field(default=None, min_length=1, max_length=256, description=
+        'Optional explicitly verified business-code domain shared with other entity rules. '
+        'Requires key_column and identity_evidence; the same type, domain, namespace values '
+        'and code then identify one object across tables. Null keeps definition-local identity.')
+    identity_evidence: list[str] = Field(default_factory=list, max_length=16, description=
+        'Issued document-section references proving this code belongs to identity_domain. '
+        'Equal labels or overlapping codes alone do not establish a common code domain.')
+    relation: str = Field(min_length=1, max_length=64, description=
+        'Registered relation from the joint-context entity to this concept type. Preserve '
+        'the source item binding so separate product and channel edges do not invent combinations.')
+    # No default splitting: all segment positions/counts must be declared.
+    delimiter: str | None = Field(default=None, min_length=1, max_length=8, description=
+        'Null for a separate concept column. Otherwise the exact literal separator explicitly '
+        'supported by the cited document, never guessed from punctuation. Declare position '
+        'and segment_count together. No regex, trimming or implicit fallback is applied.')
+    position: int | None = Field(default=None, ge=0, le=15, description=
+        'Zero-based segment position established by the cited definition. Required only with '
+        'delimiter and segment_count; must be smaller than segment_count. Null for a separate column.')
+    segment_count: int | None = Field(default=None, ge=2, le=16, description=
+        'Exact total number of segments established by the cited document. Every projected '
+        'value must have this count and nonempty segments; mismatches fail validation instead '
+        'of guessing a different split. Null for a separate concept column.')
+    @model_validator(mode="after")
+    def validate_segment(self):
+        if self.identity_domain and (not self.key_column or not self.identity_evidence):
+            raise ValueError('concept_identity_domain_evidence_required')
+        if self.identity_evidence and not self.identity_domain:
+            raise ValueError('concept_identity_domain_required')
+        segmented = self.delimiter is not None
+        if segmented != (self.position is not None and self.segment_count is not None):
+            raise ValueError("concept_segment_contract_required")
+        if not segmented and (self.position is not None or self.segment_count is not None):
+            raise ValueError("concept_segment_contract_required")
+        if segmented and self.position >= self.segment_count:
+            raise ValueError("concept_segment_out_of_range")
+        return self
+
+
+class ConceptMappingSpec(StrictModel):
+    """Explicit semantic declaration, never inferred from punctuation alone."""
+    evidence_ref: str = Field(min_length=1, max_length=256, description=
+        'Issued document version exactly as doc_id@revision, without section suffix. The '
+        'document must support decomposing this source into independent concepts and retaining '
+        'their joint binding; any delimiter, segment order and grain require explicit evidence. '
+        'The reference alone grants no semantic approval and must remain a rule dependency.')
+    components: list[ConceptComponent] = Field(min_length=2, max_length=16, description=
+        'Independent concepts assigned together by one source-item context. Each component '
+        'needs its own role, definition and permitted context-to-concept relation. Do not '
+        'encode the whole product/channel/metric combination as a single concept identity.')
+    @model_validator(mode="after")
+    def unique_roles(self):
+        if len({c.role for c in self.components}) != len(self.components):
+            raise ValueError("duplicate_concept_role")
+        return self
+
+
 class RuleSpec(StrictModel):
     rule_id: str
     revision: int = Field(default=1, ge=1)
-    kind: Literal["column_group_entity", "wide_hierarchy", "long_hierarchy", "reference"]
+    kind: Literal["column_group_entity", "wide_hierarchy", "long_hierarchy", "reference", "concept_mapping"]
     goal_refs: list[str] = Field(default_factory=list)
     semantic_schema: SemanticSchema = Field(default_factory=SemanticSchema)
     source: SourceRef
@@ -261,6 +346,7 @@ class RuleSpec(StrictModel):
     attributes: AttributeSpec = Field(default_factory=AttributeSpec)
     hierarchy: HierarchySpec | None = None
     relation: RelationSpec | None = None
+    concept_mapping: ConceptMappingSpec | None = None
     normalization: dict[str, Scalar] = Field(default_factory=lambda: {"version": "n1", "keep_leading_zeros": True})
     operators: list[OperatorSpec] = Field(default_factory=list)
     required_capabilities: list[str] = Field(default_factory=lambda: ["metadata_reading", "read_only_transaction", "parameter_binding", "distinct_projection"])
@@ -275,6 +361,28 @@ class RuleSpec(StrictModel):
     errors: dict[str, str] = Field(default_factory=dict)
     @model_validator(mode="after")
     def validate_shape(self):
+        if (self.kind == "concept_mapping") != (self.concept_mapping is not None):
+            raise ValueError("concept_mapping_contract_required")
+        if self.concept_mapping:
+            for component in self.concept_mapping.components:
+                scope = component.namespace_columns
+                if scope is not None:
+                    if len(set(scope)) != len(scope) or not set(scope) <= set(self.scope.namespaces):
+                        raise ValueError('concept_namespace_invalid')
+                    if set(scope) != set(self.scope.namespaces) and not component.scope_evidence_ref:
+                        raise ValueError('concept_scope_evidence_required')
+                if component.scope_evidence_ref and component.scope_evidence_ref.rsplit(':',1)[0] not in self.dependencies.documents:
+                    raise ValueError('concept_scope_document_required')
+                if any(ref.rsplit(':',1)[0] not in self.dependencies.documents for ref in component.identity_evidence):
+                    raise ValueError('concept_identity_document_required')
+            if self.identity.entity_kind in {c.entity_kind for c in self.concept_mapping.components}:
+                raise ValueError("concept_context_type_must_be_distinct")
+            if self.hierarchy or self.relation or self.attributes.single_valued or self.attributes.multi_valued:
+                raise ValueError("concept_mapping_contract_conflict")
+            if self.concept_mapping.evidence_ref not in self.dependencies.documents:
+                raise ValueError("concept_mapping_document_required")
+            if self.identity.semantic_resolution != "source_scoped":
+                raise ValueError("concept_binding_must_be_source_scoped")
         if self.publish.get("mode") != "staged":
             raise ValueError("publication_must_be_staged")
         if self.identity.level_policy == "relative_path" and self.kind != "wide_hierarchy":

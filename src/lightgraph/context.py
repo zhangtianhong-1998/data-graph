@@ -9,7 +9,7 @@ import json
 
 from lightgraph.contracts import ExtractionGoal, SourceRef, TableSpec, canonical, digest
 
-CONTEXT_SELECTION_VERSION = 'scoped_call_context/2'
+CONTEXT_SELECTION_VERSION = 'scoped_call_context/3'
 STAGE_SUBTASKS = {
     'T0_discovery':'Explore relevant structures and propose candidate rules.',
     'T1_table_discovery':'Clarify field meanings and propose entity or column groups.',
@@ -109,8 +109,10 @@ def with_discovery_runtime_control(messages, *, turn, max_turns, remaining_tool_
     for message in prepared:
         if message.get('role')=='system':
             message['content']=(message.get('content') or '')+'\n\n'+(
-                'The runtime_control counters are runtime instructions. Reserve the final '
-                'turn for the small finish_discovery action, using retained drafts. '
+                'The runtime_control counters are runtime instructions. Tasks of at least four '
+                'turns reserve their last two turns for local submission, field feedback and finishing. '
+                'Use the final turn to correct rejected fields and finish retained drafts; '
+                'submit each proposal early enough to receive feedback. '
                 'remaining_tool_calls counts source tools only; local submission tools have their own allowance. '
                 'When submission_required is true, source queries are forbidden. Use the remaining local '
                 'submit_* and finish_discovery tools, or the small final response. Set pending=true '
@@ -128,6 +130,22 @@ def with_discovery_runtime_control(messages, *, turn, max_turns, remaining_tool_
                 message['content']=canonical(packet)
                 break
     return prepared
+
+
+def discovery_envelope(visible):
+    """Keep one copy of evidence; context references the input's exact fields.
+
+    This is a wire projection only. The caller still owns complete transient
+    documents, observations and the issued-reference registry for validation.
+    """
+    from lightgraph.discovery.proposal_session import DiscoveryFinish
+    context=packet_call_context(visible,visible['task'],output_contract={'schema_ref':'output_schema'})
+    for field,source in (('document_snippets','document_snippets'),
+                         ('observations','strata_samples'),('iteration_context','iteration_context')):
+        context.pop(field,None)
+        context[field+'_ref']='input.'+source
+    return {'task':visible['task'],'input':visible,'call_context':context,
+            'output_schema':DiscoveryFinish.model_json_schema()}
 
 
 def initial_agent_prompt_bytes(packet, tool_specs, *, max_steps=8, max_tool_calls=16,
@@ -151,11 +169,8 @@ def initial_agent_prompt_bytes(packet, tool_specs, *, max_steps=8, max_tool_call
     system=AGENT_SYSTEM+'\n\n'+build_goal_instructions(checked.get('goal',{}),stage=checked['task'])
     system+='\nCurrent stage: '+stage+'\nSubtask: '+(
         checked.get('subtask') or STAGE_SUBTASKS[stage])
-    context=packet_call_context(checked,stage,output_contract={'schema_ref':'output_schema'})
-    schema=DiscoveryFinish.model_json_schema()
     messages=[{'role':'system','content':system},
-              {'role':'user','content':canonical({'task':stage,'input':checked,
-                  'call_context':context,'output_schema':schema})}]
+              {'role':'user','content':canonical(discovery_envelope(checked))}]
     reason='last_turn' if max_steps==1 else None
     messages=with_discovery_runtime_control(messages,turn=1,max_turns=max_steps,
         remaining_tool_calls=max_tool_calls,submission_reason=reason)
@@ -163,7 +178,7 @@ def initial_agent_prompt_bytes(packet, tool_specs, *, max_steps=8, max_tool_call
     # and removal of the redundant schema text in strict mode.
     envelope=request_envelope_for(messages,proposal_tool_specs(stage) if reason
         else [*tool_specs,*proposal_tool_specs(stage)],
-                                  response_format_for(schema,response_format))
+                                  None)
     return len(canonical(envelope).encode())
 
 

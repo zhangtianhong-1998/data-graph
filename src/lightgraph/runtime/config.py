@@ -63,7 +63,8 @@ class ModelConfig(StrictModel):
     max_tool_calls: int = Field(default=16, ge=1, le=64)
     timeout_seconds: float = Field(default=60, gt=0)
     max_output_tokens: int = Field(default=4096, gt=0)
-    max_prompt_bytes: int = Field(default=65536, gt=0)
+    # Revision requests include both the typed tool schema and the prior rule.
+    max_prompt_bytes: int = Field(default=131072, gt=0)
     max_response_bytes: int = Field(default=262144, gt=0)
     retries: int = Field(default=1, ge=0, le=1)
 
@@ -93,6 +94,12 @@ class RunConfig(StrictModel):
     max_db_queries: int = Field(default=240, gt=0)
     max_partitions: int = Field(default=256, ge=1, le=4096)
     max_discovery_rounds: int = Field(default=3, ge=1, le=8)
+    # Exploration stops early enough to leave source queries and wall time for
+    # complete rule validation and atomic publication. These are ceilings, not
+    # a guarantee that an arbitrarily large projection fits the remaining run.
+    discovery_time_fraction: float = Field(default=0.75, gt=0, lt=1)
+    discovery_query_fraction: float = Field(default=0.75, gt=0, lt=1)
+    max_relation_discovery_attempts: int = Field(default=2, ge=1, le=8)
     max_reconciliation_entities: int = Field(default=5000, ge=1, le=100000)
     max_reconciliation_candidates: int = Field(default=256, ge=1, le=4096)
     max_identity_reviews: int = Field(default=8, ge=0, le=64)

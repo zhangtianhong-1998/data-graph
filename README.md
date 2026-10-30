@@ -6,6 +6,8 @@
 
 依赖的本轮实测版本记录在 `requirements.lock`；需要复现环境时先安装该文件，再安装项目。
 
+2026-10-29 全量结果与新测试数据见[本次诊断及修改](design/lightweight_graph/FRUIT_RESULT_DIAGNOSIS_20261029.md)：旧实验一条规则已覆盖五个层级，英文名和主体范围遗漏；后续已补范围修订、跨表概念编码域与五表固定规则对照。新版实验上限为 2 小时 / 240 次调用，累计 tokens 不限。新数据尚未重跑真实模型。
+
 当前运行能力与验证边界见 [实施与验收记录](IMPLEMENTATION_STATUS.md)。最新的持续发现、可选关系、整组身份复核与运行指导改动见[两份评审后的继续修复](design/lightweight_graph/REVIEW_CONTINUATION_20261027.md)，上一轮协议修复见[真实数据反馈记录](design/lightweight_graph/REAL_DATA_DISCOVERY_REPAIR.md)。工程验证使用合成输入和离线模型替身，用户另一台机器上的真实数据仍待复跑。当前需求见 [用户故事](design/lightweight_graph/US.md) 和 [目标驱动迭代方案](design/lightweight_graph/GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)；[设计索引](design/lightweight_graph/README.md) 保留各项约束与历史边界。
 
 ## 启动 Vue 工作台
@@ -170,7 +172,7 @@ goal:
 
 ## AgentScope 与模型配置
 
-发现 Agent 使用 AgentScope 1.0.21 的 `ReActAgent`，工具注册到 AgentScope Toolkit，查询权限、SQL 守卫和预算仍由项目的工具执行器检查。模型网关需要兼容 OpenAI Chat Completions 协议，支持 `tools` / `tool_calls`、`tool_choice` 和 `response_format: json_object`。只有普通文本或 JSON 输出能力的接口无法完成工具探查。
+发现 Agent 使用 AgentScope 1.0.21 的 `ReActAgent`，工具注册到 AgentScope Toolkit；OpenAI SDK 3.35.1 负责 Chat Completions 请求、SSE 解码和工具参数分片组装。项目适配层保留完整响应检查、查询权限、SQL 守卫和预算。工具回合只发送 `tools` / `tool_choice`，不混用最终回答的 `response_format`；工具调用 ID 沿用服务端值。只有普通文本或 JSON 输出能力的接口无法完成工具探查。
 
 独立配置示例是 [agent.example.yaml](examples/agent.example.yaml)，运行入口见 [agentscope_discovery.yaml](examples/agentscope_discovery.yaml)。先复制配置，再填写模型地址、名称和密钥来源：
 
@@ -209,7 +211,7 @@ llm:
 .venv/bin/lightgraph discover examples/agentscope_discovery.yaml
 ```
 
-模型默认使用 `response_format: json_schema`，把完整输出契约交给支持严格结构化输出的服务端；本地格式、引用、语义和发布验证仍会继续执行。若网关不支持该模式，须显式设置 `response_format: json_object` 使用兼容模式；程序不会静默降级或删除约束。严格输出中的 Schema 也计入请求容量和用量估算。火山端点的能力应以实际模型与配置验证，不能只凭兼容接口名称判断；参见[官方结构化输出说明](https://docs.volcengine.com/docs/ark/structured-output-beta?lang=zh)。
+模型的无工具结构化回合默认使用 `response_format: json_schema`，把完整输出契约交给支持严格结构化输出的服务端；本地格式、引用、语义和发布验证仍会继续执行。若网关不支持该模式，须显式设置 `response_format: json_object` 使用兼容模式；程序不会静默降级或删除约束。严格输出中的 Schema 也计入请求容量和用量估算。火山端点的能力应以实际模型与配置验证，不能只凭兼容接口名称判断；参见[官方结构化输出说明](https://docs.volcengine.com/docs/ark/structured-output-beta?lang=zh)。
 
 `stream: true` 使用模型 SSE 流，`false` 接收完整 JSON；旧配置默认 `false`。两种模式使用相同的工具和输出校验，工具名称与参数完整到达后才执行工具，不执行半截参数。`stream_options_include_usage` 控制是否请求流末尾的 token 用量；网关不支持该选项时设为 `false`，缺少用量时按保守预算记账。这里的流式指模型传输；Vue 工作台采用 HTTP 轮询显示真实任务状态，尚不提供逐工具事件流，也不显示模型原文。
 
@@ -221,17 +223,49 @@ llm:
 
 具体调用路径和实现边界见 [AgentScope 接入设计](design/lightweight_graph/AGENTSCOPE_RUNTIME.md)。
 
+运行 YAML 新增三个调度参数：`discovery_time_fraction: 0.75`、`discovery_query_fraction: 0.75`、`max_relation_discovery_attempts: 2`。前两项把探索限制在运行时间和查询额度的前 75%，为完整验证和发布保留余量；第三项限制每表关系探索与关系修订的合计次数。探索延期不会撤销已经完整验证的无关规则；真正发生修改时重建受影响规则及其关系依赖。全局预算和原子发布检查始终有效。
+
+工具拒绝参数时返回字段路径、约束类型和静态允许值，不回显输入值。显式完成提交后，已纠正或撤回的错误只累计为历史计数，不再自动标成未完成。跨运行按任务保存受控失败类别，并在 `iteration_context.prior_discovery_feedback` 中提供给下次发现；不保存拒绝提案正文，也不凭错误码改变语义判定。coverage 可以为已有规则增补名称、别名和不改变身份的属性，重新完整验证；改变身份、定义或关系含义仍须普通修订。
+
+## 独立概念与联合条件
+
+`concept_mapping` 规则用于将独立列或有文档声明的名称片段映射为概念。Agent 可调用 `submit_concept_mapping`，引用已签发的文档版本和定义段落，经过独立语义审查后编译。组件的 `role`、`entity_kind`、`column`、`definition_ref`、`relation` 分别说明业务角色、类型、取值列、定义依据和上下文指向概念的关系。只有声明 `delimiter`、零基 `position` 和准确 `segment_count` 后才拆名称；不默认按连字符拆分。
+
+“应收账款占用、柑橘、批发渠道”成为三个可独立复用的概念；来源编号另建联合上下文，保存三个角色同时成立的条件。第二行“应收账款占用、苹果、零售渠道”复用指标概念，但不会推出“柑橘、零售渠道”的组合。概念身份由类型、角色、定义引用、命名空间和单个值确定；不同定义不凭同名合并。上下文身份还区分映射与联合赋值；空命名空间、分段错误或同一来源键的相互矛盾赋值使本次规则验证失败。
+
+可运行固定规则示例（零模型调用），预期 5 个概念、2 个上下文、6 条关系：
+
+```bash
+.venv/bin/python examples/concept_mapping_demo.py
+```
+
+示例验证执行能力，不代表模型能够自动发现这些语义；现有报表项图也不会被静默改写为概念图。合并评审、实施记录及剩余范围见[统一修改文档](design/lightweight_graph/CONSOLIDATED_REPAIR_20261028.md)。
+
 ## 结果、范围和增量
 
 正常 `run` 生成 `report.json`、`graph.sqlite`、`graph.json`、`graph.yaml`、节点/边 CSV 和独立 HTML 浏览页；`discover` 输出验证后的规则与报告，不保存业务图结果库。两种流程都输出 `metadata.yaml`，并在 `metadata/declarations/` 与 `metadata/interpretations/` 保留不可变修订。报告区分完成、有缺口、部分完成与失败；E/D/I 的验证状态独立列出。
 
 排查空图时，先看 `validation.business_graph` 和业务节点、边计数。只有元数据图不代表已生成业务图。若 `business_graph_reason` 为 `scope_filtered`，表示本次已发布的业务支持不在请求的结果范围中，应检查 `scopes` 是否包含已获授权的结果标签。当前规则把身份命名空间值同时用作这些标签；系统不会自动把它们加入可见范围，也不会在诊断中公开被过滤的值。结果范围不能替代数据库行权限。
 
-Agent 现在通过提交工具逐条保存内存草稿，再用简短的结束信号提交结果；单条提案失败不会清空其他草稿。 每批提案只检查一次：合同错误明确延期，独立有效计划继续执行，不再为格式或属性错误自动串联多个修订 Agent。完整数据出现 FD 冲突或新模式时，仍保留必要的数据反例迭代。层级计划只填写对象、列映射、身份范围、位置含义和关系选择，程序统一生成执行字段。源工具额度耗尽或进入最后一步后仍可提交本地草稿，本地提交最多 16 次、保留最多 6 条草稿。中途失败会标明发现未完成，只有通过原语义和完整数据验证的规则才可发布；显式全局弃权则撤回本轮草稿。语义复核由调用程序绑定原提案，模型无需抄写提案或引用编号，只返回判断、证据及条件。 引用补正只返回引用映射及缺失的文档分类，程序保留首答的结论和业务条件。流式传输分别限制实际回复内容、单个事件和总传输量，协议封装及推理事件不再占用实际回复的大小额度。
+Agent 现在通过提交工具逐条保存内存草稿，再用简短的结束信号提交结果；单条提案失败不会清空其他草稿。 每批提案的合同错误明确延期，独立有效计划继续执行，不再为格式或属性错误自动串联多个修订 Agent。完整数据出现 FD 冲突或新模式时，仍保留必要的数据反例迭代。层级计划只填写对象、列映射、身份范围、位置含义和关系选择，程序统一生成执行字段。源工具额度耗尽或进入最后一步后仍可提交本地草稿，本地提交最多 16 次、保留最多 6 条草稿。中途失败会标明发现未完成，只有通过原语义和完整数据验证的规则才可发布；显式全局弃权则撤回本轮草稿。语义复核由调用程序绑定原提案，模型无需抄写提案或引用编号，只返回判断、证据及条件。 引用补正只返回引用映射及缺失的文档分类，程序保留首答的结论和业务条件。流式传输分别限制实际回复内容、单个事件和总传输量，协议封装及推理事件不再占用实际回复的大小额度。
 
 需要取消 API 累计上限时，可把 `model.max_calls`、`model.max_tokens` 分别设为 `null`；默认上限和 `0` 的含义不变。每个 Agent 仍保留提交回合和无进展边界，SQL 权限、内存和运行超时继续生效。报告中的 `schema_repairs_succeeded`、`reference_repairs_succeeded` 和 `column_references_normalized` 分别记录格式纠正、引用纠正和精确列名规范的次数；这些过程不等于业务语义已确认。
 
-发现工作流升级到 `goal_driven_iterations/10` 后，旧发现缓存会重新审核。旧发布保留在历史中，不能绕过新的对象粒度和语义检查直接作为当前结果。
+语义失败现在保存为独立的待处理提案，仅保留已签发引用、失败类别和修订记录。实体发现每批最多追加一次结构修订：缩小身份键、重排既有层级位置或修正长表父子方向；原样重提、改名、换类型或删除原条件不能换取第二次投票。替代提案仍须独立语义审查和完整数据验证。工作台支持搁置、恢复及请求下次重新探索；这些操作不批准业务事实。关系提案的语义失败也进入列表，下一次运行按现有关系流程重新探索。
+
+业务图 API 支持 `offset`、`limit`、`q`、`kind`，画布按页检索完整授权图，显示总量、匹配量和跨页边数。无身份裁决时在 SQLite 中筛选再聚合本页；存在身份裁决时保留完整投影检查。来源详情仍使用完整授权视图，十万节点性能尚未验收。离线 HTML 不内嵌事实与支持账本，完整来源保留在 `graph.json` 和工作台详情中。
+
+离线评测和冻结运行入口：
+
+```bash
+.venv/bin/lightgraph prepare-evaluation CONFIG.json --gold GOLD.json --output runs/NEW_RUN
+.venv/bin/lightgraph run-frozen runs/NEW_RUN
+.venv/bin/lightgraph evaluate runs/NEW_RUN/output/graph.json --gold GOLD.json --output evaluation.json
+```
+
+Gold 独立于执行包；冻结工具复制完整代码、输入和配置，并核对哈希与依赖版本。评测分别计量已接受结果、含候选结果、身份、边、名称、来源位置和范围，不通过合并重复节点来提高召回。代码与输入冻结不等于抽取验收通过。
+
+发现工作流升级到 `goal_driven_iterations/15` 后，旧发现缓存会重新审核。旧发布保留在历史中，不能绕过新的对象粒度和语义检查直接作为当前结果。多表知识查询、文档重复及历史窗口问题已修复，见[请求超限诊断与离线复现](design/lightweight_graph/PROMPT_WINDOW_DIAGNOSIS_20261030.md)。
 
 引用规则默认禁止实体指向自身。自定义关系确实允许反身语义时，须在关系定义中显式声明 `allow_self_links: true`，并通过独立语义复核；换一个关系名不会自动获得许可。升级后，缺少新版自环验证标记的旧引用发布会退出当前视图，下一次运行重新验证；正确的实体、宽层级及历史记录保留。已有合法缓存可直接重验，发现反例则进入关系复核。
 

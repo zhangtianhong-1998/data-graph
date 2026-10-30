@@ -42,6 +42,16 @@ def parser():
     c.add_argument('--max-depth',type=int,default=32);c.add_argument('--publication')
     c.add_argument('--context',action='append',default=[],metavar='KEY=VALUE',
                    help='层级上下文，如 period=2026；支持 JSON 标量或普通文本')
+    c=sub.add_parser('evaluate',help='离线评分；Gold 仅供评测，不调用模型')
+    c.add_argument('graph');c.add_argument('--gold',required=True);c.add_argument('--output',required=True)
+    c.add_argument('--store');c.add_argument('--run-report');c.add_argument('--usage');c.add_argument('--manifest')
+    c=sub.add_parser('evaluate-concepts',help='按明确类型和关系映射评分独立概念及联合组合，不调用模型')
+    c.add_argument('graph');c.add_argument('--gold',required=True);c.add_argument('--output',required=True)
+    c.add_argument('--mapping',required=True,help='JSON with role_kinds, role_relations and context_kind; mapping is not inferred.')
+    c=sub.add_parser('prepare-evaluation',help='冻结本地输入、配置及完整 Python 包，不执行模型')
+    c.add_argument('config');c.add_argument('--gold',required=True);c.add_argument('--output',required=True)
+    c=sub.add_parser('run-frozen',help='核验冻结清单后从快照代码执行一次；使用配置中的模型预算')
+    c.add_argument('bundle')
     c=sub.add_parser('report');c.add_argument('path')
     c=sub.add_parser('import-graph');c.add_argument('snapshot');c.add_argument('store')
     c=sub.add_parser('validate');c.add_argument('rules',nargs='+')
@@ -59,6 +69,26 @@ def run(args):
         app=create_app(args.workspace,frontend_dir=args.frontend_dir)
         uvicorn.run(app,host='127.0.0.1',port=args.port,access_log=False)
         return 0
+    if args.command=='evaluate':
+        from .evaluation import evaluate
+        result=evaluate(args.graph,args.gold,store=args.store,run_report=args.run_report,
+                        usage=args.usage,manifest=args.manifest)
+        atomic_text(args.output,result.model_dump_json(indent=2))
+        emit(result);return 1 if result.status=='GRAPH_FILE_MISSING' else 0
+    if args.command=='prepare-evaluation':
+        from .evaluation.frozen import prepare
+        result=prepare(args.config,args.output,gold_path=args.gold)
+        emit({'status':'PREPARED','bundle':result['bundle_root'],'budgets':result['budgets'],
+              'gold_copied':result['gold_copied']});return 0
+    if args.command=='evaluate-concepts':
+        from .evaluation.concepts import evaluate_concepts
+        mapping=json.loads(Path(args.mapping).read_text())
+        result=evaluate_concepts(args.graph,args.gold,**mapping)
+        atomic_text(args.output,json.dumps(result,ensure_ascii=False,indent=2)+'\n')
+        emit(result);return 0
+    if args.command=='run-frozen':
+        from .evaluation.frozen import launch
+        return launch(args.bundle)
     from .pipeline import run_pipeline,load_rules,make_model
     from .documents import load_documents
     if args.command=='sample':

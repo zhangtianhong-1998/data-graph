@@ -81,15 +81,39 @@ def invalid_reference_slots(batch, packet):
             values = proposal
             for part in path:
                 values = values[part]
-            for offset in range(len(values)):
+            for offset in range(len(values or [])):
                 add([*path, offset], category, code)
 
         many(['evidence_cited'], 'evidence', 'dangling_evidence_reference')
         kind = proposal['kind']
-        if kind == 'column_group':
+        if kind == 'concept_mapping':
+            many(['claim', 'key_columns'])
+            many(['claim', 'namespace_columns'])
+            documents = packet.get('document_snippets', []) + packet.get('document_refs', [])
+            document_versions = {d['doc_id']+'@'+d['revision'] for d in documents
+                                 if d.get('doc_id') and d.get('revision')}
+            add(['claim', 'evidence_ref'], 'evidence', 'dangling_evidence_reference', allowed=document_versions)
+            for component in range(len(claim['components'])):
+                add(['claim', 'components', component, 'column'])
+                add(['claim', 'components', component, 'key_column'])
+                many(['claim', 'components', component, 'namespace_columns'])
+                sections = {f"{d['doc_id']}@{d['revision']}:{d['section_id']}" for d in documents
+                            if all(d.get(k) for k in ('doc_id','revision','section_id'))}
+                add(['claim', 'components', component, 'definition_ref'], 'evidence',
+                    'dangling_evidence_reference', allowed=sections)
+                add(['claim', 'components', component, 'scope_evidence_ref'], 'evidence',
+                    'dangling_evidence_reference', allowed=sections)
+                for offset in range(len(claim['components'][component]['identity_evidence'])):
+                    add(['claim', 'components', component, 'identity_evidence', offset], 'evidence',
+                        'dangling_evidence_reference', allowed=sections)
+        elif kind == 'column_group':
+            for field in ('identity_evidence', 'attribute_evidence', 'global_scope_evidence'):
+                many(['claim', field], 'evidence', 'dangling_evidence_reference')
             for member in range(len(claim['members'])):
                 add(['claim', 'members', member, 'column_id'])
         elif kind == 'entity_key':
+            for field in ('identity_evidence', 'attribute_evidence', 'global_scope_evidence'):
+                many(['claim', field], 'evidence', 'dangling_evidence_reference')
             for field in ('key_columns', 'namespace_columns'):
                 many(['claim', field])
             for field in ('single_valued', 'multi_valued', 'display_only'):

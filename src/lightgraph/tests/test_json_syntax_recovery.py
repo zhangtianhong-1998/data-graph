@@ -134,7 +134,7 @@ def test_ambiguous_json_is_terminal_and_cannot_build_a_last_wins_anchor(monkeypa
     with pytest.raises(LightGraphError,match=code):model.explore(input_packet(),Toolbox())
     assert calls==[1]
     assert not _schema_correction_anchor({'content':raw},ProposalBatch)['verifiable']
-    assert _invalid_review_terminal({'content':raw})=='semantic_claim_unresolved'
+    assert _invalid_review_terminal({'content':raw})=='semantic_review_protocol_invalid'
 
 
 def test_provider_truncation_remains_terminal_even_when_text_could_parse(monkeypatch):
@@ -177,10 +177,10 @@ def test_final_only_review_refuses_tool_calls_even_with_parseable_positive_conte
         if duplicate:raw+='"decision":"refuted",'
         raw+='"decision":"supported","basis":"data_inference","evidence":[{"reference":"probe_1","stance":"supports"}]}'
         return httpx.Response(200,json={'choices':[{'message':{'content':raw,
-            'tool_calls':[{'type':'function','function':{'name':'get_metadata','arguments':'{}'}}]},
-            'finish_reason':'stop'}]})
+            'tool_calls':[{'id':'unexpected-call','type':'function','function':{'name':'get_metadata','arguments':'{}'}}]},
+            'finish_reason':'tool_calls'}]})
     model=client(monkeypatch,handler)
-    with pytest.raises(LightGraphError,match='semantic_claim_unresolved'):
+    with pytest.raises(LightGraphError,match='semantic_review_protocol_invalid'):
         review_semantics(model,{'probe_digest':[{'probe_id':'probe_1'}]}, {'kind':'wide_hierarchy'},[])
     assert calls==[1] and model.usage.get('schema_repair_attempts',0)==0
 
@@ -190,8 +190,8 @@ def test_final_only_proposal_call_does_not_ignore_unrequested_tool_calls(monkeyp
     def handler(request):
         calls.append(1)
         return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(candidate()),
-            'tool_calls':[{'type':'function','function':{'name':'get_metadata','arguments':'{}'}}]},
-            'finish_reason':'stop'}]})
+            'tool_calls':[{'id':'unexpected-call','type':'function','function':{'name':'get_metadata','arguments':'{}'}}]},
+            'finish_reason':'tool_calls'}]})
     model=client(monkeypatch,handler)
     with pytest.raises(LightGraphError,match='llm_schema_invalid'):
         model.complete('T1_table_discovery',input_packet(),ProposalBatch)

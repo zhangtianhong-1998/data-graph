@@ -89,6 +89,8 @@ def stage_rule_metadata(store,publication_id,rule,allrules,domain,entities=()):
     emit('NodeExistence',{'entity_id':group,'kind':'ColumnGroup','layer':'metadata'})
     emit('PropertyValue',{'entity_id':group,'name':'label','value':rule.source.table+' / '+rule.rule_id})
     roles={**rule.attributes.single_valued,**rule.attributes.multi_valued}
+    if rule.concept_mapping:
+        roles.update({'concept:'+component.role:component.column for component in rule.concept_mapping.components})
     for c in rule.identity.key_columns:roles['identity:'+c]=c
     if rule.hierarchy:
         for lv in rule.hierarchy.levels:

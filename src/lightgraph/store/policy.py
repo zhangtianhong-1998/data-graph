@@ -84,6 +84,7 @@ QUALIFIER_NAMES = frozenset({
     "source_group", "semantic_level", "hierarchy_version", "column_position",
 })
 OPERATOR_ARGUMENTS = {
+    "project_concepts": {"evidence_ref", "components"},
     "distinct_projection": {"tuple", "columns", "cap", "limit", "predicate"},
     "emit_entity": {"from", "kind"},
     "project_attributes": {"from", "single_valued", "multi_valued"},
@@ -205,6 +206,18 @@ class PersistencePolicy:
 
     def check_rule(self, rule: RuleSpec, goal=None) -> None:
         """Check vocabulary and source-column restrictions before any source value is staged."""
+        if rule.concept_mapping:
+            for component in rule.concept_mapping.components:
+                if component.entity_kind not in self.kinds['business']:
+                    raise PersistenceViolation('unregistered_node_kind')
+                endpoints = self.relation_endpoint_kinds(component.relation)
+                if not endpoints or rule.identity.entity_kind not in endpoints[0] or component.entity_kind not in endpoints[1]:
+                    raise PersistenceViolation('relation_endpoint_kind_mismatch')
+                if goal is not None:
+                    if goal.entity_kinds and component.entity_kind not in goal.entity_kinds:
+                        raise PersistenceViolation('outside_extraction_goal')
+                    if goal.relation_kinds and component.relation not in goal.relation_kinds:
+                        raise PersistenceViolation('outside_relation_goal')
         if rule.identity.entity_kind not in self.kinds["business"]:
             raise PersistenceViolation("unregistered_node_kind")
         attributes = set(rule.attributes.single_valued) | set(rule.attributes.multi_valued)

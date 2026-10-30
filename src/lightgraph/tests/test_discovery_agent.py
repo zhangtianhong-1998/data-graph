@@ -234,7 +234,7 @@ def test_unverifiable_final_json_correction_and_invalid_packet_cleanup(monkeypat
     def handler(request):
         turns.append(1)
         if len(turns)==1:
-            return httpx.Response(200,json={'choices':[{'message':{'content':'bad'}}]})
+            return httpx.Response(200,json={'choices':[{'message':{'content':'bad'},'finish_reason':'stop'}]})
         return response(final())
     model=client(monkeypatch,handler);tools=Toolbox()
     # An unparseable candidate cannot prove that a second business claim kept

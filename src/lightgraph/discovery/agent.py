@@ -32,9 +32,12 @@ Document section citations use the exact doc_id@revision:section_id shown in con
 failed tool calls are not registered evidence. Do not cite an unregistered probe.
 Analytical guidance can suggest exploration but cannot confirm business semantics.
 A tool success is not business-semantic confirmation.
-For column_group and entity_key only, propose shared_definition identity_resolution
+For column_group and entity_key, propose shared_definition identity_resolution
 when the complete definition denotes the same object across the stated namespaces;
-matching labels or codes alone are insufficient. A wide_hierarchy may explicitly
+matching labels or codes alone are insufficient. A documented common code domain
+may instead use verified_identity_domain with identity_domain and identity_evidence.
+It requires independent semantic review; equal codes alone do not establish a domain.
+A wide_hierarchy may explicitly
 request source_scoped identity_resolution with legacy paths or
 verified_identity_domain with relative_path. The latter still requires identity
 evidence and independent semantic review. namespace_local within a verified identity
@@ -67,10 +70,28 @@ When proposal_repairs is supplied, repair only those rejected proposals using th
 fixed compiler guidance. Valid independent proposals have already been retained.
 Recheck evidence when needed; do not turn a semantic rejection into acceptance by
 renaming it. If no supported repair exists, abstain within the remaining budget.
+iteration_context.prior_discovery_feedback contains fixed failure categories from
+previous sessions, not evidence or verdicts for this session. Investigate those
+causes before repeating a proposal. Never infer acceptance from absent feedback.
 Preserve uncertainty, source scope and incomplete coverage. Output candidate rules,
 not confirmed claims. Stop when relevant structures are sufficiently supported or
 remaining uncertainty cannot be resolved within the available budget. Submit each
 candidate promptly using its submit_* tool; a successful draft is still unconfirmed.
+Use submit_concept_mapping for independent concepts represented in separate columns
+or explicitly documented name segments. Cite the document version and issued definition
+references for each component; never split names merely because they contain a separator.
+Keep the source item's identity in a distinct joint-context type, not in a concept key.
+When independent concepts have code and name columns, set key_column to the code
+and column to the name; equal names never override unequal codes. Concept scope
+inherits the context unless namespace_columns explicitly changes it with issued
+scope_evidence_ref. Preserve row permissions even when a concept is shared globally.
+To reuse a concept across its occurrence table and definition table, both rules must
+explicitly declare the same evidence-supported identity_domain, entity kind and namespace
+scope. Set the component's identity_evidence and key_column; declare the definition-table
+entity with verified_identity_domain. Otherwise keep their source identities separate.
+iteration_context.prior_identity_domains lists earlier tables' provisional code domains.
+Reuse their exact domain and compatible type definition only after checking this table's
+own issued evidence. That catalog is a hypothesis, not proof or permission to cite unseen documents.
 Declare new vocabulary once using declare_semantic_schema. Prefer submit_hierarchy_plan
 for wide paths. Read fixed validation errors and correct only the affected candidate.
 Retained drafts and exclusions accumulate and cannot be overwritten. Do not hold all
@@ -98,31 +119,39 @@ def _message(value: dict) -> dict:
     """Keep only the provider's actionable output, never auxiliary reasoning fields."""
     if not isinstance(value,dict):
         raise ValueError('invalid_agent_message')
+    from .llm import _strict_json_loads
     calls=value.get('tool_calls') or []
     if not isinstance(calls,list) or len(calls)>64:
         raise ValueError('invalid_agent_tool_calls')
     if not calls:
         # Parse inside the transport's retry boundary, preserving structured-call
         # retries for providers that return malformed JSON.
-        raw=json.loads(value['content'])
+        raw=_strict_json_loads(value['content'])
         if isinstance(raw,dict) and 'action' in raw:
             from .proposal_session import DiscoveryFinish
             return {'finish':DiscoveryFinish.model_validate(raw)}
         final=ProposalBatch.model_validate(raw)
         return {'final':final}
     normalized=[]
+    ids=set()
     for call in calls:
         if not isinstance(call,dict) or call.get('type','function')!='function':
             raise ValueError('invalid_agent_tool_call')
+        call_id=call.get('id')
+        if not isinstance(call_id,str) or not call_id or call_id in ids:
+            raise ValueError('invalid_agent_tool_call_id')
+        ids.add(call_id)
         function=call.get('function')
         if not isinstance(function,dict) or not isinstance(function.get('name'),str):
             raise ValueError('invalid_agent_tool_call')
         if len(function['name'])>128:
             raise ValueError('invalid_agent_tool_name')
         arguments=function.get('arguments','')
-        if not isinstance(arguments,str):
-            arguments=''
-        normalized.append({'name':function['name'],'arguments':arguments})
+        if isinstance(arguments,dict):
+            arguments=canonical(arguments)
+        elif not isinstance(arguments,str):
+            raise ValueError('invalid_agent_tool_arguments')
+        normalized.append({'id':call_id,'name':function['name'],'arguments':arguments})
     return {'calls':normalized}
 
 

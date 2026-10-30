@@ -12,6 +12,8 @@ def canonical_plan(rule):
     from .engine import RuleEngine
     columns=RuleEngine.columns(None,rule)
     plan=[OperatorSpec(op='distinct_projection',args={'columns':columns})]
+    if rule.concept_mapping:
+        plan.append(OperatorSpec(op='project_concepts',args=rule.concept_mapping.model_dump()))
     if rule.kind=='wide_hierarchy':
         plan.extend([OperatorSpec(op='unpivot_levels',args={'levels':[l.model_dump() for l in rule.hierarchy.levels]}),
             OperatorSpec(op='compress_paths',args={'gap_policy':'split','fill_semantics_confirmed':rule.hierarchy.fill_semantics_confirmed})])

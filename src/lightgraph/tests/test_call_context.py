@@ -226,7 +226,7 @@ def test_agent_registers_dynamic_sections_for_final_evidence_and_next_task_start
             message={'content':json.dumps({'task':'T0_discovery','proposals':[{'kind':'column_group','claim':{
                 'group_id':'g','entity_kind_hint':'Metric','members':[{'column_id':'c_code','role':'identity_code'}]},
                 'evidence_cited':['B']}]})}
-        return httpx.Response(200,json={'choices':[{'message':message,'finish_reason':'stop'}]})
+        return httpx.Response(200,json={'choices':[{'message':message,'finish_reason':'tool_calls' if message.get('tool_calls') else 'stop'}]})
     model=StructuredModelClient(ModelConfig(base_url='https://test.invalid',model='mock',api_key_env='CONTEXT_TEST_KEY',
         allow_source_samples=True),BudgetAllocator(Cost(llm_calls=8,llm_tokens=1000000,memory_bytes=1000000,seconds=60)),httpx.MockTransport(transport))
     packet={'task':'T0_discovery','goal':{'purpose':'指标图'},
@@ -246,7 +246,7 @@ def test_agent_registers_dynamic_sections_for_final_evidence_and_next_task_start
         context=json.loads(body['messages'][1]['content'])['call_context']
         assert context['goal']['purpose']=='组织图'
         assert {d['doc_id'] for d in context['document_directory']}=={'global','C'}
-        return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps({'task':'T0_discovery','abstain':True})}}]})
+        return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps({'task':'T0_discovery','abstain':True})},'finish_reason':'stop'}]})
     model.transport=httpx.MockTransport(second)
     next_tools=ToolExecutor(adapter,ExtractionGoal(purpose='组织图'),model.budget,documents=tools.documents)
     model.explore({'task':'T0_discovery','goal':{'purpose':'组织图'},'scope':{'source_id':'s','table':'c'}},next_tools)
@@ -289,7 +289,7 @@ def test_single_turn_model_entry_always_has_goal_and_stage(monkeypatch):
         assert '组织图' in body['messages'][0]['content']
         packet=json.loads(body['messages'][1]['content'])['input']
         assert packet['goal']['purpose']=='组织图' and packet['call_context']['stage']=='T1_table_discovery'
-        return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps({'task':'T1_table_discovery','abstain':True})}}]})
+        return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps({'task':'T1_table_discovery','abstain':True})},'finish_reason':'stop'}]})
     model=StructuredModelClient(ModelConfig(base_url='https://test.invalid',model='mock',api_key_env='CONTEXT_TEST_KEY'),
         transport=httpx.MockTransport(transport))
     assert model.propose({'task':'T1_table_discovery','goal':{'purpose':'组织图'}}).abstain

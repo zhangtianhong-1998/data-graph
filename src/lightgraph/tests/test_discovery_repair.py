@@ -34,14 +34,14 @@ def test_contract_failure_keeps_valid_sibling_without_another_agent(monkeypatch)
         for issue in result.issues)
 
 
-def test_semantic_refutation_does_not_start_another_agent(monkeypatch):
+def test_semantic_refutation_offers_one_alternative_without_repeating_review(monkeypatch):
     t=table('objects',['a','b','c','d']);tasks=[]
     def handler(request):
         _,p=input_packet(request);tasks.append(p['task'])
         if p['task']=='semantic_review':
             return response({'proposition':p['semantic_proposition'],'decision':'refuted','basis':'data_inference',
                 'evidence':[{'reference':p['metadata_digest']['columns'][0]['id'],'stance':'refutes'}]})
-        assert p['task']=='T0_discovery'
+        assert p['task'] in ('T0_discovery','T5_revision')
         batch=group(p,'a','b')
         ids={c['name']:c['id'] for c in p['metadata_digest']['columns']}
         batch['proposals'].append({'kind':'wide_hierarchy','claim':{'group_id':'tree','levels':[
@@ -50,7 +50,8 @@ def test_semantic_refutation_does_not_start_another_agent(monkeypatch):
     with MemorySource([t],{'public.objects':[('A','Alpha','C','D')]}) as source:
         result=discover(source,model=client(monkeypatch,handler))
     assert [rule.identity.key_columns for rule in result.rules]==[['a']]
-    assert tasks==['T0_discovery','semantic_review']
+    assert tasks==['T0_discovery','semantic_review','T5_revision']
+    assert len(result.pending_candidates)==1
     assert any(i['code']=='semantic_claim_refuted' and i['status']=='unresolved' for i in result.issues)
 
 

@@ -1,7 +1,7 @@
 """AgentScope runtime adapters; no sessions, trace exporters or source snapshots.
 
-ReActAgent owns the loop, Toolkit owns registered tool dispatch, and the existing
-bounded transport owns HTTP/SSE parsing. Only complete model responses reach the
+ReActAgent owns the loop, Toolkit owns registered tool dispatch, and the native
+OpenAI adapter owns protocol parsing. Only complete model responses reach the
 framework, so an interrupted argument stream can never execute a query.
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ from agentscope.memory import InMemoryMemory
 from agentscope.message import Msg
 from agentscope.model import ChatModelBase, ChatResponse
 
-from lightgraph.context import (packet_call_context, bounded_discovery_packet,
+from lightgraph.context import (discovery_envelope, bounded_discovery_packet,
                                 with_discovery_runtime_control)
 from lightgraph.contracts import canonical
 from lightgraph.errors import BudgetExceeded, LightGraphError
@@ -55,6 +55,39 @@ class DiscoveryFormatter(FormatterBase):
         self.packet=packet
         self.executor=executor
 
+    @staticmethod
+    def _deduplicate_tool_context(content: str, documents: list[dict]) -> str:
+        """Reference exact visible copies without hiding new document evidence.
+
+        Tool metadata may carry the same scoped preview on every result. Only
+        those identical objects are reused from the current task packet; search
+        pages, revisions and partial sections remain in their original fields.
+        """
+        try:
+            result=json.loads(content)
+        except (TypeError,ValueError):
+            return content
+        if not isinstance(result,dict) or not isinstance(result.get('context'),dict):
+            return content
+        context=result['context']
+        if not isinstance(context.get('documents'),list):
+            return content
+        visible={canonical(section):index for index,section in enumerate(documents)
+                 if isinstance(section,dict)}
+        retained=[]
+        references=[]
+        for section in context['documents']:
+            index=visible.get(canonical(section)) if isinstance(section,dict) else None
+            if index is None:
+                retained.append(section)
+            else:
+                references.append(f'input.document_snippets[{index}]')
+        if not references:
+            return content
+        context['documents']=retained
+        context['documents_reused_from_input']=references
+        return canonical(result)
+
     async def format(self, msgs: list[Msg]) -> list[dict]:
         _check_runtime_policy()
         if callable(getattr(self.executor,'context_documents',None)):
@@ -62,21 +95,21 @@ class DiscoveryFormatter(FormatterBase):
             self.packet['document_refs']=self.executor.document_refs()
             self.packet['context_tables']=self.executor.context_tables()
         visible=bounded_discovery_packet(self.packet)
-        context=packet_call_context(visible,visible['task'],
-                                   output_contract={'schema_ref':'output_schema'})
-        packet_text=canonical({'task':visible['task'],'input':visible,
-            'call_context':context,'output_schema':DiscoveryFinish.model_json_schema()})
+        packet_text=canonical(discovery_envelope(visible))
         output=[]
+        task_inserted=False
         for msg in msgs:
-            if msg.role=='user':
+            if msg.role=='user' and not task_inserted:
                 output.append({'role':'user','content':packet_text})
+                task_inserted=True
             elif msg.has_content_blocks('tool_result'):
                 for block in msg.get_content_blocks('tool_result'):
                     content=block['output']
                     if not isinstance(content,list) or any(b.get('type')!='text' for b in content):
                         raise LightGraphError('agent_nontext_tool_response')
                     output.append({'role':'tool','tool_call_id':block['id'],
-                                   'content':''.join(b['text'] for b in content)})
+                        'content':self._deduplicate_tool_context(
+                            ''.join(b['text'] for b in content),visible['document_snippets'])})
             elif msg.has_content_blocks('tool_use'):
                 calls=[]
                 for block in msg.get_content_blocks('tool_use'):
@@ -90,7 +123,7 @@ class DiscoveryFormatter(FormatterBase):
 
 
 class DiscoveryChatModel(ChatModelBase):
-    """Reserve a submission turn within the configured discovery allowance.
+    """Reserve submission and feedback within the configured discovery allowance.
 
     Providers may return multiple tools even when parallel calls are disabled.
     An oversized batch executes nothing; its remaining turn is used to submit
@@ -117,6 +150,7 @@ class DiscoveryChatModel(ChatModelBase):
 
     async def __call__(self, messages: list[dict], tools=None, tool_choice=None, **kwargs):
         from .agent import _message
+        from .prompt_window import prompt_bytes, fit_source_history
 
         _check_runtime_policy()
         self.client.budget.check_deadline()
@@ -129,10 +163,14 @@ class DiscoveryChatModel(ChatModelBase):
                     reason='tool_allowance_exhausted'
                 if reason is None and self.steps==self.max_steps-1:
                     reason='last_turn'
+                if reason is None and self.max_steps>=4 and self.steps==self.max_steps-2:
+                    # Leave one response after a local submission so a rejected
+                    # field can be corrected and acknowledged before finishing.
+                    # Very short tasks retain their single final turn; no call
+                    # is added beyond either the task or shared model budget.
+                    reason='submission_window'
                 if reason is None and tool_choice=='none':
                     reason='caller_requested'
-                request_messages=self._request_context(messages,reason)
-                self.steps+=1
                 available=tools or []
                 if reason:
                     available=[spec for spec in available
@@ -142,6 +180,25 @@ class DiscoveryChatModel(ChatModelBase):
                         if spec['function']['name'] not in self.submission_names]
                 if tool_choice=='none':
                     available=[]
+                request_messages=self._request_context(messages,reason)
+                mode=self.client.config.response_format
+                size=prompt_bytes(request_messages,available,mode)
+                if size>self.client.config.max_prompt_bytes and any(m.get('role')=='tool' for m in messages):
+                    # Finish within the existing turn/call allowances. Source
+                    # tools cannot keep growing history after this transition.
+                    self.submission_reason=reason='context_window_pressure'
+                    available=[spec for spec in available
+                        if spec['function']['name'] in self.submission_names]
+                    request_messages=self._request_context(messages,reason)
+                    request_messages,removed=fit_source_history(request_messages,available,mode,
+                        self.client.config.max_prompt_bytes,self.submission_names)
+                    usage=self.client.usage
+                    usage['prompt_pressure_turns']=usage.get('prompt_pressure_turns',0)+1
+                    usage['prompt_history_exchanges_omitted']=usage.get('prompt_history_exchanges_omitted',0)+removed
+                    usage['prompt_peak_before_window_bytes']=max(usage.get('prompt_peak_before_window_bytes',0),size)
+                    usage['prompt_peak_after_window_bytes']=max(usage.get('prompt_peak_after_window_bytes',0),
+                        prompt_bytes(request_messages,available,mode))
+                self.steps+=1
                 try:
                     # Source access ends at its configured allowance or final
                     # turn. Bounded local submissions can still preserve work.
@@ -157,7 +214,7 @@ class DiscoveryChatModel(ChatModelBase):
                 if tool_choice=='none' or reason and source_count:
                     if reason in {'tool_allowance_exhausted','tool_batch_rejected'}:
                         raise BudgetExceeded('discovery_tool_calls_exhausted')
-                    if reason=='last_turn':
+                    if reason in {'last_turn','submission_window'}:
                         raise BudgetExceeded('discovery_steps_exhausted')
                     raise LightGraphError('discovery_final_response_required')
                 if self.submission_calls+local_count>MAX_SUBMISSION_CALLS:
@@ -186,10 +243,11 @@ class DiscoveryChatModel(ChatModelBase):
                 if call['name'] in self.submission_names:self.submission_calls+=1
                 else:self.source_calls+=1
                 try:
-                    args=json.loads(call['arguments'])
+                    from .llm import _strict_json_loads
+                    args=_strict_json_loads(call['arguments'])
                 except (ValueError,TypeError):
                     args=call['arguments']  # Toolkit rejects non-object inputs.
-                content.append({'type':'tool_use','id':f'call_{self.total_calls}',
+                content.append({'type':'tool_use','id':call['id'],
                                 'name':call['name'],'input':args})
         response=ChatResponse(content=content)
         if self.stream:
@@ -310,6 +368,7 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
             return legacy
         # A legacy final cannot replace staged exclusions or silently drop an
         # earlier valid hypothesis. Union all locally valid drafts instead.
+        invalid_before=session.invalid_count
         if legacy.task!=session.task:
             session.reject('model_task_mismatch')
         else:
@@ -317,6 +376,8 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
             for proposal in legacy.proposals:
                 session.execute('submit_'+proposal.kind,proposal.model_dump(mode='json',exclude={'kind'}))
             session.pending=legacy.abstain
+        if session.invalid_count>invalid_before:
+            session.pending=True
         session.finished=True
         return session.batch()
     finally:

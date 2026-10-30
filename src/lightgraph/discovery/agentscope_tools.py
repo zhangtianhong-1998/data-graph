@@ -19,6 +19,7 @@ from agentscope.tool import Toolkit, ToolResponse
 from jsonschema import Draft202012Validator
 
 from lightgraph.errors import BudgetExceeded, LightGraphError
+from .validation_feedback import schema_diagnostics
 
 
 def _response(value: dict[str, Any]) -> ToolResponse:
@@ -27,8 +28,11 @@ def _response(value: dict[str, Any]) -> ToolResponse:
     )])
 
 
-def _error(code: str, operator: str = "unknown") -> ToolResponse:
-    return _response({"status": "error", "operator": operator, "code": code})
+def _error(code: str, operator: str = "unknown", *, diagnostics=None) -> ToolResponse:
+    result = {"status": "error", "operator": operator, "code": code}
+    if diagnostics:
+        result['diagnostics'] = diagnostics
+    return _response(result)
 
 
 class GuardedToolkit(Toolkit):
@@ -47,17 +51,21 @@ class GuardedToolkit(Toolkit):
         self._argument_validators: dict[str, Draft202012Validator] = {}
         self.invalid_argument_handler = None
 
-    def _valid_arguments(self, name: str, arguments: Any) -> bool:
-        """Validate without formatting JSON Schema errors containing source data."""
+    def _argument_diagnostics(self, name: str, arguments: Any) -> list[dict]:
+        """Validate without formatting exceptions or echoing dynamic field names."""
         if not isinstance(arguments, dict) or any(not isinstance(key, str) for key in arguments):
-            return False
+            return [{'path': [], 'constraint': 'type'}]
         try:
             if len(json.dumps(arguments, ensure_ascii=False, allow_nan=False).encode()) > 32768:
-                return False
+                return [{'path': [], 'constraint': 'argument_bytes_limit'}]
             validator = self._argument_validators.get(name)
-            return validator is not None and validator.is_valid(arguments)
+            return schema_diagnostics(validator, arguments) if validator is not None else [
+                {'path': [], 'constraint': 'unknown_schema'}]
         except Exception:
-            return False
+            return [{'path': [], 'constraint': 'invalid_json_value'}]
+
+    def _valid_arguments(self, name: str, arguments: Any) -> bool:
+        return not self._argument_diagnostics(name, arguments)
 
     async def call_tool_function(self, tool_call: ToolUseBlock):
         """Return AgentScope's response iterator without exposing invalid input."""
@@ -71,10 +79,11 @@ class GuardedToolkit(Toolkit):
                 yield _error("unknown_tool")
                 return
             arguments = tool_call.get("input", {})
-            if not self._valid_arguments(name, arguments):
+            diagnostics = self._argument_diagnostics(name, arguments)
+            if diagnostics:
                 if self.invalid_argument_handler is not None:
                     self.invalid_argument_handler(name)
-                yield _error("invalid_tool_arguments", name)
+                yield _error("invalid_tool_arguments", name, diagnostics=diagnostics)
                 return
             failures: list[BudgetExceeded] = []
             token = self._failure.set(failures)
@@ -109,8 +118,9 @@ def create_toolkit(executor, dispatch: Callable[[str, dict[str, Any]], Any] | No
     def wrapper(name: str):
         async def run(**arguments):
             try:
-                if not toolkit._valid_arguments(name, arguments):
-                    return _error("invalid_tool_arguments", name)
+                diagnostics = toolkit._argument_diagnostics(name, arguments)
+                if diagnostics:
+                    return _error("invalid_tool_arguments", name, diagnostics=diagnostics)
                 value = execute(name, arguments)
                 if inspect.isawaitable(value):
                     value = await value

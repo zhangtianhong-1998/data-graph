@@ -30,3 +30,6 @@ agents.local.yaml
 /workspace/
 node_modules/
 .vite/
+
+# Local evaluation inputs and Gold are not source code.
+evaluation_data/

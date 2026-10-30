@@ -45,6 +45,8 @@ class ConditionReview(StrictModel):
     evidence_refs: list[str] = Field(default_factory=list, max_length=16)
     # Transient reasoning only, like EvidenceInterpretation.explanation.
     explanation: str = Field(default='', max_length=MAX_TRANSIENT_TEXT_CHARS)
+    condition_ref: str | None = Field(default=None, max_length=64,
+        description='For a semantic revision, copy the issued prior condition_ref and preserve its condition text.')
 
 
 class SemanticReview(StrictModel):
@@ -72,6 +74,8 @@ class BoundCondition(StrictModel):
     condition: str = Field(min_length=1,max_length=MAX_TRANSIENT_TEXT_CHARS,
         description='One concise business condition per entry. No reasoning narrative, '
         'source values or multiple conditions in one entry.')
+    condition_ref: str | None = Field(default=None, max_length=64,
+        description='Copy the issued prior condition_ref when revising; do not omit or rewrite its condition.')
 
 
 class BoundSemanticVerdict(StrictModel):
@@ -88,7 +92,7 @@ class BoundSemanticVerdict(StrictModel):
             decision=self.decision,basis='bound_model_review',
             evidence=[item.model_dump() for item in self.evidence],
             conditions=[{'state':item.state,'evidence_refs':item.evidence_refs,
-                         'explanation':item.condition} for item in self.conditions])
+                         'explanation':item.condition,'condition_ref':item.condition_ref} for item in self.conditions])
 
 
 class EvidenceReferenceReplacement(StrictModel):
@@ -438,6 +442,14 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
             'ignore an original restriction or condition merely because the repair omits it. '
             'source_scoped and namespace_local are not equivalent: namespace-local verified '
             'identity domains can share identities across source tables.')
+    if packet.get('semantic_revision_guard'):
+        review_packet['subtask'] += (
+            ' This is a structurally changed alternative to a rejected claim. The '
+            'semantic_revision_guard contains the original counterevidence and conditions. '
+            'Explicitly classify that counterevidence against the new structure. Preserve '
+            'each original condition_ref and its exact condition text; every condition '
+            'must have independently justified satisfied evidence. Renaming a condition '
+            'or omitting it cannot resolve the rejection.')
     if proposition.get('kind')=='reference':
         review_packet['subtask'] += (
             ' The compiler-bound relation_definition is part of this exact proposition, '
@@ -471,8 +483,14 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
         check_args=dict(proposition_ref=proposition_ref,expected_proposition=expected_proposition,
             docs=docs,doc_refs=doc_refs,issued=issued,allow_no_support=batch is not None,
             complete_collection=batch is not None)
+        def checked(value):
+            refs = _check_review(value, **check_args)
+            if packet.get('semantic_revision_guard'):
+                from .semantic_revision import validate_prior_obligations
+                validate_prior_obligations(value, packet['semantic_revision_guard'], issued)
+            return refs
         try:
-            return _check_review(reviewed,**check_args)
+            return checked(reviewed)
         except LightGraphError as exc:
             corrections_after=getattr(model,'usage',{}).get('schema_repair_responses',0)
             if (corrections_after>corrections_before or reviewed.decision!='supported'
@@ -484,7 +502,7 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
                 # conflicts remain failures; a patch cannot change their stance.
                 repaired=_apply_reference_patch(reviewed,SemanticReferencePatch(),
                     issued=issued,doc_refs=doc_refs)
-                return _check_review(repaired,**check_args)
+                return checked(repaired)
             if not callable(getattr(model,'complete',None)):
                 raise
             patch_packet={**review_packet,'semantic_review_repair':{
@@ -520,10 +538,19 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
                 if not isinstance(patch,SemanticReferencePatch):
                     raise LightGraphError('semantic_review_patch_invalid')
                 repaired=_apply_reference_patch(reviewed,patch,issued=issued,doc_refs=doc_refs)
-                return _check_review(repaired,**check_args)
+                return checked(repaired)
             finally:
                 patch_packet.pop('tool_observations',None)
                 patch_packet.pop('semantic_review_repair',None)
+    except LightGraphError as exc:
+        from .semantic_revision import SEMANTIC_FAILURES, SemanticReviewFailure
+        if exc.code in SEMANTIC_FAILURES:
+            kind = proposition.get('kind')
+            stage = ('hierarchy' if kind in ('wide_hierarchy','long_hierarchy') else
+                     kind if kind in ('entity_granularity','reference','concept_mapping') else 'entity_definition')
+            raise SemanticReviewFailure(exc.code, packet=packet, documents=docs,
+                reviewed=locals().get('repaired', locals().get('reviewed')), stage=stage) from None
+        raise
     finally:
         review_packet.pop('tool_observations',None)
 

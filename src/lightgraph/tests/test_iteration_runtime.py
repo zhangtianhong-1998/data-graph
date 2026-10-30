@@ -12,6 +12,26 @@ from lightgraph.store import GraphStore
 from lightgraph.tests.test_agent_pipeline import client, group, input_packet, response, table
 
 
+def test_discovery_feedback_survives_restart_without_source_values_or_task_overwrite(tmp_path):
+    path=tmp_path/'feedback.sqlite'; source=SourceRef(source_id='s',table='people')
+    canary='REJECTED_SOURCE_VALUE_NOT_RETAINED'
+    with GraphStore(path) as store:
+        ledger=IterationLedger(store,ExtractionGoal(),['public'])
+        ledger.record_discovery_feedback([source],[
+            {'code':'semantic_claim_refuted','table':'public.people','message':canary,'proposal':{'label':canary}},
+            {'code':canary}, {'code':'semantic_claim_unresolved','table':'public.other'}],task='metadata_discovery')
+        ledger.record_discovery_feedback([source],[],task='relation_discovery')
+    with GraphStore(path) as store:
+        ledger=IterationLedger(store,ExtractionGoal(),['public'])
+        item=ledger.enqueue(source,task='metadata_discovery',context_version='schema1')
+        feedback=ledger.context([item],[],iteration=0)['prior_discovery_feedback']
+        assert feedback==[{'source':source.model_dump(mode='json',by_alias=True),
+            'task':'metadata_discovery','codes':['semantic_claim_refuted']}]
+        assert canary not in json.dumps([dict(row) for row in store.connection.execute('SELECT * FROM discovery_feedback')])
+        ledger.record_discovery_feedback([source],[],task='metadata_discovery')
+        assert ledger.context([item],[],iteration=1)['prior_discovery_feedback']==[]
+
+
 def test_ledger_freezes_goal_and_recovers_interrupted_work(tmp_path):
     path=tmp_path/'graph.sqlite'
     with GraphStore(path) as store:

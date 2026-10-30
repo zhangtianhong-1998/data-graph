@@ -310,11 +310,16 @@ class ToolExecutor:
     def _search_knowledge(self, table, columns=None, page=0):
         source = self._table(table)
         names = self._columns(source, columns) if columns is not None else source.column_names
-        self._activate_tables([source.model_copy(update={'columns':[c for c in source.columns if c.name in names]})])
         from lightgraph.context import document_batches
         if type(page) is not int or page < 0:
             raise LightGraphError('invalid_tool_arguments')
-        pages=list(document_batches(self.context_documents(),max_bytes=min(12000,self._max_bytes//3))) or [[]]
+        selected=source.model_copy(update={'columns':[c for c in source.columns if c.name in names]})
+        # Keep issued evidence for every visited table, while paging only this
+        # lookup's scope. The cumulative context would repeat unrelated documents
+        # and make page numbers change whenever another table was explored.
+        self._activate_tables([selected])
+        sections=self.documents.contexts_for([selected])
+        pages=list(document_batches(sections,max_bytes=min(12000,self._max_bytes//3))) or [[]]
         if page >= len(pages):
             raise LightGraphError('invalid_tool_arguments')
         return {"data": {"sections": pages[page], "page":page,

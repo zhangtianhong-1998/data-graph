@@ -346,6 +346,14 @@ def _bounded_view(view, layer):
     ids = {n["id"] for n in all_nodes}
     all_edges = [e for e in view.get("edges", []) if e["source"] in ids and e["target"] in ids]
     nodes = all_nodes[:MAX_GRAPH_NODES]
+    # Derive display scope only from already-authorized visible supports.
+    fact_entities = {f['id']: f['payload'].get('entity_id') for f in view.get('facts', [])}
+    scopes = {}
+    for support in view.get('supports', []):
+        entity = fact_entities.get(support.get('fact_id'))
+        if entity and support.get('scope_ref'):
+            scopes.setdefault(entity, set()).add(support['scope_ref'])
+    nodes = [{**node, 'scopes': sorted(scopes.get(node['id'], set()))} for node in nodes]
     ids = {n["id"] for n in nodes}
     edges = [e for e in all_edges if e["source"] in ids and e["target"] in ids][:MAX_GRAPH_EDGES]
     return {"nodes": nodes, "edges": edges, "layer": layer,
@@ -354,7 +362,7 @@ def _bounded_view(view, layer):
             "limits": {"nodes": MAX_GRAPH_NODES, "edges": MAX_GRAPH_EDGES}}
 
 
-def read_graph(workspace, pid, layer="business", *, include_candidates=False):
+def read_graph(workspace, pid, layer="business", *, include_candidates=False,offset=0,limit=240,q='',kind=''):
     """Publication heads, not stale graph.json exports, determine current results."""
     from ..store import GraphStore
     if layer == "metadata":
@@ -366,8 +374,12 @@ def read_graph(workspace, pid, layer="business", *, include_candidates=False):
     if not path.exists():
         return {**_bounded_view({}, layer), "include_candidates": include_candidates}
     with GraphStore(path) as store:
-        view = store.view(set(config.scopes), domain=config.isolation_domain, include_candidates=include_candidates)
+        from ..store.paging import graph_page
+        view = graph_page(store,set(config.scopes),config.isolation_domain,layer=layer,
+                          include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind)
     result = _bounded_view(view, layer)
+    result.update({key:view[key] for key in ('total_nodes','total_edges','matched_nodes','boundary_edges',
+        'next_offset','offset','page_size','generation','query_strategy','kinds')})
     result["include_candidates"] = include_candidates
     return result
 

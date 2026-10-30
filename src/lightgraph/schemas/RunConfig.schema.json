@@ -249,7 +249,7 @@
           "type": "integer"
         },
         "max_prompt_bytes": {
-          "default": 65536,
+          "default": 131072,
           "exclusiveMinimum": 0,
           "title": "Max Prompt Bytes",
           "type": "integer"
@@ -783,6 +783,27 @@
       "maximum": 8,
       "minimum": 1,
       "title": "Max Discovery Rounds",
+      "type": "integer"
+    },
+    "discovery_time_fraction": {
+      "default": 0.75,
+      "exclusiveMaximum": 1,
+      "exclusiveMinimum": 0,
+      "title": "Discovery Time Fraction",
+      "type": "number"
+    },
+    "discovery_query_fraction": {
+      "default": 0.75,
+      "exclusiveMaximum": 1,
+      "exclusiveMinimum": 0,
+      "title": "Discovery Query Fraction",
+      "type": "number"
+    },
+    "max_relation_discovery_attempts": {
+      "default": 2,
+      "maximum": 8,
+      "minimum": 1,
+      "title": "Max Relation Discovery Attempts",
       "type": "integer"
     },
     "max_reconciliation_entities": {

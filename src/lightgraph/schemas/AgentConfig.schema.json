@@ -120,7 +120,7 @@
           "type": "integer"
         },
         "max_prompt_bytes": {
-          "default": 65536,
+          "default": 131072,
           "exclusiveMinimum": 0,
           "title": "Max Prompt Bytes",
           "type": "integer"

@@ -237,6 +237,28 @@ def _relative_hierarchy_contract(claim, documents, scopes, levels, table, review
         allow_dag=claim.allow_dag)
 
 
+def _reviewed_code_identity(claim, keys, documents, table, reviewed_evidence):
+    """Compile explicit cross-table code sharing only after independent review."""
+    if claim.identity_resolution != 'verified_identity_domain':
+        return IdentitySpec(key_columns=keys, entity_kind=claim.entity_kind_hint)
+    _check_code_domain_evidence(claim.identity_evidence + claim.attribute_evidence
+        + claim.global_scope_evidence, documents, table, reviewed_evidence)
+    return IdentitySpec(key_columns=keys, entity_kind=claim.entity_kind_hint,
+        semantic_resolution='verified_identity_domain', identity_domain=claim.identity_domain,
+        identity_evidence=reviewed_evidence, attribute_evidence=reviewed_evidence,
+        identity_scope=claim.identity_scope,
+        global_scope_evidence=reviewed_evidence if claim.identity_scope == 'domain_global' else [])
+
+
+def _check_code_domain_evidence(references, documents, table, reviewed_evidence):
+    # An issued locator alone is not proof: source-document purpose, scope and
+    # an affirmative review of the complete claim must all remain satisfied.
+    available = {d['doc_id']+'@'+d['revision']+':'+d['section_id']
+        for d in documents if _definition_document(d, table)}
+    if not reviewed_evidence or not references or set(references) - available:
+        raise LightGraphError('identity_domain_evidence_unresolved')
+
+
 def _normalize_business_code_mapping(single, multi, key_columns):
     """The engine already emits the final identity component as business_code.
 
@@ -285,7 +307,37 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
     results=[]
     for proposal in batch.proposals:
         claim=proposal.claim
-        if proposal.kind=='column_group':
+        if proposal.kind=='concept_mapping':
+            from lightgraph.contracts import ConceptMappingSpec
+            if not semantic_evidence:
+                raise LightGraphError('semantic_evidence_unresolved')
+            for component in claim.components:
+                if component.identity_domain:
+                    _check_code_domain_evidence(component.identity_evidence, documents, table, semantic_evidence)
+            columns=[lookup[c] for c in claim.key_columns+claim.namespace_columns]
+            columns += [lookup[c.column] for c in claim.components]
+            concept_keys=[lookup[c.key_column or c.column] for c in claim.components]
+            concept_scopes=[lookup[n] for c in claim.components for n in (c.namespace_columns or [])]
+            columns += concept_keys+concept_scopes
+            if set(columns)&excluded_names:raise LightGraphError('excluded_column_projected')
+            if set(columns[:len(claim.key_columns)])&identity_excluded:raise LightGraphError('excluded_column_in_identity')
+            if set(concept_keys+concept_scopes)&identity_excluded:raise LightGraphError('excluded_column_in_identity')
+            document_versions=sorted({d['doc_id']+'@'+d['revision'] for d in documents})
+            if claim.evidence_ref not in document_versions:raise LightGraphError('dangling_evidence_reference')
+            mapping=ConceptMappingSpec(evidence_ref=claim.evidence_ref,components=[
+                c.model_copy(update={'column':lookup[c.column],
+                    'key_column':lookup[c.key_column] if c.key_column else None,
+                    'namespace_columns':[lookup[n] for n in c.namespace_columns] if c.namespace_columns is not None else None})
+                for c in claim.components])
+            namespaces=[lookup[c] for c in claim.namespace_columns]
+            keys=list(dict.fromkeys(namespaces+[lookup[c] for c in claim.key_columns]))
+            results.append(RuleSpec(rule_id=_logical_entity_rule_id(table,'concept_mapping',claim.entity_kind_hint,keys,namespaces,
+                topology=mapping.model_dump()),kind='concept_mapping',goal_refs=[goal.goal_id],source=_source(table),
+                scope=ScopeSpec(namespaces=namespaces),identity=IdentitySpec(key_columns=keys,entity_kind=claim.entity_kind_hint),
+                concept_mapping=mapping,attributes=AttributeSpec(excluded=excluded),
+                dependencies=Dependencies(schema=_table_hash(table),documents=document_versions),coverage=Coverage(scope='sampled'),
+                evidence=rule_evidence(semantic_evidence,reviewed=True,documents=documents)))
+        elif proposal.kind=='column_group':
             if goal.entity_kinds and claim.entity_kind_hint not in goal.entity_kinds:continue
             keys=list(dict.fromkeys(lookup[m.column_id] for m in claim.members if m.in_identity
                 and (m.role=='identity_code' or (m.role=='semantic_attribute' and m.property_name=='business_code'))))
@@ -314,11 +366,12 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
             _normalize_business_code_mapping(single,multi,list(dict.fromkeys(namespaces+keys)))
             results.append(RuleSpec(rule_id=_logical_entity_rule_id(table,'column_group_entity',claim.entity_kind_hint,list(dict.fromkeys(namespaces+keys)),namespaces),kind='column_group_entity',
                 goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=namespaces),
-                identity=IdentitySpec(key_columns=list(dict.fromkeys(namespaces+keys)),entity_kind=claim.entity_kind_hint),
+                identity=_reviewed_code_identity(claim,list(dict.fromkeys(namespaces+keys)),documents,table,semantic_evidence),
                 attributes=AttributeSpec(single_valued=single,
                     multi_valued=multi,excluded=excluded),
                 dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in documents})),
-                coverage=Coverage(scope='sampled'),evidence=RuleEvidence(origin='discovery',semantic_basis=['model_column_group_candidate'])))
+                coverage=Coverage(scope='sampled'),evidence=(rule_evidence(semantic_evidence,reviewed=True,documents=documents)
+                    if claim.identity_resolution=='verified_identity_domain' else RuleEvidence(origin='discovery',semantic_basis=['model_column_group_candidate']))))
         elif proposal.kind=='entity_key':
             if goal.entity_kinds and claim.entity_kind_hint not in goal.entity_kinds:continue
             mapped=set(claim.attributes.single_valued+claim.attributes.multi_valued)
@@ -349,11 +402,12 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
             _normalize_business_code_mapping(single_map,multi_map,keys)
             results.append(RuleSpec(rule_id=_logical_entity_rule_id(table,'column_group_entity',claim.entity_kind_hint,keys,namespaces),kind='column_group_entity',
                 goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=namespaces),
-                identity=IdentitySpec(key_columns=keys,entity_kind=claim.entity_kind_hint),
+                identity=_reviewed_code_identity(claim,keys,documents,table,semantic_evidence),
                 attributes=AttributeSpec(single_valued=single_map,
                     multi_valued=multi_map,excluded=excluded),
                 dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in documents})),coverage=Coverage(scope='sampled'),
-                evidence=RuleEvidence(origin='discovery',semantic_basis=['model_entity_key_candidate'])))
+                evidence=(rule_evidence(semantic_evidence,reviewed=True,documents=documents)
+                    if claim.identity_resolution=='verified_identity_domain' else RuleEvidence(origin='discovery',semantic_basis=['model_entity_key_candidate']))))
         elif proposal.kind=='long_hierarchy':
             if goal.entity_kinds and claim.entity_kind_hint not in goal.entity_kinds:continue
             scopes=[lookup[c] for c in claim.namespace_columns]
@@ -402,8 +456,12 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
         if rule.hierarchy:
             used_properties.update({'label','alias'})
         relation=rule.relation.relation if rule.relation else 'parent_of' if rule.hierarchy else None
-        local_schema=semantic_schema.for_usage(entity_kinds={rule.identity.entity_kind},
-            properties=used_properties,relations={relation} if relation else set())
+        kinds={rule.identity.entity_kind};relations={relation} if relation else set()
+        if rule.concept_mapping:
+            kinds.update(c.entity_kind for c in rule.concept_mapping.components)
+            relations.update(c.relation for c in rule.concept_mapping.components)
+        local_schema=semantic_schema.for_usage(entity_kinds=kinds,
+            properties=used_properties,relations=relations)
         # Store only new contracts. Compatible built-in declarations are
         # references to existing contracts, not schema redefinitions.
         rule.semantic_schema=PersistencePolicy().with_schema(local_schema).semantic_schema

@@ -65,7 +65,12 @@ def test_transient_model_failure_is_retried_without_redoing_completed_table(tmp_
             if fail_b and packet["scope"]["table"] == "b":
                 return httpx.Response(503, text="synthetic temporary provider failure")
             return response(group(packet, "key", "label"))
-        return client(monkeypatch, handle)
+        model=client(monkeypatch, handle)
+        # Two provider failures are charged conservatively for the complete
+        # schema-bearing prompt. This case tests retry state, not token limits.
+        from dataclasses import replace
+        model.budget.limits=replace(model.budget.limits,llm_tokens=200000)
+        return model
 
     config = RunConfig(sources=[], output_dir=str(tmp_path / "out"))
     with MemorySource(tables, {"public.a": [("A", "Alpha")],

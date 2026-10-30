@@ -14,6 +14,10 @@ PROPOSALS={
     'column_group':{'group_id':'g','entity_kind_hint':'Metric','members':[
         {'column_id':'c1','role':'identity_code','in_identity':True}]},
     'entity_key':{'group_id':'g','entity_kind_hint':'Metric','key_columns':['c1'],'attributes':{}},
+    'concept_mapping':{'group_id':'g','entity_kind_hint':'ConceptBinding','key_columns':['c1'],
+        'evidence_ref':'doc@1','components':[
+            {'role':'metric','entity_kind':'Metric','column':'c2','definition_ref':'doc@1:metric','relation':'binds_metric'},
+            {'role':'product','entity_kind':'Product','column':'c3','definition_ref':'doc@1:product','relation':'binds_product'}]},
     'wide_hierarchy':{'group_id':'g','levels':[{'position':1,'key':'c1'},{'position':2,'key':'c2'}]},
     'long_hierarchy':{'group_id':'g','key_column':'c1','parent_column':'c2'},
     'reference':{'source_columns':['c1'],'target_entity':'target','target_columns':['c2']},
