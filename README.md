@@ -6,7 +6,7 @@
 
 依赖的本轮实测版本记录在 `requirements.lock`；需要复现环境时先安装该文件，再安装项目。
 
-2026-10-30 最新完成的五表真实模型实验 `full-extraction-v2-review-20261030T161244Z` 为 PARTIAL：107 次调用、约 90 分钟，五条规则通过局部执行，但共享实体名称冲突阻止原子发布，最终业务节点为零。更早一轮的 210 个层级节点不能作为本轮结果。当前修改加入可复用的字段与对象认识、显式草案替换、多列别名、先检查跨规则冲突再探索关系，以及连续图画布，见[本轮修改方向与验证](design/lightweight_graph/SCHEMA_FIRST_DISCOVERY_20261030.md)。原五表固定规则对照仍为 462 节点 / 930 边；自动发现效果须由新实验检验。全量实验限 240 次调用 / 2 小时，累计 tokens 不限。
+2026-10-31 最新完成的五表真实模型实验 `full-extraction-v2-schema-first-20261031T024424Z` 为 PARTIAL：64 次调用、约 58 分 20 秒，只发布产品定义的一条规则，得到 5 个业务节点、0 条边，18 次无效提交；其余四表尚未发布。本轮针对字段认识替代、兼容提案合并、可恢复冲突候选及按实际依赖分组发布进行修改，见[发现冲突的修订与独立发布](design/lightweight_graph/CONFLICT_RESOLUTION_20261031.md)。五表固定规则对照仍为 462 节点 / 930 边；自动发现效果须由新实验检验。全量实验限 240 次调用 / 2 小时，累计 tokens 不限。
 
 当前运行能力与验证边界见 [实施与验收记录](IMPLEMENTATION_STATUS.md)。最新的持续发现、可选关系、整组身份复核与运行指导改动见[两份评审后的继续修复](design/lightweight_graph/REVIEW_CONTINUATION_20261027.md)，上一轮协议修复见[真实数据反馈记录](design/lightweight_graph/REAL_DATA_DISCOVERY_REPAIR.md)。工程验证使用合成输入和离线模型替身，用户另一台机器上的真实数据仍待复跑。当前需求见 [用户故事](design/lightweight_graph/US.md) 和 [目标驱动迭代方案](design/lightweight_graph/GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)；[设计索引](design/lightweight_graph/README.md) 保留各项约束与历史边界。
 

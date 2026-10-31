@@ -72,7 +72,7 @@ def test_name_family_guess_and_name_less_object_do_not_veto_legacy_mapping(kind)
     packet['schema_knowledge']={'objects':[{**mapping,'basis':'metadata_name_family','status':'candidate'}]}
     assert ProposalSession(deepcopy(packet)).execute('submit_'+kind,bad)['status']=='ok'
     session=ProposalSession(packet)
-    assert session.execute('declare_object_model',{**mapping,'label_columns':[]})['status']=='ok'
+    assert session.execute('declare_object_model',{**mapping,'object_id':'new_candidate','label_columns':[]})['status']=='ok'
     assert session.execute('submit_'+kind,bad)['status']=='ok'
 
 
@@ -82,9 +82,14 @@ def test_issued_knowledge_can_be_explicitly_revised_and_scope_is_exact(basis,sta
     packet['schema_knowledge']={'objects':[{**mapping,'basis':basis,'status':status}]}
     session=ProposalSession(packet)
     assert session.execute('submit_column_group',bad)['code']=='object_model_mapping_conflict'
-    # An explicit local revision remains a hypothesis, even over prior knowledge.
+    # An agent can revise a candidate but cannot override a verified mapping.
     assert session.execute('declare_object_model',{**mapping,'object_id':'revised','label_columns':[]})['status']=='ok'
-    assert session.execute('submit_column_group',bad)['status']=='ok'
+    outcome=session.execute('submit_column_group',bad)
+    if basis=='executed_rule':
+        assert outcome['code']=='object_model_mapping_conflict'
+        assert 'rule revision' in outcome['diagnostics'][0]['guidance']
+        assert not session.drafts
+    else:assert outcome['status']=='ok'
     packet['schema_knowledge']={'objects':[{**mapping,'namespace_columns':[], 'basis':basis,'status':status}]}
     assert ProposalSession(packet).execute('submit_column_group',bad)['status']=='ok'
 

@@ -106,7 +106,10 @@ def proposal_tool_specs(task):
         from .schema_knowledge import ObjectModelDraft
         specs.append(_spec('declare_object_model',
             'Record a candidate table object and its issued code, name, English-name, alias, scope '
-            'and position columns before proposing extraction. Reuse object_id to revise the candidate. '
+            'and position columns before proposing extraction. Reuse object_id only for an agent candidate. '
+            'To replace metadata_name_family candidates, use a new object_id plus explicit '
+            'supersedes_object_ids, preserving each code/name/English/alias/namespace and position mapping. '
+            'Validated mappings require rule revision, not candidate replacement. '
             'This does not validate semantics, replace a rule, or grant publication authority. '
             'Source values and free-text descriptions are forbidden.',ObjectModelDraft.model_json_schema()))
     specs.append(_spec('declare_semantic_schema',
@@ -276,7 +279,8 @@ class ProposalSession:
                 self.schema = SemanticSchema.merged(self.schema,incoming)
                 return {'status':'ok','schema_declared':True,'confirmed':False}
             if name == 'declare_object_model' and name in self.names:
-                from .schema_knowledge import ObjectModelDraft,validate_object_model,object_model_reference_slots
+                from .schema_knowledge import (ObjectModelDraft,validate_object_model,object_model_reference_slots,
+                    apply_object_model,current_object_knowledge)
                 contract=ObjectModelDraft
                 candidate=contract.model_validate(arguments)
                 slots=object_model_reference_slots(candidate,self.packet)
@@ -284,15 +288,14 @@ class ProposalSession:
                     return self.reject(slots[0].code,diagnostics=[slot.diagnostic(i) for i,slot in enumerate(slots[:8])])
                 incoming=validate_object_model(candidate,self.packet).model_dump(mode='json')
                 if len(self.object_models)>=32:return self.reject('object_model_limit')
-                self.object_models.append(incoming)
                 # The formatter shares this packet, so the latest candidate
                 # survives source-history eviction while the full history stays
                 # available for the workflow's versioned, value-free ledger.
-                knowledge=self.packet.setdefault('schema_knowledge',{})
-                knowledge['objects']=[o for o in knowledge.get('objects',[])
-                    if o.get('object_id')!=incoming['object_id']]+[{**incoming,'status':'candidate',
-                        'basis':'agent_field_mapping'}]
-                return {'status':'ok','object_model':incoming,'candidate':True,'confirmed':False}
+                knowledge=apply_object_model(self.packet.get('schema_knowledge',{}),candidate)
+                self.object_models.append(incoming)
+                self.packet['schema_knowledge']=current_object_knowledge(knowledge)
+                return {'status':'ok','object_model':incoming,'candidate':True,'confirmed':False,
+                    'superseded_object_ids':candidate.supersedes_object_ids}
             if name == 'submit_hierarchy_plan':
                 from .hierarchy_plan import HierarchyPlan, compile_hierarchy_plan
                 contract = HierarchyPlan

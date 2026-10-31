@@ -206,7 +206,8 @@ def _proposal_repair_record(proposal, code):
 def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observations=None,failures=None,
              projection_excluded=(),identity_excluded=(),conflicted_ids=None,
              hierarchy_rules=(),granularity_rejections=None,hierarchy_context=(),
-             compiled_proposals=None,identity_requests=None,policy_reviews=None,semantic_failures=None):
+             compiled_proposals=None,identity_requests=None,policy_reviews=None,semantic_failures=None,
+             conflict_records=None):
     from .engine import _compile_model, _check_hierarchy_identity_resolution, SENSITIVE
     from lightgraph.contracts import canonical
     # Inspect the whole batch before reviewing any sibling. Otherwise a renamed
@@ -236,7 +237,7 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
     hierarchies=list({canonical(context):context for context in [*hierarchy_context,
         *hierarchy_identity_context(batch,table,hierarchy_rules)]}.values())
     granularity_rejections={} if granularity_rejections is None else granularity_rejections
-    rules=[]
+    rules=[];variants={}
     for p in batch.proposals:
         if p.kind=='exclusion': continue
         try:
@@ -246,6 +247,13 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
             local=ProposalBatch(task=batch.task,proposals=exclusions+[p],semantic_schema=schema)
             related_requests=[item for item in requests.values() if _hierarchy_request_matches(p,item)]
             review_packet=packet or {}
+            from .conflicts import proposal_logical_id,guard_shape
+            conflict_context=[item for item in review_packet.get('iteration_context',{}).get('rule_conflict_requests',[])
+                if proposal_logical_id(p,table) in item.get('candidate',{}).get('rule_refs',[])]
+            if review_packet.get('iteration_context',{}).get('rule_conflict_requests'):
+                review_packet={**review_packet,'iteration_context':{
+                    **review_packet['iteration_context'],'rule_conflict_requests':conflict_context,
+                    'pending_candidates':[]}}
             if p.kind=='wide_hierarchy':
                 if related_requests and len(requests)>MAX_HIERARCHY_IDENTITY_REQUESTS:
                     raise LightGraphError('hierarchy_identity_repair_context_limit')
@@ -293,7 +301,8 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                 and p.claim.identity_resolution=='verified_identity_domain')
             scope_revision_review='namespace_scope_missing' in (packet or {}).get('allowed_revision_codes',[])
             if model is not None and (p.kind in ('long_hierarchy','wide_hierarchy','concept_mapping')
-                                     or sharing_requested or domain_requested or scope_revision_review):
+                                     or sharing_requested or domain_requested or scope_revision_review
+                                     or conflict_context):
                 review=review_semantics(model,{**review_packet,'semantic_schema':schema.model_dump(mode='json')},{
                     'kind':p.kind,'scope':(packet or {}).get('scope'),
                     'claim':p.claim.model_dump(mode='json')},docs,observations=observations)
@@ -320,7 +329,7 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                     rule.evidence=rule_evidence(sharing,reviewed=bool(review),documents=docs)
                 elif sharing_requested:
                     raise LightGraphError('shared_definition_attributes_missing')
-                if scope_revision_review and review:
+                if (scope_revision_review or conflict_context) and review:
                     rule.evidence=rule_evidence(review,reviewed=True,documents=docs,
                                                probe_refs=rule.evidence.probe_refs)
                 if granularity_review:
@@ -328,7 +337,12 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                     rule.evidence=rule_evidence(sorted(set(previous+granularity_review)),
                         reviewed=True,documents=docs,probe_refs=rule.evidence.probe_refs)
                 _preflight(rule,goal)
+                for item in conflict_context:
+                    if item.get('restored') and digest(guard_shape(rule)) not in {
+                            m['guard_fingerprint'] for m in item['candidate']['mappings']}:
+                        raise LightGraphError('rule_conflict_constraints_changed')
                 rules.append(rule)
+                variants.setdefault(rule.rule_id,[]).append((p.model_copy(deep=True),schema.model_copy(deep=True),rule))
                 if compiled_proposals is not None:
                     compiled_proposals[rule.rule_id]=(p.model_copy(deep=True),schema.model_copy(deep=True),
                         entity_granularity_context_signatures(grain_context) if granularity_review else set())
@@ -343,7 +357,7 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                 result.pending_candidates.append(candidate)
                 if semantic_failures is not None:
                     semantic_failures.append({'candidate':candidate,'proposal':p,'failure':exc})
-            elif code in CONTRACT_CANDIDATE_CODES and p.kind!='exclusion':
+            elif code in (CONTRACT_CANDIDATE_CODES | SEMANTIC_REVIEW_PROTOCOL_CODES) and p.kind!='exclusion':
                 from types import SimpleNamespace
                 from .engine import _definition_document
                 refs=[d['doc_id']+'@'+d['revision']+':'+d['section_id'] for d in docs
@@ -354,20 +368,30 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
             if failures is not None and code in REPAIRABLE_PROPOSAL_CODES:
                 failures.append((p,code))
             else:_issue(result,table,code)
-    unique={}
-    conflicts=set()
-    for rule in rules:
-        previous=unique.get(rule.rule_id)
-        if previous is not None and previous!=rule:
-            conflicts.add(rule.rule_id);_issue(result,table,'conflicting_rule_proposals')
-        unique[rule.rule_id]=rule
+    from .conflicts import merge_compatible_rules,conflict_record,mark_conflict_repaired
+    unique={};conflicts=set()
+    for rid,items in variants.items():
+        merged=merge_compatible_rules([item[2] for item in items])
+        if merged is not None:
+            _preflight(merged,goal);unique[rid]=merged
+            for item in (packet or {}).get('iteration_context',{}).get('rule_conflict_requests',[]):
+                if item.get('restored') and rid in item['candidate']['rule_refs']:
+                    mark_conflict_repaired(result,item['candidate']['candidate_id'],rid)
+            if len(items)>1:result.stats['compatible_rule_merges']=result.stats.get('compatible_rule_merges',0)+1
+            continue
+        conflicts.add(rid);_issue(result,table,'conflicting_rule_proposals')
+        result.issues[-1]['rule_id']=rid
+        record=conflict_record(items,table,goal,packet or {},docs)
+        result.pending_candidates.append(record['candidate'])
+        if conflict_records is not None:conflict_records.append(record)
     if conflicted_ids is not None:conflicted_ids.update(conflicts)
     return [rule for rid,rule in unique.items() if rid not in conflicts]
 
 
 def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations,
                         tool_factory=None,projection_excluded=(),identity_excluded=(),
-                        hierarchy_rules=(),granularity_rejections=None,observed_hierarchies=None):
+                        hierarchy_rules=(),granularity_rejections=None,observed_hierarchies=None,
+                        on_revision=None):
     """Preserve valid siblings and allow one structurally changed semantic alternative.
 
     Semantic judgments and full data validation remain separate. Actual data
@@ -378,6 +402,8 @@ def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations
     projection,identity=_proposal_guards(batch,table,goal)
     projection_excluded=set(projection_excluded)|projection
     identity_excluded=set(identity_excluded)|identity
+    from .conflicts import retain_unchanged_conflicts
+    batch=retain_unchanged_conflicts(batch,packet,docs,result,table)
     observed_hierarchies={} if observed_hierarchies is None else observed_hierarchies
     observed_hierarchies.update((canonical(context),context) for context in
         hierarchy_identity_context(batch,table,hierarchy_rules))
@@ -386,15 +412,41 @@ def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations
     policy_reviews={}
     compiled_proposals={}
     semantic_failures=[]
+    conflict_records=[]
     granularity_rejections={} if granularity_rejections is None else granularity_rejections
     rules=_compile(batch,table,goal,docs,result,model=model,packet=packet,
         observations=observations,failures=failures,
         projection_excluded=projection_excluded,identity_excluded=identity_excluded,
         hierarchy_rules=hierarchy_rules,hierarchy_context=list(observed_hierarchies.values()),
         granularity_rejections=granularity_rejections,identity_requests=requests,
-        policy_reviews=policy_reviews,compiled_proposals=compiled_proposals,semantic_failures=semantic_failures)
+        policy_reviews=policy_reviews,compiled_proposals=compiled_proposals,semantic_failures=semantic_failures,
+        conflict_records=conflict_records)
+    from .conflicts import propose_conflict_revisions,guard_shape
+    def ask_revision(model,repair_packet,tools,observations):
+        revised=_ask(model,repair_packet,tools,observations)
+        _record_submission_state(result,table,revised)
+        if on_revision is not None:on_revision(revised,repair_packet)
+        return revised
+    conflict_alternatives,docs=propose_conflict_revisions(conflict_records,model=model,packet=packet,
+        tool_factory=tool_factory,ask=ask_revision,observations=observations,result=result,table=table,documents=docs)
+    for record,proposal,schema,repair_packet in conflict_alternatives:
+        repaired=ProposalBatch(task='T5_revision',proposals=[proposal],
+            semantic_schema=SemanticSchema.merged(batch.semantic_schema,schema))
+        replacements=_compile(repaired,table,goal,docs,result,model=model,packet=repair_packet,
+            observations=observations,projection_excluded=projection_excluded,identity_excluded=identity_excluded,
+            hierarchy_rules=hierarchy_rules,hierarchy_context=list(observed_hierarchies.values()),
+            granularity_rejections=granularity_rejections,identity_requests=requests,
+            policy_reviews=policy_reviews,compiled_proposals=compiled_proposals)
+        original_rules=[v[2] for v in record['variants']]
+        accepted=[r for r in replacements if r.rule_id==original_rules[0].rule_id
+            and any(guard_shape(r)==guard_shape(old) for old in original_rules)]
+        if accepted:
+            rules.extend(accepted);cid=record['candidate'].candidate_id
+            from .conflicts import mark_conflict_repaired
+            mark_conflict_repaired(result,cid,accepted[0].rule_id)
+        elif replacements:_issue(result,table,'rule_conflict_constraints_changed')
     alternatives,docs=revise_once(semantic_failures,model=model,packet=packet,
-        tool_factory=tool_factory,ask=_ask,observations=observations,result=result,table=table,documents=docs)
+        tool_factory=tool_factory,ask=ask_revision,observations=observations,result=result,table=table,documents=docs)
     for item,proposal,schema,repair_packet in alternatives:
         revised_packet={**repair_packet,'semantic_revision_guard':{
             **item['failure'].feedback(), 'prior_proposal':item['proposal'].model_dump(
@@ -554,6 +606,8 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             packet['schema_knowledge']=(schema_knowledge.context(table) if schema_knowledge
                                         else seed_knowledge(table,goal))
             packet['iteration_context']=dict(iteration_context or {})
+            from .conflicts import prepare_candidate_context
+            prepare_candidate_context(packet,original,goal,corpus)
             packet['iteration_context']['prior_identity_domains']=_identity_domain_context(result.rules)
             prior=[r for r in (revision_rules or []) if r.source==_source(table)]
             original_revision_codes=_iteration_codes(iteration_context,table)
@@ -600,11 +654,14 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             def fresh_tools():
                 return ToolExecutor(adapter,goal,budget,documents=corpus,
                     allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=window)
+            def record_revision(revised,repair_packet):
+                if schema_knowledge:
+                    schema_knowledge.record_models(table,getattr(revised,'_runtime_object_models',[]),repair_packet)
             rules,docs,batch,packet,guards=_compile_candidates(batch,original,goal,docs,result,
                 model=model,packet=packet,observations=observations,tool_factory=fresh_tools,
                 projection_excluded={entry.column for prior_rule in prior for entry in prior_rule.attributes.excluded},
                 hierarchy_rules=prior,granularity_rejections=granularity_rejections,
-                observed_hierarchies=observed_hierarchies)
+                observed_hierarchies=observed_hierarchies,on_revision=record_revision)
             if prior and 'fd_violation' in original_revision_codes:
                 protected=prior[0]
                 safe=[]
@@ -746,6 +803,8 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
             packet['relation_candidates']=relation_candidates(tool_tables,schema_knowledge,
                 goal=goal,max_candidates=min(max_candidates,32))
             packet['iteration_context']=dict(iteration_context or {})
+            from .conflicts import prepare_candidate_context
+            prepare_candidate_context(packet,originals[table.qualified_name],goal,corpus)
             prior=[r for r in (revision_rules or []) if r.source==_source(table)]
             if prior:
                 packet.update(revision_of=prior[0].rule_id,
@@ -904,6 +963,16 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                     _issue(result,table,exc.code)
                     if isinstance(exc, SemanticReviewFailure):
                         result.pending_candidates.append(candidate_record(proposal,table,review_packet,docs,exc))
+                    elif exc.code in SEMANTIC_REVIEW_PROTOCOL_CODES | REPAIRABLE_PROPOSAL_CODES:
+                        from types import SimpleNamespace
+                        from typing import get_args
+                        from .models import PendingCandidate
+                        failure=SimpleNamespace(code=exc.code if exc.code in SEMANTIC_REVIEW_PROTOCOL_CODES
+                            else 'reference_contract_unresolved',blocking=[],required=[],stage='reference')
+                        candidate=candidate_record(proposal,table,packet,docs,failure)
+                        allowed=set(get_args(PendingCandidate.model_fields['failure_details'].annotation.__args__[0]))
+                        if exc.code in allowed:candidate.failure_details=[exc.code]
+                        result.pending_candidates.append(candidate)
                     if exc.code in REPAIRABLE_PROPOSAL_CODES:
                         result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+1
         except LightGraphError as exc:

@@ -51,6 +51,7 @@ def _claim(proposal):
 
 
 def candidate_record(proposal, table, packet, documents, failure):
+    from .conflicts import proposal_mapping
     columns, rules, docs, issued = issued_references(packet, documents)
     # Intersect every string leaf with issued references; arbitrary model text
     # cannot become a persisted reference, even when it looks like an ID.
@@ -70,7 +71,9 @@ def candidate_record(proposal, table, packet, documents, failure):
         source=source, proposal_kind=proposal.kind, failure_code=failure.code,
         column_refs=sorted(leaves & columns), document_refs=sorted(docs)[:128],
         rule_refs=sorted(leaves & rules), blocking_evidence_refs=sorted(set(failure.blocking) & issued)[:128],
-        required_evidence_refs=sorted(set(failure.required) & issued)[:128], review_stage=failure.stage)
+        required_evidence_refs=sorted(set(failure.required) & issued)[:128], review_stage=failure.stage,
+        mappings=[proposal_mapping(proposal,packet)],
+        dependency_fingerprint=packet.get('iteration_context',{}).get('candidate_dependency'))
 
 
 def revision_shape(proposal):

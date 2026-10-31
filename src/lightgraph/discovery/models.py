@@ -304,6 +304,33 @@ class DataUnderstanding(StrictModel):
     rule_refs: list[str] = Field(default_factory=list)
     document_refs: list[str] = Field(default_factory=list)
     unknowns: list[str] = Field(default_factory=list)
+class CandidateFieldMapping(StrictModel):
+    """Issued schema locators and fixed roles, never a source-value slot."""
+    role: Literal['key','namespace','attribute','excluded','hierarchy_key','hierarchy_label',
+                  'hierarchy_alias','parent','concept_key','concept_label','reference_source','reference_target']
+    columns: list[str] = Field(default_factory=list,max_length=256)
+    property_name: str | None = Field(default=None,pattern=r'^[A-Za-z][A-Za-z0-9_]{0,63}$')
+    multi: bool = False
+    position: int | None = Field(default=None,ge=0,le=64)
+
+class CandidateRuleMapping(StrictModel):
+    variant_id: str = Field(pattern=r'^[a-f0-9]{64}$')
+    rule_id: str | None = Field(default=None,max_length=128)
+    proposal_kind: Literal['column_group','entity_key','wide_hierarchy','long_hierarchy','reference','concept_mapping']
+    entity_kind: str | None = Field(default=None,pattern=r'^[A-Za-z][A-Za-z0-9_]{0,63}$')
+    fields: list[CandidateFieldMapping] = Field(default_factory=list,max_length=256)
+    guard_fingerprint: str = Field(pattern=r'^[a-f0-9]{64}$')
+    identity_resolution: Literal['source_scoped','shared_definition','verified_definition_registry','verified_identity_domain'] | None = None
+    identity_scope: Literal['namespace_local','domain_global'] | None = None
+    level_policy: Literal['not_applicable','code_with_fill_merge','level_qualified','relative_path'] | None = None
+    path_semantics: Literal['legacy','relative_path'] | None = None
+    position_semantics: Literal['ordinal_slots','ordered_slots'] | None = None
+    allow_dag: bool | None = None
+    component_relations: list[str] = Field(default_factory=list,max_length=16)
+    component_roles: list[Literal['metric','product','channel','object','dimension','measure','requires_reread']] = Field(default_factory=list,max_length=16)
+    required_reread: list[Literal['identity_domain','scope_condition','context_qualifiers',
+        'concept_definitions','component_roles','normalization','custom_semantic_definition']] = Field(default_factory=list,max_length=8)
+
 class PendingCandidate(StrictModel):
     """Value-free review work; a candidate never grants publication authority."""
     candidate_id: str = Field(pattern=r'^candidate_[a-f0-9]{24}$')
@@ -318,13 +345,40 @@ class PendingCandidate(StrictModel):
         'concept_context_type_must_be_distinct','concept_mapping_contract_conflict',
         'concept_mapping_document_required','concept_binding_must_be_source_scoped',
         'duplicate_concept_relation','concept_identity_domain_evidence_required',
-        'concept_identity_domain_required']
+        'concept_identity_domain_required','conflicting_rule_proposals','rule_execution_failed',
+        'semantic_review_protocol_invalid','semantic_review_reference_mismatch',
+        'semantic_review_proposition_mismatch','semantic_review_proposition_missing',
+        'semantic_review_unissued_evidence','semantic_review_patch_invalid','llm_schema_invalid',
+        'reference_contract_unresolved']
     column_refs: list[str] = Field(default_factory=list, max_length=256)
     document_refs: list[str] = Field(default_factory=list, max_length=128)
     rule_refs: list[str] = Field(default_factory=list, max_length=64)
     blocking_evidence_refs: list[str] = Field(default_factory=list, max_length=128)
     required_evidence_refs: list[str] = Field(default_factory=list, max_length=128)
     review_stage: Literal['entity_granularity','entity_definition','hierarchy','reference','concept_mapping']
+    mappings: list[CandidateRuleMapping] = Field(default_factory=list,max_length=6)
+    differences: list[Literal['label_mapping','attribute_mapping','identity_policy','hierarchy_mapping',
+                              'schema_definition','other_contract']] = Field(default_factory=list,max_length=6)
+    dependency_fingerprint: str | None = Field(default=None,pattern=r'^[a-f0-9]{64}$')
+    attempted_fingerprints: list[str] = Field(default_factory=list,max_length=8)
+    failure_details: list[Literal['fd_violation','same_code_diff_label','hierarchy_cycle',
+        'multiple_parent','identity_domain_attribute_conflict','reference_self_link_forbidden',
+        'dangling_edge_requires_dependency_publication','binding_revision_requires_dependency_publication',
+        'dependency_rule_failed','wall_time_budget_exhausted','run_time_budget_exhausted',
+        'namespace_scope_missing','query_budget_exhausted','discovery_budget_exhausted',
+        'projection_truncated','query_result_truncated','identity_conflict','label_conflict',
+        'reference_hierarchy_level_required','reference_hierarchy_level_unknown',
+        'reference_level_on_nonhierarchy','reference_arity_mismatch','relation_endpoint_kind_mismatch',
+        'unverified_entity_reference','unregistered_relation','null_key','identity_definition_conflict',
+        'shared_identity_attribute_conflict','shared_attribute_conflict','reference_unmatched','reference_ambiguous',
+        'unmatched_reference','ambiguous_reference','reference_partial_null','reference_null_endpoint','multiple_parents',
+        'new_discriminator_partition','discriminator_cardinality_drift','same_code_label_conflict',
+        'unexplained_role_occurrence','cross_level_code_reuse','non_contiguous_level_code','fill_mismatch',
+        'reference_missing','hierarchy_self_loop','reference_self_link_semantics_unreviewed',
+        'identity_migration_conflict','concept_value_missing','concept_segment_mismatch',
+        'concept_key_missing','concept_binding_conflict','concept_key_label_conflict',
+        'null_identity_namespace','partition_breaks_identity','partition_breaks_hierarchy',
+        'conflicting_entity_kinds','property_requires_visible_node_support']] = Field(default_factory=list,max_length=16)
     status: Literal['pending'] = 'pending'
 
 

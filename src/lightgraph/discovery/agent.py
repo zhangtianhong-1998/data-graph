@@ -106,6 +106,10 @@ global_scope_evidence. Probe IDs, columns and bare document names cannot prove a
 Read schema_knowledge before exploring. Establish which columns belong to each object:
 code, primary name, English names, aliases, namespace and path positions. Record supported
 field-role candidates with declare_object_model before proposing rules when available.
+When one multi-position model replaces metadata_name_family field groups, use a new
+object_id and their explicit supersedes_object_ids, preserving all code/name/English/alias
+associations, namespaces and positions. Reuse an object_id only to revise an agent candidate.
+Validated mappings need a separate rule revision; a new candidate cannot erase them.
 Physical hierarchy levels are occurrence positions. When evidence establishes reuse
 within the same code domain and scope, use relative_path for one object with multiple
 supports. Different L positions alone do not split identity; equal names alone never
@@ -118,6 +122,10 @@ Retained drafts and exclusions accumulate. Correct a retained draft with replace
 from the same tool and group_id/plan_id; this preserves identity, topology, scope, exclusions
 and evidence obligations. It changes display mappings without leaving conflicting versions.
 Structural changes require the independent revision flow, never conceal them as a replacement.
+Read pending candidate mappings and their differences before revisiting a failed object.
+In a conflict-revision task, resolve only the named conflict and collect the missing evidence.
+Keep competing mappings and conditions visible; renaming or omitting a rejected variant is
+not resolution. Return unresolved when evidence cannot distinguish the alternatives.
 Do not hold all
 findings until the last turn or reproduce the entire ProposalBatch. Call finish_discovery
 after submissions; if tools are unavailable, return the small finish_discovery action

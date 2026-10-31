@@ -114,9 +114,12 @@ def test_real_fd_revision_cannot_hide_counterexample_in_expanded_identity(monkey
 
 
 def test_same_batch_conflicting_interpretations_do_not_choose_first(monkeypatch):
-    t=table('objects',['a','b','c','d','e'])
+    t=table('objects',['a','b','c','d','e']);tasks=[]
     def handler(request):
-        _,packet=input_packet(request)
+        _,packet=input_packet(request);tasks.append(packet['task'])
+        if packet['task']=='T5_revision':
+            assert packet['iteration_context']['rule_conflict_requests']
+            return response({'task':packet['task'],'abstain':True})
         assert packet['task']=='T0_discovery'
         batch=two_groups(packet);batch['proposals'].extend(group(packet,'a','d')['proposals'])
         return response(batch)
@@ -124,6 +127,8 @@ def test_same_batch_conflicting_interpretations_do_not_choose_first(monkeypatch)
         result=discover(source,model=client(monkeypatch,handler))
     assert not result.rules
     assert any(i['code']=='conflicting_rule_proposals' for i in result.issues)
+    assert tasks==['T0_discovery','T5_revision']
+    assert len(result.pending_candidates)==1 and len(result.pending_candidates[0].mappings)==2
 
 
 @pytest.mark.parametrize('initial_error',['reference_hierarchy_level_required','relation_endpoint_kind_mismatch'])

@@ -444,6 +444,16 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
             'ignore an original restriction or condition merely because the repair omits it. '
             'source_scoped and namespace_local are not equivalent: namespace-local verified '
             'identity domains can share identities across source tables.')
+    if packet.get('iteration_context',{}).get('rule_conflict_requests'):
+        review_packet['subtask'] += (
+            ' This is an adjudication of conflicting field mappings. Compare BOTH retained '
+            'alternatives in iteration_context.rule_conflict_requests with the revised '
+            'proposition and the supplied definitions and probes. The alternatives are '
+            'hypotheses, not evidence. Establish why the chosen column names this object '
+            'and which conflicting interpretation the evidence rules out. Preserve all '
+            'scope, exclusion and applicability obligations; omission is not resolution. '
+            'FD consistency or a distinct count alone cannot establish a name mapping. '
+            'If the evidence cannot distinguish the alternatives, return unresolved.')
     if packet.get('semantic_revision_guard'):
         review_packet['subtask'] += (
             ' This is a structurally changed alternative to a rejected claim. The '

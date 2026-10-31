@@ -30,12 +30,13 @@ def _safe_draft_diagnostics(issues, table, contract_codes):
     from lightgraph.discovery.models import ProposalBatch
     from lightgraph.discovery.hierarchy_plan import HierarchyPlan
     from lightgraph.discovery.proposal_session import DiscoveryFinish
+    from lightgraph.discovery.schema_knowledge import ObjectModelDraft
     from lightgraph.semantic_schema import SemanticSchema
     from lightgraph.discovery.validation_feedback import _property_names, _path, _JSON_CONSTRAINTS
     codes=set(contract_codes)|{'invalid_tool_arguments','invalid_proposal_arguments',
         'dangling_evidence_reference','unauthorized_column_reference','unauthorized_source_reference'}
     names=set().union(*(_property_names(model.model_json_schema())
-        for model in (ProposalBatch,HierarchyPlan,SemanticSchema,DiscoveryFinish)))
+        for model in (ProposalBatch,HierarchyPlan,SemanticSchema,DiscoveryFinish,ObjectModelDraft)))
     records=[]
     for issue in issues:
         if (issue.get('table')!=table or issue.get('code')!='discovery_draft_field_diagnostic'

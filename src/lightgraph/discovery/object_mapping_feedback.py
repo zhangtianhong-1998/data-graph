@@ -13,13 +13,15 @@ def object_mapping_diagnostics(proposal, packet, *, hierarchy_plan=False):
     for obj in packet.get('schema_knowledge',{}).get('objects',[]):
         declared=obj.get('basis') in {'agent_field_mapping','agent_field_model'}
         validated=(obj.get('basis')=='executed_rule' and obj.get('status') in {'local_validated','published'})
-        if obj.get('status')=='conflict' or not (declared or validated):continue
-        priority=3 if obj.get('basis')=='agent_field_mapping' else 2 if declared else 1
+        if obj.get('status') in {'conflict','superseded'} or not (declared or validated):continue
+        priority=4 if validated else 3 if obj.get('basis')=='agent_field_mapping' else 2
         def remember(keys,scope,labels):
             target=(keys,scope)
-            # A deliberate field-model revision can retract a candidate name
-            # slot. The independent compiler/reviewer still validates rules.
+            # Agent declarations can revise candidates, but changing a verified
+            # mapping requires rule revision and independent revalidation.
             if keys and keys|scope|labels<=columns and priority>=mappings.get(target,(0,set()))[0]:
+                if priority==4 and mappings.get(target,(0,set()))[0]==4:
+                    labels=labels|mappings[target][1]
                 mappings[target]=(priority,labels)
         scope=frozenset(obj.get('namespace_columns',[]))
         keys=frozenset(obj.get('key_columns',[]))-scope
@@ -34,13 +36,16 @@ def object_mapping_diagnostics(proposal, packet, *, hierarchy_plan=False):
     def check(keys, scope, label, field):
         scope=frozenset(scope);keys=frozenset(keys)-scope
         if label not in keys:return
-        expected=sorted(mappings.get((keys,scope),(0,set()))[1])
+        priority,labels=mappings.get((keys,scope),(0,set()))
+        expected=sorted(labels)
         if expected:
             diagnostics.append({'code':'object_model_mapping_conflict','field':field,
                 'constraint':'declared_code_name_mapping','category':'columns',
                 'allowed':expected,'guidance':'This object already has a distinct primary-name mapping. '
-                    'Use its issued name column, or explicitly revise declare_object_model first if '
-                    'the remembered candidate is wrong. Use replace_draft_id for an existing draft. '
+                    + ('Use its issued name column; changing a verified mapping requires rule revision and revalidation. '
+                       if priority==4 else 'Use its issued name column, or explicitly revise declare_object_model '
+                       'first if the remembered candidate is wrong. ') +
+                    'Use replace_draft_id for an existing draft. '
                     'This feedback does not confirm semantic identity.'})
     claim=proposal.claim
     if proposal.kind=='column_group':

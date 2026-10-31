@@ -37,12 +37,20 @@ class CandidateQueue:
                 row=self.connection.execute('SELECT payload,state,revision FROM discovery_candidate WHERE scope_key=? AND candidate_id=?',
                     (self.scope_key,candidate.candidate_id)).fetchone()
                 if row and row['payload']==payload:
+                    if row['state']=='resolved':
+                        self._state(self._find(candidate.candidate_id),'pending','conflict_reobserved')
+                        self.connection.execute('DELETE FROM discovery_candidate_replacement WHERE scope_key=? AND candidate_id=?',
+                            (self.scope_key,candidate.candidate_id))
                     continue
                 revision=row['revision']+1 if row else 1
                 self.connection.execute('INSERT OR REPLACE INTO discovery_candidate VALUES(?,?,?,?,?)',
                     (self.scope_key,candidate.candidate_id,payload,'pending',revision))
+                self.connection.execute('DELETE FROM discovery_candidate_replacement WHERE scope_key=? AND candidate_id=?',
+                    (self.scope_key,candidate.candidate_id))
                 self._event(candidate.candidate_id,revision,'observed')
             for candidate_id in result.resolved_candidate_ids:
+                self.connection.execute('DELETE FROM discovery_candidate_replacement WHERE scope_key=? AND candidate_id=?',
+                    (self.scope_key,candidate_id))
                 row=self._find(candidate_id,required=False)
                 if row and row['state'] not in ('resolved','revised'):
                     self._state(row,'revised','replacement_proposed')
@@ -54,7 +62,17 @@ class CandidateQueue:
 
     def confirm_publications(self,published):
         """A semantic repair is resolved only after every replacement publishes."""
-        revisions={r.rule_id:r.revision for r in self.store.get_rules() if r.rule_id in published}
+        heads={}
+        for head in self.store.heads():heads.setdefault(head['logical_rule_id'],[]).append(head)
+        revisions={}
+        for rule_id in set(published):
+            current=heads.get(rule_id,[])
+            # A stored RuleSpec or one updated partition is not a completed
+            # replacement. Confirm the actual, valid complete-generation head.
+            if len(current)!=1 or not current[0]['valid'] or current[0]['partition_id']!='all':continue
+            publication=self.store._publication(current[0]['publication_id'])
+            if publication['state']=='published' and self.store._is_rule_generation(publication['publication_id']):
+                revisions[rule_id]=publication['revision']
         with self.store._transaction():
             for row in self.connection.execute('SELECT candidate_id,rule_revisions FROM discovery_candidate_replacement WHERE scope_key=?',(self.scope_key,)).fetchall():
                 expected=json.loads(row['rule_revisions'])
@@ -118,6 +136,18 @@ class CandidateQueue:
                 result.append(value)
             if len(result)>=16:break
         return result
+
+    def refresh_context(self, dependencies):
+        """Schema/document changes retire stored mappings, never replay them."""
+        with self.store._transaction():
+            rows=self.connection.execute("SELECT * FROM discovery_candidate WHERE scope_key=? "
+                "AND state IN ('pending','retry_requested','revised')",(self.scope_key,)).fetchall()
+            for row in rows:
+                value=json.loads(row['payload']);source=value['source']
+                key=(source['source_id'],source.get('schema','public'),source['table'])
+                expected=value.get('dependency_fingerprint')
+                if expected and (key not in dependencies or dependencies[key]!=expected):
+                    self._state(row,'stale','dependencies_changed')
 
     def retry_sources(self):
         from lightgraph.contracts import SourceRef

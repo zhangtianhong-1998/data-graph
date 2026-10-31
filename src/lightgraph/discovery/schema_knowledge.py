@@ -6,6 +6,7 @@ stored. A remembered hypothesis never becomes evidence for its own meaning.
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from itertools import combinations, product
 import json
 import re
@@ -27,7 +28,8 @@ class ObjectPosition(StrictModel):
 
 class ObjectModelDraft(StrictModel):
     object_id: str = Field(pattern=r'^[A-Za-z][A-Za-z0-9_]{0,63}$', description=
-        'Local hypothesis identifier, not a source value or business identity.')
+        'Local hypothesis identifier, not a source value or business identity. Reuse an agent candidate '
+        'ID to revise it; use a new ID when explicitly superseding metadata candidates.')
     key_columns: list[str] = Field(default_factory=list, max_length=16, description=
         'Issued code/key column IDs. For relative hierarchy positions, list their code columns; '
         'this records their roles and does not make a composite entity key.')
@@ -37,6 +39,11 @@ class ObjectModelDraft(StrictModel):
     namespace_columns: list[str] = Field(default_factory=list, max_length=16)
     positions: list[ObjectPosition] = Field(default_factory=list, max_length=32)
     evidence_refs: list[str] = Field(default_factory=list, max_length=32)
+    supersedes_object_ids: list[str] = Field(default_factory=list, max_length=32, description=
+        'Explicit issued IDs of metadata_name_family candidates replaced by this object model. '
+        'Preserve each candidate\'s complete code/name/English/alias/namespace mapping and every '
+        'code/name/alias position tuple. Shared columns alone never authorize replacement. '
+        'Previously validated or published objects require rule revision, not supersession.')
 
     @model_validator(mode='after')
     def field_roles(self):
@@ -66,7 +73,7 @@ def _field_ids(model):
 def _mapped_columns(objects):
     refs=set()
     for obj in objects:
-        if obj['status']=='conflict':continue
+        if obj['status'] in {'conflict','superseded'}:continue
         for field in ('key_columns','label_columns','english_name_columns','alias_columns','namespace_columns'):
             refs.update(obj.get(field,[]))
         for position in obj.get('positions',[]):
@@ -74,6 +81,100 @@ def _mapped_columns(objects):
             if position.get('label'):refs.add(position['label'])
             refs.update(position.get('aliases',[]))
     return refs
+
+
+def current_object_knowledge(knowledge):
+    """Return a prompt view without retired hypotheses; keep the ledger intact."""
+    value=deepcopy(knowledge)
+    retired=sum(o.get('status')=='superseded' for o in value.get('objects',[]))
+    value['retired_object_ids']=sorted(set(value.get('retired_object_ids',[]))|
+        {o['object_id'] for o in value.get('objects',[]) if o.get('status')=='superseded'})
+    value['objects']=[o for o in value.get('objects',[]) if o.get('status')!='superseded']
+    value['objects_total']=len(value['objects'])+value.get('objects_omitted',0)
+    value['objects_superseded']=value.get('objects_superseded',0)+retired
+    return value
+
+
+def _retains_mapping(previous,incoming):
+    """Preserve role associations, not merely the union of referenced columns."""
+    def role_refs(value,field):
+        refs=set(value.get(field,[]))
+        if field in {'key_columns','label_columns'}:
+            refs.update(p.get('code' if field=='key_columns' else 'label') for p in value.get('positions',[]))
+            refs.discard(None)
+        return refs
+    fields=('key_columns','label_columns','english_name_columns','alias_columns')
+    if any(not role_refs(previous,field)<=role_refs(incoming,field) for field in fields):
+        return False
+    if set(previous.get('namespace_columns',[]))!=set(incoming.get('namespace_columns',[])):
+        return False
+    positions={p['position']:p for p in incoming.get('positions',[])}
+    for old in previous.get('positions',[]):
+        new=positions.get(old['position'])
+        if (not new or new['code']!=old['code'] or new.get('label')!=old.get('label')
+            or not set(old.get('aliases',[]))<=set(new.get('aliases',[]))):
+            return False
+    if not previous.get('positions'):
+        # An unpositioned code/name pair cannot be swallowed by a wider flat
+        # list: that list no longer tells which name belongs to which code.
+        same_keys=role_refs(previous,'key_columns')==role_refs(incoming,'key_columns')
+        if not same_keys:return False
+    return True
+
+
+def apply_object_model(knowledge,model,*,basis='agent_field_mapping'):
+    """Atomically revise a candidate and explicitly retire compatible seeds.
+
+    The owning knowledge snapshot supplies source and dependency version. Only
+    IDs present in that snapshot are eligible; callers cannot grant ownership
+    through model arguments. The unchanged input also makes rejection atomic.
+    """
+    model=ObjectModelDraft.model_validate(model)
+    if model.object_id in knowledge.get('retired_object_ids',[]):
+        raise LightGraphError('object_model_already_superseded')
+    incoming=model.model_dump(mode='json')
+    objects=knowledge.get('objects',[])
+    indexed={obj['object_id']:obj for obj in objects}
+    prior=indexed.get(model.object_id)
+    if prior:
+        if prior.get('basis')=='executed_rule' or prior.get('status') in {'local_validated','published'}:
+            raise LightGraphError('object_model_verified_revision_required')
+        if prior.get('status')=='superseded':
+            raise LightGraphError('object_model_already_superseded')
+        if prior.get('basis')=='metadata_name_family':
+            raise LightGraphError('object_model_supersession_requires_new_id')
+    inherited=list(prior.get('supersedes_object_ids',[])) if prior else []
+    requested=[identifier for identifier in dict.fromkeys(model.supersedes_object_ids)
+               if identifier not in inherited]
+    for identifier in requested:
+        if identifier==model.object_id:raise LightGraphError('object_model_supersession_requires_new_id')
+        previous=indexed.get(identifier)
+        if previous is None:raise LightGraphError('object_model_supersession_target_invalid')
+        if previous.get('source',knowledge.get('source'))!=knowledge.get('source') or (
+            previous.get('dependency_version',knowledge.get('dependency_version'))!=knowledge.get('dependency_version')):
+            raise LightGraphError('object_model_supersession_scope_mismatch')
+        if previous.get('basis')!='metadata_name_family' or previous.get('status')!='candidate':
+            raise LightGraphError('object_model_supersession_target_invalid')
+        if not _retains_mapping(previous,incoming):
+            raise LightGraphError('object_model_supersession_mapping_loss')
+    if inherited and not _retains_mapping(prior,incoming):
+        raise LightGraphError('object_model_supersession_mapping_loss')
+    incoming['supersedes_object_ids']=list(dict.fromkeys(inherited+requested))
+    if len(incoming['supersedes_object_ids'])>32:raise LightGraphError('object_model_supersession_limit')
+    incoming.update(status='candidate',basis=basis)
+    for field in ('source','dependency_version'):
+        if field in knowledge:incoming[field]=deepcopy(knowledge[field])
+    value=deepcopy(knowledge)
+    value['objects']=[o for o in value.get('objects',[]) if o['object_id']!=model.object_id]
+    for obj in value['objects']:
+        if obj['object_id'] in requested:
+            obj.update(status='superseded',superseded_by=model.object_id)
+    value['objects'].append(incoming)
+    value['objects_total']=sum(o.get('status')!='superseded' for o in value['objects'])+value.get('objects_omitted',0)
+    if 'columns' in value:
+        mapped=_mapped_columns(value['objects'])
+        value['unassigned_columns']=[c['id'] for c in value['columns'] if c['id'] not in mapped]
+    return value
 
 
 def object_model_reference_slots(model,packet):
@@ -141,6 +242,8 @@ def seed_knowledge(table, goal=None, *, dependency_version=''):
             'namespace_columns':[ids[c] for c in namespaces], 'positions':positions,
             'evidence_refs':[], 'status':'candidate','basis':'metadata_name_family'}
         value['object_id']='object_'+digest(_source(table).model_dump(mode='json',by_alias=True),value)[:24]
+        value['source']=_source(table).model_dump(mode='json',by_alias=True)
+        value['dependency_version']=dependency_version
         objects.append(value)
     used=_mapped_columns(objects)
     return {'version':'schema_knowledge/1','source':_source(table).model_dump(mode='json',by_alias=True),
@@ -201,7 +304,7 @@ class SchemaKnowledgeLedger:
         return json.loads(row['payload'])
 
     def context(self,table,max_objects=16):
-        value=self._load(table)
+        value=current_object_knowledge(self._load(table))
         value['objects']=sorted(value['objects'],key=lambda o:(
             {'published':0,'local_validated':1,'candidate':2,'conflict':3}[o['status']],
             o['basis']=='metadata_name_family',o['object_id']))
@@ -235,15 +338,18 @@ class SchemaKnowledgeLedger:
                 if not _field_ids(model)<=allowed:continue
                 item=model.model_dump(mode='json');local_id=item.pop('object_id')
                 item['evidence_refs']=sorted(set(item['evidence_refs']) & (documents|allowed))
-                item.update(status='candidate',basis='agent_field_model')
                 prior=next((o for o in value['objects'] if o['object_id']==local_id),None)
-                item['object_id']=(local_id if prior and prior['basis']!='executed_rule' else
+                if prior and (prior.get('basis')=='executed_rule' or prior.get('status') in {'local_validated','published'}):
+                    raise LightGraphError('object_model_verified_revision_required')
+                item['object_id']=(local_id if prior else
                     'object_'+digest(source,'agent_field_model',local_id)[:24])
-                value['objects']=[o for o in value['objects'] if o['object_id']!=item['object_id']]+[item]
+                value=apply_object_model(value,item,basis='agent_field_model')
                 # Every accepted revision is immutable, including two edits in
                 # one conversation; only the latest map is injected next time.
-                value['objects']=sorted(value['objects'],key=lambda o:(o['status']=='candidate',
-                    o['basis']=='metadata_name_family'))[:128]
+                retired=[o for o in value['objects'] if o['status']=='superseded']
+                active=[o for o in value['objects'] if o['status']!='superseded']
+                value['objects']=sorted(active,key=lambda o:(o['status']=='candidate',
+                    o['basis']=='metadata_name_family'))[:128]+retired
                 self._append(source,value)
             self._append(source,value)
 
@@ -335,10 +441,17 @@ def relation_candidates(tables, knowledge=None, *, goal=None, max_candidates=32)
         state=knowledge._load(table) if knowledge else seed_knowledge(table,goal)
         columns={c['id']:c for c in state['columns']}
         for obj in state['objects']:
-            if obj['status']=='conflict':continue
+            if obj['status'] in {'conflict','superseded'}:continue
             for role,field in [('identity_code','key_columns'),('label','label_columns'),
                                ('english_name','english_name_columns'),('alias','alias_columns')]:
-                for ref in obj.get(field,[]):
+                references=list(obj.get(field,[]))
+                if field in {'key_columns','label_columns'}:
+                    references.extend(p.get('code' if field=='key_columns' else 'label')
+                        for p in obj.get('positions',[]))
+                elif field=='alias_columns':
+                    references.extend(ref for p in obj.get('positions',[]) for ref in p.get('aliases',[])
+                        if ref not in obj.get('english_name_columns',[]))
+                for ref in dict.fromkeys(references):
                     if ref not in columns:continue
                     col=columns[ref];item=endpoint(table,[col['name']])
                     family=('number' if re.search(r'int|numeric|decimal|float|double|real',col['type'],re.I) else

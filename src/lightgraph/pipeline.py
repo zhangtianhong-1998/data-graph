@@ -65,7 +65,8 @@ def _deferred_tables(result, selected=()):
 
 def _discovery_counts(report, result):
     for key in ('compile_repair_rounds', 'recovered_proposals', 'deferred_proposals',
-                'discovery_invalid_drafts', 'discovery_pending_submissions', 'semantic_revision_attempts'):
+                'discovery_invalid_drafts', 'discovery_pending_submissions', 'semantic_revision_attempts',
+                'compatible_rule_merges','rule_conflict_revision_attempts','rule_conflict_revisions_compiled'):
         value = result.stats.get(key, 0)
         if type(value) is int:
             report.counts[key] = report.counts.get(key, 0) + value
@@ -328,6 +329,9 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         schema_knowledge.prepare([t for adapter in scoped_adapters for t in adapter.describe()],config.goal,corpus)
         from .runtime.candidates import CandidateQueue
         candidates_queue=CandidateQueue(store,config.goal,config.scopes,config.isolation_domain,config.sources)
+        from .discovery.conflicts import candidate_dependency
+        candidates_queue.refresh_context({key:candidate_dependency(table,config.goal,contexts.get(key[0],{}).get(table.qualified_name,''))
+            for key,table in table_map.items() if table.qualified_name in contexts.get(key[0],{})})
         ledger.candidate_queue=candidates_queue
         store.configure_goal(config.goal,ledger.goal_revision)
         report.counts['goal_revision']=ledger.goal_revision
@@ -500,6 +504,15 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             report.validation['D']='model_run_unscored' if discovery_model and need_discovery else 'deterministic_or_reused_unscored'
         engine=RuleEngine(store,isolation_domain=config.isolation_domain,max_working_bytes=config.max_working_bytes,max_partitions=config.max_partitions)
         prepared_rules=[];failed=set();feedback={}
+        from .store.publication_groups import dependency_groups,inspect_group,PublicationGroup
+        def persist_failed_rule(rule,codes):
+            from .discovery.conflicts import execution_candidate
+            from .discovery.models import DiscoveryResult
+            table=table_map.get((rule.source.source_id,rule.source.schema_name,rule.source.table))
+            if table is None:return
+            candidate=execution_candidate(rule,codes,table=table,goal=config.goal,
+                context_version=contexts.get(table.source_id,{}).get(table.qualified_name,''))
+            if candidate is not None:candidates_queue.record(DiscoveryResult(pending_candidates=[candidate]))
         allrules.sort(key=lambda r:r.kind=='reference')
         def execute(rule, *, preserve_previous=False):
             previous=[r for r in prepared_rules if r.rule_id==rule.rule_id]
@@ -515,6 +528,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     return False
                 failed.add(rule.rule_id);report.rules_skipped.append(rule.rule_id)
                 schema_knowledge.invalidate_rule(rule.rule_id)
+                persist_failed_rule(rule,[code])
                 report.issues.append({'rule_id':rule.rule_id,'code':code});return False
             previous_pubs=[p for p in prepared if store._publication(p)['logical_rule_id']==rule.rule_id]
             previous_bindings={k:v for k,v in engine.bindings.items() if k[0]==rule.rule_id}
@@ -541,6 +555,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     return False
                 failed.add(rule.rule_id);report.rules_skipped.append(rule.rule_id)
                 schema_knowledge.invalidate_rule(rule.rule_id)
+                persist_failed_rule(rule,outcome.codes)
                 discovery_completed.get(rule.source.source_id,set()).discard(
                     rule.source.schema_name+'.'+rule.source.table)
                 repair_codes=set(outcome.codes)&REVIEWABLE_CODES
@@ -558,10 +573,16 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     # Keep the executable interpretation for zero-model rechecks,
                     # but stop presenting its last publication as current truth.
                     if auto:
-                        store.mark_rule_for_review(rule.rule_id,'data_pattern_requires_review')
-                        for head in store.heads():
-                            if head['valid'] and head['logical_rule_id'].startswith('document-alignment:'):
-                                store.invalidate_rule(head['logical_rule_id'],'business_requires_review')
+                        published_revisions={store._publication(h['publication_id'])['revision']
+                            for h in store.heads() if h['valid'] and h['logical_rule_id']==rule.rule_id}
+                        prior_definitions=[r for r in store.get_rules(include_stale=True)
+                            if r.rule_id==rule.rule_id and r.revision in published_revisions]
+                        if any(rule_shape(r)==rule_shape(rule) for r in prior_definitions):
+                            # Only a counterexample to the published mapping can
+                            # withdraw it. A different failed proposal cannot.
+                            store.mark_rule_for_review(rule.rule_id,'data_pattern_requires_review')
+                            from .store.publication_groups import retire_dangling_document_alignments
+                            retire_dangling_document_alignments(store)
             for code in outcome.codes:report.issues.append({'rule_id':rule.rule_id,'code':code})
             return outcome.prepared
         for rule in allrules:execute(rule)
@@ -703,42 +724,48 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             review_role_occurrences()
         generation_conflicts={}
         def review_generation_constraints():
-            """Feed cross-rule conflicts back before a publication is attempted."""
-            pubs=[store._publication(p) for p in prepared if store._publication(p)['state'] in ('staging','ready')]
+            """Repair actual conflicting contributors without withdrawing valid old heads."""
+            pubs=[p for p in prepared if store._publication(p)['state'] in ('staging','ready')
+                  and not store._publication(p)['logical_rule_id'].startswith('document-alignment:')]
             if not auto or not pubs:return
-            try:
-                store._validate_endpoints(store._prospective_publications(pubs))
-                # A correction to one contributor can resolve the shared
-                # conflict for other, unchanged rules as well. Retire only
-                # feedback owned by this cross-rule check; keep local failures.
-                for key,entry in list(feedback.items()):
-                    if len(entry['rules'])!=1:continue
-                    rule_id=entry['rules'][0].rule_id
-                    owned=generation_conflicts.get(rule_id,set())
-                    entry['codes'].difference_update(owned)
-                    if not entry['codes']:feedback.pop(key)
-                for rule in prepared_rules:
-                    if rule.rule_id in generation_conflicts and not any(
-                        rule.rule_id in {r.rule_id for r in e['rules']} for e in feedback.values()):
-                        failed.discard(rule.rule_id)
-                        schema_knowledge.record_rule(rule,status='local_validated')
-                generation_conflicts.clear()
-            except LightGraphError as exc:
-                if exc.code not in REVIEWABLE_CODES:return
-                topology=exc.code in ('hierarchy_cycle','hierarchy_self_loop','multiple_parent')
-                for rule in prepared_rules:
-                    if topology and rule.kind not in ('wide_hierarchy','long_hierarchy'):continue
+            active={};locations={}
+            for group in dependency_groups(store,pubs):
+                conflict=inspect_group(store,group,ignore_derived_alignments=True)
+                if conflict is None or conflict.code not in REVIEWABLE_CODES:continue
+                affected=set(conflict.rule_ids)&set(group.rule_ids)
+                # An unknown locator blocks only its dependency unit.
+                for rule_id in affected or set(group.rule_ids):
+                    active.setdefault(rule_id,set()).add(conflict.code)
+                    locations[(rule_id,conflict.code)]=conflict
+            previous=dict(generation_conflicts)
+            for key,entry in list(feedback.items()):
+                if len(entry['rules'])!=1:continue
+                rule_id=entry['rules'][0].rule_id
+                entry['codes'].difference_update(previous.get(rule_id,set()))
+                if not entry['codes']:feedback.pop(key)
+            generation_conflicts.clear();generation_conflicts.update(active)
+            for rule in prepared_rules:
+                codes=active.get(rule.rule_id,set())
+                if codes:
                     sid=rule.source.source_id;name=rule.source.schema_name+'.'+rule.source.table
                     entry=feedback.setdefault((sid,name,rule.rule_id),{'rules':[],'codes':set(),'counts':{}})
                     if rule.rule_id not in {r.rule_id for r in entry['rules']}:entry['rules'].append(rule)
-                    entry['codes'].add(exc.code)
-                    generation_conflicts.setdefault(rule.rule_id,set()).add(exc.code)
-                    failed.add(rule.rule_id)
+                    entry['codes'].update(codes);failed.add(rule.rule_id)
                     need_discovery.add(sid);discovery_tables.setdefault(sid,set()).add(name)
                     discovery_completed.get(sid,set()).discard(name)
-                    store.mark_rule_for_review(rule.rule_id,'graph_constraint_requires_review')
+                    # A conflicting new projection does not refute the old published
+                    # generation. Keep old heads until an atomic valid replacement.
                     schema_knowledge.invalidate_rule(rule.rule_id)
-                    report.issues.append({'rule_id':rule.rule_id,'code':exc.code})
+                    persist_failed_rule(rule,codes)
+                    for code in sorted(codes):
+                        conflict=locations[(rule.rule_id,code)]
+                        issue={'rule_id':rule.rule_id,'code':code,
+                            'related_rules':canonical(conflict.rule_ids),'fact_refs':canonical(conflict.fact_refs)}
+                        if issue not in report.issues:report.issues.append(issue)
+                elif rule.rule_id in previous and not any(
+                        rule.rule_id in {r.rule_id for r in e['rules']} for e in feedback.values()):
+                    failed.discard(rule.rule_id)
+                    schema_knowledge.record_rule(rule,status='local_validated')
         review_generation_constraints()
         review_role_occurrences()
         # Exploration alone does not invalidate a complete projection. Rebuild
@@ -872,34 +899,50 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 if r.rule_id not in old_shapes or old_shapes[r.rule_id]!=rule_shape(r)})
             report.counts['total_rule_candidates']=len({r.rule_id for r in allrules})
             report.counts['prepared_rules']=len({r.rule_id for r in prepared_rules})
-        for rule in prepared_rules:
-            if (rule.source.source_id,rule.source.schema_name,rule.source.table) not in failed_tables:
-                ledger.resolve_table(rule.source)
-        # One atomic visibility change for the current dependency set. If an old
-        # dependent edge would dangle, the whole replacement remains unpublished.
+        # Each connected replacement unit is atomic. Independent units may
+        # publish even if another unit still has an unresolved contradiction.
         business_prepared=[p for p in prepared if store._publication(p)['state'] in ('staging','ready')]
-        publish_ok=not business_prepared
-        if business_prepared:
+        groups=dependency_groups(store,business_prepared)
+        report.counts['publication_groups']=len(groups)
+        report.counts['publication_groups_published']=0
+        report.counts['publication_groups_failed']=0
+        alignments=[]
+        if groups:
+            # These links are derived views, rebuilt after the business commits.
+            # Retire them with the first successful unit, not with a failed unit.
+            for head in store.heads():
+                if head['valid'] and head['logical_rule_id'].startswith('document-alignment:'):
+                    replacement=store.begin_publication(head['logical_rule_id'],1,'all',{'refresh':report.run_id})
+                    prepared.append(replacement);alignments.append(replacement)
+        for group in groups:
+            retiring=[p for p in alignments if store._publication(p)['state'] in ('staging','ready')]
+            publication_ids=list(group.publication_ids)+retiring
+            group_rules=[r for r in prepared_rules if r.rule_id in group.rule_ids]
             try:
-                # Retire derived alignments in the same transaction as replacing
-                # their possible endpoints. Original document claims stay intact.
-                for head in store.heads():
-                    if head['valid'] and head['logical_rule_id'].startswith('document-alignment:'):
-                        replacement=store.begin_publication(head['logical_rule_id'],1,'all',{'refresh':report.run_id})
-                        prepared.append(replacement);business_prepared.append(replacement)
                 budget.check_time()
                 from .identity.reconciliation import GenerationView
-                generation=GenerationView.capture(store,business_prepared,set(config.scopes),config.isolation_domain)
+                generation=GenerationView.capture(store,publication_ids,set(config.scopes),config.isolation_domain)
                 store.publish_partitions([PartitionCompletion(publication_id=p,complete=True,consistent=True,dependencies_valid=True)
-                    for p in business_prepared],expected_heads=generation.heads)
-                report.rules_published=[r.rule_id for r in prepared_rules]
-                for rule in prepared_rules:schema_knowledge.record_rule(rule,status='published')
-                publish_ok=True
+                    for p in publication_ids],expected_heads=generation.heads)
+                report.rules_published.extend(r.rule_id for r in group_rules)
+                for rule in group_rules:schema_knowledge.record_rule(rule,status='published')
+                report.counts['publication_groups_published']+=1
             except LightGraphError as exc:
-                _abort_staging(store,prepared)
-                for rule in prepared_rules:schema_knowledge.invalidate_rule(rule.rule_id)
-                report.rules_skipped.extend(r.rule_id for r in prepared_rules)
-                report.issues.append({'code':exc.code});report.status='PARTIAL'
+                conflict=inspect_group(store,PublicationGroup(tuple(publication_ids),group.rule_ids))
+                _abort_staging(store,group.publication_ids)
+                for rule in group_rules:
+                    schema_knowledge.invalidate_rule(rule.rule_id)
+                    persist_failed_rule(rule,[exc.code])
+                report.rules_skipped.extend(r.rule_id for r in group_rules)
+                report.issues.append({'code':exc.code,'status':'unresolved',
+                    'publication_group':digest(group.rule_ids),'count':len(group.rule_ids),
+                    'related_rules':canonical(conflict.rule_ids if conflict else group.rule_ids),
+                    'fact_refs':canonical(conflict.fact_refs if conflict else ())})
+                report.status='PARTIAL';report.counts['publication_groups_failed']+=1
+        _abort_staging(store,alignments)
+        for rule in prepared_rules:
+            source_rules={r.rule_id for r in allrules if r.source==rule.source}
+            if source_rules <= set(report.rules_published):ledger.resolve_table(rule.source)
         if auto:
             for sid in need_discovery:
                 previous=store.current_versions('discovery:'+sid) or {}
@@ -910,9 +953,10 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 # retried next run even when another table published successfully.
                 for name in discovery_tables.get(sid,set(contexts[sid])):
                     completed_versions.pop(name,None)
-                if publish_ok:
-                    completed_versions.update({name:contexts[sid][name]
-                        for name in discovery_completed.get(sid,set()) if name in contexts[sid]})
+                completed_versions.update({name:contexts[sid][name]
+                    for name in discovery_completed.get(sid,set()) if name in contexts[sid]
+                    and {r.rule_id for r in allrules if r.source.source_id==sid
+                         and r.source.schema_name+'.'+r.source.table==name} <= set(report.rules_published)})
                 marker=store.begin_publication('discovery:'+sid,1,'all',{'goal':digest(config.goal.model_dump()),
                     'workflow':DISCOVERY_WORKFLOW_VERSION,'mode':discovery_mode,
                     'contexts':[canonical([name,value]) for name,value in sorted(completed_versions.items())]})
@@ -1005,9 +1049,14 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                         'prompt_pressure_turns','prompt_history_exchanges_omitted',
                         'prompt_peak_before_window_bytes','prompt_peak_after_window_bytes',
                         'prompt_packets_rejected','prompt_rejected_peak_bytes',
-                        'semantic_reference_repair_attempts','semantic_reference_repairs_succeeded',
+                        'semantic_review_container_normalizations','semantic_reference_repair_attempts','semantic_reference_repairs_succeeded',
                         'semantic_reference_repairs_failed'):
             report.counts[counter]=model.usage.get(counter,0) if model else 0
+        if model:
+            for key,count in model.usage.get('semantic_review_protocol_diagnostics',{}).items():
+                diagnostic=json.loads(key)
+                report.issues.append({'code':'semantic_review_protocol_diagnostic','status':'diagnostic',
+                    'field_path':canonical(diagnostic['field']),'constraint':diagnostic['code'],'count':count})
         report.counts['db_queries']=budget.snapshot()['queries'] if 'budget' in locals() else sum(a.stats.queries for a in adapters)
         report.counts['returned_rows']=budget.snapshot()['returned_rows'] if 'budget' in locals() else sum(a.stats.returned_rows for a in adapters)
         report.counts['returned_bytes']=budget.snapshot()['returned_bytes'] if 'budget' in locals() else sum(a.stats.returned_bytes for a in adapters)

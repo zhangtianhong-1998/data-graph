@@ -71,3 +71,47 @@ def test_replacement_is_resolved_only_for_its_published_revision():
         assert execute(store,replacement,[path('A','B')]).published
         queue.confirm_publications([replacement.rule_id])
         assert queue.listing()['candidates'][0]['state']=='resolved'
+
+
+def test_stored_new_revision_does_not_resolve_candidate_whose_head_is_old():
+    from lightgraph.tests.test_relative_hierarchy import rule,execute,path
+    with GraphStore() as store:
+        queue=CandidateQueue(store,ExtractionGoal(),['public'],'d')
+        old=rule();cid=candidate().candidate_id
+        assert execute(store,old,[path('A','B')]).published
+        replacement=store.get_rules()[0].model_copy(update={'revision':2})
+        store.put_rule(replacement)
+        queue.record(DiscoveryResult(pending_candidates=[candidate()],resolved_candidate_ids=[cid],
+            rules=[replacement],candidate_replacement_rules={cid:[replacement.rule_id]}))
+        queue.confirm_publications([replacement.rule_id])
+        assert queue.listing()['candidates'][0]['state']=='revised'
+        assert store._publication(store.heads()[0]['publication_id'])['revision']==1
+        assert execute(store,replacement,[path('A','B')]).published
+        queue.confirm_publications([replacement.rule_id])
+        assert queue.listing()['candidates'][0]['state']=='resolved'
+
+
+def test_reobserved_resolved_failure_reopens_but_dismissed_choice_is_preserved():
+    from lightgraph.tests.test_relative_hierarchy import rule,execute,path
+    with GraphStore() as store:
+        queue=CandidateQueue(store,ExtractionGoal(),['public'],'d')
+        replacement=rule();cid=candidate().candidate_id
+        queue.record(DiscoveryResult(pending_candidates=[candidate()],resolved_candidate_ids=[cid],
+            rules=[replacement],candidate_replacement_rules={cid:[replacement.rule_id]}))
+        assert execute(store,replacement,[path('A','B')]).published
+        queue.confirm_publications([replacement.rule_id])
+        queue.record(DiscoveryResult(pending_candidates=[candidate()]))
+        item=queue.listing()['candidates'][0]
+        assert item['state']=='pending'
+        # A newly compiled result with no surviving replacement rules cannot
+        # reuse the previous generation's now-obsolete replacement mapping.
+        queue.record(DiscoveryResult(resolved_candidate_ids=[cid]))
+        queue.confirm_publications([replacement.rule_id])
+        assert queue.listing()['candidates'][0]['state']=='revised'
+        queue.record(DiscoveryResult(pending_candidates=[candidate().model_copy(update={
+            'failure_code':'semantic_claim_refuted'})]))
+        item=queue.listing()['candidates'][0]
+        queue.decide(cid,'dismiss',item['revision'])
+        queue.record(DiscoveryResult(pending_candidates=[candidate().model_copy(update={
+            'failure_code':'semantic_claim_refuted'})]))
+        assert queue.listing()['candidates'][0]['state']=='dismissed'

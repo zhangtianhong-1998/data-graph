@@ -81,7 +81,9 @@ def test_failed_reference_cannot_publish_changed_target(tmp_path):
     execute(tmp_path);before=graph(tmp_path)
     _,rows=build_sample(5000);rows['public.measure_registry']=[]
     result=execute(tmp_path,rows=rows)
-    assert result.status=='PARTIAL' and not result.rules_published
+    assert result.status=='PARTIAL'
+    assert 'measures' not in result.rules_published
+    assert result.rules_published  # Independent complete units still publish.
     assert {f['id'] for f in before['facts']}=={f['id'] for f in graph(tmp_path)['facts']}
 
 

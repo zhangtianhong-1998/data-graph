@@ -407,6 +407,38 @@ def _invalid_review_terminal(message):
     return None
 
 
+def _normalize_review_containers(message, usage):
+    """Repair only lossless singleton containers, never a semantic judgment.
+
+    Providers sometimes emit one evidence/condition object in place of its
+    array, or a single condition locator instead of an array of locators.
+    Keep every field and value, including unknown fields and counterevidence;
+    the normal schema, binding and evidence checks still decide acceptance.
+    """
+    try:
+        value = _strict_json_loads(message['content'])
+    except (KeyError, TypeError, ValueError, LightGraphError):
+        return message
+    if not isinstance(value, dict):
+        return message
+    changed = 0
+    for field in ('evidence', 'conditions'):
+        if isinstance(value.get(field), dict):
+            value[field] = [value[field]]
+            changed += 1
+    conditions = value.get('conditions', [])
+    if isinstance(conditions, list):
+        for condition in conditions:
+            if isinstance(condition, dict) and isinstance(condition.get('evidence_refs'), str):
+                condition['evidence_refs'] = [condition['evidence_refs']]
+                changed += 1
+    if not changed:
+        return message
+    usage['semantic_review_container_normalizations'] = usage.get(
+        'semantic_review_container_normalizations', 0) + changed
+    return {**message, 'content': canonical(value)}
+
+
 class ModelConfig(StrictModel):
     model_config = ConfigDict(hide_input_in_errors=True)
     base_url: str
@@ -596,6 +628,8 @@ class StructuredModelClient:
                     raise LightGraphError((_invalid_review_terminal(candidate_message)
                         or 'semantic_review_protocol_invalid') if semantic_review else 'llm_schema_invalid')
                 candidate_message=_recover_final_json(candidate_message,self.usage,self.config.max_response_bytes)
+                if semantic_review:
+                    candidate_message=_normalize_review_containers(candidate_message,self.usage)
                 result = parse_message(candidate_message)
                 self.budget.check_deadline()
                 if correcting:
@@ -616,6 +650,15 @@ class StructuredModelClient:
                 last_code = 'semantic_review_protocol_invalid' if semantic_review else 'llm_schema_invalid'
                 self.usage['failures'] += 1
                 if semantic_review:
+                    # Fixed paths/codes only: never retain the malformed body,
+                    # unexpected field names or Pydantic's input values.
+                    diagnostics=_schema_feedback(candidate_message,exc,schema)[
+                        'schema_protocol_correction']['diagnostics']
+                    histogram=self.usage.setdefault('semantic_review_protocol_diagnostics',{})
+                    for diagnostic in diagnostics:
+                        key=canonical(diagnostic)
+                        if key in histogram or len(histogram)<64:
+                            histogram[key]=histogram.get(key,0)+1
                     terminal=_invalid_review_terminal(candidate_message)
                     if terminal:raise LightGraphError(terminal) from None
                     # A second malformed verdict cannot earn another model
