@@ -22,7 +22,7 @@ CANARY = 'PRIVATE_VALUE_AND_FIELD_82413'
 @pytest.mark.parametrize('finished,pending,expected', [
     (False, False, ['discovery_invalid_drafts']),
     (True, True, ['discovery_invalid_drafts', 'discovery_submission_pending']),
-    (True, False, []),
+    (True, False, ['discovery_invalid_drafts', 'discovery_submission_pending']),
 ])
 def test_rejected_attempt_count_is_distinct_from_remaining_work(finished, pending, expected):
     session = ProposalSession(input_packet())
@@ -46,8 +46,8 @@ def test_rejected_attempt_count_is_distinct_from_remaining_work(finished, pendin
 
 def test_explicit_withdrawal_does_not_create_a_valid_draft_or_semantic_authority():
     session = ProposalSession(input_packet())
-    session.execute('submit_column_group', {'claim': {CANARY: CANARY}})
-    session.execute('finish_discovery', {'pending': False})
+    rejected=session.execute('submit_column_group', {'claim': {CANARY: CANARY}})
+    session.execute('finish_discovery', {'pending': False,'withdraw_rejections':[rejected['rejection_id']]})
     batch = session.batch()
     assert batch.abstain and batch.proposals == []
     assert batch._runtime_invalid_drafts == 1 and not batch._runtime_pending_codes
@@ -119,6 +119,7 @@ def test_corrected_tool_submission_publishes_and_does_not_repeat_discovery(monke
         error = json.loads(body['messages'][-1]['content'])
         assert error['code'] == 'invalid_tool_arguments'
         assert CANARY not in json.dumps(error)
+        proposal['resolves_rejections']=[error['rejection_id']]
         return tools_response(('submit_column_group', proposal), ('finish_discovery', {'pending': False}))
     model = client(monkeypatch, handler)
     config = RunConfig(sources=[], output_dir=str(tmp_path), max_identity_reviews=0)

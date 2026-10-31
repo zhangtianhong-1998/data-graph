@@ -64,8 +64,11 @@ class IdentityDomainClaim(StrictModel):
     identity_resolution: Literal['source_scoped', 'shared_definition', 'verified_identity_domain'] = 'source_scoped'
     identity_domain: str = Field(default='', max_length=256, description=
         'Business-code domain shared only when independent evidence proves identical meaning across sources.')
-    identity_evidence: list[str] = Field(default_factory=list, max_length=16)
-    attribute_evidence: list[str] = Field(default_factory=list, max_length=16)
+    identity_evidence: list[str] = Field(default_factory=list, max_length=16, description=
+        'Complete definition-section IDs doc_id@revision:section_id applicable to this table. '
+        'Select reference_options.definition_sections; probes and bare document IDs do not prove a shared code domain.')
+    attribute_evidence: list[str] = Field(default_factory=list, max_length=16, description=
+        'Complete applicable definition-section IDs doc_id@revision:section_id for shared attribute meaning.')
     identity_scope: Literal['namespace_local', 'domain_global'] = 'namespace_local'
     global_scope_evidence: list[str] = Field(default_factory=list, max_length=16)
 
@@ -115,6 +118,7 @@ class HypothesisLevel(StrictModel):
     key: str
     label: str | None = None
     alias: str | None = None
+    aliases: list[str] = Field(default_factory=list,max_length=16,description='Additional issued alias/name columns; no identity meaning.')
     display_order: str | None = None
 
 class WideHierarchy(StrictModel):
@@ -250,6 +254,9 @@ Proposal = Annotated[Union[ColumnGroupProposal,EntityKeyProposal,HierarchyPropos
 class ProposalBatch(StrictModel):
     _runtime_pending_codes: list[str] = PrivateAttr(default_factory=list)
     _runtime_invalid_drafts: int = PrivateAttr(default=0)
+    _runtime_invalid_codes: dict[str,int] = PrivateAttr(default_factory=dict)
+    _runtime_invalid_diagnostics: list[dict] = PrivateAttr(default_factory=list)
+    _runtime_object_models: list[dict] = PrivateAttr(default_factory=list)
     model_config = ConfigDict(json_schema_extra=_proposal_batch_schema_guards)
     packet_version: Literal['1.0'] = '1.0'
     task: Task
@@ -304,7 +311,14 @@ class PendingCandidate(StrictModel):
     proposal_kind: Literal['column_group','entity_key','wide_hierarchy','long_hierarchy','reference','concept_mapping']
     failure_code: Literal['semantic_claim_refuted','semantic_claim_unresolved',
         'semantic_condition_unresolved','semantic_review_missing_support','semantic_review_incomplete_context',
-        'semantic_revision_no_progress','semantic_revision_constraints_changed']
+        'semantic_revision_no_progress','semantic_revision_constraints_changed',
+        'identity_domain_evidence_unresolved','excluded_column_projected',
+        'concept_scope_evidence_required','concept_scope_document_required',
+        'concept_identity_document_required','concept_namespace_invalid',
+        'concept_context_type_must_be_distinct','concept_mapping_contract_conflict',
+        'concept_mapping_document_required','concept_binding_must_be_source_scoped',
+        'duplicate_concept_relation','concept_identity_domain_evidence_required',
+        'concept_identity_domain_required']
     column_refs: list[str] = Field(default_factory=list, max_length=256)
     document_refs: list[str] = Field(default_factory=list, max_length=128)
     rule_refs: list[str] = Field(default_factory=list, max_length=64)
@@ -389,6 +403,10 @@ class TaskPacket(StrictModel):
     scope: SourceRef | None = None
     goal: dict = Field(default_factory=dict)
     iteration_context: dict = Field(default_factory=dict)
+    # Runtime-issued, value-free field hypotheses and bounded overlap counts.
+    # Their candidate status is preserved; neither is semantic evidence.
+    schema_knowledge: dict = Field(default_factory=dict)
+    relation_candidates: dict = Field(default_factory=dict)
     semantic_schema: SemanticSchema = Field(default_factory=SemanticSchema)
     subtask: str | None = Field(default=None,max_length=2000)
     context_tables: list[SourceRef] = Field(default_factory=list,max_length=64)

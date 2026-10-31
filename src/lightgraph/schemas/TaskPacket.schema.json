@@ -17,6 +17,23 @@
           "title": "Multi Valued",
           "type": "object"
         },
+        "name_columns": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": "Additional columns for aliases or explicitly identified English names; values never participate in identity.",
+          "propertyNames": {
+            "enum": [
+              "alias",
+              "english_name"
+            ]
+          },
+          "title": "Name Columns",
+          "type": "object"
+        },
         "excluded": {
           "items": {
             "$ref": "#/$defs/ExcludedColumn"
@@ -49,6 +66,7 @@
           "type": "string"
         },
         "identity_evidence": {
+          "description": "Complete definition-section IDs doc_id@revision:section_id applicable to this table. Select reference_options.definition_sections; probes and bare document IDs do not prove a shared code domain.",
           "items": {
             "type": "string"
           },
@@ -57,6 +75,7 @@
           "type": "array"
         },
         "attribute_evidence": {
+          "description": "Complete applicable definition-section IDs doc_id@revision:section_id for shared attribute meaning.",
           "items": {
             "type": "string"
           },
@@ -243,7 +262,7 @@
             }
           ],
           "default": null,
-          "description": "Independent business-code column for this concept. When present, identity uses this code and column supplies only the label. Same labels with different codes remain different objects. Null retains the explicitly declared value identity.",
+          "description": "Independent business-code column for this concept. When present, identity uses this code (nonempty string or finite number, preserving its scalar type) and column supplies only the label. Same labels with different codes remain different objects. Null retains the explicitly declared value identity.",
           "title": "Key Column"
         },
         "namespace_columns": {
@@ -310,7 +329,7 @@
           "type": "array"
         },
         "relation": {
-          "description": "Registered relation from the joint-context entity to this concept type. Preserve the source item binding so separate product and channel edges do not invent combinations.",
+          "description": "Registered relation from the joint-context entity to this concept type; unique among components so each outgoing relation identifies exactly one role. Preserve the source item binding so separate product and channel edges do not invent combinations.",
           "maxLength": 64,
           "minLength": 1,
           "title": "Relation",
@@ -798,6 +817,7 @@
           "type": "string"
         },
         "identity_evidence": {
+          "description": "Complete definition-section IDs doc_id@revision:section_id applicable to this table. Select reference_options.definition_sections; probes and bare document IDs do not prove a shared code domain.",
           "items": {
             "type": "string"
           },
@@ -806,6 +826,7 @@
           "type": "array"
         },
         "attribute_evidence": {
+          "description": "Complete applicable definition-section IDs doc_id@revision:section_id for shared attribute meaning.",
           "items": {
             "type": "string"
           },
@@ -1379,6 +1400,15 @@
           ],
           "default": null,
           "title": "Alias"
+        },
+        "aliases": {
+          "description": "Additional issued alias/name columns; no identity meaning.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Aliases",
+          "type": "array"
         },
         "display_order": {
           "anyOf": [
@@ -3361,6 +3391,16 @@
     "iteration_context": {
       "additionalProperties": true,
       "title": "Iteration Context",
+      "type": "object"
+    },
+    "schema_knowledge": {
+      "additionalProperties": true,
+      "title": "Schema Knowledge",
+      "type": "object"
+    },
+    "relation_candidates": {
+      "additionalProperties": true,
+      "title": "Relation Candidates",
       "type": "object"
     },
     "semantic_schema": {

@@ -470,6 +470,8 @@ class StructuredModelClient:
     def _complete_messages(self,task,packet,response_model):
         if not self.config.allow_source_samples and task != 'T4_document':
             packet={**packet,'strata_samples':[],'tool_observations':[]}
+        from .table_presentation import present_observations
+        packet=present_observations(packet)
         context=packet_call_context(packet,task,output_contract={'schema_ref':'output_schema'})
         packet={**packet,'goal':context['goal'],'stage':task,'call_context':context}
         content = canonical({'task':task,'input':packet,'output_schema':response_model.model_json_schema()})

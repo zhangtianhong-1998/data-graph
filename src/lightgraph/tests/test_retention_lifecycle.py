@@ -20,6 +20,7 @@ import pytest
 from lightgraph.contracts import (TableSpec,ColumnSpec,SourceRef,RuleSpec,IdentitySpec,
     AttributeSpec,ExcludedColumn,ExtractionGoal,QueryLimits,OperatorSpec)
 from lightgraph.discovery import StructuredModelClient,ModelConfig
+from lightgraph.discovery.budget import BudgetAllocator,Cost
 from lightgraph.errors import LightGraphError
 from lightgraph.pipeline import run_pipeline
 from lightgraph.runtime.config import RunConfig
@@ -120,7 +121,10 @@ def _provider_envelope(request,packets):
 def _model(monkeypatch,handler,retries=1):
     monkeypatch.setenv('LIGHTGRAPH_RETENTION_TEST_KEY','synthetic-test-key')
     return StructuredModelClient(ModelConfig(base_url='https://model.invalid/v1',model='synthetic',
+        # This test audits retention across a retry, independently of the
+        # cumulative token gate (covered by the model-budget tests).
         api_key_env='LIGHTGRAPH_RETENTION_TEST_KEY',allow_source_samples=False,retries=retries),
+        budget=BudgetAllocator(Cost(db_cu=160,llm_calls=8,llm_tokens=None,memory_bytes=8*1024*1024,seconds=60)),
         transport=httpx.MockTransport(handler))
 
 

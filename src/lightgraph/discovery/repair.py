@@ -7,7 +7,7 @@ def compiled_contract_error(error):
     Pydantic diagnostics may contain source input. Inspect the fixed validator
     code without formatting the exception, and let unexpected failures escape.
     """
-    if error.title != 'HierarchySpec':
+    if error.title not in {'HierarchySpec','RuleSpec','ConceptMappingSpec','ConceptComponent'}:
         return None
     details=error.errors(include_url=False,include_input=False)
     if len(details)!=1 or details[0].get('type')!='value_error':
@@ -15,7 +15,7 @@ def compiled_contract_error(error):
     cause=details[0].get('ctx',{}).get('error')
     arguments=getattr(cause,'args',())
     if len(arguments)==1 and isinstance(arguments[0],str) and arguments[0] in {
-            'invalid_hierarchy_context','empty_hierarchy_context'}:
+            'invalid_hierarchy_context','empty_hierarchy_context',*CONCEPT_CONTRACT_CODES}:
         return arguments[0]
     return None
 
@@ -27,7 +27,22 @@ HIERARCHY_IDENTITY_REPAIR_CODES = frozenset({
     'hierarchy_identity_resolution_required',
 })
 
+CONCEPT_CONTRACT_CODES = frozenset({
+    'concept_scope_evidence_required','concept_scope_document_required',
+    'concept_identity_document_required','concept_namespace_invalid',
+    'concept_context_type_must_be_distinct','concept_mapping_contract_conflict',
+    'concept_mapping_document_required','concept_binding_must_be_source_scoped',
+    'duplicate_concept_relation','concept_identity_domain_evidence_required',
+    'concept_identity_domain_required',
+})
+CONTRACT_CANDIDATE_CODES = CONCEPT_CONTRACT_CODES | {
+    'identity_domain_evidence_unresolved','excluded_column_projected'}
+
 PROPOSAL_REPAIR_GUIDANCE = {
+    'object_model_mapping_conflict': 'The proposal uses a code column as its label despite an explicit object model with a distinct name column for the same key and namespace. Reuse the issued name mapping, or explicitly revise the candidate object model if that understanding is wrong. Existing drafts need their current-session replace_draft_id. This feedback is not semantic confirmation; preserve independent evidence and validation.',
+    'draft_replacement_required': 'A draft for this group is already retained. Revise it with the current-session replace_draft_id returned by the tool instead of submitting conflicting sibling versions. Preserve identity, namespace, topology, exclusions and evidence.',
+    'invalid_draft_replacement': 'Use an issued current-session draft ID from the same submission tool and stable group_id or plan_id. Earlier-run IDs cannot be reused. Anonymous reference or exclusion drafts cannot be replaced through this mechanism.',
+    'draft_replacement_changes_obligations': 'Display repair cannot change the retained identity, namespace, topology, exclusions or semantic obligations, or remove evidence. Keep those constraints; use an independently reviewed structural revision or abstain if a display-only correction cannot express the intended change.',
     'hierarchy_position_semantics_missing': 'A relative_path hierarchy must explicitly provide a nonempty identity_domain, nonempty taxonomy and position_semantics (ordinal_slots or ordered_slots). Derive each interpretation from the goal and issued evidence; do not invent defaults, copy row values, or drop relative_path or its restrictions just to pass compilation. Preserve the original scope, conditions and evidence. If these meanings cannot be established, abstain. The complete repaired claim still requires independent semantic review, and FD success does not supply semantic confirmation.',
     'hierarchy_identity_resolution_unsupported': 'Wide hierarchy supports explicit source_scoped with legacy paths or verified_identity_domain with relative_path. shared_definition and unknown policies are not aliases for either. Preserve the original identity request and its evidence in hierarchy_identity_requests; resolve the meaning explicitly or abstain. Do not omit or null identity_resolution. The repaired full claim still requires independent semantic review.',
     'hierarchy_identity_resolution_conflict': 'Align the explicit identity_resolution, path_semantics and identity_scope using evidence. source_scoped requires legacy paths and cannot mean domain_global; relative_path requires verified_identity_domain. namespace_local limits namespace values within a verified domain and can share across sources; it is not source isolation. Preserve the original request, conditions and evidence; do not drop or null the policy to bypass the conflict. Repair the meaning explicitly or abstain; independent semantic review is still required.',
@@ -62,6 +77,11 @@ PROPOSAL_REPAIR_GUIDANCE = {
     'invalid_hierarchy_context': 'context_qualifiers supports only condition, valid_period, period and hierarchy_version. Put source namespace columns in namespace_columns, not context_qualifiers. Preserve all actual conditions; if they cannot be represented, abstain rather than silently removing them. Never copy row values into rule constants.',
     'empty_hierarchy_context': 'Hierarchy context qualifier values must be nonempty. Use an empty context_qualifiers mapping only when no actual condition is required; otherwise provide an evidence-supported permitted condition or abstain. Do not invent a value to satisfy the contract.',
 }
+PROPOSAL_REPAIR_GUIDANCE.update({
+    'identity_domain_evidence_unresolved': 'Use current-table applicable complete non-derived definition sections from reference_options.definition_sections. Identity-domain fields require doc_id@revision:section_id, not column/probe IDs or a document name. Preserve the exact claimed domain, kind and scope. A valid locator still requires independent semantic review.',
+    'excluded_column_projected': 'The proposed identity or attribute mapping uses a column excluded by the goal or this batch. Preserve exclusions; remove the conflicting projection or leave the candidate unresolved. Do not silently withdraw an exclusion to force publication.',
+    **{code:'Repair the concept mapping contract using issued columns and complete applicable definition sections. Keep context identity distinct from concept identity, preserve namespace permissions, and use distinguishable role relationships. Do not invent global scope or remove restrictions to pass validation.' for code in CONCEPT_CONTRACT_CODES},
+})
 REPAIRABLE_PROPOSAL_CODES = frozenset(PROPOSAL_REPAIR_GUIDANCE)
 
 # review_semantics already retries these once against its frozen proposition.

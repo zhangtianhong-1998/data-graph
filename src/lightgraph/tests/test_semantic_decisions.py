@@ -130,7 +130,7 @@ def test_independent_review_receives_bounded_sql_observations_only_in_memory(mon
     def handler(request):
         payload,p=input_packet(request);calls.append(p['task'])
         if p['task']=='semantic_review':
-            assert p['tool_observations'][0]['rows']==[[CANARY]]
+            assert p['tool_observations'][0]['rows']==[{'label':CANARY}]
             assert p['tool_observations'][0]['probe_id']=='probe_0002'
             assert not p['tool_observations'][0]['full_source_validation']
             return response({'proposition':p['semantic_proposition'],'decision':'supported',

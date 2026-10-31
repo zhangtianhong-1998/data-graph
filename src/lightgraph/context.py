@@ -9,7 +9,7 @@ import json
 
 from lightgraph.contracts import ExtractionGoal, SourceRef, TableSpec, canonical, digest
 
-CONTEXT_SELECTION_VERSION = 'scoped_call_context/3'
+CONTEXT_SELECTION_VERSION = 'scoped_call_context/4'
 STAGE_SUBTASKS = {
     'T0_discovery':'Explore relevant structures and propose candidate rules.',
     'T1_table_discovery':'Clarify field meanings and propose entity or column groups.',
@@ -139,12 +139,19 @@ def discovery_envelope(visible):
     documents, observations and the issued-reference registry for validation.
     """
     from lightgraph.discovery.proposal_session import DiscoveryFinish
+    from lightgraph.discovery.table_presentation import present_observations
+    visible=present_observations(visible)
+    from lightgraph.discovery.reference_validation import definition_sections
     context=packet_call_context(visible,visible['task'],output_contract={'schema_ref':'output_schema'})
     for field,source in (('document_snippets','document_snippets'),
                          ('observations','strata_samples'),('iteration_context','iteration_context')):
         context.pop(field,None)
         context[field+'_ref']='input.'+source
     return {'task':visible['task'],'input':visible,'call_context':context,
+            'reference_options':{'definition_sections':sorted(definition_sections(visible)),
+                'usage':'For verified_identity_domain identity/attribute/global scope evidence, '
+                    'select applicable complete definition sections exactly as doc_id@revision:section_id. '
+                    'The options are issued references, not semantic confirmation.'},
             'output_schema':DiscoveryFinish.model_json_schema()}
 
 

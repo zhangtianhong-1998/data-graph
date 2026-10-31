@@ -94,6 +94,10 @@ def test_agent_code_domain_review_and_compilation_reuse_existing_concept(monkeyp
         ids={c['name']:c['id'] for c in packet['metadata_digest']['columns']}
         d=packet['document_snippets'][0];ref=document_ref(d);rule=coded_rule()
         if packet['scope']['table']=='items':
+            domains=packet['iteration_context']['prior_identity_domains']
+            assert domains['total']==1 and not domains['truncated']
+            assert domains['items'][0]['identity_domain']=='group_metric_codes'
+            assert domains['items'][0]['status']=='hypothesis_requires_local_review'
             mapping=rule.concept_mapping.model_dump();mapping['evidence_ref']=d['doc_id']+'@'+d['revision']
             for component in mapping['components']:
                 component['column']=ids[component['role']];component['key_column']=ids[component['role']+'_code']
@@ -102,10 +106,7 @@ def test_agent_code_domain_review_and_compilation_reuse_existing_concept(monkeyp
             kind='concept_mapping';claim={**mapping,'group_id':'contexts','entity_kind_hint':'ConceptBinding',
                 'key_columns':[ids['id']],'namespace_columns':[ids['subject']]}
         else:
-            domains=packet['iteration_context']['prior_identity_domains']
-            assert domains['total']==1 and not domains['truncated']
-            assert domains['items'][0]['identity_domain']=='group_metric_codes'
-            assert domains['items'][0]['status']=='hypothesis_requires_local_review'
+            assert packet['iteration_context']['prior_identity_domains']['total']==0
             kind=proposal_kind;claim={'group_id':'metrics','entity_kind_hint':'Metric',
                 'identity_resolution':'verified_identity_domain','identity_domain':'group_metric_codes','identity_evidence':[ref]}
             if kind=='entity_key':claim.update(key_columns=[ids['code']],attributes={

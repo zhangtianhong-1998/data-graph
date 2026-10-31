@@ -84,7 +84,7 @@ def test_real_react_reply_and_toolkit_with_source_observation_cleanup(stream,fra
             assert json.loads(body['messages'][-1]['content'])['probe_id']=='probe_0001'
             message=tool_message('execute_readonly_sql')
         else:
-            assert json.loads(body['messages'][-1]['content'])['data']['rows']==[[CANARY]]
+            assert json.loads(body['messages'][-1]['content'])['data']['rows']==[{'label':CANARY}]
             message={'content':json.dumps(final(evidence='probe_0002'))}
         return reply_for(message,stream)
     client=model(handler,stream=stream,agent_name='configured-discovery')

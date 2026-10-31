@@ -26,6 +26,9 @@ def attribute_enrichment(previous, candidate):
             if name in other or (name in target and target[name]!=column):return None
             if name not in target and name in STRONG_FIELDS:return None
             target[name]=column
+    for name,columns in candidate.attributes.name_columns.items():
+        if name in merged.attributes.single_valued:return None
+        merged.attributes.name_columns[name]=list(dict.fromkeys(merged.attributes.name_columns.get(name,[])+columns))
     if bool(previous.hierarchy)!=bool(candidate.hierarchy):return None
     if previous.hierarchy:
         if len(previous.hierarchy.levels)!=len(candidate.hierarchy.levels):return None

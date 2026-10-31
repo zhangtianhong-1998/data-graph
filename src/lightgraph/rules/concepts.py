@@ -3,15 +3,25 @@
 The ordinary rule engine owns authorization, complete projection, snapshot,
 staging and rollback. This operator never guesses a separator or executes code.
 """
+import math
+
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
 
 
+def valid_concept_key(value):
+    """Finite scalar codes keep their JSON type; booleans are not numeric IDs."""
+    return (isinstance(value,str) and bool(value) or type(value) is int
+            or type(value) is float and math.isfinite(value))
+
+
 def component_value(component, row):
     value = row.get(component.column)
-    if not isinstance(value, str) or not value:
+    if not valid_concept_key(value):
         raise LightGraphError('concept_value_missing')
     if component.delimiter is not None:
+        if not isinstance(value,str):
+            raise LightGraphError('concept_segment_mismatch')
         parts = value.split(component.delimiter)
         if len(parts) != component.segment_count or any(not part.strip() for part in parts):
             raise LightGraphError('concept_segment_mismatch')
@@ -31,21 +41,36 @@ def emit_concepts(engine, publication, rule, rows):
             raise LightGraphError('null_identity_namespace')
         key = tuple(row.get(c) for c in rule.identity.key_columns)
         values = [component_value(component, row) for component in spec.components]
+        labels = [value if isinstance(value,str) else canonical(value) for value in values]
         keys = [row.get(c.key_column) if c.key_column else value for c,value in zip(spec.components,values)]
-        if any(not isinstance(key,str) or not key for key in keys):
+        if any(not valid_concept_key(code) for code in keys):
             raise LightGraphError('concept_key_missing')
         signature = canonical([row.get(c) for c in rule.scope.namespaces] + list(key))
-        assignments = list(zip(keys,values))
-        previous = seen.setdefault(signature, assignments)
-        if previous != assignments:
+        assignments = list(zip(keys,labels))
+        # JSON distinguishes 1, 1.0 and "1" even though Python scalar equality
+        # can collapse them. The identity registry uses the same typed encoding.
+        assignment_signature=canonical(assignments)
+        previous = seen.setdefault(signature, assignment_signature)
+        if previous != assignment_signature:
             raise LightGraphError('concept_binding_conflict')
         # One source identity owns the joint assignment. Independent concept
         # edges never imply unobserved combinations of product and channel.
+        binding_context=digest('concept_binding',spec.model_dump(mode='json'),assignments)
+        context_code='ctx_'+digest(engine.domain,rule.source.model_dump(mode='json'),
+            rule.identity.entity_kind,rule.scope.namespaces,rule.identity.key_columns,
+            [row.get(c) for c in rule.scope.namespaces],key,binding_context)
+        context_label=' | '.join([
+            *[f'{name}={canonical(row.get(name))}' for name in rule.scope.namespaces],
+            *[f'{component.role}={label} [{canonical(code)}]'
+              for component,label,code in zip(spec.components,labels,keys)]])
+        # The readable role values are presentation, never a merged concept key.
+        # A suffix distinguishes separate source items with equal assignments.
+        context_label+=f' 〔{context_code[-12:]}〕'
         context, binding, scope = engine._emit_entity(
-            publication, rule, row, key, label='组合上下文',
-            binding_context=digest('concept_binding',spec.model_dump(mode='json'),assignments))
+            publication, rule, row, key, label=context_label,
+            binding_context=binding_context,business_code_override=context_code)
         contexts.add(context)
-        for component, value, concept_key in zip(spec.components, values, keys):
+        for component, value, concept_key in zip(spec.components, labels, keys):
             namespaces = rule.scope.namespaces if component.namespace_columns is None else component.namespace_columns
             namespace_values = [row.get(c) for c in namespaces]
             semantic_key = canonical([component.entity_kind,component.role,component.definition_ref,namespace_values,concept_key])

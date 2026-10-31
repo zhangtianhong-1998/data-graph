@@ -23,7 +23,7 @@ from lightgraph.semantic_schema import SemanticSchema, EntityTypeDefinition
 from lightgraph.rules.endpoints import endpoint_columns
 from .repair import (REPAIRABLE_PROPOSAL_CODES, SEMANTIC_REVIEW_PROTOCOL_CODES,
     PROPOSAL_REPAIR_GUIDANCE, MAX_PROPOSAL_REPAIR_ROUNDS, compiled_contract_error,
-    HIERARCHY_IDENTITY_REPAIR_CODES)
+    HIERARCHY_IDENTITY_REPAIR_CODES, CONTRACT_CANDIDATE_CODES)
 
 
 def _catalog(adapter, goal):
@@ -52,6 +52,26 @@ def _ask(model, packet, tools, observations):
         review_observations=observations)
 
 
+def _exploration_order(tables):
+    """Declared FK targets first; narrow tables first when dependencies allow.
+
+    Scheduling is a cost heuristic, never evidence that a table is a definition
+    or that matching codes share an identity. Cycles retain a deterministic exit.
+    """
+    keyed={(t.source_id,t.qualified_name):t for t in tables}
+    positions={key:i for i,key in enumerate(keyed)}
+    dependencies={key:{(table.source_id,f'{fk.target_schema}.{fk.target_table}')
+        for fk in table.foreign_keys if (table.source_id,f'{fk.target_schema}.{fk.target_table}') in keyed
+        and (table.source_id,f'{fk.target_schema}.{fk.target_table}')!=key}
+        for key,table in keyed.items()}
+    remaining=set(keyed);ordered=[]
+    while remaining:
+        ready=[key for key in remaining if not dependencies[key]&remaining]
+        key=min(ready or remaining,key=lambda k:(len(keyed[k].columns),positions[k]))
+        remaining.remove(key);ordered.append(keyed[key])
+    return ordered
+
+
 def _iteration_codes(context, table):
     context=context or {};codes=set(context.get('codes',[]))
     for item in context.get('work_items',[]):
@@ -73,12 +93,26 @@ def _issue(result, table, code, *, count=None):
 def _record_submission_state(result, table, batch):
     """Keep valid drafts while reporting an unfinished Agent submission truthfully."""
     allowed = {'discovery_submission_incomplete', 'discovery_submission_pending',
-               'discovery_invalid_drafts'}
+               'discovery_invalid_drafts','discovery_steps_exhausted',
+               'discovery_tool_calls_exhausted','discovery_final_response_required',
+               'model_schema_invalid','model_response_invalid','model_response_truncated',
+               'model_stream_invalid','model_http_error','model_rate_limited',
+               'object_model_mapping_conflict'}
     pending = set(getattr(batch, '_runtime_pending_codes', ())) & allowed
     invalid = getattr(batch, '_runtime_invalid_drafts', 0)
     invalid = invalid if type(invalid) is int and invalid >= 0 else 0
     if invalid:
         result.stats['discovery_invalid_drafts'] = result.stats.get('discovery_invalid_drafts', 0) + invalid
+        # Only static schema paths and categories survive; permitted evidence
+        # choices and rejected input text remain in the transient tool feedback.
+        for rejection,count in getattr(batch,'_runtime_invalid_codes',{}).items():
+            result.issues.append({'table':table.qualified_name,'code':'discovery_draft_rejected',
+                'reason_code':rejection,'count':count,'status':'diagnostic'})
+        from lightgraph.contracts import canonical
+        for detail in getattr(batch,'_runtime_invalid_diagnostics',[])[:64]:
+            result.issues.append({'table':table.qualified_name,'code':'discovery_draft_field_diagnostic',
+                'reason_code':detail['code'],'field_path':canonical(detail['path']),
+                'constraint':detail['constraint'],'count':detail['count'],'status':'diagnostic'})
     for code in sorted(pending):
         result.issues.append({'table': table.qualified_name, 'code': code, 'status': 'deferred'})
     if pending:
@@ -301,8 +335,7 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                 if policy_reviews is not None and p.kind=='wide_hierarchy' and review:
                     policy_reviews[rule.rule_id]={canonical(item) for item in related_requests}
         except (LightGraphError,ValidationError) as exc:
-            code=(exc.code if isinstance(exc,LightGraphError) else compiled_contract_error(exc)
-                  if p.kind=='wide_hierarchy' and p.claim.path_semantics=='relative_path' else None)
+            code=(exc.code if isinstance(exc,LightGraphError) else compiled_contract_error(exc))
             if code is None:
                 raise
             if isinstance(exc, SemanticReviewFailure):
@@ -310,6 +343,14 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                 result.pending_candidates.append(candidate)
                 if semantic_failures is not None:
                     semantic_failures.append({'candidate':candidate,'proposal':p,'failure':exc})
+            elif code in CONTRACT_CANDIDATE_CODES and p.kind!='exclusion':
+                from types import SimpleNamespace
+                from .engine import _definition_document
+                refs=[d['doc_id']+'@'+d['revision']+':'+d['section_id'] for d in docs
+                      if _definition_document(d,table)]
+                failure=SimpleNamespace(code=code,blocking=[],required=refs,
+                    stage='concept_mapping' if p.kind=='concept_mapping' else 'entity_definition')
+                result.pending_candidates.append(candidate_record(p,table,packet or {},docs,failure))
             if failures is not None and code in REPAIRABLE_PROPOSAL_CODES:
                 failures.append((p,code))
             else:_issue(result,table,code)
@@ -477,7 +518,7 @@ def _identity_domain_context(rules):
 
 
 def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=None, *,
-                        table_refs=None,iteration_context=None,revision_rules=None):
+                        table_refs=None,iteration_context=None,revision_rules=None,schema_knowledge=None):
     from .engine import _source, _packet, _understanding, _table_hash, _column_id
     from .tools import ToolExecutor
     goal=goal or ExtractionGoal()
@@ -492,7 +533,7 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
     # table after the first page can never be explored, even on a retry.
     catalog_size=len(tables)
     window_coverage=[]
-    for table in tables:
+    for table in _exploration_order(tables):
         if table_refs is not None and not any(key in table_refs for key in (
             table.qualified_name,table.source_id+'.'+table.qualified_name,
             (table.source_id,table.schema_name,table.name))):continue
@@ -509,6 +550,9 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             budget.reserve(reservation,Cost(db_cu=2))
             if len(table.columns)>256: raise LightGraphError('catalog_column_limit')
             packet=_packet(table,goal,[],docs,'T0_discovery',understanding)
+            from .schema_knowledge import seed_knowledge
+            packet['schema_knowledge']=(schema_knowledge.context(table) if schema_knowledge
+                                        else seed_knowledge(table,goal))
             packet['iteration_context']=dict(iteration_context or {})
             packet['iteration_context']['prior_identity_domains']=_identity_domain_context(result.rules)
             prior=[r for r in (revision_rules or []) if r.source==_source(table)]
@@ -543,6 +587,8 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                 allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=window)
             batch=_ask(model,packet,tools,observations)
+            if schema_knowledge:
+                schema_knowledge.record_models(table,getattr(batch,'_runtime_object_models',[]),packet)
             _record_submission_state(result, table, batch)
             docs=tools.context_documents()
             understanding.document_refs=sorted({d['doc_id']+'@'+d['revision'] for d in docs})
@@ -593,6 +639,8 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
                     observations.clear()
                     try:
                         revised_batch=_ask(model,revision,tools,observations)
+                        if schema_knowledge is not None:
+                            schema_knowledge.record_models(table,getattr(revised_batch,'_runtime_object_models',[]),revision)
                         _record_submission_state(result, table, revised_batch)
                         docs=tools.context_documents()
                     except LightGraphError as exc:
@@ -655,7 +703,8 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
 
 def discover_references_with_agent(adapter, validated_rules, documents=None, model=None,
                                    budget=None, goal=None, max_candidates=32,
-                                   source_adapters=None, table_refs=None,iteration_context=None,revision_rules=None):
+                                   source_adapters=None, table_refs=None,iteration_context=None,revision_rules=None,
+                                   schema_knowledge=None):
     """Check one candidate batch; only missing endpoint context can reopen discovery."""
     from .engine import _source, _packet, _understanding, _table_hash, _column_id
     from .tools import ToolExecutor
@@ -691,6 +740,11 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
         try:
             if count>=max_candidates:raise LightGraphError('reference_candidate_limit')
             packet=_packet(table,goal,[],docs,'T2_cross_table',_understanding(table,[],{},docs))
+            from .schema_knowledge import seed_knowledge,relation_candidates
+            packet['schema_knowledge']=(schema_knowledge.context(table) if schema_knowledge
+                                        else seed_knowledge(table,goal))
+            packet['relation_candidates']=relation_candidates(tool_tables,schema_knowledge,
+                goal=goal,max_candidates=min(max_candidates,32))
             packet['iteration_context']=dict(iteration_context or {})
             prior=[r for r in (revision_rules or []) if r.source==_source(table)]
             if prior:

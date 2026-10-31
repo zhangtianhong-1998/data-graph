@@ -82,7 +82,10 @@ class GuardedToolkit(Toolkit):
             diagnostics = self._argument_diagnostics(name, arguments)
             if diagnostics:
                 if self.invalid_argument_handler is not None:
-                    self.invalid_argument_handler(name)
+                    feedback=self.invalid_argument_handler(name,arguments,diagnostics)
+                    if feedback is not None:
+                        yield _response(feedback)
+                        return
                 yield _error("invalid_tool_arguments", name, diagnostics=diagnostics)
                 return
             failures: list[BudgetExceeded] = []

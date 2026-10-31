@@ -69,8 +69,11 @@ def validate(dataset,output):
             result=evaluate_concepts(folder/'graph.json',dataset/'gold/concepts.json',role_kinds=role_kinds,
                 role_relations=relations,context_kind='ConceptBinding')
             assert all(result['accepted'][k]['exact'] for k in ('concepts','labels','joint_contexts'))
+            assert result['accepted']['context_presentation']['passed']
         (folder/'evaluation.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n')
         summaries[mode]={'nodes':len(graph['nodes']),'edges':len(graph['edges']),'all_declared_metrics_exact':True}
+        if mode=='concepts':
+            summaries[mode]['context_presentation_passed']=result['accepted']['context_presentation']['passed']
     # Exercise all five physical tables in one atomic generation. Domains below
     # are explicit evaluator choices justified by the input documentation, never
     # provided to the discovery Agent or inferred from the Gold answer set.
@@ -115,6 +118,7 @@ def validate(dataset,output):
         role_relations=relations,context_kind='ConceptBinding')
     assert all(hierarchy['accepted'][k]['exact'] for k in ('identities','labels','english_names','positions','edges','subject_verified_identities'))
     assert all(concepts['accepted'][k]['exact'] for k in ('concepts','labels','joint_contexts'))
+    assert concepts['accepted']['context_presentation']['passed']
     # Each concept has both its definition-table and occurrence-table support.
     support_rules={}
     for support in graph['supports']:support_rules.setdefault(support['fact_id'],set()).add(support['rule_id'])
@@ -123,7 +127,8 @@ def validate(dataset,output):
         any(r.startswith('manual_definition_') for r in support_rules[f['id']]) for f in shared)
     (folder/'evaluation.json').write_text(json.dumps({'hierarchy':hierarchy,'concepts':concepts},ensure_ascii=False,indent=2)+'\n')
     summaries['full']={'nodes':len(graph['nodes']),'edges':len(graph['edges']),
-        'cross_table_shared_concepts':len(shared),'all_declared_metrics_exact':True}
+        'cross_table_shared_concepts':len(shared),'all_declared_metrics_exact':True,
+        'context_presentation_passed':concepts['accepted']['context_presentation']['passed']}
     result={'mode':'manual_rule_control','model_calls':0,'results':summaries,
         'acceptance_boundary':'Explicit manual rules validated; automatic discovery and customer semantics remain untested.'}
     (output/'summary.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n')

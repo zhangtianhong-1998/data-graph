@@ -151,7 +151,16 @@ class ExcludedColumn(StrictModel):
 class AttributeSpec(StrictModel):
     single_valued: dict[str, str] = Field(default_factory=dict)
     multi_valued: dict[str, str] = Field(default_factory=dict)
+    name_columns: dict[Literal['alias','english_name'], list[str]] = Field(default_factory=dict,
+        description='Additional columns for aliases or explicitly identified English names; values never participate in identity.')
     excluded: list[ExcludedColumn] = Field(default_factory=list)
+    @model_validator(mode='after')
+    def validate_names(self):
+        if any(not columns or len(columns)>32 or len(set(columns))!=len(columns)
+               or any(not column for column in columns) for columns in self.name_columns.values()):
+            raise ValueError('invalid_name_columns')
+        if set(self.name_columns)&set(self.single_valued):raise ValueError('name_property_multiplicity_conflict')
+        return self
 
 class LevelSpec(StrictModel):
     level: int = Field(gt=0)
@@ -265,7 +274,7 @@ class ConceptComponent(StrictModel):
         'not the identity of the full source row or path.')
     key_column: str | None = Field(default=None, min_length=1, description=
         'Independent business-code column for this concept. When present, identity uses '
-        'this code and column supplies only the label. Same labels with different codes '
+        'this code (nonempty string or finite number, preserving its scalar type) and column supplies only the label. Same labels with different codes '
         'remain different objects. Null retains the explicitly declared value identity.')
     namespace_columns: list[str] | None = Field(default=None, max_length=16, description=
         'Null inherits the joint-context namespaces. An explicit subset selects this '
@@ -286,7 +295,8 @@ class ConceptComponent(StrictModel):
         'Issued document-section references proving this code belongs to identity_domain. '
         'Equal labels or overlapping codes alone do not establish a common code domain.')
     relation: str = Field(min_length=1, max_length=64, description=
-        'Registered relation from the joint-context entity to this concept type. Preserve '
+        'Registered relation from the joint-context entity to this concept type; unique '
+        'among components so each outgoing relation identifies exactly one role. Preserve '
         'the source item binding so separate product and channel edges do not invent combinations.')
     # No default splitting: all segment positions/counts must be declared.
     delimiter: str | None = Field(default=None, min_length=1, max_length=8, description=
@@ -331,6 +341,8 @@ class ConceptMappingSpec(StrictModel):
     def unique_roles(self):
         if len({c.role for c in self.components}) != len(self.components):
             raise ValueError("duplicate_concept_role")
+        if len({c.relation for c in self.components}) != len(self.components):
+            raise ValueError("duplicate_concept_relation")
         return self
 
 
@@ -377,7 +389,7 @@ class RuleSpec(StrictModel):
                     raise ValueError('concept_identity_document_required')
             if self.identity.entity_kind in {c.entity_kind for c in self.concept_mapping.components}:
                 raise ValueError("concept_context_type_must_be_distinct")
-            if self.hierarchy or self.relation or self.attributes.single_valued or self.attributes.multi_valued:
+            if self.hierarchy or self.relation or self.attributes.single_valued or self.attributes.multi_valued or self.attributes.name_columns:
                 raise ValueError("concept_mapping_contract_conflict")
             if self.concept_mapping.evidence_ref not in self.dependencies.documents:
                 raise ValueError("concept_mapping_document_required")

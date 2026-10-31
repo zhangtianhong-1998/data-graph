@@ -25,6 +25,34 @@ REVIEWABLE_CODES = frozenset({
 WorkState = Literal['pending', 'running', 'resolved', 'unresolved', 'deferred', 'superseded']
 
 
+def _safe_draft_diagnostics(issues, table, contract_codes):
+    """Retain schema paths and counts, never input keys, IDs or allowed values."""
+    from lightgraph.discovery.models import ProposalBatch
+    from lightgraph.discovery.hierarchy_plan import HierarchyPlan
+    from lightgraph.discovery.proposal_session import DiscoveryFinish
+    from lightgraph.semantic_schema import SemanticSchema
+    from lightgraph.discovery.validation_feedback import _property_names, _path, _JSON_CONSTRAINTS
+    codes=set(contract_codes)|{'invalid_tool_arguments','invalid_proposal_arguments',
+        'dangling_evidence_reference','unauthorized_column_reference','unauthorized_source_reference'}
+    names=set().union(*(_property_names(model.model_json_schema())
+        for model in (ProposalBatch,HierarchyPlan,SemanticSchema,DiscoveryFinish)))
+    records=[]
+    for issue in issues:
+        if (issue.get('table')!=table or issue.get('code')!='discovery_draft_field_diagnostic'
+                or issue.get('reason_code') not in codes
+                or issue.get('constraint') not in _JSON_CONSTRAINTS|{'reference','contract','semantic_contract'}):
+            continue
+        try:path=json.loads(issue.get('field_path',''))
+        except (ValueError,TypeError):continue
+        if not isinstance(path,list):continue
+        count=issue.get('count',1)
+        if type(count) is not int or count<=0:continue
+        records.append({'code':issue['reason_code'],'path':_path(path,names),
+                        'constraint':issue['constraint'],'count':min(count,1000000)})
+        if len(records)>=64:break
+    return records
+
+
 class WorkItem(StrictModel):
     work_id: str
     goal_revision: int
@@ -54,6 +82,9 @@ class IterationLedger:
         self.connection.executescript('''
         CREATE TABLE IF NOT EXISTS discovery_feedback (
           goal_revision INTEGER NOT NULL, source_ref TEXT NOT NULL, task TEXT NOT NULL, codes TEXT NOT NULL,
+          PRIMARY KEY(goal_revision,source_ref,task));
+        CREATE TABLE IF NOT EXISTS discovery_diagnostic (
+          goal_revision INTEGER NOT NULL, source_ref TEXT NOT NULL, task TEXT NOT NULL, diagnostics TEXT NOT NULL,
           PRIMARY KEY(goal_revision,source_ref,task));
         CREATE TABLE IF NOT EXISTS goal_revision (
           revision INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL);
@@ -176,13 +207,22 @@ class IterationLedger:
             'discovery_invalid_drafts','discovery_submission_incomplete','discovery_submission_pending',
             'no_confirmable_entity_group','model_abstained','model_response_truncated'}
         allowed.add('namespace_scope_missing')
+        def feedback_code(issue):
+            # Submission diagnostics wrap a fixed reason code; never persist
+            # the rejected payload, permitted IDs or arbitrary field values.
+            if issue.get('code') in {'discovery_draft_rejected','discovery_draft_field_diagnostic'}:
+                return issue.get('reason_code')
+            return issue.get('code')
         with self.store._transaction():
             for source in sources:
                 name=source.schema_name+'.'+source.table
-                codes=sorted({i['code'] for i in issues if i.get('code') in allowed
+                codes=sorted({feedback_code(i) for i in issues if feedback_code(i) in allowed
                               and i.get('table',name)==name})[:32]
                 self.connection.execute('INSERT OR REPLACE INTO discovery_feedback VALUES(?,?,?,?)',
                     (self.goal_revision,canonical(source.model_dump(mode='json',by_alias=True)),task,canonical(codes)))
+                diagnostics=_safe_draft_diagnostics(issues,name,allowed)
+                self.connection.execute('INSERT OR REPLACE INTO discovery_diagnostic VALUES(?,?,?,?)',
+                    (self.goal_revision,canonical(source.model_dump(mode='json',by_alias=True)),task,canonical(diagnostics)))
 
     def context(self, items, rules, *, iteration: int) -> dict:
         selected = {(i.source.source_id, i.source.schema_name, i.source.table) for i in items}
@@ -204,9 +244,13 @@ class IterationLedger:
             rows=self.connection.execute('SELECT task,codes FROM discovery_feedback WHERE goal_revision=? AND source_ref=? ORDER BY task',
                 (self.goal_revision,canonical(source.model_dump(mode='json',by_alias=True)))).fetchall()
             for task,codes in rows:
-                if json.loads(codes):
+                row=self.connection.execute('SELECT diagnostics FROM discovery_diagnostic WHERE goal_revision=? AND source_ref=? AND task=?',
+                    (self.goal_revision,canonical(source.model_dump(mode='json',by_alias=True)),task)).fetchone()
+                diagnostics=json.loads(row['diagnostics']) if row else []
+                if json.loads(codes) or diagnostics:
                     failures.append({'source':source.model_dump(mode='json',by_alias=True),
-                                     'task':task,'codes':json.loads(codes)})
+                                     'task':task,'codes':json.loads(codes),
+                                     **({'diagnostics':diagnostics} if diagnostics else {})})
         return {'goal_revision': self.goal_revision, 'iteration': iteration,
                 'pending_candidates':self.candidate_queue.context(selected) if self.candidate_queue else [],
                 'prior_discovery_feedback':failures,

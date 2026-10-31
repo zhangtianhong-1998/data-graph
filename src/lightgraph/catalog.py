@@ -156,10 +156,14 @@ def semantic_catalog(declared, goal, understandings=(), rules=(), documents=(), 
                                   "unit": "semantic_attribute"}.get(name)
                         if mapped:
                             inferred.add(mapped); refs.append(rule.rule_id)
+                for cols in rule.attributes.name_columns.values():
+                    if column.name in cols:
+                        inferred.add('alias'); refs.append(rule.rule_id)
                 if rule.hierarchy:
                     for level in rule.hierarchy.levels:
                         if level.code == column.name: inferred.add("identity_code"); refs.append(rule.rule_id)
                         if level.label == column.name: inferred.add("label"); refs.append(rule.rule_id)
+                        if column.name in level.aliases: inferred.add('alias'); refs.append(rule.rule_id)
             # Conflicting interpretations remain candidate instead of silently choosing one.
             if len(inferred) == 1:
                 candidate = next(iter(inferred))

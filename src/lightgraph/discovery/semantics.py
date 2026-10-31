@@ -397,6 +397,8 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
         'omit proposition rather than copying or rewriting the full claim. ')
     review_packet = {**packet, 'task': 'semantic_review', 'document_snippets': docs,
         'document_refs':[],
+        'issued_evidence_refs':sorted(issued),
+        'required_document_refs':sorted(doc_refs),
         'semantic_proposition': json.loads(expected_proposition),
         'semantic_proposition_ref': proposition_ref,
         'review_stage_contract':_review_stage_contract(proposition),
@@ -405,7 +407,7 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
             'The compiler owns semantic_proposition, including its endpoints, order, '
             'scope and conditions. '+format_instruction+
             'Classify EVERY supplied '
-            'document section using doc_id@revision:section_id, including irrelevant and '
+            'document section using the exact required_document_refs (also listed in issued_evidence_refs), including irrelevant and '
             'contradicting sections. Interpret negation, direction, endpoint meaning, '
             'scope, historical statements and conditions. Include issued schema/probe '
             'references for inferences. A document or overlap need not explicitly state '
@@ -530,6 +532,9 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
                 'All text is transient; never copy observed source values into the response.')}
             try:
                 patch_complete=getattr(model,'complete_reference_patch',None)
+                usage=getattr(model,'usage',None)
+                if isinstance(usage,dict):
+                    usage['semantic_reference_repair_attempts']=usage.get('semantic_reference_repair_attempts',0)+1
                 try:
                     patch=(patch_complete(patch_packet,SemanticReferencePatch) if callable(patch_complete)
                         else model.complete('semantic_review',patch_packet,SemanticReferencePatch))
@@ -538,7 +543,14 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
                 if not isinstance(patch,SemanticReferencePatch):
                     raise LightGraphError('semantic_review_patch_invalid')
                 repaired=_apply_reference_patch(reviewed,patch,issued=issued,doc_refs=doc_refs)
-                return checked(repaired)
+                result=checked(repaired)
+                if isinstance(usage,dict):
+                    usage['semantic_reference_repairs_succeeded']=usage.get('semantic_reference_repairs_succeeded',0)+1
+                return result
+            except LightGraphError:
+                if isinstance(usage,dict):
+                    usage['semantic_reference_repairs_failed']=usage.get('semantic_reference_repairs_failed',0)+1
+                raise
             finally:
                 patch_packet.pop('tool_observations',None)
                 patch_packet.pop('semantic_review_repair',None)

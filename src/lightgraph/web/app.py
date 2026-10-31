@@ -591,11 +591,11 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return read_metadata(workspace,pid,refresh=True,**options)
 
     @app.get('/api/projects/{pid}/graph')
-    def graph(pid:str,layer:str='business',include_candidates:bool=False,offset:int=0,limit:int=240,q:str='',kind:str=''):
+    def graph(pid:str,layer:str='business',include_candidates:bool=False,offset:int=0,limit:int=240,q:str='',kind:str='',focus:str=''):
         if layer not in ('business','metadata'):raise LightGraphError('graph_layer_invalid')
         with workspace.lock(pid):
             workspace.get(pid)
-            return read_graph(workspace,pid,layer,include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind)
+            return read_graph(workspace,pid,layer,include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus)
 
     @app.get('/api/projects/{pid}/graph/details')
     def graph_details(pid:str,entity_id:str|None=None,fact_id:str|None=None,include_candidates:bool=False,offset:int=0):

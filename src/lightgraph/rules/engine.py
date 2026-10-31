@@ -54,6 +54,7 @@ class RuleEngine:
             cols += [name for c in rule.concept_mapping.components for name in (c.namespace_columns or [])]
         cols += list(rule.identity.semantic_key_columns)
         cols += list(rule.attributes.single_valued.values()) + list(rule.attributes.multi_valued.values())
+        cols += [column for columns in rule.attributes.name_columns.values() for column in columns]
         if rule.hierarchy:
             for lv in rule.hierarchy.levels:
                 cols += [lv.code] + ([lv.label] if lv.label else []) + lv.aliases
@@ -158,7 +159,7 @@ class RuleEngine:
                 codes.append("null_identity_namespace")
             if rule.kind == "wide_hierarchy" and rule.identity.level_policy != "relative_path":
                 codes.append("relative_path_policy_required")
-            if (rule.attributes.single_valued or rule.attributes.multi_valued
+            if (rule.attributes.single_valued or rule.attributes.multi_valued or rule.attributes.name_columns
                     or (rule.hierarchy and any(level.label or level.aliases for level in rule.hierarchy.levels))):
                 if not rule.identity.attribute_evidence:
                     codes.append("shared_attribute_evidence_missing")
@@ -385,7 +386,7 @@ class RuleEngine:
             semantic_namespace=rule.identity.semantic_namespace, **domain_args)
         return resolution
 
-    def _emit_entity(self,pub,rule,row,key, *, label=None,aliases=None,extra_definition=None,binding_columns=None,binding_context=None):
+    def _emit_entity(self,pub,rule,row,key, *, label=None,aliases=None,extra_definition=None,binding_columns=None,binding_context=None,business_code_override=None):
         if rule.identity.semantic_resolution == "verified_identity_domain":
             extra_definition = dict(extra_definition or {})
             if label is not None:
@@ -398,7 +399,7 @@ class RuleEngine:
         self._stage(pub,rule,r.binding_id,scope,"NodeExistence",{"entity_id":r.entity_id,"kind":rule.identity.entity_kind,"layer":"business"})
         attrs={k:row.get(col) for k,col in rule.attributes.single_valued.items()}
         if label is not None:attrs["label"]=label
-        attrs["business_code"]=key[-1] if key else None
+        attrs["business_code"]=business_code_override if business_code_override is not None else (key[-1] if key else None)
         for name,value in attrs.items():
             if value is not None:
                 self._stage(pub,rule,r.binding_id,scope,"PropertyValue",{"entity_id":r.entity_id,"name":name,"value":value})
@@ -406,6 +407,11 @@ class RuleEngine:
             value=row.get(col)
             if value is not None:
                 self._stage(pub,rule,r.binding_id,scope,"PropertyValue",{"entity_id":r.entity_id,"name":name,"value":value})
+        for name,columns in rule.attributes.name_columns.items():
+            for column in columns:
+                value=row.get(column)
+                if value is not None:
+                    self._stage(pub,rule,r.binding_id,scope,"PropertyValue",{"entity_id":r.entity_id,"name":name,"value":value})
         for value in aliases or []:
             if value is not None:
                 self._stage(pub,rule,r.binding_id,scope,"PropertyValue",{"entity_id":r.entity_id,"name":"alias","value":value})

@@ -64,7 +64,9 @@ def test_history_pressure_finishes_existing_draft_with_no_extra_calls(capsys,cap
         if repair_feedback and len(seen)==5:
             assert 'diagnostics' in wire and 'invalid_tool_arguments' in wire
             proposal=final()['proposals'][0]
-            return response(tool='submit_column_group',args={k:v for k,v in proposal.items() if k!='kind'})
+            error=json.loads(body['messages'][-1]['content'])
+            return response(tool='submit_column_group',args={**{k:v for k,v in proposal.items() if k!='kind'},
+                'resolves_rejections':[error['rejection_id']]})
         return response(tool='finish_discovery',args={'pending':False})
     client=model(handle,stream=False,max_prompt_bytes=limit,max_discovery_steps=8)
     tools=LargeTools()

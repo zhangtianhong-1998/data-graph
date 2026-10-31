@@ -18,8 +18,9 @@ def canonical_plan(rule):
         plan.extend([OperatorSpec(op='unpivot_levels',args={'levels':[l.model_dump() for l in rule.hierarchy.levels]}),
             OperatorSpec(op='compress_paths',args={'gap_policy':'split','fill_semantics_confirmed':rule.hierarchy.fill_semantics_confirmed})])
     if rule.kind!='reference':plan.append(OperatorSpec(op='emit_entity',args={'kind':rule.identity.entity_kind}))
-    if rule.attributes.single_valued or rule.attributes.multi_valued:
-        plan.append(OperatorSpec(op='project_attributes',args={'single_valued':rule.attributes.single_valued,'multi_valued':rule.attributes.multi_valued}))
+    if rule.attributes.single_valued or rule.attributes.multi_valued or rule.attributes.name_columns:
+        plan.append(OperatorSpec(op='project_attributes',args={'single_valued':rule.attributes.single_valued,'multi_valued':rule.attributes.multi_valued,
+            **({'name_columns':rule.attributes.name_columns} if rule.attributes.name_columns else {})}))
     if rule.kind in ('reference','wide_hierarchy','long_hierarchy'):
         relation=rule.relation.relation if rule.relation else 'parent_of'
         plan.append(OperatorSpec(op='emit_relation',args={'relation':relation}))

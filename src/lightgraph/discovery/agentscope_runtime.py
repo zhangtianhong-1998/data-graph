@@ -67,6 +67,11 @@ class DiscoveryFormatter(FormatterBase):
             result=json.loads(content)
         except (TypeError,ValueError):
             return content
+        from .table_presentation import present_tool_result
+        presented=present_tool_result(result)
+        if presented is not result:
+            result=presented
+            content=canonical(result)
         if not isinstance(result,dict) or not isinstance(result.get('context'),dict):
             return content
         context=result['context']
@@ -327,7 +332,8 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
         return dispatch(name,arguments)
 
     toolkit=create_toolkit(CombinedTools(),combined_dispatch)
-    toolkit.invalid_argument_handler=lambda name: session.reject() if name in session.names else None
+    toolkit.invalid_argument_handler=lambda name,args,diagnostics: (
+        session.reject_tool_arguments(name,args,diagnostics) if name in session.names else None)
     model=DiscoveryChatModel(client,max_tool_calls,max_steps,session.names)
     agent=DiscoveryReActAgent(name=client.config.agent_name,sys_prompt=system,
         model=model,formatter=DiscoveryFormatter(packet,executor),toolkit=toolkit,
@@ -348,24 +354,29 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
                 'discovery_tool_calls_exhausted','discovery_final_response_required',
                 'model_schema_invalid','model_response_invalid','model_response_truncated',
                 'model_stream_invalid','model_http_error','model_rate_limited'})
-            if not session.drafts or not recoverable:
+            if not (session.drafts or session.invalid_count or session.object_models) or not recoverable:
                 raise
-            return session.batch(pending_code='discovery_submission_incomplete')
+            batch=session.batch(pending_code='discovery_submission_incomplete')
+            if exc.code not in batch._runtime_pending_codes:
+                batch._runtime_pending_codes.append(exc.code)
+            return batch
         if session.finished:
             return session.batch()
         raw=json.loads(reply.get_text_content())
         if isinstance(raw,dict) and 'action' in raw:
             finish=DiscoveryFinish.model_validate(raw)
-            session.pending=finish.pending
-            session.finished=True
+            if finish.action!='abstain':
+                session.execute('finish_discovery',finish.model_dump(exclude={'action'}))
             return session.batch(abstain=finish.action=='abstain')
         legacy=ProposalBatch.model_validate(raw)
         if legacy.abstain:
             # Legacy global abstention is also a withdrawal, never a request
             # to finish and publish the previously staged candidates.
             return session.batch(abstain=True)
-        if not session.drafts and session.schema.is_empty() and not session.invalid_count:
-            return legacy
+        if not session.drafts and session.schema.is_empty() and not session.invalid_count and not session.object_models:
+            from .object_mapping_feedback import object_mapping_diagnostics
+            if not any(object_mapping_diagnostics(proposal,packet) for proposal in legacy.proposals):
+                return legacy
         # A legacy final cannot replace staged exclusions or silently drop an
         # earlier valid hypothesis. Union all locally valid drafts instead.
         invalid_before=session.invalid_count

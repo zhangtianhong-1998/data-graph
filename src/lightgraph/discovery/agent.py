@@ -94,7 +94,31 @@ Reuse their exact domain and compatible type definition only after checking this
 own issued evidence. That catalog is a hypothesis, not proof or permission to cite unseen documents.
 Declare new vocabulary once using declare_semantic_schema. Prefer submit_hierarchy_plan
 for wide paths. Read fixed validation errors and correct only the affected candidate.
-Retained drafts and exclusions accumulate and cannot be overwritten. Do not hold all
+Rejection feedback includes a rejection_id. Resubmit with resolves_rejections containing
+that ID only for the same submission tool and same group_id/plan_id; it closes after validation.
+When feedback says resolution=explicit_withdrawal, no stable candidate ID was available:
+submit the correction without resolves_rejections and explicitly withdraw the old rejection.
+To withdraw an attempt, list its ID in finish_discovery.withdraw_rejections. pending=false alone
+cannot clear unresolved rejections. Never conceal unfinished work by merely finishing.
+For verified code domains, use exact applicable complete section IDs from
+reference_options.definition_sections in identity_evidence, attribute_evidence and
+global_scope_evidence. Probe IDs, columns and bare document names cannot prove a code domain.
+Read schema_knowledge before exploring. Establish which columns belong to each object:
+code, primary name, English names, aliases, namespace and path positions. Record supported
+field-role candidates with declare_object_model before proposing rules when available.
+Physical hierarchy levels are occurrence positions. When evidence establishes reuse
+within the same code domain and scope, use relative_path for one object with multiple
+supports. Different L positions alone do not split identity; equal names alone never
+merge objects across scopes.
+Candidate knowledge is not independent semantic evidence. Include known English names and
+aliases in the initial proposal rather than intentionally deferring them to coverage.
+For concept_mapping, key_column identifies the concept and column supplies its name.
+If an object model identifies a separate name column, do not use the code column as its name.
+Retained drafts and exclusions accumulate. Correct a retained draft with replace_draft_id
+from the same tool and group_id/plan_id; this preserves identity, topology, scope, exclusions
+and evidence obligations. It changes display mappings without leaving conflicting versions.
+Structural changes require the independent revision flow, never conceal them as a replacement.
+Do not hold all
 findings until the last turn or reproduce the entire ProposalBatch. Call finish_discovery
 after submissions; if tools are unavailable, return the small finish_discovery action
 using the requested output schema. Set pending=true if relevant work remains.
@@ -302,9 +326,15 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
                                    max_steps=max_steps,max_tool_calls=max_tool_calls))
         pending_codes=list(final._runtime_pending_codes)
         invalid_drafts=final._runtime_invalid_drafts
+        invalid_codes=dict(final._runtime_invalid_codes)
+        invalid_diagnostics=list(final._runtime_invalid_diagnostics)
+        object_models=list(final._runtime_object_models)
         final=validate_or_repair(client,final,checked)
         final._runtime_pending_codes=pending_codes
         final._runtime_invalid_drafts=invalid_drafts
+        final._runtime_invalid_codes=invalid_codes
+        final._runtime_invalid_diagnostics=invalid_diagnostics
+        final._runtime_object_models=object_models
         client.budget.check_deadline()
         for key in ('probe_digest','document_snippets','document_refs','context_tables'):
             packet[key]=checked.get(key,[])

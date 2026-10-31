@@ -147,11 +147,11 @@ def test_invalid_submission_recovers_next_tool_and_retains_valid_sibling(framewo
         if len(calls)==2:return response(tool='submit_entity_key',args={'claim':{'invalid':CANARY}})
         error=json.loads(body['messages'][-1]['content'])
         assert error['code']=='invalid_tool_arguments' and CANARY not in json.dumps(error)
-        return response(tool='finish_discovery')
+        return response(tool='finish_discovery',args={'withdraw_rejections':[error['rejection_id']]})
     client=model(handler,stream=False);tools=Toolbox()
     batch=client.explore(input_packet(),tools,max_steps=5)
     assert len(batch.proposals)==1 and batch._runtime_invalid_drafts==1
-    assert batch._runtime_pending_codes==[]  # Explicit finish withdraws the rejected attempt.
+    assert batch._runtime_pending_codes==[]  # Explicit rejection ID withdrawal.
     assert client.usage['calls']==3 and tools.executed==[]
     assert_cleared(framework_spy)
     assert CANARY not in capsys.readouterr().out+caplog.text
@@ -169,11 +169,13 @@ def test_reserved_submission_window_allows_field_repair_before_final_turn(framew
         assert names and not (names & {'get_metadata','profile_columns','execute_readonly_sql'})
         if len(controls)==3:
             assert control['submission_reason']=='submission_window'
-            return response(tool='submit_column_group',args={'claim':{'invalid':CANARY}})
+            invalid=group();invalid['claim']['members'][0]['role']=CANARY
+            return response(tool='submit_column_group',args=invalid)
         assert control['submission_reason']=='last_turn'
         feedback=json.loads(body['messages'][-1]['content'])
         assert feedback['code']=='invalid_tool_arguments' and feedback['diagnostics']
-        return tools_response(('submit_column_group',group()),('finish_discovery',{}))
+        return tools_response(('submit_column_group',{**group(),'resolves_rejections':[feedback['rejection_id']]}),
+                              ('finish_discovery',{}))
     client=model(handler,stream=False);tools=Toolbox()
     batch=client.explore(input_packet(),tools,max_steps=4,max_tool_calls=16)
     assert len(batch.proposals)==1 and not batch._runtime_pending_codes
@@ -205,7 +207,10 @@ def test_failed_final_preserves_draft_but_marks_pending_without_extra_turn(failu
     client=model(handler,stream=False,retries=0);tools=Toolbox()
     batch=client.explore(input_packet(),tools,max_steps=2,max_tool_calls=1)
     assert len(batch.proposals)==1
-    assert batch._runtime_pending_codes==['discovery_submission_incomplete']
+    cause={'malformed':'llm_schema_invalid','transport':'model_transport_error',
+           'ignored_none':'discovery_steps_exhausted','truncated':'model_response_truncated',
+           'duplicate':'model_json_duplicate_key'}.get(failure,failure)
+    assert batch._runtime_pending_codes==['discovery_submission_incomplete',cause]
     assert client.usage['calls']==2 and tools.executed==[] and tools.closed
     assert_cleared(framework_spy)
 
@@ -294,7 +299,8 @@ def test_final_turn_still_accepts_hierarchy_plan_after_source_budget_exhaustion(
     batch=client.explore(packet,tools,max_steps=steps,max_tool_calls=1)
     assert len(batch.proposals)==1 and batch.proposals[0].kind=='wide_hierarchy'
     assert batch.semantic_schema.entity_types[0].name=='CatalogEntry'
-    assert batch._runtime_pending_codes==([] if finish else ['discovery_submission_incomplete'])
+    assert batch._runtime_pending_codes==([] if finish else [
+        'discovery_submission_incomplete','discovery_steps_exhausted'])
     assert client.usage['calls']==steps
     assert tools.executed==(['get_metadata'] if source_first else [])
     agent=assert_cleared(framework_spy)
@@ -312,7 +318,8 @@ def test_submissions_have_separate_finite_cap_and_do_not_expand_query_budget(fra
         return tools_response(*[('declare_semantic_schema',{})]*MAX_SUBMISSION_CALLS)
     client=model(handler,stream=False);tools=Toolbox()
     batch=client.explore(input_packet(),tools,max_steps=4,max_tool_calls=1)
-    assert len(batch.proposals)==1 and batch._runtime_pending_codes==['discovery_submission_incomplete']
+    assert len(batch.proposals)==1 and batch._runtime_pending_codes==[
+        'discovery_submission_incomplete','discovery_tool_calls_exhausted']
     assert client.usage['calls']==2 and tools.executed==[]
     agent=assert_cleared(framework_spy)
     assert agent.model.source_calls==0 and agent.model.submission_calls==1

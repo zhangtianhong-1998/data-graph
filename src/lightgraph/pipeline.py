@@ -11,7 +11,7 @@ from .rules import RuleEngine
 from .metadata import publish_metadata
 from .runtime.retention import write_report,write_rules,atomic_text
 
-DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/15'
+DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/17'
 
 # These failures mean the Agent never completed an interpretation. They are not
 # permission to retry within a turn; leave the table pending for a later run.
@@ -201,7 +201,10 @@ def _issues(report, items):
     for issue in items:
         if hasattr(issue,'model_dump'):issue=issue.model_dump()
         safe={k:v for k,v in issue.items() if k in ('code','table','rule_id','count') and isinstance(v,(str,int))}
-        if issue.get('status') in ('unresolved','deferred','partial','resolved','rejected'):
+        if issue.get('code') in {'discovery_draft_rejected','discovery_draft_field_diagnostic'}:
+            for name in ('reason_code','field_path','constraint'):
+                if isinstance(issue.get(name),str):safe[name]=issue[name]
+        if issue.get('status') in ('unresolved','deferred','partial','resolved','rejected','diagnostic'):
             safe['status']=issue['status']
         if safe:report.issues.append(safe)
 
@@ -285,11 +288,14 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             model.budget.limits=replace(model.budget.limits,
                 memory_bytes=min(model.budget.limits.memory_bytes,config.max_working_bytes))
         budget.check_time()
+        schema_knowledge=None
         def explore(function, *args, **kwargs):
             """Return deferred work at the phase boundary, preserving prepared rules."""
             from .discovery.models import DiscoveryResult
             try:
                 with budget.exploration(deadline=discovery_deadline,query_limit=discovery_query_limit):
+                    if schema_knowledge is not None and function in (discover,discover_references):
+                        kwargs.setdefault('schema_knowledge',schema_knowledge)
                     return function(*args, **kwargs)
             except BudgetExceeded as exc:
                 return DiscoveryResult(issues=[{'code':exc.code,'status':'deferred'}])
@@ -317,6 +323,9 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         from .runtime.iteration import IterationLedger, REVIEWABLE_CODES, rule_shape
         from .contracts import SourceRef
         ledger=IterationLedger(store,config.goal,config.scopes)
+        from .discovery.schema_knowledge import SchemaKnowledgeLedger
+        schema_knowledge=SchemaKnowledgeLedger(store)
+        schema_knowledge.prepare([t for adapter in scoped_adapters for t in adapter.describe()],config.goal,corpus)
         from .runtime.candidates import CandidateQueue
         candidates_queue=CandidateQueue(store,config.goal,config.scopes,config.isolation_domain,config.sources)
         ledger.candidate_queue=candidates_queue
@@ -505,6 +514,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     report.issues.append({'rule_id':rule.rule_id,'code':code,'status':'deferred'})
                     return False
                 failed.add(rule.rule_id);report.rules_skipped.append(rule.rule_id)
+                schema_knowledge.invalidate_rule(rule.rule_id)
                 report.issues.append({'rule_id':rule.rule_id,'code':code});return False
             previous_pubs=[p for p in prepared if store._publication(p)['logical_rule_id']==rule.rule_id]
             previous_bindings={k:v for k,v in engine.bindings.items() if k[0]==rule.rule_id}
@@ -517,6 +527,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     _abort_staging(store,previous_pubs)
                     prepared_rules[:]=[r for r in prepared_rules if r.rule_id!=rule.rule_id]
                 prepared.extend(outcome.publication_ids or [outcome.publication_id]);prepared_rules.append(rule)
+                schema_knowledge.record_rule(rule,status='local_validated')
                 from .metadata import stage_rule_metadata
                 for publication_id in outcome.active_publication_ids:
                     stage_rule_metadata(store,publication_id,rule,allrules+prepared_rules,config.isolation_domain)
@@ -529,6 +540,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     report.issues.extend({'rule_id':rule.rule_id,'code':code,'status':'deferred'} for code in outcome.codes)
                     return False
                 failed.add(rule.rule_id);report.rules_skipped.append(rule.rule_id)
+                schema_knowledge.invalidate_rule(rule.rule_id)
                 discovery_completed.get(rule.source.source_id,set()).discard(
                     rule.source.schema_name+'.'+rule.source.table)
                 repair_codes=set(outcome.codes)&REVIEWABLE_CODES
@@ -689,13 +701,28 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             # Coverage work is persisted independently; do not repeat successful
             # T0 groups when a single remaining field still needs explanation.
             review_role_occurrences()
-            discover_pending_relations()
+        generation_conflicts={}
         def review_generation_constraints():
             """Feed cross-rule conflicts back before a publication is attempted."""
             pubs=[store._publication(p) for p in prepared if store._publication(p)['state'] in ('staging','ready')]
             if not auto or not pubs:return
             try:
                 store._validate_endpoints(store._prospective_publications(pubs))
+                # A correction to one contributor can resolve the shared
+                # conflict for other, unchanged rules as well. Retire only
+                # feedback owned by this cross-rule check; keep local failures.
+                for key,entry in list(feedback.items()):
+                    if len(entry['rules'])!=1:continue
+                    rule_id=entry['rules'][0].rule_id
+                    owned=generation_conflicts.get(rule_id,set())
+                    entry['codes'].difference_update(owned)
+                    if not entry['codes']:feedback.pop(key)
+                for rule in prepared_rules:
+                    if rule.rule_id in generation_conflicts and not any(
+                        rule.rule_id in {r.rule_id for r in e['rules']} for e in feedback.values()):
+                        failed.discard(rule.rule_id)
+                        schema_knowledge.record_rule(rule,status='local_validated')
+                generation_conflicts.clear()
             except LightGraphError as exc:
                 if exc.code not in REVIEWABLE_CODES:return
                 topology=exc.code in ('hierarchy_cycle','hierarchy_self_loop','multiple_parent')
@@ -705,16 +732,26 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     entry=feedback.setdefault((sid,name,rule.rule_id),{'rules':[],'codes':set(),'counts':{}})
                     if rule.rule_id not in {r.rule_id for r in entry['rules']}:entry['rules'].append(rule)
                     entry['codes'].add(exc.code)
+                    generation_conflicts.setdefault(rule.rule_id,set()).add(exc.code)
                     failed.add(rule.rule_id)
                     need_discovery.add(sid);discovery_tables.setdefault(sid,set()).add(name)
                     discovery_completed.get(sid,set()).discard(name)
                     store.mark_rule_for_review(rule.rule_id,'graph_constraint_requires_review')
+                    schema_knowledge.invalidate_rule(rule.rule_id)
                     report.issues.append({'rule_id':rule.rule_id,'code':exc.code})
         review_generation_constraints()
         review_role_occurrences()
         # Exploration alone does not invalidate a complete projection. Rebuild
         # only changed rules and their reference dependency closure, atomically.
-        while auto and feedback:
+        while auto:
+            # Optional relation exploration starts only after the current
+            # object/attribute generation has passed cross-rule checks and
+            # required repairs. It must not spend the repair window first.
+            if not any(entry['codes']-{'unexplained_role_occurrence'} for entry in feedback.values()):
+                discover_pending_relations()
+                review_generation_constraints()
+                review_role_occurrences()
+            if not feedback:break
             work=[]
             for (sid,name,_),entry in sorted(feedback.items()):
                 item=ledger.enqueue(entry['rules'][0].source,codes=entry['codes'],
@@ -764,7 +801,8 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 old_shapes={rule_shape(r) for r in prior}
                 if not result.rules or {rule_shape(r) for r in result.rules}==old_shapes:
                     ledger.transition(item,'unresolved')
-                    report.issues.append({'code':'pattern_review_no_progress','table':name})
+                    report.issues.append({'code':'pattern_review_no_progress','table':name,
+                                          'rule_id':prior[0].rule_id if prior else item.work_id})
                     continue
                 if not affected_ids & {r.rule_id for r in result.rules}:
                     ledger.transition(item,'unresolved')
@@ -790,6 +828,9 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             prepared_rules[:]=[r for r in prepared_rules if r.rule_id not in rebuild]
             engine.bindings={k:v for k,v in engine.bindings.items() if k[0] not in rebuild}
             failed.difference_update(rebuild)
+            # The next execution owns fresh local failures, even when they use
+            # the same code as a previous generation-wide conflict.
+            for rule_id in rebuild:generation_conflicts.pop(rule_id,None)
             # A successful repair does not resolve an unrelated failed rule.
             # Preserve its counterexample and terminal/deferred work state;
             # only rebuilt dependency units receive fresh execution feedback.
@@ -802,15 +843,12 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             # A repaired/new entity can enable relations that had no endpoints
             # during the first T2 pass. Revisit against this validated generation.
             review_role_occurrences()
-            discover_pending_relations()
             review_generation_constraints()
             failing_ids=set(failed)|{r.rule_id for entry in feedback.values() for r in entry['rules']}
             report.issues=[issue for index,issue in enumerate(report.issues)
                 if not (index<before and issue.get('rule_id') not in failing_ids
-                        and issue.get('code') in REVIEWABLE_CODES)]
+                        and issue.get('code') in (REVIEWABLE_CODES|{'pattern_review_no_progress'}))]
             for item,_ in work:
-                if item.state in ('unresolved','deferred'):
-                    continue
                 if (not set(item.rule_revisions)&failed and
                     not any(r.rule_id in item.rule_revisions for entry in feedback.values() for r in entry['rules'])):
                     ledger.transition(item,'resolved')
@@ -825,6 +863,15 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     report.issues[:]=[i for i in report.issues if not (
                         i.get('table')==table.qualified_name and i.get('code')=='unexplained_columns')]
         failed_tables={(r.source.source_id,r.source.schema_name,r.source.table) for r in allrules if r.rule_id in failed}
+        # Include coverage additions and later revisions in the final rule
+        # inventory. The previous counter only described initial exploration.
+        if auto:
+            report.counts['initial_discovered_rules']=report.counts.get('discovered_rules',0)
+            old_shapes={r.rule_id:rule_shape(r) for r in _latest(old_rules)}
+            report.counts['discovered_rules']=len({r.rule_id for r in allrules
+                if r.rule_id not in old_shapes or old_shapes[r.rule_id]!=rule_shape(r)})
+            report.counts['total_rule_candidates']=len({r.rule_id for r in allrules})
+            report.counts['prepared_rules']=len({r.rule_id for r in prepared_rules})
         for rule in prepared_rules:
             if (rule.source.source_id,rule.source.schema_name,rule.source.table) not in failed_tables:
                 ledger.resolve_table(rule.source)
@@ -846,9 +893,11 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 store.publish_partitions([PartitionCompletion(publication_id=p,complete=True,consistent=True,dependencies_valid=True)
                     for p in business_prepared],expected_heads=generation.heads)
                 report.rules_published=[r.rule_id for r in prepared_rules]
+                for rule in prepared_rules:schema_knowledge.record_rule(rule,status='published')
                 publish_ok=True
             except LightGraphError as exc:
                 _abort_staging(store,prepared)
+                for rule in prepared_rules:schema_knowledge.invalidate_rule(rule.rule_id)
                 report.rules_skipped.extend(r.rule_id for r in prepared_rules)
                 report.issues.append({'code':exc.code});report.status='PARTIAL'
         if auto:
@@ -905,8 +954,9 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         write_catalog(output,declared,semantic_catalog(declared,config.goal,understandings,
             _latest(store.get_rules()),documents,previous=previous_semantic))
         report.validation['incremental_mode']='complete_projection_reconciliation'
+        report.counts.update(schema_knowledge.counts())
         report.validation['iteration_mode']='bounded_pattern_feedback'
-        if report.issues and report.status=='COMPLETED':
+        if any(i.get('status')!='diagnostic' for i in report.issues) and report.status=='COMPLETED':
             partial_tokens=('budget','exhausted','timeout','truncated','unavailable','permission','incomplete','unverified','formula_cache_missing','execution_failed','dependency_rule_failed','too_large','model_http','model_response','model_transport')
             report.status='PARTIAL' if any(
                 i.get('status') in ('deferred','partial') or _agent_execution_failure(str(i.get('code',''))) or
@@ -954,7 +1004,9 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                         'json_fence_recoveries','json_control_char_recoveries','json_trailing_comma_recoveries',
                         'prompt_pressure_turns','prompt_history_exchanges_omitted',
                         'prompt_peak_before_window_bytes','prompt_peak_after_window_bytes',
-                        'prompt_packets_rejected','prompt_rejected_peak_bytes'):
+                        'prompt_packets_rejected','prompt_rejected_peak_bytes',
+                        'semantic_reference_repair_attempts','semantic_reference_repairs_succeeded',
+                        'semantic_reference_repairs_failed'):
             report.counts[counter]=model.usage.get(counter,0) if model else 0
         report.counts['db_queries']=budget.snapshot()['queries'] if 'budget' in locals() else sum(a.stats.queries for a in adapters)
         report.counts['returned_rows']=budget.snapshot()['returned_rows'] if 'budget' in locals() else sum(a.stats.returned_rows for a in adapters)

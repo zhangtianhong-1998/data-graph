@@ -103,6 +103,9 @@ def _roles(rule: RuleSpec):
     excluded={e.column for e in rule.attributes.excluded}
     for role,column in {**rule.attributes.single_valued,**rule.attributes.multi_valued}.items():
         if column not in excluded: result[(role,column)]=None
+    for role,columns in rule.attributes.name_columns.items():
+        for column in columns:
+            if column not in excluded:result[(role,column)]=None
     keys=[c for c in rule.identity.key_columns if c not in rule.scope.namespaces and c not in excluded]
     if len(keys)==1:result[('identity_code',keys[0])]=None
     if rule.hierarchy:

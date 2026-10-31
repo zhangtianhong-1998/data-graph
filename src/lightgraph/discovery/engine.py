@@ -153,19 +153,31 @@ def _packet(table,goal,rows,documents,task,understanding):
             'budget':{'max_hypotheses':6,'max_probe_requests':4,'max_rationale_chars':MAX_TRANSIENT_TEXT_CHARS}}
 
 
+def _name_mappings(pairs):
+    """Preserve explicit language roles without limiting names to two columns."""
+    multi={};additional={}
+    for name,column in pairs:
+        if name not in multi:multi[name]=column
+        elif multi[name]!=column:
+            if name not in ('alias','english_name'):raise LightGraphError('ambiguous_primary_attribute')
+            extra=additional.setdefault(name,[])
+            if column not in extra:extra.append(column)
+    return multi,additional
+
+
 def _draft(table,group,scope,semantic,excluded,goal,documents):
     prefix,fields=group
     kind=_kind(prefix,table,goal,documents)
     if not kind:return None
     attrs=dict(semantic)
     if fields['label']:attrs['label']=fields['label']
-    aliases={key:name for key,name in zip(('alias','english_name'),fields['aliases'])}
+    aliases,extra_names=_name_mappings([('alias',name) for name in fields['aliases']])
     # Semantic columns common to a multi-entity wide table cannot be assigned to
     # every entity without evidence; caller passes them only for one entity group.
     rule=RuleSpec(rule_id='rule_'+digest(table.source_id,table.qualified_name,'entity',prefix)[:24],
         kind='column_group_entity',goal_refs=[goal.goal_id],source=_source(table),
         scope=ScopeSpec(namespaces=scope),identity=IdentitySpec(key_columns=scope+[fields['code']],entity_kind=kind),
-        attributes=AttributeSpec(single_valued=attrs,multi_valued=aliases,excluded=excluded),
+        attributes=AttributeSpec(single_valued=attrs,multi_valued=aliases,name_columns=extra_names,excluded=excluded),
         dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in documents})),
         coverage=Coverage(scope='sampled',consistent=False),evidence=RuleEvidence(origin='discovery',semantic_basis=['declared_column_group']))
     sharing=declared_evidence(documents,table,'shared_definition',
@@ -348,12 +360,9 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
             aliases=[m for m in claim.members if m.role=='alias' and lookup[m.column_id] not in excluded_names]
             if len(labels)>1:raise LightGraphError('ambiguous_primary_label')
             single={'label':labels[0]} if labels else {}
-            multi={}
-            for index,member in enumerate(aliases):
-                if index>=2:raise LightGraphError('too_many_alias_columns')
-                name=member.property_name or ('alias','english_name')[index]
-                if name not in ('alias','english_name') or name in multi:raise LightGraphError('ambiguous_alias_property')
-                multi[name]=lookup[member.column_id]
+            if any(m.property_name not in (None,'alias','english_name') for m in aliases):
+                raise LightGraphError('ambiguous_alias_property')
+            multi,extra_names=_name_mappings([(m.property_name or 'alias',lookup[m.column_id]) for m in aliases])
             for member in claim.members:
                 if member.role!='semantic_attribute' or lookup[member.column_id] in excluded_names:continue
                 if member.property_name not in properties:
@@ -368,7 +377,7 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
                 goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=namespaces),
                 identity=_reviewed_code_identity(claim,list(dict.fromkeys(namespaces+keys)),documents,table,semantic_evidence),
                 attributes=AttributeSpec(single_valued=single,
-                    multi_valued=multi,excluded=excluded),
+                    multi_valued=multi,name_columns=extra_names,excluded=excluded),
                 dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in documents})),
                 coverage=Coverage(scope='sampled'),evidence=(rule_evidence(semantic_evidence,reviewed=True,documents=documents)
                     if claim.identity_resolution=='verified_identity_domain' else RuleEvidence(origin='discovery',semantic_basis=['model_column_group_candidate']))))
@@ -393,18 +402,15 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
             namespaces=[lookup[c] for c in claim.namespace_columns]
             if not set(namespaces)<=set(keys):raise LightGraphError('namespace_not_in_identity')
             if set(keys+single+multi)&excluded_names:raise LightGraphError('excluded_column_projected')
-            if len(multi)>2:raise LightGraphError('too_many_alias_columns')
-            multi_map={}
-            for index,column in enumerate(multi):
-                property_name=explicit.get(column,('alias','english_name')[index])
-                if property_name in single_map or property_name in multi_map:raise LightGraphError('ambiguous_primary_attribute')
-                multi_map[property_name]=column
+            if any(explicit.get(column,'alias') in single_map for column in multi):
+                raise LightGraphError('ambiguous_primary_attribute')
+            multi_map,extra_names=_name_mappings([(explicit.get(column,'alias'),column) for column in multi])
             _normalize_business_code_mapping(single_map,multi_map,keys)
             results.append(RuleSpec(rule_id=_logical_entity_rule_id(table,'column_group_entity',claim.entity_kind_hint,keys,namespaces),kind='column_group_entity',
                 goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=namespaces),
                 identity=_reviewed_code_identity(claim,keys,documents,table,semantic_evidence),
                 attributes=AttributeSpec(single_valued=single_map,
-                    multi_valued=multi_map,excluded=excluded),
+                    multi_valued=multi_map,name_columns=extra_names,excluded=excluded),
                 dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in documents})),coverage=Coverage(scope='sampled'),
                 evidence=(rule_evidence(semantic_evidence,reviewed=True,documents=documents)
                     if claim.identity_resolution=='verified_identity_domain' else RuleEvidence(origin='discovery',semantic_basis=['model_entity_key_candidate']))))
@@ -418,18 +424,20 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
             if set(scopes+[key,parent]+([label] if label else [])+aliases)&excluded_names:
                 raise LightGraphError('excluded_column_projected')
             order=semantic_evidence or declared_evidence(documents,table,'parent_column',[key],[parent])
+            multi_names,additional_names=_name_mappings([('alias',c) for c in aliases])
             results.append(RuleSpec(rule_id=_logical_entity_rule_id(table,'long_hierarchy',claim.entity_kind_hint,scopes+[key],scopes,topology={'parent':parent}),
                 kind='long_hierarchy',goal_refs=[goal.goal_id],source=_source(table),scope=ScopeSpec(namespaces=scopes),
                 identity=IdentitySpec(key_columns=scopes+[key],entity_kind=claim.entity_kind_hint),
                 attributes=AttributeSpec(single_valued={'label':label} if label else {},
-                    multi_valued=dict(zip(('alias','english_name'),aliases)),excluded=excluded),
+                    multi_valued=multi_names,name_columns=additional_names,excluded=excluded),
                 hierarchy=HierarchySpec(parent_column=parent,taxonomy=table.qualified_name,order_evidence=order),
                 dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in documents})),
                 coverage=Coverage(scope='sampled'),evidence=rule_evidence(order,reviewed=bool(semantic_evidence),documents=documents)))
         elif proposal.kind=='wide_hierarchy':
             if goal.entity_kinds and claim.entity_kind_hint not in goal.entity_kinds:continue
             _check_hierarchy_identity_resolution(claim)
-            levels=[LevelSpec(level=l.position,code=lookup[l.key],label=lookup.get(l.label),aliases=[lookup[l.alias]] if l.alias else []) for l in claim.levels]
+            levels=[LevelSpec(level=l.position,code=lookup[l.key],label=lookup.get(l.label),
+                aliases=list(dict.fromkeys(lookup[c] for c in ([l.alias] if l.alias else [])+l.aliases))) for l in claim.levels]
             scopes=[lookup[c] for c in claim.namespace_columns]
             if identity_excluded & set(scopes+[l.code for l in levels]):raise LightGraphError('excluded_column_in_identity')
             if set(scopes+[c for l in levels for c in [l.code,l.label,*l.aliases] if c])&excluded_names:
@@ -452,7 +460,7 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
                 dependencies=Dependencies(schema=_table_hash(table),documents=sorted({d['doc_id']+'@'+d['revision'] for d in documents})),
                 coverage=Coverage(scope='sampled'),evidence=rule_evidence(order,reviewed=bool(semantic_evidence),documents=documents)))
     for rule in results:
-        used_properties=set(rule.attributes.single_valued)|set(rule.attributes.multi_valued)|{'business_code'}
+        used_properties=set(rule.attributes.single_valued)|set(rule.attributes.multi_valued)|set(rule.attributes.name_columns)|{'business_code'}
         if rule.hierarchy:
             used_properties.update({'label','alias'})
         relation=rule.relation.relation if rule.relation else 'parent_of' if rule.hierarchy else None
@@ -469,7 +477,7 @@ def _compile_model(batch,table,goal,documents,excluded, *, semantic_evidence=Non
 
 
 def discover(adapter,goal: ExtractionGoal | None=None,documents=None,model=None,budget=None, *,
-             table_refs=None,iteration_context=None,revision_rules=None) -> DiscoveryResult:
+             table_refs=None,iteration_context=None,revision_rules=None,schema_knowledge=None) -> DiscoveryResult:
     """Discover bounded candidates, preserving the source/semantic validation boundary.
 
     No dataset mappings are imported. Generic column families and sample shapes
@@ -479,7 +487,7 @@ def discover(adapter,goal: ExtractionGoal | None=None,documents=None,model=None,
     if model is not None and callable(getattr(model,'explore',None)):
         from .workflow import discover_with_agent
         return discover_with_agent(adapter,goal,documents,model,budget,table_refs=table_refs,
-            iteration_context=iteration_context,revision_rules=revision_rules)
+            iteration_context=iteration_context,revision_rules=revision_rules,schema_knowledge=schema_knowledge)
     goal=goal or ExtractionGoal();budget=budget or (model.budget if model else BudgetAllocator())
     corpus=documents if isinstance(documents,DocumentCorpus) else DocumentCorpus(documents or [])
     result=DiscoveryResult();tables=adapter.describe();used_tables=[]
@@ -681,7 +689,7 @@ def revise_after_counterexample(model,packet:dict,hypothesis:Hypothesis,countere
 
 
 def discover_references(adapter,validated_rules,documents=None,model=None,budget=None,*,max_candidates=32,goal=None,
-                        source_adapters=None,table_refs=None,iteration_context=None,revision_rules=None) -> DiscoveryResult:
+                        source_adapters=None,table_refs=None,iteration_context=None,revision_rules=None,schema_knowledge=None) -> DiscoveryResult:
     """Reference discovery joins already verified entity bindings, never all columns.
 
     Structural coverage and document semantics are separate. Exact column-family
@@ -693,7 +701,7 @@ def discover_references(adapter,validated_rules,documents=None,model=None,budget
         from .workflow import discover_references_with_agent
         result=discover_references_with_agent(adapter,validated_rules,documents,model,budget,goal,max_candidates,
             source_adapters=source_adapters,table_refs=table_refs,
-            iteration_context=iteration_context,revision_rules=revision_rules)
+            iteration_context=iteration_context,revision_rules=revision_rules,schema_knowledge=schema_knowledge)
         # Preserve the existing independently documented JSON/selector rules.
         # Agent proposals cannot invent selector constants; this deterministic
         # verifier still requires a scoped declaration and complete key checks.

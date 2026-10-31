@@ -70,6 +70,7 @@ def test_default_graph_excludes_candidates_and_details_authorize_each_support(cl
 
 def test_identity_review_cas_mutability_and_revoke_preserve_original_evidence(client,monkeypatch):
     seed(client)
+    initial_generation=client.get('/api/projects/p/graph').json()['generation']
     listing=client.get('/api/projects/p/graph/identity-candidates').json()
     assert listing['revision']==0 and len(listing['candidates'])==1
     candidate=listing['candidates'][0]
@@ -85,7 +86,10 @@ def test_identity_review_cas_mutability_and_revoke_preserve_original_evidence(cl
     response=client.post(url,json=body,headers=revision(client))
     assert response.status_code==200,response.text
     decision=response.json()
-    assert len(client.get('/api/projects/p/graph').json()['nodes'])==1
+    merged=client.get('/api/projects/p/graph').json()
+    assert len(merged['nodes'])==1 and merged['generation']!=initial_generation
+    focused=client.get('/api/projects/p/graph?focus='+merged['nodes'][0]['id']).json()
+    assert focused['focus_node_id']==merged['nodes'][0]['id'] and len(focused['nodes'])==1
     again=client.get('/api/projects/p/graph/identity-candidates').json()
     assert len(again['candidates'][0]['nodes'])==2  # Review always uses originals.
     assert again['candidates'][0]['has_active_decision'] is True
@@ -97,3 +101,16 @@ def test_identity_review_cas_mutability_and_revoke_preserve_original_evidence(cl
     assert response.status_code==200,response.text
     assert len(client.get('/api/projects/p/graph').json()['nodes'])==2
     assert client.get('/api/projects/p/graph/identity-candidates').json()['decisions'][0]['status']=='revoked'
+
+
+def test_graph_focus_search_and_counts_respect_visibility(client):
+    seed(client)
+    focused=client.get('/api/projects/p/graph?focus=a').json()
+    assert focused['focus_node_id']=='a'
+    assert {node['id'] for node in focused['nodes']}=={'a'}
+    assert focused['kind_counts']=={'ReportItem':2}
+    assert client.get('/api/projects/p/graph?focus=x').json()['nodes']==[]
+    assert client.get('/api/projects/p/graph?focus=c').json()['nodes']==[]
+    assert client.get('/api/projects/p/graph?focus=c&include_candidates=true').json()['focus_node_id']=='c'
+    assert client.get('/api/projects/p/graph?focus='+('x'*257)).status_code==400
+    assert client.get('/api/projects/p/graph?q=Shared').json()['matched_nodes']==2

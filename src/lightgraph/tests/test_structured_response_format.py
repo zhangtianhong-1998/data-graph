@@ -54,7 +54,7 @@ def test_small_finish_schema_is_sent_while_submissions_remain_typed_tools(monkey
     model=client(monkeypatch,handler);tools=Toolbox()
     assert model.explore(input_packet(),tools,max_steps=2).proposals
     assert len(calls)==2 and tools.executed==['get_metadata']
-    assert set(schema['properties'])=={'action','pending'}
+    assert set(schema['properties'])=={'action','pending','withdraw_rejections'}
     assert calls[0]['tools'][0]['function']['name']=='get_metadata'
 
 

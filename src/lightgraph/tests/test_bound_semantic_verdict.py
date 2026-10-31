@@ -180,6 +180,9 @@ def test_outer_reference_patch_never_requests_a_second_verdict(monkeypatch,chang
         with pytest.raises(LightGraphError,match='semantic_review_patch_invalid'):
             review_semantics(model,PACKET,PROPOSITION,[])
     assert len(calls)==2
+    assert model.usage['semantic_reference_repair_attempts']==1
+    assert model.usage.get('semantic_reference_repairs_succeeded',0)==(change=='fix_reference')
+    assert model.usage.get('semantic_reference_repairs_failed',0)==(change!='fix_reference')
 
 
 def test_higher_transport_retry_limit_does_not_allow_two_schema_corrections(monkeypatch):

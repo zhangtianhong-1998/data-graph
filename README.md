@@ -2,11 +2,11 @@
 
 根据用户填写的抽取目标，从 Gauss、MySQL、Excel 和 CSV 中发现表内实体、跨表关系，并将已确认的规则应用到数据，生成图谱。对象可以由多个字段共同定义；字段关系作为实体关系的推导依据保留。Markdown 提供全局说明、表列定义和带出处与条件的分析知识。图中分开显示业务实体、表与列、文档来源。
 
-**所有源码均在 `src/`：Python 后端与引擎位于 `src/lightgraph/`，Vue 3 工作台位于 `src/workbench/`。** 本项目不需要图数据库。SQLite 只保存抽取结果、规则、来源支持和发布记录；数据库查询返回的行、抽样、模型请求和响应不会进入结果库。
+**所有源码均在 `src/`：Python 后端与引擎位于 `src/lightgraph/`，Vue 3 工作台位于 `src/workbench/`。** 本项目不需要图数据库。SQLite 保存抽取结果、规则、来源支持、发布记录，以及不含源值的字段认识与统计计数；数据库查询返回的行、抽样、模型请求和响应不会进入结果库。
 
 依赖的本轮实测版本记录在 `requirements.lock`；需要复现环境时先安装该文件，再安装项目。
 
-2026-10-29 全量结果与新测试数据见[本次诊断及修改](design/lightweight_graph/FRUIT_RESULT_DIAGNOSIS_20261029.md)：旧实验一条规则已覆盖五个层级，英文名和主体范围遗漏；后续已补范围修订、跨表概念编码域与五表固定规则对照。新版实验上限为 2 小时 / 240 次调用，累计 tokens 不限。新数据尚未重跑真实模型。
+2026-10-30 最新完成的五表真实模型实验 `full-extraction-v2-review-20261030T161244Z` 为 PARTIAL：107 次调用、约 90 分钟，五条规则通过局部执行，但共享实体名称冲突阻止原子发布，最终业务节点为零。更早一轮的 210 个层级节点不能作为本轮结果。当前修改加入可复用的字段与对象认识、显式草案替换、多列别名、先检查跨规则冲突再探索关系，以及连续图画布，见[本轮修改方向与验证](design/lightweight_graph/SCHEMA_FIRST_DISCOVERY_20261030.md)。原五表固定规则对照仍为 462 节点 / 930 边；自动发现效果须由新实验检验。全量实验限 240 次调用 / 2 小时，累计 tokens 不限。
 
 当前运行能力与验证边界见 [实施与验收记录](IMPLEMENTATION_STATUS.md)。最新的持续发现、可选关系、整组身份复核与运行指导改动见[两份评审后的继续修复](design/lightweight_graph/REVIEW_CONTINUATION_20261027.md)，上一轮协议修复见[真实数据反馈记录](design/lightweight_graph/REAL_DATA_DISCOVERY_REPAIR.md)。工程验证使用合成输入和离线模型替身，用户另一台机器上的真实数据仍待复跑。当前需求见 [用户故事](design/lightweight_graph/US.md) 和 [目标驱动迭代方案](design/lightweight_graph/GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)；[设计索引](design/lightweight_graph/README.md) 保留各项约束与历史边界。
 

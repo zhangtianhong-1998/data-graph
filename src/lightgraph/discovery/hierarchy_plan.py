@@ -23,6 +23,9 @@ class PlanPosition(StrictModel):
     code: str = Field(min_length=1, description='Issued column ID containing this position object code.')
     label: str | None = Field(default=None, description='Issued display-name column ID, if present.')
     alias: str | None = Field(default=None, description='Issued alternate-name column ID, if present.')
+    aliases: list[str] = Field(default_factory=list,max_length=16,description=
+        'All additional alternate-name or English-name column IDs for this same object position. '
+        'Include known aliases in the first plan; these columns never enter identity.')
 
 
 class HierarchyPlan(StrictModel):
@@ -85,7 +88,7 @@ def hierarchy_plan_tool_schema() -> dict:
     }}
 
 
-def compile_hierarchy_plan(plan: HierarchyPlan | dict, packet: dict) -> ProposalBatch:
+def compile_hierarchy_plan(plan: HierarchyPlan | dict, packet: dict, *, validate_references=True) -> ProposalBatch:
     """Derive internal fields without changing the Agent's identity decisions.
 
     Source-local relative identities use a metadata-only domain tied to the
@@ -105,7 +108,7 @@ def compile_hierarchy_plan(plan: HierarchyPlan | dict, packet: dict) -> Proposal
     claim = WideHierarchy(
         group_id=plan.plan_id, entity_kind_hint=plan.entity_type,
         levels=[HypothesisLevel(position=position.position, key=position.code,
-            label=position.label, alias=position.alias) for position in plan.positions],
+            label=position.label, alias=position.alias,aliases=list(dict.fromkeys(position.aliases))) for position in plan.positions],
         namespace_columns=plan.namespace_columns,
         path_semantics='relative_path' if relative else 'legacy',
         identity_resolution='verified_identity_domain' if relative else 'source_scoped',
@@ -126,5 +129,5 @@ def compile_hierarchy_plan(plan: HierarchyPlan | dict, packet: dict) -> Proposal
         EntityTypeDefinition(name=plan.entity_type, description='Agent-proposed hierarchy business object type.')])
     batch = ProposalBatch(task=packet['task'], semantic_schema=schema, proposals=[
         HierarchyProposal(kind='wide_hierarchy', claim=claim, evidence_cited=refs)])
-    validate_proposal_references(batch, packet)
+    if validate_references:validate_proposal_references(batch, packet)
     return batch

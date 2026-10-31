@@ -9,6 +9,20 @@ from lightgraph.errors import LightGraphError
 from .models import ProposalBatch
 
 
+def definition_sections(packet):
+    """Use the compiler's exact scope/completeness gate for shared code domains."""
+    from types import SimpleNamespace
+    from .engine import _definition_document
+    scope=packet.get('scope')
+    table=SimpleNamespace(source_id=scope['source_id'],schema_name=scope.get('schema',scope.get('schema_name','public')),
+                          name=scope['table']) if scope else None
+    documents=packet.get('document_snippets',[])+packet.get('document_refs',[])
+    blocked={(d.get('doc_id'),d.get('revision'),d.get('section_id')) for d in documents if d.get('derived')}
+    return {f"{d['doc_id']}@{d['revision']}:{d['section_id']}" for d in documents
+        if all(d.get(k) for k in ('doc_id','revision','section_id'))
+        and (d['doc_id'],d['revision'],d['section_id']) not in blocked and _definition_document(d,table)}
+
+
 def reference_registry(packet):
     """Use the same revision-qualified section IDs as the semantic compiler."""
     documents = packet.get('document_snippets', []) + packet.get('document_refs', [])
@@ -19,6 +33,7 @@ def reference_registry(packet):
     probes = {p['probe_id'] for p in packet.get('probe_digest', [])}
     strata = {s['stratum'] for s in packet.get('strata_samples', [])}
     return {'columns': columns, 'evidence': columns | probes | strata | document_ids | sections,
+            'definition_sections':definition_sections(packet),
             'entities': set(packet.get('authorized_entities', [])),
             'selectors': set(packet.get('authorized_selectors', []))}
 
@@ -104,16 +119,20 @@ def invalid_reference_slots(batch, packet):
                 add(['claim', 'components', component, 'scope_evidence_ref'], 'evidence',
                     'dangling_evidence_reference', allowed=sections)
                 for offset in range(len(claim['components'][component]['identity_evidence'])):
-                    add(['claim', 'components', component, 'identity_evidence', offset], 'evidence',
-                        'dangling_evidence_reference', allowed=sections)
+                    add(['claim', 'components', component, 'identity_evidence', offset], 'definition_sections',
+                        'identity_domain_evidence_unresolved')
         elif kind == 'column_group':
             for field in ('identity_evidence', 'attribute_evidence', 'global_scope_evidence'):
-                many(['claim', field], 'evidence', 'dangling_evidence_reference')
+                domain=claim.get('identity_resolution')=='verified_identity_domain'
+                many(['claim', field], 'definition_sections' if domain else 'evidence',
+                     'identity_domain_evidence_unresolved' if domain else 'dangling_evidence_reference')
             for member in range(len(claim['members'])):
                 add(['claim', 'members', member, 'column_id'])
         elif kind == 'entity_key':
             for field in ('identity_evidence', 'attribute_evidence', 'global_scope_evidence'):
-                many(['claim', field], 'evidence', 'dangling_evidence_reference')
+                domain=claim.get('identity_resolution')=='verified_identity_domain'
+                many(['claim', field], 'definition_sections' if domain else 'evidence',
+                     'identity_domain_evidence_unresolved' if domain else 'dangling_evidence_reference')
             for field in ('key_columns', 'namespace_columns'):
                 many(['claim', field])
             for field in ('single_valued', 'multi_valued', 'display_only'):
@@ -127,6 +146,7 @@ def invalid_reference_slots(batch, packet):
             for level in range(len(claim['levels'])):
                 for field in ('key', 'label', 'alias', 'display_order'):
                     add(['claim', 'levels', level, field])
+                many(['claim','levels',level,'aliases'])
             for field in ('ordering_evidence', 'identity_evidence', 'attribute_evidence',
                           'global_scope_evidence', 'taxonomy_evidence', 'position_evidence',
                           'context_evidence', 'dag_evidence'):
@@ -162,6 +182,22 @@ def validate_proposal_references(batch, packet):
     slots = invalid_reference_slots(batch, packet)
     if slots:
         raise LightGraphError(slots[0].code)
+
+
+def normalize_definition_references(batch, packet):
+    """Resolve a document ID/version only when it names exactly one issued section.
+
+    This changes the locator spelling, never chooses among alternative evidence
+    sections, expands scope, substitutes a probe, or supplies absent evidence.
+    """
+    raw=batch.model_dump(mode='json');changed=0
+    for slot in invalid_reference_slots(batch,packet):
+        if slot.category!='definition_sections':continue
+        value=slot.get(raw)
+        matches=[ref for ref in slot.allowed if value in (ref.split('@',1)[0],ref.split(':',1)[0])]
+        if len(matches)==1:
+            slot.put(raw,matches[0]);changed+=1
+    return (ProposalBatch.model_validate(raw),changed) if changed else (batch,0)
 
 
 def normalize_column_references(batch, packet):
@@ -223,6 +259,9 @@ def validate_or_repair(client, batch, packet, *, max_repairs=2):
     batch, normalized = normalize_column_references(batch, packet)
     if normalized:
         client.usage['column_references_normalized'] = client.usage.get('column_references_normalized', 0) + normalized
+    batch, normalized = normalize_definition_references(batch,packet)
+    if normalized:
+        client.usage['definition_references_normalized']=client.usage.get('definition_references_normalized',0)+normalized
     slots = invalid_reference_slots(batch, packet)
     if not slots:
         return batch

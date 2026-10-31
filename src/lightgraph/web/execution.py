@@ -362,7 +362,7 @@ def _bounded_view(view, layer):
             "limits": {"nodes": MAX_GRAPH_NODES, "edges": MAX_GRAPH_EDGES}}
 
 
-def read_graph(workspace, pid, layer="business", *, include_candidates=False,offset=0,limit=240,q='',kind=''):
+def read_graph(workspace, pid, layer="business", *, include_candidates=False,offset=0,limit=240,q='',kind='',focus=''):
     """Publication heads, not stale graph.json exports, determine current results."""
     from ..store import GraphStore
     if layer == "metadata":
@@ -376,10 +376,10 @@ def read_graph(workspace, pid, layer="business", *, include_candidates=False,off
     with GraphStore(path) as store:
         from ..store.paging import graph_page
         view = graph_page(store,set(config.scopes),config.isolation_domain,layer=layer,
-                          include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind)
+                          include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus)
     result = _bounded_view(view, layer)
     result.update({key:view[key] for key in ('total_nodes','total_edges','matched_nodes','boundary_edges',
-        'next_offset','offset','page_size','generation','query_strategy','kinds')})
+        'next_offset','offset','page_size','generation','query_strategy','kinds','kind_counts','focus_node_id','focus_neighbor_count')})
     result["include_candidates"] = include_candidates
     return result
 

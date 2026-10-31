@@ -220,13 +220,13 @@ class PersistencePolicy:
                         raise PersistenceViolation('outside_relation_goal')
         if rule.identity.entity_kind not in self.kinds["business"]:
             raise PersistenceViolation("unregistered_node_kind")
-        attributes = set(rule.attributes.single_valued) | set(rule.attributes.multi_valued)
+        attributes = set(rule.attributes.single_valued) | set(rule.attributes.multi_valued) | set(rule.attributes.name_columns)
         if attributes - PROPERTY_NAMES - set(self.property_definitions):
             raise PersistenceViolation("property_not_in_output_contract")
         for name in attributes:
             self.check_property_kind(name, rule.identity.entity_kind)
             definition = self.property_definitions.get(name)
-            if definition and name in rule.attributes.multi_valued and not definition.multi_valued:
+            if definition and name in (set(rule.attributes.multi_valued)|set(rule.attributes.name_columns)) and not definition.multi_valued:
                 raise PersistenceViolation("property_multiplicity_mismatch")
         relation = rule.relation.relation if rule.relation else "parent_of" if rule.hierarchy else None
         if relation and not self.relation_states(relation):
