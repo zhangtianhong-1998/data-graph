@@ -22,7 +22,7 @@ def relation_attempt_consumed(result):
     return not any(issue.get('code') in _TIME_DEFERRALS for issue in (getattr(result,'issues',None) or []))
 
 
-DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/21'
+DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/23'
 # Share of the discovery window held back from object discovery so relation
 # discovery and its follow-up still run after entities exist.
 RELATION_WINDOW_FRACTION=0.35
@@ -80,7 +80,8 @@ def _deferred_tables(result, selected=()):
 def _discovery_counts(report, result):
     for key in ('compile_repair_rounds', 'recovered_proposals', 'deferred_proposals',
                 'discovery_invalid_drafts', 'discovery_pending_submissions', 'semantic_revision_attempts',
-                'compatible_rule_merges','rule_conflict_revision_attempts','rule_conflict_revisions_compiled'):
+                'compatible_rule_merges','rule_conflict_revision_attempts','rule_conflict_revisions_compiled',
+                'field_model_resume_tasks','field_model_rule_attempts','table_time_deferrals'):
         value = result.stats.get(key, 0)
         if type(value) is int:
             report.counts[key] = report.counts.get(key, 0) + value
@@ -388,13 +389,12 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             changed_goals={sid for sid in rules_by_source
                 if (marker:=store.current_versions('discovery:'+sid))
                 and (marker.get('goal')!=digest(config.goal.model_dump())
-                     or marker.get('workflow')!=DISCOVERY_WORKFLOW_VERSION
                      or marker.get('mode')!=discovery_mode)}
             for rule in old_rules:
                 if rule.source.source_id in changed_goals:
-                    invalidate(rule.rule_id,'discovery_goal_or_workflow_changed')
+                    invalidate(rule.rule_id,'discovery_goal_or_mode_changed')
             if changed_goals:
-                store.invalidate_rule('metadata-alignments','discovery_goal_or_workflow_changed')
+                store.invalidate_rule('metadata-alignments','discovery_goal_or_mode_changed')
                 report.counts['goal_invalidated_rules']=sum(r.source.source_id in changed_goals for r in old_rules)
         goal_engine=RuleEngine(store,isolation_domain=config.isolation_domain)
         for r in old_rules:
@@ -431,6 +431,12 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             if not adapter.describe():report.issues.append({'code':'source_catalog_empty_unverified'})
             report.counts['tables']=report.counts.get('tables',0)+publish_metadata(store,adapter,config.isolation_domain)
         cached=_latest(store.get_rules()) if auto and not config.rediscover else []
+        # A workflow upgrade changes discovery strategy, not the authority of an
+        # already published interpretation. All cached rules still undergo goal,
+        # dependency, pattern and complete-projection validation below.
+        stable_tables={(r.source.source_id,r.source.schema_name+'.'+r.source.table)
+            for r in cached if r.kind!='reference' and r.rule_id not in affected_context_rules}
+        pattern_review_tables=set()
         need_discovery={sid for sid in rules_by_source if old_catalog[sid]!=store.current_versions('catalog:'+sid)}
         discovery_tables={sid:set(contexts[sid]) for sid in need_discovery}
         for sid,names in changed_contexts.items():
@@ -456,9 +462,12 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         for sid in rules_by_source:
             marker=store.current_versions('discovery:'+sid)
             if marker and (marker.get('goal')!=digest(config.goal.model_dump())
-                           or marker.get('workflow')!=DISCOVERY_WORKFLOW_VERSION
                            or marker.get('mode')!=discovery_mode):
                 need_discovery.add(sid);discovery_tables[sid]=set(contexts[sid])
+            elif marker and marker.get('workflow')!=DISCOVERY_WORKFLOW_VERSION:
+                need_discovery.add(sid)
+                discovery_tables.setdefault(sid,set()).update(name for name in contexts[sid]
+                    if (sid,name) not in stable_tables)
         if auto:
             from .discovery.cache import validate_cached_patterns
             for sid,adapter in rules_by_source.items():
@@ -468,6 +477,8 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     need_discovery.add(sid)
                     discovery_tables.setdefault(sid,set()).update(
                         r.source.schema_name+'.'+r.source.table for r in cached if r.rule_id in review.needs_review)
+                    pattern_review_tables.update((sid,r.source.schema_name+'.'+r.source.table)
+                        for r in cached if r.rule_id in review.needs_review)
             by_table={(t.source_id,t.schema_name,t.name):t for t in tables}
             for rule in cached:
                 table=by_table.get((rule.source.source_id,rule.source.schema_name,rule.source.table))
@@ -487,6 +498,11 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 selected=set(contexts[sid]) if config.rediscover else discovery_tables.get(sid,set(contexts[sid]))
                 if not config.rediscover:
                     selected=selected-ledger.unresolved_tables(sid,contexts[sid])
+                    # A partial tool session need not rediscover its published
+                    # objects. Coverage and relation tasks resume independently.
+                    selected={name for name in selected if (sid,name) not in stable_tables
+                        or name in invalidating_contexts.get(sid,set())
+                        or (sid,name) in pattern_review_tables}
                     selected.update(retry_tables.get(sid,set()))
                 discovery_tables[sid]=selected
                 if not selected:
@@ -519,8 +535,10 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 old={r.rule_id:r for r in _latest(store.get_rules(include_stale=True))}
                 for rule in result.rules:
                     if rule.rule_id in old:rule.revision=old[rule.rule_id].revision+1
-                allrules=[r for r in allrules if r.source.source_id!=sid
-                          or r.source.schema_name+'.'+r.source.table not in selected]+result.rules
+                # Failed exploration is not a withdrawal of independent valid
+                # rules from the same table. Replace only explicitly revised IDs.
+                replacements={r.rule_id for r in result.rules}
+                allrules=[r for r in allrules if r.rule_id not in replacements]+result.rules
                 _issues(report,result.issues)
                 _discovery_counts(report,result)
                 report.counts['discovered_rules']=report.counts.get('discovered_rules',0)+len(result.rules)
@@ -612,14 +630,12 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                             retire_dangling_document_alignments(store)
             for code in outcome.codes:report.issues.append({'rule_id':rule.rule_id,'code':code})
             return outcome.prepared
-        from .discovery.schema_knowledge import drop_foreign_identity_copies, project_retained_labels
-        dropped=drop_foreign_identity_copies(allrules)
-        if dropped:
-            allrules=[rule for rule in allrules if rule.rule_id not in dropped]
-            for rule_id, table in sorted(dropped.items()):
-                report.issues.append({'rule_id':rule_id,'code':'foreign_identity_not_entity',
-                    'table':table,'status':'deferred'})
-        report.counts['display_labels_projected']=project_retained_labels(allrules, schema_knowledge)
+        from .discovery.schema_knowledge import project_retained_labels
+        # A new display mapping is a rule change. Never mutate cached/manual
+        # contracts under their existing immutable revision.
+        cached_ids={(r.rule_id,r.revision) for r in cached}
+        fresh=[r for r in allrules if auto and (r.rule_id,r.revision) not in cached_ids]
+        report.counts['display_labels_projected']=project_retained_labels(fresh, schema_knowledge)
         for rule in allrules:execute(rule)
         relation_role_context={}
         def review_role_occurrences():
@@ -720,10 +736,35 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                             if rule.rule_id not in failed:
                                 executed_object=True
                         if executed_object:
+                            # The repair may have created the endpoint this very
+                            # request was missing. Refresh both the authorization
+                            # set and scheduler version before the bounded retry.
+                            endpoint_ids={r.rule_id for r in prepared_rules
+                                if r.kind!='reference' and r.rule_id not in failed}
+                            endpoints=[r for r in _latest(store.get_rules()) if r.rule_id in endpoint_ids]
+                            endpoint_versions=sorted((r.rule_id,r.revision) for r in endpoints)
+                            version='relations_'+digest(context_version,endpoint_versions,role_context)
+                            relation_attempts.add((sid,name,version))
+                            ledger.transition(item,'superseded')
+                            item=ledger.enqueue(item.source,task='relation_discovery',rules=endpoints,
+                                context_version=version,force=True,codes=role_codes,column_refs=role_columns)
+                            ledger.supersede_previous(item)
+                            if relation_attempt_counts.get((sid,name),0)>=config.max_relation_discovery_attempts:
+                                ledger.transition(item,'deferred')
+                                report.issues.append({'code':'relation_discovery_attempt_budget_exhausted',
+                                    'table':name,'status':'deferred'})
+                                continue
+                            ledger.transition(item,'running')
                             retried=explore(discover_references,rules_by_source[sid],endpoints,documents=corpus,
                                 model=discovery_model,goal=config.goal,source_adapters=rules_by_source,
                                 table_refs={name},iteration_context={**ledger.context([item],allrules,iteration=rounds),
                                     'role_occurrences':role_context},phase='relation')
+                            if relation_attempt_consumed(retried):
+                                relation_attempt_counts[(sid,name)]=relation_attempt_counts.get((sid,name),0)+1
+                            if not any(i.get('code')=='reference_source_object_missing'
+                                       for i in retried.issues):
+                                report.issues[:]=[i for i in report.issues if not (
+                                    i.get('table')==name and i.get('code')=='reference_source_object_missing')]
                             ledger.record_discovery_feedback([item.source],retried.issues,task='relation_discovery')
                             candidates_queue.record(retried)
                             _issues(report,retried.issues);_discovery_counts(report,retried)
@@ -953,6 +994,10 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 if not unexplained_columns(table,prepared_rules,understandings,config.goal,engine):
                     ledger.resolve_exploration(SourceRef(source_id=table.source_id,schema=table.schema_name,table=table.name),
                                                'coverage_discovery')
+                    if any(r.source.source_id==table.source_id and r.source.schema_name==table.schema_name
+                           and r.source.table==table.name for r in prepared_rules):
+                        ledger.resolve_exploration(SourceRef(source_id=table.source_id,
+                            schema=table.schema_name,table=table.name),'metadata_discovery')
                     report.issues[:]=[i for i in report.issues if not (
                         i.get('table')==table.qualified_name and i.get('code')=='unexplained_columns')]
         failed_tables={(r.source.source_id,r.source.schema_name,r.source.table) for r in allrules if r.rule_id in failed}
@@ -1013,14 +1058,21 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             for sid in need_discovery:
                 previous=store.current_versions('discovery:'+sid) or {}
                 matching=(previous.get('goal')==digest(config.goal.model_dump()) and
-                    previous.get('workflow')==DISCOVERY_WORKFLOW_VERSION and previous.get('mode')==discovery_mode)
+                    previous.get('mode')==discovery_mode)
                 completed_versions=_context_versions(previous) if matching else {}
                 # Do not advance failed or unvisited tables. Missing entries are
                 # retried next run even when another table published successfully.
                 for name in discovery_tables.get(sid,set(contexts[sid])):
                     completed_versions.pop(name,None)
+                # A prior marker write may have failed after business commit.
+                # Full revalidation and complete column coverage can restore it
+                # without asking the model to rediscover the published objects.
+                complete_tables=set(discovery_completed.get(sid,set()))
+                complete_tables.update(t.qualified_name for t in tables if t.source_id==sid
+                    and (sid,t.qualified_name) in stable_tables
+                    and not unexplained_columns(t,prepared_rules,understandings,config.goal,engine))
                 completed_versions.update({name:contexts[sid][name]
-                    for name in discovery_completed.get(sid,set()) if name in contexts[sid]
+                    for name in complete_tables if name in contexts[sid]
                     and {r.rule_id for r in allrules if r.source.source_id==sid
                          and r.source.schema_name+'.'+r.source.table==name} <= set(report.rules_published)})
                 marker=store.begin_publication('discovery:'+sid,1,'all',{'goal':digest(config.goal.model_dump()),

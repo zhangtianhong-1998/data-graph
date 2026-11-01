@@ -6,7 +6,7 @@
 
 依赖的本轮实测版本记录在 `requirements.lock`；需要复现环境时先安装该文件，再安装项目。
 
-2026-10-31 最新完成的五表真实模型实验 `full-extraction-v2-schema-first-20261031T024424Z` 为 PARTIAL：64 次调用、约 58 分 20 秒，只发布产品定义的一条规则，得到 5 个业务节点、0 条边，18 次无效提交；其余四表尚未发布。本轮针对字段认识替代、兼容提案合并、可恢复冲突候选及按实际依赖分组发布进行修改，见[发现冲突的修订与独立发布](design/lightweight_graph/CONFLICT_RESOLUTION_20261031.md)。五表固定规则对照仍为 462 节点 / 930 边；自动发现效果须由新实验检验。全量实验限 240 次调用 / 2 小时，累计 tokens 不限。
+2026-11-01 本轮回到 `full-extraction-v2-relation-window-20261101T045641Z` 的代码基线：该实验为 PARTIAL，七条规则发布 252 个业务节点、720 条边；概念 12/12、联合组合 240/240 匹配，报表项层级及英文名未完成。本轮改为保存有效规则、恢复已记录字段模型并补充层级语义，再全量重验；冻结实验支持从已结束的实验继续。详见[原因、修改与验收边界](design/lightweight_graph/RESUMABLE_DISCOVERY_20261101.md)。当前五表固定规则对照仍为 462 节点 / 930 边、全部声明评分 exact；自动发现质量须由新实验检验。全量实验限 240 次调用 / 2 小时，累计 tokens 不限。
 
 当前运行能力与验证边界见 [实施与验收记录](IMPLEMENTATION_STATUS.md)。最新的持续发现、可选关系、整组身份复核与运行指导改动见[两份评审后的继续修复](design/lightweight_graph/REVIEW_CONTINUATION_20261027.md)，上一轮协议修复见[真实数据反馈记录](design/lightweight_graph/REAL_DATA_DISCOVERY_REPAIR.md)。工程验证使用合成输入和离线模型替身，用户另一台机器上的真实数据仍待复跑。当前需求见 [用户故事](design/lightweight_graph/US.md) 和 [目标驱动迭代方案](design/lightweight_graph/GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)；[设计索引](design/lightweight_graph/README.md) 保留各项约束与历史边界。
 
@@ -259,13 +259,15 @@ Agent 现在通过提交工具逐条保存内存草稿，再用简短的结束�
 
 ```bash
 .venv/bin/lightgraph prepare-evaluation CONFIG.json --gold GOLD.json --output runs/NEW_RUN
+# 继续已结束的同输入实验，复制旧状态到新目录并全量重验：
+.venv/bin/lightgraph prepare-evaluation CONFIG.json --gold GOLD.json --output runs/RESUME_RUN --resume-from runs/OLD_RUN
 .venv/bin/lightgraph run-frozen runs/NEW_RUN
 .venv/bin/lightgraph evaluate runs/NEW_RUN/output/graph.json --gold GOLD.json --output evaluation.json
 ```
 
 Gold 独立于执行包；冻结工具复制完整代码、输入和配置，并核对哈希与依赖版本。评测分别计量已接受结果、含候选结果、身份、边、名称、来源位置和范围，不通过合并重复节点来提高召回。代码与输入冻结不等于抽取验收通过。
 
-发现工作流升级到 `goal_driven_iterations/15` 后，旧发现缓存会重新审核。旧发布保留在历史中，不能绕过新的对象粒度和语义检查直接作为当前结果。多表知识查询、文档重复及历史窗口问题已修复，见[请求超限诊断与离线复现](design/lightweight_graph/PROMPT_WINDOW_DIAGNOSIS_20261030.md)。
+当前发现工作流为 `goal_driven_iterations/23`。仅调度版本变化时保留已验证规则，优先补缺失对象、属性和关系；规则仍做完整数据重验，目标、模式、权限、文档变化及数据反例仍可触发失效或复核。冻结续跑只接受输入及授权一致的已结束实验，并明确记录父实验，不能作为从空白库发现的独立样本。多表知识查询、文档重复及历史窗口修复见[请求超限诊断与离线复现](design/lightweight_graph/PROMPT_WINDOW_DIAGNOSIS_20261030.md)。
 
 引用规则默认禁止实体指向自身。自定义关系确实允许反身语义时，须在关系定义中显式声明 `allow_self_links: true`，并通过独立语义复核；换一个关系名不会自动获得许可。升级后，缺少新版自环验证标记的旧引用发布会退出当前视图，下一次运行重新验证；正确的实体、宽层级及历史记录保留。已有合法缓存可直接重验，发现反例则进入关系复核。
 

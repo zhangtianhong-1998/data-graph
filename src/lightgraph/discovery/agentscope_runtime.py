@@ -353,7 +353,9 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
                 'model_packet_too_large','model_response_too_large','discovery_steps_exhausted',
                 'discovery_tool_calls_exhausted','discovery_final_response_required',
                 'model_schema_invalid','model_response_invalid','model_response_truncated',
-                'model_stream_invalid','model_http_error','model_rate_limited'})
+                'model_stream_invalid','model_http_error','model_rate_limited',
+                'wall_time_budget_exhausted','discovery_time_budget_exhausted',
+                'run_time_budget_exhausted'})
             if not (session.drafts or session.invalid_count or session.object_models) or not recoverable:
                 raise
             batch=session.batch(pending_code='discovery_submission_incomplete')

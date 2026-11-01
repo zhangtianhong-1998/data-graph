@@ -5,6 +5,8 @@ The Agent and query tools own ephemeral observations and never persist transcrip
 """
 from __future__ import annotations
 
+import time
+
 from pydantic import ValidationError
 
 from lightgraph.contracts import (ExtractionGoal, ExcludedColumn, RuleSpec, IdentitySpec,
@@ -254,6 +256,8 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                 review_packet={**review_packet,'iteration_context':{
                     **review_packet['iteration_context'],'rule_conflict_requests':conflict_context,
                     'pending_candidates':[]}}
+            if p.kind=='wide_hierarchy' and (packet or {}).get('iteration_context',{}).get('field_model_revision_guard'):
+                review_packet={**review_packet,'semantic_revision_guard':packet['iteration_context']['field_model_revision_guard']}
             if p.kind=='wide_hierarchy':
                 if related_requests and len(requests)>MAX_HIERARCHY_IDENTITY_REQUESTS:
                     raise LightGraphError('hierarchy_identity_repair_context_limit')
@@ -391,7 +395,7 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
 def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations,
                         tool_factory=None,projection_excluded=(),identity_excluded=(),
                         hierarchy_rules=(),granularity_rejections=None,observed_hierarchies=None,
-                        on_revision=None):
+                        on_revision=None,defer_granularity_revision=False):
     """Preserve valid siblings and allow one structurally changed semantic alternative.
 
     Semantic judgments and full data validation remain separate. Actual data
@@ -445,11 +449,8 @@ def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations
             from .conflicts import mark_conflict_repaired
             mark_conflict_repaired(result,cid,accepted[0].rule_id)
         elif replacements:_issue(result,table,'rule_conflict_constraints_changed')
-    # A grain refutation means those columns are not one composite entity.
-    # Asking for a smaller key of the same kind cannot express the path.
-    revisable=[item for item in semantic_failures
-        if not (getattr(item['failure'],'stage',None)=='entity_granularity'
-                and item['failure'].code=='semantic_claim_refuted')]
+    revisable=[item for item in semantic_failures if not (defer_granularity_revision
+        and item['failure'].stage=='entity_granularity' and item['failure'].code=='semantic_claim_refuted')]
     alternatives,docs=revise_once(revisable,model=model,packet=packet,
         tool_factory=tool_factory,ask=ask_revision,observations=observations,result=result,table=table,documents=docs)
     for item,proposal,schema,repair_packet in alternatives:
@@ -487,35 +488,6 @@ def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations
     if unresolved:
         result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
     return rules,docs,batch,packet,(projection_excluded,identity_excluded)
-
-
-def hierarchy_recovery_refs(result, table, docs):
-    """Evidence for a path compiled after a composite-key grain refutation.
-
-    A direct refutation of the hierarchy claim itself blocks this recovery.
-    Grain counterevidence prefers the definition sections that refuted the
-    composite key; otherwise the table's applicable definition sections.
-    """
-    from .engine import _definition_document, _source
-    source=_source(table)
-    own=[candidate for candidate in result.pending_candidates if candidate.source==source]
-    if any(candidate.review_stage=='hierarchy' and candidate.failure_code=='semantic_claim_refuted'
-           for candidate in own):
-        return None
-    applicable=[document['doc_id']+'@'+document['revision']+':'+document['section_id']
-        for document in docs if _definition_document(document, table)]
-    grain=[candidate for candidate in own
-        if candidate.review_stage=='entity_granularity' and candidate.failure_code=='semantic_claim_refuted']
-    if not grain:
-        return applicable, ()
-    allowed=set(applicable)
-    blocking=[ref for candidate in grain for ref in candidate.blocking_evidence_refs if ref in allowed]
-    keys=[]
-    for candidate in grain:
-        for ref in candidate.column_refs:
-            if ref not in keys:
-                keys.append(ref)
-    return (blocking or applicable), keys
 
 
 def _verify_fd(adapter, table, rule, budget):
@@ -619,10 +591,10 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
     # table after the first page can never be explored, even on a retry.
     catalog_size=len(tables)
     window_coverage=[]
-    for table in _exploration_order(tables):
-        if table_refs is not None and not any(key in table_refs for key in (
-            table.qualified_name,table.source_id+'.'+table.qualified_name,
-            (table.source_id,table.schema_name,table.name))):continue
+    selected=[table for table in _exploration_order(tables) if table_refs is None or any(
+        key in table_refs for key in (table.qualified_name,table.source_id+'.'+table.qualified_name,
+            (table.source_id,table.schema_name,table.name)))]
+    for table_index,table in enumerate(selected):
         original=originals[table.qualified_name]
         docs=corpus.context_for(_source(table),table.column_names)
         understanding=_understanding(table,[],{},docs)
@@ -631,6 +603,12 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
         reservation='agent_validation_'+digest(table.qualified_name)[:16]
         tools=None
         observations=ReviewObservations()
+        phase_deadline=getattr(budget,'deadline_monotonic',None)
+        if phase_deadline is not None and callable(getattr(budget,'set_phase_deadline',None)):
+            # Give every selected table a turn. Unused time rolls forward; no
+            # table may extend the caller's object/relation phase ceiling.
+            now=time.monotonic()
+            budget.set_phase_deadline(now+max(0,phase_deadline-now)/(len(selected)-table_index))
         try:
             # Exploration cannot consume the minimum reserved validation work.
             budget.reserve(reservation,Cost(db_cu=2))
@@ -667,6 +645,31 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
                     '若列表达遗漏的身份范围，提出保留对象键与层级并增加命名空间的完整候选；'
                     '程序会另开 T5 身份修订和独立语义审查，不以属性增补代替范围更改。'
                     '只有独立业务对象才提出新实体；无法说明的列保留未决，不得仅为完成覆盖而排除。')
+            from .schema_knowledge import hierarchy_field_models
+            remembered=hierarchy_field_models(packet['schema_knowledge'].get('objects',[]))
+            field_work=packet['schema_knowledge'].get('field_model_work')
+            prior_hierarchy_refuted=any(item.get('review_stage')=='hierarchy'
+                and item.get('failure_code')=='semantic_claim_refuted'
+                for item in packet.get('iteration_context',{}).get('pending_candidates',[]))
+            if schema_knowledge and prior_hierarchy_refuted:
+                schema_knowledge.set_field_model_work(table,'review_refuted')
+                field_work='review_refuted'
+            restoring=bool(remembered and not prior and field_work!='review_refuted')
+            if restoring:
+                packet.update(task='T3_hierarchy',subtask=
+                    '继续已有字段对象的层级语义确认。使用 submit_field_model_hierarchy，选择已签发 object_id；'
+                    '程序会复用位置、编码、名称、全部别名和命名空间，不要重新填写这些列。'
+                    '根据本表定义明确选择身份范围、多父关系和重复填充语义；缺证据才补查。'
+                    '旧对象粒度反驳不是层级批准。提案仍必须独立语义审查；不能确认则保留未决。')
+                schema_knowledge.set_field_model_work(table,'pending')
+                result.stats['field_model_resume_tasks']=result.stats.get('field_model_resume_tasks',0)+1
+                grain_candidates=[item for item in packet.get('iteration_context',{}).get('pending_candidates',[])
+                    if item.get('review_stage')=='entity_granularity' and item.get('failure_code')=='semantic_claim_refuted']
+                if grain_candidates:
+                    packet['iteration_context']['field_model_revision_guard']={'blocking_evidence_refs':sorted({ref
+                        for item in grain_candidates for ref in item.get('blocking_evidence_refs',[])}),
+                        'conditions':[]}
+
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                 allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=[table])
             window,packet=_bounded_catalog_window(table,tables,packet,model,tools.tool_specs())
@@ -691,26 +694,74 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             def record_revision(revised,repair_packet):
                 if schema_knowledge:
                     schema_knowledge.record_models(table,getattr(revised,'_runtime_object_models',[]),repair_packet)
+            remembered=(hierarchy_field_models(schema_knowledge.current_objects(table)) if schema_knowledge else [])
+            old_guards=(schema_knowledge.field_model_guards(table) if schema_knowledge else (set(),set()))
+            batch_guards=_proposal_guards(batch,original,goal)
+            projection_guards=old_guards[0]|batch_guards[0]|{
+                entry.column for prior_rule in prior for entry in prior_rule.attributes.excluded}
+            identity_guards=old_guards[1]|batch_guards[1]
+            if schema_knowledge:
+                schema_knowledge.record_field_model_guards(table,projection_guards,identity_guards)
+                if remembered:schema_knowledge.set_field_model_work(table,'pending')
             rules,docs,batch,packet,guards=_compile_candidates(batch,original,goal,docs,result,
                 model=model,packet=packet,observations=observations,tool_factory=fresh_tools,
-                projection_excluded={entry.column for prior_rule in prior for entry in prior_rule.attributes.excluded},
+                projection_excluded=projection_guards,identity_excluded=identity_guards,
                 hierarchy_rules=prior,granularity_rejections=granularity_rejections,
-                observed_hierarchies=observed_hierarchies,on_revision=record_revision)
-            if schema_knowledge and not any(rule.kind=='wide_hierarchy' for rule in rules):
-                from .schema_knowledge import proposals_from_field_models
-                recovery_refs=hierarchy_recovery_refs(result, table, docs)
-                prepared=proposals_from_field_models(
-                    schema_knowledge.current_objects(table), *recovery_refs) if recovery_refs is not None else []
-                if prepared:
-                    recovery=ProposalBatch(task=batch.task,proposals=prepared[:6],
-                        semantic_schema=batch.semantic_schema)
-                    recovered,docs,batch,packet,guards=_compile_candidates(recovery,original,goal,docs,result,
-                        model=model,packet=packet,observations=observations,tool_factory=fresh_tools,
-                        projection_excluded={entry.column for prior_rule in prior for entry in prior_rule.attributes.excluded},
+                observed_hierarchies=observed_hierarchies,on_revision=record_revision,
+                defer_granularity_revision=bool(remembered))
+            hierarchy_refuted=any(candidate.source==_source(table) and candidate.review_stage=='hierarchy'
+                and candidate.failure_code=='semantic_claim_refuted' for candidate in result.pending_candidates)
+            if schema_knowledge and hierarchy_refuted:
+                schema_knowledge.set_field_model_work(table,'review_refuted')
+            if (schema_knowledge and remembered and not restoring and not hierarchy_refuted
+                    and schema_knowledge._load(table).get('field_model_work')!='review_refuted'
+                    and not any(rule.kind=='wide_hierarchy' for rule in rules)):
+                recovery_packet={**packet,'task':'T3_hierarchy','schema_knowledge':schema_knowledge.context(table),
+                    'subtask':'已有完整多位置字段模型。使用 submit_field_model_hierarchy 和该模型 object_id，'
+                    '仅补充本表文档支持的身份范围、位置含义、多父许可及重复填充含义。'
+                    '程序会保留全部字段映射和排除约束；不得重试已被反驳的组合键身份。'}
+                recovery_tools=fresh_tools()
+                try:
+                    budget.check_deadline()
+                    recovery=_ask(model,recovery_packet,recovery_tools,observations)
+                    record_revision(recovery,recovery_packet)
+                    docs=recovery_tools.context_documents()
+                    recovered,docs,_,_,guards=_compile_candidates(recovery,original,goal,docs,result,
+                        model=model,packet=recovery_packet,observations=observations,tool_factory=None,
+                        projection_excluded=guards[0],identity_excluded=guards[1],
                         hierarchy_rules=prior,granularity_rejections=granularity_rejections,
                         observed_hierarchies=observed_hierarchies,on_revision=record_revision)
-                    rules=[*rules,*recovered]
+                    rules.extend(recovered)
                     result.stats['field_model_rule_attempts']=result.stats.get('field_model_rule_attempts',0)+1
+                except LightGraphError as exc:
+                    # An incomplete follow-up cannot discard independently
+                    # compiled siblings. Retained mappings are tried next run.
+                    _issue(result,table,exc.code)
+                finally:
+                    recovery_tools.close()
+                if any(candidate.source==_source(table) and candidate.review_stage=='hierarchy'
+                        and candidate.failure_code=='semantic_claim_refuted' for candidate in result.pending_candidates):
+                    schema_knowledge.set_field_model_work(table,'review_refuted')
+            if schema_knowledge and any(rule.kind=='wide_hierarchy' for rule in rules):
+                schema_knowledge.set_field_model_work(table,'compiled')
+                if restoring:
+                    for item in grain_candidates:
+                        # Resolve the work only after the replacement hierarchy
+                        # publishes; the old refutation itself is never changed.
+                        matches=[]
+                        for r in rules:
+                            if r.kind!='wide_hierarchy':continue
+                            keys={_column_id(table,level.code) for level in r.hierarchy.levels}
+                            namespaces={_column_id(table,name) for name in r.scope.namespaces}
+                            for mapping in item.get('mappings',[]):
+                                before={ref for field in mapping.get('fields',[]) if field.get('role')=='key'
+                                    for ref in field.get('columns',[])}-namespaces
+                                if mapping.get('entity_kind')==r.identity.entity_kind and len(before)>=2 and before<=keys:
+                                    matches.append(r);break
+                        if len(matches)==1:
+                            result.resolved_candidate_ids.append(item['candidate_id'])
+                            result.candidate_replacement_rules[item['candidate_id']]=[matches[0].rule_id]
+
             if prior and 'fd_violation' in original_revision_codes:
                 protected=prior[0]
                 safe=[]
@@ -790,11 +841,17 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             if not understanding.rule_refs: _issue(result,table,'no_confirmable_entity_group')
         except LightGraphError as exc:
             _issue(result,table,exc.code)
-            if isinstance(exc,BudgetExceeded):break
+            if exc.code=='wall_time_budget_exhausted' and phase_deadline is not None and time.monotonic()<phase_deadline:
+                result.stats['table_time_deferrals']=result.stats.get('table_time_deferrals',0)+1
+            if isinstance(exc,BudgetExceeded) and not (
+                    exc.code=='wall_time_budget_exhausted' and phase_deadline is not None
+                    and time.monotonic()<phase_deadline):break
         finally:
             if tools is not None: tools.close()
             observations.close()
             budget.release(reservation)
+            if phase_deadline is not None and callable(getattr(budget,'set_phase_deadline',None)):
+                budget.set_phase_deadline(phase_deadline)
     result.stats.update({'tables_considered':len(result.understandings),'catalog_tables':catalog_size,
         'catalog_window_limit':64,'catalog_windows':len(window_coverage),
         'catalog_window_min':min(window_coverage,default=0),

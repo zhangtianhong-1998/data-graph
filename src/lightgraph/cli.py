@@ -50,6 +50,7 @@ def parser():
     c.add_argument('--mapping',required=True,help='JSON with role_kinds, role_relations and context_kind; mapping is not inferred.')
     c=sub.add_parser('prepare-evaluation',help='冻结本地输入、配置及完整 Python 包，不执行模型')
     c.add_argument('config');c.add_argument('--gold',required=True);c.add_argument('--output',required=True)
+    c.add_argument('--resume-from',help='从已结束冻结实验的结果副本继续；输入、目标和权限须一致，旧规则全量重验')
     c=sub.add_parser('run-frozen',help='核验冻结清单后从快照代码执行一次；使用配置中的模型预算')
     c.add_argument('bundle')
     c=sub.add_parser('report');c.add_argument('path')
@@ -77,7 +78,7 @@ def run(args):
         emit(result);return 1 if result.status=='GRAPH_FILE_MISSING' else 0
     if args.command=='prepare-evaluation':
         from .evaluation.frozen import prepare
-        result=prepare(args.config,args.output,gold_path=args.gold)
+        result=prepare(args.config,args.output,gold_path=args.gold,resume_from=args.resume_from)
         emit({'status':'PREPARED','bundle':result['bundle_root'],'budgets':result['budgets'],
               'gold_copied':result['gold_copied']});return 0
     if args.command=='evaluate-concepts':

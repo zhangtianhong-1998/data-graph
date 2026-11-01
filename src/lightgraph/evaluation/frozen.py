@@ -1,7 +1,8 @@
 """Freeze local inputs and code, then execute only the verified package snapshot.
 
 Gold is hashed for provenance and exclusion checks, never copied into the bundle
-or opened by the execution worker. Database snapshots are intentionally rejected.
+or opened by the execution worker. Live database inputs are intentionally rejected.
+An explicit resume copies a completed result database after input/scope checks.
 """
 from __future__ import annotations
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -31,7 +33,74 @@ def files_under(directory):
     return {str(p.relative_to(directory)): fingerprint(p) for p in sorted(directory.rglob('*')) if p.is_file()}
 
 
-def prepare(config_path, output, *, gold_path):
+def _resume_contract(config):
+    """Paths may move; authorized inputs, semantics and permissions must not."""
+    sources=[]
+    for source in config.sources:
+        item=source.model_dump(mode='json')
+        path=item.pop('path', None)
+        item.pop('capability_manifest', None)
+        if not path or not Path(path).is_file():
+            raise LightGraphError('evaluation_resume_input_missing')
+        item['content_sha256']=fingerprint(path)
+        if source.kind=='csv_file':
+            item['table_name']=source.table_name or Path(path).stem
+        sources.append(item)
+    return {'sources':sources, 'documents':[fingerprint(p) for p in config.documents],
+        'rules':[fingerprint(p) for p in config.rules], 'goal':config.goal.model_dump(mode='json'),
+        'scopes':sorted(config.scopes), 'document_scopes':sorted(config.document_scopes),
+        'domain':config.isolation_domain, 'removed_rule_ids':sorted(config.removed_rule_ids),
+        'removed_document_ids':sorted(config.removed_document_ids), 'mode':config.resolved_model.mode}
+
+
+def _prepare_resume(parent, target, config):
+    """Back up the completed parent without changing its graph or frozen files."""
+    from lightgraph.runtime.config import load_config
+    from lightgraph.runtime.locking import run_lock
+    from lightgraph.contracts import digest
+    parent=Path(parent).resolve()
+    verify(parent)
+    terminal=load(parent/'execution.json') if (parent/'execution.json').is_file() else {}
+    if terminal.get('status') not in {'PARTIAL','COMPLETED','COMPLETED_WITH_GAPS'}:
+        raise LightGraphError('evaluation_resume_parent_not_completed')
+    previous=load_config(parent/'config.json')
+    if config.rediscover:
+        raise LightGraphError('evaluation_resume_requires_incremental')
+    if _resume_contract(previous)!=_resume_contract(config):
+        raise LightGraphError('evaluation_resume_context_changed')
+    database=parent/'output/graph.sqlite'
+    if not database.is_file():
+        raise LightGraphError('evaluation_resume_store_missing')
+    seed=target/'resume_seed';seed.mkdir()
+    # The original run may have WAL pages. A raw file copy is not a snapshot.
+    with run_lock(parent/'output'):
+        with sqlite3.connect(database.as_uri()+'?mode=ro',uri=True) as source:
+            with sqlite3.connect(seed/'graph.sqlite') as destination:
+                source.backup(destination)
+                if destination.execute('PRAGMA integrity_check').fetchone()[0]!='ok':
+                    raise LightGraphError('evaluation_resume_store_invalid')
+        for name in ('metadata','understanding'):
+            if (parent/'output'/name).is_dir():
+                shutil.copytree(parent/'output'/name,seed/name)
+    frozen=load_config(target/'config.json')
+    def scope_key(cfg):
+        return digest(cfg.goal.model_dump(mode='json'),sorted(cfg.scopes),cfg.isolation_domain,
+            [s.model_dump(mode='json',by_alias=True) for s in cfg.sources])
+    old_key,new_key=scope_key(previous),scope_key(frozen)
+    with sqlite3.connect(seed/'graph.sqlite') as connection:
+        tables={r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for name in ('discovery_candidate','discovery_candidate_event','discovery_candidate_replacement'):
+            if name in tables and old_key!=new_key:
+                connection.execute(f'UPDATE {name} SET scope_key=? WHERE scope_key=?',(new_key,old_key))
+    return {'parent_bundle':str(parent), 'parent_manifest_sha256':fingerprint(parent/'bundle.json'),
+        'parent_report_sha256':fingerprint(parent/'output/report.json'),
+        'seed_database_sha256':fingerprint(seed/'graph.sqlite'),
+        'candidate_scope_rebound':old_key!=new_key,
+        'input_contract_sha256':digest(_resume_contract(config)),
+        'mode':'resume_and_full_revalidation', 'parent_status':terminal['status']}
+
+
+def prepare(config_path, output, *, gold_path, resume_from=None):
     from lightgraph.runtime.config import load_config
     config = load_config(config_path)
     settings = config.resolved_model
@@ -73,6 +142,9 @@ def prepare(config_path, output, *, gold_path):
             remap[str(Path(path).resolve())] = str(destination)
         data = config.model_dump(mode='json')
         for item in data['sources']:
+            if item['kind']=='csv_file' and not item.get('table_name'):
+                # Freezing changes the filename, not the authorized table name.
+                item['table_name']=Path(item['path']).stem
             item['path'] = remap[str(Path(item['path']).resolve())]
             item['capability_manifest'] = None
         data['documents'] = [remap[str(Path(p).resolve())] for p in config.documents]
@@ -82,6 +154,7 @@ def prepare(config_path, output, *, gold_path):
             write(target/'agent.json', config._agent.model_dump(mode='json'))
             data['agent_config'] = str(target/'agent.json')
         write(target/'config.json', data)
+        resume=_prepare_resume(resume_from,target,config) if resume_from is not None else None
         current_code = files_under(package)
         frozen_code = files_under(target/'code/lightgraph')
         if any(current_code.get(name) != digest for name, digest in frozen_code.items()):
@@ -94,6 +167,7 @@ def prepare(config_path, output, *, gold_path):
             'model':settings.model, 'mode':settings.mode,
             'budgets':{'calls':settings.max_calls,'tokens':settings.max_tokens,'seconds':config.max_run_seconds},
             'configured_input_files':sorted(str(Path(v).relative_to(target)) for v in remap.values())}
+        if resume is not None:manifest['resume']=resume
         write(target/'bundle.json', manifest)
         return manifest
     except Exception:
@@ -117,6 +191,10 @@ def verify(bundle):
                     if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc'}
     if current_code != {p for p in manifest['files'] if p.startswith('code/')}:
         raise LightGraphError('evaluation_frozen_code_changed')
+    if manifest.get('resume'):
+        current_seed={str(p.relative_to(root)) for p in (root/'resume_seed').rglob('*') if p.is_file()}
+        if current_seed != {p for p in manifest['files'] if p.startswith('resume_seed/')}:
+            raise LightGraphError('evaluation_frozen_seed_changed')
     if environment() != manifest['environment']:
         raise LightGraphError('evaluation_runtime_environment_changed')
     return manifest
@@ -136,7 +214,7 @@ def launch(bundle):
 
 def execute(bundle):
     root = Path(bundle).resolve()
-    verify(root)
+    manifest=verify(root)
     import lightgraph
     if Path(lightgraph.__file__).resolve() != root/'code/lightgraph/__init__.py':
         raise LightGraphError('evaluation_wrong_loaded_package')
@@ -149,6 +227,10 @@ def execute(bundle):
     sources, model, status, error = [], None, 'FAILED', None
     start = time.monotonic()
     try:
+        if manifest.get('resume'):
+            # Restore only the hash-protected seed, never read the parent again.
+            if (root/'output').exists():raise LightGraphError('evaluation_resume_output_exists')
+            shutil.copytree(root/'resume_seed',root/'output')
         model = make_model(config)
         sources = open_sources(config)
         report = run_pipeline(config, sources, model=model,
@@ -171,7 +253,8 @@ def execute(bundle):
         except LightGraphError: integrity = False
         write(root/'execution.json', {'status':status, 'error':error, 'elapsed_seconds':round(time.monotonic()-start,6),
             'finished_at':datetime.now(timezone.utc).isoformat(), 'frozen_files_unchanged':integrity,
-            'loaded_package':str(Path(lightgraph.__file__).resolve()), 'gold_loaded_by_worker':False})
+            'loaded_package':str(Path(lightgraph.__file__).resolve()), 'gold_loaded_by_worker':False,
+            'execution_mode':'resume_and_full_revalidation' if manifest.get('resume') else 'fresh'})
 
 
 if __name__ == '__main__':

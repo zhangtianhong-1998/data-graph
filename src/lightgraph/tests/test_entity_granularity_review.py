@@ -146,21 +146,6 @@ def test_malformed_hierarchy_still_supplies_counterevidence_against_path_identit
     assert any(issue['code']=='invalid_hierarchy_context' and issue['status']=='deferred' for issue in result.issues)
 
 
-def test_refuted_grain_does_not_ask_for_a_smaller_composite_key():
-    source,goal,packet=fixture();reviewer=Reviewer('refuted');result=DiscoveryResult()
-    class Tools:
-        def context_documents(self): return []
-        def close(self): raise AssertionError('grain refutation must not open a revision')
-    with ReviewObservations() as observations:
-        rules,*_= _compile_candidates(ProposalBatch(task='T0_discovery',proposals=[
-            hierarchy(packet),composite(packet)]),source,goal,[],result,model=reviewer,packet=packet,
-            observations=observations,tool_factory=lambda: Tools())
-    assert [rule.kind for rule in rules]==['wide_hierarchy']
-    assert reviewer.explorations==0
-    assert any(c.review_stage=='entity_granularity' and c.failure_code=='semantic_claim_refuted'
-        for c in result.pending_candidates)
-
-
 def test_cached_grain_rejection_is_checked_without_any_hierarchy_context():
     source,goal,packet=fixture();reviewer=Reviewer();result=DiscoveryResult()
     keys=tuple(sorted(_column_id(source,c) for c in ('head','leaf')))

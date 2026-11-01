@@ -229,50 +229,22 @@ def validate_object_model(raw, packet):
     return model
 
 
-def proposals_from_field_models(objects, definition_refs=(), position_keys=()):
-    """Turn a retained field model into a hierarchy proposal when this table's definition supports it.
+def hierarchy_field_models(objects):
+    """Eligible remembered mappings; metadata alone supplies no hierarchy semantics."""
+    return [obj for obj in objects if obj.get('status') not in
+        {'superseded','conflict','published','local_validated'}
+        and obj.get('basis')=='agent_field_model'
+        and len(obj.get('positions') or [])>=2
+        and all(item.get('code') and item.get('label') for item in obj['positions'])]
 
-    Without an applicable definition section, or without position semantics the
-    model recorded from that definition, this returns nothing. It does not mint
-    a domain name or guess that numbered positions are ordinal slots.
+
+def proposals_from_field_models(objects, definition_refs=()):
+    """Legacy callers cannot turn field roles into invented identity/parent policy.
+
+    Use submit_field_model_hierarchy to supply explicit business choices while
+    reusing the exact remembered columns. All proposals still require review.
     """
-    from .models import HierarchyProposal, HypothesisLevel, WideHierarchy
-    refs=list(dict.fromkeys(ref for ref in definition_refs if isinstance(ref, str)))
-    if not refs:
-        return []
-    needed=set(position_keys)
-    domain=refs[0].split('@',1)[0]
-    proposals=[]
-    for obj in objects:
-        if obj.get('status') in ('superseded','conflict','published','local_validated'):
-            continue
-        semantics=obj.get('position_semantics')
-        if semantics not in {'ordinal_slots','ordered_slots'}:
-            continue
-        positions=sorted(obj.get('positions') or [], key=lambda item: item['position'])
-        if len(positions)<2 or any(not item.get('code') or not item.get('label') for item in positions):
-            continue
-        if needed and len({item['code'] for item in positions} & needed)<2:
-            continue
-        proposals.append(HierarchyProposal(
-            evidence_cited=refs[:32],
-            kind='wide_hierarchy',
-            claim=WideHierarchy(
-                group_id=obj['object_id'],
-                entity_kind_hint=obj.get('entity_kind') or 'ReportItem',
-                levels=[HypothesisLevel(position=item['position'], key=item['code'],
-                    label=item['label'], aliases=list(item.get('aliases') or [])[:16])
-                    for item in positions],
-                namespace_columns=list(obj.get('namespace_columns') or []),
-                path_semantics='relative_path',
-                identity_resolution='verified_identity_domain',
-                identity_domain=domain,
-                identity_scope='namespace_local',
-                repeat_policy='collapse_consecutive_equal_identity',
-                allow_dag=False,
-                position_semantics=semantics,
-                taxonomy=domain)))
-    return proposals
+    return []
 
 
 def _source(table):
@@ -377,6 +349,31 @@ class SchemaKnowledgeLedger:
     def current_objects(self,table):
         """Active field models, including published ones and excluding retired seeds."""
         return [obj for obj in self._load(table).get('objects',[]) if obj.get('status')!='superseded']
+
+    def field_model_guards(self,table):
+        value=self._load(table)
+        names={c['id']:c['name'] for c in value['columns']}
+        guards=value.get('field_model_guards',{})
+        return tuple({names[ref] for ref in guards.get(key,[]) if ref in names}
+            for key in ('projection','identity'))
+
+    def record_field_model_guards(self,table,projection=(),identity=()):
+        """Keep only authorized column IDs; proposal-local display roles are not prohibitions."""
+        source=canonical(_source(table));value=self._load(table)
+        ids={c['name']:c['id'] for c in value['columns']}
+        guards=value.setdefault('field_model_guards',{})
+        for key,names in (('projection',projection),('identity',identity)):
+            guards[key]=sorted(set(guards.get(key,[]))|{ids[n] for n in names if n in ids})
+        with self.store._transaction():self._append(source,value)
+
+    def set_field_model_work(self,table,state):
+        if state not in {'pending','review_refuted','compiled'}:
+            raise ValueError('invalid_field_model_work_state')
+        value=self._load(table)
+        # A timed-out attempt cannot erase an independent negative verdict.
+        if value.get('field_model_work')=='review_refuted' and state=='pending':return
+        value['field_model_work']=state
+        with self.store._transaction():self._append(canonical(_source(table)),value)
 
     def context(self,table,max_objects=16):
         value=current_object_knowledge(self._load(table))
@@ -551,15 +548,18 @@ def project_retained_labels(rules, knowledge):
         ids={c.name:_column_id(table,c.name) for c in table.columns}
         reverse={column_id:name for name,column_id in ids.items()}
         key_ids={ids[name] for name in rule.identity.key_columns if name in ids}
+        namespace_ids={ids[name] for name in rule.scope.namespaces if name in ids}
+        excluded={item.column for item in rule.attributes.excluded}
         found=[]
         for obj in value.get('objects',[]):
             if obj.get('status') in ('superseded','conflict'):
                 continue
-            if key_ids and not key_ids & set(obj.get('key_columns') or []):
+            if key_ids-set(namespace_ids)!=set(obj.get('key_columns') or [])-namespace_ids:
                 continue
+            if namespace_ids!=set(obj.get('namespace_columns') or []):continue
             for ref in obj.get('label_columns') or []:
                 name=reverse.get(ref)
-                if name and name not in rule.identity.key_columns and name not in found:
+                if name and name not in excluded and name not in rule.identity.key_columns and name not in found:
                     found.append(name)
         if len(found)!=1:
             continue

@@ -420,9 +420,19 @@ class RuleEngine:
 
     def _entities(self,pub,rule,rows):
         ids=set()
+        composite=(rule.identity.semantic_resolution=='source_scoped' and
+            len([c for c in rule.identity.key_columns if c not in rule.scope.namespaces])>1)
         for row in rows:
             key=tuple(row.get(c) for c in rule.identity.key_columns)
-            eid,_,_=self._emit_entity(pub,rule,row,key)
+            # A joint object has a tuple identity: its last component alone is
+            # not its business code. Keep identity/bindings unchanged and make
+            # unlabelled combinations distinguishable using authorized keys.
+            label=None
+            if composite and not (rule.attributes.single_valued.get('label') or
+                                  rule.attributes.name_columns.get('label')):
+                label=' · '.join(f'{column}={row.get(column)}' for column in rule.identity.key_columns)
+            eid,_,_=self._emit_entity(pub,rule,row,key,label=label,
+                business_code_override=canonical(key) if composite else None)
             ids.add(eid)
         return {"entities":len(ids),"projected_tuples":len(rows)},[]
 

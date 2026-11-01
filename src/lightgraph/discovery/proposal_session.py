@@ -117,7 +117,7 @@ def proposal_tool_specs(task, packet=None):
         # Fresh discovery uses business choices rather than redundant internal
         # hierarchy fields. Revision still needs the exact old domain/taxonomy
         # and distinct evidence bindings when repairing an existing rule.
-        if kind in ('wide_hierarchy','long_hierarchy') and not hierarchy:
+        if kind == 'wide_hierarchy' and not hierarchy:
             continue
         if kind == 'wide_hierarchy' and task != 'T5_revision':
             continue
@@ -132,6 +132,11 @@ def proposal_tool_specs(task, packet=None):
     if hierarchy and 'wide_hierarchy' in TASK_PROPOSAL_KINDS[task]:
         from .hierarchy_plan import hierarchy_plan_tool_schema
         specs.insert(0,hierarchy_plan_tool_schema())
+    if 'wide_hierarchy' in TASK_PROPOSAL_KINDS[task]:
+        from .field_model_plan import field_model_plan_tool_schema
+        # A field model can be declared later in this session. Keep this small
+        # tool available; its adapter validates the current issued object ID.
+        specs.append(field_model_plan_tool_schema())
     if task in {'T0_discovery','T1_table_discovery','T3_hierarchy','T5_revision'}:
         from .schema_knowledge import ObjectModelDraft
         specs.append(_spec('declare_object_model',
@@ -272,9 +277,9 @@ class ProposalSession:
         if name=='declare_object_model':
             identifier=arguments.get('object_id')
             return digest(name,identifier) if isinstance(identifier,str) and identifier else None
-        if name!='submit_hierarchy_plan' and name not in grouped:return None
+        if name not in {'submit_hierarchy_plan','submit_field_model_hierarchy'} and name not in grouped:return None
         claim=arguments.get('claim',{})
-        identifier=arguments.get('plan_id') if name=='submit_hierarchy_plan' else (
+        identifier=arguments.get('plan_id') if name in {'submit_hierarchy_plan','submit_field_model_hierarchy'} else (
             claim.get('group_id') if isinstance(claim,dict) else None)
         return digest(name,identifier) if isinstance(identifier,str) and identifier else None
 
@@ -335,8 +340,8 @@ class ProposalSession:
                 self.packet['schema_knowledge']=current_object_knowledge(knowledge)
                 return {'status':'ok','object_model':incoming,'candidate':True,'confirmed':False,
                     'superseded_object_ids':candidate.supersedes_object_ids}
-            if name == 'submit_hierarchy_plan':
-                if not hierarchy_shape_available(self.packet):
+            if name in {'submit_hierarchy_plan','submit_field_model_hierarchy'}:
+                if name == 'submit_hierarchy_plan' and not hierarchy_shape_available(self.packet):
                     columns=sorted(column['id'] for column in (self.packet.get('metadata_digest') or {}).get('columns') or []
                         if isinstance(column, dict) and column.get('id'))
                     return self.reject('hierarchy_shape_not_on_table', diagnostics=[{
@@ -344,7 +349,12 @@ class ProposalSession:
                         'constraint':'reference', 'allowed_references':columns[:32]}])
                 from .hierarchy_plan import HierarchyPlan, compile_hierarchy_plan
                 contract = HierarchyPlan
-                converted = compile_hierarchy_plan(arguments,self.packet,validate_references=False)
+                if name == 'submit_field_model_hierarchy':
+                    from .field_model_plan import FieldModelHierarchyPlan, compile_field_model_plan
+                    contract = FieldModelHierarchyPlan
+                    converted = compile_field_model_plan(arguments,self.packet,validate_references=False)
+                else:
+                    converted = compile_hierarchy_plan(arguments,self.packet,validate_references=False)
                 slots=invalid_reference_slots(converted,self.packet)
                 if slots:
                     return self.reject(slots[0].code,diagnostics=[slot.diagnostic(i) for i,slot in enumerate(slots[:8])])
@@ -390,7 +400,7 @@ class ProposalSession:
     def _retain(self, proposal):
         from .object_mapping_feedback import object_mapping_diagnostics
         diagnostics=object_mapping_diagnostics(proposal,self.packet,
-            hierarchy_plan=self._active_operator=='submit_hierarchy_plan')
+            hierarchy_plan=self._active_operator in {'submit_hierarchy_plan','submit_field_model_hierarchy'})
         if diagnostics:
             result=self.reject('object_model_mapping_conflict',diagnostics=diagnostics)
             target=getattr(proposal.claim,'group_id',None)
@@ -429,7 +439,7 @@ class ProposalSession:
         for index,proposal in enumerate(self.drafts):
             operator,target=self.draft_origins[index]
             diagnostics=object_mapping_diagnostics(proposal,self.packet,
-                hierarchy_plan=operator=='submit_hierarchy_plan')
+                hierarchy_plan=operator in {'submit_hierarchy_plan','submit_field_model_hierarchy'})
             if not diagnostics:continue
             signature=digest(proposal.model_dump(mode='json'),diagnostics)
             cached=self._mapping_rejections.get(index)

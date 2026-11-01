@@ -6,6 +6,7 @@ from lightgraph.discovery.budget import BudgetAllocator
 from lightgraph.discovery.engine import _definition_document
 from lightgraph.discovery.models import ProposalBatch
 from lightgraph.discovery.schema_knowledge import proposals_from_field_models
+from lightgraph.discovery.field_model_plan import compile_field_model_plan
 from lightgraph.discovery.semantics import BoundSemanticVerdict
 from lightgraph.discovery.validation_feedback import model_diagnostics
 from lightgraph.discovery.workflow import discover_with_agent
@@ -34,6 +35,12 @@ class ReviewModel:
         if scope and hasattr(tools,'begin_context'):
             from lightgraph.contracts import SourceRef
             tools.begin_context([SourceRef.model_validate(scope)])
+        if packet['task']=='T3_hierarchy':
+            obj=next(o for o in packet['schema_knowledge']['objects'] if len(o.get('positions') or [])>=2)
+            evidence=[d['doc_id']+'@'+d['revision']+':'+d['section_id'] for d in packet['document_snippets']]
+            return compile_field_model_plan(dict(object_id=obj['object_id'],plan_id='path',entity_type='ReportItem',
+                identity_scope='namespace',shared_identity_domain='paths',position_meaning='relative_ordinal',
+                allow_multiple_parents=False,repeat_is_fill=True,relation_type='parent_of',evidence=evidence),packet)
         return ProposalBatch(task=packet['task'],abstain=True,proposals=[])
 
     def complete_bound_review(self, packet, *, proposition_ref, allow_schema_repair=True):
@@ -42,19 +49,23 @@ class ReviewModel:
         return BoundSemanticVerdict(decision='supported', evidence=evidence).bind(proposition_ref)
 
 
-def test_field_model_keeps_position_column_ids():
-    _,knowledge,model=fixture()
+def test_field_model_keeps_position_column_ids_without_inventing_semantics():
+    source,knowledge,model=fixture()
     stored={**model,'status':'candidate','object_id':model['object_id'],'position_semantics':'ordinal_slots'}
-    assert proposals_from_field_models([stored])==[]
-    proposals=proposals_from_field_models([stored],[DEFINITION])
-    assert len(proposals)==1
-    claim=proposals[0].claim
+    assert proposals_from_field_models([stored],[DEFINITION])==[]
+    body=packet(source)
+    body.update(scope={'source_id':source.source_id,'schema':source.schema_name,'table':source.name},
+        schema_knowledge={'objects':[stored]})
+    supplied=dict(object_id=model['object_id'],plan_id='explicit',entity_type='ReportItem',identity_scope='source',
+        position_meaning='relative_ordinal',allow_multiple_parents=True,repeat_is_fill=True,
+        relation_type='parent_of',evidence=['definition@1:fields'])
+    proposal=compile_field_model_plan(supplied,body).proposals[0]
+    claim=proposal.claim
     assert [level.key for level in claim.levels]==[item['code'] for item in model['positions']]
     assert [level.label for level in claim.levels]==[item['label'] for item in model['positions']]
-    assert claim.path_semantics=='relative_path'
-    assert claim.identity_domain=='paths'
-    assert proposals[0].evidence_cited==[DEFINITION]
-    assert proposals_from_field_models([{**stored,'status':'local_validated'}],[DEFINITION])==[]
+    assert all(level.aliases==position['aliases'] for level,position in zip(claim.levels,model['positions']))
+    assert claim.identity_domain.startswith('plan_source:') and claim.allow_dag is True
+    assert claim.namespace_columns==model['namespace_columns']
 
 
 def test_abstaining_agent_still_compiles_retained_hierarchy(tmp_path):
@@ -91,7 +102,7 @@ applies_to: ["s:public.paths"]
     rule=next(rule for rule in result.rules if rule.kind=='wide_hierarchy')
     assert [level.code for level in rule.hierarchy.levels]==[
         'item_l1_code','item_l2_code','item_l3_code','item_l4_code','item_l5_code']
-    assert rule.identity.identity_domain=='paths'
+    assert rule.identity.identity_domain.startswith('plan_shared:')
     assert all(ref.startswith('paths@') for ref in rule.identity.identity_evidence if '@' in ref)
 
 

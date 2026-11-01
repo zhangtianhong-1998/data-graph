@@ -1,4 +1,4 @@
-"""Unfinished Agent submissions must publish valid work without closing discovery."""
+"""Unfinished submissions retain work; covered published objects need no cold restart."""
 import pytest
 
 from lightgraph.pipeline import run_pipeline
@@ -12,7 +12,7 @@ from lightgraph.tests.test_agent_pipeline import client, group, input_packet, re
     ('discovery_submission_pending', 0),
     ('discovery_invalid_drafts', 1),
 ])
-def test_valid_draft_publishes_and_unfinished_discovery_retries(monkeypatch, tmp_path,
+def test_valid_draft_is_revalidated_without_repeating_covered_object_discovery(monkeypatch, tmp_path,
                                                               pending_code, invalid_count):
     source_table = table('drafts', ['key', 'label'])
     tasks = []
@@ -41,8 +41,10 @@ def test_valid_draft_publishes_and_unfinished_discovery_retries(monkeypatch, tmp
     if invalid_count:
         assert first.counts['discovery_invalid_drafts'] >= invalid_count
     tasks.clear()
-    with MemorySource([source_table], rows) as source:
+    updated_rows={'public.drafts':[('K','Name'),('K2','New object')]}
+    with MemorySource([source_table], updated_rows) as source:
         second = run_pipeline(config, [source], model=client(monkeypatch, handler))
-    assert 'T0_discovery' in tasks
-    assert second.counts['business_nodes'] == 1
+    assert 'T0_discovery' not in tasks
+    assert second.counts['reused_rules']==1
+    assert second.counts['business_nodes'] == 2
     assert second.counts['work_deferred'] == 0

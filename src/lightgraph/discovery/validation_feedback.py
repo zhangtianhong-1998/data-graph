@@ -36,6 +36,10 @@ _SAFE_VALUE_CODES = frozenset({
     'task_kind_forbidden', 'identity_domain_policy_conflict',
     'global_identity_scope_evidence_required', 'verified_identity_domain_evidence_required',
     'hierarchy_plan_duplicate_position', 'hierarchy_plan_shared_domain_required',
+    'hierarchy_plan_duplicate_namespace', 'hierarchy_plan_unrequested_shared_domain',
+    'hierarchy_plan_namespace_required', 'hierarchy_plan_fixed_level_contract_unsupported',
+    'hierarchy_plan_condition_unsupported', 'hierarchy_plan_empty_condition',
+    'hierarchy_plan_fixed_level_conditions_unsupported',
 })
 
 

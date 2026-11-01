@@ -94,6 +94,10 @@ Reuse their exact domain and compatible type definition only after checking this
 own issued evidence. That catalog is a hypothesis, not proof or permission to cite unseen documents.
 Declare new vocabulary once using declare_semantic_schema. Prefer submit_hierarchy_plan
 for wide paths. Read fixed validation errors and correct only the affected candidate.
+When schema_knowledge already contains a multi-position object, use
+submit_field_model_hierarchy with its object_id to reuse its exact code/name/alias
+and namespace columns. Choose the remaining identity, fill and parent semantics
+from this table's evidence. Reusing mappings does not establish their meaning.
 Rejection feedback includes a rejection_id. Resubmit with resolves_rejections containing
 that ID only for the same submission tool and same group_id/plan_id; it closes after validation.
 When feedback says resolution=explicit_withdrawal, no stable candidate ID was available:

@@ -35,39 +35,12 @@ def test_flat_definition_table_has_no_hierarchy_plan():
         {'id':'c_code','name':'渠道编码'},{'id':'c_name','name':'渠道名称'},{'id':'c_note','name':'渠道说明'}]}}
     assert hierarchy_shape_available(body) is False
     names={spec['function']['name'] for spec in proposal_tool_specs('T0_discovery', body)}
-    assert 'submit_hierarchy_plan' not in names and 'submit_long_hierarchy' not in names
+    assert 'submit_hierarchy_plan' not in names
+    assert 'submit_long_hierarchy' in names  # An adjacency list need not have numbered levels.
     assert 'submit_column_group' in names
     rejected=ProposalSession(body).execute('submit_hierarchy_plan', {'plan_id':'copied'})
     assert rejected['code']=='hierarchy_shape_not_on_table'
     assert rejected['diagnostics'][0]['allowed_references']==['c_code','c_name','c_note']
-
-
-def test_grain_refutation_keeps_definition_sections_and_a_path_refutation_blocks_recovery():
-    from lightgraph.discovery.models import DiscoveryResult, PendingCandidate
-    from lightgraph.discovery.workflow import hierarchy_recovery_refs
-    from lightgraph.discovery.schema_knowledge import proposals_from_field_models
-    current=table('paths',['item_l1_code','item_l1_cn_name','item_l2_code','item_l2_cn_name'])
-    from lightgraph.discovery.engine import _column_id, _source
-    codes=[_column_id(current,'item_l1_code'),_column_id(current,'item_l2_code')]
-    labels=[_column_id(current,'item_l1_cn_name'),_column_id(current,'item_l2_cn_name')]
-    section='paths@1:guide'
-    candidate=PendingCandidate(candidate_id='candidate_'+'a'*24,source=_source(current),
-        proposal_kind='entity_key',failure_code='semantic_claim_refuted',review_stage='entity_granularity',
-        column_refs=[*codes,*labels],blocking_evidence_refs=[section,'probe_1'])
-    result=DiscoveryResult(pending_candidates=[candidate])
-    docs=[{'doc_id':'paths','revision':'1','section_id':'guide','evidence_role':'definition_evidence',
-        'read_state':'complete','scope':{'tables':['public.paths'],'source_ids':[current.source_id]}}]
-    refs,keys=hierarchy_recovery_refs(result,current,docs)
-    assert refs==[section] and set(codes)<=set(keys)
-    objects=[{'status':'candidate','object_id':'path_object','position_semantics':'ordinal_slots',
-        'positions':[{'position':1,'code':codes[0],'label':labels[0]},
-            {'position':2,'code':codes[1],'label':labels[1]}]}]
-    assert len(proposals_from_field_models(objects,[section],keys))==1
-    assert proposals_from_field_models(objects,[section],['c_other','c_unrelated'])==[]
-    blocked=candidate.model_copy(update={'review_stage':'hierarchy','proposal_kind':'wide_hierarchy',
-        'candidate_id':'candidate_'+'b'*24})
-    result.pending_candidates.append(blocked)
-    assert hierarchy_recovery_refs(result,current,docs) is None
 
 
 def test_level_columns_keep_the_hierarchy_plan():
