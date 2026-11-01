@@ -82,7 +82,7 @@ def test_dynamic_map_keys_and_validator_exception_context_are_redacted():
     with pytest.raises(ValidationError) as caught:
         Member.model_validate(value)
     result = model_diagnostics(caught.value, Member.model_json_schema(), value)
-    assert result == [{'path': [], 'constraint': 'semantic_contract'}]
+    assert result == [{'path': [], 'constraint': 'excluded_role_in_identity'}]
     assert CANARY not in json.dumps(result)
 
 

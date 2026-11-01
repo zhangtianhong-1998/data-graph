@@ -29,6 +29,7 @@ class BudgetAllocator:
         self._lock = threading.RLock()
         self._started = time.monotonic()
         self._deadline = self._started + self.limits.seconds
+        self._ceiling = self._deadline
 
     @property
     def deadline_monotonic(self) -> float:
@@ -46,6 +47,23 @@ class BudgetAllocator:
             raise ValueError('invalid_budget_deadline')
         with self._lock:
             self._deadline = min(self._deadline, deadline_monotonic)
+            self._ceiling = min(self._ceiling, self._deadline)
+            return self._deadline
+
+    def bind_run_deadline(self, deadline_monotonic: float) -> float:
+        """Fix the furthest deadline later phases may use."""
+        return self.tighten_deadline(deadline_monotonic)
+
+    def set_phase_deadline(self, deadline_monotonic: float) -> float:
+        """Move the active deadline within the bound ceiling.
+
+        Object discovery can stop early so relation discovery still has time.
+        A later phase may use time up to the ceiling, never past it.
+        """
+        if not math.isfinite(deadline_monotonic):
+            raise ValueError('invalid_budget_deadline')
+        with self._lock:
+            self._deadline = min(self._ceiling, deadline_monotonic)
             return self._deadline
 
     def remaining_seconds(self) -> float:

@@ -134,7 +134,7 @@ def test_executed_mappings_preserve_multiple_names_and_publication_conflict_stat
 def test_reference_diagnostics_are_field_addressed_and_do_not_echo_rejected_values():
     t=table('items',['item_code','item_cn_name']);p=packet(t)
     invalid=draft(t,key_columns=['PRIVATE_SOURCE_VALUE'])
-    with pytest.raises(LightGraphError,match='unauthorized_column_reference'):validate_object_model(invalid,p)
+    with pytest.raises(LightGraphError,match='object_model_cross_table_reference'):validate_object_model(invalid,p)
     slots=object_model_reference_slots(ObjectModelDraft.model_validate(invalid),p)
     diagnostic=slots[0].diagnostic(0)
     assert diagnostic['field']==['key_columns',0]

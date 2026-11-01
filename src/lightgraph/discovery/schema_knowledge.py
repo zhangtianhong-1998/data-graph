@@ -27,6 +27,9 @@ class ObjectPosition(StrictModel):
 
 
 class ObjectModelDraft(StrictModel):
+    table_id: str = Field(default='', max_length=256, description=
+        'Current task table only: source_id:schema.table, schema.table, or the table name from this packet. '
+        'Column IDs must come from this table. Do not copy another table\'s columns.')
     object_id: str = Field(pattern=r'^[A-Za-z][A-Za-z0-9_]{0,63}$', description=
         'Local hypothesis identifier, not a source value or business identity. Reuse an agent candidate '
         'ID to revise it; use a new ID when explicitly superseding metadata candidates.')
@@ -38,7 +41,11 @@ class ObjectModelDraft(StrictModel):
     alias_columns: list[str] = Field(default_factory=list, max_length=32)
     namespace_columns: list[str] = Field(default_factory=list, max_length=16)
     positions: list[ObjectPosition] = Field(default_factory=list, max_length=32)
-    evidence_refs: list[str] = Field(default_factory=list, max_length=32)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=32, description=
+        'Issued definition sections for this table only.')
+    position_semantics: Literal['ordinal_slots', 'ordered_slots'] | None = Field(default=None, description=
+        'Set only when this table\'s definition says how positions work. ordinal_slots keeps numbered positions '
+        'and treats repeated codes as fill. ordered_slots means a dense order. Omit it when the definition does not say.')
     supersedes_object_ids: list[str] = Field(default_factory=list, max_length=32, description=
         'Explicit issued IDs of metadata_name_family candidates replaced by this object model. '
         'Preserve each candidate\'s complete code/name/English/alias/namespace mapping and every '
@@ -177,15 +184,33 @@ def apply_object_model(knowledge,model,*,basis='agent_field_mapping'):
     return value
 
 
+def _current_table_ids(packet):
+    scope=packet.get('scope') or {}
+    table=scope.get('table')
+    if not table:
+        return set()
+    schema=scope.get('schema', scope.get('schema_name', 'public'))
+    source=scope.get('source_id')
+    names={table, f'{schema}.{table}'}
+    if source:
+        names.update({f'{source}:{schema}.{table}', f'{source}.{schema}.{table}'})
+    return names
+
+
 def object_model_reference_slots(model,packet):
     """Safe field-level feedback uses issued references, never rejected values."""
     from .reference_validation import ReferenceSlot,reference_registry
     registry=reference_registry(packet);slots=[]
+    if model.table_id:
+        names=_current_table_ids(packet)
+        if names and model.table_id not in names:
+            slots.append(ReferenceSlot(0,('table_id',),'tables','object_model_table_mismatch',names))
+            return slots
     def check(path,value,category):
         if value not in registry[category]:
-            slots.append(ReferenceSlot(0,path,category,
-                'unauthorized_column_reference' if category=='columns' else 'dangling_evidence_reference',
-                registry[category]))
+            code=('object_model_cross_table_reference' if category=='columns'
+                  else 'dangling_evidence_reference')
+            slots.append(ReferenceSlot(0,path,category,code,registry[category]))
     for field in ('key_columns','label_columns','english_name_columns','alias_columns','namespace_columns','evidence_refs'):
         for index,value in enumerate(getattr(model,field)):
             check((field,index),value,'evidence' if field=='evidence_refs' else 'columns')
@@ -202,6 +227,52 @@ def validate_object_model(raw, packet):
     slots=object_model_reference_slots(model,packet)
     if slots:raise LightGraphError(slots[0].code)
     return model
+
+
+def proposals_from_field_models(objects, definition_refs=(), position_keys=()):
+    """Turn a retained field model into a hierarchy proposal when this table's definition supports it.
+
+    Without an applicable definition section, or without position semantics the
+    model recorded from that definition, this returns nothing. It does not mint
+    a domain name or guess that numbered positions are ordinal slots.
+    """
+    from .models import HierarchyProposal, HypothesisLevel, WideHierarchy
+    refs=list(dict.fromkeys(ref for ref in definition_refs if isinstance(ref, str)))
+    if not refs:
+        return []
+    needed=set(position_keys)
+    domain=refs[0].split('@',1)[0]
+    proposals=[]
+    for obj in objects:
+        if obj.get('status') in ('superseded','conflict','published','local_validated'):
+            continue
+        semantics=obj.get('position_semantics')
+        if semantics not in {'ordinal_slots','ordered_slots'}:
+            continue
+        positions=sorted(obj.get('positions') or [], key=lambda item: item['position'])
+        if len(positions)<2 or any(not item.get('code') or not item.get('label') for item in positions):
+            continue
+        if needed and len({item['code'] for item in positions} & needed)<2:
+            continue
+        proposals.append(HierarchyProposal(
+            evidence_cited=refs[:32],
+            kind='wide_hierarchy',
+            claim=WideHierarchy(
+                group_id=obj['object_id'],
+                entity_kind_hint=obj.get('entity_kind') or 'ReportItem',
+                levels=[HypothesisLevel(position=item['position'], key=item['code'],
+                    label=item['label'], aliases=list(item.get('aliases') or [])[:16])
+                    for item in positions],
+                namespace_columns=list(obj.get('namespace_columns') or []),
+                path_semantics='relative_path',
+                identity_resolution='verified_identity_domain',
+                identity_domain=domain,
+                identity_scope='namespace_local',
+                repeat_policy='collapse_consecutive_equal_identity',
+                allow_dag=False,
+                position_semantics=semantics,
+                taxonomy=domain)))
+    return proposals
 
 
 def _source(table):
@@ -303,6 +374,10 @@ class SchemaKnowledgeLedger:
             'dependency_version=? ORDER BY revision DESC LIMIT 1',(source,version)).fetchone()
         return json.loads(row['payload'])
 
+    def current_objects(self,table):
+        """Active field models, including published ones and excluding retired seeds."""
+        return [obj for obj in self._load(table).get('objects',[]) if obj.get('status')!='superseded']
+
     def context(self,table,max_objects=16):
         value=current_object_knowledge(self._load(table))
         value['objects']=sorted(value['objects'],key=lambda o:(
@@ -319,10 +394,11 @@ class SchemaKnowledgeLedger:
     def record_models(self,table,models,packet):
         source=canonical(_source(table))
         if source not in self.versions:return
+        from .engine import _definition_document
         value=self._load(table);allowed={c['id'] for c in value['columns']}
         documents={d['doc_id']+'@'+d['revision']+':'+d['section_id']
             for d in packet.get('document_snippets',[])+packet.get('document_refs',[])
-            if all(d.get(k) for k in ('doc_id','revision','section_id'))}
+            if all(d.get(k) for k in ('doc_id','revision','section_id')) and _definition_document(d, table)}
         value['document_refs']=sorted(set(value['document_refs'])|documents)
         for probe in packet.get('probe_digest',[]):
             if probe.get('operator')!='profile_columns':continue
@@ -403,6 +479,18 @@ class SchemaKnowledgeLedger:
                     basis='executed_rule',rule_id=rule.rule_id,rule_revision=rule.revision,
                     evidence_refs=list(rule.dependencies.documents))
                 value['objects']=[o for o in value['objects'] if o['object_id']!=item['object_id']]+[item]
+                positions={(p['position'], p['code']) for p in item['positions']}
+                keys=set(item['key_columns'])
+                for obj in value['objects']:
+                    if obj.get('object_id')==item['object_id'] or obj.get('status')!='candidate':
+                        continue
+                    if obj.get('basis')!='agent_field_model':
+                        continue
+                    same_positions=bool(positions) and {(p['position'], p['code'])
+                        for p in obj.get('positions') or []}==positions
+                    same_keys=not obj.get('positions') and set(obj.get('key_columns') or [])==keys
+                    if same_positions or same_keys:
+                        obj.update(status='superseded', superseded_by=item['object_id'])
             value['counts']['executed_rules']=len({o['rule_id'] for o in value['objects'] if o.get('rule_id')})
             self._append(source,value)
 
@@ -419,6 +507,66 @@ class SchemaKnowledgeLedger:
                     if obj.get('rule_id')==rule_id and obj['status']!='conflict':
                         obj['status']='conflict';changed=True
                 if changed:self._append(source,value)
+
+
+def is_foreign_identity_copy(rule, rules):
+    """A fact-table code column is not a second entity when another table already labels that domain."""
+    if rule.kind!='column_group_entity' or rule.attributes.single_valued.get('label'):
+        return False
+    domain=rule.identity.identity_domain or ''
+    keys=set(rule.identity.key_columns)
+    if not domain or not keys:
+        return False
+    for other in rules:
+        if other.rule_id==rule.rule_id or other.source==rule.source or other.kind=='reference':
+            continue
+        if (other.identity.identity_domain or '')!=domain or other.identity.entity_kind!=rule.identity.entity_kind:
+            continue
+        if keys<=set(other.identity.key_columns) and other.attributes.single_valued.get('label'):
+            return True
+    return False
+
+
+def drop_foreign_identity_copies(rules):
+    """Return rule_id -> table for copies that must stay available to relation discovery."""
+    return {rule.rule_id: rule.source.table for rule in rules if is_foreign_identity_copy(rule, rules)}
+
+
+def project_retained_labels(rules, knowledge):
+    """Fill one unambiguous retained name column before a rule can publish without a label."""
+    if knowledge is None:
+        return 0
+    from .engine import _column_id
+    projected=0
+    for rule in rules:
+        if rule.kind!='column_group_entity' or rule.attributes.single_valued.get('label'):
+            continue
+        if is_foreign_identity_copy(rule, rules):
+            continue
+        source=canonical(rule.source)
+        if source not in knowledge.tables:
+            continue
+        table=knowledge.tables[source]
+        value=knowledge._load(table)
+        ids={c.name:_column_id(table,c.name) for c in table.columns}
+        reverse={column_id:name for name,column_id in ids.items()}
+        key_ids={ids[name] for name in rule.identity.key_columns if name in ids}
+        found=[]
+        for obj in value.get('objects',[]):
+            if obj.get('status') in ('superseded','conflict'):
+                continue
+            if key_ids and not key_ids & set(obj.get('key_columns') or []):
+                continue
+            for ref in obj.get('label_columns') or []:
+                name=reverse.get(ref)
+                if name and name not in rule.identity.key_columns and name not in found:
+                    found.append(name)
+        if len(found)!=1:
+            continue
+        rule.attributes=rule.attributes.model_copy(update={
+            'single_valued':{**rule.attributes.single_valued,'label':found[0]}})
+        projected+=1
+    return projected
 
 
 def relation_candidates(tables, knowledge=None, *, goal=None, max_candidates=32):

@@ -86,6 +86,7 @@ class ToolExecutor:
             self.documents.bind_catalog(catalog.values())
         self._context_tables={}
         self._context_refs=[]
+        self._task_table_keys=[]
         allowed = None if allowed_tables is None else {
             f'{t.source_id}:{t.qualified_name}' if isinstance(t, TableSpec) else t for t in allowed_tables}
         tables = []
@@ -123,7 +124,15 @@ class ToolExecutor:
         """Start a new task with fresh scope and no previous observations/references."""
         self._context_tables.clear()
         self._context_refs.clear()
+        self._task_table_keys=[]
         self._activate_tables(tables)
+        self._task_table_keys=list(self._context_tables)
+
+    def _document_tables(self):
+        """Definition context stays on the task tables, not every table later queried."""
+        if self._task_table_keys:
+            return [self._context_tables[key] for key in self._task_table_keys if key in self._context_tables]
+        return list(self._context_tables.values())
 
     def _activate_tables(self, tables):
         for table in tables:
@@ -140,7 +149,7 @@ class ToolExecutor:
                 names|=set(previous.column_names)
             table=self.tables[key].model_copy(update={'columns':[c for c in self.tables[key].columns if c.name in names]})
             self._context_tables[key]=table
-        sections=self.documents.contexts_for(self._context_tables.values(),max_bytes=min(12000,self._max_bytes//2))
+        sections=self.documents.contexts_for(self._document_tables(),max_bytes=min(12000,self._max_bytes//2))
         self._context_refs=[document_reference(s) for s in sections]
 
     def context_tables(self):
@@ -154,7 +163,7 @@ class ToolExecutor:
 
     def context_documents(self):
         """Usable after close; revalidate every registered revision and scope."""
-        return self.documents.validate_references(self._context_refs,list(self._context_tables.values()))
+        return self.documents.validate_references(self._context_refs,self._document_tables())
 
     def _activate_query(self, sql):
         tree=sqlglot.parse_one(sql,read=self.compiler.dialect)
@@ -314,9 +323,9 @@ class ToolExecutor:
         if type(page) is not int or page < 0:
             raise LightGraphError('invalid_tool_arguments')
         selected=source.model_copy(update={'columns':[c for c in source.columns if c.name in names]})
-        # Keep issued evidence for every visited table, while paging only this
-        # lookup's scope. The cumulative context would repeat unrelated documents
-        # and make page numbers change whenever another table was explored.
+        # The lookup return is this table only. Task document context stays on
+        # the tables named when the task started, so a visit does not import
+        # another table's definition into the current proposal.
         self._activate_tables([selected])
         sections=self.documents.contexts_for([selected])
         pages=list(document_batches(sections,max_bytes=min(12000,self._max_bytes//3))) or [[]]

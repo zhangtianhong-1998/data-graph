@@ -11,7 +11,21 @@ from .rules import RuleEngine
 from .metadata import publish_metadata
 from .runtime.retention import write_report,write_rules,atomic_text
 
-DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/17'
+_TIME_DEFERRALS=frozenset({
+    'discovery_time_budget_exhausted','wall_time_budget_exhausted','run_time_budget_exhausted'})
+
+
+def relation_attempt_consumed(result):
+    """A clock stop before any relation rule is not a used attempt."""
+    if getattr(result,'rules',None):
+        return True
+    return not any(issue.get('code') in _TIME_DEFERRALS for issue in (getattr(result,'issues',None) or []))
+
+
+DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/21'
+# Share of the discovery window held back from object discovery so relation
+# discovery and its follow-up still run after entities exist.
+RELATION_WINDOW_FRACTION=0.35
 
 # These failures mean the Agent never completed an interpretation. They are not
 # permission to retry within a turn; leave the table pending for a later run.
@@ -279,12 +293,21 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         # A live source opened by config already shares a budget from connection time.
         budget=QueryBudget(max_queries=config.max_db_queries,max_run_seconds=config.max_run_seconds)
         for a in adapters:a.install_budget(budget)
-        discovery_deadline=time.monotonic()+max(0,budget.deadline-time.monotonic())*config.discovery_time_fraction
+        now=time.monotonic()
+        discovery_span=max(0,budget.deadline-now)*config.discovery_time_fraction
+        discovery_deadline=now+discovery_span
+        object_deadline=now+discovery_span*(1-RELATION_WINDOW_FRACTION)
         discovery_query_limit=budget.queries+int(max(0,budget.max_queries-budget.queries)*config.discovery_query_fraction)
         if model and hasattr(model,'budget'):
             # All model work is exploratory. Full projection/publication does
             # not need the model and keeps the longer source-run deadline.
-            model.budget.tighten_deadline(discovery_deadline if auto else budget.deadline)
+            # Object discovery stops before the discovery ceiling so relations
+            # can still call the model.
+            if auto:
+                model.budget.bind_run_deadline(discovery_deadline)
+                model.budget.set_phase_deadline(object_deadline)
+            else:
+                model.budget.tighten_deadline(budget.deadline)
             from dataclasses import replace
             model.budget.limits=replace(model.budget.limits,
                 memory_bytes=min(model.budget.limits.memory_bytes,config.max_working_bytes))
@@ -293,8 +316,12 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         def explore(function, *args, **kwargs):
             """Return deferred work at the phase boundary, preserving prepared rules."""
             from .discovery.models import DiscoveryResult
+            phase=kwargs.pop('phase','object')
+            deadline=discovery_deadline if phase=='relation' else object_deadline
+            if auto and discovery_model and hasattr(discovery_model,'budget'):
+                discovery_model.budget.set_phase_deadline(deadline)
             try:
-                with budget.exploration(deadline=discovery_deadline,query_limit=discovery_query_limit):
+                with budget.exploration(deadline=deadline,query_limit=discovery_query_limit):
                     if schema_knowledge is not None and function in (discover,discover_references):
                         kwargs.setdefault('schema_knowledge',schema_knowledge)
                     return function(*args, **kwargs)
@@ -585,6 +612,14 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                             retire_dangling_document_alignments(store)
             for code in outcome.codes:report.issues.append({'rule_id':rule.rule_id,'code':code})
             return outcome.prepared
+        from .discovery.schema_knowledge import drop_foreign_identity_copies, project_retained_labels
+        dropped=drop_foreign_identity_copies(allrules)
+        if dropped:
+            allrules=[rule for rule in allrules if rule.rule_id not in dropped]
+            for rule_id, table in sorted(dropped.items()):
+                report.issues.append({'rule_id':rule_id,'code':'foreign_identity_not_entity',
+                    'table':table,'status':'deferred'})
+        report.counts['display_labels_projected']=project_retained_labels(allrules, schema_knowledge)
         for rule in allrules:execute(rule)
         relation_role_context={}
         def review_role_occurrences():
@@ -654,16 +689,46 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                         ledger.transition(item,'deferred')
                         report.issues.append({'code':'relation_discovery_attempt_budget_exhausted','table':name,'status':'deferred'})
                         continue
-                    relation_attempt_counts[(sid,name)]=relation_attempt_counts.get((sid,name),0)+1
                     ledger.transition(item,'running')
                     result=explore(discover_references,rules_by_source[sid],endpoints,documents=corpus,model=discovery_model,
                         goal=config.goal,source_adapters=rules_by_source,table_refs={name},
                         iteration_context={**ledger.context([item],allrules,iteration=rounds),
-                                           'role_occurrences':role_context})
+                                           'role_occurrences':role_context},phase='relation')
+                    if relation_attempt_consumed(result):
+                        relation_attempt_counts[(sid,name)]=relation_attempt_counts.get((sid,name),0)+1
                     ledger.record_discovery_feedback([item.source],result.issues,task='relation_discovery')
                     candidates_queue.record(result)
                     _issues(report,result.issues);_discovery_counts(report,result)
                     report.counts['relation_discovery_tasks']=report.counts.get('relation_discovery_tasks',0)+1
+                    if (any(i.get('code')=='reference_source_object_missing' and i.get('table')==name
+                            for i in result.issues) and object_followups.get((sid,name),0)<1):
+                        # The edge was refused because this table has no source
+                        # object. One bounded return to object discovery can
+                        # compile a retained field model; it does not retry the
+                        # same missing premise indefinitely.
+                        object_followups[(sid,name)]=1
+                        recovered=explore(discover,rules_by_source[sid],config.goal,documents=corpus,
+                            model=discovery_model,table_refs={name},
+                            iteration_context=ledger.context([item],allrules,iteration=rounds),phase='relation')
+                        ledger.record_discovery_feedback([item.source],recovered.issues,task='metadata_discovery')
+                        candidates_queue.record(recovered)
+                        _issues(report,recovered.issues);_discovery_counts(report,recovered)
+                        executed_object=False
+                        for rule in recovered.rules:
+                            if rule.rule_id not in {r.rule_id for r in allrules}:
+                                allrules.append(rule);execute(rule)
+                            if rule.rule_id not in failed:
+                                executed_object=True
+                        if executed_object:
+                            retried=explore(discover_references,rules_by_source[sid],endpoints,documents=corpus,
+                                model=discovery_model,goal=config.goal,source_adapters=rules_by_source,
+                                table_refs={name},iteration_context={**ledger.context([item],allrules,iteration=rounds),
+                                    'role_occurrences':role_context},phase='relation')
+                            ledger.record_discovery_feedback([item.source],retried.issues,task='relation_discovery')
+                            candidates_queue.record(retried)
+                            _issues(report,retried.issues);_discovery_counts(report,retried)
+                            report.counts['relation_discovery_tasks']=report.counts.get('relation_discovery_tasks',0)+1
+                            result=retried
                     existing={r.rule_id:r for r in _latest(store.get_rules(include_stale=True))}
                     for rule in result.rules:
                         if rule.rule_id in existing and rule_shape(rule)==rule_shape(existing[rule.rule_id]):
@@ -685,7 +750,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     report.issues[:]=[i for i in report.issues if not (i.get('code')=='relation_discovery_pending' and i.get('table')==name)]
                     if state!='resolved':
                         report.issues.append({'code':'relation_discovery_pending','table':name,'status':state})
-        relation_attempts=set();relation_attempt_counts={};rounds=0
+        relation_attempts=set();relation_attempt_counts={};object_followups={};rounds=0
         review_role_occurrences()
         if auto:
             from .discovery.coverage import discover_uncovered
@@ -809,11 +874,12 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                         ledger.transition(item,'deferred')
                         report.issues.append({'code':'relation_discovery_attempt_budget_exhausted','table':name,'status':'deferred'})
                         continue
-                    relation_attempt_counts[(sid,name)]=relation_attempt_counts.get((sid,name),0)+1
                     endpoints=[r for r in _latest(store.get_rules()) if r.kind!='reference' and r.rule_id not in failed]
                     result=explore(discover_references,rules_by_source[sid],endpoints,documents=corpus,model=discovery_model,
                         goal=config.goal,source_adapters=rules_by_source,table_refs={name},
-                        iteration_context=context,revision_rules=entry['rules'])
+                        iteration_context=context,revision_rules=entry['rules'],phase='relation')
+                    if relation_attempt_consumed(result):
+                        relation_attempt_counts[(sid,name)]=relation_attempt_counts.get((sid,name),0)+1
                 else:
                     result=explore(discover,rules_by_source[sid],config.goal,documents=corpus,model=discovery_model,
                         table_refs={name},iteration_context=context,revision_rules=entry['rules'])

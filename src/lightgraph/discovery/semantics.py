@@ -111,14 +111,10 @@ def document_ref(document):
 
 
 def applicable_definition(document, table):
+    from .engine import _definition_document
     source = table if isinstance(table, SourceRef) else SourceRef(
         source_id=table.source_id, schema=table.schema_name, table=table.name)
-    applicable = ('sources' not in document or any(
-        item.get('source_id') == source.source_id
-        and item.get('schema', item.get('schema_name', 'public')) == source.schema_name
-        and item.get('table') == source.table for item in document['sources']))
-    return (applicable and document.get('evidence_role', 'definition_evidence') == 'definition_evidence'
-        and document.get('read_state', 'complete') == 'complete' and not document.get('derived', False))
+    return _definition_document(document, source)
 
 
 def declarations(documents, table):

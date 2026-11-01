@@ -82,13 +82,43 @@ def _spec(name, description, parameters):
         'description': description, 'parameters': parameters}}
 
 
-def proposal_tool_specs(task):
+def hierarchy_shape_available(packet):
+    """Hierarchy tools belong on a path table, not on a flat definition or role table.
+
+    Level-indexed columns or a field model with two code/label positions qualify.
+    A wide catalog without those signals still qualifies so an existing path can
+    be submitted. A table of a few role columns does not.
+    """
+    from .engine import LEVEL
+    if not packet:
+        return True
+    columns=(packet.get('metadata_digest') or {}).get('columns') or []
+    names=[column.get('name','') for column in columns if isinstance(column, dict)]
+    levels={int(match.group(2)) for name in names if (match:=LEVEL.search(name))}
+    if len(levels)>=2:
+        return True
+    for obj in (packet.get('schema_knowledge') or {}).get('objects') or []:
+        if obj.get('status') in ('superseded','conflict'):
+            continue
+        ready=[item for item in obj.get('positions') or [] if item.get('code') and item.get('label')]
+        if len({item.get('position') for item in ready})>=2:
+            return True
+    candidate=packet.get('revision_candidate') or {}
+    if candidate.get('kind') in ('wide_hierarchy','long_hierarchy'):
+        return True
+    return len(columns)>=8
+
+
+def proposal_tool_specs(task, packet=None):
     """Expose only this task's kinds; no tool repeats the full batch vocabulary."""
+    hierarchy=packet is None or hierarchy_shape_available(packet)
     specs = []
     for kind in sorted(TASK_PROPOSAL_KINDS[task]):
         # Fresh discovery uses business choices rather than redundant internal
         # hierarchy fields. Revision still needs the exact old domain/taxonomy
         # and distinct evidence bindings when repairing an existing rule.
+        if kind in ('wide_hierarchy','long_hierarchy') and not hierarchy:
+            continue
         if kind == 'wide_hierarchy' and task != 'T5_revision':
             continue
         schema = deepcopy(PROPOSAL_MODELS[kind].model_json_schema())
@@ -99,14 +129,16 @@ def proposal_tool_specs(task):
             'Use issued references; an error leaves prior drafts intact and does not retain '
             'the rejected input. Correct the diagnosed fields and resubmit, or withdraw '
             'the rejected attempt when finishing.', schema))
-    if 'wide_hierarchy' in TASK_PROPOSAL_KINDS[task]:
+    if hierarchy and 'wide_hierarchy' in TASK_PROPOSAL_KINDS[task]:
         from .hierarchy_plan import hierarchy_plan_tool_schema
         specs.insert(0,hierarchy_plan_tool_schema())
     if task in {'T0_discovery','T1_table_discovery','T3_hierarchy','T5_revision'}:
         from .schema_knowledge import ObjectModelDraft
         specs.append(_spec('declare_object_model',
-            'Record a candidate table object and its issued code, name, English-name, alias, scope '
-            'and position columns before proposing extraction. Reuse object_id only for an agent candidate. '
+            'Record a candidate for the current task table only. table_id and every column ID must come from '
+            'schema_knowledge.context for this table; another table\'s columns are rejected with the current '
+            'column list. Set position_semantics only when this table\'s definition states it. '
+            'Reuse object_id only for an agent candidate. '
             'To replace metadata_name_family candidates, use a new object_id plus explicit '
             'supersedes_object_ids, preserving each code/name/English/alias/namespace and position mapping. '
             'Validated mappings require rule revision, not candidate replacement. '
@@ -162,7 +194,7 @@ class ProposalSession:
         self.open_rejections = {}
         self._active_operator = None
         self._active_target = None
-        self.names = {item['function']['name'] for item in proposal_tool_specs(self.task)}
+        self.names = {item['function']['name'] for item in proposal_tool_specs(self.task, packet)}
 
     def reject(self, code='invalid_proposal_arguments', *, diagnostics=None):
         self.invalid_count += 1
@@ -179,7 +211,9 @@ class ProposalSession:
             field_code=diagnostic.get('code')
             allowed={'unauthorized_column_reference','dangling_evidence_reference',
                 'identity_domain_evidence_unresolved','dangling_order_evidence',
-                'unverified_entity_reference','unauthorized_selector_reference'}
+                'unverified_entity_reference','unauthorized_selector_reference',
+                'object_model_cross_table_reference','object_model_table_mismatch',
+                'hierarchy_shape_not_on_table'}
             self.invalid_diagnostics[(field_code if field_code in allowed else code,tuple(path),constraint)]+=1
         result = {'status':'error', 'code':code,
                   'rejection_id':rejection_id,
@@ -189,6 +223,11 @@ class ProposalSession:
             result['operator']=self._active_operator
         if diagnostics:
             result['diagnostics'] = diagnostics
+        evidence_codes={'dangling_evidence_reference','identity_domain_evidence_unresolved',
+                        'dangling_order_evidence'}
+        if code in evidence_codes or any(item.get('code') in evidence_codes for item in (diagnostics or [])):
+            from .reference_validation import definition_sections
+            result['definition_sections']=sorted(definition_sections(self.packet))[:32]
         return result
 
     def execute(self, name, arguments):
@@ -297,6 +336,12 @@ class ProposalSession:
                 return {'status':'ok','object_model':incoming,'candidate':True,'confirmed':False,
                     'superseded_object_ids':candidate.supersedes_object_ids}
             if name == 'submit_hierarchy_plan':
+                if not hierarchy_shape_available(self.packet):
+                    columns=sorted(column['id'] for column in (self.packet.get('metadata_digest') or {}).get('columns') or []
+                        if isinstance(column, dict) and column.get('id'))
+                    return self.reject('hierarchy_shape_not_on_table', diagnostics=[{
+                        'path':['positions'], 'code':'hierarchy_shape_not_on_table',
+                        'constraint':'reference', 'allowed_references':columns[:32]}])
                 from .hierarchy_plan import HierarchyPlan, compile_hierarchy_plan
                 contract = HierarchyPlan
                 converted = compile_hierarchy_plan(arguments,self.packet,validate_references=False)

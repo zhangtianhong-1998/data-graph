@@ -27,6 +27,16 @@ _PYDANTIC_CONSTRAINTS = {
     'greater_than_equal': 'minimum', 'less_than': 'exclusiveMaximum',
     'less_than_equal': 'maximum', 'value_error': 'semantic_contract',
 }
+# Validator messages here are fixed codes, never source text. Only these may
+# replace the generic semantic_contract label shown to the agent.
+_SAFE_VALUE_CODES = frozenset({
+    'object_model_identity_fields_required', 'object_model_code_label_overlap',
+    'object_model_duplicate_position', 'duplicate_hierarchy_position',
+    'duplicate_key_column', 'excluded_role_in_identity', 'abstain_with_proposals',
+    'task_kind_forbidden', 'identity_domain_policy_conflict',
+    'global_identity_scope_evidence_required', 'verified_identity_domain_evidence_required',
+    'hierarchy_plan_duplicate_position', 'hierarchy_plan_shared_domain_required',
+})
 
 
 def _property_names(schema):
@@ -96,7 +106,14 @@ def model_diagnostics(error: ValidationError, schema: dict, arguments) -> list[d
     if result:
         return result
     names = _property_names(schema)
-    return [{'path': _path(item['loc'], names),
-             'constraint': _PYDANTIC_CONSTRAINTS.get(item['type'], 'type')}
-            for item in error.errors(include_url=False, include_context=False,
-                                     include_input=False)[:MAX_DIAGNOSTICS]]
+    diagnostics=[]
+    for item in error.errors(include_url=False, include_context=True,
+                             include_input=False)[:MAX_DIAGNOSTICS]:
+        constraint=_PYDANTIC_CONSTRAINTS.get(item['type'], 'type')
+        if item.get('type')=='value_error':
+            cause=(item.get('ctx') or {}).get('error')
+            arguments=getattr(cause,'args',())
+            if len(arguments)==1 and isinstance(arguments[0], str) and arguments[0] in _SAFE_VALUE_CODES:
+                constraint=arguments[0]
+        diagnostics.append({'path': _path(item['loc'], names), 'constraint': constraint})
+    return diagnostics

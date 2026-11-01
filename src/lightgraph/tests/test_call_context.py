@@ -180,7 +180,7 @@ def test_sql_ast_adds_actual_join_tables_before_rows_and_catalog_listing_does_no
     assert {s['doc_id'] for s in tools.context_documents()}=={'global','A'}
     real_execute=adapter.execute
     def execute(*args,**kwargs):
-        assert {s['doc_id'] for s in tools.context_documents()}=={'global','A','B'}
+        assert {s['doc_id'] for s in tools.context_documents()}=={'global','A'}
         yield from real_execute(*args,**kwargs)
     monkeypatch.setattr(adapter,'execute',execute)
     result=tools.execute('execute_readonly_sql',{'sql':(
@@ -188,7 +188,7 @@ def test_sql_ast_adds_actual_join_tables_before_rows_and_catalog_listing_does_no
         'SELECT a.code, b.label FROM public.a a JOIN x b ON a.code=b.code')})
     assert result['status']=='ok' and result['data']['rows']==[['K','OBSERVATION_CANARY_9271']]
     refs=tools.document_refs()
-    assert {r['doc_id'] for r in refs}=={'global','A','B'}
+    assert {r['doc_id'] for r in refs}=={'global','A'}
     assert 'OBSERVATION_CANARY' not in json.dumps(refs)
     tools.begin_context([tables[2]])
     assert {s['doc_id'] for s in tools.context_documents()}=={'global','C'}
@@ -199,8 +199,7 @@ def test_sql_ast_adds_actual_join_tables_before_rows_and_catalog_listing_does_no
 
 def test_registered_revision_and_scope_revalidated_before_compilation():
     adapter,tools,tables=fixture_tools()
-    tools.begin_context([tables[0]])
-    tools.execute('search_knowledge',{'table':'s:public.b'})
+    tools.begin_context([tables[0],tables[1]])
     assert {d['doc_id'] for d in tools.context_documents()}=={'global','A','B'}
     tools.documents.documents[2]=document('B','修订后的定义',binding='s:public.b')
     with pytest.raises(LightGraphError,match='stale_document_reference'):
@@ -221,11 +220,11 @@ def test_agent_registers_dynamic_sections_for_final_evidence_and_next_task_start
             message={'content':None,'tool_calls':[{'id':'provider-id','type':'function','function':{
                 'name':'execute_readonly_sql','arguments':json.dumps({'sql':'SELECT code, label FROM public.b'})}}]}
         else:
-            assert {d['doc_id'] for d in context['document_directory']}=={'global','A','B'}
+            assert {d['doc_id'] for d in context['document_directory']}=={'global','A'}
             assert 'OBSERVATION_CANARY_9271' in body['messages'][-1]['content']
             message={'content':json.dumps({'task':'T0_discovery','proposals':[{'kind':'column_group','claim':{
                 'group_id':'g','entity_kind_hint':'Metric','members':[{'column_id':'c_code','role':'identity_code'}]},
-                'evidence_cited':['B']}]})}
+                'evidence_cited':['A']}]})}
         return httpx.Response(200,json={'choices':[{'message':message,'finish_reason':'tool_calls' if message.get('tool_calls') else 'stop'}]})
     model=StructuredModelClient(ModelConfig(base_url='https://test.invalid',model='mock',api_key_env='CONTEXT_TEST_KEY',
         allow_source_samples=True),BudgetAllocator(Cost(llm_calls=8,llm_tokens=1000000,memory_bytes=1000000,seconds=60)),httpx.MockTransport(transport))
@@ -233,9 +232,9 @@ def test_agent_registers_dynamic_sections_for_final_evidence_and_next_task_start
         'scope':{'source_id':'s','schema':'public','table':'a'},
         'metadata_digest':{'columns':[{'id':'c_code','name':'code'}]}}
     result=model.explore(packet,tools)
-    assert result.proposals[0].evidence_cited==['B']
-    assert {r['doc_id'] for r in packet['document_refs']}=={'global','A','B'}
-    assert {s['doc_id'] for s in tools.context_documents()}=={'global','A','B'}
+    assert result.proposals[0].evidence_cited==['A']
+    assert {r['doc_id'] for r in packet['document_refs']}=={'global','A'}
+    assert {s['doc_id'] for s in tools.context_documents()}=={'global','A'}
     assert 'OBSERVATION_CANARY' not in json.dumps(packet)
     assert not list(tmp_path.iterdir()) and 'OBSERVATION_CANARY' not in caplog.text+capsys.readouterr().out
     # Reusing the model creates no conversation history or old table documents.

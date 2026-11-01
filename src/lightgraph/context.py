@@ -183,8 +183,8 @@ def initial_agent_prompt_bytes(packet, tool_specs, *, max_steps=8, max_tool_call
         remaining_tool_calls=max_tool_calls,submission_reason=reason)
     # Use the transport's exact representation, including its provider schema
     # and removal of the redundant schema text in strict mode.
-    envelope=request_envelope_for(messages,proposal_tool_specs(stage) if reason
-        else [*tool_specs,*proposal_tool_specs(stage)],
+    envelope=request_envelope_for(messages,proposal_tool_specs(stage, checked) if reason
+        else [*tool_specs,*proposal_tool_specs(stage, checked)],
                                   None)
     return len(canonical(envelope).encode())
 

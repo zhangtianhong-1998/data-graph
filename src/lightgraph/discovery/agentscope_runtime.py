@@ -323,7 +323,7 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
     session=ProposalSession(packet)
     class CombinedTools:
         def tool_specs(self):
-            return [*executor.tool_specs(),*proposal_tool_specs(packet['task'])]
+            return [*executor.tool_specs(),*proposal_tool_specs(packet['task'], packet)]
 
     def combined_dispatch(name,arguments):
         if name in session.names:

@@ -30,8 +30,8 @@ def test_table_lookup_omits_other_activated_tables_but_preserves_issued_refs():
         assert {s['doc_id'] for s in sections}=={'global','A'}
         assert all(s['sources']==[{'source_id':'s','schema':'public','table':'a'}] for s in sections)
         assert result['data']['next_page'] is None and result['coverage']['result_complete']
-        assert {s['doc_id'] for s in tools.context_documents()}=={'global','A','B'}
-        assert {r['doc_id'] for r in tools.document_refs()}=={'global','A','B'}
+        assert {s['doc_id'] for s in tools.context_documents()}=={'global','B'}
+        assert {r['doc_id'] for r in tools.document_refs()}=={'global','B'}
         assert tools.documents.validate_references(before,tables)
         assert adapter.stats.queries==0
     finally:

@@ -192,11 +192,32 @@ def _draft(table,group,scope,semantic,excluded,goal,documents):
     return rule
 
 
+def _document_applies(document, table):
+    """A definition applies only to the tables its scope or sources name."""
+    scope = document.get("scope") or {}
+    if not isinstance(scope, dict):
+        scope = {}
+    name = getattr(table, "name", None) or table.table
+    schema_name = getattr(table, "schema_name", None) or "public"
+    names = {name, f"{schema_name}.{name}",
+             f"{table.source_id}:{schema_name}.{name}",
+             f"{table.source_id}.{schema_name}.{name}"}
+    source_ids = scope.get("source_ids") or []
+    tables = scope.get("tables") or []
+    if source_ids and table.source_id not in source_ids:
+        return False
+    if tables and not any(selector in names for selector in tables):
+        return False
+    sources = document.get("sources")
+    if sources and not any(source.get("source_id") == table.source_id
+            and source.get("schema", source.get("schema_name", "public")) == schema_name
+            and source.get("table") == name for source in sources):
+        return False
+    return True
+
+
 def _definition_document(document, table=None):
-    applicable = (table is None or "sources" not in document
-        or any(source.get("source_id") == table.source_id
-               and source.get("schema", source.get("schema_name", "public")) == table.schema_name
-               and source.get("table") == table.name for source in document["sources"]))
+    applicable = table is None or _document_applies(document, table)
     return (applicable and document.get("evidence_role", "definition_evidence") == "definition_evidence"
         and document.get("read_state", "complete") == "complete"
         and not document.get("derived", False))

@@ -66,13 +66,21 @@ class CandidateQueue:
         for head in self.store.heads():heads.setdefault(head['logical_rule_id'],[]).append(head)
         revisions={}
         for rule_id in set(published):
-            current=heads.get(rule_id,[])
-            # A stored RuleSpec or one updated partition is not a completed
-            # replacement. Confirm the actual, valid complete-generation head.
-            if len(current)!=1 or not current[0]['valid'] or current[0]['partition_id']!='all':continue
-            publication=self.store._publication(current[0]['publication_id'])
-            if publication['state']=='published' and self.store._is_rule_generation(publication['publication_id']):
-                revisions[rule_id]=publication['revision']
+            current=[head for head in heads.get(rule_id,[]) if head['valid']]
+            # One updated partition is not a completed replacement. Every valid
+            # head for the rule must be a published complete generation.
+            if not current:
+                continue
+            publications=[]
+            complete=True
+            for head in current:
+                publication=self.store._publication(head['publication_id'])
+                if publication['state']!='published' or not self.store._is_rule_generation(publication['publication_id']):
+                    complete=False
+                    break
+                publications.append(publication)
+            if complete and publications:
+                revisions[rule_id]=max(item['revision'] for item in publications)
         with self.store._transaction():
             for row in self.connection.execute('SELECT candidate_id,rule_revisions FROM discovery_candidate_replacement WHERE scope_key=?',(self.scope_key,)).fetchall():
                 expected=json.loads(row['rule_revisions'])

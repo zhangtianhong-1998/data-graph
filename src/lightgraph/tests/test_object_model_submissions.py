@@ -27,7 +27,7 @@ def test_object_model_is_candidate_and_latest_mapping_stays_in_packet():
     assert '_runtime_object_models' not in session.batch().model_dump_json()
     bad={**first,'key_columns':['PRIVATE_COLUMN']}
     rejected=session.execute('declare_object_model',bad)
-    assert rejected['code']=='unauthorized_column_reference'
+    assert rejected['code']=='object_model_cross_table_reference'
     assert rejected['diagnostics'][0]['field']==['key_columns',0]
     assert 'PRIVATE_COLUMN' not in json.dumps(rejected)
     assert len(session.batch()._runtime_object_models)==2

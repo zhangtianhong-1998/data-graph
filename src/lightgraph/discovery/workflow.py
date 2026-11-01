@@ -445,7 +445,12 @@ def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations
             from .conflicts import mark_conflict_repaired
             mark_conflict_repaired(result,cid,accepted[0].rule_id)
         elif replacements:_issue(result,table,'rule_conflict_constraints_changed')
-    alternatives,docs=revise_once(semantic_failures,model=model,packet=packet,
+    # A grain refutation means those columns are not one composite entity.
+    # Asking for a smaller key of the same kind cannot express the path.
+    revisable=[item for item in semantic_failures
+        if not (getattr(item['failure'],'stage',None)=='entity_granularity'
+                and item['failure'].code=='semantic_claim_refuted')]
+    alternatives,docs=revise_once(revisable,model=model,packet=packet,
         tool_factory=tool_factory,ask=ask_revision,observations=observations,result=result,table=table,documents=docs)
     for item,proposal,schema,repair_packet in alternatives:
         revised_packet={**repair_packet,'semantic_revision_guard':{
@@ -482,6 +487,35 @@ def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations
     if unresolved:
         result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
     return rules,docs,batch,packet,(projection_excluded,identity_excluded)
+
+
+def hierarchy_recovery_refs(result, table, docs):
+    """Evidence for a path compiled after a composite-key grain refutation.
+
+    A direct refutation of the hierarchy claim itself blocks this recovery.
+    Grain counterevidence prefers the definition sections that refuted the
+    composite key; otherwise the table's applicable definition sections.
+    """
+    from .engine import _definition_document, _source
+    source=_source(table)
+    own=[candidate for candidate in result.pending_candidates if candidate.source==source]
+    if any(candidate.review_stage=='hierarchy' and candidate.failure_code=='semantic_claim_refuted'
+           for candidate in own):
+        return None
+    applicable=[document['doc_id']+'@'+document['revision']+':'+document['section_id']
+        for document in docs if _definition_document(document, table)]
+    grain=[candidate for candidate in own
+        if candidate.review_stage=='entity_granularity' and candidate.failure_code=='semantic_claim_refuted']
+    if not grain:
+        return applicable, ()
+    allowed=set(applicable)
+    blocking=[ref for candidate in grain for ref in candidate.blocking_evidence_refs if ref in allowed]
+    keys=[]
+    for candidate in grain:
+        for ref in candidate.column_refs:
+            if ref not in keys:
+                keys.append(ref)
+    return (blocking or applicable), keys
 
 
 def _verify_fd(adapter, table, rule, budget):
@@ -662,6 +696,21 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
                 projection_excluded={entry.column for prior_rule in prior for entry in prior_rule.attributes.excluded},
                 hierarchy_rules=prior,granularity_rejections=granularity_rejections,
                 observed_hierarchies=observed_hierarchies,on_revision=record_revision)
+            if schema_knowledge and not any(rule.kind=='wide_hierarchy' for rule in rules):
+                from .schema_knowledge import proposals_from_field_models
+                recovery_refs=hierarchy_recovery_refs(result, table, docs)
+                prepared=proposals_from_field_models(
+                    schema_knowledge.current_objects(table), *recovery_refs) if recovery_refs is not None else []
+                if prepared:
+                    recovery=ProposalBatch(task=batch.task,proposals=prepared[:6],
+                        semantic_schema=batch.semantic_schema)
+                    recovered,docs,batch,packet,guards=_compile_candidates(recovery,original,goal,docs,result,
+                        model=model,packet=packet,observations=observations,tool_factory=fresh_tools,
+                        projection_excluded={entry.column for prior_rule in prior for entry in prior_rule.attributes.excluded},
+                        hierarchy_rules=prior,granularity_rejections=granularity_rejections,
+                        observed_hierarchies=observed_hierarchies,on_revision=record_revision)
+                    rules=[*rules,*recovered]
+                    result.stats['field_model_rule_attempts']=result.stats.get('field_model_rule_attempts',0)+1
             if prior and 'fd_violation' in original_revision_codes:
                 protected=prior[0]
                 safe=[]
@@ -873,7 +922,10 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                         matches=[r for r in approved.values() if r.source==_source(table)
                             and any(binding['rule_id']==r.rule_id and binding['level']==claim.source_level
                                     and binding['key_columns']==local for binding in bindings)]
-                        if len(matches)!=1:raise LightGraphError('reference_source_binding_ambiguous')
+                        if not matches:
+                            raise LightGraphError('reference_source_object_missing')
+                        if len(matches)!=1:
+                            raise LightGraphError('reference_source_binding_ambiguous')
                         source=matches[0]
                     target=approved[claim.target_entity]
                     if claim.condition_ref or claim.polymorphic_by:raise LightGraphError('reference_condition_requires_registered_selector')
