@@ -155,7 +155,7 @@ def discovery_envelope(visible):
             'output_schema':DiscoveryFinish.model_json_schema()}
 
 
-def initial_agent_prompt_bytes(packet, tool_specs, *, max_steps=8, max_tool_calls=16,
+def initial_agent_prompt_sizes(packet, tool_specs, *, max_steps=8, max_tool_calls=16,
                                response_format='json_schema'):
     """Measure the first Agent request, including schema, context and tool specs.
 
@@ -178,15 +178,29 @@ def initial_agent_prompt_bytes(packet, tool_specs, *, max_steps=8, max_tool_call
         checked.get('subtask') or STAGE_SUBTASKS[stage])
     messages=[{'role':'system','content':system},
               {'role':'user','content':canonical(discovery_envelope(checked))}]
+    from lightgraph.discovery.model_references import ModelReferences
+    references=ModelReferences(checked)
+    messages=references.messages(messages)
     reason='last_turn' if max_steps==1 else None
     messages=with_discovery_runtime_control(messages,turn=1,max_turns=max_steps,
         remaining_tool_calls=max_tool_calls,submission_reason=reason)
     # Use the transport's exact representation, including its provider schema
     # and removal of the redundant schema text in strict mode.
-    envelope=request_envelope_for(messages,proposal_tool_specs(stage, checked) if reason
-        else [*tool_specs,*proposal_tool_specs(stage, checked)],
+    envelope=request_envelope_for(messages,references.schema(proposal_tool_specs(stage, checked) if reason
+        else [*tool_specs,*proposal_tool_specs(stage, checked)]),
                                   None)
-    return len(canonical(envelope).encode())
+    from lightgraph.discovery.token_estimation import estimate_tokens
+    content=canonical(envelope)
+    references.clear()
+    return len(content.encode()), estimate_tokens(content)
+
+
+def initial_agent_prompt_bytes(packet, tool_specs, **options):
+    return initial_agent_prompt_sizes(packet, tool_specs, **options)[0]
+
+
+def initial_agent_prompt_tokens(packet, tool_specs, **options):
+    return initial_agent_prompt_sizes(packet, tool_specs, **options)[1]
 
 
 def document_batches(documents, *, max_bytes=12000, max_sections=32):

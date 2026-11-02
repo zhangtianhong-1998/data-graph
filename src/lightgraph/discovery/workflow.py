@@ -13,6 +13,7 @@ from lightgraph.contracts import (ExtractionGoal, ExcludedColumn, RuleSpec, Iden
     ScopeSpec, RelationSpec, HierarchySpec, Dependencies, Coverage, digest)
 from lightgraph.documents import DocumentCorpus
 from lightgraph.errors import LightGraphError, BudgetExceeded
+from lightgraph.runtime.progress import emit_progress
 from .budget import BudgetAllocator, Cost
 from .goal import source_in_goal, column_is_excluded, column_is_evidence_only
 from .models import DiscoveryResult, Hypothesis, ProposalBatch, MAX_HIERARCHY_IDENTITY_REQUESTS
@@ -518,21 +519,22 @@ def _verify_fd(adapter, table, rule, budget):
 
 def _bounded_catalog_window(table, tables, packet, model, tool_specs):
     """Keep the task table and fit optional catalog entries into the real prompt."""
-    from lightgraph.context import initial_agent_prompt_bytes, STAGE_SUBTASKS
+    from lightgraph.context import initial_agent_prompt_sizes, STAGE_SUBTASKS
+    from .token_estimation import prompt_token_limit
     candidates=[table]+[t for t in tables
         if (t.source_id,t.qualified_name)!=(table.source_id,table.qualified_name)][:63]
-    limit=getattr(model.config,'max_prompt_bytes',131072)
-    byte_limit=limit
-    # The transport conservatively reserves one token per request byte plus
-    # output. A larger prompt cap must not pack optional tables past the actual
-    # remaining model budget before the first request even starts.
+    byte_limit=getattr(model.config,'max_prompt_bytes',131072)
+    context_limit=prompt_token_limit(model.config)
+    budget_limit=None
+    # Request bytes, context tokens and cumulative spend are separate limits.
+    # Use the same token estimator as transport, including its output reserve.
     if getattr(model,'budget',None) is not None:
         allowance=model.budget.snapshot()
         tokens=allowance['limits']['llm_tokens']
         if tokens is not None:
             available=tokens-allowance['used']['llm_tokens']-sum(
                 cost['llm_tokens'] for cost in allowance['reserved'].values())
-            limit=min(limit,available-getattr(model.config,'max_output_tokens',4096))
+            budget_limit=available-getattr(model.config,'max_output_tokens',4096)
     control={'max_steps':getattr(model.config,'max_discovery_steps',8),
              'max_tool_calls':getattr(model.config,'max_tool_calls',16),
              'response_format':getattr(model.config,'response_format','json_schema')}
@@ -543,17 +545,25 @@ def _bounded_catalog_window(table, tables, packet, model, tool_specs):
                 f' Catalog coverage: {size} of {len(tables)} authorized tables are visible '
                 'in this call; the task table is included. Unlisted tables have not been examined.')}
     selected=candidate(1)
-    required=initial_agent_prompt_bytes(selected,tool_specs,**control)
-    if required>byte_limit:raise LightGraphError('model_packet_too_large')
-    if required>limit:raise BudgetExceeded('llm_tokens_budget_exhausted')
+    required_bytes,required_tokens=initial_agent_prompt_sizes(selected,tool_specs,**control)
+    if required_bytes>byte_limit:raise LightGraphError('model_packet_too_large')
+    if context_limit is not None and required_tokens>context_limit:
+        raise LightGraphError('model_context_window_exceeded')
+    if budget_limit is not None and required_tokens>budget_limit:
+        raise BudgetExceeded('llm_tokens_budget_exhausted')
     # Optional catalog entries must leave room for tools and refreshed evidence.
     # Keep the mandatory task table even if it alone consumes this headroom.
-    window_limit=max(required,limit-min(65536,limit//4))
+    window_bytes=max(required_bytes,byte_limit-min(65536,byte_limit//4))
+    token_limits=[limit for limit in (context_limit,budget_limit) if limit is not None]
+    token_limit=min(token_limits) if token_limits else None
+    window_tokens=(max(required_tokens,token_limit-min(16384,token_limit//4))
+                   if token_limit is not None else None)
     low,high=1,len(candidates)
     while low<high:
         middle=(low+high+1)//2
         trial=candidate(middle)
-        if initial_agent_prompt_bytes(trial,tool_specs,**control)<=window_limit:
+        trial_bytes,trial_tokens=initial_agent_prompt_sizes(trial,tool_specs,**control)
+        if trial_bytes<=window_bytes and (window_tokens is None or trial_tokens<=window_tokens):
             low=middle
             selected=trial
         else:high=middle-1
@@ -608,6 +618,9 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
         key in table_refs for key in (table.qualified_name,table.source_id+'.'+table.qualified_name,
             (table.source_id,table.schema_name,table.name)))]
     for table_index,table in enumerate(selected):
+        emit_progress('discovery','table_started',table=table.source_id+'.'+table.qualified_name,
+            completed=table_index,total=len(selected),unit='tables')
+        issue_start=len(result.issues)
         original=originals[table.qualified_name]
         docs=corpus.context_for(_source(table),table.column_names)
         understanding=_understanding(table,[],{},docs)
@@ -878,6 +891,9 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             budget.release(reservation)
             if phase_deadline is not None and callable(getattr(budget,'set_phase_deadline',None)):
                 budget.set_phase_deadline(phase_deadline)
+            emit_progress('discovery','table_completed',table=table.source_id+'.'+table.qualified_name,
+                completed=table_index+1,total=len(selected),unit='tables',
+                level='warning' if result.issues[issue_start:] else 'info')
     result.stats.update({'tables_considered':len(result.understandings),'catalog_tables':catalog_size,
         'catalog_window_limit':64,'catalog_windows':len(window_coverage),
         'catalog_window_min':min(window_coverage,default=0),
@@ -908,6 +924,10 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
     approved={r.rule_id:r for r in validated_rules if r.status in ('validated','canary_checked','published')
               and r.validation_ref and r.kind in ('column_group_entity','wide_hierarchy','long_hierarchy')
               and source_in_goal(goal,r.source)}
+    existing_references=[r for r in validated_rules if r.kind=='reference' and r.relation
+        and r.status in ('validated','canary_checked','published') and r.validation_ref
+        and r.relation.source_rule_id in approved and r.relation.target_rule_id in approved
+        and source_in_goal(goal,r.source)]
     result=DiscoveryResult()
     bindings=[{'rule_id':r.rule_id,'source':r.source.model_dump(by_alias=True),
         'entity_kind':r.identity.entity_kind,'level':level,'key_columns':endpoint_columns(r,level)}
@@ -917,10 +937,12 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
     if len(tables)>64 or len(approved)>64:
         result.issues.append({'code':'reference_catalog_limit','status':'partial'});return result
     count=0
-    for table in tables:
-        if table_refs is not None and not any(key in table_refs for key in (
-            table.qualified_name,table.source_id+'.'+table.qualified_name,
-            (table.source_id,table.schema_name,table.name))):continue
+    selected=[table for table in tables if table_refs is None or any(key in table_refs for key in (
+        table.qualified_name,table.source_id+'.'+table.qualified_name,
+        (table.source_id,table.schema_name,table.name)))]
+    for table_index,table in enumerate(selected):
+        emit_progress('relations','table_started',table=table.source_id+'.'+table.qualified_name,
+            completed=table_index,total=len(selected),unit='tables')
         tools=None
         observations=ReviewObservations()
         issue_start=len(result.issues);rule_start=len(result.rules)
@@ -947,8 +969,29 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
             if len(tool_tables)>64:raise LightGraphError('reference_catalog_limit')
             packet['catalog']=[t.model_dump(mode='json',by_alias=True) for t in tool_tables]
             packet['authorized_entities']=list(approved)
+            existing=sorted((r for r in existing_references if r.source==_source(table)),
+                key=lambda r:(r.rule_id,r.revision))
+            # Reused rules are context, not new semantic evidence. Include their
+            # actual mappings and vocabulary so a resumed Agent need not invent
+            # a second name for an already discovered relationship.
+            packet['existing_reference_rules']=[]
+            for rule in existing[:64]:
+                mapping=rule.relation.model_dump(mode='json')
+                for field in ('source_columns','target_columns','source_json_array_columns','target_json_array_columns'):
+                    mapping[field]=[_column_id(table,c) for c in mapping[field]]
+                packet['existing_reference_rules'].append({'rule_id':rule.rule_id,
+                    'revision':rule.revision,'relation_contract':mapping})
+            packet['existing_reference_rules_total']=len(existing)
+            packet['existing_reference_rules_truncated']=len(existing)>64
+            packet['relation_reuse_instruction']=(
+                'Read existing_reference_rules and the issued semantic_schema before proposing relations. '
+                'Reuse an existing relation name when its meaning and mapping apply. Do not create a synonym '
+                'only to restate an existing relationship. Shared endpoints alone do not establish equivalent '
+                'meaning: independently evidenced different relations remain valid. Existing rules are context, '
+                'not evidence for a new semantic claim.')
             packet['semantic_schema']=SemanticSchema.merged(goal.semantic_schema,
-                *(r.semantic_schema for r in approved.values())).model_dump(mode='json')
+                *(r.semantic_schema for r in approved.values()),
+                *(r.semantic_schema for r in existing[:64])).model_dump(mode='json')
             if len(bindings)>64:raise LightGraphError('reference_catalog_limit')
             packet['entity_bindings']=bindings
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
@@ -1013,7 +1056,7 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                     target=approved[claim.target_entity]
                     if claim.condition_ref or claim.polymorphic_by:raise LightGraphError('reference_condition_requires_registered_selector')
                     if goal.relation_kinds and claim.relation_kind not in goal.relation_kinds:raise LightGraphError('outside_relation_goal')
-                    schema=SemanticSchema.merged(goal.semantic_schema,batch.semantic_schema,
+                    schema=SemanticSchema.merged(SemanticSchema.model_validate(packet['semantic_schema']),batch.semantic_schema,
                         source.semantic_schema,target.semantic_schema)
                     schema=_reference_schema(schema,source.identity.entity_kind,target.identity.entity_kind,
                         claim.relation_kind,goal)
@@ -1122,6 +1165,9 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
             else:result.relation_table_outcomes[table.qualified_name]='resolved'
             if tools is not None:tools.close()
             observations.close()
+            emit_progress('relations','table_completed',table=table.source_id+'.'+table.qualified_name,
+                completed=table_index+1,total=len(selected),unit='tables',
+                level='warning' if table_issues else 'info')
     result.stats.update({'reference_candidates':count,'rules_proposed':len(result.rules),'endpoint_rules':len(approved)})
     result.budget=budget.snapshot()
     return result

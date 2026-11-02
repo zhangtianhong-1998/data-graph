@@ -93,3 +93,18 @@ def test_supported_semantics_does_not_publish_a_cycle_or_null_identity_namespace
             outcome=execute(store,spec,rows)
             assert not outcome.published and expected in outcome.codes
             assert not store.view({'t'})['nodes']
+
+
+@pytest.mark.parametrize('allow_dag',[False,True])
+def test_relative_position_identity_is_explicit_but_cannot_override_a_negative_review(allow_dag):
+    value=proposal();value['claim']['allow_dag']=allow_dag
+    def complete(task,packet,schema):
+        identity=packet['review_stage_contract']['identity_interpretation']
+        assert identity['physical_position']=='source support, not an additional identity component'
+        assert 'not a conflict by itself' in identity['repeated_code_across_positions']
+        assert identity['multiple_parents'].startswith('permitted' if allow_dag else 'not permitted')
+        assert 'requires identity or label disambiguation' in identity['different_labels_for_same_scoped_code']
+        return schema.model_validate({**review_response(packet),'decision':'refuted'})
+    with pytest.raises(LightGraphError,match='semantic_claim_refuted'):
+        review_semantics(SimpleNamespace(complete=complete),
+            {'probe_digest':[{'probe_id':'probe_1'}]},value,[])

@@ -1,14 +1,26 @@
 """Bound ephemeral history without changing tool identities or inventing evidence."""
 from lightgraph.contracts import canonical
 from .llm import _request_schema, request_envelope_for, response_format_for
+from .token_estimation import estimate_tokens
 
 
 def prompt_bytes(messages, tools, mode):
+    return prompt_size(messages, tools, mode)[0]
+
+
+def prompt_size(messages, tools, mode):
+    """Size the complete transport envelope, including tool schemas."""
     response_format=None if tools else response_format_for(_request_schema(messages),mode)
-    return len(canonical(request_envelope_for(messages,tools,response_format)).encode())
+    content=canonical(request_envelope_for(messages,tools,response_format))
+    return len(content.encode()), estimate_tokens(content)
 
 
-def fit_source_history(messages, tools, mode, limit, submission_names):
+def prompt_fits(messages, tools, mode, byte_limit, token_limit=None):
+    byte_count,token_count=prompt_size(messages,tools,mode)
+    return byte_count<=byte_limit and (token_limit is None or token_count<=token_limit)
+
+
+def fit_source_history(messages, tools, mode, limit, submission_names, *, token_limit=None):
     """Evict oldest complete source exchanges, keeping the newest and all drafts.
 
     Local submissions, declarations and validation feedback are pinned verbatim.
@@ -38,7 +50,7 @@ def fit_source_history(messages, tools, mode, limit, submission_names):
     # The newest source exchange stays available even when followed by a local
     # validation error; repairing that draft may still depend on its evidence.
     for start,end in groups[:-1]:
-        if prompt_bytes(fitted,tools,mode)<=limit:
+        if prompt_fits(fitted,tools,mode,limit,token_limit):
             break
         omitted.update(range(start,end))
         removed+=1
@@ -48,7 +60,11 @@ def fit_source_history(messages, tools, mode, limit, submission_names):
                 fitted[i]={**message,'content':(message.get('content') or '')+'\n'+canonical({
                     'history_window':{'omitted_source_exchanges':removed,
                         'note':'Older source exchanges are outside this request window. '
-                        'Their absence is not negative evidence. Use visible evidence and retained '
-                        'draft feedback only; finish with pending=true if evidence is insufficient.'}})}
+                        'Their absence is not negative evidence. The current task, schema knowledge, '
+                        'issued-reference registry and draft feedback remain visible with unchanged '
+                        'candidate/validated status; omission does not validate any claim. '
+                        'If a missing result is needed, query the authorized source again within '
+                        'the remaining allowance. Never reconstruct missing rows from memory; '
+                        'finish with pending=true if evidence remains insufficient.'}})}
                 break
     return fitted,removed

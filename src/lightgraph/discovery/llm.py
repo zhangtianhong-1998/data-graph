@@ -9,6 +9,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from lightgraph.contracts import StrictModel, canonical
 from lightgraph.errors import LightGraphError, BudgetExceeded
+from lightgraph.runtime.progress import emit_progress
 from .budget import BudgetAllocator, Cost
 from .models import ProposalBatch, TaskPacket
 from .goal import build_goal_instructions
@@ -456,6 +457,8 @@ class ModelConfig(StrictModel):
     timeout_seconds: float = 45
     max_response_bytes: int = 262144
     max_prompt_bytes: int = 131072
+    max_prompt_tokens: int | None = Field(default=None, gt=0)
+    context_window_tokens: int | None = Field(default=None, gt=0)
     max_output_tokens: int = 4096
     retries: int = 1
     allow_source_samples: bool = False
@@ -489,18 +492,43 @@ class StructuredModelClient:
             raise LightGraphError('insecure_model_endpoint')
         if config.timeout_seconds <= 0 or config.max_response_bytes <= 0 or config.max_prompt_bytes <= 0 or config.max_output_tokens <= 0:
             raise LightGraphError('invalid_model_limits')
+        if config.context_window_tokens is not None and config.context_window_tokens <= config.max_output_tokens:
+            raise LightGraphError('invalid_model_limits')
         self.config, self.budget = config, budget or BudgetAllocator()
         self.transport = transport
         self.usage = {'calls':0,'input_tokens':0,'output_tokens':0,'failures':0}
+
+    def _check_prompt_limits(self, content):
+        """Keep transport bytes, per-request context and cumulative tokens separate."""
+        from .token_estimation import estimate_tokens, prompt_token_limit
+        size = len(content.encode())
+        if size > self.config.max_prompt_bytes:
+            self.usage['prompt_packets_rejected'] = self.usage.get('prompt_packets_rejected', 0) + 1
+            self.usage['prompt_rejected_peak_bytes'] = max(self.usage.get('prompt_rejected_peak_bytes', 0), size)
+            raise LightGraphError('model_packet_too_large')
+        estimated_tokens = estimate_tokens(content)
+        limit = prompt_token_limit(self.config)
+        if limit is not None and estimated_tokens > limit:
+            self.usage['prompt_token_windows_rejected'] = self.usage.get('prompt_token_windows_rejected', 0) + 1
+            self.usage['prompt_rejected_peak_estimated_tokens'] = max(
+                self.usage.get('prompt_rejected_peak_estimated_tokens', 0), estimated_tokens)
+            raise LightGraphError('model_context_window_exceeded')
+        return estimated_tokens
 
     @property
     def allow_source_samples(self):
         return self.config.allow_source_samples
 
     def complete(self, task: str, packet: dict, response_model: type[T]) -> T:
-        messages=self._complete_messages(task,packet,response_model)
-        return self._request(messages,lambda message:response_model.model_validate(_strict_json_loads(message['content'])),
-                             semantic_review=task=='semantic_review',correction_contract=response_model)
+        from .model_references import ModelReferences
+        references=ModelReferences(packet)
+        try:
+            messages=references.messages(self._complete_messages(task,packet,response_model))
+            return self._request(messages,lambda message:response_model.model_validate(
+                _strict_json_loads(references.response(message)['content'])),
+                semantic_review=task=='semantic_review',correction_contract=response_model)
+        finally:
+            references.clear()
 
     def _complete_messages(self,task,packet,response_model):
         if not self.config.allow_source_samples and task != 'T4_document':
@@ -518,24 +546,33 @@ class StructuredModelClient:
         from .semantics import BoundSemanticVerdict, SemanticReview
         if packet.get('semantic_proposition_ref')!=proposition_ref or not isinstance(packet.get('semantic_proposition'),dict):
             raise LightGraphError('semantic_review_reference_mismatch')
+        from .model_references import ModelReferences
+        references=ModelReferences(packet)
         def parse(message):
-            value=_strict_json_loads(message['content'])
+            value=_strict_json_loads(references.response(message)['content'])
             if isinstance(value,dict) and {'proposition_ref','proposition','basis'} & set(value):
                 return SemanticReview.model_validate(value)
             return BoundSemanticVerdict.model_validate(value).bind(proposition_ref)
-        return self._request(self._complete_messages('semantic_review',packet,BoundSemanticVerdict),parse,
-            semantic_review=True,correction_contract=BoundSemanticVerdict,allow_schema_repair=allow_schema_repair)
+        try:
+            return self._request(references.messages(self._complete_messages('semantic_review',packet,BoundSemanticVerdict)),parse,
+                semantic_review=True,correction_contract=BoundSemanticVerdict,allow_schema_repair=allow_schema_repair)
+        finally:
+            references.clear()
 
     def complete_reference_patch(self, packet, response_model):
         """One locator correction; never start a nested schema-repair turn."""
+        from .model_references import ModelReferences
+        references=ModelReferences(packet)
         try:
-            return self._request(self._complete_messages('semantic_review',packet,response_model),
-                lambda message:response_model.model_validate(_strict_json_loads(message['content'])),
+            return self._request(references.messages(self._complete_messages('semantic_review',packet,response_model)),
+                lambda message:response_model.model_validate(_strict_json_loads(references.response(message)['content'])),
                 correction_contract=response_model,allow_schema_repair=False)
         except LightGraphError as exc:
             if exc.code == 'llm_schema_invalid':
                 raise LightGraphError('semantic_review_patch_invalid') from None
             raise
+        finally:
+            references.clear()
 
     def _request(self, messages: list[dict], parse_message: Callable[[dict],T],
                  tool_specs: list[dict] | None = None, *, tool_choice: str = 'auto',
@@ -545,10 +582,7 @@ class StructuredModelClient:
         schema=_request_schema(messages)
         response_format=None if tool_specs else response_format_for(schema,self.config.response_format)
         content = canonical(request_envelope_for(messages,tool_specs,response_format))
-        if len(content.encode()) > self.config.max_prompt_bytes:
-            self.usage['prompt_packets_rejected']=self.usage.get('prompt_packets_rejected',0)+1
-            self.usage['prompt_rejected_peak_bytes']=max(self.usage.get('prompt_rejected_peak_bytes',0),len(content.encode()))
-            raise LightGraphError('model_packet_too_large')
+        self._check_prompt_limits(content)
         key = self.config.api_key.get_secret_value() if self.config.api_key else ''
         key = key or os.environ.get(self.config.api_key_env)
         if not key:
@@ -575,19 +609,20 @@ class StructuredModelClient:
                             if correcting and response_format is None else response_format)
             request_envelope=request_envelope_for(request_messages,request_tools,request_format)
             content=canonical(request_envelope)
-            if len(content.encode())>self.config.max_prompt_bytes:
-                self.usage['prompt_packets_rejected']=self.usage.get('prompt_packets_rejected',0)+1
-                self.usage['prompt_rejected_peak_bytes']=max(self.usage.get('prompt_rejected_peak_bytes',0),len(content.encode()))
-                if correcting:request_messages.clear()
-                raise LightGraphError('model_packet_too_large')
+            try:
+                estimated_input_tokens = self._check_prompt_limits(content)
+            except LightGraphError:
+                if correcting: request_messages.clear()
+                raise
             # Correction text and the transient candidate consume the same
             # prompt/token budget as every other request, including retries.
-            estimate=len(content.encode())+self.config.max_output_tokens
+            estimate=estimated_input_tokens+self.config.max_output_tokens
             reserved = f'model_call_{id(self)}_{self.usage["calls"]}'
             cost = Cost(llm_calls=1,llm_tokens=estimate)
             self.budget.reserve(reserved,cost)
             counted = False
             request_started = False
+            request_succeeded = False
             payload = envelope = value = candidate_message = None
             try:
                 self.budget.admit(cost,reserved)
@@ -604,13 +639,30 @@ class StructuredModelClient:
                 if request_tools:
                     payload.update(tools=request_tools,tool_choice=tool_choice,parallel_tool_calls=False)
                 request_started = True
+                emit_progress(None,'model_call_started',counters={'model_calls':self.usage['calls'],
+                    'input_tokens':self.usage['input_tokens'],'output_tokens':self.usage['output_tokens']})
                 envelope = request_completion(self.config, self.budget, self.transport, key, payload)
                 self.budget.check_deadline()
                 usage = envelope.get('usage') or {}
                 if not isinstance(usage,dict):
                     raise LightGraphError('llm_schema_invalid')
-                input_tokens = max(0,int(usage.get('prompt_tokens',len(content.encode()))))
-                output_tokens = max(0,int(usage.get('completion_tokens',self.config.max_output_tokens)))
+                # Provider usage, when present, is the actual accounting source.
+                # Missing usage is marked explicitly instead of calling bytes tokens.
+                from .token_estimation import estimate_tokens
+                estimated_output_tokens = estimate_tokens(canonical(envelope['choices'][0]['message']))
+                token_counts = []
+                for name, fallback, counter in (
+                        ('prompt_tokens', estimated_input_tokens, 'estimated_input_tokens'),
+                        ('completion_tokens', estimated_output_tokens, 'estimated_output_tokens')):
+                    measured = usage.get(name)
+                    if measured is None:
+                        measured = fallback
+                        self.usage[counter] = self.usage.get(counter, 0) + fallback
+                        self.usage[counter+'_calls'] = self.usage.get(counter+'_calls', 0) + 1
+                    elif isinstance(measured, bool) or not isinstance(measured, int) or measured < 0:
+                        raise LightGraphError('llm_schema_invalid')
+                    token_counts.append(measured)
+                input_tokens, output_tokens = token_counts
                 self.usage['input_tokens'] += input_tokens
                 self.usage['output_tokens'] += output_tokens
                 counted = True
@@ -645,6 +697,7 @@ class StructuredModelClient:
                     counter=('schema_repair_abstentions' if isinstance(final,ProposalBatch) and final.abstain
                              else 'schema_repairs_succeeded')
                     self.usage[counter]=self.usage.get(counter,0)+1
+                request_succeeded = True
                 return result
             except BudgetExceeded:
                 self.usage['failures'] += 1
@@ -674,18 +727,33 @@ class StructuredModelClient:
                         original_candidate={'content':candidate_message.get('content')} if isinstance(candidate_message,dict) else {}
                     feedback=_schema_feedback(original_candidate,exc,schema)
                     feedback['schema_protocol_correction']['allowed_corrections']=correction_anchor.get('slots',[])
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
+                from .sdk_transport import transport_failure_kind
+                counter='transport_'+transport_failure_kind(exc)
+                self.usage[counter]=self.usage.get(counter,0)+1
                 last_code = 'model_transport_error'
                 self.usage['failures'] += 1
             except LightGraphError as exc:
+                if exc.code=='model_transport_error':
+                    from .sdk_transport import TRANSPORT_FAILURE_KINDS
+                    kind=getattr(exc,'failure_kind','unknown')
+                    counter='transport_'+(kind if kind in TRANSPORT_FAILURE_KINDS else 'unknown')
+                    self.usage[counter]=self.usage.get(counter,0)+1
                 last_code = exc.code
                 self.usage['failures'] += 1
                 if not exc.retryable:
                     raise LightGraphError(last_code) from None
             finally:
-                # Unknown provider usage gets the reserved upper estimate charged.
+                if request_started:
+                    emit_progress(None,'model_call_completed' if request_succeeded else 'model_call_failed',
+                        level='info' if request_succeeded else 'warning',
+                        counters={'model_calls':self.usage['calls'],'input_tokens':self.usage['input_tokens'],
+                            'output_tokens':self.usage['output_tokens'],'model_failures':self.usage['failures']})
+                # A failed transport has unknown usage; retain the conservative
+                # reservation and distinguish it from measured provider tokens.
                 try:
                     if request_started and not counted:
+                        self.usage['unknown_usage_reserved_tokens']=self.usage.get('unknown_usage_reserved_tokens',0)+estimate
                         self.budget.charge(Cost(llm_tokens=estimate),reserved)
                 finally:
                     self.budget.release(reserved)

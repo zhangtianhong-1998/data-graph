@@ -28,7 +28,7 @@ def test_five_level_claim_is_reviewed_by_reference_without_model_echo(monkeypatc
     def handler(request):
         _, packet = input_packet(request); seen.append(packet)
         assert packet['semantic_proposition'] == original
-        assert packet['semantic_proposition_ref'].startswith('proposition_')
+        assert packet['semantic_proposition_ref']=='claim1'
         return response(reference_response(packet))
     model = client(monkeypatch, handler)
     refs = review_semantics(model, {'probe_digest': [{'probe_id': 'probe_1'}]}, claim, [])

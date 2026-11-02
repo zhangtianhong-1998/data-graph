@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from lightgraph.context import initial_agent_prompt_bytes
+from lightgraph.context import initial_agent_prompt_bytes, initial_agent_prompt_tokens
 from lightgraph.contracts import canonical
 from lightgraph.errors import LightGraphError
 from lightgraph.tests.test_discovery_agent import Toolbox, final, input_packet, response
@@ -95,7 +95,8 @@ def test_catalog_window_counts_provider_schema_and_honors_compatibility_mode():
     from lightgraph.errors import BudgetExceeded
     configuration.max_prompt_bytes=1000000
     configuration.max_output_tokens=4096
-    client.budget=BudgetAllocator(Cost(llm_tokens=threshold+4096+1000,seconds=60))
+    token_threshold=initial_agent_prompt_tokens(one,tools)
+    client.budget=BudgetAllocator(Cost(llm_tokens=token_threshold+4096+1000,seconds=60))
     client.budget.reserve('other_work',Cost(llm_tokens=1000))
     selected,_=_bounded_catalog_window(primary,[primary,other],input_packet(),client,tools)
     assert selected==[primary]

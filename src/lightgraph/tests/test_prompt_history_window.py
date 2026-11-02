@@ -35,7 +35,7 @@ def test_complete_batches_are_evicted_but_local_feedback_and_latest_evidence_sta
 
 
 @pytest.mark.parametrize('repair_feedback',[False,True])
-def test_history_pressure_finishes_existing_draft_with_no_extra_calls(capsys,caplog,repair_feedback):
+def test_history_pressure_retains_draft_without_forcing_submission(capsys,caplog,repair_feedback):
     class LargeTools(Toolbox):
         def execute(self,name,args):
             self.executed.append(name)
@@ -53,8 +53,8 @@ def test_history_pressure_finishes_existing_draft_with_no_extra_calls(capsys,cap
             return response(tool='submit_column_group',args={k:v for k,v in proposal.items() if k!='kind'})
         if len(seen)==3:return response(tool='get_metadata',args={'page':2})
         control=json.loads(body['messages'][1]['content'])['runtime_control']
-        assert control['submission_reason']=='context_window_pressure'
-        assert all(t['function']['name'].startswith(('submit_','declare_','finish_')) for t in body['tools'])
+        assert control.get('submission_reason') is None
+        assert any(t['function']['name']=='get_metadata' for t in body['tools'])
         wire=json.dumps(body)
         assert 'OLD_EVIDENCE' not in wire and 'LATEST_EVIDENCE' in wire
         assert 'draft_1' in wire
@@ -79,3 +79,30 @@ def test_history_pressure_finishes_existing_draft_with_no_extra_calls(capsys,cap
     assert client.usage['prompt_peak_after_window_bytes']<=limit
     assert client.budget.snapshot()['reserved']=={} and tools.closed
     assert 'EVIDENCE' not in json.dumps(client.usage)+capsys.readouterr().out+caplog.text
+
+
+def test_trimmed_history_can_reread_source_before_finishing():
+    class SourceTools(Toolbox):
+        def execute(self,name,args):
+            self.executed.append(name)
+            return {'status':'ok','operator':name,'probe_id':f'probe_{len(self.executed):04d}',
+                'data':{'text':'ephemeral_source_'+'x'*33000}}
+    seen=[]
+    def handler(request):
+        body=json.loads(request.content);seen.append(body)
+        if len(seen) in (1,3,4):
+            if len(seen)==4:
+                control=json.loads(body['messages'][1]['content'])['runtime_control']
+                assert not control['submission_required']
+                assert 'history_window' in body['messages'][0]['content']
+            return response(tool='get_metadata',args={'page':len(seen)})
+        if len(seen)==2:
+            proposal=final()['proposals'][0]
+            return response(tool='submit_column_group',args={k:v for k,v in proposal.items() if k!='kind'})
+        return response(tool='finish_discovery',args={'pending':False})
+    client=model(handler,stream=False,max_prompt_bytes=90000,max_discovery_steps=8)
+    source=SourceTools()
+    assert client.explore(input_packet(),source).proposals
+    assert source.executed==['get_metadata']*3 and source.closed
+    assert len(seen)==client.usage['calls']==5
+    assert client.budget.snapshot()['reserved']=={}

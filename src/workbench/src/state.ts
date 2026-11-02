@@ -25,4 +25,4 @@ export function graphOutcome(report: unknown): string {
     default: return ''
   }
 }
-export const stageLabel = (stage: string): string => ({ queued: '等待启动', starting: '初始化', metadata: '读取元数据', discovery: '发现关键列与关系', extraction: '抽取图谱', extracting: '正在执行抽取', publishing: '发布结果', completed: '处理完成', finished: '运行结束', cleanup: '清理临时数据' } as Record<string, string>)[stage] || stage || '—'
+export const stageLabel = (stage: string): string => ({ queued: '等待启动', starting: '初始化', initializing: '初始化', metadata: '读取元数据', discovery: '发现对象与属性', validation: '验证规则', relations: '发现补充关系', extraction: '抽取图谱', extracting: '正在执行抽取', publishing: '发布结果', completed: '处理完成', finished: '运行结束', cleanup: '清理临时数据' } as Record<string, string>)[stage] || stage || '—'

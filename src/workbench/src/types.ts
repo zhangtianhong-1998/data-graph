@@ -16,11 +16,22 @@ export interface RunConfig {
 export interface Table { source_id: string; schema: string; name: string; columns: Array<{ name: string; data_type?: string; comment?: string; [key: string]: unknown }> }
 export interface GraphNode { id: string; label?: string; name?: string; kind?: string; layer?: string; status?: string; [key: string]: unknown }
 export interface GraphEdge { id?: string; status?: string; source: string; target: string; relation?: string; [key: string]: unknown }
-export interface Graph { nodes: GraphNode[]; edges: GraphEdge[]; claims?: unknown[]; [key: string]: unknown }
+export interface Graph { nodes: GraphNode[]; edges: GraphEdge[]; claims?: unknown[]; display_schema?: import('./graphLabels').DisplaySchema; [key: string]: unknown }
 export interface Metadata extends Graph { tables: Table[]; files?: Array<{ name: string; content: string }> }
+export interface RunEvent {
+  seq: number; time: string; stage: string; code: string; level: 'info' | 'warning' | 'error'
+  table?: string; rule_id?: string; completed?: number; total?: number; unit?: string
+  counters?: Record<string, number>
+}
+export interface RunProgressSnapshot {
+  stage: string; completed: number | null; total: number | null; unit: string | null
+  updated_at: string; elapsed_seconds: number; counters: Record<string, number>
+  events: RunEvent[]; dropped_events: number
+}
 export interface Run {
   run_id: string; project_id: string; status: 'queued' | 'running' | 'completed' | 'completed_with_gaps' | 'partial' | 'failed' | 'cancelled' | 'interrupted'
   stage: string; created_at: string; finished_at?: string; report?: unknown; error_code?: string
   config_revision?: number
+  progress?: RunProgressSnapshot | null
   cleanup_status: 'pending' | 'completed' | 'unknown'
 }

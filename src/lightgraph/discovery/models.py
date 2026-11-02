@@ -2,7 +2,7 @@
 from __future__ import annotations
 from typing import Annotated, Literal, Union
 from pydantic import ConfigDict, Field, PrivateAttr, model_validator
-from lightgraph.contracts import StrictModel, RuleSpec, SourceRef, TableSpec, ConceptMappingSpec, digest
+from lightgraph.contracts import StrictModel, RuleSpec, RelationSpec, SourceRef, TableSpec, ConceptMappingSpec, digest
 from lightgraph.semantic_schema import SemanticSchema
 
 Role = Literal['identity_code','namespace','label','alias','semantic_attribute','display_order',
@@ -447,6 +447,13 @@ class EntityBinding(StrictModel):
     key_columns: list[str]
     level: int | None = Field(default=None,gt=0)
 
+
+class ExistingReferenceRule(StrictModel):
+    rule_id: str
+    revision: int = Field(ge=1)
+    relation_contract: RelationSpec
+
+
 class ProposalRepair(StrictModel):
     """A rejected schema-only proposal and a compiler-issued repair instruction."""
     code: str
@@ -488,6 +495,10 @@ class TaskPacket(StrictModel):
     # Schema only. Query rows and tool transcripts never enter a stored packet.
     catalog: list[TableSpec] = Field(default_factory=list,max_length=64)
     entity_bindings: list[EntityBinding] = Field(default_factory=list,max_length=64)
+    existing_reference_rules: list[ExistingReferenceRule] = Field(default_factory=list,max_length=64)
+    existing_reference_rules_total: int = Field(default=0,ge=0)
+    existing_reference_rules_truncated: bool = False
+    relation_reuse_instruction: str | None = Field(default=None,max_length=1000)
     @model_validator(mode='after')
     def bounds(self):
         from lightgraph.contracts import canonical,ExtractionGoal

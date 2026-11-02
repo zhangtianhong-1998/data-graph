@@ -371,6 +371,27 @@ def test_safe_report_preserves_only_known_issue_categories_and_actions():
     assert 'PRIVATE' not in json.dumps(safe)
 
 
+def test_safe_report_retains_schema_diagnostics_but_never_input_keys_or_values():
+    safe=_safe_report(RunReport(run_id='test',issues=[
+        {'code':'discovery_draft_field_diagnostic','reason_code':'invalid_tool_arguments',
+         'field_path':'["claim","members",0,"role"]','constraint':'enum','count':3,
+         'input':'PRIVATE_INPUT','message':'PRIVATE_MESSAGE','allowed_references':'PRIVATE_ID'},
+        {'code':'discovery_draft_field_diagnostic','reason_code':'PRIVATE_REASON',
+         'field_path':'["claim","PRIVATE_SOURCE_KEY",true,-1,1000000]',
+         'constraint':'PRIVATE_CONSTRAINT','count':-2},
+        {'code':'discovery_draft_rejected','reason_code':'identity_domain_evidence_unresolved','count':2},
+        {'code':'discovery_draft_field_diagnostic','field_path':'{"PRIVATE":"BODY"}'},
+    ]))
+    assert safe['issues'][0]=={'code':'discovery_draft_field_diagnostic',
+        'reason_code':'invalid_tool_arguments','field_path':'["claim","members",0,"role"]',
+        'constraint':'enum','count':3}
+    assert safe['issues'][1]=={'code':'discovery_draft_field_diagnostic',
+        'field_path':'["claim","*","*","*","*"]'}
+    assert safe['issues'][2]['reason_code']=='identity_domain_evidence_unresolved'
+    assert 'field_path' not in safe['issues'][3]
+    assert 'PRIVATE' not in json.dumps(safe)
+
+
 def test_metadata_refresh_only_describes_and_closes_adapter(workspace, monkeypatch):
     table = TableSpec(source_id='input', name='metrics', columns=[ColumnSpec(name='code')])
     source = MemorySource([table], {'public.metrics': [('PRIVATE_VALUE',)]})
@@ -676,3 +697,75 @@ def test_removed_source_and_narrowed_columns_do_not_reappear_from_old_graph(work
     empty = read_metadata(workspace, 'alpha', refresh=True)
     assert not empty['tables'] and not empty['nodes'] and not empty['edges']
     assert empty['stale_engine_metadata']
+
+
+def test_live_worker_progress_survives_polling_without_source_rows(workspace, monkeypatch):
+    # A real child proves the web process sees events while work is in flight,
+    # on both Windows and POSIX. The pipeline itself is a deterministic fixture.
+    code = r'''
+import sys,time
+from pathlib import Path
+import lightgraph.pipeline as pipeline
+import lightgraph.runtime.config as config
+from lightgraph.contracts import RunReport
+from lightgraph.runtime.progress import emit_progress
+from lightgraph.web.worker import main
+config.open_sources=lambda _: []
+def run(*a,**kw):
+    emit_progress('discovery','table_started',completed=0,total=2,unit='tables',table='fruit.public.items')
+    emit_progress(None,'model_call_completed',counters={'model_calls':1,'input_tokens':20,'output_tokens':5})
+    Path('progress-ready').touch()
+    until=time.monotonic()+20
+    while not Path('progress-release').exists() and time.monotonic()<until: time.sleep(.02)
+    emit_progress('discovery','table_completed',completed=1,total=2,unit='tables')
+    return RunReport(run_id='progress',status='COMPLETED_WITH_GAPS')
+pipeline.run_pipeline=run
+sys.exit(main())
+'''
+    real_popen = subprocess.Popen
+    def child(args, **kwargs):
+        return real_popen([sys.executable, '-c', code, args[-1]], **kwargs)
+    monkeypatch.setattr('lightgraph.web.execution.subprocess.Popen', child)
+    manager = RunManager(workspace)
+    project = workspace.project_path('alpha')
+    try:
+        record = manager.start('alpha')
+        until = time.monotonic() + 20
+        while not (project / 'progress-ready').exists() and time.monotonic() < until:
+            time.sleep(.02)
+        assert (project / 'progress-ready').exists()
+        live = manager.get('alpha', record['run_id'])
+        assert live['status'] == 'running' and live['stage'] == 'discovery'
+        assert live['progress']['completed'] == 0 and live['progress']['total'] == 2
+        assert live['progress']['counters']['model_calls'] == 1
+        assert manager.list('alpha')[0]['progress']['events'][-1]['code'] == 'model_call_completed'
+        (project / 'progress-release').touch()
+        terminal = wait_run(manager, 'alpha', record['run_id'])
+        assert terminal['status'] == 'completed_with_gaps'
+        assert terminal['progress']['events'][-1]['code'] == 'run_completed_with_gaps'
+        assert terminal['progress']['completed'] is None
+        assert len(terminal['progress']['events']) > len(live['progress']['events'])
+    finally:
+        (project / 'progress-release').touch()
+        manager.shutdown()
+
+
+def test_progress_is_optional_and_matches_exact_record(workspace):
+    from lightgraph.runtime.progress import RunProgress, bind_progress, emit_progress, progress_path
+    manager = RunManager(workspace)
+    rid = 'run_' + 'c' * 24
+    _, path = manager._paths('alpha', rid)
+    record = {'run_id': rid, 'status': 'completed', 'created_at': '2026-11-02'}
+    path.write_text(json.dumps(record))
+    try:
+        assert 'progress' not in manager.get('alpha', rid)
+        progress_path(path).write_text('{')
+        assert manager.get('alpha', rid)['status'] == 'completed'
+        with bind_progress(RunProgress(progress_path(path))):
+            emit_progress('finished', 'run_completed')
+        assert manager.get('alpha', rid)['progress']['stage'] == 'finished'
+        record['run_id'] = 'run_' + 'd' * 24
+        path.write_text(json.dumps(record))
+        assert 'progress' not in manager.get('alpha', rid)
+    finally:
+        manager.shutdown()

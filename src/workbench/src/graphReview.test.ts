@@ -41,7 +41,7 @@ describe('业务图来源与归并裁决', () => {
     ], edges: [] }, layer: 'business' })
     const nodes = [...root.querySelectorAll('.graph-node')]
     expect(nodes.map(node => node.querySelector('.node-kind')?.textContent)).toEqual([
-      'ReportItem · 已接受', 'ReportItem · 候选', 'ReportItem · 未决',
+      '报表项 · 已接受', '报表项 · 候选', '报表项 · 未决',
     ])
     expect(nodes[0]!.querySelector('.node-scope')?.textContent).toBe('集团合并')
     expect(nodes[1]!.querySelector('.node-scope')?.textContent).toBe('批发中心')
@@ -94,6 +94,8 @@ describe('业务图来源与归并裁决', () => {
   it.each([
     ['excluded_column_projected', '提案使用了已排除的列'],
     ['model_response_truncated', '模型回复未完整返回'],
+    ['model_context_window_exceeded', 'token 窗口'],
+    ['model_reference_collision', '短引用发生映射冲突'],
     ['unexplained_columns', '部分字段尚未被规则解释'],
     ['concept_scope_evidence_required', '概念的共享范围缺少证据'],
     ['semantic_review_unissued_evidence', '本次未签发或重复的引用'],
@@ -158,6 +160,43 @@ describe('业务图来源与归并裁决', () => {
     await vi.waitFor(() => expect(root.querySelector('[aria-label="来源支持"]')?.textContent).toContain('people.code → family.parent_code'))
     expect(api.request).toHaveBeenCalledWith('/projects/p/graph/details?fact_id=edge1&include_candidates=true&offset=0')
     expect(root.querySelector('.graph-detail')?.textContent).toContain('候选'); expect(root.textContent).toContain('doc:family'); expect(root.textContent).toContain('字段映射与语义依据')
+  })
+  it('关联列表一次读取页外端点名称，属性与来源默认按表展示，技术ID可展开', async () => {
+    const edge = { source: 'long_source_hash', target: 'long_target_hash', relation: 'custom_relation', qualifiers: { source_level: 1, target_level: 2 } }
+    api.request.mockResolvedValue({
+      facts: [{ id: 'edge_fact_hash', fact_kind: 'Edge', payload: edge, status: 'accepted' }],
+      nodes: [{ id: 'long_source_hash', label: '经营利润' }, { id: 'long_target_hash', label: '销售收入' }],
+      display_schema: { relations: [{ name: 'custom_relation', description: '经营支撑关系' }] },
+      supports: [], rules: [], next_offset: null, supports_truncated: false,
+    })
+    mount(GraphCanvas, { graph: { nodes: [{ id: 'long_source_hash', label: '经营利润', kind: 'ReportItem', properties: { business_code: 'M01', english_name: ['Operating profit'], source_position: [1, 2] } }], edges: [] }, layer: 'business', projectId: 'p' })
+    root.querySelector('.graph-node')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await vi.waitFor(() => expect(root.querySelector('.relation-selection')?.textContent).toContain('销售收入'))
+    expect(api.request).toHaveBeenCalledTimes(1)
+    expect(root.querySelector('.relation-selection')?.textContent).toContain('经营支撑关系')
+    expect(root.querySelector('.relation-selection')?.textContent).not.toContain('long_')
+    const table = root.querySelector('.graph-detail .property-table')!
+    expect(table.textContent).toContain('业务编码'); expect(table.textContent).toContain('M01')
+    expect(table.textContent).toContain('英文名'); expect(table.textContent).toContain('Operating profit')
+    expect(table.textContent).toContain('来源层位'); expect(table.textContent).not.toContain('long_source_hash')
+    expect([...root.querySelectorAll('.graph-detail pre')].every(node => !!node.closest('details:not([open])'))).toBe(true)
+    ;(root.querySelector('.relation-selection') as HTMLButtonElement).click()
+    await vi.waitFor(() => expect(root.querySelector('.graph-detail h2[title]')?.textContent).toBe('经营支撑关系'))
+    expect(root.querySelector('.relation-endpoints')?.textContent).toBe('经营利润 → 销售收入')
+    expect(root.querySelector('.graph-detail .property-table')?.textContent).toContain('来源层位')
+    expect(root.querySelector('.graph-detail .technical-details')?.textContent).toContain('long_target_hash')
+  })
+  it('未知关系不猜测中文语义，明确提示缺少定义；长定义缩短显示并保留完整说明', async () => {
+    const description = '这是一个来自项目定义的较长关系说明，用来说明指标与业务对象之间的关系含义'
+    mount(GraphCanvas, { graph: { ...graph, edges: [{ source: 'a', target: 'b', relation: 'unknown_relation' }] }, layer: 'business' })
+    root.querySelector('.graph-edge')!.dispatchEvent(new MouseEvent('click', { bubbles: true })); await nextTick()
+    expect(root.querySelector('.graph-detail h2[title]')?.textContent).toBe('unknown_relation（未提供中文名）')
+    app.unmount()
+    app = createApp(GraphCanvas, { graph: { ...graph, display_schema: { relations: [{ name: 'knows', description }] } }, layer: 'business' }); app.mount(root)
+    root.querySelector('.graph-edge')!.dispatchEvent(new MouseEvent('click', { bubbles: true })); await nextTick()
+    expect(root.querySelector('.graph-detail h2[title]')?.getAttribute('title')).toBe(description)
+    expect(root.querySelector('.graph-detail h2[title]')?.textContent?.length).toBeLessThanOrEqual(24)
+    expect(root.querySelector('.graph-detail')?.textContent).toContain(description)
   })
   it('候选先展示原对象依据，确认后携带配置和裁决修订，支持撤销', async () => {
     let revision = 0

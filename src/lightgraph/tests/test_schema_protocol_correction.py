@@ -140,8 +140,11 @@ def test_schema_correction_stays_within_original_limits(monkeypatch, constraint)
                                      'response_format':body['response_format']}).encode())
         if constraint == 'prompt': model.config.max_prompt_bytes = prompt_bytes + 100
         if constraint == 'tokens':
+            from lightgraph.discovery.token_estimation import estimate_tokens
+            prompt_tokens = estimate_tokens(canonical({'messages': body['messages'],
+                'tools': body.get('tools', []), 'response_format': body['response_format']}))
             model.budget.limits = replace(model.budget.limits,
-                llm_tokens=prompt_bytes + model.config.max_output_tokens + 100)
+                llm_tokens=prompt_tokens + model.config.max_output_tokens + 100)
         return response(malformed_hierarchy())
     model = client(monkeypatch, handler); tools = Toolbox()
     if constraint == 'calls': model.budget = BudgetAllocator(replace(model.budget.limits, llm_calls=1))

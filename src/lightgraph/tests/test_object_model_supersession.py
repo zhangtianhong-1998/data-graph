@@ -179,3 +179,25 @@ def test_an_agent_cannot_reuse_a_verified_object_id_to_overwrite_it(status):
     model.update(object_id=target['object_id'],supersedes_object_ids=[])
     with pytest.raises(LightGraphError,match='object_model_verified_revision_required'):
         apply_object_model(knowledge,model)
+
+
+def test_mapping_loss_returns_position_and_issued_fields_for_a_successful_scoped_repair():
+    t,knowledge,model=fixture()
+    broken=deepcopy(model)
+    broken['positions'][2]['aliases']=[]
+    broken['english_name_columns'].remove(model['positions'][2]['aliases'][0])
+    p=packet(t);p['schema_knowledge']=knowledge
+    session=ProposalSession(p)
+    rejected=session.execute('declare_object_model',broken)
+    assert rejected['code']=='object_model_supersession_mapping_loss'
+    positional=next(d for d in rejected['diagnostics'] if d['path']==['positions',2,'aliases'])
+    assert positional['position']==3
+    assert positional['required_references']==sorted(model['positions'][2]['aliases'])
+    assert positional['object_id'] in model['supersedes_object_ids']
+    fixed={**model,'resolves_rejections':[rejected['rejection_id']]}
+    assert session.execute('declare_object_model',fixed)['status']=='ok'
+    assert not session.open_rejections
+    diagnostics=session.batch()._runtime_invalid_diagnostics
+    assert any(item['path']==['positions',2,'aliases'] for item in diagnostics)
+    assert 'required_references' not in json.dumps(diagnostics)
+    assert positional['object_id'] not in json.dumps(diagnostics)

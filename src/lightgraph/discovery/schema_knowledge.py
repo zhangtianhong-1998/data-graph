@@ -102,8 +102,13 @@ def current_object_knowledge(knowledge):
     return value
 
 
-def _retains_mapping(previous,incoming):
-    """Preserve role associations, not merely the union of referenced columns."""
+def _mapping_loss_diagnostics(previous,incoming):
+    """Explain lost associations using issued field references, never row values."""
+    diagnostics=[]
+    def missing(path,required,*,constraint='mapping_preservation',position=None):
+        diagnostic={'path':path,'constraint':constraint,'required_references':sorted(required)}
+        if position is not None:diagnostic['position']=position
+        diagnostics.append(diagnostic)
     def role_refs(value,field):
         refs=set(value.get(field,[]))
         if field in {'key_columns','label_columns'}:
@@ -111,22 +116,52 @@ def _retains_mapping(previous,incoming):
             refs.discard(None)
         return refs
     fields=('key_columns','label_columns','english_name_columns','alias_columns')
-    if any(not role_refs(previous,field)<=role_refs(incoming,field) for field in fields):
-        return False
+    for field in fields:
+        absent=role_refs(previous,field)-role_refs(incoming,field)
+        if absent:missing([field],absent)
     if set(previous.get('namespace_columns',[]))!=set(incoming.get('namespace_columns',[])):
-        return False
-    positions={p['position']:p for p in incoming.get('positions',[])}
+        missing(['namespace_columns'],previous.get('namespace_columns',[]),constraint='same_identity_scope')
+    positions={p['position']:(i,p) for i,p in enumerate(incoming.get('positions',[]))}
     for old in previous.get('positions',[]):
-        new=positions.get(old['position'])
-        if (not new or new['code']!=old['code'] or new.get('label')!=old.get('label')
-            or not set(old.get('aliases',[]))<=set(new.get('aliases',[]))):
-            return False
+        index,new=positions.get(old['position'],(None,None))
+        if new is None:
+            missing(['positions'],[old['code']]+([old['label']] if old.get('label') else [])+
+                old.get('aliases',[]),constraint='missing_position',position=old['position'])
+            continue
+        for field in ('code','label'):
+            if new.get(field)!=old.get(field):
+                missing(['positions',index,field],[old[field]] if old.get(field) else [],
+                    constraint='same_position_mapping',position=old['position'])
+        absent=set(old.get('aliases',[]))-set(new.get('aliases',[]))
+        if absent:missing(['positions',index,'aliases'],absent,position=old['position'])
     if not previous.get('positions'):
         # An unpositioned code/name pair cannot be swallowed by a wider flat
         # list: that list no longer tells which name belongs to which code.
         same_keys=role_refs(previous,'key_columns')==role_refs(incoming,'key_columns')
-        if not same_keys:return False
-    return True
+        if not same_keys:
+            missing(['key_columns'],role_refs(previous,'key_columns'),constraint='same_object_key')
+    return diagnostics
+
+
+def _retains_mapping(previous,incoming):
+    """Preserve role associations, not merely the union of referenced columns."""
+    return not _mapping_loss_diagnostics(previous,incoming)
+
+
+def object_model_mapping_diagnostics(knowledge,model):
+    """Bounded correction hints for an already rejected supersession attempt."""
+    incoming=model.model_dump(mode='json')
+    indexed={obj['object_id']:obj for obj in knowledge.get('objects',[])}
+    previous=indexed.get(model.object_id)
+    targets=list(dict.fromkeys(model.supersedes_object_ids))
+    if previous and previous.get('supersedes_object_ids'):targets.append(model.object_id)
+    diagnostics=[]
+    for identifier in targets:
+        if identifier not in indexed:continue
+        for diagnostic in _mapping_loss_diagnostics(indexed[identifier],incoming):
+            diagnostics.append({**diagnostic,'object_id':identifier})
+            if len(diagnostics)==8:return diagnostics
+    return diagnostics
 
 
 def apply_object_model(knowledge,model,*,basis='agent_field_mapping'):

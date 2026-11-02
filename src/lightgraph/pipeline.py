@@ -10,6 +10,7 @@ from .errors import LightGraphError, BudgetExceeded
 from .rules import RuleEngine
 from .metadata import publish_metadata
 from .runtime.retention import write_report,write_rules,atomic_text
+from .runtime.progress import emit_progress
 
 _TIME_DEFERRALS=frozenset({
     'discovery_time_budget_exhausted','wall_time_budget_exhausted','run_time_budget_exhausted'})
@@ -43,6 +44,11 @@ def _missing_hierarchy_foundation(table, endpoints, knowledge):
         return False
     return bool(hierarchy_field_models(knowledge.current_objects(table)))
 
+
+def _relation_context_rules(endpoints, rules, failed):
+    """Retain verified relation vocabulary when resuming from entity endpoints."""
+    return endpoints+[rule for rule in rules if rule.kind=='reference' and rule.rule_id not in failed]
+
 # These failures mean the Agent never completed an interpretation. They are not
 # permission to retry within a turn; leave the table pending for a later run.
 _AGENT_EXECUTION_FAILURES = frozenset({
@@ -56,6 +62,25 @@ _AGENT_EXECUTION_FAILURES = frozenset({
 
 def _agent_execution_failure(code):
     return code in _AGENT_EXECUTION_FAILURES or code.startswith('model_stream_')
+
+
+def _discovery_outcome(issues):
+    """Historical diagnostics do not reopen completed or explicitly rejected work."""
+    active=[issue for issue in issues if issue.get('status') not in {'diagnostic','resolved'}]
+    if not active:
+        return 'COMPLETED'
+    partial_tokens=('budget','exhausted','timeout','truncated','unavailable','permission',
+        'incomplete','unverified','formula_cache_missing','execution_failed',
+        'dependency_rule_failed','too_large','model_http','model_response','model_transport')
+    for issue in active:
+        if issue.get('status')=='rejected':
+            continue
+        code=str(issue.get('code',''))
+        if (issue.get('status') in {'deferred','partial'} or _agent_execution_failure(code)
+                or any(token in code for token in partial_tokens)):
+            return 'PARTIAL'
+    return 'COMPLETED_WITH_GAPS'
+
 
 def _context_versions(marker):
     """Source-version values stay flat references, never arbitrary dictionaries."""
@@ -86,6 +111,8 @@ def _deferred_tables(result, selected=()):
             'model_api_key','llm_schema','llm_json')
     failed=set()
     for issue in result.issues:
+        if issue.get('status') in {'diagnostic','resolved','rejected'}:
+            continue
         if (issue.get('status') in ('deferred','partial') or
             _agent_execution_failure(str(issue.get('code',''))) or
             any(token in str(issue.get('code','')) for token in tokens)):
@@ -159,6 +186,7 @@ def make_model(config):
         stream=settings.stream, stream_options_include_usage=settings.stream_options_include_usage,
         allow_insecure_http=settings.allow_insecure_http, timeout_seconds=settings.timeout_seconds,
         max_output_tokens=settings.max_output_tokens, max_prompt_bytes=settings.max_prompt_bytes,
+        max_prompt_tokens=settings.max_prompt_tokens, context_window_tokens=settings.context_window_tokens,
         max_response_bytes=settings.max_response_bytes, retries=settings.retries,
         max_discovery_steps=settings.max_discovery_steps, max_tool_calls=settings.max_tool_calls,
         allow_source_samples=settings.mode in ("in_environment", "approved_external")),
@@ -306,6 +334,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
     allrules=list(rules or [])
     document_versions={d.document_id+'@'+d.revision for d in documents}
     try:
+        emit_progress('metadata','stage_started')
         report.counts['recovered_publications']=len(store.recover_staging())
         namespace=store.current_versions('workspace')
         if namespace and namespace!={'domain':config.isolation_domain}:raise LightGraphError('output_domain_mismatch')
@@ -343,12 +372,15 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             deadline=discovery_deadline if phase=='relation' else object_deadline
             if auto and discovery_model and hasattr(discovery_model,'budget'):
                 discovery_model.budget.set_phase_deadline(deadline)
+            stage='relations' if function is discover_references else 'discovery'
+            emit_progress(stage,'stage_started')
             try:
                 with budget.exploration(deadline=deadline,query_limit=discovery_query_limit):
                     if schema_knowledge is not None and function in (discover,discover_references):
                         kwargs.setdefault('schema_knowledge',schema_knowledge)
                     return function(*args, **kwargs)
             except BudgetExceeded as exc:
+                emit_progress(stage,'issue_detected',level='warning')
                 return DiscoveryResult(issues=[{'code':exc.code,'status':'deferred'}])
         tables=[t for a in adapters for t in a.describe()]
         from .documents import DocumentCorpus
@@ -452,6 +484,9 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         for adapter in adapters:
             if not adapter.describe():report.issues.append({'code':'source_catalog_empty_unverified'})
             report.counts['tables']=report.counts.get('tables',0)+publish_metadata(store,adapter,config.isolation_domain)
+        emit_progress('metadata','stage_completed',completed=len(tables),total=len(tables),unit='tables',
+            counters={'tables_total':len(tables)})
+        emit_progress('validation','stage_started')
         cached=_latest(store.get_rules()) if auto and not config.rediscover else []
         # A workflow upgrade changes discovery strategy, not the authority of an
         # already published interpretation. All cached rules still undergo goal,
@@ -585,7 +620,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             for h in store.heads() if h['valid']}
         accepted_context_rules={r.rule_id:r for r in _latest([r for r in store.get_rules()
             if (r.rule_id,r.revision) in published_revisions])}
-        def execute(rule, *, preserve_previous=False):
+        def _execute(rule, *, preserve_previous=False):
             previous=[r for r in prepared_rules if r.rule_id==rule.rule_id]
             code=None
             if time.monotonic()-started>config.max_run_seconds:code='wall_time_budget_exhausted'
@@ -681,6 +716,22 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                             retire_dangling_document_alignments(store)
             for code in outcome.codes:report.issues.append({'rule_id':rule.rule_id,'code':code})
             return outcome.prepared
+        execution_progress={'completed':0,'total':len(allrules)}
+        def execute(rule, *, preserve_previous=False):
+            # Revisions add work as it becomes known. These counts describe rule
+            # attempts in this stage, never an estimate of the whole run.
+            execution_progress['total']=max(execution_progress['total'],execution_progress['completed']+1)
+            fields={'table':rule.source.source_id+'.'+rule.source.schema_name+'.'+rule.source.table,'rule_id':rule.rule_id,
+                    'unit':'rules','total':execution_progress['total']}
+            emit_progress('extraction','rule_started',completed=execution_progress['completed'],**fields)
+            accepted=False
+            try:
+                accepted=_execute(rule,preserve_previous=preserve_previous)
+                return accepted
+            finally:
+                execution_progress['completed']+=1
+                emit_progress('extraction','rule_completed' if accepted else 'rule_rejected',
+                    completed=execution_progress['completed'],level='info' if accepted else 'warning',**fields)
         from .discovery.schema_knowledge import project_retained_labels
         # A new display mapping is a rule change. Never mutate cached/manual
         # contracts under their existing immutable revision.
@@ -765,7 +816,8 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                         report.issues.append({'code':'relation_discovery_attempt_budget_exhausted','table':name,'status':'deferred'})
                         continue
                     ledger.transition(item,'running')
-                    result=explore(discover_references,rules_by_source[sid],endpoints,documents=corpus,model=discovery_model,
+                    result=explore(discover_references,rules_by_source[sid],
+                        _relation_context_rules(endpoints,_latest(store.get_rules()),failed),documents=corpus,model=discovery_model,
                         goal=config.goal,source_adapters=rules_by_source,table_refs={name},
                         iteration_context={**ledger.context([item],allrules,iteration=rounds),
                                            'role_occurrences':role_context},phase='relation')
@@ -814,7 +866,8 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                                     'table':name,'status':'deferred'})
                                 continue
                             ledger.transition(item,'running')
-                            retried=explore(discover_references,rules_by_source[sid],endpoints,documents=corpus,
+                            retried=explore(discover_references,rules_by_source[sid],
+                                _relation_context_rules(endpoints,_latest(store.get_rules()),failed),documents=corpus,
                                 model=discovery_model,goal=config.goal,source_adapters=rules_by_source,
                                 table_refs={name},iteration_context={**ledger.context([item],allrules,iteration=rounds),
                                     'role_occurrences':role_context},phase='relation')
@@ -893,6 +946,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             pubs=[p for p in prepared if store._publication(p)['state'] in ('staging','ready')
                   and not store._publication(p)['logical_rule_id'].startswith('document-alignment:')]
             if not auto or not pubs:return
+            emit_progress('validation','stage_started')
             active={};locations={}
             for group in dependency_groups(store,pubs):
                 conflict=inspect_group(store,group,ignore_derived_alignments=True)
@@ -975,7 +1029,8 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                         report.issues.append({'code':'relation_discovery_attempt_budget_exhausted','table':name,'status':'deferred'})
                         continue
                     endpoints=[r for r in _latest(store.get_rules()) if r.kind!='reference' and r.rule_id not in failed]
-                    result=explore(discover_references,rules_by_source[sid],endpoints,documents=corpus,model=discovery_model,
+                    result=explore(discover_references,rules_by_source[sid],
+                        _relation_context_rules(endpoints,_latest(store.get_rules()),failed),documents=corpus,model=discovery_model,
                         goal=config.goal,source_adapters=rules_by_source,table_refs={name},
                         iteration_context=context,revision_rules=entry['rules'],phase='relation')
                     if relation_attempt_consumed(result):
@@ -1084,7 +1139,12 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 if head['valid'] and head['logical_rule_id'].startswith('document-alignment:'):
                     replacement=store.begin_publication(head['logical_rule_id'],1,'all',{'refresh':report.run_id})
                     prepared.append(replacement);alignments.append(replacement)
+        publication_total=sum(len(group.rule_ids) for group in groups)
+        publication_processed=0
+        emit_progress('publishing','stage_started',completed=0,total=publication_total,unit='rules')
         for group in groups:
+            publication_succeeded=False
+            emit_progress('publishing','publication_started',completed=publication_processed,total=publication_total,unit='rules')
             retiring=[p for p in alignments if store._publication(p)['state'] in ('staging','ready')]
             publication_ids=list(group.publication_ids)+retiring
             group_rules=[r for r in prepared_rules if r.rule_id in group.rule_ids]
@@ -1097,6 +1157,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 report.rules_published.extend(r.rule_id for r in group_rules)
                 for rule in group_rules:schema_knowledge.record_rule(rule,status='published')
                 report.counts['publication_groups_published']+=1
+                publication_succeeded=True
             except LightGraphError as exc:
                 conflict=inspect_group(store,PublicationGroup(tuple(publication_ids),group.rule_ids))
                 _abort_staging(store,group.publication_ids)
@@ -1109,6 +1170,11 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     'related_rules':canonical(conflict.rule_ids if conflict else group.rule_ids),
                     'fact_refs':canonical(conflict.fact_refs if conflict else ())})
                 report.status='PARTIAL';report.counts['publication_groups_failed']+=1
+            publication_processed+=len(group.rule_ids)
+            emit_progress('publishing','publication_completed' if publication_succeeded else 'issue_detected',
+                level='info' if publication_succeeded else 'warning',
+                completed=publication_processed,total=publication_total,unit='rules',
+                counters={'published_rules':len(report.rules_published)})
         _abort_staging(store,alignments)
         for rule in prepared_rules:
             source_rules={r.rule_id for r in allrules if r.source==rule.source}
@@ -1156,9 +1222,11 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             accepted=[r for r in _latest(store.get_rules()) if r.rule_id in report.rules_published]
             write_rules(output/'rules.yaml',accepted)
         else:
+            emit_progress('publishing','stage_started',completed=0,total=len(documents),unit='documents')
             count,issues=publish_documents(store,documents,config.isolation_domain,model,config.scopes,
                 config.document_scopes,check_time=budget.check_time,goal=config.goal)
             report.counts['document_claims']=count;report.issues.extend(issues)
+            emit_progress('publishing','stage_completed',completed=len(documents),total=len(documents),unit='documents')
             budget.check_time()
             _publish_document_alignments(store,[d for d in documents if d.document_id not in config.removed_document_ids],config)
             _publish_alignments(store,tables,config,report)
@@ -1177,19 +1245,17 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         report.validation['incremental_mode']='complete_projection_reconciliation'
         report.counts.update(schema_knowledge.counts())
         report.validation['iteration_mode']='bounded_pattern_feedback'
-        if any(i.get('status')!='diagnostic' for i in report.issues) and report.status=='COMPLETED':
-            partial_tokens=('budget','exhausted','timeout','truncated','unavailable','permission','incomplete','unverified','formula_cache_missing','execution_failed','dependency_rule_failed','too_large','model_http','model_response','model_transport')
-            report.status='PARTIAL' if any(
-                i.get('status') in ('deferred','partial') or _agent_execution_failure(str(i.get('code',''))) or
-                any(t in str(i.get('code','')) for t in partial_tokens)
-                for i in report.issues) else 'COMPLETED_WITH_GAPS'
+        if report.status=='COMPLETED':
+            report.status=_discovery_outcome(report.issues)
     except (LightGraphError,KeyboardInterrupt) as exc:
         _abort_staging(store,prepared)
         code=exc.code if isinstance(exc,LightGraphError) else 'cancelled'
         report.status='PARTIAL';report.issues.append({'code':code})
+        emit_progress(None,'issue_detected',level='warning')
     except Exception:
         _abort_staging(store,prepared)
         report.status='FAILED';report.issues.append({'code':'internal_error'})
+        emit_progress(None,'issue_detected',level='error')
     finally:
         # Post-publication document/reconciliation failures must not suppress
         # files for the already committed, authorized graph (including empty).
@@ -1226,6 +1292,12 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                         'prompt_pressure_turns','prompt_history_exchanges_omitted',
                         'prompt_peak_before_window_bytes','prompt_peak_after_window_bytes',
                         'prompt_packets_rejected','prompt_rejected_peak_bytes',
+                        'prompt_peak_before_window_estimated_tokens','prompt_peak_after_window_estimated_tokens',
+                        'prompt_token_windows_rejected','prompt_rejected_peak_estimated_tokens',
+                        'estimated_input_tokens','estimated_output_tokens',
+                        'estimated_input_tokens_calls','estimated_output_tokens_calls','unknown_usage_reserved_tokens',
+                        'transport_read_timeout','transport_connect_timeout','transport_write_timeout',
+                        'transport_pool_timeout','transport_connection_error','transport_protocol_error','transport_unknown',
                         'semantic_review_container_normalizations','semantic_reference_repair_attempts','semantic_reference_repairs_succeeded',
                         'semantic_reference_repairs_failed'):
             report.counts[counter]=model.usage.get(counter,0) if model else 0

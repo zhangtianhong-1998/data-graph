@@ -1,7 +1,8 @@
 """Project-isolated background execution and bounded, published graph views.
 
-Only typed run reports and hashes of user-uploaded files survive a process. Model
-transcripts, database query results and subprocess output never become run logs.
+Typed run reports, bounded event codes/counts and hashes of user-uploaded files
+survive a process. Model transcripts, database query results and subprocess output
+never become run logs.
 """
 from __future__ import annotations
 
@@ -15,11 +16,13 @@ import sys
 import threading
 from datetime import datetime, timezone
 import uuid
+from functools import lru_cache
 
 from ..contracts import RunReport, digest
 from ..errors import LightGraphError
 from ..runtime.locking import FileLock
 from ..runtime.retention import atomic_text
+from ..runtime.progress import finish_progress, progress_path, read_progress
 
 ACTIVE_STATUSES = frozenset({"queued", "running"})
 TERMINAL_STATUSES = frozenset({"completed", "completed_with_gaps", "partial", "failed", "cancelled", "interrupted"})
@@ -60,6 +63,50 @@ def _cancel_path(result_path):
     return result_path.with_suffix(".cancel")
 
 
+@lru_cache(maxsize=1)
+def _diagnostic_vocabulary():
+    """Only schema-defined field names and fixed rejection codes may survive."""
+    from ..discovery.models import ProposalBatch
+    from ..discovery.hierarchy_plan import HierarchyPlan
+    from ..discovery.proposal_session import DiscoveryFinish
+    from ..discovery.schema_knowledge import ObjectModelDraft
+    from ..discovery.repair import REPAIRABLE_PROPOSAL_CODES
+    from ..discovery.validation_feedback import _property_names, _JSON_CONSTRAINTS, _SAFE_VALUE_CODES
+    from ..semantic_schema import SemanticSchema
+    names=set().union(*(_property_names(model.model_json_schema()) for model in
+        (ProposalBatch,HierarchyPlan,DiscoveryFinish,ObjectModelDraft,SemanticSchema)))
+    codes=REPAIRABLE_PROPOSAL_CODES | _SAFE_VALUE_CODES | {
+        'invalid_tool_arguments','invalid_proposal_arguments','dangling_evidence_reference',
+        'unauthorized_column_reference','unauthorized_source_reference','unauthorized_selector_reference',
+        'unverified_entity_reference','dangling_order_evidence','hierarchy_shape_not_on_table',
+        'discovery_session_finished','draft_replacement_changes_obligations','draft_replacement_required',
+        'invalid_draft_replacement','invalid_rejection_resolution','unknown_rejection_id',
+        'object_model_limit','object_model_mapping_conflict','proposal_draft_limit',
+        'semantic_definition_conflict','task_kind_forbidden'}
+    return names,codes,_JSON_CONSTRAINTS | {'schema','reference','contract','semantic_contract'}
+
+
+def _safe_issue(item):
+    safe={key:value for key,value in item.items() if key in {'code','table','rule_id'}
+        or key in _ISSUE_ENUMS and value in _ISSUE_ENUMS[key]}
+    if type(item.get('count')) is int and item['count']>=0:
+        safe['count']=item['count']
+    if item.get('code') in {'discovery_draft_rejected','discovery_draft_field_diagnostic'}:
+        names,codes,constraints=_diagnostic_vocabulary()
+        if item.get('reason_code') in codes:
+            safe['reason_code']=item['reason_code']
+        if item.get('constraint') in constraints:
+            safe['constraint']=item['constraint']
+        raw=item.get('field_path')
+        if isinstance(raw,str) and len(raw)<=4096:
+            try:path=json.loads(raw)
+            except (TypeError,ValueError):path=None
+            if isinstance(path,list):
+                from ..discovery.validation_feedback import _path
+                safe['field_path']=json.dumps(_path(path,names),ensure_ascii=False,separators=(',',':'))
+    return safe
+
+
 def _safe_report(value):
     """Accept the existing report contract, never arbitrary process output."""
     try:
@@ -68,10 +115,7 @@ def _safe_report(value):
         raise LightGraphError("run_report_invalid") from None
     # Runtime reports use closed numeric counters and error codes. Keep only
     # supported issue fields rather than allowing arbitrary message/evidence keys.
-    report.issues = [{k: v for k, v in item.items()
-                      if k in {"code", "table", "rule_id", "count"}
-                      or k in _ISSUE_ENUMS and v in _ISSUE_ENUMS[k]}
-                     for item in report.issues]
+    report.issues = [_safe_issue(item) for item in report.issues]
     return report.model_dump(mode="json")
 
 
@@ -181,6 +225,7 @@ class RunManager:
                     if record.get("status") in ACTIVE_STATUSES:
                         record.update(status="interrupted", stage="finished", finished_at=_now(),
                                       cleanup_status="unknown", error_code="service_restarted")
+                        finish_progress(progress_path(path), record.get("run_id"), "interrupted")
                         _save(path, record)
                     # Exclusive service ownership proves no surviving worker
                     # still needs a cancellation request from a previous run.
@@ -276,7 +321,9 @@ class RunManager:
             if changed and record["status"] in {"completed", "completed_with_gaps", "partial"}:
                 record.update(status="partial", error_code="input_dependency_changed")
         record.update(stage="finished", finished_at=_now())
-        _save(self._paths(pid, record["run_id"])[1], record)
+        record_path = self._paths(pid, record["run_id"])[1]
+        finish_progress(progress_path(record_path), record["run_id"], record["status"])
+        _save(record_path, record)
         try:
             entry["result"].unlink(missing_ok=True)
             _cancel_path(entry["result"]).unlink(missing_ok=True)
@@ -293,7 +340,20 @@ class RunManager:
             _, path = self._paths(pid, rid)
             if not path.exists():
                 raise LightGraphError("run_not_found")
-            return _json_file(path)
+            return self._with_progress(_json_file(path), path)
+
+    @staticmethod
+    def _with_progress(record, path):
+        # A worker owns only its sibling progress file. Optional telemetry cannot
+        # break old records or override the authoritative terminal run status.
+        if record.get("run_id") != path.stem:
+            return record
+        progress = read_progress(progress_path(path), record.get("run_id"))
+        if progress is not None:
+            record = dict(record, progress=progress)
+            if record.get("status") in ACTIVE_STATUSES:
+                record["stage"] = progress["stage"]
+        return record
 
     def list(self, pid):
         with self.workspace.lock(pid):
@@ -301,7 +361,7 @@ class RunManager:
             records = []
             for path in directory.glob("run_*.json"):
                 if _RUN_ID.fullmatch(path.stem):
-                    records.append(_json_file(path))
+                    records.append(self._with_progress(_json_file(path), path))
             return sorted(records, key=lambda r: r["created_at"], reverse=True)
 
     def cancel(self, pid, rid):
@@ -383,10 +443,13 @@ def read_graph(workspace, pid, layer="business", *, include_candidates=False,off
         from ..store.paging import graph_page
         view = graph_page(store,set(config.scopes),config.isolation_domain,layer=layer,
                           include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus)
+        from .graph_display import display_schema
+        vocabulary = display_schema(store, view)
     result = _bounded_view(view, layer)
     result.update({key:view[key] for key in ('total_nodes','total_edges','matched_nodes','boundary_edges',
         'next_offset','offset','page_size','generation','query_strategy','kinds','kind_counts','focus_node_id','focus_neighbor_count')})
     result["include_candidates"] = include_candidates
+    result["display_schema"] = vocabulary
     return result
 
 
@@ -416,6 +479,9 @@ def read_graph_details(workspace, pid, *, entity_id=None, fact_id=None, include_
         facts = selected[offset:offset + 50]
         ids = {f["id"] for f in facts}
         supports = [v for v in view["supports"] if v["fact_id"] in ids]
+        from .graph_display import display_schema, endpoint_captions
+        captions = endpoint_captions(view['nodes'], facts)
+        vocabulary = display_schema(store, {'nodes': captions, 'facts': facts, 'supports': supports})
         visible_rules = {(v["rule_id"], v["rule_revision"]) for v in supports}
         rules = []
         for rule in store.get_rules(include_stale=True):
@@ -426,8 +492,13 @@ def read_graph_details(workspace, pid, *, entity_id=None, fact_id=None, include_
                 "source": rule.source.model_dump(mode="json", by_alias=True),
                 "identity_columns": list(rule.identity.key_columns) if rule.identity else [],
                 "attribute_columns": rule.attributes.model_dump(mode="json") if rule.attributes else {},
+                "namespace_columns": list(rule.scope.namespaces),
+                "hierarchy_columns": [level.model_dump(mode='json') for level in rule.hierarchy.levels] if rule.hierarchy else [],
+                "reference_columns": {key:getattr(rule.relation,key) for key in ('source_columns','target_columns','source_level','target_level')} if rule.relation else {},
+                "concept_columns": [{key:getattr(component,key) for key in ('role','column','key_column','namespace_columns')} for component in rule.concept_mapping.components] if rule.concept_mapping else [],
                 "semantic_basis": list(rule.evidence.semantic_basis)})
     return {"facts": facts, "supports": supports[:500], "rules": rules,
+            "nodes": captions, "display_schema": vocabulary,
             "total_facts": len(selected), "total_supports": len(supports),
             "supports_truncated": len(supports) > 500,
             "next_offset": offset + len(facts) if offset + len(facts) < len(selected) else None,

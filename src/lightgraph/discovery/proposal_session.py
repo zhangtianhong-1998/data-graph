@@ -240,6 +240,11 @@ class ProposalSession:
                   'retained_drafts':len(self.drafts), 'confirmed':False}
         if self._active_operator in self.names:
             result['operator']=self._active_operator
+        if self._active_target is None:
+            result['repair_instruction'] = ('This attempt has no stable proposal ID. Submit the corrected '
+                'candidate without resolves_rejections. After it succeeds, explicitly withdraw this '
+                'rejection ID in finish_discovery.withdraw_rejections; a successful unrelated draft '
+                'does not resolve it automatically.')
         if diagnostics:
             result['diagnostics'] = diagnostics
         evidence_codes={'dangling_evidence_reference','identity_domain_evidence_unresolved',
@@ -258,6 +263,7 @@ class ProposalSession:
         if code == 'invalid_rejection_resolution':
             result['resolvable_rejections'] = [rid for rid, target in self.open_rejections.items()
                 if target == (self._active_operator, self._active_target) and self._active_target is not None]
+            result['withdrawable_rejections'] = list(self.open_rejections)[:16]
             result['instruction'] = ('Only listed rejection IDs can be resolved by this submission. '
                 'For a changed target, submit without resolves_rejections and explicitly withdraw the old IDs when finishing.')
         return result
@@ -351,7 +357,7 @@ class ProposalSession:
                 return {'status':'ok','schema_declared':True,'confirmed':False}
             if name == 'declare_object_model' and name in self.names:
                 from .schema_knowledge import (ObjectModelDraft,validate_object_model,object_model_reference_slots,
-                    apply_object_model,current_object_knowledge)
+                    apply_object_model,current_object_knowledge,object_model_mapping_diagnostics)
                 contract=ObjectModelDraft
                 candidate=contract.model_validate(arguments)
                 slots=object_model_reference_slots(candidate,self.packet)
@@ -362,7 +368,12 @@ class ProposalSession:
                 # The formatter shares this packet, so the latest candidate
                 # survives source-history eviction while the full history stays
                 # available for the workflow's versioned, value-free ledger.
-                knowledge=apply_object_model(self.packet.get('schema_knowledge',{}),candidate)
+                current=self.packet.get('schema_knowledge',{})
+                try:
+                    knowledge=apply_object_model(current,candidate)
+                except LightGraphError as exc:
+                    if exc.code!='object_model_supersession_mapping_loss':raise
+                    return self.reject(exc.code,diagnostics=object_model_mapping_diagnostics(current,candidate))
                 self.object_models.append(incoming)
                 self.packet['schema_knowledge']=current_object_knowledge(knowledge)
                 return {'status':'ok','object_model':incoming,'candidate':True,'confirmed':False,

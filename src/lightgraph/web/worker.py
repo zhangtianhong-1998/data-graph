@@ -14,6 +14,7 @@ def execute(payload, result_path):
     from ..errors import LightGraphError
     from ..pipeline import load_rules, make_model, run_pipeline
     from ..runtime.config import AgentConfig, RunConfig, open_sources
+    from ..runtime.progress import RunProgress, bind_progress, emit_progress, progress_path
     from .execution import check_dependencies, write_metadata_context, _safe_code, _safe_report, _save, _cancel_path
 
     config = None
@@ -64,6 +65,9 @@ def execute(payload, result_path):
                 # reads get a chance to return before the parent force-kills.
                 cancel_sources()
     watcher = threading.Thread(target=watch_cancellation, daemon=True)
+    progress_context = bind_progress(RunProgress(progress_path(result_path)))
+    progress_context.__enter__()
+    emit_progress("initializing", "run_started")
     try:
         watcher.start()
         config = RunConfig.model_validate(payload["config"])
@@ -72,11 +76,13 @@ def execute(payload, result_path):
         check_dependencies(payload["dependencies"], project)
         check_cancelled()
         opening_sources = True
+        emit_progress("initializing", "source_open_started")
         # Direct credentials arrive through the parent's private stdin pipe.
         # They never enter the persisted RunConfig or process environment.
         options = {"source_credentials": payload["source_credentials"]} if payload.get("source_credentials") else {}
         sources = open_sources(config, **options)
         opening_sources = False
+        emit_progress("initializing", "source_open_completed")
         check_cancelled()
         rules = load_rules(config.rules) if config.rules else None
         check_cancelled()
@@ -107,6 +113,7 @@ def execute(payload, result_path):
         error_code = "worker_execution_failed"
     finally:
         # Late cancellation must not interrupt release/report finally blocks.
+        emit_progress("cleanup", "cleanup_started")
         closing.set()
         if watcher.ident is not None:
             watcher.join(timeout=.2)
@@ -124,12 +131,20 @@ def execute(payload, result_path):
         if cancelled:
             status = "cancelled"
             error_code = "run_cancelled"
+        emit_progress("cleanup", "cleanup_completed" if cleanup == "completed" else "issue_detected",
+                      level="info" if cleanup == "completed" else "warning")
         try:
             result = {"status": status, "report": _safe_report(report) if report is not None else None,
                       "cleanup_status": cleanup, "error_code": error_code}
             _save(result_path, result)
+            emit_progress("finished", "run_" + status,
+                          level="error" if status == "failed" else "warning" if status in {"partial", "cancelled"} else "info",
+                          counters={"published_rules": len(report.rules_published)} if report is not None else None)
         finally:
-            signal.signal(signal.SIGTERM, previous)
+            try:
+                signal.signal(signal.SIGTERM, previous)
+            finally:
+                progress_context.__exit__(None, None, None)
     # A completed interpretation may legitimately leave unsupported candidates.
     # That is distinct from an interrupted or otherwise unfinished execution.
     return 0 if status in {"completed", "completed_with_gaps"} else 2

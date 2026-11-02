@@ -342,10 +342,21 @@ def _review_stage_contract(proposition):
     if kind=='reference':
         checks+=['reference_endpoint_resolution','reference_null_and_array_policy',
                  'reference_self_link_policy','prospective_endpoint_visibility']
-    return {'stage':'semantic_interpretation_before_rule_execution',
+    contract={'stage':'semantic_interpretation_before_rule_execution',
         'supported_decision_allows':'draft_rule_compilation_only',
         'publication_authorized':False,
         'programmatic_checks':{'state':'pending_if_rule_compiles','checks':checks}}
+    if kind=='wide_hierarchy' and claim.get('path_semantics')=='relative_path':
+        contract['identity_interpretation']={
+            'identity':'code within the explicitly claimed identity domain and scope',
+            'physical_position':'source support, not an additional identity component',
+            'repeated_code_across_positions':'not a conflict by itself; one object can have multiple position supports',
+            'multiple_parents':('permitted by the proposed DAG policy only if independently supported by evidence'
+                if claim.get('allow_dag') else 'not permitted by the proposed parent policy'),
+            'different_labels_for_same_scoped_code':'still requires identity or label disambiguation; position repetition does not resolve it',
+            'evidence_requirement':'review the claimed identity domain, scope and parent policy; these execution semantics are not evidence of their business meaning',
+        }
+    return contract
 
 
 def _review_reference_state(reviewed, issued, doc_refs):

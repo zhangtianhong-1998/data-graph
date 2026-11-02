@@ -118,11 +118,15 @@ def test_reference_candidates_without_stable_ids_cannot_resolve_each_others_reje
         'target_entity':'target_a','target_columns':['c_b'],'cardinality_hint':'invalid_cardinality'}}
     rejected=session.execute('submit_reference',original)
     assert rejected['resolution']=='explicit_withdrawal'
+    assert 'without resolves_rejections' in rejected['repair_instruction']
     other=deepcopy(original)
     other['claim'].update(target_entity='target_b',cardinality_hint='n_to_1')
     other['resolves_rejections']=[rejected['rejection_id']]
     denied=session.execute('submit_reference',other)
     assert denied['code']=='invalid_rejection_resolution' and not session.drafts
+    assert denied['resolvable_rejections']==[]
+    assert rejected['rejection_id'] in denied['withdrawable_rejections']
+    assert denied['rejection_id'] in denied['withdrawable_rejections']
     assert rejected['rejection_id'] in session.open_rejections
     # Anonymous candidates remain usable: submit first, deliberately withdraw the
     # earlier rejected attempt afterwards, never infer repair from mere success.

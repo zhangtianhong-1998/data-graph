@@ -65,8 +65,18 @@ class ModelConfig(StrictModel):
     max_output_tokens: int = Field(default=4096, gt=0)
     # Revision requests include both the typed tool schema and the prior rule.
     max_prompt_bytes: int = Field(default=131072, gt=0)
+    max_prompt_tokens: int | None = Field(default=None, gt=0,
+        description="Optional estimated input token cap, including tool schemas; independent of byte limits.")
+    context_window_tokens: int | None = Field(default=None, gt=0,
+        description="Optional combined input/output token window; max_output_tokens is reserved from it.")
     max_response_bytes: int = Field(default=262144, gt=0)
     retries: int = Field(default=1, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def check_context_window(self):
+        if self.context_window_tokens is not None and self.context_window_tokens <= self.max_output_tokens:
+            raise ValueError("context_window_must_exceed_output_reservation")
+        return self
 
 
 class AgentConfig(StrictModel):

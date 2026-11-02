@@ -1150,6 +1150,30 @@
       "title": "ExclusionProposal",
       "type": "object"
     },
+    "ExistingReferenceRule": {
+      "additionalProperties": false,
+      "properties": {
+        "rule_id": {
+          "title": "Rule Id",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "relation_contract": {
+          "$ref": "#/$defs/RelationSpec"
+        }
+      },
+      "required": [
+        "rule_id",
+        "revision",
+        "relation_contract"
+      ],
+      "title": "ExistingReferenceRule",
+      "type": "object"
+    },
     "ForeignKeySpec": {
       "additionalProperties": false,
       "properties": {
@@ -3567,6 +3591,38 @@
       "maxItems": 64,
       "title": "Entity Bindings",
       "type": "array"
+    },
+    "existing_reference_rules": {
+      "items": {
+        "$ref": "#/$defs/ExistingReferenceRule"
+      },
+      "maxItems": 64,
+      "title": "Existing Reference Rules",
+      "type": "array"
+    },
+    "existing_reference_rules_total": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Existing Reference Rules Total",
+      "type": "integer"
+    },
+    "existing_reference_rules_truncated": {
+      "default": false,
+      "title": "Existing Reference Rules Truncated",
+      "type": "boolean"
+    },
+    "relation_reuse_instruction": {
+      "anyOf": [
+        {
+          "maxLength": 1000,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Relation Reuse Instruction"
     }
   },
   "required": [

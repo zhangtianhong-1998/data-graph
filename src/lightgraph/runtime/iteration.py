@@ -238,6 +238,7 @@ class IterationLedger:
                   'namespace_columns': list(r.scope.namespaces),
                   'identity_contract': r.identity.model_dump(mode='json'),
                   'hierarchy_contract': r.hierarchy.model_dump(mode='json') if r.hierarchy else None,
+                  'relation_contract': r.relation.model_dump(mode='json') if r.relation else None,
                   'hierarchy_levels': [level.model_dump(mode='json') for level in r.hierarchy.levels]
                       if r.hierarchy else []} for r in relevant[:24]]
         failures=[]

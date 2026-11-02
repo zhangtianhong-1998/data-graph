@@ -46,6 +46,8 @@ const hints: Record<string, string> = {
   identity_domain_evidence_unresolved: '跨表编码复用缺少可用的定义证据。补充适用的编码域说明并重新审查，不能仅按同码合并。',
   excluded_column_projected: '提案使用了已排除的列。检查该列的用途，修正字段映射或有依据地修订排除声明后重新验证。',
   model_response_truncated: '模型回复未完整返回，本次内容不能作为完整提交。缩小单次提交范围，逐条提交后再完成发现。',
+  model_context_window_exceeded: '输入超出模型的 token 窗口。检查 tokenizer、上下文裁剪及输入窗口配置；这与 max_prompt_bytes 请求字节上限是两项独立限制。',
+  model_reference_collision: '模型上下文中的短引用发生映射冲突。原始引用未被替换，检查引用映射代码后重试；这不代表业务对象冲突。',
   unexplained_columns: '部分字段尚未被规则解释。检查是否需要补充别名、属性或明确排除；已有规则的发布不代表这些字段已覆盖。',
   concept_scope_evidence_required: '概念的共享范围缺少证据。选择适用于该表的定义章节，说明哪些主体可以共用该概念后重新提交。',
   semantic_review_unissued_evidence: '语义审查使用了本次未签发或重复的引用。按本次可用证据修正引用后重新审查；这不代表业务含义已被否定。',

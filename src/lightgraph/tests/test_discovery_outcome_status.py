@@ -69,3 +69,26 @@ def test_report_advice_is_derived_from_safe_code_not_arbitrary_input():
         'category':'SOURCE_SECRET','next_action':'SOURCE_SECRET','message':'SOURCE_SECRET'}])
     assert report.issues==[{'code':'recovery_state_invalid','status':'partial',
         'category':'internal_error','next_action':'fix_code'}]
+
+
+@pytest.mark.parametrize('history_status',['diagnostic','resolved'])
+def test_recovered_transport_history_does_not_reopen_a_finished_semantic_decision(history_status):
+    from types import SimpleNamespace
+    from lightgraph.pipeline import _discovery_outcome, _deferred_tables
+    issues=[{'code':'model_transport_timeout','status':history_status}]
+    assert _discovery_outcome(issues)=='COMPLETED'
+    assert not _deferred_tables(SimpleNamespace(issues=issues),['public.t'])
+    issues.append({'code':'semantic_claim_refuted','status':'unresolved'})
+    assert _discovery_outcome(issues)=='COMPLETED_WITH_GAPS'
+    assert not _deferred_tables(SimpleNamespace(issues=issues),['public.t'])
+    issues.append({'code':'discovery_submission_pending','status':'deferred'})
+    assert _discovery_outcome(issues)=='PARTIAL'
+    assert _deferred_tables(SimpleNamespace(issues=issues),['public.t'])=={'public.t'}
+
+
+def test_unrecovered_failure_still_interrupts_work_even_alongside_diagnostics():
+    from lightgraph.pipeline import _discovery_outcome
+    assert _discovery_outcome([
+        {'code':'semantic_review_protocol_diagnostic','status':'diagnostic'},
+        {'code':'model_response_truncated','status':'deferred'},
+    ])=='PARTIAL'

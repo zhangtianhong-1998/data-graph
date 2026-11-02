@@ -47,7 +47,7 @@ workspace/<项目编号>/
 
 数据库连接窗口的“运行权限与高级选项”提供能力清单生成指引、YAML 上传和绑定。先在获准环境用 `lightgraph connect-check <运行配置.yaml> --verify-runtime --output capabilities.yaml` 生成与来源对应的结果，再上传选择。上传只校验清单格式；实际运行仍核对数据库产品、版本、驱动、一致快照和所需能力。读取元数据不代表实例抽取已通过验证。
 
-服务默认只监听本机，每个 workspace 只允许一个服务。页面按秒轮询真实任务状态；不向浏览器传送查询样本、模型原文，也不虚构进度百分比。详细接口、当前范围和启动方式见 [Vue 工作台实现](design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md)。原 [交互设计](design/lightweight_graph/WORKBENCH_DESIGN.md) 和 [用户故事](design/lightweight_graph/WORKBENCH_US.md) 中的后续能力仍单独列出。旧合成原型保留在 `src/lightgraph/workbench_prototype/`，不再作为实际工作台入口。
+服务默认只监听本机，每个 workspace 只允许一个服务。“运行记录”每秒更新当前阶段、阶段进度和运行日志。处理表或规则时显示已完成数与总数；等待模型等无法确定工作量的阶段显示活动进度条，不将时间或调用额度换算成完成百分比。日志保留最近 200 条结构化事件，可暂停自动跟随；页面显示模型调用次数和 token 用量，不传送查询样本、模型原文或密钥。旧运行没有过程记录时会明确提示。详细接口、当前范围和启动方式见 [Vue 工作台实现](design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md)。原 [交互设计](design/lightweight_graph/WORKBENCH_DESIGN.md) 和 [用户故事](design/lightweight_graph/WORKBENCH_US.md) 中的后续能力仍单独列出。旧合成原型保留在 `src/lightgraph/workbench_prototype/`，不再作为实际工作台入口。
 
 工作台支持删除项目、上传的数据文件和 Markdown，以及移除数据库连接或已选表。数据接入列表只展示数据库表与 Excel/CSV；自动生成的元数据 YAML 在右侧预览，随对应数据一并清理。移除数据库表只调整本项目的抽取范围，不修改源数据库。删除输入保留已有图谱发布和运行记录；删除整个项目则清除该项目的本地文件、配置、连接信息和结果。操作前显示确认，运行中的项目暂不允许删除。
 
@@ -215,13 +215,15 @@ llm:
 
 模型的无工具结构化回合默认使用 `response_format: json_schema`，把完整输出契约交给支持严格结构化输出的服务端；本地格式、引用、语义和发布验证仍会继续执行。若网关不支持该模式，须显式设置 `response_format: json_object` 使用兼容模式；程序不会静默降级或删除约束。严格输出中的 Schema 也计入请求容量和用量估算。火山端点的能力应以实际模型与配置验证，不能只凭兼容接口名称判断；参见[官方结构化输出说明](https://docs.volcengine.com/docs/ark/structured-output-beta?lang=zh)。
 
-`stream: true` 使用模型 SSE 流，`false` 接收完整 JSON；旧配置默认 `false`。两种模式使用相同的工具和输出校验，工具名称与参数完整到达后才执行工具，不执行半截参数。`stream_options_include_usage` 控制是否请求流末尾的 token 用量；网关不支持该选项时设为 `false`，缺少用量时按保守预算记账。这里的流式指模型传输；Vue 工作台采用 HTTP 轮询显示真实任务状态，尚不提供逐工具事件流，也不显示模型原文。
+`stream: true` 使用模型 SSE 流，`false` 接收完整 JSON；旧配置默认 `false`。两种模式使用相同的工具和输出校验，工具名称与参数完整到达后才执行工具，不执行半截参数。`stream_options_include_usage` 控制是否请求流末尾的 token 用量；网关不支持该选项时设为 `false`，缺少用量的输入和输出分别估算，并在报告的 `estimated_input_tokens` / `estimated_output_tokens` 中单列。传输中断导致用量未知时，保守预留单列为 `unknown_usage_reserved_tokens`。Vue 工作台采用 HTTP 轮询显示任务阶段和结构化运行日志，不显示模型原文。
 
 远端默认要求 HTTPS。客户的可信内网网关只有 HTTP 时，可以显式设置 `allow_insecure_http: true`；该设置不改变数据查询权限或允许发送的内容。
 
 `metadata_only` 只向模型提供授权元数据与相关知识文档；模型工具拒绝实例查询，包括统计、只读 SQL 和跨源核验。后续程序端的规则验证仍受来源权限和查询预算约束。`in_environment` 或 `approved_external` 表示相应数据使用条件已确认，允许发送经过列过滤、长度限制的内存样本。外部服务自身的日志与保留策略必须在客户环境验证；本地测试无法证明这一点。
 
-`max_discovery_steps` 限制单次探索的模型轮数（1～32），`max_tool_calls` 限制源数据工具调用数（1～64）；全程仍受 `max_calls`、`max_tokens`、查询预算和运行截止时间约束。到达上限时保留覆盖缺口，不将未验证提案当作完成。`max_prompt_bytes`、`max_response_bytes` 和 `max_output_tokens` 分别限制请求、响应和生成长度。完整字段见配置示例及 [AgentConfig Schema](src/lightgraph/schemas/AgentConfig.schema.json)。
+`max_discovery_steps` 限制单次探索的模型轮数（1～32），`max_tool_calls` 限制源数据工具调用数（1～64）；全程仍受 `max_calls`、`max_tokens`、查询预算和运行截止时间约束。到达上限时保留覆盖缺口，不将未验证提案当作完成。`max_prompt_bytes` 和 `max_response_bytes` 按 UTF-8 字节限制请求与响应；`max_output_tokens` 按 token 限制生成长度。可选的 `max_prompt_tokens` 单独限制估算输入 token；`context_window_tokens` 限制输入与输出的总窗口，并为 `max_output_tokens` 预留空间。两者默认不设置，旧配置保持原意：`max_prompt_bytes: 1048576` 仍是 1 MiB，不能等同于 1,048,576 tokens。工具 Schema 计入请求容量，累计预算按提供方 usage 记账，缺失 usage 时使用明确标记的估算。完整字段见 [AgentConfig Schema](src/lightgraph/schemas/AgentConfig.schema.json) 和 [上下文窗口与用量计量](design/lightweight_graph/CONTEXT_WINDOW_ACCOUNTING_20261102.md)。
+
+`timeout_seconds` 控制 HTTP 连接、读写等待等网络超时，并非整次模型调用的总耗时；总耗时仍受运行预算限制。报告用 `transport_read_timeout` 等固定计数区分读超时、连接错误和协议错误，不记录异常原文。调大窗口不会自动调大网络超时。历史超时不能直接说明模型曾提交半截 JSON：当前传输层会在执行工具前拒绝未完成响应。
 
 具体调用路径和实现边界见 [AgentScope 接入设计](design/lightweight_graph/AGENTSCOPE_RUNTIME.md)。
 

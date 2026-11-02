@@ -27,6 +27,9 @@ def seed(client):
                                           ('hidden','private','accepted',[('x','PRIVATE'),('y','PRIVATE')])]:
             rule=RuleSpec(rule_id=name,kind='column_group_entity',source={'source_id':'input','table':'people'},
                 identity={'key_columns':['code'],'entity_kind':'ReportItem'},attributes={'single_valued':{'label':'name'}},
+                semantic_schema={'entity_types':[
+                    {'name':'ReportItem','description':'PRIVATE TYPE' if scope=='private' else '报表项目'},
+                    {'name':'UnusedKind','description':'UNUSED PRIVATE DEFINITION'}]},
                 evidence={'semantic_basis':['fixture:approved']})
             store.put_rule(rule)
             pub=store.begin_publication(name,1,'all',{})
@@ -50,6 +53,7 @@ def test_default_graph_excludes_candidates_and_details_authorize_each_support(cl
     normal=client.get('/api/projects/p/graph').json()
     assert {n['id'] for n in normal['nodes']}=={'a','b'}
     assert all(n['status']=='accepted' for n in normal['nodes'])
+    assert normal['display_schema']['entity_types']==[{'name':'ReportItem','description':'报表项目'}]
     preview=client.get('/api/projects/p/graph?include_candidates=true').json()
     assert {n['id'] for n in preview['nodes']}=={'a','b','c'}
     assert next(n for n in preview['nodes'] if n['id']=='c')['status']=='candidate'
@@ -58,6 +62,7 @@ def test_default_graph_excludes_candidates_and_details_authorize_each_support(cl
     assert details['supports'] and all(s['scope_ref']=='public' for s in details['supports'])
     assert details['rules'][0]['identity_columns']==['code']
     assert details['rules'][0]['attribute_columns']['single_valued']=={'label':'name'}
+    assert details['nodes']==[{'id':'a','label':'Shared','kind':'ReportItem','layer':'business','status':'accepted'}]
     assert client.get('/api/projects/p/graph/details?entity_id=c').status_code==404
     candidate_details=client.get('/api/projects/p/graph/details?entity_id=c&include_candidates=true')
     assert candidate_details.status_code==200
@@ -114,3 +119,36 @@ def test_graph_focus_search_and_counts_respect_visibility(client):
     assert client.get('/api/projects/p/graph?focus=c&include_candidates=true').json()['focus_node_id']=='c'
     assert client.get('/api/projects/p/graph?focus='+('x'*257)).status_code==400
     assert client.get('/api/projects/p/graph?q=Shared').json()['matched_nodes']==2
+
+
+def test_fact_page_resolves_authorized_off_page_endpoints_and_vocabulary(client, monkeypatch):
+    seed(client)
+    config=client.app.state.workspace.resolved_config('p')
+    with GraphStore(config.output_dir+'/graph.sqlite') as store:
+        rule=RuleSpec(rule_id='links',kind='column_group_entity',source={'source_id':'input','table':'people'},
+            identity={'key_columns':['code'],'entity_kind':'ReportItem'},
+            semantic_schema={'relations':[{'name':'associated_with','description':'关联报表项',
+                'source_kinds':['ReportItem'],'target_kinds':['ReportItem']}],
+                'properties':[{'name':'business_note','description':'业务说明','entity_kinds':['ReportItem']}]},
+            evidence={'semantic_basis':['fixture:approved']})
+        store.put_rule(rule)
+        pub=store.begin_publication('links',1,'all',{})
+        support=SupportSpec(origin='user_input',source_binding='people.code',scope_ref='public',
+            partition_id='all',rule_id='links',rule_revision=1,status='accepted')
+        for kind,payload in [('Edge',{'source':'a','target':'b','relation':'associated_with','qualifiers':{}}),
+                ('PropertyValue',{'entity_id':'a','name':'business_note','value':'说明'})]:
+            store.stage_fact(pub,GraphFact(isolation_domain='p',fact_kind=kind,payload=payload),support)
+        store.publish_partition(PartitionCompletion(publication_id=pub,complete=True,consistent=True,dependencies_valid=True))
+    # The ordinary page stays SQL-bounded; vocabulary must not call store.view.
+    original_view=GraphStore.view
+    monkeypatch.setattr(GraphStore,'view',lambda *a,**k: pytest.fail('full graph read'))
+    page=client.get('/api/projects/p/graph?limit=1').json()
+    assert [node['id'] for node in page['nodes']]==['a']
+    assert page['display_schema']['properties']==[{'name':'business_note','description':'业务说明'}]
+    assert page['display_schema']['relations']==[]  # The edge is outside this page.
+    monkeypatch.setattr(GraphStore,'view',original_view)
+    details=client.get('/api/projects/p/graph/details?entity_id=a').json()
+    assert {node['id'] for node in details['nodes']}=={'a','b'}
+    assert all(node['label']=='Shared' for node in details['nodes'])
+    assert details['display_schema']['relations']==[{'name':'associated_with','description':'关联报表项'}]
+    assert 'PRIVATE' not in str(details)

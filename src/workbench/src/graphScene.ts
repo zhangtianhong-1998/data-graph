@@ -1,4 +1,5 @@
 import type { Graph, GraphNode } from './types'
+import { mergeDisplaySchema } from './graphLabels'
 
 export const SCENE_LIMIT = 4000
 export const SCENE_EDGE_LIMIT = 16000
@@ -12,7 +13,7 @@ export function mergeScene(previous: Graph, incoming: Graph): Graph {
   for (const node of incoming.nodes) if (nodes.has(node.id) || nodes.size < SCENE_LIMIT) nodes.set(node.id, node)
   const edges = new Map(previous.edges.filter(e => nodes.has(e.source) && nodes.has(e.target)).slice(0, SCENE_EDGE_LIMIT).map(e => [edgeKey(e), e]))
   for (const edge of incoming.edges) if (nodes.has(edge.source) && nodes.has(edge.target) && (edges.has(edgeKey(edge)) || edges.size < SCENE_EDGE_LIMIT)) edges.set(edgeKey(edge), edge)
-  return { ...previous, ...incoming, nodes: [...nodes.values()], edges: [...edges.values()] }
+  return { ...previous, ...incoming, display_schema: mergeDisplaySchema(previous.display_schema, incoming.display_schema), nodes: [...nodes.values()], edges: [...edges.values()] }
 }
 
 /** Directed breadth-first bands; existing positions survive every expansion.

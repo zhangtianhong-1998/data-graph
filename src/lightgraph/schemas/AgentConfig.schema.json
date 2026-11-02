@@ -125,6 +125,34 @@
           "title": "Max Prompt Bytes",
           "type": "integer"
         },
+        "max_prompt_tokens": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional estimated input token cap, including tool schemas; independent of byte limits.",
+          "title": "Max Prompt Tokens"
+        },
+        "context_window_tokens": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional combined input/output token window; max_output_tokens is reserved from it.",
+          "title": "Context Window Tokens"
+        },
         "max_response_bytes": {
           "default": 262144,
           "exclusiveMinimum": 0,

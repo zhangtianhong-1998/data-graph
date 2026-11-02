@@ -51,9 +51,11 @@ class DiscoveryFormatter(FormatterBase):
     system instructions.
     """
 
-    def __init__(self, packet: dict, executor):
+    def __init__(self, packet: dict, executor, references=None, submission_names=()):
         self.packet=packet
         self.executor=executor
+        self.references=references
+        self.submission_names=set(submission_names)
 
     @staticmethod
     def _deduplicate_tool_context(content: str, documents: list[dict]) -> str:
@@ -124,7 +126,7 @@ class DiscoveryFormatter(FormatterBase):
                 output.append({'role':'assistant','content':None,'tool_calls':calls})
             else:
                 output.append({'role':msg.role,'content':msg.get_text_content() or ''})
-        return output
+        return self.references.messages(output,self.submission_names) if self.references else output
 
 
 class DiscoveryChatModel(ChatModelBase):
@@ -135,7 +137,7 @@ class DiscoveryChatModel(ChatModelBase):
     the evidence already obtained, without increasing either allowance.
     """
 
-    def __init__(self, client, max_tool_calls: int, max_steps: int, submission_names=()):
+    def __init__(self, client, max_tool_calls: int, max_steps: int, submission_names=(), references=None):
         super().__init__(model_name=client.config.model,stream=client.config.stream)
         self.client=client
         self.max_tool_calls=max_tool_calls
@@ -146,6 +148,7 @@ class DiscoveryChatModel(ChatModelBase):
         self.submission_names=set(submission_names)
         self.steps=0
         self.submission_reason=None
+        self.references=references
 
     def _request_context(self, messages, reason):
         """Add runtime-owned counters, never tool arguments or source values."""
@@ -155,10 +158,16 @@ class DiscoveryChatModel(ChatModelBase):
 
     async def __call__(self, messages: list[dict], tools=None, tool_choice=None, **kwargs):
         from .agent import _message
-        from .prompt_window import prompt_bytes, fit_source_history
+        from .prompt_window import prompt_bytes, prompt_size, prompt_fits, fit_source_history
+        from .token_estimation import prompt_token_limit
 
         _check_runtime_policy()
         self.client.budget.check_deadline()
+        if self.references:
+            tools=self.references.schema(tools)
+        def parse(message):
+            return _message(self.references.response(message,self.submission_names)
+                            if self.references else message)
         try:
             while True:
                 if self.steps>=self.max_steps:
@@ -187,27 +196,37 @@ class DiscoveryChatModel(ChatModelBase):
                     available=[]
                 request_messages=self._request_context(messages,reason)
                 mode=self.client.config.response_format
-                size=prompt_bytes(request_messages,available,mode)
-                if size>self.client.config.max_prompt_bytes and any(m.get('role')=='tool' for m in messages):
-                    # Finish within the existing turn/call allowances. Source
-                    # tools cannot keep growing history after this transition.
-                    self.submission_reason=reason='context_window_pressure'
-                    available=[spec for spec in available
-                        if spec['function']['name'] in self.submission_names]
-                    request_messages=self._request_context(messages,reason)
+                size,estimated_tokens=prompt_size(request_messages,available,mode)
+                token_limit=prompt_token_limit(self.client.config)
+                byte_limit=self.client.config.max_prompt_bytes
+                if not prompt_fits(request_messages,available,mode,byte_limit,token_limit) and any(m.get('role')=='tool' for m in messages):
+                    # First trim old complete exchanges while retaining the
+                    # ability to reread evidence within the discovery allowance.
                     request_messages,removed=fit_source_history(request_messages,available,mode,
-                        self.client.config.max_prompt_bytes,self.submission_names)
+                        byte_limit,self.submission_names,token_limit=token_limit)
+                    if not prompt_fits(request_messages,available,mode,byte_limit,token_limit):
+                        self.submission_reason=reason='context_window_pressure'
+                        available=[spec for spec in available
+                            if spec['function']['name'] in self.submission_names]
+                        request_messages=self._request_context(messages,reason)
+                        request_messages,removed=fit_source_history(request_messages,available,mode,
+                            byte_limit,self.submission_names,token_limit=token_limit)
                     usage=self.client.usage
                     usage['prompt_pressure_turns']=usage.get('prompt_pressure_turns',0)+1
                     usage['prompt_history_exchanges_omitted']=usage.get('prompt_history_exchanges_omitted',0)+removed
                     usage['prompt_peak_before_window_bytes']=max(usage.get('prompt_peak_before_window_bytes',0),size)
                     usage['prompt_peak_after_window_bytes']=max(usage.get('prompt_peak_after_window_bytes',0),
                         prompt_bytes(request_messages,available,mode))
+                    usage['prompt_peak_before_window_estimated_tokens']=max(
+                        usage.get('prompt_peak_before_window_estimated_tokens',0),estimated_tokens)
+                    usage['prompt_peak_after_window_estimated_tokens']=max(
+                        usage.get('prompt_peak_after_window_estimated_tokens',0),
+                        prompt_size(request_messages,available,mode)[1])
                 self.steps+=1
                 try:
                     # Source access ends at its configured allowance or final
                     # turn. Bounded local submissions can still preserve work.
-                    parsed=self.client._request(request_messages,_message,available or None,
+                    parsed=self.client._request(request_messages,parse,available or None,
                         tool_choice=(tool_choice or 'auto') if available else 'none')
                 finally:
                     request_messages.clear()
@@ -317,10 +336,12 @@ class DiscoveryReActAgent(ReActAgent):
 
 async def run_agent(client, packet, executor, dispatch, system, *, max_steps, max_tool_calls):
     from .agentscope_tools import create_toolkit
+    from .model_references import ModelReferences
 
     _check_runtime_policy()
     memory=EphemeralMemory()
     session=ProposalSession(packet)
+    references=ModelReferences(packet)
     class CombinedTools:
         def tool_specs(self):
             return [*executor.tool_specs(),*proposal_tool_specs(packet['task'], packet)]
@@ -334,9 +355,9 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
     toolkit=create_toolkit(CombinedTools(),combined_dispatch)
     toolkit.invalid_argument_handler=lambda name,args,diagnostics: (
         session.reject_tool_arguments(name,args,diagnostics) if name in session.names else None)
-    model=DiscoveryChatModel(client,max_tool_calls,max_steps,session.names)
+    model=DiscoveryChatModel(client,max_tool_calls,max_steps,session.names,references)
     agent=DiscoveryReActAgent(name=client.config.agent_name,sys_prompt=system,
-        model=model,formatter=DiscoveryFormatter(packet,executor),toolkit=toolkit,
+        model=model,formatter=DiscoveryFormatter(packet,executor,references,session.names),toolkit=toolkit,
         memory=memory,max_iters=max_steps,parallel_tool_calls=False,
         enable_meta_tool=False,print_hint_msg=False)
     agent.set_console_output_enabled(False)
@@ -412,3 +433,4 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
         agent._sys_prompt=''
         agent.formatter.packet={}
         agent.formatter.executor=None
+        references.clear()

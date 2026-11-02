@@ -16,6 +16,38 @@ from openai.types.chat import ChatCompletionChunk
 from lightgraph.errors import LightGraphError
 
 
+TRANSPORT_FAILURE_KINDS = frozenset({
+    'read_timeout', 'connect_timeout', 'write_timeout', 'pool_timeout',
+    'connection_error', 'protocol_error', 'unknown',
+})
+
+
+def transport_failure_kind(error):
+    """Classify exception types only; never inspect messages, URLs or response bodies."""
+    seen = set()
+    current = error
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        for error_type, kind in (
+                (httpx.ReadTimeout, 'read_timeout'), (httpx.ConnectTimeout, 'connect_timeout'),
+                (httpx.WriteTimeout, 'write_timeout'), (httpx.PoolTimeout, 'pool_timeout'),
+                (httpx.ProtocolError, 'protocol_error'), (httpx.NetworkError, 'connection_error')):
+            if isinstance(current, error_type):
+                return kind
+        current = current.__cause__
+    return 'connection_error' if isinstance(error, openai.APIConnectionError) and not isinstance(
+        error, openai.APITimeoutError) else 'unknown'
+
+
+class _ModelTransportError(LightGraphError):
+    """Carry one allowlisted diagnostic alongside the unchanged public error code."""
+    def __init__(self, error):
+        self.failure_kind = transport_failure_kind(error)
+        super().__init__('model_transport_error', retryable=True)
+
+
 def stream_transport_limit(max_response_bytes, max_output_tokens):
     return 6 * max_response_bytes + 2048 * max_output_tokens + 65536
 
@@ -292,6 +324,6 @@ def request_completion(config, budget, transport, key, payload):
     except openai.APIConnectionError as exc:
         if isinstance(exc.__cause__, LightGraphError):
             raise exc.__cause__ from None
-        raise LightGraphError('model_transport_error', retryable=True) from None
-    except openai.APIError:
-        raise LightGraphError('model_transport_error', retryable=True) from None
+        raise _ModelTransportError(exc) from None
+    except openai.APIError as exc:
+        raise _ModelTransportError(exc) from None

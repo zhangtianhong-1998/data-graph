@@ -113,7 +113,9 @@ def test_fragmented_unicode_multiple_tool_indices_and_no_usage_option():
     client=model(handler,stream_options_include_usage=False,response_format='json_object')
     result=client._request([{'role':'user','content':'test'}],lambda value:value)
     assert result['tool_calls']==message['tool_calls']
-    assert client.usage['output_tokens']==client.config.max_output_tokens
+    assert 0 < client.usage['output_tokens'] < client.config.max_output_tokens
+    assert client.usage['output_tokens']==client.usage['estimated_output_tokens']
+    assert client.usage['estimated_input_tokens_calls']==client.usage['estimated_output_tokens_calls']==1
 
 
 @pytest.mark.parametrize('suffix,code',[
@@ -147,6 +149,26 @@ def test_socket_interruption_after_tool_json_cannot_execute_tool():
     with pytest.raises(LightGraphError,match='model_transport_error') as error:
         client.explore(input_packet(),toolbox)
     assert toolbox.executed==[] and toolbox.closed and CANARY not in str(error.value)
+    assert client.usage['transport_connection_error']==1
+
+
+@pytest.mark.parametrize('exception_type,kind',[
+    (httpx.ReadTimeout,'read_timeout'),(httpx.ConnectTimeout,'connect_timeout'),
+    (httpx.WriteTimeout,'write_timeout'),(httpx.PoolTimeout,'pool_timeout'),
+    (httpx.ConnectError,'connection_error'),(httpx.RemoteProtocolError,'protocol_error'),
+])
+def test_transport_diagnostics_use_types_without_retaining_error_values(exception_type,kind,capsys,caplog):
+    def fail(request):
+        raise exception_type(CANARY,request=request)
+    client=model(fail)
+    source=Toolbox()
+    with pytest.raises(LightGraphError,match='model_transport_error') as caught:
+        client.explore(input_packet(),source)
+    assert client.usage['transport_'+kind]==1
+    assert client.usage['calls']==1 and client.usage['failures']==1
+    assert source.executed==[] and source.closed
+    assert CANARY not in json.dumps(client.usage)+str(caught.value)+capsys.readouterr().out+caplog.text
+    assert client.budget.snapshot()['reserved']=={}
 
 
 def test_malformed_complete_tool_arguments_are_not_executed():
