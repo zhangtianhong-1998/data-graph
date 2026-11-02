@@ -19,7 +19,7 @@ export interface GraphEdge { id?: string; status?: string; source: string; targe
 export interface Graph { nodes: GraphNode[]; edges: GraphEdge[]; claims?: unknown[]; [key: string]: unknown }
 export interface Metadata extends Graph { tables: Table[]; files?: Array<{ name: string; content: string }> }
 export interface Run {
-  run_id: string; project_id: string; status: 'queued' | 'running' | 'completed' | 'partial' | 'failed' | 'cancelled' | 'interrupted'
+  run_id: string; project_id: string; status: 'queued' | 'running' | 'completed' | 'completed_with_gaps' | 'partial' | 'failed' | 'cancelled' | 'interrupted'
   stage: string; created_at: string; finished_at?: string; report?: unknown; error_code?: string
   config_revision?: number
   cleanup_status: 'pending' | 'completed' | 'unknown'

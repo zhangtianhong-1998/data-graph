@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { assertNoCredentials, graphOutcome, isActive, splitLines } from './state'
+import { assertNoCredentials, graphOutcome, isActive, runLabels, splitLines } from './state'
 import { ApiError, request } from './api'
 import type { Run } from './types'
 
@@ -13,9 +13,15 @@ describe('运行和配置边界', () => {
     expect(graphOutcome({ status: 'completed' })).toBe('')
   })
   it('只有后端 queued/running 状态触发轮询', () => {
-    for (const status of ['completed', 'partial', 'failed', 'cancelled', 'interrupted']) expect(isActive({ status } as Run)).toBe(false)
+    for (const status of ['completed', 'completed_with_gaps', 'partial', 'failed', 'cancelled', 'interrupted']) expect(isActive({ status } as Run)).toBe(false)
     expect(isActive({ status: 'running' } as Run)).toBe(true)
     expect(isActive({ status: 'queued' } as Run)).toBe(true)
+  })
+  it('区分已完成但有未决项和执行未完成，不用图的大小推断执行状态', () => {
+    expect(runLabels.completed_with_gaps).toBe('已完成，有未决项')
+    expect(runLabels.partial).toBe('执行未完成')
+    expect(graphOutcome({ status: 'COMPLETED_WITH_GAPS', validation: { business_graph: 'empty' } })).toContain('没有已发布的业务实体')
+    expect(graphOutcome({ status: 'PARTIAL', validation: { business_graph: 'entities_and_relations' }, counts: { business_nodes: 12, business_edges: 20 } })).toContain('12 个业务实体、20 条业务关系')
   })
   it('允许环境变量引用，拒绝嵌套明文凭据', () => {
     expect(() => assertNoCredentials({ model: { api_key_env: 'MODEL_KEY' }, sources: [{ dsn_env: 'DB_DSN' }] })).not.toThrow()

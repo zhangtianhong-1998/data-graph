@@ -158,12 +158,14 @@ def test_recovery_reviews_all_document_windows_without_cross_window_unissued_ref
     refs=['0@1:definition','1@1:definition'];packet=guard_packet()
     packet['semantic_revision_guard']['blocking_evidence_refs']+=refs
     packet['semantic_revision_guard']['recovery_obligations'][0]['required_evidence_refs']+=refs
+    packet['semantic_revision_guard']['recovery_obligations'][0]['entity_kind_definition_refs']=refs
     calls=[]
     def complete(task,body,schema):
         calls.append(body)
         expected={'probe_new',refs[len(calls)-1]}
         assert set(body['required_evidence_refs'])==expected
         assert set(body['semantic_revision_guard']['recovery_obligations'][0]['required_evidence_refs'])==expected
+        assert body['semantic_revision_guard']['recovery_obligations'][0]['entity_kind_definition_refs']==[refs[len(calls)-1]]
         return schema.model_validate({'proposition_ref':body['semantic_proposition_ref'],
             'decision':'supported','basis':'data_inference',
             'evidence':[{'reference':r,'stance':'supports'} for r in expected],
@@ -263,5 +265,177 @@ def test_type_rename_or_partial_key_removal_cannot_drop_recovery_obligations(kin
         entity_kind_hint=kind,path_semantics='relative_path',namespace_columns=['scope']))
     selected=select_recovery_guard(proposal,guard)
     assert selected['recovery_obligations']==[obligation]
-    with pytest.raises(LightGraphError,match='semantic_recovery_evidence_required'):
+    with pytest.raises(LightGraphError,match='semantic_recovery_shape_changed'):
         validate_recovery_shape(proposal,selected)
+
+
+@pytest.mark.parametrize('historical_probe',[True,False])
+def test_persisted_unknown_type_requires_review_then_resolves_only_after_publication(tmp_path,historical_probe):
+    from lightgraph.contracts import ExtractionGoal
+    from lightgraph.discovery.models import DiscoveryResult,PendingCandidate
+    from lightgraph.runtime.candidates import CandidateQueue
+    from lightgraph.tests.test_schema_knowledge import setup_ledger
+    table,guide,store,ledger,row=setup(tmp_path)
+    candidate=rejected_grain(table,[],guide=guide)
+    candidate['mappings'][0]['entity_kind']=None
+    if not historical_probe:
+        candidate['blocking_evidence_refs']=[]
+    for position in range(1,6):
+        row[f'item_l{position}_code']='A'
+        row[f'item_l{position}_cn_name']='Alpha'
+    queue=CandidateQueue(store,ExtractionGoal(),['T'],'default')
+    queue.record(DiscoveryResult(pending_candidates=[PendingCandidate.model_validate(candidate)]))
+    store.close()
+    with GraphStore(tmp_path/'knowledge.sqlite') as resumed:
+        queue=CandidateQueue(resumed,ExtractionGoal(),['T'],'default')
+        pending=queue.context({('s','public','paths')})
+        assert pending[0]['mappings'][0]['entity_kind'] is None
+        ledger=setup_ledger(resumed,[table],docs=[guide]);model=Recover()
+        with MemorySource([table],{table.qualified_name:[row]}) as source:
+            result=discover_with_agent(source,documents=[guide],model=model,schema_knowledge=ledger,
+                iteration_context={'pending_candidates':pending})
+        assert len(result.rules)==1,result.issues
+        assert len(model.seen)==1
+        obligation=model.seen[0]['semantic_revision_guard']['recovery_obligations'][0]
+        assert obligation['entity_kind_requirement']=='confirm_from_current_definition'
+        assert obligation['replacement_entity_kind'] is None
+        assert obligation['entity_kind_definition_refs']
+        assert set(obligation['entity_kind_definition_refs'])<=set(obligation['required_evidence_refs'])
+        assert len(obligation['current_rechecks'])==6
+        assert result.resolved_candidate_ids==[candidate['candidate_id']]
+        queue.record(result)
+        assert queue.counts()=={'revised':1}
+        queue.confirm_publications({result.rules[0].rule_id})
+        assert queue.counts()=={'revised':1}  # Compiling a replacement is not publication.
+        with MemorySource([table],{table.qualified_name:[row]}) as source:
+            executed=RuleEngine(resumed).execute(source,result.rules[0],document_versions={guide.document_id+'@'+guide.revision})
+        assert executed.published,executed.codes
+        queue.confirm_publications({result.rules[0].rule_id})
+        assert queue.counts()=={'resolved':1}
+        nodes=[node for node in resumed.view({'T'})['nodes'] if node['kind']=='ReportItem']
+        assert len(nodes)==1
+        assert set(nodes[0]['properties']['source_position'])=={1,2,3,4,5}
+        assert len(nodes[0]['aliases'])>=5
+        assert queue.listing()['candidates'][0]['failure_code']=='semantic_claim_refuted'
+
+
+def test_unknown_historical_kind_cannot_bypass_an_unresolved_type_review(tmp_path):
+    table,guide,store,ledger,row=setup(tmp_path)
+    candidate=rejected_grain(table,[],guide=guide);candidate['mappings'][0]['entity_kind']=None
+    class Unresolved(Recover):
+        def complete_bound_review(self,packet,*,proposition_ref,**kwargs):
+            verdict=super().complete_bound_review(packet,proposition_ref=proposition_ref,**kwargs)
+            verdict.recovery_obligations[0].decision='unresolved'
+            return verdict
+    try:
+        model=Unresolved()
+        with MemorySource([table],{table.qualified_name:[row]}) as source:
+            result=discover_with_agent(source,documents=[guide],model=model,schema_knowledge=ledger,
+                iteration_context={'pending_candidates':[candidate]})
+        assert model.seen and not result.rules and not result.resolved_candidate_ids
+        assert any(i['code']=='semantic_recovery_obligation_unresolved' for i in result.issues)
+    finally:store.close()
+
+
+def test_unknown_type_must_be_registered_before_review(tmp_path):
+    table,guide,store,ledger,row=setup(tmp_path)
+    candidate=rejected_grain(table,[],guide=guide);candidate['mappings'][0]['entity_kind']=None
+    class Unregistered(Recover):
+        def explore(self,packet,tools,**kwargs):
+            batch=super().explore(packet,tools,**kwargs)
+            batch.proposals[0].claim.entity_kind_hint='UnregisteredItem'
+            return batch
+    try:
+        model=Unregistered()
+        with MemorySource([table],{table.qualified_name:[row]}) as source:
+            result=discover_with_agent(source,documents=[guide],model=model,schema_knowledge=ledger,
+                iteration_context={'pending_candidates':[candidate]})
+        assert not model.seen and not result.rules and not result.resolved_candidate_ids
+        assert any(i['code']=='unregistered_node_kind' for i in result.issues)
+    finally:store.close()
+
+
+def test_unknown_type_without_current_definition_is_missing_evidence(tmp_path):
+    from lightgraph.discovery.recovery_evidence import prepare_grain_recovery
+    from lightgraph.discovery.schema_knowledge import hierarchy_field_models
+    table,guide,store,ledger,row=setup(tmp_path)
+    candidate=rejected_grain(table,[],guide=guide);candidate['mappings'][0]['entity_kind']=None
+    packet={'metadata_digest':{'columns':[{'id':_column_id(table,c.name),'name':c.name} for c in table.columns]},
+        'document_snippets':[],'probe_digest':[]}
+    tools=SimpleNamespace(reserve_probe_ids=lambda ids:None)
+    try:
+        with pytest.raises(LightGraphError,match='semantic_recovery_evidence_required'):
+            prepare_grain_recovery(packet,table,hierarchy_field_models(ledger.current_objects(table)),[candidate],tools)
+    finally:store.close()
+
+
+@pytest.mark.parametrize('case,expected',[
+    ('context_window',None),
+    ('no_definition_support','semantic_recovery_obligation_unresolved'),
+    ('later_refutation','semantic_claim_refuted'),
+    ('later_uncertainty','semantic_recovery_obligation_unresolved'),
+])
+def test_unknown_type_review_combines_document_windows_without_inventing_type_support(monkeypatch,case,expected):
+    import lightgraph.context
+    docs=[{'doc_id':str(i),'revision':'1','section_id':'definition','text':'document',
+        'purpose':'data_description','evidence_role':'definition_evidence','read_state':'complete'} for i in range(2)]
+    monkeypatch.setattr(lightgraph.context,'document_batches',lambda documents:iter([[docs[0]],[docs[1]]]))
+    packet=guard_packet();guard=packet['semantic_revision_guard']
+    obligation=guard['recovery_obligations'][0]
+    obligation.update(replacement_entity_kind=None,entity_kind_requirement='confirm_from_current_definition',
+        entity_kind_definition_refs=['0@1:definition'])
+    obligation['required_evidence_refs']+=['0@1:definition']
+    guard['blocking_evidence_refs']+=['0@1:definition']
+    calls=[]
+    class Review:
+        def complete_bound_review(self,body,*,proposition_ref,**kwargs):
+            calls.append(body)
+            first=len(calls)==1
+            local=body['semantic_revision_guard']['recovery_obligations'][0]
+            assert local['entity_kind_definition_refs']==(['0@1:definition'] if first else [])
+            assert set(local['required_evidence_refs'])<=set(body['issued_evidence_refs'])
+            assert 'absence of a definition from this window alone is not a conflict' in body['subtask']
+            stance='supports' if first and case!='no_definition_support' else 'context'
+            if not first and case=='later_refutation':stance='refutes'
+            evidence=[{'reference':body['required_document_refs'][0],'stance':stance},
+                {'reference':'probe_new','stance':'supports' if case=='no_definition_support' else 'context'}]
+            return BoundSemanticVerdict(decision='supported',decision_scope='document_window',
+                evidence=evidence,recovery_obligations=[{'candidate_id':'candidate_a',
+                    'decision':'unresolved' if not first and case=='later_uncertainty' else 'resolved',
+                    'evidence_refs':local['required_evidence_refs']}]).bind(proposition_ref)
+    if expected:
+        with pytest.raises(LightGraphError,match=expected):
+            review_semantics(Review(),packet,{'kind':'wide_hierarchy'},docs)
+    else:
+        assert '0@1:definition' in review_semantics(Review(),packet,{'kind':'wide_hierarchy'},docs)
+    assert len(calls)==2
+
+
+def test_corrupt_recovery_type_constraint_is_internal_state_not_missing_evidence():
+    from lightgraph.discovery.recovery_evidence import validate_recovery_shape
+    guard={'recovery_obligations':[{'prior_mapping':{'entity_kind':None},
+        'replacement_entity_kind':'ReportItem','replacement_positions':[],
+        'replacement_namespaces':[]}]}
+    with pytest.raises(LightGraphError,match='recovery_state_invalid'):
+        validate_recovery_shape(SimpleNamespace(),guard)
+
+
+def test_current_batch_type_registration_survives_candidate_snapshot():
+    from lightgraph.contracts import ExtractionGoal
+    from lightgraph.discovery.models import DiscoveryResult
+    from lightgraph.discovery.workflow import _compile
+    from lightgraph.semantic_schema import SemanticSchema
+    from lightgraph.tests.test_semantic_revision import setup_batch
+    table,batch,packet=setup_batch()
+    batch.proposals[0].claim.entity_kind_hint='AccountNode'
+    batch.semantic_schema=SemanticSchema.model_validate({'entity_types':[
+        {'name':'AccountNode','description':'Account object'}]})
+    class Refute:
+        usage={}
+        def complete_bound_review(self,body,*,proposition_ref,**kwargs):
+            assert body['semantic_schema']['entity_types'][0]['name']=='AccountNode'
+            return BoundSemanticVerdict(decision='refuted',evidence=[
+                {'reference':body['metadata_digest']['columns'][0]['id'],'stance':'refutes'}]).bind(proposition_ref)
+    result=DiscoveryResult()
+    assert not _compile(batch,table,ExtractionGoal(),[],result,model=Refute(),packet=packet)
+    assert result.pending_candidates[0].mappings[0].entity_kind=='AccountNode'

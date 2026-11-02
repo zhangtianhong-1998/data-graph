@@ -99,12 +99,27 @@ describe('业务图来源与归并裁决', () => {
     ['semantic_review_unissued_evidence', '本次未签发或重复的引用'],
     ['concept_key_label_conflict', '同一概念编码对应了不同名称'],
     ['concept_binding_conflict', '同一联合上下文对应了不同的概念组合'],
+    ['recovery_state_invalid', '历史恢复约束存在程序错误'],
+    ['semantic_recovery_shape_changed', '恢复提案改变了保留的身份、范围或位置约束'],
+    ['semantic_recovery_obligation_unresolved', '审查已完成，但现有证据仍不能支持新结构'],
   ])('为实际错误 %s 显示固定建议并隐藏任意错误正文', (code, guidance) => {
     mount(RunIssues, { report: { issues: [{ code, table: 'public.items', message: '秘密源值不能展示' }] } })
     expect(root.querySelectorAll('.note')).toHaveLength(1)
     expect(root.textContent).toContain('public.items')
     expect(root.textContent).toContain(guidance)
     expect(root.textContent).not.toContain('秘密源值不能展示')
+  })
+  it('只展示受控的问题类别与下一步操作，程序错误不能提示补业务证据', () => {
+    mount(RunIssues, { report: { issues: [
+      { code: 'recovery_state_invalid', category: 'internal_error', next_action: 'fix_code' },
+      { code: 'semantic_claim_refuted', category: 'semantic_decision', next_action: 'continue_other_candidates' },
+      { code: 'semantic_claim_unresolved', category: '秘密类别', next_action: '秘密操作' },
+    ] } })
+    expect(root.textContent).toContain('问题类型：程序错误')
+    expect(root.textContent).toContain('处理：修复代码后续跑')
+    expect(root.textContent).toContain('问题类型：业务判断')
+    expect(root.textContent).toContain('处理：继续处理其他候选')
+    expect(root.textContent).not.toContain('秘密')
   })
   it('同表不同字段诊断分别保留，并展示拒绝码、约束和次数', () => {
     const detail = { code: 'discovery_draft_field_diagnostic', table: 'public.items', reason_code: 'invalid_tool_arguments', constraint: 'enum', count: 3, status: 'diagnostic' }

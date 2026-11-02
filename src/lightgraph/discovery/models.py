@@ -339,7 +339,7 @@ class PendingCandidate(StrictModel):
     failure_code: Literal['semantic_claim_refuted','semantic_claim_unresolved',
         'semantic_condition_unresolved','semantic_review_missing_support','semantic_review_incomplete_context',
         'semantic_revision_no_progress','semantic_revision_constraints_changed',
-        'semantic_revision_evidence_missing','semantic_recovery_evidence_required',
+        'semantic_revision_evidence_missing','semantic_recovery_evidence_required','semantic_recovery_shape_changed',
         'semantic_recovery_obligation_missing','semantic_recovery_obligation_unresolved',
         'identity_domain_evidence_unresolved','excluded_column_projected',
         'concept_scope_evidence_required','concept_scope_document_required',

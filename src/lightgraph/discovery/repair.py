@@ -36,7 +36,7 @@ CONCEPT_CONTRACT_CODES = frozenset({
     'concept_identity_domain_required',
 })
 CONTRACT_CANDIDATE_CODES = CONCEPT_CONTRACT_CODES | {
-    'identity_domain_evidence_unresolved','excluded_column_projected'}
+    'identity_domain_evidence_unresolved','excluded_column_projected','semantic_recovery_shape_changed'}
 
 PROPOSAL_REPAIR_GUIDANCE = {
     'conflicting_rule_proposals': 'Two proposals compile to the same logical rule but disagree on a mapping or contract. Read the retained structural candidates and exact conflicting fields. Compatible attributes are merged by the compiler. For a real conflict, investigate that conflict only and submit one evidence-supported revised plan, or keep it unresolved. Preserve scope, exclusions, counterevidence and independent validation; changing group_id does not create a different identity. Do not repeat the unchanged plan with unchanged evidence.',
@@ -91,6 +91,7 @@ PROPOSAL_REPAIR_GUIDANCE = {
     'empty_hierarchy_context': 'Hierarchy context qualifier values must be nonempty. Use an empty context_qualifiers mapping only when no actual condition is required; otherwise provide an evidence-supported permitted condition or abstain. Do not invent a value to satisfy the contract.',
 }
 PROPOSAL_REPAIR_GUIDANCE.update({
+    'semantic_recovery_shape_changed': 'The proposed hierarchy changes the retained positions, namespace or known entity type. Restore those fields for this recovery, or use an independently reviewed structural revision. A historical unknown type must be confirmed from current registered definitions; do not invent a null type or weaken the identity scope.',
     'identity_domain_evidence_unresolved': 'Use current-table applicable complete non-derived definition sections from definition_sections on this error. Identity-domain fields require doc_id@revision:section_id, not column/probe IDs or a document name. Preserve the exact claimed domain, kind and scope. A valid locator still requires independent semantic review.',
     'excluded_column_projected': 'The proposed identity or attribute mapping uses a column excluded by the goal or this batch. Preserve exclusions; remove the conflicting projection or leave the candidate unresolved. Do not silently withdraw an exclusion to force publication.',
     **{code:'Repair the concept mapping contract using issued columns and complete applicable definition sections. Keep context identity distinct from concept identity, preserve namespace permissions, and use distinguishable role relationships. Do not invent global scope or remove restrictions to pass validation.' for code in CONCEPT_CONTRACT_CODES},
@@ -106,6 +107,29 @@ SEMANTIC_REVIEW_PROTOCOL_CODES = frozenset({
     'semantic_review_incomplete_context', 'llm_schema_invalid',
     'semantic_review_patch_invalid',
     'semantic_revision_evidence_missing','semantic_recovery_evidence_required',
-    'semantic_recovery_obligation_missing','semantic_recovery_obligation_unresolved',
+    'semantic_recovery_obligation_missing',
 })
+# A reviewer can finish its work without finding support for the replacement.
+# Keep that decision as an unresolved candidate, not a broken model protocol.
+SEMANTIC_RECOVERY_DECISION_CODES = frozenset({'semantic_recovery_obligation_unresolved'})
+DISCOVERY_INTERNAL_CODES = frozenset({'recovery_state_invalid'})
+
+
+def issue_classification(code):
+    """Separate decisions, missing evidence and compiler faults without source text."""
+    if code in DISCOVERY_INTERNAL_CODES:
+        return {'category':'internal_error','next_action':'fix_code'}
+    if code in {'semantic_recovery_evidence_required','identity_domain_evidence_unresolved',
+                'concept_scope_evidence_required'}:
+        return {'category':'evidence_gap','next_action':'gather_evidence'}
+    if code in SEMANTIC_RECOVERY_DECISION_CODES or code in {
+            'semantic_claim_refuted','semantic_claim_unresolved','semantic_condition_unresolved',
+            'model_abstained','no_confirmable_entity_group'}:
+        return {'category':'semantic_decision','next_action':'continue_other_candidates'}
+    if code in REPAIRABLE_PROPOSAL_CODES:
+        return {'category':'proposal_contract','next_action':'revise_proposal'}
+    if code in SEMANTIC_REVIEW_PROTOCOL_CODES:
+        return {'category':'review_protocol','next_action':'retry_review'}
+    return {}
+
 MAX_PROPOSAL_REPAIR_ROUNDS = 2

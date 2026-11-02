@@ -488,7 +488,18 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
             'are NOT current evidence and their observations are unknown. Current full-column '
             'aggregates are a new recheck, not a replay. Resolve only if the structural change '
             'and independent current evidence address the old grain objection; otherwise keep '
-            'unresolved. Multiple English aliases or a code at several positions alone are '
+            'unresolved. If entity_kind_requirement is confirm_from_current_definition, '
+            'the retained null kind is unknown, not an identity constraint or evidence. '
+            'Independently establish the proposed registered type from '
+            'entity_kind_definition_refs; keep the recovery obligation unresolved if those '
+            'definitions do not support that type. Registration alone is insufficient. '
+            'When assessment_scope=current_document_window_requires_all_windows, assess '
+            'only compatibility with the supplied window. A resolved obligation in a '
+            'context-only window means no local unresolved objection, not global type '
+            'approval; absence of a definition from this window alone is not a conflict. '
+            'The compiler separately requires a supporting current definition across '
+            'the complete collection. Never resolve actual uncertainty or counterevidence. '
+            'Multiple English aliases or a code at several positions alone are '
             'not contradictions. Never accept an unchanged composite key as that replacement.')
     if proposition.get('kind')=='reference':
         review_packet['subtask'] += (
@@ -622,10 +633,19 @@ def review_semantics(model, packet, proposition, documents, *, observations=None
     if len({document_ref(d) for d in documents})>128:
         raise LightGraphError('semantic_review_document_limit')
     windows=list(document_batches(documents)) or [[]]
-    if len(windows)==1 and not any(d.get('read_state')=='partial' for d in windows[0]):
-        return _review_semantics_window(model,packet,proposition,windows[0],observations=observations)
-    evidence=[]
     guard=packet.get('semantic_revision_guard')
+    def require_type_support(evidence):
+        # Window-local approval is not enough to recover a lost historical type.
+        # At least one applicable current definition must actually support it.
+        for obligation in (guard or {}).get('recovery_obligations',[]):
+            if (obligation.get('entity_kind_requirement')=='confirm_from_current_definition'
+                    and not set(obligation.get('entity_kind_definition_refs',[])) & set(evidence)):
+                raise LightGraphError('semantic_recovery_obligation_unresolved')
+    if len(windows)==1 and not any(d.get('read_state')=='partial' for d in windows[0]):
+        evidence=_review_semantics_window(model,packet,proposition,windows[0],observations=observations)
+        require_type_support(evidence)
+        return evidence
+    evidence=[]
     all_documents={document_ref(d) for d in documents}
     if guard:
         from .semantic_revision import issued_references
@@ -641,11 +661,14 @@ def review_semantics(model, packet, proposition, documents, *, observations=None
             window_guard['blocking_evidence_refs']=selected(guard.get('blocking_evidence_refs',[]))
             for obligation in window_guard.get('recovery_obligations',[]):
                 obligation['required_evidence_refs']=selected(obligation['required_evidence_refs'])
+                if 'entity_kind_definition_refs' in obligation:
+                    obligation['entity_kind_definition_refs']=selected(obligation['entity_kind_definition_refs'])
                 obligation['assessment_scope']='current_document_window_requires_all_windows'
             local={**packet,'semantic_revision_guard':window_guard}
         evidence.extend(_review_semantics_window(model,local,proposition,window,
             observations=observations,batch={'index':index+1,'total':len(windows),
                 'acceptance_requires_all_windows':True}))
+    require_type_support(evidence)
     if not any(not ref.startswith('semantic_review:') for ref in evidence):
         raise LightGraphError('semantic_review_missing_support')
     return sorted(set(evidence))

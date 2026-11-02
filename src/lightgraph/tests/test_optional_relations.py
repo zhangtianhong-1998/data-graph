@@ -107,7 +107,8 @@ def test_reference_abstention_is_an_unresolved_table_outcome():
     with MemorySource(tables,data) as source:
         result=discover_references_with_agent(source,entities,model=Model(),table_refs={'public.links'})
     assert result.relation_table_outcomes=={'public.links':'unresolved'}
-    assert result.issues==[{'table':'public.links','code':'model_abstained','status':'unresolved'}]
+    assert result.issues==[{'table':'public.links','code':'model_abstained','status':'unresolved',
+        'category':'semantic_decision','next_action':'continue_other_candidates'}]
 
 
 def test_composite_null_coverage_is_consistent_between_sql_and_cross_source():

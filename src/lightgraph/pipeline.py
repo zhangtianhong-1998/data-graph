@@ -232,6 +232,7 @@ def publish_documents(store,documents,domain,model=None,scopes=("public",),docum
 
 
 def _issues(report, items):
+    from .discovery.repair import issue_classification
     for issue in items:
         if hasattr(issue,'model_dump'):issue=issue.model_dump()
         safe={k:v for k,v in issue.items() if k in ('code','table','rule_id','count') and isinstance(v,(str,int))}
@@ -240,6 +241,9 @@ def _issues(report, items):
                 if isinstance(issue.get(name),str):safe[name]=issue[name]
         if issue.get('status') in ('unresolved','deferred','partial','resolved','rejected','diagnostic'):
             safe['status']=issue['status']
+        # Derive only known, value-free diagnostics; never trust model-provided
+        # categories or instructions as durable user-facing advice.
+        safe.update(issue_classification(safe.get('code')))
         if safe:report.issues.append(safe)
 
 
@@ -577,6 +581,10 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 context_version=contexts.get(table.source_id,{}).get(table.qualified_name,''))
             if candidate is not None:candidates_queue.record(DiscoveryResult(pending_candidates=[candidate]))
         allrules.sort(key=lambda r:r.kind=='reference')
+        published_revisions={(h['logical_rule_id'],store._publication(h['publication_id'])['revision'])
+            for h in store.heads() if h['valid']}
+        accepted_context_rules={r.rule_id:r for r in _latest([r for r in store.get_rules()
+            if (r.rule_id,r.revision) in published_revisions])}
         def execute(rule, *, preserve_previous=False):
             previous=[r for r in prepared_rules if r.rule_id==rule.rule_id]
             code=None
@@ -585,6 +593,31 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             if not adapter:code='source_not_configured'
             if rule.relation and {rule.relation.source_rule_id,rule.relation.target_rule_id}&failed:code='dependency_rule_failed'
             code=_goal_violation(rule,config.goal,engine.columns(rule)) or code
+            # A different operator is a proposed replacement of the same source
+            # object, not permission to publish a second identity namespace.
+            # Preserve existing accepted rules; retain the competing mapping as
+            # review work before registering any new entities or alias edges.
+            accepted=accepted_context_rules.get(rule.rule_id)
+            if not code and (accepted is None or rule_shape(rule)!=rule_shape(accepted)):
+                from .rules.context_identity import competing_context_rules
+                alternatives={r.rule_id:r for r in [*accepted_context_rules.values(),*prepared_rules]
+                    if r.rule_id not in failed}
+                competing=competing_context_rules(rule,list(alternatives.values()))
+                if competing:
+                    from .discovery.operator_conflicts import context_conflict_candidate
+                    from .discovery.models import DiscoveryResult
+                    table=table_map.get((rule.source.source_id,rule.source.schema_name,rule.source.table))
+                    if table is not None:
+                        candidate=context_conflict_candidate(rule,competing,table=table,goal=config.goal,
+                            context_version=contexts.get(table.source_id,{}).get(table.qualified_name,''))
+                        candidates_queue.record(DiscoveryResult(pending_candidates=[candidate]))
+                    _issues(report,[{'rule_id':rule.rule_id,'code':'conflicting_rule_proposals',
+                        'table':rule.source.schema_name+'.'+rule.source.table,'status':'unresolved'}])
+                    report.counts['competing_context_rules']=report.counts.get('competing_context_rules',0)+1
+                    if not previous:
+                        failed.add(rule.rule_id)
+                        if rule.rule_id not in report.rules_skipped:report.rules_skipped.append(rule.rule_id)
+                    return False
             if code:
                 if previous and preserve_previous:
                     report.issues.append({'rule_id':rule.rule_id,'code':code,'status':'deferred'})

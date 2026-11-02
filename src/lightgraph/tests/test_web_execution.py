@@ -16,7 +16,7 @@ from lightgraph.runtime.config import RunConfig
 from lightgraph.sources import MemorySource
 from lightgraph.store import GraphStore
 from lightgraph.web.execution import (RunManager, _bounded_view, _input_manifest,
-                                      _resolved_payload, read_graph, read_metadata)
+                                      _resolved_payload, _safe_report, read_graph, read_metadata)
 from lightgraph.web.worker import execute
 
 
@@ -252,13 +252,14 @@ def test_worker_error_redacts_exception_and_credentials(workspace, monkeypatch):
     assert json.loads(raw)['error_code'] == 'worker_execution_failed'
 
 
-def test_worker_dependency_change_is_partial_with_safe_report(workspace, monkeypatch):
+@pytest.mark.parametrize('pipeline_status', ['COMPLETED', 'COMPLETED_WITH_GAPS'])
+def test_worker_dependency_change_is_partial_with_safe_report(workspace, monkeypatch, pipeline_status):
     data = prepare_csv(workspace)
     config = workspace.configs['alpha']
     monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _: [])
     def run(*_args, **_kwargs):
         data.write_text('metric_code,metric_name\nnew,new\n')
-        return RunReport(run_id='test', rules_published=['existing'])
+        return RunReport(run_id='test', status=pipeline_status, rules_published=['existing'])
     monkeypatch.setattr('lightgraph.pipeline.run_pipeline', run)
     result = workspace.project_path('alpha') / 'runs' / 'result.json'
     execute(_resolved_payload(config, workspace.project_path('alpha')), result)
@@ -267,6 +268,107 @@ def test_worker_dependency_change_is_partial_with_safe_report(workspace, monkeyp
     assert record['report']['rules_published'] == ['existing']
     assert record['report']['status'] == 'PARTIAL'
     assert record['error_code'] == 'input_dependency_changed'
+
+
+@pytest.mark.parametrize('report_status,expected_status,exit_code', [
+    ('COMPLETED', 'completed', 0),
+    ('COMPLETED_WITH_GAPS', 'completed_with_gaps', 0),
+    ('PARTIAL', 'partial', 2),
+    ('FAILED', 'failed', 2),
+])
+def test_worker_and_manager_preserve_completion_with_gaps(workspace, monkeypatch,
+        report_status, expected_status, exit_code):
+    config = workspace.configs['alpha']
+    project = workspace.project_path('alpha')
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _: [])
+    monkeypatch.setattr('lightgraph.pipeline.run_pipeline', lambda *_a, **_kw: RunReport(
+        run_id='test', status=report_status, issues=[{'code': 'semantic_claim_refuted'}]))
+    manager = RunManager(workspace)
+    rid = 'run_' + 'b' * 24
+    payload = _resolved_payload(config, project)
+    record = {'run_id': rid, 'status': 'running', 'config_revision': 1,
+              'dependencies': dict(payload['dependencies'])}
+    result = project / 'runs' / (rid + '.result.json')
+    try:
+        assert execute(payload, result) == exit_code
+        manager._finish('alpha', {'record': record, 'result': result, 'config': config,
+                                 'cancel_requested': False, 'forced': False})
+        persisted = manager.get('alpha', rid)
+        assert persisted['status'] == expected_status
+        assert persisted['report']['status'] == report_status
+        assert persisted['report']['issues'] == [{'code': 'semantic_claim_refuted'}]
+        assert persisted['stage'] == 'finished'
+        assert persisted['cleanup_status'] == 'completed'
+        assert not manager.active('alpha')
+        assert manager.cancel('alpha', rid)['status'] == expected_status
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize('changed', [False, True])
+def test_manager_checks_dependencies_after_completion_with_gaps(workspace, changed):
+    config = workspace.configs['alpha']
+    project = workspace.project_path('alpha')
+    manager = RunManager(workspace)
+    rid = 'run_' + 'c' * 24
+    record = {'run_id': rid, 'status': 'running', 'config_revision': 1,
+              'dependencies': _input_manifest(config, project)}
+    result = project / 'runs' / (rid + '.result.json')
+    result.write_text(json.dumps({'status': 'completed_with_gaps', 'cleanup_status': 'completed',
+        'report': RunReport(run_id='test', status='COMPLETED_WITH_GAPS').model_dump(mode='json')}), encoding='utf-8')
+    if changed:
+        (project / 'analysis.md').write_text('Updated analysis', encoding='utf-8')
+    try:
+        manager._finish('alpha', {'record': record, 'result': result, 'config': config,
+                                 'cancel_requested': False, 'forced': False})
+        persisted = manager.get('alpha', rid)
+        assert persisted['status'] == ('partial' if changed else 'completed_with_gaps')
+        assert persisted['error_code'] == ('input_dependency_changed' if changed else None)
+    finally:
+        manager.shutdown()
+
+
+def test_service_restart_preserves_historical_partial_and_new_gap_status(workspace):
+    project = workspace.project_path('alpha')
+    runs = project / 'runs'
+    runs.mkdir()
+    originals = {}
+    for ordinal, status in enumerate(['partial', 'completed_with_gaps']):
+        rid = 'run_' + str(ordinal) * 24
+        path = runs / (rid + '.json')
+        # A legacy partial may contain a COMPLETED_WITH_GAPS report. Do not
+        # silently reinterpret a historical execution during service startup.
+        raw = json.dumps({'run_id': rid, 'status': status,
+                          'report': {'status': 'COMPLETED_WITH_GAPS'}})
+        path.write_text(raw, encoding='utf-8')
+        originals[path] = raw
+    manager = RunManager(workspace)
+    try:
+        for path, raw in originals.items():
+            assert path.read_text(encoding='utf-8') == raw
+            assert manager.get('alpha', path.stem)['status'] == json.loads(raw)['status']
+    finally:
+        manager.shutdown()
+
+
+def test_safe_report_preserves_only_known_issue_categories_and_actions():
+    report = RunReport(run_id='test', issues=[
+        {'code': 'recovery_state_invalid', 'status': 'deferred',
+         'category': 'internal_error', 'next_action': 'fix_code', 'message': 'PRIVATE_SOURCE_VALUE'},
+        {'code': 'semantic_claim_refuted', 'status': 'unresolved',
+         'category': 'semantic_decision', 'next_action': 'continue_other_candidates'},
+        {'code': 'semantic_claim_unresolved', 'status': 'PRIVATE_STATUS',
+         'category': 'PRIVATE_CATEGORY', 'next_action': 'PRIVATE_ACTION'},
+    ])
+    safe = _safe_report(report)
+    assert safe['issues'] == [
+        {'code': 'recovery_state_invalid', 'status': 'deferred',
+         'category': 'internal_error', 'next_action': 'fix_code'},
+        {'code': 'semantic_claim_refuted', 'status': 'unresolved',
+         'category': 'semantic_decision', 'next_action': 'continue_other_candidates'},
+        {'code': 'semantic_claim_unresolved'},
+    ]
+    assert 'PRIVATE' not in json.dumps(safe)
 
 
 def test_metadata_refresh_only_describes_and_closes_adapter(workspace, monkeypatch):

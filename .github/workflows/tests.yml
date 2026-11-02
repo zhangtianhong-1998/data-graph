@@ -45,7 +45,7 @@ jobs:
       - name: Check credential retention lifecycle
         run: python -m pytest -q src/lightgraph/tests/test_web_credentials.py
       - name: Check experiment recovery and portability
-        run: python -m pytest -q src/lightgraph/tests/test_evaluation.py src/lightgraph/tests/test_frozen_resume.py src/lightgraph/tests/test_frozen_portability.py src/lightgraph/tests/test_recovery_evidence.py src/lightgraph/tests/test_reference_display.py src/lightgraph/tests/test_submission_scope_options.py src/lightgraph/tests/test_relation_foundation_wait.py
+        run: python -m pytest -q src/lightgraph/tests/test_evaluation.py src/lightgraph/tests/test_frozen_resume.py src/lightgraph/tests/test_frozen_portability.py src/lightgraph/tests/test_recovery_evidence.py src/lightgraph/tests/test_reference_display.py src/lightgraph/tests/test_submission_scope_options.py src/lightgraph/tests/test_relation_foundation_wait.py src/lightgraph/tests/test_discovery_outcome_status.py src/lightgraph/tests/test_context_operator_pipeline.py
       - name: Run complete test suite
         # End a stalled suite before the job deadline, leaving cleanup time.
         timeout-minutes: ${{ startsWith(matrix.os, 'windows') && 55 || 17 }}

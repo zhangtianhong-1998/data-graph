@@ -24,8 +24,12 @@ def reserved_evidence_probe_ids(packet):
 
 def prepare_grain_recovery(packet, table, objects, candidates, tools, *, documents=None):
     from .agent import _record_probe
+    from .engine import _definition_document
     columns={c['id']:c['name'] for c in packet['metadata_digest']['columns']}
-    docs={d['doc_id']+'@'+d['revision']+':'+d['section_id'] for d in (documents if documents is not None else packet['document_snippets'])}
+    material=list(documents if documents is not None else packet['document_snippets'])
+    docs={d['doc_id']+'@'+d['revision']+':'+d['section_id'] for d in material}
+    definitions={d['doc_id']+'@'+d['revision']+':'+d['section_id'] for d in material
+        if _definition_document(d,table)}
     historical={ref for c in candidates for ref in c.get('blocking_evidence_refs',[])+c.get('required_evidence_refs',[]) if ref.startswith('probe_')}
     # An already reused ordinal is ambiguous. Do not expose it as issued
     # historical evidence or invent a renaming of observations.
@@ -41,7 +45,7 @@ def prepare_grain_recovery(packet, table, objects, candidates, tools, *, documen
         if not stable <= docs|set(columns):
             raise LightGraphError('semantic_recovery_evidence_required')
         guard['blocking_evidence_refs'].extend(sorted(stable))
-        if not refs & historical:
+        if not refs & historical and all(m.get('entity_kind') is not None for m in candidate.get('mappings',[])):
             continue
         matches=[]
         for obj in objects:
@@ -55,6 +59,14 @@ def prepare_grain_recovery(packet, table, objects, candidates, tools, *, documen
         if len(matches)!=1:
             raise LightGraphError('semantic_recovery_evidence_required')
         obj,mapping,before=matches[0]
+        unknown_kind=mapping.get('entity_kind') is None
+        if unknown_kind:
+            # Older snapshots removed types absent from that packet's registry.
+            # Null records lost knowledge, not a type the replacement must use.
+            # Current definitions and an independent bound review must establish it.
+            if not definitions:
+                raise LightGraphError('semantic_recovery_evidence_required')
+            stable|=definitions
         positions=obj['positions'];scope=obj.get('namespace_columns') or []
         fields=set(scope)|{p['code'] for p in positions}|{p['label'] for p in positions if p.get('label')}
         fields.update(c for p in positions for c in p.get('aliases',[]))
@@ -83,7 +95,7 @@ def prepare_grain_recovery(packet, table, objects, candidates, tools, *, documen
                     for key in ('columns','keys','values') if key in arguments},
                 'coverage':'full_authorized_table_aggregate',
                 'snapshot_scope':'per_probe_full_rule_validation_still_required'})
-        guard['blocking_evidence_refs'].extend(current)
+        guard['blocking_evidence_refs'].extend(sorted(stable|set(current)))
         guard['recovery_obligations'].append({
             'candidate_id':candidate['candidate_id'], 'prior_failure':'semantic_claim_refuted',
             'prior_review_stage':'entity_granularity','prior_mapping':mapping,
@@ -94,6 +106,8 @@ def prepare_grain_recovery(packet, table, objects, candidates, tools, *, documen
             'current_rechecks':descriptions,
             'replacement_object_id':obj['object_id'],
             'replacement_entity_kind':mapping.get('entity_kind'),
+            'entity_kind_requirement':'confirm_from_current_definition' if unknown_kind else 'preserve_known_kind',
+            'entity_kind_definition_refs':sorted(definitions) if unknown_kind else [],
             'replacement_positions':positions,'replacement_namespaces':scope,
         })
     guard['blocking_evidence_refs']=sorted(set(guard['blocking_evidence_refs']))
@@ -108,6 +122,7 @@ def select_recovery_guard(proposal, guard):
     obligations=guard.get('recovery_obligations',[])
     matches=[]
     for obligation in obligations:
+        _retained_kind(obligation)
         mapping=obligation['prior_mapping']
         before={col for field in mapping['fields'] if field['role']=='key' for col in field['columns']}
         before-=set(obligation['replacement_namespaces'])
@@ -122,13 +137,48 @@ def select_recovery_guard(proposal, guard):
     return selected
 
 
-def validate_recovery_shape(proposal, guard):
+def _retained_kind(obligation):
+    """Reject corrupt guards separately from missing evidence or a changed claim."""
+    required={'prior_mapping','replacement_entity_kind','replacement_positions','replacement_namespaces'}
+    if not required<=set(obligation) or not isinstance(obligation['prior_mapping'],dict):
+        raise LightGraphError('recovery_state_invalid')
+    kind=obligation['prior_mapping'].get('entity_kind')
+    if (obligation['replacement_entity_kind']!=kind
+            or not isinstance(obligation['replacement_positions'],list)
+            or not isinstance(obligation['replacement_namespaces'],list)):
+        raise LightGraphError('recovery_state_invalid')
+    return kind
+
+
+def validate_recovery_shape(proposal, guard, *, allowed_entity_kinds=()):
     """The fresh review only applies to the exact retained structural change."""
     for obligation in guard.get('recovery_obligations',[]):
+        kind=_retained_kind(obligation)
         claim=proposal.claim
         positions=[{'position':p.position,'code':p.key,'label':p.label,'aliases':p.aliases} for p in claim.levels]
         if (proposal.kind!='wide_hierarchy' or claim.path_semantics!='relative_path'
-                or claim.entity_kind_hint!=obligation['replacement_entity_kind']
+                or kind is not None and claim.entity_kind_hint!=kind
                 or positions!=obligation['replacement_positions']
                 or claim.namespace_columns!=obligation['replacement_namespaces']):
-            raise LightGraphError('semantic_recovery_evidence_required')
+            raise LightGraphError('semantic_recovery_shape_changed')
+        if kind is None:
+            if claim.entity_kind_hint not in allowed_entity_kinds:
+                raise LightGraphError('unregistered_node_kind')
+            if (obligation.get('entity_kind_requirement')!='confirm_from_current_definition'
+                    or not obligation.get('entity_kind_definition_refs')):
+                raise LightGraphError('semantic_recovery_evidence_required')
+
+
+def recovery_rule_matches(rule, obligation, table):
+    """Only an independently reviewed exact replacement can close unknown-type work."""
+    from .engine import _column_id
+    kind=_retained_kind(obligation)
+    if (rule.kind!='wide_hierarchy' or rule.identity.level_policy!='relative_path'
+            or rule.evidence.semantic_status!='supported'
+            or kind is not None and rule.identity.entity_kind!=kind):
+        return False
+    positions=[{'position':p.level,'code':_column_id(table,p.code),
+        'label':_column_id(table,p.label) if p.label else None,
+        'aliases':[_column_id(table,c) for c in p.aliases]} for p in rule.hierarchy.levels]
+    return (positions==obligation['replacement_positions']
+        and [_column_id(table,c) for c in rule.scope.namespaces]==obligation['replacement_namespaces'])

@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 const props = defineProps<{ report: unknown }>()
-type RunIssue = { code?: string; table?: string; reason_code?: unknown; field_path?: unknown; constraint?: unknown; count?: unknown }
+type RunIssue = { code?: string; table?: string; reason_code?: unknown; field_path?: unknown; constraint?: unknown; count?: unknown; category?: unknown; next_action?: unknown }
+const categories: Record<string, string> = { semantic_decision: '业务判断', evidence_gap: '证据不足', proposal_contract: '提案格式或约束', review_protocol: '审查响应错误', internal_error: '程序错误' }
+const actions: Record<string, string> = { continue_other_candidates: '继续处理其他候选', gather_evidence: '补充证据', revise_proposal: '修订提案', retry_review: '重新审查', fix_code: '修复代码后续跑' }
+const enumLabel = (value: unknown, labels: Record<string, string>) => typeof value === 'string' && Object.prototype.hasOwnProperty.call(labels, value) ? labels[value] : ''
 const diagnosticCode = (value: unknown) => typeof value === 'string' && /^[a-z][a-z0-9_]{0,127}$/.test(value) ? value : ''
 const diagnosticConstraint = (value: unknown) => typeof value === 'string' && /^[a-z][A-Za-z0-9_]{0,63}$/.test(value) ? value : ''
 function fieldPath(value: unknown): string {
@@ -29,7 +32,9 @@ const hints: Record<string, string> = {
   semantic_revision_evidence_missing: '新审查遗漏了必须核对的反证。补全本次已签发证据的分类后再验证，不能直接忽略原反证。',
   semantic_recovery_evidence_required: '历史查询证据不能直接用于本次恢复。需要按保留的字段映射重新核验；已有候选继续保留。',
   semantic_recovery_obligation_missing: '恢复审查尚未说明新结构如何处理历史反驳。补全该项审查后继续验证。',
-  semantic_recovery_obligation_unresolved: '重新核验后仍无法确认历史反驳已被处理。保留候选，补充定义或修订结构后继续。',
+  semantic_recovery_obligation_unresolved: '审查已完成，但现有证据仍不能支持新结构。保留候选，继续处理其他候选；补充证据后可再次审查。',
+  recovery_state_invalid: '历史恢复约束存在程序错误，当前候选已保留。修复代码后续跑；补充业务证据或重复提交不能解决此问题。',
+  semantic_recovery_shape_changed: '恢复提案改变了保留的身份、范围或位置约束。核对改变的原因，通过独立修订处理，不能直接绕过原约束。',
   semantic_revision_constraints_changed: '修订遗漏或改写了原有审查条件。保留原条件与证据要求后重新提交。',
   relation_waiting_for_foundation: '本表的层级对象尚未验证完成，相关关系探索等待基础规则。其他独立表继续处理。',
   no_confirmable_entity_group: '本表没有形成可确认的实体规则。结合本次其他错误判断是证据不足、提交失败还是目标不适用。',
@@ -55,4 +60,4 @@ const issues = computed(() => {
   return (report?.issues || []).filter((item, index, items) => item.code && hints[item.code] && items.findIndex(other => issueKey(other) === issueKey(item)) === index)
 })
 </script>
-<template><section v-if="issues.length" aria-label="问题与处理建议"><h3>问题与处理建议</h3><p v-for="issue in issues" :key="issueKey(issue)" class="note amber"><strong>{{ issue.table || issue.code }}</strong><br/>{{ hints[issue.code!] }}<template v-if="isDiagnostic(issue)"><br/><span v-if="diagnosticCode(issue.reason_code)">拒绝原因：<code>{{ diagnosticCode(issue.reason_code) }}</code>；</span><span v-if="fieldPath(issue.field_path)">字段：<code>{{ fieldPath(issue.field_path) }}</code>；</span><span v-if="diagnosticConstraint(issue.constraint)">约束：<code>{{ diagnosticConstraint(issue.constraint) }}</code>；</span><span v-if="diagnosticCount(issue)">发生 {{ diagnosticCount(issue) }} 次</span></template></p></section></template>
+<template><section v-if="issues.length" aria-label="问题与处理建议"><h3>问题与处理建议</h3><p v-for="issue in issues" :key="issueKey(issue)" class="note amber"><strong>{{ issue.table || issue.code }}</strong><br/>{{ hints[issue.code!] }}<template v-if="enumLabel(issue.category, categories) || enumLabel(issue.next_action, actions)"><br/><span v-if="enumLabel(issue.category, categories)">问题类型：{{ enumLabel(issue.category, categories) }}；</span><span v-if="enumLabel(issue.next_action, actions)">处理：{{ enumLabel(issue.next_action, actions) }}</span></template><template v-if="isDiagnostic(issue)"><br/><span v-if="diagnosticCode(issue.reason_code)">拒绝原因：<code>{{ diagnosticCode(issue.reason_code) }}</code>；</span><span v-if="fieldPath(issue.field_path)">字段：<code>{{ fieldPath(issue.field_path) }}</code>；</span><span v-if="diagnosticConstraint(issue.constraint)">约束：<code>{{ diagnosticConstraint(issue.constraint) }}</code>；</span><span v-if="diagnosticCount(issue)">发生 {{ diagnosticCount(issue) }} 次</span></template></p></section></template>

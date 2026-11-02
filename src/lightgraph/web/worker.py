@@ -88,7 +88,7 @@ def execute(payload, result_path):
         check_cancelled()
         report = run_pipeline(config, sources, rules=rules, documents=documents, model=model)
         check_cancelled()
-        status = {"COMPLETED": "completed", "COMPLETED_WITH_GAPS": "partial",
+        status = {"COMPLETED": "completed", "COMPLETED_WITH_GAPS": "completed_with_gaps",
                   "PARTIAL": "partial", "FAILED": "failed"}[report.status]
         try:
             check_dependencies(payload["dependencies"], project)
@@ -130,7 +130,9 @@ def execute(payload, result_path):
             _save(result_path, result)
         finally:
             signal.signal(signal.SIGTERM, previous)
-    return 0 if status == "completed" else 2
+    # A completed interpretation may legitimately leave unsupported candidates.
+    # That is distinct from an interrupted or otherwise unfinished execution.
+    return 0 if status in {"completed", "completed_with_gaps"} else 2
 
 
 def main():

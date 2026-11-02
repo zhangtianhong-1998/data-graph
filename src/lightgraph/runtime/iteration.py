@@ -202,8 +202,9 @@ class IterationLedger:
         """Persist only fixed failure categories, never rejected proposal bodies."""
         if task not in ('metadata_discovery','relation_discovery','coverage_discovery','review_pattern'):
             raise LightGraphError('unregistered_discovery_feedback_task')
-        from lightgraph.discovery.repair import REPAIRABLE_PROPOSAL_CODES, SEMANTIC_REVIEW_PROTOCOL_CODES
-        allowed=set(REPAIRABLE_PROPOSAL_CODES)|set(SEMANTIC_REVIEW_PROTOCOL_CODES)|{
+        from lightgraph.discovery.repair import (REPAIRABLE_PROPOSAL_CODES, SEMANTIC_REVIEW_PROTOCOL_CODES,
+            SEMANTIC_RECOVERY_DECISION_CODES, DISCOVERY_INTERNAL_CODES)
+        allowed=set(REPAIRABLE_PROPOSAL_CODES)|set(SEMANTIC_REVIEW_PROTOCOL_CODES)|set(SEMANTIC_RECOVERY_DECISION_CODES)|set(DISCOVERY_INTERNAL_CODES)|{
             'semantic_claim_unresolved','semantic_claim_refuted','semantic_condition_unresolved',
             'discovery_invalid_drafts','discovery_submission_incomplete','discovery_submission_pending',
             'no_confirmable_entity_group','model_abstained','model_response_truncated'}

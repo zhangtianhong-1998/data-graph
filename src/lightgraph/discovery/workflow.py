@@ -24,6 +24,7 @@ from .semantic_revision import SemanticReviewFailure, candidate_record, revise_o
 from lightgraph.semantic_schema import SemanticSchema, EntityTypeDefinition
 from lightgraph.rules.endpoints import endpoint_columns
 from .repair import (REPAIRABLE_PROPOSAL_CODES, SEMANTIC_REVIEW_PROTOCOL_CODES,
+    SEMANTIC_RECOVERY_DECISION_CODES, DISCOVERY_INTERNAL_CODES, issue_classification,
     PROPOSAL_REPAIR_GUIDANCE, MAX_PROPOSAL_REPAIR_ROUNDS, compiled_contract_error,
     HIERARCHY_IDENTITY_REPAIR_CODES, CONTRACT_CANDIDATE_CODES)
 
@@ -86,8 +87,10 @@ def _iteration_codes(context, table):
 
 def _issue(result, table, code, *, count=None):
     entry={'table':table.qualified_name,'code':code,
-           'status':'deferred' if (code in REPAIRABLE_PROPOSAL_CODES | SEMANTIC_REVIEW_PROTOCOL_CODES
-               or any(token in code for token in ('budget','limit','exhausted','too_large'))) else 'unresolved'}
+           'status':('partial' if code in DISCOVERY_INTERNAL_CODES else
+               'deferred' if (code in REPAIRABLE_PROPOSAL_CODES | SEMANTIC_REVIEW_PROTOCOL_CODES
+               or any(token in code for token in ('budget','limit','exhausted','too_large'))) else 'unresolved'),
+           **issue_classification(code)}
     if count is not None: entry['count']=count
     result.issues.append(entry)
 
@@ -242,13 +245,16 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
     rules=[];variants={}
     for p in batch.proposals:
         if p.kind=='exclusion': continue
+        review_packet=packet or {}
         try:
             if goal.entity_kinds and getattr(p.claim,'entity_kind_hint',None) not in goal.entity_kinds:
                 raise LightGraphError('outside_extraction_goal')
             schema=SemanticSchema.merged(goal.semantic_schema,batch.semantic_schema)
             local=ProposalBatch(task=batch.task,proposals=exclusions+[p],semantic_schema=schema)
             related_requests=[item for item in requests.values() if _hierarchy_request_matches(p,item)]
-            review_packet=packet or {}
+            # Candidate snapshots must see this batch's registered types too;
+            # otherwise a valid newly declared kind is persisted as unknown.
+            review_packet={**(packet or {}),'semantic_schema':schema.model_dump(mode='json')}
             from .conflicts import proposal_logical_id,guard_shape
             conflict_context=[item for item in review_packet.get('iteration_context',{}).get('rule_conflict_requests',[])
                 if proposal_logical_id(p,table) in item.get('candidate',{}).get('rule_refs',[])]
@@ -260,7 +266,10 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                 from .recovery_evidence import select_recovery_guard,validate_recovery_shape
                 review_packet={**review_packet,'semantic_revision_guard':select_recovery_guard(
                     p,packet['iteration_context']['field_model_revision_guard'])}
-                validate_recovery_shape(p,review_packet['semantic_revision_guard'])
+                from lightgraph.store.policy import KINDS
+                validate_recovery_shape(p,review_packet['semantic_revision_guard'],
+                    allowed_entity_kinds=KINDS['business']|set(goal.entity_kinds)|
+                        {definition.name for definition in schema.entity_types})
             if p.kind=='wide_hierarchy':
                 if related_requests and len(requests)>MAX_HIERARCHY_IDENTITY_REQUESTS:
                     raise LightGraphError('hierarchy_identity_repair_context_limit')
@@ -360,11 +369,11 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
             if code is None:
                 raise
             if isinstance(exc, SemanticReviewFailure):
-                candidate = candidate_record(p, table, packet or {}, docs, exc)
+                candidate = candidate_record(p, table, review_packet, docs, exc)
                 result.pending_candidates.append(candidate)
                 if semantic_failures is not None:
                     semantic_failures.append({'candidate':candidate,'proposal':p,'failure':exc})
-            elif code in (CONTRACT_CANDIDATE_CODES | SEMANTIC_REVIEW_PROTOCOL_CODES) and p.kind!='exclusion':
+            elif code in (CONTRACT_CANDIDATE_CODES | SEMANTIC_REVIEW_PROTOCOL_CODES | SEMANTIC_RECOVERY_DECISION_CODES) and p.kind!='exclusion':
                 from types import SimpleNamespace
                 from .engine import _definition_document
                 refs=[d['doc_id']+'@'+d['revision']+':'+d['section_id'] for d in docs
@@ -372,7 +381,7 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                 failure=SimpleNamespace(code=code,blocking=[],required=refs,
                     stage='hierarchy' if p.kind in ('wide_hierarchy','long_hierarchy') else
                         'concept_mapping' if p.kind=='concept_mapping' else 'entity_definition')
-                result.pending_candidates.append(candidate_record(p,table,packet or {},docs,failure))
+                result.pending_candidates.append(candidate_record(p,table,review_packet,docs,failure))
             if failures is not None and code in REPAIRABLE_PROPOSAL_CODES:
                 failures.append((p,code))
             else:_issue(result,table,code)
@@ -767,7 +776,13 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
                             for mapping in item.get('mappings',[]):
                                 before={ref for field in mapping.get('fields',[]) if field.get('role')=='key'
                                     for ref in field.get('columns',[])}-namespaces
-                                if mapping.get('entity_kind')==r.identity.entity_kind and len(before)>=2 and before<=keys:
+                                same_kind=mapping.get('entity_kind')==r.identity.entity_kind
+                                if mapping.get('entity_kind') is None:
+                                    from .recovery_evidence import recovery_rule_matches
+                                    same_kind=any(o['candidate_id']==item['candidate_id']
+                                        and o['prior_mapping']==mapping and recovery_rule_matches(r,o,table)
+                                        for o in packet['iteration_context'].get('field_model_revision_guard',{}).get('recovery_obligations',[]))
+                                if same_kind and len(before)>=2 and before<=keys:
                                     matches.append(r);break
                         if len(matches)==1:
                             result.resolved_candidate_ids.append(item['candidate_id'])
@@ -1083,11 +1098,11 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                     _issue(result,table,exc.code)
                     if isinstance(exc, SemanticReviewFailure):
                         result.pending_candidates.append(candidate_record(proposal,table,review_packet,docs,exc))
-                    elif exc.code in SEMANTIC_REVIEW_PROTOCOL_CODES | REPAIRABLE_PROPOSAL_CODES:
+                    elif exc.code in SEMANTIC_REVIEW_PROTOCOL_CODES | REPAIRABLE_PROPOSAL_CODES | SEMANTIC_RECOVERY_DECISION_CODES:
                         from types import SimpleNamespace
                         from typing import get_args
                         from .models import PendingCandidate
-                        failure=SimpleNamespace(code=exc.code if exc.code in SEMANTIC_REVIEW_PROTOCOL_CODES
+                        failure=SimpleNamespace(code=exc.code if exc.code in SEMANTIC_REVIEW_PROTOCOL_CODES | SEMANTIC_RECOVERY_DECISION_CODES
                             else 'reference_contract_unresolved',blocking=[],required=[],stage='reference')
                         candidate=candidate_record(proposal,table,packet,docs,failure)
                         allowed=set(get_args(PendingCandidate.model_fields['failure_details'].annotation.__args__[0]))

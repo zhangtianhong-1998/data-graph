@@ -22,11 +22,16 @@ from ..runtime.locking import FileLock
 from ..runtime.retention import atomic_text
 
 ACTIVE_STATUSES = frozenset({"queued", "running"})
-TERMINAL_STATUSES = frozenset({"completed", "partial", "failed", "cancelled", "interrupted"})
+TERMINAL_STATUSES = frozenset({"completed", "completed_with_gaps", "partial", "failed", "cancelled", "interrupted"})
 MAX_GRAPH_NODES = 1000
 MAX_GRAPH_EDGES = 3000
 _RUN_ID = re.compile(r"^run_[0-9a-f]{24}$")
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,99}$")
+_ISSUE_ENUMS = {
+    "status": frozenset({"unresolved", "deferred", "partial", "resolved", "rejected", "diagnostic"}),
+    "category": frozenset({"semantic_decision", "evidence_gap", "proposal_contract", "review_protocol", "internal_error"}),
+    "next_action": frozenset({"continue_other_candidates", "gather_evidence", "revise_proposal", "retry_review", "fix_code"}),
+}
 
 
 def _now():
@@ -64,7 +69,8 @@ def _safe_report(value):
     # Runtime reports use closed numeric counters and error codes. Keep only
     # supported issue fields rather than allowing arbitrary message/evidence keys.
     report.issues = [{k: v for k, v in item.items()
-                      if k in {"code", "table", "rule_id", "count"}}
+                      if k in {"code", "table", "rule_id", "count"}
+                      or k in _ISSUE_ENUMS and v in _ISSUE_ENUMS[k]}
                      for item in report.issues]
     return report.model_dump(mode="json")
 
@@ -267,7 +273,7 @@ class RunManager:
                            or self.workspace.resolved_config(pid) != entry["config"])
             except LightGraphError:
                 changed = True
-            if changed and record["status"] in {"completed", "partial"}:
+            if changed and record["status"] in {"completed", "completed_with_gaps", "partial"}:
                 record.update(status="partial", error_code="input_dependency_changed")
         record.update(stage="finished", finished_at=_now())
         _save(self._paths(pid, record["run_id"])[1], record)
