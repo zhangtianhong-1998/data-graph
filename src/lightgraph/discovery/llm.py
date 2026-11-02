@@ -394,6 +394,9 @@ def _invalid_review_terminal(message):
             isinstance(item,dict) and item.get('stance')=='refutes' for item in items):
         return 'semantic_claim_refuted'
     if value.get('decision')=='unresolved':return 'semantic_claim_unresolved'
+    recovery=value.get('recovery_obligations',[])
+    if isinstance(recovery,list) and any(isinstance(item,dict) and item.get('decision')=='unresolved' for item in recovery):
+        return 'semantic_recovery_obligation_unresolved'
     if value.get('decision')!='supported':return 'semantic_review_protocol_invalid'
     if not isinstance(evidence,list) or any(not isinstance(item,dict) or
             item.get('stance') not in {'supports','refutes','context','irrelevant'} for item in evidence):

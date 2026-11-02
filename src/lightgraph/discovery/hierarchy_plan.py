@@ -48,7 +48,8 @@ class HierarchyPlan(StrictModel):
     relation_type: Literal['parent_of'] = Field(description=
         'This hierarchy operator implements parent-to-child edges. Other business predicates use reference proposals.')
     evidence: list[str] = Field(min_length=1, max_length=16, description='Issued evidence references supporting this exact plan.')
-    conditions: dict[str, str] = Field(default_factory=dict, description=
+    conditions: dict[str, str] = Field(default_factory=dict,
+        json_schema_extra={'propertyNames': {'enum': ['condition', 'valid_period', 'period', 'hierarchy_version']}}, description=
         'Preserve applicable condition, valid_period, period or hierarchy_version qualifiers; never copy row values.')
 
     @model_validator(mode='after')

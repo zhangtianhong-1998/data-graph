@@ -105,5 +105,7 @@ SEMANTIC_REVIEW_PROTOCOL_CODES = frozenset({
     'semantic_review_proposition_missing', 'semantic_review_unissued_evidence',
     'semantic_review_incomplete_context', 'llm_schema_invalid',
     'semantic_review_patch_invalid',
+    'semantic_revision_evidence_missing','semantic_recovery_evidence_required',
+    'semantic_recovery_obligation_missing','semantic_recovery_obligation_unresolved',
 })
 MAX_PROPOSAL_REPAIR_ROUNDS = 2

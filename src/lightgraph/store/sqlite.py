@@ -650,6 +650,8 @@ class GraphStore:
                     from ..identity.reconciliation import project_resolutions
                     rows = project_resolutions(self, rows, scopes, domain)
                 result = self._aggregate(rows)
+                from .display import display_rules, project_display_labels
+                project_display_labels(result, display_rules(self, result))
                 schema = self.policy.schema_for_facts(result["facts"])
                 if not schema.is_empty():
                     result["semantic_schema"] = schema.model_dump(mode="json")
@@ -743,7 +745,8 @@ class GraphStore:
     def search(self, text: str, scopes: set[str], domain: str = "default") -> list[dict[str, Any]]:
         view = self.view(scopes, domain)
         needle = text.casefold()
-        return [node for node in view["nodes"] if needle in canonical({"label": node["label"], "aliases": node["aliases"], "properties": node["properties"]}).casefold()]
+        return [node for node in view["nodes"] if needle in canonical({"label": node["label"],
+            "display_label":node.get("display_label"), "aliases": node["aliases"], "properties": node["properties"]}).casefold()]
 
     def export(self, scopes: set[str], domain: str = "default", publication_id: str | None = None) -> dict[str, Any]:
         """Return one coherent ACL-filtered snapshot for a caller-owned output writer."""

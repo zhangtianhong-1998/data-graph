@@ -297,7 +297,8 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
             sources=checked.get('context_tables') or ([checked['scope']] if checked.get('scope') else [])
             executor.begin_context([SourceRef.model_validate(s) for s in sources])
         if callable(getattr(executor,'reserve_probe_ids',None)):
-            executor.reserve_probe_ids([item['probe_id'] for item in checked['probe_digest']])
+            from .recovery_evidence import reserved_evidence_probe_ids
+            executor.reserve_probe_ids(reserved_evidence_probe_ids(checked))
         system=AGENT_SYSTEM+'\n\n'+build_goal_instructions(checked.get('goal',{}),stage=checked['task'])
         system+='\nCurrent stage: '+checked['task']+'\nSubtask: '+(checked.get('subtask') or STAGE_SUBTASKS[checked['task']])
 

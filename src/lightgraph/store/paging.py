@@ -69,6 +69,35 @@ def graph_page(store,scopes,domain,*,layer='business',include_candidates=False,o
             kinds=list(kind_counts)
             publications=[r[0] for r in store.connection.execute(base+'SELECT DISTINCT publication_id FROM visible ORDER BY publication_id',args)]
             result=store._aggregate(rows)
+            from .display import composite_columns, display_rules, project_display_labels
+            contracts=display_rules(store,result)
+            context_ids={r['rule_id'] for r in contracts.values() if composite_columns(r)}
+            if context_ids:
+                # Fetch only accepted role endpoints of this page. Captions can
+                # use off-page names without returning off-page nodes/facts.
+                refs=[]
+                for r in store.connection.execute('SELECT rule_id,payload FROM rule'):
+                    rule=json.loads(r[1])
+                    if rule.get('kind')=='reference' and (rule.get('relation') or {}).get('source_rule_id') in context_ids:
+                        refs.append(r[0])
+                if refs:
+                    marks=','.join('?' for _ in set(refs))
+                    extra=store.connection.execute(base+f''', display_edges AS (
+                      SELECT * FROM visible WHERE status='accepted' AND fact_kind='Edge'
+                      AND json_extract(payload,'$.source') IN (SELECT id FROM page) AND rule_id IN ({marks}))
+                      SELECT * FROM visible WHERE status='accepted' AND (
+                        fact_id IN (SELECT fact_id FROM display_edges) OR
+                        (fact_kind IN ('NodeExistence','PropertyValue') AND json_extract(payload,'$.entity_id') IN
+                          (SELECT json_extract(payload,'$.target') FROM display_edges))) LIMIT 20001''',
+                      [*args,*sorted(set(refs))]).fetchall()
+                    if len(extra)<=20000:
+                        basis=store._aggregate([*rows,*extra])
+                        project_display_labels(basis,display_rules(store,basis))
+                        captions={n['id']:n for n in basis['nodes'] if 'display_label' in n}
+                        for node in result['nodes']:
+                            if node['id'] in captions:
+                                for key in ('display_label','display_label_basis'):
+                                    node[key]=captions[node['id']][key]
             return {**result,'total_nodes':counts[0],'total_edges':counts[1],'matched_nodes':counts[2],
                 'boundary_edges':counts[3],'kinds':kinds,'kind_counts':kind_counts,
                 'focus_node_id':focus if any(n['id']==focus for n in result['nodes']) else None,

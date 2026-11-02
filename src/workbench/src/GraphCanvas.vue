@@ -83,7 +83,7 @@ const kinds = computed(() => serverPaging.value && Array.isArray(graph.value.kin
 const filtered = computed(() => graph.value.nodes.filter(n =>
   (!selectedKind.value || (n.kind || n.layer || '节点') === selectedKind.value) &&
   (!search.value || (serverPaging.value && searchMatches.value ? searchMatches.value.includes(n.id) :
-    `${n.label || n.name || ''} ${n.id}`.toLowerCase().includes(search.value.toLowerCase())))))
+    `${n.display_label || ''} ${n.label || n.name || ''} ${n.id}`.toLowerCase().includes(search.value.toLowerCase())))))
 // Searching highlights and locates without removing the surrounding graph.
 const visible = computed(() => graph.value.nodes.slice(0, SCENE_LIMIT))
 const positions = ref<Map<string, Point>>(new Map())
@@ -95,7 +95,7 @@ const edges = computed(() => graph.value.edges.filter(edge => points.value.has(e
 const accessibleNodes = computed(() => (search.value || selectedKind.value ? filtered.value : visible.value).slice(0, 40))
 watch(() => graph.value, value => { positions.value = placeNodes({ ...value, nodes: value.nodes.slice(0, SCENE_LIMIT) }, positions.value) }, { immediate: true, flush: 'sync' })
 const adjacent = computed(() => selected.value ? graph.value.edges.filter(edge => edge.source === selected.value!.id || edge.target === selected.value!.id) : [])
-const display = (node: GraphNode) => String(node.label || node.name || node.id)
+const display = (node: GraphNode) => String(node.display_label || node.label || node.name || node.id)
 const scopeLabel = (node: GraphNode) => Array.isArray(node.scopes) ? node.scopes.join('、') : ''
 const shortScope = (node: GraphNode) => { const text = scopeLabel(node); return text.length > 18 ? text.slice(0, 17) + '…' : text }
 const shortLabel = (node: GraphNode) => { const text = display(node); return text.length > 15 ? text.slice(0, 14) + '…' : text }

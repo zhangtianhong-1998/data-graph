@@ -6,7 +6,9 @@
 
 依赖的本轮实测版本记录在 `requirements.lock`；需要复现环境时先安装该文件，再安装项目。
 
-2026-11-01 本轮回到 `full-extraction-v2-relation-window-20261101T045641Z` 的代码基线：该实验为 PARTIAL，七条规则发布 252 个业务节点、720 条边；概念 12/12、联合组合 240/240 匹配，报表项层级及英文名未完成。本轮改为保存有效规则、恢复已记录字段模型并补充层级语义，再全量重验；冻结实验支持从已结束的实验继续。详见[原因、修改与验收边界](design/lightweight_graph/RESUMABLE_DISCOVERY_20261101.md)。当前五表固定规则对照仍为 462 节点 / 930 边、全部声明评分 exact；自动发现质量须由新实验检验。全量实验限 240 次调用 / 2 小时，累计 tokens 不限。
+2026-11-02 最新完成的 `full-extraction-v2-window64k-20261102T014842Z` 为 PARTIAL：90 次调用、2,734,719 tokens，十条规则发布 252 个业务节点、720 条边。概念 12/12、联合组合 240/240 匹配，报表项层级及英文名仍未完成；此次没有回复截断，层级卡在历史反证引用恢复。本轮修复旧证据重查与有界补证、当前表连接列约束、关系等待基础、组合节点业务显示名，以及 Windows 测试超时。详见[修改与验收边界](design/lightweight_graph/EVIDENCE_RECOVERY_REPAIR_20261102.md)。完整的分阶段发布检查点仍按设计分批实现，不能据本轮局部修复宣称整个新流程已完成。
+
+冻结实验支持从已结束的实验继续，保存有效规则和字段模型，再对全部数据重验，详见[可恢复发现](design/lightweight_graph/RESUMABLE_DISCOVERY_20261101.md)。五表固定规则对照为 462 节点 / 930 边、全部声明评分 exact；自动发现质量须独立评测。全量实验限 240 次调用 / 2 小时，累计 tokens 不限。
 
 当前运行能力与验证边界见 [实施与验收记录](IMPLEMENTATION_STATUS.md)。最新的持续发现、可选关系、整组身份复核与运行指导改动见[两份评审后的继续修复](design/lightweight_graph/REVIEW_CONTINUATION_20261027.md)，上一轮协议修复见[真实数据反馈记录](design/lightweight_graph/REAL_DATA_DISCOVERY_REPAIR.md)。工程验证使用合成输入和离线模型替身，用户另一台机器上的真实数据仍待复跑。当前需求见 [用户故事](design/lightweight_graph/US.md) 和 [目标驱动迭代方案](design/lightweight_graph/GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)；[设计索引](design/lightweight_graph/README.md) 保留各项约束与历史边界。
 

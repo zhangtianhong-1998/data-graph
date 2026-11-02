@@ -66,7 +66,9 @@ def evaluate_concepts(graph_path,gold_path,*,role_kinds,role_relations,context_k
             if len(codes)!=1 or not isinstance(codes[0],str) or not codes[0]:
                 missing_codes.append(nid)
             else:context_codes[codes[0]].append(nid)
-            label=node.get('label')
+            # Display-only captions never participate in identity or concept
+            # name scoring above; assess what the exported viewer actually shows.
+            label=node.get('display_label') or node.get('label')
             if isinstance(label,str):context_labels[label].append(nid)
             # Check observable display content, not semantic identity. Equal
             # captions are never merged and this check cannot improve recall.
@@ -95,7 +97,7 @@ def evaluate_concepts(graph_path,gold_path,*,role_kinds,role_relations,context_k
                 'passed':bool(context_nodes) and not (missing_codes or unreadable)
                     and all(len(nids)==1 for nids in context_codes.values())
                     and all(len(nids)==1 for nids in context_labels.values()),
-                'method':'Nonempty unique context codes and distinct labels containing assigned concept names and source scopes; does not infer identity from labels.'}}
+                'method':'Nonempty unique context codes and distinct displayed captions containing assigned concept names and source scopes; display_label is presentation only and never changes identity or concept-name scoring.'}}
     return {'version':'lightgraph.concepts-evaluation/1','graph_sha256':fingerprint(graph_path),
         'gold_sha256':fingerprint(gold_path),'role_kinds':role_kinds,'role_relations':role_relations,
         'context_kind':context_kind,'accepted':evaluate_mode({'accepted'}),

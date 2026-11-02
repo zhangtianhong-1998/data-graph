@@ -34,7 +34,7 @@ def test_compact_output_binds_original_proposition_and_keeps_conditions_ephemera
         body,packet=input_packet(request);seen.append(body)
         schema=body['response_format']['json_schema']['schema']
         assert schema==BoundSemanticVerdict.model_json_schema()
-        assert set(schema['properties'])=={'decision','decision_scope','evidence','conditions'}
+        assert set(schema['properties'])=={'decision','decision_scope','evidence','conditions','recovery_obligations'}
         assert set(schema['$defs']['BoundEvidence']['properties'])=={'reference','stance'}
         assert 'explanation' not in canonical(schema)
         assert packet['semantic_proposition']==original

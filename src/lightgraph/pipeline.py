@@ -22,10 +22,26 @@ def relation_attempt_consumed(result):
     return not any(issue.get('code') in _TIME_DEFERRALS for issue in (getattr(result,'issues',None) or []))
 
 
-DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/23'
+DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/24'
 # Share of the discovery window held back from object discovery so relation
 # discovery and its follow-up still run after entities exist.
 RELATION_WINDOW_FRACTION=0.35
+
+
+def _missing_hierarchy_foundation(table, endpoints, knowledge):
+    """Defer this path table's relations while it has no validated local object.
+
+    Independent definition/bridge tables and usable local objects remain eligible.
+    A remembered multi-position mapping is a dependency, never an approved rule.
+    """
+    from .contracts import SourceRef
+    from .discovery.schema_knowledge import hierarchy_field_models
+    if knowledge is None:
+        return False
+    source=SourceRef(source_id=table.source_id,schema=table.schema_name,table=table.name)
+    if any(rule.source==source for rule in endpoints):
+        return False
+    return bool(hierarchy_field_models(knowledge.current_objects(table)))
 
 # These failures mean the Agent never completed an interpretation. They are not
 # permission to retry within a turn; leave the table pending for a later run.
@@ -81,7 +97,8 @@ def _discovery_counts(report, result):
     for key in ('compile_repair_rounds', 'recovered_proposals', 'deferred_proposals',
                 'discovery_invalid_drafts', 'discovery_pending_submissions', 'semantic_revision_attempts',
                 'compatible_rule_merges','rule_conflict_revision_attempts','rule_conflict_revisions_compiled',
-                'field_model_resume_tasks','field_model_rule_attempts','table_time_deferrals'):
+                'field_model_resume_tasks','field_model_rule_attempts','field_model_recheck_probes',
+                'field_model_recovery_obligations','table_time_deferrals'):
         value = result.stats.get(key, 0)
         if type(value) is int:
             report.counts[key] = report.counts.get(key, 0) + value
@@ -100,6 +117,7 @@ def _graph_outcome(report, store, config, *, discover_only):
         business_edges=sum(e['status'] == 'accepted' for e in edges),
         candidate_business_nodes=sum(n['status'] != 'accepted' for n in business.values()),
         candidate_business_edges=sum(e['status'] != 'accepted' for e in edges),
+        display_captions_projected=sum(bool(n.get('display_label')) for n in business.values()),
     )
     report.validation['business_graph'] = (
         'entities_and_relations' if report.counts['business_edges'] else
@@ -701,6 +719,14 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                             context_version=version,force=True,codes=role_codes,column_refs=role_columns)
                     relation_attempts.add(key)
                     ledger.supersede_previous(item)
+                    if _missing_hierarchy_foundation(source,endpoints,schema_knowledge):
+                        ledger.transition(item,'deferred')
+                        issue={'code':'relation_waiting_for_foundation','table':name,'status':'deferred'}
+                        if issue not in report.issues:report.issues.append(issue)
+                        ledger.record_discovery_feedback([item.source],[issue],task='relation_discovery')
+                        continue
+                    report.issues[:]=[i for i in report.issues if not (
+                        i.get('code')=='relation_waiting_for_foundation' and i.get('table')==name)]
                     if relation_attempt_counts.get((sid,name),0)>=config.max_relation_discovery_attempts:
                         ledger.transition(item,'deferred')
                         report.issues.append({'code':'relation_discovery_attempt_budget_exhausted','table':name,'status':'deferred'})

@@ -207,7 +207,7 @@ class IterationLedger:
             'semantic_claim_unresolved','semantic_claim_refuted','semantic_condition_unresolved',
             'discovery_invalid_drafts','discovery_submission_incomplete','discovery_submission_pending',
             'no_confirmable_entity_group','model_abstained','model_response_truncated'}
-        allowed.add('namespace_scope_missing')
+        allowed.update({'namespace_scope_missing','relation_waiting_for_foundation'})
         def feedback_code(issue):
             # Submission diagnostics wrap a fixed reason code; never persist
             # the rejected payload, permitted IDs or arbitrary field values.

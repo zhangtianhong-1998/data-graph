@@ -133,7 +133,15 @@ def validate_prior_obligations(reviewed, guard, issued):
     """A renamed condition or missing counterevidence cannot pass a revision."""
     evidence = {item.reference for item in reviewed.evidence}
     if not set(guard.get('blocking_evidence_refs', ())) <= evidence:
-        raise LightGraphError('semantic_revision_constraints_changed')
+        raise LightGraphError('semantic_revision_evidence_missing')
+    for obligation in guard.get('recovery_obligations',[]):
+        matches=[o for o in reviewed.recovery_obligations if o.candidate_id==obligation['candidate_id']]
+        if not matches:
+            raise LightGraphError('semantic_recovery_obligation_missing')
+        if (len(matches)!=1 or matches[0].decision!='resolved'
+                or not set(obligation['required_evidence_refs'])<=set(matches[0].evidence_refs)
+                or not set(matches[0].evidence_refs)<=issued):
+            raise LightGraphError('semantic_recovery_obligation_unresolved')
     for prior in guard.get('conditions', ()):
         matches = [c for c in reviewed.conditions if c.condition_ref == prior['condition_ref']]
         if (len(matches) != 1 or matches[0].explanation != prior['condition'] or

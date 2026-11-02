@@ -257,7 +257,10 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                     **review_packet['iteration_context'],'rule_conflict_requests':conflict_context,
                     'pending_candidates':[]}}
             if p.kind=='wide_hierarchy' and (packet or {}).get('iteration_context',{}).get('field_model_revision_guard'):
-                review_packet={**review_packet,'semantic_revision_guard':packet['iteration_context']['field_model_revision_guard']}
+                from .recovery_evidence import select_recovery_guard,validate_recovery_shape
+                review_packet={**review_packet,'semantic_revision_guard':select_recovery_guard(
+                    p,packet['iteration_context']['field_model_revision_guard'])}
+                validate_recovery_shape(p,review_packet['semantic_revision_guard'])
             if p.kind=='wide_hierarchy':
                 if related_requests and len(requests)>MAX_HIERARCHY_IDENTITY_REQUESTS:
                     raise LightGraphError('hierarchy_identity_repair_context_limit')
@@ -367,7 +370,8 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                 refs=[d['doc_id']+'@'+d['revision']+':'+d['section_id'] for d in docs
                       if _definition_document(d,table)]
                 failure=SimpleNamespace(code=code,blocking=[],required=refs,
-                    stage='concept_mapping' if p.kind=='concept_mapping' else 'entity_definition')
+                    stage='hierarchy' if p.kind in ('wide_hierarchy','long_hierarchy') else
+                        'concept_mapping' if p.kind=='concept_mapping' else 'entity_definition')
                 result.pending_candidates.append(candidate_record(p,table,packet or {},docs,failure))
             if failures is not None and code in REPAIRABLE_PROPOSAL_CODES:
                 failures.append((p,code))
@@ -665,10 +669,6 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
                 result.stats['field_model_resume_tasks']=result.stats.get('field_model_resume_tasks',0)+1
                 grain_candidates=[item for item in packet.get('iteration_context',{}).get('pending_candidates',[])
                     if item.get('review_stage')=='entity_granularity' and item.get('failure_code')=='semantic_claim_refuted']
-                if grain_candidates:
-                    packet['iteration_context']['field_model_revision_guard']={'blocking_evidence_refs':sorted({ref
-                        for item in grain_candidates for ref in item.get('blocking_evidence_refs',[])}),
-                        'conditions':[]}
 
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                 allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=[table])
@@ -677,6 +677,14 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             tools.close()
             tools=ToolExecutor(adapter,goal,budget,documents=corpus,
                 allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=window)
+            if restoring and grain_candidates:
+                from .recovery_evidence import prepare_grain_recovery
+                packet['iteration_context']['field_model_revision_guard']=prepare_grain_recovery(
+                    packet,table,remembered,grain_candidates,tools,documents=docs)
+                result.stats['field_model_recheck_probes']=sum(sum(ref.startswith('probe_') for ref in o['required_evidence_refs'])
+                    for o in packet['iteration_context']['field_model_revision_guard']['recovery_obligations'])
+                result.stats['field_model_recovery_obligations']=len(
+                    packet['iteration_context']['field_model_revision_guard']['recovery_obligations'])
             batch=_ask(model,packet,tools,observations)
             if schema_knowledge:
                 schema_knowledge.record_models(table,getattr(batch,'_runtime_object_models',[]),packet)
@@ -689,8 +697,11 @@ def discover_with_agent(adapter, goal=None, documents=None, model=None, budget=N
             granularity_rejections={}
             observed_hierarchies={}
             def fresh_tools():
-                return ToolExecutor(adapter,goal,budget,documents=corpus,
+                from .recovery_evidence import reserved_evidence_probe_ids
+                fresh=ToolExecutor(adapter,goal,budget,documents=corpus,
                     allow_source_samples=getattr(model.config,'allow_source_samples',False),allowed_tables=window)
+                fresh.reserve_probe_ids(reserved_evidence_probe_ids(packet))
+                return fresh
             def record_revision(revised,repair_packet):
                 if schema_knowledge:
                     schema_knowledge.record_models(table,getattr(revised,'_runtime_object_models',[]),repair_packet)

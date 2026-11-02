@@ -16,6 +16,22 @@ beforeEach(() => { api.request.mockReset(); vi.stubGlobal('ResizeObserver', clas
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('业务图来源与归并裁决', () => {
+  it('组合节点显示已验证端点名称，保留原始属性并支持画布内搜索', async () => {
+    const caption = '主体=A · 指标=占用 [M0] · 产品=梨 [P1]'
+    mount(GraphCanvas, { graph: { nodes: [
+      { id: 'joint', label: 'A/M0/P1', display_label: caption, kind: 'Assignment', status: 'accepted' },
+      { id: 'other', label: '其他', kind: 'Assignment', status: 'accepted' },
+    ], edges: [] }, layer: 'business' })
+    const node = root.querySelector('.graph-node')!
+    expect(node.getAttribute('aria-label')).toBe(caption)
+    expect(node.querySelector('title')?.textContent).toContain(caption)
+    node.dispatchEvent(new MouseEvent('click', { bubbles: true })); await nextTick()
+    expect(root.querySelector('.detail-name')?.textContent).toBe(caption)
+    expect(root.querySelector('.detail-code')?.textContent).toContain('A/M0/P1')
+    const input = root.querySelector<HTMLInputElement>('[aria-label="搜索图节点"]')!
+    input.value = '占用'; input.dispatchEvent(new Event('input', { bubbles: true })); await nextTick()
+    expect(root.querySelectorAll('.graph-node:not(.dimmed)')).toHaveLength(1)
+  })
   it('同名节点同时展示状态和范围，长范围保留完整悬浮说明', () => {
     const longScope = '集团合并、区域分拨、批发中心、配送服务、冷链物流'
     mount(GraphCanvas, { graph: { nodes: [

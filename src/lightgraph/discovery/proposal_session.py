@@ -18,7 +18,7 @@ from .models import (ProposalBatch, TASK_PROPOSAL_KINDS, ColumnGroupProposal,
     EntityKeyProposal, HierarchyProposal, LongHierarchyProposal, ReferenceProposal,
     DiscriminatorProposal, ExclusionProposal, ConceptMappingProposal)
 from .reference_validation import (normalize_column_references, normalize_definition_references,
-                                  invalid_reference_slots)
+                                  invalid_reference_slots, local_column_aliases)
 from .validation_feedback import model_diagnostics
 
 
@@ -124,6 +124,20 @@ def proposal_tool_specs(task, packet=None):
         schema = deepcopy(PROPOSAL_MODELS[kind].model_json_schema())
         schema['properties'].pop('kind')
         schema['required'].remove('kind')
+        if kind == 'reference' and packet:
+            # Bind the public tool to the same local-column authority as the
+            # compiler. Remote endpoint keys are explanatory, not local inputs.
+            claim = schema['$defs']['Reference']['properties']
+            columns = packet.get('metadata_digest', {}).get('columns', [])
+            choices = sorted({c['id'] for c in columns} | set(local_column_aliases(packet)))
+            if choices:
+                for field in ('source_columns', 'target_columns'):
+                    claim[field]['items']['enum'] = choices
+                claim['polymorphic_by']['enum'] = choices + [None]
+            entities = packet.get('authorized_entities', [])
+            if entities:
+                claim['source_entity']['enum'] = sorted(entities) + [None]
+                claim['target_entity']['enum'] = sorted(entities)
         specs.append(_spec('submit_' + kind,
             'Validate and retain one candidate. This does not confirm semantics or publish it. '
             'Use issued references; an error leaves prior drafts intact and does not retain '
@@ -233,6 +247,19 @@ class ProposalSession:
         if code in evidence_codes or any(item.get('code') in evidence_codes for item in (diagnostics or [])):
             from .reference_validation import definition_sections
             result['definition_sections']=sorted(definition_sections(self.packet))[:32]
+        if self._active_operator == 'submit_reference' and (
+                code == 'unauthorized_column_reference' or any(
+                    item.get('code') == 'unauthorized_column_reference' for item in (diagnostics or []))):
+            result['column_scope'] = 'current_table'
+            result['local_columns'] = [{'id': c['id'], 'name': c['name']}
+                for c in self.packet.get('metadata_digest', {}).get('columns', [])]
+            result['instruction'] = ('source_columns and target_columns both use this current table. '
+                'Select endpoint rule IDs separately; remote-table column IDs are not join columns here.')
+        if code == 'invalid_rejection_resolution':
+            result['resolvable_rejections'] = [rid for rid, target in self.open_rejections.items()
+                if target == (self._active_operator, self._active_target) and self._active_target is not None]
+            result['instruction'] = ('Only listed rejection IDs can be resolved by this submission. '
+                'For a changed target, submit without resolves_rejections and explicitly withdraw the old IDs when finishing.')
         return result
 
     def execute(self, name, arguments):

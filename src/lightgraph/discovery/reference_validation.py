@@ -200,6 +200,14 @@ def normalize_definition_references(batch, packet):
     return (ProposalBatch.model_validate(raw),changed) if changed else (batch,0)
 
 
+def local_column_aliases(packet):
+    """Exact names for typed current-table slots; catalog columns grant no access."""
+    names = {}
+    for column in packet.get('metadata_digest', {}).get('columns', []):
+        names.setdefault(column['name'], set()).add(column['id'])
+    return {name: next(iter(ids)) for name, ids in names.items() if len(ids) == 1}
+
+
 def normalize_column_references(batch, packet):
     """Resolve exact, unique authorized names only in typed column slots.
 
@@ -227,7 +235,10 @@ def normalize_column_references(batch, packet):
         for slot in invalid_reference_slots(batch, packet):
             if slot.category != 'columns':
                 continue
-            replacement = aliases.get(slot.get(raw))
+            # Both ends of a reference use columns from the CURRENT join table.
+            # A same-named remote key cannot make that explicit scope ambiguous.
+            current_only = batch.proposals[slot.proposal_index].kind == 'reference'
+            replacement = (local_column_aliases(packet) if current_only else aliases).get(slot.get(raw))
             if replacement is not None:
                 slot.put(raw, replacement)
                 changed += 1

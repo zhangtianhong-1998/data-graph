@@ -20,7 +20,10 @@ class FieldModelHierarchyPlan(StrictModel):
     repeat_is_fill: bool = Field(strict=True)
     relation_type: Literal['parent_of']
     evidence: list[str] = Field(min_length=1, max_length=16)
-    conditions: dict[str, str] = Field(default_factory=dict)
+    conditions: dict[str, str] = Field(default_factory=dict,
+        json_schema_extra={'propertyNames': {'enum': ['condition', 'valid_period', 'period', 'hierarchy_version']}},
+        description='Optional business qualifiers: condition, valid_period, period or hierarchy_version. '
+            'Use an empty object when none apply; structural checks and review obligations are not qualifiers.')
 
 
 def field_model_plan_tool_schema():
