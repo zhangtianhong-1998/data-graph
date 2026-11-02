@@ -111,6 +111,26 @@ def test_reference_abstention_is_an_unresolved_table_outcome():
         'category':'semantic_decision','next_action':'continue_other_candidates'}]
 
 
+@pytest.mark.parametrize('pending',[False,True])
+def test_reference_explicit_empty_finish_is_complete_only_without_pending_work(pending):
+    from lightgraph.discovery.proposal_session import ProposalSession
+    tables,data,entities,_=fixtures([('A','B')])
+    for rule in entities:rule.status='validated';rule.validation_ref='validation_'+rule.rule_id
+    class Model:
+        config=SimpleNamespace(allow_source_samples=True,max_discovery_steps=8,max_tool_calls=16)
+        budget=BudgetAllocator()
+        def explore(self,packet,tools,**kwargs):
+            tools.begin_context([tables[-1]])
+            session=ProposalSession(packet)
+            session.execute('finish_discovery',{'pending':pending})
+            return session.batch()
+    with MemorySource(tables,data) as source:
+        result=discover_references_with_agent(source,entities,model=Model(),table_refs={'public.links'})
+    assert result.rules==[]
+    assert result.relation_table_outcomes=={'public.links':'deferred' if pending else 'resolved'}
+    if not pending:assert result.issues==[]
+
+
 def test_composite_null_coverage_is_consistent_between_sql_and_cross_source():
     left=TableSpec(source_id='a',name='refs',columns=[ColumnSpec(name=c) for c in ('tenant','code')])
     right=left.model_copy(update={'source_id':'b','name':'objects'})

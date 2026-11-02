@@ -98,6 +98,20 @@ PROPOSAL_REPAIR_GUIDANCE.update({
 })
 REPAIRABLE_PROPOSAL_CODES = frozenset(PROPOSAL_REPAIR_GUIDANCE)
 
+# A closed relation contract disproves this specific mapping before a model
+# review. A different mapping remains a new hypothesis, never a reason to keep
+# this invalid candidate pending or to rewrite the registered relation.
+REJECTED_REFERENCE_CONTRACT_CODES = frozenset({
+    'relation_endpoint_kind_mismatch', 'unregistered_relation',
+    'reference_arity_mismatch', 'reference_hierarchy_level_unknown',
+    'reference_level_on_nonhierarchy', 'outside_relation_goal',
+})
+MISSING_PROPOSAL_EVIDENCE_CODES = frozenset({
+    'identity_domain_evidence_unresolved', 'concept_scope_evidence_required',
+    'concept_scope_document_required', 'concept_identity_document_required',
+    'concept_mapping_document_required', 'concept_identity_domain_evidence_required',
+})
+
 # review_semantics already retries these once against its frozen proposition.
 # Exhaustion must remain retryable on a later run, not cached as discovery done.
 SEMANTIC_REVIEW_PROTOCOL_CODES = frozenset({
@@ -126,6 +140,8 @@ def issue_classification(code):
             'semantic_claim_refuted','semantic_claim_unresolved','semantic_condition_unresolved',
             'model_abstained','no_confirmable_entity_group'}:
         return {'category':'semantic_decision','next_action':'continue_other_candidates'}
+    if code in REJECTED_REFERENCE_CONTRACT_CODES:
+        return {'category':'proposal_contract','next_action':'continue_other_candidates'}
     if code in REPAIRABLE_PROPOSAL_CODES:
         return {'category':'proposal_contract','next_action':'revise_proposal'}
     if code in SEMANTIC_REVIEW_PROTOCOL_CODES:

@@ -785,6 +785,19 @@
           ],
           "default": null,
           "title": "Level"
+        },
+        "shared_identity_domain": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Already validated global code domain, when present. Equal codes within this domain and entity kind denote one object with multiple source supports; the domain alone does not establish a relationship between different codes.",
+          "title": "Shared Identity Domain"
         }
       },
       "required": [

@@ -62,7 +62,8 @@ def test_agent_failure_keeps_only_affected_table_pending_until_next_run(tmp_path
 
         attempts.clear()
         third = run_pipeline(config, [source], model=model(False))
-        assert attempts==[('T2_cross_table','a'),('T2_cross_table','b')]  # only unresolved relations retry
+        assert attempts==[]  # interruptions recovered; unchanged relation decisions stay closed
+        assert third.status=='COMPLETED_WITH_GAPS'
         assert third.counts["reused_rules"] == 2
 
     with GraphStore(tmp_path / "out/graph.sqlite") as store:

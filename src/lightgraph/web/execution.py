@@ -91,6 +91,17 @@ def _safe_issue(item):
         or key in _ISSUE_ENUMS and value in _ISSUE_ENUMS[key]}
     if type(item.get('count')) is int and item['count']>=0:
         safe['count']=item['count']
+    if item.get('code') in {'unexplained_columns','coverage_shared_label_unresolved'}:
+        # The coverage stage supplies authorized metadata names, never row values.
+        # Keep this field restricted to its two producers and bounded JSON shape.
+        raw=item.get('column_names')
+        if isinstance(raw,str) and len(raw)<=32768:
+            try:names=json.loads(raw)
+            except (TypeError,ValueError):names=None
+            if (isinstance(names,list) and len(names)<=32 and all(
+                    isinstance(name,str) and 0<len(name)<=256 and
+                    not any(ord(char)<32 or ord(char)==127 for char in name) for name in names)):
+                safe['column_names']=json.dumps(names,ensure_ascii=False,separators=(',',':'))
     if item.get('code') in {'discovery_draft_rejected','discovery_draft_field_diagnostic'}:
         names,codes,constraints=_diagnostic_vocabulary()
         if item.get('reason_code') in codes:

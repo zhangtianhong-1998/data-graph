@@ -143,13 +143,13 @@ def policy_request(packet,policy=UNKNOWN,code='hierarchy_identity_resolution_uns
     return _proposal_repair_record(proposal,code)
 
 
-def test_unsupported_policy_stays_deferred_and_keeps_valid_sibling():
+def test_unsupported_policy_is_unresolved_and_keeps_valid_sibling():
     source,packet=fixture()
     rules,result,reviewer=run_candidates([hierarchy(packet,UNKNOWN),
         group(packet,'aux','aux_label')['proposals'][0]],source,packet)
     assert [rule.kind for rule in rules]==['column_group_entity']
     assert not reviewer.review_packets
-    assert any(issue['code']=='hierarchy_identity_resolution_unsupported' and issue['status']=='deferred'
+    assert any(issue['code']=='hierarchy_identity_resolution_unsupported' and issue['status']=='unresolved'
         for issue in result.issues)
     assert UNKNOWN not in json.dumps(result.model_dump())
 

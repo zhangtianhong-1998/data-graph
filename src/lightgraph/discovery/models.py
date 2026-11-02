@@ -252,6 +252,7 @@ class ConceptMappingProposal(ProposalBase):
 Proposal = Annotated[Union[ColumnGroupProposal,EntityKeyProposal,HierarchyProposal,LongHierarchyProposal,ReferenceProposal,
                            DiscriminatorProposal,ExclusionProposal,ConceptMappingProposal],Field(discriminator='kind')]
 class ProposalBatch(StrictModel):
+    _runtime_completed_empty: bool = PrivateAttr(default=False)
     _runtime_pending_codes: list[str] = PrivateAttr(default_factory=list)
     _runtime_invalid_drafts: int = PrivateAttr(default=0)
     _runtime_invalid_codes: dict[str,int] = PrivateAttr(default_factory=dict)
@@ -371,6 +372,7 @@ class PendingCandidate(StrictModel):
         'projection_truncated','query_result_truncated','identity_conflict','label_conflict',
         'reference_hierarchy_level_required','reference_hierarchy_level_unknown',
         'reference_level_on_nonhierarchy','reference_arity_mismatch','relation_endpoint_kind_mismatch',
+        'outside_relation_goal',
         'unverified_entity_reference','unregistered_relation','null_key','identity_definition_conflict',
         'shared_identity_attribute_conflict','shared_attribute_conflict','reference_unmatched','reference_ambiguous',
         'unmatched_reference','ambiguous_reference','reference_partial_null','reference_null_endpoint','multiple_parents',
@@ -381,7 +383,17 @@ class PendingCandidate(StrictModel):
         'concept_key_missing','concept_binding_conflict','concept_key_label_conflict',
         'null_identity_namespace','partition_breaks_identity','partition_breaks_hierarchy',
         'conflicting_entity_kinds','property_requires_visible_node_support']] = Field(default_factory=list,max_length=16)
-    status: Literal['pending'] = 'pending'
+    status: Literal['pending','rejected'] = 'pending'
+
+    @model_validator(mode='after')
+    def closed_reference_rejection(self):
+        if self.status=='rejected':
+            from .repair import REJECTED_REFERENCE_CONTRACT_CODES
+            if (self.proposal_kind!='reference' or self.failure_code!='reference_contract_unresolved'
+                    or not self.failure_details
+                    or not set(self.failure_details)<=REJECTED_REFERENCE_CONTRACT_CODES):
+                raise ValueError('rejected_candidate_requires_closed_reference_contract')
+        return self
 
 
 class DiscoveryResult(StrictModel):
@@ -446,6 +458,10 @@ class EntityBinding(StrictModel):
     entity_kind: str
     key_columns: list[str]
     level: int | None = Field(default=None,gt=0)
+    shared_identity_domain: str | None = Field(default=None,description=
+        'Already validated global code domain, when present. Equal codes within '
+        'this domain and entity kind denote one object with multiple source supports; '
+        'the domain alone does not establish a relationship between different codes.')
 
 
 class ExistingReferenceRule(StrictModel):

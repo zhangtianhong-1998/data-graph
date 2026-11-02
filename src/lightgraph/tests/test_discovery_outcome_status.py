@@ -71,7 +71,7 @@ def test_report_advice_is_derived_from_safe_code_not_arbitrary_input():
         'category':'internal_error','next_action':'fix_code'}]
 
 
-@pytest.mark.parametrize('history_status',['diagnostic','resolved'])
+@pytest.mark.parametrize('history_status',['diagnostic','resolved','rejected'])
 def test_recovered_transport_history_does_not_reopen_a_finished_semantic_decision(history_status):
     from types import SimpleNamespace
     from lightgraph.pipeline import _discovery_outcome, _deferred_tables
@@ -92,3 +92,83 @@ def test_unrecovered_failure_still_interrupts_work_even_alongside_diagnostics():
         {'code':'semantic_review_protocol_diagnostic','status':'diagnostic'},
         {'code':'model_response_truncated','status':'deferred'},
     ])=='PARTIAL'
+
+
+def test_relation_investigation_version_changes_with_contract_not_run_id():
+    from lightgraph.pipeline import _relation_work_version
+    from lightgraph.contracts import RuleSpec
+    t=table('items',['code','name'])
+    rule=RuleSpec(rule_id='items',kind='column_group_entity',
+        source={'source_id':'s','table':'items'},identity={'key_columns':['code'],'entity_kind':'ReportItem'})
+    base=_relation_work_version(t,'docs-v1',[rule],[])
+    assert base==_relation_work_version(t.model_copy(deep=True),'docs-v1',[rule.model_copy()],[])
+    assert base!=_relation_work_version(t,'docs-v2',[rule],[])
+    assert base!=_relation_work_version(t,'docs-v1',[rule.model_copy(update={'revision':2})],[])
+    changed=t.model_copy(deep=True)
+    changed.columns[0].name='new_code'
+    assert base!=_relation_work_version(changed,'docs-v1',[rule],[])
+
+
+def test_finished_relation_gap_does_not_erase_an_operational_failure():
+    from lightgraph.contracts import RunReport
+    from lightgraph.pipeline import _relation_work_issue, _discovery_outcome
+    report=RunReport(run_id='test',issues=[
+        {'table':'public.items','code':'relation_discovery_pending','status':'deferred'},
+        {'table':'public.other','code':'model_response_truncated','status':'deferred'}])
+    _relation_work_issue(report,'public.items','unresolved')
+    assert report.issues[-1]['code']=='relation_discovery_unresolved'
+    assert _discovery_outcome(report.issues)=='PARTIAL'
+    _relation_work_issue(report,'public.items','resolved')
+    assert len(report.issues)==1 and report.issues[0]['table']=='public.other'
+
+
+def test_rejected_endpoint_proposals_close_without_losing_entities_or_repeating(monkeypatch,tmp_path):
+    tables=[table('items',['key','label']),table('dimensions',['key','label'])]
+    rows={'public.items':[('A','Alpha')],'public.dimensions':[('D','Dimension')]}
+    tasks=[]
+    retrying=False
+    def handler(request):
+        _,packet=input_packet(request);tasks.append(packet['task'])
+        if packet['task'] in ('T0_discovery','T1_table_discovery'):
+            kind='Dimension' if packet['scope']['table']=='dimensions' else 'ReportItem'
+            return response(group(packet,'key','label',kind))
+        assert packet['task']=='T2_cross_table'
+        if retrying:return response({'task':packet['task'],'proposals':[]})
+        bindings={b['entity_kind']:b for b in packet['entity_bindings']}
+        ids={c['name']:c['id'] for c in packet['metadata_digest']['columns']}
+        # verified_reference belongs to physical Column endpoints. Rejecting
+        # this business proposal must not leave a task indefinitely pending.
+        return response({'task':packet['task'],'proposals':[{'kind':'reference','claim':{
+            'source_entity':bindings['ReportItem']['rule_id'],
+            'target_entity':bindings['Dimension']['rule_id'],
+            'source_columns':[ids['key']],'target_columns':[ids['key']],
+            'relation_kind':'verified_reference'},'evidence_cited':[ids['key']]}]})
+    config=RunConfig(sources=[],output_dir=str(tmp_path),max_identity_reviews=0)
+    for run in range(2):
+        tasks.clear()
+        with MemorySource(tables,rows) as source:
+            report=run_pipeline(config,[source],model=client(monkeypatch,handler))
+        assert report.status=='COMPLETED',report.issues
+        assert report.counts['business_nodes']==2 and report.counts['business_edges']==0
+        assert report.counts['work_deferred']==0 and report.counts['work_unresolved']==0
+        if run==0:
+            assert tasks.count('T2_cross_table')==2
+            assert all(i['status']=='rejected' for i in report.issues
+                if i['code']=='relation_endpoint_kind_mismatch')
+        else:assert not tasks
+    with GraphStore(tmp_path/'graph.sqlite') as store:
+        candidates=[dict(row) for row in store.connection.execute('SELECT state FROM discovery_candidate')]
+        assert candidates and all(row['state']=='rejected' for row in candidates)
+        from lightgraph.runtime.candidates import CandidateQueue
+        queue=CandidateQueue(store,config.goal,config.scopes,config.isolation_domain,config.sources)
+        candidate=queue.listing()['candidates'][0]
+        queue.decide(candidate['candidate_id'],'retry',candidate['revision'])
+    retrying=True;tasks.clear()
+    with MemorySource(tables,rows) as source:
+        retried=run_pipeline(config,[source],model=client(monkeypatch,handler))
+    assert retried.status=='COMPLETED',retried.issues
+    assert 'T2_cross_table' in tasks
+    with GraphStore(tmp_path/'graph.sqlite') as store:
+        row=store.connection.execute('SELECT state FROM discovery_candidate WHERE candidate_id=?',
+            (candidate['candidate_id'],)).fetchone()
+        assert row['state']=='rejected'  # no new result never erases the original rejection

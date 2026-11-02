@@ -143,7 +143,7 @@ def test_malformed_hierarchy_still_supplies_counterevidence_against_path_identit
     assert [review['kind'] for review in reviewer.reviews]==['entity_granularity']
     assert {context['state'] for context in reviewer.reviews[0]['hierarchy_identity_context']}=={'proposed'}
     assert any(issue['code']=='semantic_claim_'+decision for issue in result.issues)
-    assert any(issue['code']=='invalid_hierarchy_context' and issue['status']=='deferred' for issue in result.issues)
+    assert any(issue['code']=='invalid_hierarchy_context' and issue['status']=='unresolved' for issue in result.issues)
 
 
 def test_cached_grain_rejection_is_checked_without_any_hierarchy_context():

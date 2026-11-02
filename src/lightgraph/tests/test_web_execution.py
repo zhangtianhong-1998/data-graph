@@ -392,6 +392,24 @@ def test_safe_report_retains_schema_diagnostics_but_never_input_keys_or_values()
     assert 'PRIVATE' not in json.dumps(safe)
 
 
+def test_safe_report_keeps_terminal_rejections_and_bounded_coverage_column_names():
+    safe=_safe_report(RunReport(run_id='test',issues=[
+        {'code':'relation_endpoint_kind_mismatch','status':'rejected','message':'PRIVATE_INPUT'},
+        {'code':'unexplained_columns','count':3,'status':'unresolved',
+         'column_names':'["指标名称","产品名称","渠道名称"]'},
+        {'code':'coverage_shared_label_unresolved','column_names':'["产品名称"]'},
+        {'code':'semantic_claim_unresolved','column_names':'["PRIVATE_INPUT"]'},
+        {'code':'unexplained_columns','column_names':'{"PRIVATE":"INPUT"}'},
+        {'code':'unexplained_columns','column_names':json.dumps(['PRIVATE_INPUT']*33)},
+        {'code':'unexplained_columns','column_names':json.dumps(['PRIVATE\nINPUT'])},
+    ]))
+    assert safe['issues'][0]=={'code':'relation_endpoint_kind_mismatch','status':'rejected'}
+    assert json.loads(safe['issues'][1]['column_names'])==['指标名称','产品名称','渠道名称']
+    assert json.loads(safe['issues'][2]['column_names'])==['产品名称']
+    assert all('column_names' not in issue for issue in safe['issues'][3:])
+    assert 'PRIVATE' not in json.dumps(safe)
+
+
 def test_metadata_refresh_only_describes_and_closes_adapter(workspace, monkeypatch):
     table = TableSpec(source_id='input', name='metrics', columns=[ColumnSpec(name='code')])
     source = MemorySource([table], {'public.metrics': [('PRIVATE_VALUE',)]})

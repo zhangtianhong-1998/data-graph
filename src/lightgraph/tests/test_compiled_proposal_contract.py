@@ -1,4 +1,4 @@
-"""Defer invalid contracts without hiding failures or discarding valid siblings."""
+"""Retain unresolved contracts without hiding failures or discarding valid siblings."""
 import json
 
 import pytest
@@ -50,7 +50,7 @@ def test_exploratory_context_mismatch_is_reproduced_at_executable_contract(quali
 
 @pytest.mark.parametrize('qualifiers,code',[({'source_subject':CANARY},'invalid_hierarchy_context'),
                                          ({'condition':''},'empty_hierarchy_context')])
-def test_invalid_hierarchy_context_is_deferred_without_review_and_good_sibling_publishes(monkeypatch,qualifiers,code):
+def test_invalid_hierarchy_context_is_unresolved_without_review_and_good_sibling_publishes(monkeypatch,qualifiers,code):
     t=table('objects',['a','b','c','d']);tasks=[]
     def handler(request):
         _,packet=input_packet(request);tasks.append(packet['task'])
@@ -65,7 +65,7 @@ def test_invalid_hierarchy_context_is_deferred_without_review_and_good_sibling_p
         assert len(graph['nodes'])==1 and graph['nodes'][0]['label']=='Alpha'
         assert not graph['edges']
     assert tasks==['T0_discovery']
-    assert any(issue['code']==code and issue['status']=='deferred' for issue in result.issues)
+    assert any(issue['code']==code and issue['status']=='unresolved' for issue in result.issues)
     assert CANARY not in json.dumps(result.model_dump())
 
 
@@ -84,7 +84,7 @@ def test_unexpected_compiler_failures_are_not_reclassified(monkeypatch,validatio
 
 @pytest.mark.parametrize('missing',[('identity_domain',),('taxonomy',),('position_semantics',),
                                     ('identity_domain','taxonomy','position_semantics')])
-def test_missing_relative_semantics_stay_deferred_without_paid_review(monkeypatch,missing):
+def test_missing_relative_semantics_stay_unresolved_without_paid_review(monkeypatch,missing):
     t=table('objects',['a','b','c','d']);tasks=[]
     def handler(request):
         _,packet=input_packet(request);tasks.append(packet['task'])
@@ -97,7 +97,7 @@ def test_missing_relative_semantics_stay_deferred_without_paid_review(monkeypatc
         result=discover(source,model=client(monkeypatch,handler))
     assert tasks==['T0_discovery']
     assert [rule.kind for rule in result.rules]==['column_group_entity']
-    assert any(issue['code']=='hierarchy_position_semantics_missing' and issue['status']=='deferred'
+    assert any(issue['code']=='hierarchy_position_semantics_missing' and issue['status']=='unresolved'
         for issue in result.issues)
 
 

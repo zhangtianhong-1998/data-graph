@@ -75,3 +75,22 @@ def test_resumed_reference_packet_preserves_mapping_and_vocabulary_but_allows_di
         filtered=_relation_context_rules(endpoints,rules,{'existing_assignment'})
         assert all(rule.kind!='reference' for rule in filtered)
     assert seen==['T2_cross_table','semantic_review']
+
+
+def test_relation_packet_exposes_only_verified_global_identity_domains(monkeypatch):
+    from lightgraph.tests.test_shared_label_coverage import fixture
+    tables,rules,rows=fixture()
+    for rule in rules:
+        rule.status='validated';rule.validation_ref='v_'+rule.rule_id
+    rules[1].identity.identity_scope='namespace_local'
+    def handler(request):
+        _,packet=input_packet(request)
+        bindings={b['source']['table']:b for b in packet['entity_bindings']}
+        assert bindings['occurrences']['shared_identity_domain']=='metric_codes'
+        assert bindings['definitions']['shared_identity_domain'] is None
+        assert 'sources supporting one object' in packet['relation_reuse_instruction']
+        return response({'task':packet['task'],'proposals':[]})
+    with MemorySource(tables,rows) as source:
+        result=discover_references_with_agent(source,rules,model=client(monkeypatch,handler))
+    assert not result.rules and not result.issues
+    assert set(result.relation_table_outcomes.values())=={'resolved'}

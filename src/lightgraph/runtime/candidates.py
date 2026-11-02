@@ -27,6 +27,28 @@ class CandidateQueue:
           scope_key TEXT NOT NULL,candidate_id TEXT NOT NULL,rule_revisions TEXT NOT NULL,
           PRIMARY KEY(scope_key,candidate_id));
         ''')
+        # Older runs retained closed reference-contract violations as pending.
+        # Reclassify only that exact, safe failure family; semantic uncertainty
+        # and interrupted reviews remain work requiring investigation.
+        from lightgraph.discovery.repair import REJECTED_REFERENCE_CONTRACT_CODES
+        with self.store._transaction():
+            rows=self.connection.execute("SELECT * FROM discovery_candidate WHERE scope_key=? AND state='pending'",
+                (self.scope_key,)).fetchall()
+            for row in rows:
+                value=json.loads(row['payload'])
+                latest=self.connection.execute('SELECT action FROM discovery_candidate_event '
+                    'WHERE scope_key=? AND candidate_id=? ORDER BY revision DESC LIMIT 1',
+                    (self.scope_key,row['candidate_id'])).fetchone()
+                if latest and latest['action']=='retry_started':
+                    continue
+                if (value.get('proposal_kind')=='reference'
+                        and value.get('failure_code')=='reference_contract_unresolved'
+                        and value.get('failure_details')
+                        and set(value['failure_details']) <= REJECTED_REFERENCE_CONTRACT_CODES):
+                    value['status']='rejected'
+                    self.connection.execute('UPDATE discovery_candidate SET payload=? WHERE scope_key=? AND candidate_id=?',
+                        (canonical(value),self.scope_key,row['candidate_id']))
+                    self._state(row,'rejected','contract_rejected')
 
     def record(self, result):
         from lightgraph.discovery.models import PendingCandidate
@@ -36,23 +58,32 @@ class CandidateQueue:
                 payload=canonical(candidate.model_dump(mode='json',by_alias=True))
                 row=self.connection.execute('SELECT payload,state,revision FROM discovery_candidate WHERE scope_key=? AND candidate_id=?',
                     (self.scope_key,candidate.candidate_id)).fetchone()
+                if row and row['state']=='rejected' and candidate.status!='rejected':
+                    old=json.loads(row['payload'])
+                    changed=(old.get('dependency_fingerprint')!=candidate.dependency_fingerprint
+                        or old.get('document_refs',[])!=candidate.document_refs)
+                    if not changed:
+                        continue  # Same claim/materials cannot reopen a terminal rejection.
                 if row and row['payload']==payload:
-                    if row['state']=='resolved':
+                    if candidate.status=='rejected' and row['state'] not in ('rejected','dismissed'):
+                        self._state(self._find(candidate.candidate_id),'rejected','contract_rejected')
+                    elif row['state']=='resolved':
                         self._state(self._find(candidate.candidate_id),'pending','conflict_reobserved')
                         self.connection.execute('DELETE FROM discovery_candidate_replacement WHERE scope_key=? AND candidate_id=?',
                             (self.scope_key,candidate.candidate_id))
                     continue
                 revision=row['revision']+1 if row else 1
                 self.connection.execute('INSERT OR REPLACE INTO discovery_candidate VALUES(?,?,?,?,?)',
-                    (self.scope_key,candidate.candidate_id,payload,'pending',revision))
+                    (self.scope_key,candidate.candidate_id,payload,candidate.status,revision))
                 self.connection.execute('DELETE FROM discovery_candidate_replacement WHERE scope_key=? AND candidate_id=?',
                     (self.scope_key,candidate.candidate_id))
-                self._event(candidate.candidate_id,revision,'observed')
+                self._event(candidate.candidate_id,revision,
+                    'contract_rejected' if candidate.status=='rejected' else 'observed')
             for candidate_id in result.resolved_candidate_ids:
                 self.connection.execute('DELETE FROM discovery_candidate_replacement WHERE scope_key=? AND candidate_id=?',
                     (self.scope_key,candidate_id))
                 row=self._find(candidate_id,required=False)
-                if row and row['state'] not in ('resolved','revised'):
+                if row and row['state'] not in ('resolved','revised','rejected'):
                     self._state(row,'revised','replacement_proposed')
             rules={r.rule_id:r.revision for r in result.rules}
             for candidate_id,rule_ids in getattr(result,'candidate_replacement_rules',{}).items():
@@ -113,6 +144,8 @@ class CandidateQueue:
             if type(expected_revision) is not int or expected_revision!=row['revision']:
                 raise LightGraphError('discovery_candidate_revision_conflict')
             if row['state']=='resolved':raise LightGraphError('discovery_candidate_already_resolved')
+            if row['state']=='rejected' and action!='retry':
+                raise LightGraphError('discovery_candidate_closed')
             state={'dismiss':'dismissed','retry':'retry_requested','reopen':'pending'}[action]
             revision=self._state(row,state,action)
         return {'candidate_id':candidate_id,'state':state,'revision':revision,'published':False}
@@ -140,6 +173,9 @@ class CandidateQueue:
         result=[]
         for row in self.connection.execute("SELECT payload FROM discovery_candidate WHERE scope_key=? AND state IN ('pending','retry_requested','revised') ORDER BY candidate_id",(self.scope_key,)):
             value=json.loads(row[0]);source=value['source']
+            # A requested investigation is fresh work, not publication authority
+            # for the rejected proposal stored in its history.
+            value['status']='pending'
             if (source['source_id'],source.get('schema','public'),source['table']) in selected:
                 result.append(value)
             if len(result)>=16:break
@@ -149,7 +185,7 @@ class CandidateQueue:
         """Schema/document changes retire stored mappings, never replay them."""
         with self.store._transaction():
             rows=self.connection.execute("SELECT * FROM discovery_candidate WHERE scope_key=? "
-                "AND state IN ('pending','retry_requested','revised')",(self.scope_key,)).fetchall()
+                "AND state IN ('pending','retry_requested','revised','rejected')",(self.scope_key,)).fetchall()
             for row in rows:
                 value=json.loads(row['payload']);source=value['source']
                 key=(source['source_id'],source.get('schema','public'),source['table'])
@@ -170,3 +206,29 @@ class CandidateQueue:
                 source=json.loads(row['payload'])['source']
                 if source['source_id']==source_id and source.get('schema','public')+'.'+source['table'] in tables:
                     self._state(row,'pending','retry_started')
+
+    def finish_retries(self, source_id, tables):
+        """Close completed investigations which did not replace a rejected claim.
+
+        The scheduler calls this only for a finished relation investigation,
+        including an explicit abstention. An interrupted task must leave the
+        retry pending. A newly observed semantic gap has its own pending payload
+        and is not overwritten by this retirement of the original rejection.
+        """
+        completed=0
+        with self.store._transaction():
+            rows=self.connection.execute("SELECT * FROM discovery_candidate WHERE scope_key=? AND state='pending'",
+                (self.scope_key,)).fetchall()
+            for row in rows:
+                value=json.loads(row['payload']);source=value['source']
+                if (value.get('status')!='rejected' or value.get('proposal_kind')!='reference'
+                        or source['source_id']!=source_id
+                        or source.get('schema','public')+'.'+source['table'] not in tables):
+                    continue
+                latest=self.connection.execute('SELECT action FROM discovery_candidate_event '
+                    'WHERE scope_key=? AND candidate_id=? ORDER BY revision DESC LIMIT 1',
+                    (self.scope_key,row['candidate_id'])).fetchone()
+                if latest and latest['action']=='retry_started':
+                    self._state(row,'rejected','retry_completed_without_replacement')
+                    completed+=1
+        return completed

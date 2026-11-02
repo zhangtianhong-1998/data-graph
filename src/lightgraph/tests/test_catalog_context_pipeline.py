@@ -80,8 +80,8 @@ def test_new_table_document_rediscovers_only_affected_table(tmp_path, monkeypatc
         seen.clear()
         third=run_pipeline(config,[source],model=model,documents=[doc])
         assert third.counts["reused_rules"]==2,third.issues
-        assert seen==[('T1_table_discovery','a'),('T1_table_discovery','b'),
-                      ('T2_cross_table','a'),('T2_cross_table','b')]
+        assert seen==[]  # unchanged completed coverage/relation decisions are retained
+        assert third.status=='COMPLETED_WITH_GAPS'
         assert any(i['code']=='unexplained_columns' for i in third.issues)
 
 

@@ -1,7 +1,8 @@
 """Bounded follow-up for authorized columns not yet explained by any rule."""
 from __future__ import annotations
+import json
 
-from lightgraph.contracts import SourceRef, digest
+from lightgraph.contracts import SourceRef, canonical, digest
 from lightgraph.discovery.goal import column_is_excluded, column_is_evidence_only
 from lightgraph.runtime.iteration import rule_shape
 
@@ -77,6 +78,7 @@ def namespace_refinement(previous, candidate):
 
 
 def unexplained_columns(table, rules, understandings, goal, engine):
+    from .tools import _SENSITIVE
     source=SourceRef(source_id=table.source_id,schema=table.schema_name,table=table.name)
     covered=set()
     for rule in rules:
@@ -89,12 +91,13 @@ def unexplained_columns(table, rules, understandings, goal, engine):
         if understanding.source==source:
             covered.update(c.name for c in understanding.columns
                 if c.inferred_role in ('fact_value','display_order','audit'))
-    return [c for c in table.column_names if c not in covered
+    return [c for c in table.column_names if c not in covered and not _SENSITIVE.search(c)
         and not column_is_excluded(goal,table,c) and not column_is_evidence_only(goal,table,c)]
 
 
 def discover_uncovered(*,tables,contexts,adapters,goal,engine,rules,understandings,
-                       ledger,corpus,model,max_rounds,execute,validated_rules,explore=None,candidate_queue=None):
+                       ledger,corpus,model,max_rounds,execute,validated_rules,explore=None,candidate_queue=None,
+                       rediscover=False):
     """Retain siblings, ask only about remaining columns, stop at no progress.
 
     Returns safe issues/stats plus source references of unfinished work. The
@@ -115,13 +118,28 @@ def discover_uncovered(*,tables,contexts,adapters,goal,engine,rules,understandin
         # ask the same question a second time within one run.
         if not local:continue
         remaining=unexplained_columns(table,validated_rules,understandings,goal,engine)
+        from .shared_labels import enrich_shared_labels
+        label_issues,label_stats,label_interrupted=enrich_shared_labels(table=table,tables=tables,
+            adapter=adapters[table.source_id],goal=goal,rules=rules,validated_rules=validated_rules,
+            remaining=remaining,execute=execute)
+        issues.extend(label_issues)
+        for key,value in label_stats.items():stats[key]=stats.get(key,0)+value
+        local=[r for r in validated_rules if r.source==source]
+        remaining=unexplained_columns(table,validated_rules,understandings,goal,engine)
         if not remaining:
             ledger.resolve_exploration(source,'coverage_discovery')
             continue
-        version='coverage_'+digest(contexts[table.source_id][table.qualified_name],remaining,
+        version='coverage_'+digest(contexts[table.source_id][table.qualified_name],
+                                   table.model_dump(mode='json',by_alias=True),remaining,
                                    sorted((r.rule_id,r.revision) for r in local))
-        item=ledger.enqueue(source,task='coverage_discovery',rules=local,context_version=version,force=True)
+        item=ledger.enqueue(source,task='coverage_discovery',rules=local,context_version=version,force=rediscover)
         ledger.supersede_previous(item)
+        if label_interrupted or item.state=='unresolved' and not rediscover:
+            if label_interrupted:ledger.transition(item,'deferred')
+            unfinished.add((table.source_id,table.qualified_name))
+            issues.append({'code':'unexplained_columns','table':table.qualified_name,
+                           'count':len(remaining),'column_names':canonical(remaining[:32]),'status':item.state})
+            continue
         for iteration in range(1,max_rounds):
             ledger.transition(item,'running')
             context=ledger.context([item],rules,iteration=iteration)
@@ -133,7 +151,8 @@ def discover_uncovered(*,tables,contexts,adapters,goal,engine,rules,understandin
                 if candidate_queue is not None:candidate_queue.record(result)
                 stats['coverage_discovery_tasks']+=1
                 for key in ('compile_repair_rounds','recovered_proposals','deferred_proposals',
-                            'discovery_invalid_drafts','discovery_pending_submissions','semantic_revision_attempts'):
+                            'unresolved_proposals','rejected_proposals','discovery_invalid_drafts',
+                            'discovery_pending_submissions','semantic_revision_attempts'):
                     stats[key]=stats.get(key,0)+int(result.stats.get(key,0))
                 issues.extend(result.issues)
                 understandings.extend(result.understandings)
@@ -196,6 +215,10 @@ def discover_uncovered(*,tables,contexts,adapters,goal,engine,rules,understandin
                 rules.append(rule);existing[rule.rule_id]=rule
                 execute(rule)
             after=unexplained_columns(table,validated_rules,understandings,goal,engine)
+            for issue in label_issues:
+                if (issue['code']=='coverage_shared_label_unresolved'
+                        and not set(json.loads(issue['column_names'])) & set(after)):
+                    issue['status']='resolved'
             if deferred:
                 # Compilation retained independent valid siblings. Run their
                 # normal publication gates before leaving other work deferred.
@@ -210,9 +233,12 @@ def discover_uncovered(*,tables,contexts,adapters,goal,engine,rules,understandin
             remaining=after
             # Continue only if the set of unexplained columns actually shrank.
             ledger.transition(item,'deferred')
-        else:ledger.transition(item,'deferred')
+        else:
+            # A bounded investigation can finish with unexplained columns.
+            # No available investigation turn is still unfinished work.
+            ledger.transition(item,'unresolved' if max_rounds>1 else 'deferred')
         if remaining:
             unfinished.add((table.source_id,table.qualified_name))
             issues.append({'code':'unexplained_columns','table':table.qualified_name,
-                           'count':len(remaining),'status':item.state})
+                           'count':len(remaining),'column_names':canonical(remaining[:32]),'status':item.state})
     return issues,stats,unfinished

@@ -1,4 +1,4 @@
-"""Bad reference contracts are deferred without restarting the discovery Agent."""
+"""Closed reference-contract rejections preserve independent valid siblings."""
 from copy import deepcopy
 
 import pytest
@@ -44,10 +44,15 @@ def test_one_t2_batch_records_invalid_reference_and_publishes_valid_sibling(monk
         for rule in base:assert engine.execute(source,rule).published
         result=discover_references_with_agent(source,store.get_rules(),model=client(monkeypatch,handler))
         assert len(result.rules)==1
-        status='unresolved' if error=='reference_missing' else 'deferred'
-        assert result.relation_table_outcomes[table.qualified_name]==status
+        status='unresolved' if error=='reference_missing' else 'rejected'
+        assert result.relation_table_outcomes[table.qualified_name]==('unresolved' if status=='unresolved' else 'resolved')
         assert any(item['code']==error and item['status']==status for item in result.issues)
-        assert result.stats.get('deferred_proposals',0)==int(status=='deferred')
+        assert result.stats.get('deferred_proposals',0)==0
+        if status=='rejected':
+            assert result.stats['rejected_proposals']==1
+            assert len(result.pending_candidates)==1
+            assert result.pending_candidates[0].status=='rejected'
+            assert result.pending_candidates[0].failure_details==[error]
         assert result.stats.get('compile_repair_rounds',0)==0
         assert result.stats.get('recovered_proposals',0)==0
         assert engine.execute(source,result.rules[0]).published
@@ -70,3 +75,31 @@ def test_single_pass_does_not_retry_or_publish_negative_relation_meaning(monkeyp
         assert result.rules==[] and not store.view({'public'})['edges']
         assert any(issue['code']==code for issue in result.issues)
     assert [packet['task'] for packet in packets]==['T2_cross_table','semantic_review']
+
+
+@pytest.mark.parametrize('failure',[None,'model_transport_error','semantic_review_protocol_invalid'])
+def test_only_invalid_candidate_finishes_but_interrupted_discovery_remains_deferred(monkeypatch,failure):
+    from lightgraph.errors import LightGraphError
+    from lightgraph.runtime.candidates import CandidateQueue
+    from lightgraph.contracts import ExtractionGoal
+    table,base=inputs();calls=[]
+    def handler(request):
+        _,packet=input_packet(request);calls.append(packet['task'])
+        assert packet['task']=='T2_cross_table'  # No review can authorize wrong endpoint kinds.
+        if failure:raise LightGraphError(failure)
+        ids={item['name']:item['id'] for item in packet['metadata_digest']['columns']}
+        return response({'task':packet['task'],'proposals':[{'kind':'reference','claim':{
+            'source_entity':'objects','target_entity':'other','source_columns':[ids['code']],
+            'target_columns':[ids['other']],'relation_kind':'verified_reference'},
+            'evidence_cited':[ids['code']]}]})
+    with MemorySource([table],{'public.objects':[('A','Alpha','unused','D')]}) as source,GraphStore() as store:
+        engine=RuleEngine(store)
+        for rule in base:assert engine.execute(source,rule).published
+        result=discover_references_with_agent(source,store.get_rules(),model=client(monkeypatch,handler))
+        assert result.rules==[] and store.view({'public'})['edges']==[]
+        assert result.relation_table_outcomes[table.qualified_name]==('deferred' if failure else 'resolved')
+        queue=CandidateQueue(store,ExtractionGoal(),['public'],'d')
+        queue.record(result)
+        assert queue.counts()==({} if failure else {'rejected':1})
+        assert queue.context({('s','public','objects')})==[]
+    assert calls==['T2_cross_table']

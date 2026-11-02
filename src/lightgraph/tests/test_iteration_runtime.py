@@ -115,7 +115,7 @@ def test_unresolved_counterexample_does_not_repeat_same_agent_task(monkeypatch,t
     packets.clear()
     with MemorySource([t],{'public.opaque':[('K','First','A')]}) as source:
         recovered=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert [p['task'] for p in packets]==['T1_table_discovery']
+    assert not packets  # the unchanged coverage gap already has a finished decision
     assert recovered.counts['work_unresolved']==1,recovered.model_dump()  # only coverage remains open
 
 
@@ -147,7 +147,7 @@ def test_repairing_one_column_group_keeps_sibling_new_entities(monkeypatch,tmp_p
     with MemorySource([t],{'public.multi':[('X','old','A','Y1','first-y')]}) as source:
         initial=run_pipeline(config,[source],model=client(monkeypatch,handler))
     assert initial.status=='COMPLETED_WITH_GAPS'
-    assert any(i['code']=='relation_discovery_pending' for i in initial.issues)
+    assert any(i['code']=='relation_discovery_unresolved' for i in initial.issues)
     rows=[('X','old','A','Y1','first-y'),('X','changed','B','Y2','new-y')]
     calls.clear()
     with MemorySource([t],{'public.multi':rows}) as source:
@@ -160,4 +160,5 @@ def test_repairing_one_column_group_keeps_sibling_new_entities(monkeypatch,tmp_p
     calls.clear()
     with MemorySource([t],{'public.multi':rows}) as source:
         repeated=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert calls==['T2_cross_table'],repeated.model_dump()  # entity rules are reused; abstained relations remain open
+    assert calls==[],repeated.model_dump()  # same completed abstention does not cause another investigation
+    assert repeated.status=='COMPLETED_WITH_GAPS'

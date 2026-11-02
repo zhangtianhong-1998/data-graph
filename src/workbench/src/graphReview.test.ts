@@ -152,6 +152,30 @@ describe('业务图来源与归并裁决', () => {
     expect(root.textContent).not.toContain('秘密')
     expect(root.textContent).not.toContain('发生 -4 次')
   })
+  it('区分已拒绝、分析未决和执行中断，保留各自状态', () => {
+    mount(RunIssues, { report: { issues: [
+      { code: 'relation_endpoint_kind_mismatch', table: 'public.items', status: 'rejected' },
+      { code: 'relation_discovery_unresolved', table: 'public.items', status: 'unresolved' },
+      { code: 'relation_discovery_pending', table: 'public.other', status: 'deferred' },
+    ] } })
+    const notes = [...root.querySelectorAll('.note')]
+    expect(notes).toHaveLength(3)
+    expect(notes[0]!.textContent).toContain('已拒绝，提案已结束')
+    expect(notes[0]!.classList.contains('amber')).toBe(false)
+    expect(notes[1]!.textContent).toContain('关系探索已结束')
+    expect(notes[2]!.textContent).toContain('工作尚未完成')
+  })
+  it('覆盖问题展示受控列名，其他问题不接受任意列名正文', () => {
+    mount(RunIssues, { report: { issues: [
+      { code: 'unexplained_columns', table: 'public.items', count: 3, column_names: '["指标名称","产品名称","渠道名称"]', status: 'unresolved' },
+      { code: 'coverage_shared_label_unresolved', column_names: '["产品名称"]', status: 'unresolved' },
+      { code: 'semantic_claim_unresolved', column_names: '["秘密源值"]' },
+      { code: 'unexplained_columns', table: 'public.other', column_names: '{"secret":"秘密源值"}' },
+    ] } })
+    expect(root.textContent).toContain('相关列：指标名称、产品名称、渠道名称')
+    expect(root.textContent).toContain('重复名称列尚未通过共享编码核验')
+    expect(root.textContent).not.toContain('秘密源值')
+  })
   it('显示候选关系状态，键盘选中后按 fact ID 读取授权支持', async () => {
     api.request.mockResolvedValue({ facts: [{ id: 'edge1', fact_kind: 'Edge', payload: graph.edges[0], status: 'candidate' }], supports: [{ id: 'support', fact_id: 'edge1', status: 'candidate', origin: 'source_query', source_binding: 'people.code → family.parent_code', rule_id: 'r', rule_revision: 3, publication_id: 'pub', scope_ref: 'public', document_ref: 'doc:family' }], rules: [{ identity_columns: ['code', 'name'] }], next_offset: null, supports_truncated: false })
     mount(GraphCanvas, { graph, layer: 'business', projectId: 'p', includeCandidates: true })

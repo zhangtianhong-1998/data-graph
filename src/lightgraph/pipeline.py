@@ -23,7 +23,7 @@ def relation_attempt_consumed(result):
     return not any(issue.get('code') in _TIME_DEFERRALS for issue in (getattr(result,'issues',None) or []))
 
 
-DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/24'
+DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/25'
 # Share of the discovery window held back from object discovery so relation
 # discovery and its follow-up still run after entities exist.
 RELATION_WINDOW_FRACTION=0.35
@@ -66,15 +66,13 @@ def _agent_execution_failure(code):
 
 def _discovery_outcome(issues):
     """Historical diagnostics do not reopen completed or explicitly rejected work."""
-    active=[issue for issue in issues if issue.get('status') not in {'diagnostic','resolved'}]
+    active=[issue for issue in issues if issue.get('status') not in {'diagnostic','resolved','rejected'}]
     if not active:
         return 'COMPLETED'
     partial_tokens=('budget','exhausted','timeout','truncated','unavailable','permission',
         'incomplete','unverified','formula_cache_missing','execution_failed',
         'dependency_rule_failed','too_large','model_http','model_response','model_transport')
     for issue in active:
-        if issue.get('status')=='rejected':
-            continue
         code=str(issue.get('code',''))
         if (issue.get('status') in {'deferred','partial'} or _agent_execution_failure(code)
                 or any(token in code for token in partial_tokens)):
@@ -120,8 +118,30 @@ def _deferred_tables(result, selected=()):
     return failed
 
 
+def _relation_work_version(table, context_version, endpoints, role_context):
+    """Remember a completed investigation against its schema and endpoint contract.
+
+    No row values enter this key. A schema, document, endpoint revision or
+    explicit retry can reopen investigation; an unchanged uncertain decision
+    does not itself justify another model call.
+    """
+    return 'relations_'+digest('terminal_decisions/1',context_version,
+        table.model_dump(mode='json',by_alias=True),
+        sorted((rule.rule_id,rule.revision) for rule in endpoints),role_context)
+
+
+def _relation_work_issue(report, table, state):
+    """Keep a finished evidence gap distinct from an interrupted investigation."""
+    codes={'relation_discovery_pending','relation_discovery_unresolved'}
+    report.issues[:]=[i for i in report.issues if not (
+        i.get('code') in codes and i.get('table')==table)]
+    if state in ('deferred','unresolved'):
+        report.issues.append({'code':'relation_discovery_pending' if state=='deferred'
+            else 'relation_discovery_unresolved','table':table,'status':state})
+
+
 def _discovery_counts(report, result):
-    for key in ('compile_repair_rounds', 'recovered_proposals', 'deferred_proposals',
+    for key in ('compile_repair_rounds', 'recovered_proposals', 'deferred_proposals', 'rejected_proposals', 'unresolved_proposals',
                 'discovery_invalid_drafts', 'discovery_pending_submissions', 'semantic_revision_attempts',
                 'compatible_rule_merges','rule_conflict_revision_attempts','rule_conflict_revisions_compiled',
                 'field_model_resume_tasks','field_model_rule_attempts','field_model_recheck_probes',
@@ -267,6 +287,15 @@ def _issues(report, items):
         if issue.get('code') in {'discovery_draft_rejected','discovery_draft_field_diagnostic'}:
             for name in ('reason_code','field_path','constraint'):
                 if isinstance(issue.get(name),str):safe[name]=issue[name]
+        if issue.get('code') in {'unexplained_columns','coverage_shared_label_unresolved'}:
+            raw=issue.get('column_names')
+            if isinstance(raw,str) and len(raw)<=32768:
+                try:names=json.loads(raw)
+                except (ValueError,TypeError):names=None
+                if isinstance(names,list) and len(names)<=32 and all(
+                    isinstance(name,str) and 0<len(name)<=256 and
+                    not any(ord(char)<32 or ord(char)==127 for char in name) for name in names):
+                    safe['column_names']=canonical(names)
         if issue.get('status') in ('unresolved','deferred','partial','resolved','rejected','diagnostic'):
             safe['status']=issue['status']
         # Derive only known, value-free diagnostics; never trust model-provided
@@ -682,7 +711,8 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     # must not erase a fully validated narrower interpretation.
                     engine.bindings={k:v for k,v in engine.bindings.items() if k[0]!=rule.rule_id}
                     engine.bindings.update(previous_bindings)
-                    report.issues.extend({'rule_id':rule.rule_id,'code':code,'status':'deferred'} for code in outcome.codes)
+                    report.issues.extend({'rule_id':rule.rule_id,'code':code,
+                        'status':'unresolved' if code in REVIEWABLE_CODES else 'deferred'} for code in outcome.codes)
                     return False
                 failed.add(rule.rule_id);report.rules_skipped.append(rule.rule_id)
                 schema_knowledge.invalidate_rule(rule.rule_id)
@@ -768,9 +798,9 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         def discover_pending_relations():
             """Track relation exploration separately from entity completeness.
 
-            Unresolved T2 work gets one attempt on the next run. Changes to the
-            validated endpoint set create a new task in this run after repair.
-            No source values or value fingerprints enter this scheduler key.
+            Finished negative/uncertain decisions are retained across runs.
+            Interruptions remain resumable. Changed schemas, documents or
+            validated endpoints create a fresh investigation after repair.
             """
             if not auto:return
             endpoint_ids={r.rule_id for r in prepared_rules if r.kind!='reference' and r.rule_id not in failed}
@@ -781,7 +811,6 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             explicit_relations=set(config.goal.relation_kinds)-{'parent_of','child_of','contains'}
             if len(endpoints)<2 and not (endpoints and (explicit_relations or relation_role_context)):
                 return
-            endpoint_versions=sorted((r.rule_id,r.revision) for r in endpoints)
             for sid in sorted(rules_by_source):
                 if not discovery_model and sid not in need_discovery:continue
                 for name,context_version in sorted(contexts[sid].items()):
@@ -790,15 +819,17 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     role_context=relation_role_context.get((sid,name),[])
                     role_columns=sorted({c for item in role_context for c in item['column_refs']})
                     role_codes=['unexplained_role_occurrence'] if role_context else []
-                    version='relations_'+digest(context_version,endpoint_versions,role_context)
+                    version=_relation_work_version(source,context_version,endpoints,role_context)
                     key=(sid,name,version)
                     if key in relation_attempts:continue
                     item=ledger.enqueue(SourceRef(source_id=sid,schema=source.schema_name,table=source.name),
                         task='relation_discovery',rules=endpoints,context_version=version,
                         codes=role_codes,column_refs=role_columns)
                     requested_retry=name in retry_tables.get(sid,set())
-                    if item.state=='resolved' and not config.rediscover and not requested_retry:continue
-                    if item.state=='unresolved' or config.rediscover or requested_retry:
+                    if item.state in ('resolved','unresolved') and not config.rediscover and not requested_retry:
+                        _relation_work_issue(report,name,item.state)
+                        continue
+                    if config.rediscover or requested_retry:
                         item=ledger.enqueue(item.source,task='relation_discovery',rules=endpoints,
                             context_version=version,force=True,codes=role_codes,column_refs=role_columns)
                     relation_attempts.add(key)
@@ -853,8 +884,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                             endpoint_ids={r.rule_id for r in prepared_rules
                                 if r.kind!='reference' and r.rule_id not in failed}
                             endpoints=[r for r in _latest(store.get_rules()) if r.rule_id in endpoint_ids]
-                            endpoint_versions=sorted((r.rule_id,r.revision) for r in endpoints)
-                            version='relations_'+digest(context_version,endpoint_versions,role_context)
+                            version=_relation_work_version(source,context_version,endpoints,role_context)
                             relation_attempts.add((sid,name,version))
                             ledger.transition(item,'superseded')
                             item=ledger.enqueue(item.source,task='relation_discovery',rules=endpoints,
@@ -897,12 +927,13 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                     elif any(r.rule_id in failed for r in result.rules):state='unresolved'
                     elif outcome:state=outcome
                     elif discovery_model:
-                        state='resolved' if result.rules and not result.issues else 'unresolved'
+                        active=[i for i in result.issues if i.get('status') not in ('diagnostic','resolved','rejected')]
+                        state='unresolved' if active else 'resolved'
                     else:state='resolved'
                     ledger.transition(item,state)
-                    report.issues[:]=[i for i in report.issues if not (i.get('code')=='relation_discovery_pending' and i.get('table')==name)]
-                    if state!='resolved':
-                        report.issues.append({'code':'relation_discovery_pending','table':name,'status':state})
+                    if state in ('resolved','unresolved'):
+                        candidates_queue.finish_retries(sid,{name})
+                    _relation_work_issue(report,name,state)
         relation_attempts=set();relation_attempt_counts={};object_followups={};rounds=0
         review_role_occurrences()
         if auto:
@@ -914,7 +945,8 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 contexts=contexts,adapters=rules_by_source,goal=config.goal,engine=engine,
                 rules=allrules,understandings=understandings,ledger=ledger,corpus=corpus,
                 model=discovery_model,max_rounds=config.max_discovery_rounds,execute=execute,
-                validated_rules=prepared_rules,explore=explore,candidate_queue=candidates_queue)
+                validated_rules=prepared_rules,explore=explore,candidate_queue=candidates_queue,
+                rediscover=config.rediscover)
             _issues(report,coverage_issues)
             for key,value in coverage_stats.items():report.counts[key]=report.counts.get(key,0)+value
             # A namespace revision changes endpoint bindings even when the

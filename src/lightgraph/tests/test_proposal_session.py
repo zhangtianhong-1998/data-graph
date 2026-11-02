@@ -18,6 +18,28 @@ def group():
     return {key:value for key,value in final()['proposals'][0].items() if key!='kind'}
 
 
+@pytest.mark.parametrize('withdraw',[False,True])
+def test_explicitly_withdrawn_errors_can_finish_without_publishing_or_implicit_repair(withdraw):
+    session=ProposalSession(input_packet())
+    rejection=session.execute('submit_column_group',{'claim':{'bad':CANARY}})
+    session.execute('finish_discovery',{'pending':False,
+        'withdraw_rejections':[rejection['rejection_id']] if withdraw else []})
+    batch=session.batch()
+    assert batch.proposals==[] and batch._runtime_invalid_drafts==1
+    assert batch._runtime_completed_empty is withdraw
+    assert bool(batch._runtime_pending_codes) is (not withdraw)
+    assert '_runtime_completed_empty' not in batch.model_dump_json()
+    assert CANARY not in str(batch._runtime_invalid_diagnostics)
+
+
+def test_empty_finish_is_distinct_from_abstention_and_interruption():
+    session=ProposalSession(input_packet())
+    assert not session.batch(pending_code='discovery_submission_incomplete')._runtime_completed_empty
+    assert not session.batch(abstain=True)._runtime_completed_empty
+    session.execute('finish_discovery',{'pending':False})
+    assert session.batch()._runtime_completed_empty
+
+
 def tools_response(*operations):
     return httpx.Response(200,json={'choices':[{'message':{'content':None,'tool_calls':[
         {'id':f'call_{index}','type':'function','function':{'name':name,'arguments':json.dumps(args)}}

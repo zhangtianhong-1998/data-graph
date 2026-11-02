@@ -53,7 +53,7 @@ def test_fd_repair_failure_preserves_only_independently_reviewed_hierarchy(monke
 
 
 @pytest.mark.parametrize('guard',['none','refuted','excluded','cycle'])
-def test_deferred_coverage_executes_valid_sibling_but_keeps_pending_work(monkeypatch,tmp_path,guard):
+def test_coverage_retains_gaps_but_only_broken_revisions_stay_deferred(monkeypatch,tmp_path,guard):
     source_table=table('objects',['a','b','c','d','e','f','g']);tasks=[]
     def handler(request):
         _,packet=input_packet(request);tasks.append(packet['task'])
@@ -80,8 +80,9 @@ def test_deferred_coverage_executes_valid_sibling_but_keeps_pending_work(monkeyp
     assert report.counts['business_nodes']==(4 if guard=='none' else 1),report.model_dump()
     assert report.counts['business_edges']==(2 if guard=='none' else 0)
     assert report.status!='COMPLETED'
-    assert tasks.count('T1_table_discovery')==1
-    assert any(issue['code']=='unregistered_attribute_semantics' and issue['status']=='deferred'
+    # Publishing the hierarchy shrinks coverage, permitting one bounded follow-up.
+    assert tasks.count('T1_table_discovery')==(2 if guard=='none' else 1)
+    assert any(issue['code']=='unregistered_attribute_semantics' and issue['status']=='unresolved'
                for issue in report.issues)
     if guard in ('cycle','refuted'):
         # Structural failures and semantic alternatives each get one bounded revision.
@@ -90,12 +91,15 @@ def test_deferred_coverage_executes_valid_sibling_but_keeps_pending_work(monkeyp
     else:
         assert 'T5_revision' not in tasks
         assert not any(issue['code']=='llm_schema_invalid' for issue in report.issues)
-    assert any(issue['code']=='unexplained_columns' and issue['status']=='deferred'
+    coverage_state='deferred' if guard=='refuted' else 'unresolved'
+    # A cycle's later pattern revision can fail even after coverage closed.
+    assert report.status==('PARTIAL' if guard in ('cycle','refuted') else 'COMPLETED_WITH_GAPS')
+    assert any(issue['code']=='unexplained_columns' and issue['status']==coverage_state
                and issue['count']==(3 if guard=='none' else 5) for issue in report.issues)
     with GraphStore(tmp_path/'graph.sqlite') as store:
         states=[row['state'] for row in store.connection.execute(
             "SELECT state FROM iteration_work WHERE task='coverage_discovery'")]
-        assert states and set(states)=={'deferred'}
+        assert states and set(states)=={coverage_state}
         graph=store.view({'public'})
         assert all(node['kind']!='Metric' for node in graph['nodes'])
         if guard=='none':

@@ -168,6 +168,8 @@ def proposal_tool_specs(task, packet=None):
         SemanticSchema.model_json_schema()))
     specs.append(_spec('finish_discovery',
         'Finish using all retained drafts. Set pending=true if relevant work remains. '
+        'When no supported correction remains, finish with withdraw_rejections listing the issued rejection IDs. '
+        'This closes rejected attempts without confirming or publishing them. '
         'Use withdraw_rejections for explicit rejected-attempt withdrawal; pending=false cannot clear them. '
         'Never resubmit the full batch; finishing does not approve semantics.',
         {'type':'object','properties':{'pending':{'type':'boolean','default':False,
@@ -513,6 +515,11 @@ class ProposalSession:
         if self.open_rejections and not abstain:
             codes.add('discovery_invalid_drafts')
         batch._runtime_pending_codes = sorted(codes)
+        # An explicit, clean finish with no drafts is a completed exploration.
+        # Preserve the legacy abstain flag while distinguishing it internally
+        # from an actual abstention or an interrupted/blocked submission.
+        batch._runtime_completed_empty = bool(self.finished and not abstain
+            and not self.drafts and not codes)
         batch._runtime_invalid_drafts = self.invalid_count
         batch._runtime_invalid_codes = dict(self.invalid_code_counts)
         batch._runtime_object_models = deepcopy(self.object_models)

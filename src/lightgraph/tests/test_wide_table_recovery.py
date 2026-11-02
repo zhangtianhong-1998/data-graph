@@ -45,7 +45,7 @@ def proposals(packet, *, missing_definition=False):
     return {'task':packet['task'], 'semantic_schema':schema, 'proposals':[hierarchy, center]}
 
 
-def test_wide_hierarchy_publishes_while_invalid_center_contract_is_deferred(monkeypatch, tmp_path):
+def test_wide_hierarchy_publishes_with_invalid_center_contract_recorded_as_gap(monkeypatch, tmp_path):
     table, rows = wide_fixture()
     calls=[]
     def handler(request):
@@ -75,12 +75,12 @@ def test_wide_hierarchy_publishes_while_invalid_center_contract_is_deferred(monk
         goal=ExtractionGoal(purpose='发现报表项目层级和责任中心关系'))
     with MemorySource([table],rows) as source:
         report=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert report.status=='PARTIAL',report.model_dump()
+    assert report.status=='COMPLETED_WITH_GAPS',report.model_dump()
     assert len(report.rules_published)==1 and not report.rules_skipped
     assert report.counts['business_nodes']==7 and report.counts['business_edges']==6
     assert report.validation['business_graph']=='entities_and_relations'
     assert report.counts.get('recovered_proposals',0)==0 and 'T5_revision' not in calls
-    assert any(i['code']=='unregistered_attribute_semantics' and i.get('status')=='deferred'
+    assert any(i['code']=='unregistered_attribute_semantics' and i.get('status')=='unresolved'
                for i in report.issues)
     with GraphStore(tmp_path/'out/graph.sqlite') as store:
         graph=store.view({'public'})
@@ -94,8 +94,8 @@ def test_wide_hierarchy_publishes_while_invalid_center_contract_is_deferred(monk
     before=len(calls)
     with MemorySource([table],rows) as source:
         reused=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert len(calls)>before and reused.counts['business_edges']==6
-    assert reused.status=='PARTIAL' and 'T5_revision' not in calls
+    assert len(calls)==before and reused.counts['business_edges']==6
+    assert reused.status=='COMPLETED_WITH_GAPS' and 'T5_revision' not in calls
 
 
 def test_rejected_hierarchy_does_not_hide_independent_entities(monkeypatch,tmp_path):
@@ -144,8 +144,8 @@ def test_unrepaired_contract_is_not_cached_as_completed_and_next_run_recovers(mo
     rows={'public.catalog':[('K','A reusable object','items')]}
     with MemorySource([table],rows) as source:
         first=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert first.counts['business_nodes']==0 and first.counts['work_deferred']>=1
-    assert first.status=='PARTIAL'
+    assert first.counts['business_nodes']==0 and first.counts['work_unresolved']>=1
+    assert first.status=='COMPLETED_WITH_GAPS'
     assert any(i['code']=='unregistered_attribute_semantics' for i in first.issues)
     with GraphStore(tmp_path/'out/graph.sqlite') as store:
         from lightgraph.pipeline import _context_versions

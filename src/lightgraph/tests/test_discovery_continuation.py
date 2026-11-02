@@ -10,7 +10,7 @@ from lightgraph.store import GraphStore
 from lightgraph.tests.test_agent_pipeline import client,group,input_packet,response,table
 
 
-def test_relation_abstention_retries_t2_without_repeating_entity_discovery(monkeypatch,tmp_path):
+def test_finished_relation_abstention_is_not_repeated_without_new_context(monkeypatch,tmp_path):
     tables=[table('a',['key','label']),table('b',['key','label'])]
     rows={'public.a':[('A','Alpha')],'public.b':[('B','Beta')]}
     tasks=[]
@@ -25,10 +25,21 @@ def test_relation_abstention_retries_t2_without_repeating_entity_discovery(monke
             report=run_pipeline(config,[source],model=client(monkeypatch,handler))
         assert report.counts['business_nodes']==2
         assert report.counts['business_edges']==0
-        assert tasks.count('T2_cross_table')==2
+        assert tasks.count('T2_cross_table')==(2 if index==0 else 0)
         assert tasks.count('T0_discovery')==(2 if index==0 else 0)
         assert report.counts['work_unresolved']==2
-        assert any(i['code']=='relation_discovery_pending' for i in report.issues)
+        assert report.status=='COMPLETED_WITH_GAPS'
+        assert any(i['code']=='relation_discovery_unresolved' for i in report.issues)
+        assert not any(i['code']=='relation_discovery_pending' for i in report.issues)
+
+    # An explicit new investigation is allowed; abstention is never a positive
+    # claim that these sources cannot have any relationship.
+    tasks.clear()
+    config.rediscover=True
+    with MemorySource(tables,rows) as source:
+        retried=run_pipeline(config,[source],model=client(monkeypatch,handler))
+    assert tasks.count('T2_cross_table')==2
+    assert retried.status=='COMPLETED_WITH_GAPS'
 
 
 def test_abstention_does_not_cache_empty_table_as_complete(monkeypatch,tmp_path):

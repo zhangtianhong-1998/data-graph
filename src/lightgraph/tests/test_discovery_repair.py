@@ -29,8 +29,9 @@ def test_contract_failure_keeps_valid_sibling_without_another_agent(monkeypatch)
         result=discover(source,model=client(monkeypatch,handler))
     assert [rule.identity.key_columns for rule in result.rules]==[['a']]
     assert tasks==['T0_discovery']
-    assert result.stats['deferred_proposals']==1
-    assert any(issue['code']=='unregistered_attribute_semantics' and issue['status']=='deferred'
+    assert result.stats['unresolved_proposals']==1
+    assert result.stats.get('deferred_proposals',0)==0
+    assert any(issue['code']=='unregistered_attribute_semantics' and issue['status']=='unresolved'
         for issue in result.issues)
 
 
@@ -132,7 +133,7 @@ def test_same_batch_conflicting_interpretations_do_not_choose_first(monkeypatch)
 
 
 @pytest.mark.parametrize('initial_error',['reference_hierarchy_level_required','relation_endpoint_kind_mismatch'])
-def test_invalid_hierarchy_endpoint_is_deferred_without_extra_model_call(monkeypatch,initial_error):
+def test_invalid_hierarchy_endpoint_closes_or_retains_a_gap_without_extra_model_call(monkeypatch,initial_error):
     t=table('objects',['parent','parent_name','child','child_name','center','center_name'])
     hierarchy=RuleSpec(rule_id='tree',kind='wide_hierarchy',source={'source_id':'s','table':'objects'},
         identity={'key_columns':['parent'],'entity_kind':'ReportItem','level_policy':'level_qualified'},
@@ -156,7 +157,9 @@ def test_invalid_hierarchy_endpoint_is_deferred_without_extra_model_call(monkeyp
     with MemorySource([t],{'public.objects':[('A','Parent','B','Child','Z','Center')]}) as source:
         result=discover_references(source,[hierarchy,center],model=client(monkeypatch,handler))
     assert not result.rules and tasks==['T2_cross_table']
-    assert any(issue['code']==initial_error and issue['status']=='deferred' for issue in result.issues)
+    status='rejected' if initial_error=='relation_endpoint_kind_mismatch' else 'unresolved'
+    assert any(issue['code']==initial_error and issue['status']==status for issue in result.issues)
+    assert result.relation_table_outcomes['public.objects']==('resolved' if status=='rejected' else 'unresolved')
 
 
 def test_valid_wide_hierarchy_publishes_despite_unbound_entity_attribute(monkeypatch,tmp_path):

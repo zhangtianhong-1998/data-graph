@@ -27,7 +27,8 @@ from lightgraph.rules.endpoints import endpoint_columns
 from .repair import (REPAIRABLE_PROPOSAL_CODES, SEMANTIC_REVIEW_PROTOCOL_CODES,
     SEMANTIC_RECOVERY_DECISION_CODES, DISCOVERY_INTERNAL_CODES, issue_classification,
     PROPOSAL_REPAIR_GUIDANCE, MAX_PROPOSAL_REPAIR_ROUNDS, compiled_contract_error,
-    HIERARCHY_IDENTITY_REPAIR_CODES, CONTRACT_CANDIDATE_CODES)
+    HIERARCHY_IDENTITY_REPAIR_CODES, CONTRACT_CANDIDATE_CODES,
+    REJECTED_REFERENCE_CONTRACT_CODES, MISSING_PROPOSAL_EVIDENCE_CODES)
 
 
 def _catalog(adapter, goal):
@@ -86,10 +87,13 @@ def _iteration_codes(context, table):
     return sorted(codes)
 
 
-def _issue(result, table, code, *, count=None):
+def _issue(result, table, code, *, count=None, rejected=False):
     entry={'table':table.qualified_name,'code':code,
            'status':('partial' if code in DISCOVERY_INTERNAL_CODES else
-               'deferred' if (code in REPAIRABLE_PROPOSAL_CODES | SEMANTIC_REVIEW_PROTOCOL_CODES
+               'rejected' if rejected else
+               'deferred' if (code in MISSING_PROPOSAL_EVIDENCE_CODES | SEMANTIC_REVIEW_PROTOCOL_CODES
+               or code.startswith(('model_transport','model_http','model_response','model_stream',
+                                   'model_api_key','model_rate_limit'))
                or any(token in code for token in ('budget','limit','exhausted','too_large'))) else 'unresolved'),
            **issue_classification(code)}
     if count is not None: entry['count']=count
@@ -499,8 +503,11 @@ def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations
     unresolved.extend(request['code'] for request in requests if canonical(request) not in resolved)
     for code in dict.fromkeys(unresolved):
         _issue(result,table,code)
-    if unresolved:
-        result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+len(failures)
+    for _,code in failures:
+        if code not in unresolved:continue
+        counter=('deferred_proposals' if code in MISSING_PROPOSAL_EVIDENCE_CODES |
+                 SEMANTIC_REVIEW_PROTOCOL_CODES else 'unresolved_proposals')
+        result.stats[counter]=result.stats.get(counter,0)+1
     return rules,docs,batch,packet,(projection_excluded,identity_excluded)
 
 
@@ -930,7 +937,10 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
         and source_in_goal(goal,r.source)]
     result=DiscoveryResult()
     bindings=[{'rule_id':r.rule_id,'source':r.source.model_dump(by_alias=True),
-        'entity_kind':r.identity.entity_kind,'level':level,'key_columns':endpoint_columns(r,level)}
+        'entity_kind':r.identity.entity_kind,'level':level,'key_columns':endpoint_columns(r,level),
+        'shared_identity_domain':(r.identity.identity_domain if
+            r.identity.semantic_resolution=='verified_identity_domain'
+            and r.identity.identity_scope=='domain_global' else None)}
         for r in approved.values() for level in (
             [entry.level for entry in r.hierarchy.levels] if r.kind=='wide_hierarchy' else [None])]
     if len(bindings)<2:return result
@@ -988,7 +998,12 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                 'Reuse an existing relation name when its meaning and mapping apply. Do not create a synonym '
                 'only to restate an existing relationship. Shared endpoints alone do not establish equivalent '
                 'meaning: independently evidenced different relations remain valid. Existing rules are context, '
-                'not evidence for a new semantic claim.')
+                'not evidence for a new semantic claim. entity_bindings.shared_identity_domain identifies '
+                'already validated global code domains. Same-kind, same-domain, same-code occurrences '
+                'are sources supporting one object; do not invent a business relationship merely to '
+                'connect those sources. Different objects within the same domain may still have '
+                'independently evidenced business relationships. Finish without new proposals when '
+                'investigation finds no additions; use abstain only for an undecided interpretation.')
             packet['semantic_schema']=SemanticSchema.merged(goal.semantic_schema,
                 *(r.semantic_schema for r in approved.values()),
                 *(r.semantic_schema for r in existing[:64])).model_dump(mode='json')
@@ -1030,8 +1045,10 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                 batch=_ask(model,packet,tools,observations)
                 _record_submission_state(result, table, batch)
                 docs=tools.context_documents()
-            if batch.abstain:_issue(result,table,'model_abstained')
-            elif not batch.proposals:_issue(result,table,'no_confirmable_relation')
+            if batch.abstain and not batch._runtime_completed_empty:
+                _issue(result,table,'model_abstained')
+            elif not batch.proposals and batch.open_questions:
+                _issue(result,table,'no_confirmable_relation')
             lookup={_column_id(table,c.name):c.name for c in table.columns}
             for proposal in batch.proposals:
                 if proposal.kind!='reference':
@@ -1138,7 +1155,8 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                         result.rules.append(compiled)
                 except BudgetExceeded:raise
                 except LightGraphError as exc:
-                    _issue(result,table,exc.code)
+                    rejected=exc.code in REJECTED_REFERENCE_CONTRACT_CODES
+                    _issue(result,table,exc.code,rejected=rejected)
                     if isinstance(exc, SemanticReviewFailure):
                         result.pending_candidates.append(candidate_record(proposal,table,review_packet,docs,exc))
                     elif exc.code in SEMANTIC_REVIEW_PROTOCOL_CODES | REPAIRABLE_PROPOSAL_CODES | SEMANTIC_RECOVERY_DECISION_CODES:
@@ -1150,17 +1168,21 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                         candidate=candidate_record(proposal,table,packet,docs,failure)
                         allowed=set(get_args(PendingCandidate.model_fields['failure_details'].annotation.__args__[0]))
                         if exc.code in allowed:candidate.failure_details=[exc.code]
+                        if rejected:candidate.status='rejected'
                         result.pending_candidates.append(candidate)
                     if exc.code in REPAIRABLE_PROPOSAL_CODES:
-                        result.stats['deferred_proposals']=result.stats.get('deferred_proposals',0)+1
+                        counter='rejected_proposals' if rejected else 'unresolved_proposals'
+                        result.stats[counter]=result.stats.get(counter,0)+1
         except LightGraphError as exc:
             _issue(result,table,exc.code)
             if isinstance(exc,BudgetExceeded):break
         finally:
             table_issues=result.issues[issue_start:]
-            if any(issue.get('status')=='deferred' for issue in table_issues):
+            active=[issue for issue in table_issues
+                    if issue.get('status') not in {'diagnostic','resolved','rejected'}]
+            if any(issue.get('status') in {'deferred','partial'} for issue in active):
                 result.relation_table_outcomes[table.qualified_name]='deferred'
-            elif table_issues or len(result.rules)==rule_start:
+            elif active:
                 result.relation_table_outcomes[table.qualified_name]='unresolved'
             else:result.relation_table_outcomes[table.qualified_name]='resolved'
             if tools is not None:tools.close()

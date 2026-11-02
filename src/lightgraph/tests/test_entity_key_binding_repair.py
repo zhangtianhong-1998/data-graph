@@ -81,4 +81,4 @@ def test_attribute_binding_and_exclusion_are_checked_once_with_valid_hierarchy_p
         expected='unbound_attribute_property' if binding=='unbound' else 'excluded_column_projected'
         assert any(issue['code']==expected for issue in result.issues)
         if binding=='unbound':
-            assert any(issue['code']==expected and issue['status']=='deferred' for issue in result.issues)
+            assert any(issue['code']==expected and issue['status']=='unresolved' for issue in result.issues)
