@@ -1,4 +1,5 @@
 """Frozen continuation keeps old output immutable and revalidates copied state."""
+from contextlib import closing
 import json
 import sqlite3
 
@@ -73,7 +74,7 @@ def test_resume_rebinds_only_the_same_verified_candidate_scope(tmp_path):
     old_key=digest(old.goal.model_dump(mode='json'),sorted(old.scopes),old.isolation_domain,
         [s.model_dump(mode='json',by_alias=True) for s in old.sources])
     # Fixed structural fixture, no samples or source values.
-    with sqlite3.connect(parent/'output/graph.sqlite') as connection:
+    with closing(sqlite3.connect(parent/'output/graph.sqlite')) as connection, connection:
         connection.execute('INSERT INTO discovery_candidate VALUES(?,?,?,?,?)',
             (old_key,'candidate_fixture',json.dumps({'required_reread':True}),'pending',1))
         connection.execute('INSERT INTO discovery_candidate_event VALUES(?,?,?,?)',
@@ -82,7 +83,7 @@ def test_resume_rebinds_only_the_same_verified_candidate_scope(tmp_path):
     new=load_config(child/'config.json')
     new_key=digest(new.goal.model_dump(mode='json'),sorted(new.scopes),new.isolation_domain,
         [s.model_dump(mode='json',by_alias=True) for s in new.sources])
-    with sqlite3.connect(child/'resume_seed/graph.sqlite') as connection:
+    with closing(sqlite3.connect(child/'resume_seed/graph.sqlite')) as connection:
         assert connection.execute('SELECT state FROM discovery_candidate WHERE scope_key=?',(new_key,)).fetchone()==('pending',)
         assert connection.execute('SELECT action FROM discovery_candidate_event WHERE scope_key=?',(new_key,)).fetchone()==('observed',)
         assert not connection.execute('SELECT 1 FROM discovery_candidate WHERE scope_key=?',(old_key,)).fetchone()

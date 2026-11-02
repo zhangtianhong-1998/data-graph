@@ -5,6 +5,7 @@ or opened by the execution worker. Live database inputs are intentionally reject
 An explicit resume copies a completed result database after input/scope checks.
 """
 from __future__ import annotations
+from contextlib import closing
 from datetime import datetime, timezone
 import importlib.metadata
 import json
@@ -30,7 +31,18 @@ def environment():
 
 
 def files_under(directory):
-    return {str(p.relative_to(directory)): fingerprint(p) for p in sorted(directory.rglob('*')) if p.is_file()}
+    return {p.relative_to(directory).as_posix(): fingerprint(p) for p in sorted(directory.rglob('*')) if p.is_file()}
+
+
+def _protected_files(manifest):
+    """Use portable manifest keys, including older Windows backslash records."""
+    protected={}
+    for name, fingerprint_value in manifest['files'].items():
+        relative=name.replace('\\','/')
+        if relative in protected:
+            raise LightGraphError('evaluation_bundle_invalid')
+        protected[relative]=fingerprint_value
+    return protected
 
 
 def _resume_contract(config):
@@ -74,8 +86,8 @@ def _prepare_resume(parent, target, config):
     seed=target/'resume_seed';seed.mkdir()
     # The original run may have WAL pages. A raw file copy is not a snapshot.
     with run_lock(parent/'output'):
-        with sqlite3.connect(database.as_uri()+'?mode=ro',uri=True) as source:
-            with sqlite3.connect(seed/'graph.sqlite') as destination:
+        with closing(sqlite3.connect(database.as_uri()+'?mode=ro',uri=True)) as source:
+            with closing(sqlite3.connect(seed/'graph.sqlite')) as destination:
                 source.backup(destination)
                 if destination.execute('PRAGMA integrity_check').fetchone()[0]!='ok':
                     raise LightGraphError('evaluation_resume_store_invalid')
@@ -87,11 +99,12 @@ def _prepare_resume(parent, target, config):
         return digest(cfg.goal.model_dump(mode='json'),sorted(cfg.scopes),cfg.isolation_domain,
             [s.model_dump(mode='json',by_alias=True) for s in cfg.sources])
     old_key,new_key=scope_key(previous),scope_key(frozen)
-    with sqlite3.connect(seed/'graph.sqlite') as connection:
-        tables={r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        for name in ('discovery_candidate','discovery_candidate_event','discovery_candidate_replacement'):
-            if name in tables and old_key!=new_key:
-                connection.execute(f'UPDATE {name} SET scope_key=? WHERE scope_key=?',(new_key,old_key))
+    with closing(sqlite3.connect(seed/'graph.sqlite')) as connection:
+        with connection:
+            tables={r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            for name in ('discovery_candidate','discovery_candidate_event','discovery_candidate_replacement'):
+                if name in tables and old_key!=new_key:
+                    connection.execute(f'UPDATE {name} SET scope_key=? WHERE scope_key=?',(new_key,old_key))
     return {'parent_bundle':str(parent), 'parent_manifest_sha256':fingerprint(parent/'bundle.json'),
         'parent_report_sha256':fingerprint(parent/'output/report.json'),
         'seed_database_sha256':fingerprint(seed/'graph.sqlite'),
@@ -166,7 +179,7 @@ def prepare(config_path, output, *, gold_path, resume_from=None):
             'gold_isolation':'Configured input/document/rule paths and whole-file hashes exclude Gold; this does not prove documents lack semantically leaked answers.',
             'model':settings.model, 'mode':settings.mode,
             'budgets':{'calls':settings.max_calls,'tokens':settings.max_tokens,'seconds':config.max_run_seconds},
-            'configured_input_files':sorted(str(Path(v).relative_to(target)) for v in remap.values())}
+            'configured_input_files':sorted(Path(v).relative_to(target).as_posix() for v in remap.values())}
         if resume is not None:manifest['resume']=resume
         write(target/'bundle.json', manifest)
         return manifest
@@ -182,18 +195,19 @@ def verify(bundle):
     if manifest.get('version') != 'lightgraph.frozen/1' or manifest.get('bundle_root') != str(root):
         raise LightGraphError('evaluation_bundle_invalid')
     if (root/'preparation_failed.json').exists(): raise LightGraphError('evaluation_bundle_invalid')
-    for relative, digest in manifest['files'].items():
+    protected=_protected_files(manifest)
+    for relative, digest in protected.items():
         path = (root/relative).resolve()
         if root not in path.parents or not path.is_file() or fingerprint(path) != digest:
             raise LightGraphError('evaluation_frozen_file_changed')
     # An added module could change lazy import behavior even with every old hash intact.
-    current_code = {str(p.relative_to(root)) for p in (root/'code').rglob('*')
+    current_code = {p.relative_to(root).as_posix() for p in (root/'code').rglob('*')
                     if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc'}
-    if current_code != {p for p in manifest['files'] if p.startswith('code/')}:
+    if current_code != {p for p in protected if p.startswith('code/')}:
         raise LightGraphError('evaluation_frozen_code_changed')
     if manifest.get('resume'):
-        current_seed={str(p.relative_to(root)) for p in (root/'resume_seed').rglob('*') if p.is_file()}
-        if current_seed != {p for p in manifest['files'] if p.startswith('resume_seed/')}:
+        current_seed={p.relative_to(root).as_posix() for p in (root/'resume_seed').rglob('*') if p.is_file()}
+        if current_seed != {p for p in protected if p.startswith('resume_seed/')}:
             raise LightGraphError('evaluation_frozen_seed_changed')
     if environment() != manifest['environment']:
         raise LightGraphError('evaluation_runtime_environment_changed')
