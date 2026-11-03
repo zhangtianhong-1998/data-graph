@@ -31,10 +31,10 @@ beforeEach(() => {
     if (url === '/api/projects/p') return response(project)
     if (url.endsWith('/session')) return response({ session_id: 'session' })
     if (url.endsWith('/config')) { if (method === 'PUT') { config = body; revision++ } return response(config, `"${revision}"`) }
-    if (url.endsWith('/model-limits')) {
+    if (url.includes('/model-limits')) {
       if (method === 'PUT' && rejectLimits) return new Response(JSON.stringify({ error: { code: 'config_revision_conflict' } }), { status: 409 })
       if (method === 'PUT') { limits = { ...limits, ...body }; config.agent_config = 'files/agent-new.yaml'; revision++ }
-      return response(limits, `"${revision}"`)
+      return response(url.includes('include_config=true') ? { config, limits } : limits, `"${revision}"`)
     }
     if (url.endsWith('/credentials')) return response({ database_sources: [], model: false })
     if (url.endsWith('/metadata')) return response({ tables: [], nodes: [], edges: [] })
@@ -50,6 +50,63 @@ beforeEach(() => {
 })
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); clearSessions(); sessionStorage.clear() })
 describe('visible model limits', () => {
+  it.each([false, true])('the complete-config button saves edited controls when JSON is unchanged (Agent file: %s)', async separate => {
+    if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }
+    await mount()
+    await edit('model-input-tokens', '1048576'); await edit('model-output-tokens', '65536')
+    button('保存完整配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('完整配置已保存'))
+    expect(separate ? limits : config.model).toMatchObject({ max_prompt_tokens: 1048576, max_output_tokens: 65536 })
+    app.unmount(); root.remove(); await mount()
+    expect(root.querySelector<HTMLInputElement>('#model-input-tokens')!.value).toBe('1048576')
+    expect(root.querySelector<HTMLInputElement>('#model-output-tokens')!.value).toBe('65536')
+  })
+  it('does not overwrite edited controls with a separately edited JSON draft', async () => {
+    await mount(); await edit('model-output-tokens', '65536')
+    await edit('advanced-config', JSON.stringify({ ...config, goal: { purpose: 'JSON 中的新目标' } }, null, 2))
+    button('保存完整配置').click()
+    await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('表单和完整 JSON 都有修改'))
+    expect(calls.some(c => c.method === 'PUT')).toBe(false)
+    expect(root.querySelector<HTMLInputElement>('#model-output-tokens')!.value).toBe('65536')
+    expect(root.querySelector<HTMLTextAreaElement>('#advanced-config')!.value).toContain('JSON 中的新目标')
+    button('放弃表单修改').click(); await nextTick(); button('保存完整配置').click()
+    await vi.waitFor(() => expect(config.goal?.purpose).toBe('JSON 中的新目标'))
+    expect(config.model?.max_output_tokens).toBe(200)
+  })
+  it.each([false, true])('persists the total window and shows the actual input cap (Agent file: %s)', async separate => {
+    if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }
+    await mount()
+    await edit('model-input-tokens', '1048576'); await edit('model-output-tokens', '65536'); await edit('model-context-tokens', '131072')
+    expect(root.querySelector('[data-testid="effective-input-tokens"]')?.textContent).toContain('65536 tokens')
+    await edit('model-context-tokens', '')
+    expect(root.querySelector('[data-testid="effective-input-tokens"]')?.textContent).toContain('1048576 tokens')
+    button('保存配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存，下次启动立即生效'))
+    expect((separate ? limits : config.model)?.context_window_tokens).toBeNull()
+    app.unmount(); root.remove(); await mount()
+    expect(root.querySelector<HTMLInputElement>('#model-context-tokens')!.value).toBe('')
+    expect(root.querySelector('[data-testid="effective-input-tokens"]')?.textContent).toContain('1048576 tokens')
+  })
+  it('applies the saved Agent snapshot without a fallible follow-up config read', async () => {
+    delete config.model; config.agent_config = 'files/agent-original.yaml'
+    await mount(); await edit('model-output-tokens', '65536')
+    const readCount = calls.filter(c => c.method === 'GET' && (c.url.endsWith('/config') || c.url.endsWith('/model-limits'))).length
+    const original = vi.mocked(fetch).getMockImplementation()!
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = String(input)
+      if ((!init?.method || init.method === 'GET') && (url.endsWith('/config') || url.endsWith('/model-limits'))) return Promise.reject(new Error('read disconnected'))
+      return original(input, init)
+    })
+    button('保存配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存，下次启动立即生效'))
+    expect(calls.filter(c => c.method === 'GET' && (c.url.endsWith('/config') || c.url.endsWith('/model-limits')))).toHaveLength(readCount)
+    expect(root.querySelector('.error-strip')).toBeNull()
+    expect(root.querySelector<HTMLInputElement>('#model-output-tokens')!.value).toBe('65536')
+    button('开始抽取').click()
+    await vi.waitFor(() => expect(runModels).toHaveLength(1))
+    expect(calls.find(c => c.method === 'POST' && c.url.endsWith('/runs'))!.headers.get('If-Match')).toBe('"2"')
+    expect(runModels[0]!.max_output_tokens).toBe(65536)
+  })
   it('saves per-request token and timeout controls without changing the run call budget', async () => {
     await mount()
     await edit('model-discovery-steps', '24'); await edit('model-input-tokens', '1048576'); await edit('model-output-tokens', '65536'); await edit('model-timeout-seconds', '300')
@@ -80,9 +137,9 @@ describe('visible model limits', () => {
     button('保存配置').click()
     await vi.waitFor(() => expect(config.agent_config).toBe('files/agent-new.yaml'))
     const write = calls.find(c => c.method === 'PUT')!
-    expect(write.url).toBe('/api/projects/p/model-limits')
+    expect(write.url).toBe('/api/projects/p/model-limits?include_config=true')
     expect(write.headers.get('If-Match')).toBe('"1"')
-    expect(write.body).toEqual({ max_discovery_steps: 24, max_prompt_tokens: 1048576, max_output_tokens: 65536, timeout_seconds: 300, max_prompt_bytes: 131072, max_response_bytes: 262144 })
+    expect(write.body).toEqual({ max_discovery_steps: 24, max_prompt_tokens: 1048576, max_output_tokens: 65536, timeout_seconds: 300, context_window_tokens: 2000000, max_prompt_bytes: 131072, max_response_bytes: 262144 })
     expect(config.model).toBeUndefined()
   })
   it('persists changed separate-file limits before starting a run', async () => {
@@ -91,7 +148,7 @@ describe('visible model limits', () => {
     button('保存并开始抽取').click()
     await vi.waitFor(() => expect(calls.some(c => c.method === 'POST' && c.url.endsWith('/runs'))).toBe(true))
     const writes = calls.filter(c => c.method === 'PUT' || c.method === 'POST' && c.url.endsWith('/runs'))
-    expect(writes.map(c => c.url)).toEqual(['/api/projects/p/model-limits', '/api/projects/p/runs'])
+    expect(writes.map(c => c.url)).toEqual(['/api/projects/p/model-limits?include_config=true', '/api/projects/p/runs'])
     expect(writes[1]!.headers.get('If-Match')).toBe('"2"')
   })
   it.each([false, true])('saved controls apply to the next run and survive reload (Agent file: %s)', async separate => {
@@ -125,7 +182,7 @@ describe('visible model limits', () => {
     await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存，下次启动立即生效'))
     await vi.waitFor(() => expect(button('开始抽取').disabled).toBe(false))
     const writes = calls.filter(c => c.method === 'PUT')
-    expect(writes.map(c => c.url)).toEqual(['/api/projects/p/config', '/api/projects/p/model-limits'])
+    expect(writes.map(c => c.url)).toEqual(['/api/projects/p/config', '/api/projects/p/model-limits?include_config=true'])
     expect(writes[1]!.headers.get('If-Match')).toBe('"2"')
     expect(writes[1]!.body).toMatchObject({ max_discovery_steps: 24 })
     expect(config.goal).toMatchObject({ purpose: '保存后的目标', entity_kinds: ['ReportItem'], relation_kinds: ['parent_of'], runtime_guidance: [{ text: '同编码跨位置保留来源支持。', injection: 'global', stages: [] }] })
@@ -185,5 +242,7 @@ describe('visible model limits', () => {
     expect(modelLimitError({ max_output_tokens: null })).not.toBe('')
     expect(modelLimitError({ max_discovery_steps: 1 })).toBe('')
     expect(modelLimitError({ max_discovery_steps: 32 })).toBe('')
+    expect(modelLimitError({ context_window_tokens: null })).toBe('')
+    expect(modelLimitError({ context_window_tokens: .5 })).not.toBe('')
   })
 })

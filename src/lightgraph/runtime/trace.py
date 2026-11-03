@@ -200,7 +200,7 @@ class RunTrace:
                     'kind':kind,'data':self._redact(data)}
                 raw=(json.dumps(event,ensure_ascii=False,allow_nan=False,separators=(',',':'))+'\n').encode('utf-8')
                 offset=self._append(self.path,raw)
-                entry={'seq':event['seq'],'offset':offset,'length':len(raw)}
+                entry={'seq':event['seq'],'offset':offset,'length':len(raw),'kind':kind}
                 self._append(self.index_path,(json.dumps(entry,separators=(',',':'))+'\n').encode('utf-8'))
                 self.sequence+=1
             except (OSError,ValueError,TypeError,RecursionError):

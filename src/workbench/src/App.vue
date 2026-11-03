@@ -4,7 +4,7 @@ import GraphCanvas from './GraphCanvas.vue'
 import RunIssues from './RunIssues.vue'
 import RunProgress from './RunProgress.vue'
 import RunTrace from './RunTrace.vue'
-import { modelLimitError, modelLimitKeys } from './modelLimits'
+import { effectiveInputTokenLimit, modelLimitError, modelLimitKeys } from './modelLimits'
 import type { ModelLimitKey } from './modelLimits'
 import IdentityCandidates from './IdentityCandidates.vue'
 import DiscoveryCandidates from './DiscoveryCandidates.vue'
@@ -52,6 +52,7 @@ const agentLimits = ref<Record<string, unknown>>({}), agentLimitsSaved = ref('{}
 const agentLimitsDirty = computed(() => !!config.value.agent_config && JSON.stringify(agentLimits.value) !== agentLimitsSaved.value)
 const limitModel = computed(() => config.value.agent_config ? agentLimits.value : model.value)
 const limitsError = computed(() => modelLimitError(limitModel.value))
+const effectiveInputTokens = computed(() => effectiveInputTokenLimit(limitModel.value))
 function setModelLimit(key: ModelLimitKey, event: Event) {
   const text = (event.target as HTMLInputElement).value
   const value = text === '' ? null : Number(text)
@@ -63,14 +64,19 @@ function removeByteLimits() {
   else model.value = { ...model.value, max_prompt_bytes: null, max_response_bytes: null }
 }
 let agentLimitsEpoch = 0
+let loadedAgentLimitsKey = ''
 watch([() => project.value?.project_id, () => config.value.agent_config], async () => {
+  const id = project.value?.project_id, file = config.value.agent_config
+  const key = JSON.stringify([id, file])
+  if (id && file && key === loadedAgentLimitsKey) return
   const requestEpoch = ++agentLimitsEpoch
-  agentLimits.value = {}; agentLimitsSaved.value = '{}'; const id = project.value?.project_id, file = config.value.agent_config
+  loadedAgentLimitsKey = ''
+  agentLimits.value = {}; agentLimitsSaved.value = '{}'
   if (!id || !file) { agentLimitsLoading.value = false; return }
   agentLimitsLoading.value = true
   try {
     const value = await request<Record<string, unknown>>(`${projectPath(id)}/model-limits`)
-    if (requestEpoch === agentLimitsEpoch && project.value?.project_id === id && config.value.agent_config === file) { agentLimits.value = value; agentLimitsSaved.value = JSON.stringify(value) }
+    if (requestEpoch === agentLimitsEpoch && project.value?.project_id === id && config.value.agent_config === file) { agentLimits.value = value; agentLimitsSaved.value = JSON.stringify(value); loadedAgentLimitsKey = key }
   } catch (exception) { if (requestEpoch === agentLimitsEpoch && project.value?.project_id === id) report(exception) }
   finally { if (requestEpoch === agentLimitsEpoch && project.value?.project_id === id) agentLimitsLoading.value = false }
 })
@@ -82,9 +88,15 @@ async function saveModelLimits() {
   // Save all edited form fields before refreshing the versioned Agent reference.
   // Otherwise a refresh can erase pending guidance or vocabulary changes.
   if (formDirty.value || modelKey.value) await saveForms()
-  await request(`${path.value}/model-limits`, { method: 'PUT', body: json(value), headers: revisionHeaders() })
-  agentLimitsSaved.value = JSON.stringify(agentLimits.value)
-  await refreshProjectConfig(); notify('模型配置已保存，下次启动立即生效')
+  // The saved Agent path, limits and revision must come from the same write.
+  // A second GET could fail after a successful save or read another tab's edit.
+  const saved = await request<{ config: RunConfig; limits: Record<string, unknown> }>(`${path.value}/model-limits?include_config=true`, { method: 'PUT', body: json(value), headers: revisionHeaders() })
+  configRevision.value = responseRevision(saved) || configRevision.value
+  agentLimitsEpoch++
+  loadedAgentLimitsKey = JSON.stringify([project.value?.project_id, saved.config.agent_config])
+  agentLimits.value = saved.limits; agentLimitsSaved.value = JSON.stringify(saved.limits); agentLimitsLoading.value = false
+  fillForms(saved.config)
+  notify('模型配置已保存，下次启动立即生效')
 }
 const advanced = ref('')
 const modelKey = ref('')
@@ -408,8 +420,16 @@ async function inspectRun(run: Run) {
 function showRunProgress(run: Run) { selectedRun.value = run; tab.value = 'runs' }
 async function saveAdvanced() {
   await action(async () => {
-    await persistConfiguration(advancedConfig()); notify('完整配置已保存')
+    // Unedited JSON is only the last saved snapshot. It must not overwrite
+    // newer ordinary form controls just because this save button was chosen.
+    await saveDraft(); notify('完整配置已保存')
   })
+}
+function discardFormEdits() {
+  const jsonDraft = advanced.value
+  fillForms(JSON.parse(JSON.stringify(config.value)) as RunConfig)
+  agentLimits.value = JSON.parse(agentLimitsSaved.value)
+  advanced.value = jsonDraft
 }
 async function openDatabaseSource(source: SourceConfig | null = null) {
   await action(async () => {
@@ -492,9 +512,10 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
 <div class="two-fields"><div class="field"><label for="model-input-tokens">最大输入 tokens</label><input id="model-input-tokens" type="number" min="1" step="1" :value="limitModel.max_prompt_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="留空不额外限制" @input="setModelLimit('max_prompt_tokens', $event)"/><p class="field-hint">每次模型请求的输入额度，包括系统提示、历史消息和工具定义。</p></div><div class="field"><label for="model-output-tokens">最大输出 tokens</label><input id="model-output-tokens" type="number" min="1" step="1" :value="limitModel.max_output_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="默认 4096" @input="setModelLimit('max_output_tokens', $event)"/><p class="field-hint">单次请求的输出上限，不是整轮抽取的 token 预算。</p></div></div>
 <div class="field"><label for="model-timeout-seconds">接口超时时间（秒）</label><input id="model-timeout-seconds" type="number" min="0.1" step="any" :value="limitModel.timeout_seconds ?? ''" :disabled="locked || agentLimitsLoading" placeholder="默认 60" @input="setModelLimit('timeout_seconds', $event)"/></div>
 <p class="field-hint">配置保存成功后，下一次启动立即使用新值，无需重启服务。运行中的任务使用启动时的配置。</p>
-<p v-if="limitModel.context_window_tokens" class="field-hint">模型总上下文窗口：{{ limitModel.context_window_tokens }} tokens；系统会为最大输出预留空间。</p>
+<div class="field"><label for="model-context-tokens">模型总上下文窗口（tokens，可选）</label><input id="model-context-tokens" type="number" min="1" step="1" :value="limitModel.context_window_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="留空不额外限制" @input="setModelLimit('context_window_tokens', $event)"/><p class="field-hint">同时设置时，输入上限取“最大输入”与“总窗口减最大输出”中的较小值。</p></div>
+<p class="field-hint" data-testid="effective-input-tokens">当前有效输入上限：{{ effectiveInputTokens === null ? '未额外限制' : `${effectiveInputTokens} tokens` }}。可选字节限制仍独立生效。</p>
 <details class="model-advanced"><summary>可选传输保护（bytes）</summary><p class="field-hint">字节数限制请求与响应的传输大小，不代表 token 数。显式设置后可能先于 token 额度生效；留空取消字节限制。</p><div class="two-fields"><div class="field"><label for="model-prompt-bytes">请求字节上限</label><input id="model-prompt-bytes" type="number" min="1" step="1" :value="limitModel.max_prompt_bytes ?? ''" :disabled="locked || agentLimitsLoading" placeholder="不限制" @input="setModelLimit('max_prompt_bytes', $event)"/></div><div class="field"><label for="model-response-bytes">响应字节上限</label><input id="model-response-bytes" type="number" min="1" step="1" :value="limitModel.max_response_bytes ?? ''" :disabled="locked || agentLimitsLoading" placeholder="不限制" @input="setModelLimit('max_response_bytes', $event)"/></div></div><button class="btn small" :disabled="locked || agentLimitsLoading" @click="removeByteLimits">取消字节限制</button></details><p v-if="limitsError" class="note amber" role="alert">{{ limitsError }}</p>
-</div><div class="panel-footer"><span>API key 仅本次会话有效，刷新后须重新填写</span><button class="btn primary" :disabled="locked || agentLimitsLoading || !!limitsError" @click="action(saveModelLimits)">保存配置</button></div></section><aside class="panel"><div class="panel-head"><h2>运行前检查</h2></div><div class="panel-body"><div class="setup-check"><strong>{{ config.sources?.length || 0 }} 个数据来源</strong><button class="text-button" @click="tab = 'inputs'">配置数据接入</button></div><div class="setup-check"><strong>{{ documentFiles.length }} 个知识文档</strong><button class="text-button" @click="tab = 'documents'">配置知识文档</button></div><div class="setup-check"><strong>{{ purpose.trim() ? '已填写抽取目标' : '尚未填写抽取目标' }}</strong><button class="text-button" @click="tab = 'goal'">配置抽取目标</button></div></div></aside></div><section class="panel advanced-panel"><div class="panel-head"><h2>完整项目配置</h2><span class="badge">JSON 编辑 · 服务端保存 YAML</span></div><div class="panel-body"><p class="field-hint editor-hint">开始抽取前会保存此处修改；与普通表单同时修改时，会先提示选择。</p><label class="sr-only" for="advanced-config">完整项目 JSON 配置</label><textarea id="advanced-config" v-model="advanced" class="code-editor" :disabled="locked" spellcheck="false"/></div><div class="panel-footer"><span>完整配置不接受明文密码或 API key，请使用上方连接表单</span><div class="actions"><button v-if="advancedDirty" class="btn" :disabled="locked" @click="advanced = JSON.stringify(config, null, 2)">放弃修改</button><button class="btn primary" :disabled="locked" @click="saveAdvanced">保存完整配置</button></div></div></section></template>
+</div><div class="panel-footer"><span>API key 仅本次会话有效，刷新后须重新填写</span><button class="btn primary" :disabled="locked || agentLimitsLoading || !!limitsError" @click="action(saveModelLimits)">保存配置</button></div></section><aside class="panel"><div class="panel-head"><h2>运行前检查</h2></div><div class="panel-body"><div class="setup-check"><strong>{{ config.sources?.length || 0 }} 个数据来源</strong><button class="text-button" @click="tab = 'inputs'">配置数据接入</button></div><div class="setup-check"><strong>{{ documentFiles.length }} 个知识文档</strong><button class="text-button" @click="tab = 'documents'">配置知识文档</button></div><div class="setup-check"><strong>{{ purpose.trim() ? '已填写抽取目标' : '尚未填写抽取目标' }}</strong><button class="text-button" @click="tab = 'goal'">配置抽取目标</button></div></div></aside></div><section class="panel advanced-panel"><div class="panel-head"><h2>完整项目配置</h2><span class="badge">JSON 编辑 · 服务端保存 YAML</span></div><div class="panel-body"><p class="field-hint editor-hint">开始抽取前会保存此处修改；与普通表单同时修改时，会先提示选择。</p><label class="sr-only" for="advanced-config">完整项目 JSON 配置</label><textarea id="advanced-config" v-model="advanced" class="code-editor" :disabled="locked" spellcheck="false"/></div><div class="panel-footer"><span>完整配置不接受明文密码或 API key，请使用上方连接表单</span><div class="actions"><button v-if="advancedDirty && (formDirty || agentLimitsDirty)" class="btn" :disabled="locked" @click="discardFormEdits">放弃表单修改</button><button v-if="advancedDirty" class="btn" :disabled="locked" @click="advanced = JSON.stringify(config, null, 2)">放弃修改</button><button class="btn primary" :disabled="locked" @click="saveAdvanced">保存完整配置</button></div></div></section></template>
         </div>
       </template>
     </main>

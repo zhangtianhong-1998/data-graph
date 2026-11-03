@@ -142,3 +142,48 @@ def test_model_limits_save_for_inline_and_agent_file(client):
     for invalid in (0,33,1.5,None):
         assert client.put(path,json={'max_discovery_steps':invalid},headers={'If-Match':etag}).status_code==400
     assert client.get(path).json()['max_discovery_steps']==24
+
+
+def test_filtered_trace_pages_preserve_actual_sequence_and_complete_export(client):
+    rid,_,sink=seed(client)
+    sink('progress',{'stage':'discovery'})
+    sink('tool_call',{'call':{'name':'check_fd','input':{'columns':['A','B']}}})
+    sink('model_wire_response',{'body':'data: raw response'})
+    sink('tool_result',{'name':'check_fd','content':[{'type':'text','text':'{"status":"ok"}'}]})
+    path=f'/api/projects/p/runs/{rid}/trace'
+    value=client.get(path+'?view=agent&offset=20&limit=4').json()
+    assert value['total_events']==25 and value['recorded_events']==27
+    assert [event['seq'] for event in value['events']]==[21,22,23,25]
+    assert value['next_offset']==24
+    assert [e['seq'] for e in client.get(path+'?view=agent&offset=24').json()['events']]==[27]
+    runtime=client.get(path+'?view=runtime').json()
+    assert [event['seq'] for event in runtime['events']]==[24,26]
+    assert len(client.get(path+'/export').text.splitlines())==27
+    assert client.get(path+'?view=not-a-view').status_code==400
+
+
+def test_legacy_kind_cache_does_not_reread_all_payloads_on_each_poll(client,monkeypatch):
+    import lightgraph.web.run_traces as reader
+    rid,_,sink=seed(client)
+    # Old frozen bundles contain only seq/offset/length. Never rewrite them.
+    entries=[json.loads(line) for line in sink.index_path.read_text().splitlines()]
+    for item in entries:item.pop('kind',None)
+    original=''.join(json.dumps(item)+'\n' for item in entries)
+    sink.index_path.write_text(original)
+    calls=[]
+    real=reader._read_event
+    def tracked(stream,item):
+        calls.append(item['seq'])
+        return real(stream,item)
+    monkeypatch.setattr(reader,'_read_event',tracked)
+    path=f'/api/projects/p/runs/{rid}/trace?view=agent&limit=2'
+    assert client.get(path).json()['total_events']==23
+    assert len(calls)==25  # One legacy scan, plus two displayed payloads.
+    calls.clear()
+    assert client.get(path).json()['total_events']==23
+    assert calls==[1,2]
+    sink('tool_result',{'name':'check_fd','content':[]})
+    calls.clear()
+    assert client.get(path).json()['total_events']==24
+    assert calls==[1,2]  # Append reuses old kinds; new entries include the kind.
+    assert sink.index_path.read_text().startswith(original)

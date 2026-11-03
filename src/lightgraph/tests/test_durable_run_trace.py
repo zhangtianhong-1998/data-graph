@@ -40,7 +40,7 @@ def test_trace_retains_complete_inputs_and_index_until_manual_cleanup(tmp_path):
     assert events(path)[0]['data']['messages'][0]['content']==content
     assert events(path)[0]['data']['tool_schema']['properties']['password']=={'type':'string','description':'User secret'}
     index=json.loads(sink.index_path.read_text())
-    assert index=={'seq':1,'offset':0,'length':path.stat().st_size}
+    assert index=={'seq':1,'offset':0,'length':path.stat().st_size,'kind':'model_request'}
     assert trace_path(tmp_path/'run_a.result.json')==path
     assert trace_artifacts(path)==(path,sink.index_path,sink.status_path)
     # New binding continues the same archive, without replacing prior content.

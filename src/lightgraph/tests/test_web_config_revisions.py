@@ -42,6 +42,43 @@ def test_two_tabs_cannot_replace_a_newer_config_and_revision_survives_restart(cl
     assert client.put('/api/projects/p/config',json=first).status_code==428
 
 
+@pytest.mark.parametrize('standalone_agent', [False, True])
+def test_model_limits_return_the_saved_configuration_in_the_same_revision(client, standalone_agent):
+    workspace=client.app.state.workspace
+    original_path=original_bytes=None
+    if standalone_agent:
+        original_bytes=yaml.safe_dump({'name':'review-agent','llm':{'mode':'disabled','max_calls':240}}).encode()
+        asset=upload(client,'agent.yaml',original_bytes).json()
+        config,tag=current(client)
+        config.pop('model',None)
+        config['agent_config']=asset['relative_path']
+        assert client.put('/api/projects/p/config',json=config,headers={'If-Match':tag}).status_code==200
+        original_path=workspace.file_path('p',asset['file_id'])
+    desired={'max_prompt_tokens':1048576,'max_output_tokens':65536,'context_window_tokens':None}
+    _,tag=current(client)
+    response=client.put('/api/projects/p/model-limits?include_config=true',json=desired,headers={'If-Match':tag})
+    assert response.status_code==200,response.text
+    saved=response.json()
+    actual,current_tag=current(client)
+    assert response.headers['etag']==current_tag
+    assert saved['config']==actual
+    assert all(saved['limits'][key]==value for key,value in desired.items())
+    assert client.get('/api/projects/p/model-limits').json()==saved['limits']
+    reopened=Workspace(workspace.root)
+    assert reopened.get_config('p')==saved['config']
+    effective=reopened.resolved_config('p').resolved_model
+    assert all(getattr(effective,key)==value for key,value in desired.items())
+    if standalone_agent:
+        assert original_path.read_bytes()==original_bytes
+        assert saved['config']['agent_config']!=asset['relative_path']
+        assert 'model' not in saved['config']
+        assert effective.max_calls==240
+    # A stale tab may not save either a standalone or an inline snapshot.
+    stale=client.put('/api/projects/p/model-limits?include_config=true',json={'max_output_tokens':128},headers={'If-Match':tag})
+    assert stale.status_code==409
+    assert current(client)==(actual,current_tag)
+
+
 def test_asset_binding_import_and_run_check_the_same_revision(client,monkeypatch):
     file=upload(client,'note.md',b'# context').json()
     imported=upload(client,'config.yaml',b'sources: []\ngoal: {purpose: imported}').json()

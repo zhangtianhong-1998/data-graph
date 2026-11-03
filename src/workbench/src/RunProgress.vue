@@ -79,7 +79,8 @@ function toggleFollow() {
   follow.value = !follow.value
   if (follow.value) void toBottom()
 }
-watch(() => [props.run.run_id, props.run.project_id], () => { follow.value = true; void toBottom() })
+// Polling replaces the run object. Only a different identity should reset the reader's position.
+watch([() => props.run.run_id, () => props.run.project_id], () => { follow.value = true; void toBottom() })
 watch(() => events.value.at(-1)?.seq, () => { if (follow.value) void toBottom() }, { immediate: true })
 </script>
 

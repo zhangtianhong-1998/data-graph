@@ -22,12 +22,15 @@ afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.useRe
 describe('persistent run trace viewer', () => {
   it('shows exact recorded inputs on demand and exposes unpaged native export', async () => {
     await mount()
-    expect(api.request.mock.calls[0][0]).toBe('/projects/p/runs/run_a/trace?offset=0&limit=10')
+    expect(api.request.mock.calls[0][0]).toBe('/projects/p/runs/run_a/trace?offset=0&limit=10&view=agent')
     expect(root.querySelector('pre')).toBeNull()
     const details = root.querySelector<HTMLDetailsElement>('.trace-step')!
     details.open = true; details.dispatchEvent(new Event('toggle')); await nextTick()
+    expect(root.textContent).toContain('消息 1 · 用户输入')
+    const message = root.querySelector<HTMLDetailsElement>('.trace-message')!
+    message.open = true; message.dispatchEvent(new Event('toggle')); await nextTick()
     expect(root.querySelector('pre')!.textContent).toContain('input_1')
-    expect(root.querySelector('pre')!.textContent).toContain('tools')
+    expect(root.textContent).toContain('本次可用工具定义')
     expect(root.querySelector('a')!.getAttribute('href')).toBe('/api/projects/p/runs/run_a/trace/export')
     expect(root.textContent).toContain('运行结束后保留')
     expect(api.request.mock.calls.every(([, options]) => !options?.method || options.method === 'GET')).toBe(true)
@@ -35,10 +38,44 @@ describe('persistent run trace viewer', () => {
   it('uses cursors for next and previous pages without truncating the export', async () => {
     api.request.mockImplementation(async path => page(path.includes('offset=1') ? 2 : 1))
     await mount(); button('下一页轨迹').click()
-    await vi.waitFor(() => expect(root.textContent).toContain('第 2 步'))
+    await vi.waitFor(() => expect(root.textContent).toContain('记录 #2'))
     expect(button('下一页轨迹').disabled).toBe(true)
     button('上一页轨迹').click()
-    await vi.waitFor(() => expect(root.textContent).toContain('第 1 步'))
+    await vi.waitFor(() => expect(root.textContent).toContain('记录 #1'))
+  })
+  it('filters before paging and resets the page only when the selected view changes', async () => {
+    api.request.mockImplementation(async path => page(path.includes('offset=1') ? 2 : 1))
+    await mount(); button('下一页轨迹').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('记录 #2'))
+    const select = root.querySelector<HTMLSelectElement>('[aria-label="轨迹显示内容"]')!
+    expect(select.value).toBe('agent')
+    select.value = 'all'; select.dispatchEvent(new Event('change'))
+    await vi.waitFor(() => expect(api.request.mock.calls.at(-1)![0]).toContain('offset=0&limit=10&view=all'))
+    expect(button('上一页轨迹').disabled).toBe(true)
+    expect(root.querySelector('a')!.getAttribute('href')).toBe('/api/projects/p/runs/run_a/trace/export')
+  })
+  it('keeps page, expanded messages and scroll when the same run object is replaced by polling', async () => {
+    api.request.mockImplementation(async path => page(path.includes('offset=1') ? 2 : 1))
+    const props = await mount(); button('下一页轨迹').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('记录 #2'))
+    const details = root.querySelector<HTMLDetailsElement>('.trace-step')!
+    details.open = true; details.dispatchEvent(new Event('toggle')); await nextTick()
+    const message = root.querySelector<HTMLDetailsElement>('.trace-message')!
+    message.open = true; message.dispatchEvent(new Event('toggle')); await nextTick()
+    const payload = root.querySelector<HTMLPreElement>('.trace-payload')!
+    payload.scrollTop = 50
+    const calls = api.request.mock.calls.length
+    props.run = { ...props.run }
+    await nextTick(); await nextTick()
+    expect(api.request.mock.calls.length).toBe(calls)
+    expect(details.open).toBe(true); expect(message.open).toBe(true)
+    expect(payload.scrollTop).toBe(50)
+    expect(root.textContent).toContain('input_2')
+    button('刷新轨迹').click()
+    await vi.waitFor(() => expect(api.request.mock.calls.length).toBe(calls + 1))
+    expect(api.request.mock.calls.at(-1)![0]).toContain('offset=1')
+    expect(root.querySelector('.trace-payload')).toBe(payload)
+    expect(payload.scrollTop).toBe(50)
   })
   it('deletes only after explicit confirmation and preserves the report contract', async () => {
     api.request.mockImplementation(async (_path, options) => options?.method === 'DELETE' ? {} : page())
@@ -84,9 +121,9 @@ describe('persistent run trace viewer', () => {
     api.request.mockImplementation(path => path.includes('run_a') ? new Promise(resolve => { finish = resolve }) : Promise.resolve(page(2)))
     button('刷新轨迹').click(); await nextTick()
     props.run.run_id = 'run_b'
-    await vi.waitFor(() => expect(root.textContent).toContain('第 2 步'))
+    await vi.waitFor(() => expect(root.textContent).toContain('记录 #2'))
     finish(page(1)); await nextTick(); await nextTick()
-    expect(root.textContent).not.toContain('第 1 步')
+    expect(root.textContent).not.toContain('记录 #1')
     expect(root.querySelector('a')!.getAttribute('href')).toContain('run_b')
   })
 })

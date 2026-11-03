@@ -112,6 +112,40 @@ describe('运行进度与过程日志', () => {
     expect(log.getAttribute('aria-live')).toBe('off')
   })
 
+  it.each(['滚动阅读', '暂停跟随'])('同一运行的轮询响应不会重置%s状态和位置', async mode => {
+    const state = await render()
+    const log = scrollArea(); log.scrollTop = 100
+    if (mode === '滚动阅读') log.dispatchEvent(new Event('scroll'))
+    else button().click()
+    await flush()
+    expect(button().textContent).toBe('继续跟随')
+
+    // The API replaces the whole run object, including its nested snapshot, every second.
+    for (let seq = 2; seq <= 4; seq++) {
+      const refreshed = JSON.parse(JSON.stringify(state.run)) as Run
+      refreshed.progress!.events.push(event(seq))
+      if (seq === 4) { refreshed.status = 'completed'; refreshed.stage = 'finished' }
+      state.run = refreshed
+      await flush()
+      expect(root.querySelector('[role="log"]')).toBe(log)
+      expect(log.scrollTop).toBe(100)
+      expect(button().textContent).toBe('继续跟随')
+      expect(log.getAttribute('aria-live')).toBe('off')
+      expect(root.textContent).toContain(`table_${seq}`)
+    }
+    button().click(); await flush()
+    expect(log.scrollTop).toBe(900)
+  })
+
+  it('同一运行没有新事件的轮询不会主动滚动日志', async () => {
+    const state = await render()
+    const log = scrollArea(); log.scrollTop = 100
+    // A poll may arrive before the browser dispatches the user's scroll event.
+    state.run = JSON.parse(JSON.stringify(state.run)) as Run
+    await flush()
+    expect(log.scrollTop).toBe(100)
+  })
+
   it('切换运行不混入旧日志，并恢复新运行的默认跟随', async () => {
     const state = await render()
     button().click(); await flush()

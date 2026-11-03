@@ -570,12 +570,16 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return versioned(pid,read_model_limits(workspace,pid))
 
     @app.put('/api/projects/{pid}/model-limits')
-    def update_model_limits(pid:str,data:dict,if_match:str|None=Header(default=None)):
+    def update_model_limits(pid:str,data:dict,if_match:str|None=Header(default=None),include_config:bool=False):
         from .model_limits import save_model_limits
         with workspace.lock(pid):
             mutable(pid)
             workspace.require_config_revision(pid,if_match)
-            return versioned(pid,save_model_limits(workspace,pid,data))
+            limits=save_model_limits(workspace,pid,data)
+            # The workbench needs the new versioned Agent reference alongside
+            # the saved values, without a separate read racing another writer.
+            value={'config':workspace.get_config(pid),'limits':limits} if include_config else limits
+            return versioned(pid,value)
 
     @app.get('/api/projects/{pid}/config/export')
     def export_config(pid:str):
@@ -682,10 +686,10 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return manager.cancel(pid,rid)
 
     @app.get('/api/projects/{pid}/runs/{rid}/trace')
-    def run_trace(pid:str,rid:str,offset:int=0,limit:int=10):
+    def run_trace(pid:str,rid:str,offset:int=0,limit:int=10,view:str='all'):
         from .run_traces import read_run_trace
         with workspace.lock(pid):
-            return read_run_trace(manager,pid,rid,offset=offset,limit=limit)
+            return read_run_trace(manager,pid,rid,offset=offset,limit=limit,view=view)
 
     @app.get('/api/projects/{pid}/runs/{rid}/trace/export')
     def run_trace_export(pid:str,rid:str):
