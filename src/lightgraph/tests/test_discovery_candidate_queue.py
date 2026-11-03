@@ -136,26 +136,6 @@ def test_decisions_are_revision_checked_isolated_and_never_publish(tmp_path):
         assert not store.heads()
 
 
-def test_retry_request_reopens_unresolved_table_without_requiring_global_rediscovery(monkeypatch,tmp_path):
-    from lightgraph.pipeline import run_pipeline
-    from lightgraph.runtime.config import RunConfig
-    from lightgraph.sources import MemorySource
-    from lightgraph.tests.test_agent_pipeline import client,input_packet,response,table,group
-    config=RunConfig(sources=[],output_dir=str(tmp_path),max_identity_reviews=0)
-    t=table('t',['code','name']);calls=[]
-    def handler(request):
-        _,packet=input_packet(request);calls.append(packet['task'])
-        return response(group(packet,'code','name') if len(calls)>1 else {'task':packet['task'],'abstain':True})
-    with MemorySource([t],{'public.t':[('1','item')]}) as source:
-        run_pipeline(config,[source],model=client(monkeypatch,handler))
-    with GraphStore(tmp_path/'graph.sqlite') as store:
-        queue=CandidateQueue(store,config.goal,config.scopes,config.isolation_domain,config.sources)
-        queue.record(DiscoveryResult(pending_candidates=[candidate()]))
-        queue.decide(candidate().candidate_id,'retry',1)
-    with MemorySource([t],{'public.t':[('1','item')]}) as source:
-        report=run_pipeline(config,[source],model=client(monkeypatch,handler))
-    assert report.counts['business_nodes']==1
-    assert calls==['T0_discovery','T0_discovery']
 
 
 def test_replacement_is_resolved_only_for_its_published_revision():

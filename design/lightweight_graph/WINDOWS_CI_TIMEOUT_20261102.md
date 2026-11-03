@@ -1,5 +1,7 @@
 # Windows 完整回归超时修复
 
+> 设计状态（2026-11-03）：本页保留原版本的方案、故障与验证记录。当前通用构图目标、Harness 迁移与 YAML 产物规范见 [按用户目标自主构图](GENERIC_GRAPH_CONSTRUCTION.md)。本文的历史通过结果不证明新路径已验收；未被迁移改变的接入、执行、权限及平台约束继续适用。
+
 2026-11-02，依据提交 `798d8a0` 的 [GitHub Actions 运行 41374038459](https://github.com/zhangtianhong-1998/data-graph/actions/runs/41374038459)。
 
 Windows 路径校验修复已经生效：Python 3.11 和 3.13 的冻结实验 17 项回归都通过。Windows 3.13 的完整套件为 2,240 项通过、2 项按已有平台条件跳过，耗时 25 分 15 秒。macOS、Linux 和前端也通过。

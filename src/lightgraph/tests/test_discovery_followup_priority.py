@@ -29,53 +29,8 @@ def supported(packet):
                                             'stance':'supports'}]})
 
 
-def test_single_hierarchy_does_not_start_optional_cross_rule_discovery(monkeypatch,tmp_path):
-    source_table=table('paths',['c1','n1','c2','n2']);tasks=[]
-    def handler(request):
-        _,packet=input_packet(request);tasks.append(packet['task'])
-        if packet['task']=='semantic_review':return supported(packet)
-        assert packet['task']=='T0_discovery'
-        return response({'task':packet['task'],'proposals':[hierarchy(packet)]})
-    with MemorySource([source_table],{'public.paths':[('A','Parent','B','Child')]}) as source:
-        report=run_pipeline(RunConfig(sources=[],output_dir=str(tmp_path),max_identity_reviews=0),
-                            [source],model=client(monkeypatch,handler))
-    assert report.counts['business_nodes']==2 and report.counts['business_edges']==1
-    assert len(report.rules_published)==1
-    assert tasks==['T0_discovery','semantic_review']
-    assert not report.counts.get('relation_discovery_tasks')
-    assert not any(i['code']=='relation_discovery_pending' for i in report.issues)
 
 
-def test_hierarchy_alias_coverage_keeps_complete_mapping_and_precedes_relations(monkeypatch,tmp_path):
-    source_table=table('paths',['c1','n1','e1','c2','n2','e2','other','other_name']);tasks=[]
-    def handler(request):
-        _,packet=input_packet(request);tasks.append(packet['task'])
-        if packet['task']=='semantic_review':return supported(packet)
-        if packet['task']=='T0_discovery':
-            batch=group(packet,'other','other_name','Metric');batch['proposals'].append(hierarchy(packet))
-            return response(batch)
-        if packet['task']=='T1_table_discovery':
-            assert set(packet['iteration_context']['coverage_columns'])=={'e1','e2'}
-            known=next(r for r in packet['iteration_context']['known_rules'] if r['kind']=='wide_hierarchy')
-            assert [l['code'] for l in known['hierarchy_levels']]==['c1','c2']
-            assert known['namespace_columns']==[]
-            assert known['identity_contract']['identity_domain']=='items'
-            assert known['hierarchy_contract']['taxonomy']=='path'
-            assert '完整提案并补映射' in packet['subtask']
-            return response({'task':packet['task'],'proposals':[hierarchy(packet,aliases=True)]})
-        assert packet['task']=='T2_cross_table'
-        return response({'task':packet['task'],'abstain':True})
-    with MemorySource([source_table],{'public.paths':[('A','Parent','PARENT','B','Child','CHILD','M','Metric')]}) as source:
-        report=run_pipeline(RunConfig(sources=[],output_dir=str(tmp_path),max_identity_reviews=0),
-                            [source],model=client(monkeypatch,handler))
-    assert tasks.index('T1_table_discovery')<tasks.index('T2_cross_table')
-    assert report.counts['coverage_attribute_revisions']==1
-    assert len(report.rules_published)==2
-    assert not any(i['code']=='unexplained_columns' for i in report.issues)
-    with GraphStore(tmp_path/'graph.sqlite') as store:
-        nodes=[n for n in store.view({'public'})['nodes'] if n['kind']=='ReportItem']
-        assert {a for n in nodes for a in n['aliases']}=={'PARENT','CHILD'}
-        assert len({r.rule_id for r in store.get_rules()})==2  # Old revision is retained for history.
 
 
 def test_expired_identity_budget_returns_one_issue_and_no_fake_reviews(monkeypatch):

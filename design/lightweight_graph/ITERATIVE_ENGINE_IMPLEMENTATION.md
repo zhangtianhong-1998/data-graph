@@ -1,5 +1,7 @@
 # 2026-10-26 迭代构图引擎实施记录
 
+> 设计状态（2026-11-03）：本页保留原版本的方案、故障与验证记录。当前通用构图目标、Harness 迁移与 YAML 产物规范见 [按用户目标自主构图](GENERIC_GRAPH_CONSTRUCTION.md)。本文的历史通过结果不证明新路径已验收；未被迁移改变的接入、执行、权限及平台约束继续适用。
+
 > 本文记录 `81d04b2` 的实现与验证。后续根据真实运行反馈所做的协议、提案修复和宽层级关系端点改动见[发现引擎修复记录](REAL_DATA_DISCOVERY_REPAIR.md)；下述验证数字属于本轮历史快照。
 
 本轮从 `66225ef3ee75278fd7d5e25700ddba11063b6d92` 开始，在 `codex/iterative-graph-engine` 分支实施，按用户要求合入 GitHub `main`。需求依据为 [US](US.md)、[工作台 US](WORKBENCH_US.md) 和[目标驱动的迭代构图设计](GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)。

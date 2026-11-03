@@ -90,12 +90,13 @@
               "type": "null"
             }
           ],
-          "default": 120000,
+          "default": null,
+          "description": "Legacy cumulative-token setting retained for configuration migration; Harness budgets physical calls and wall time.",
           "title": "Max Tokens"
         },
         "max_discovery_steps": {
           "default": 16,
-          "description": "Maximum model turns per discovery task, including submission and correction; shared call and time limits still apply.",
+          "description": "Legacy per-table setting, accepted when reading old configurations; not used by Harness.",
           "maximum": 32,
           "minimum": 1,
           "title": "Max Discovery Steps",
@@ -103,6 +104,7 @@
         },
         "max_tool_calls": {
           "default": 16,
+          "description": "Legacy source-tool allowance; not used by Harness.",
           "maximum": 64,
           "minimum": 1,
           "title": "Max Tool Calls",
@@ -131,7 +133,7 @@
             }
           ],
           "default": null,
-          "description": "Optional UTF-8 request-byte guard; null disables it. This is not the input token window.",
+          "description": "Legacy request-byte guard retained for configuration migration; not applied by Harness.",
           "title": "Max Prompt Bytes"
         },
         "max_prompt_tokens": {
@@ -173,7 +175,7 @@
             }
           ],
           "default": 32768,
-          "description": "Soft discovery input target: compact old source results proactively; null disables it. Pinned evidence can exceed this target, subject to hard limits.",
+          "description": "Harness working-context target; null disables automatic compaction including overflow recovery. Token-meter estimates are calibrated from provider usage.",
           "title": "Working Context Tokens"
         },
         "max_response_bytes": {
@@ -187,7 +189,7 @@
             }
           ],
           "default": null,
-          "description": "Optional response-byte guard; null disables it. max_output_tokens controls model generation.",
+          "description": "Legacy response-byte guard retained for configuration migration; not applied by Harness.",
           "title": "Max Response Bytes"
         },
         "retries": {
@@ -203,11 +205,11 @@
     }
   },
   "additionalProperties": false,
-  "description": "Separate reusable AgentScope settings; secrets never enter dumps or repr.",
+  "description": "Harness configuration; old framework names migrate, never select an old engine.",
   "properties": {
     "framework": {
-      "const": "agentscope",
-      "default": "agentscope",
+      "const": "deepseek_harness",
+      "default": "deepseek_harness",
       "title": "Framework",
       "type": "string"
     },

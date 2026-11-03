@@ -184,63 +184,6 @@ def test_unexplained_column_names_do_not_expose_sensitive_or_excluded_metadata()
     assert unexplained_columns(table,[],[],goal,RuleEngine(None)) == ['name']
 
 
-def test_pipeline_enriches_cached_shared_rule_and_keeps_reference_publication(monkeypatch,tmp_path):
-    """Exercise prepared rules, dependency publication and schema knowledge together."""
-    from lightgraph.discovery.models import DiscoveryResult
-    from lightgraph.pipeline import run_pipeline
-    from lightgraph.runtime.config import RunConfig
-    tables,rules,rows=fixture()
-    tables[0].columns.append(ColumnSpec(name='measure'))
-    rows['public.occurrences']=[(*row,'unit') for row in rows['public.occurrences']]
-    for rule in rules:rule.dependencies.documents=[]
-    measure=RuleSpec(rule_id='measure',kind='column_group_entity',source=rules[0].source,
-        identity={'key_columns':['measure'],'entity_kind':'Measure'})
-    relation=RuleSpec(rule_id='uses',kind='reference',source=rules[0].source,
-        identity={'key_columns':['code','measure'],'entity_kind':'Metric'},
-        relation={'source_rule_id':'occurrences','target_rule_id':'measure',
-                  'source_columns':['code'],'target_columns':['measure'],'relation':'uses_measure'},
-        evidence={'semantic_basis':['explicit_measure_mapping']})
-    config=RunConfig(sources=[],output_dir=str(tmp_path/'out'),max_identity_reviews=0)
-    with MemorySource(tables,rows) as source:
-        first=run_pipeline(config,[source],rules=[*rules,measure,relation])
-    assert first.counts['business_nodes']==3 and first.counts['business_edges']==2,first.model_dump()
-    with GraphStore(tmp_path/'out/graph.sqlite') as store:
-        before=store.view({'public'})
-    monkeypatch.setattr('lightgraph.discovery.discover',lambda *a,**kw:DiscoveryResult())
-    monkeypatch.setattr('lightgraph.discovery.discover_references',lambda *a,**kw:
-        DiscoveryResult(relation_table_outcomes={n:'resolved' for n in kw['table_refs']}))
-    with MemorySource(tables,rows) as source:
-        report=run_pipeline(config,[source],model=SimpleNamespace(explore=lambda:None,usage={'calls':0}))
-    assert report.status=='COMPLETED',report.model_dump()
-    assert report.counts['coverage_shared_label_columns']==1
-    assert report.counts['publication_groups_failed']==0
-    assert report.counts['business_nodes']==3 and report.counts['business_edges']==2
-    assert set(report.rules_published)=={'occurrences','definitions','measure','uses'}
-    assert report.counts['llm_calls']==0
-    with GraphStore(tmp_path/'out/graph.sqlite') as store:
-        after=store.view({'public'})
-        assert {n['id'] for n in before['nodes'] if n['layer']=='business'} == {
-            n['id'] for n in after['nodes'] if n['layer']=='business'}
-        assert {(e['source'],e['relation'],e['target']) for e in before['edges']
-            if e['relation']=='uses_measure'} == {(e['source'],e['relation'],e['target'])
-            for e in after['edges'] if e['relation']=='uses_measure'}
-        latest={}
-        for rule in store.get_rules():
-            if rule.rule_id not in latest or rule.revision>latest[rule.rule_id].revision:latest[rule.rule_id]=rule
-        assert latest['occurrences'].revision==2
-        assert latest['occurrences'].attributes.single_valued=={'label':'name'}
-        supports={s['id']:s for s in after['supports']}
-        labels=[f for f in after['facts'] if f['fact_kind']=='PropertyValue'
-                and f['payload']['name']=='label' and f['payload']['value'] in {'Alpha','Beta'}]
-        assert len(labels)==2
-        assert all({supports[s]['rule_id'] for s in fact['support_ids']} ==
-                   {'occurrences','definitions'} for fact in labels)
-        knowledge=json.loads(store.connection.execute(
-            "SELECT payload FROM schema_knowledge WHERE source_ref LIKE '%occurrences%' ORDER BY revision DESC LIMIT 1"
-        ).fetchone()['payload'])
-        obj=next(o for o in knowledge['objects'] if o.get('rule_id')=='occurrences'
-                 and o['status']=='published')
-        assert obj['rule_revision']==2 and len(obj['label_columns'])==1
 
 
 @pytest.mark.parametrize('max_rounds,expected_state',[(1,'deferred'),(2,'unresolved')])

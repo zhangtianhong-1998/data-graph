@@ -1,0 +1,94 @@
+schema_version: 1
+updated: '2026-11-03'
+purpose: 按用户目的从事实数据自主发现图谱；本轮尚未登记真实模型或客户语义验收。
+design: GENERIC_GRAPH_CONSTRUCTION.md
+scope:
+  current_target: graph
+  kernel: deepseek_harness
+  knowledge_format: yaml
+  excluded_current_work:
+    - ontology_skill
+    - data_agent
+    - question_answering_application
+evaluation_boundary:
+  engineering: 契约、工具、持久化、执行与内核接线；可使用离线替身。
+  model_discovery: Agent 只读取用户目标、授权数据和材料；Gold 和参考规则由独立评测器读取。
+  customer: 客户环境、真实数据语义与部署另行验证。
+engineering_snapshot:
+  date: '2026-11-03'
+  kernel_revision: 5badb15009ae1756c3afe0ae0cef1faafc290ccc
+  current_contracts_passed: 249
+  final_kernel_unit_and_integration_passed: 25
+  frontend_passed: 239
+  complete_python_suite:
+    passed: 2559
+    failed: 143
+    skipped: 9
+  model_endpoint: loopback_scripted_fixture
+  external_model_called: false
+  autonomous_discovery_acceptance: not_run
+  scope: 测试集合可能重叠，数量不可相加；工程接线与脚本生成映射不证明真实模型自主发现。
+  status_document: ../../IMPLEMENTATION_STATUS.md
+  migration_gaps: CONSTRUCTION_MIGRATION_GAPS.md
+execution_record_fields:
+  - code_revision
+  - input_revision
+  - goal_revision
+  - kernel_revision
+  - skill_revision
+  - model
+  - command
+  - evidence
+  - result
+  - remaining_scope
+scenarios:
+  - id: G01
+    title: 表列改名
+    acceptance_status: not_run
+    expected: 根据剩余元数据、内容和文档发现映射，不依赖固定业务列名；证据不足明确未决。
+    execution_records: []
+  - id: G02
+    title: 异构模式与非经营分析目标
+    acceptance_status: not_run
+    expected: 在宽表、长表、关联表及其他业务目标下选择有依据的对象和关系映射。
+    execution_records: []
+  - id: G03
+    title: 同一对象多位置
+    acceptance_status: not_run
+    expected: 同一身份保留多个出现位置及有效关系的支持；不按层位制造重复实体。
+    execution_records: []
+  - id: G04
+    title: 跨表身份与关系
+    acceptance_status: not_run
+    expected: 共享身份与建立关系分别判断，区分同名异义、同码异义和真正共享对象。
+    execution_records: []
+  - id: G05
+    title: 局部失败与修订
+    acceptance_status: not_run
+    expected: 坏 YAML、错误字段或候选反证返回可修正诊断，保存成果和独立候选不丢失。
+    execution_records: []
+  - id: G06
+    title: 压缩与证据找回
+    acceptance_status: not_run
+    expected: 压缩不删除原始记录；业务状态从工作区恢复，旧证据能够按需读取。
+    execution_records: []
+  - id: G07
+    title: 中断与来源变化
+    acceptance_status: not_run
+    expected: 从同一工作区继续并保留修订；目标或来源变化触发适用性检查。
+    execution_records: []
+  - id: G08
+    title: 截断及依赖完整性
+    acceptance_status: not_run
+    expected: 截断、超时、引用或共享身份不一致不能伪装为完整验证或正式发布。
+    execution_records: []
+  - id: G09
+    title: YAML 往返
+    acceptance_status: not_run
+    expected: 编码、身份、关系、属性与引用在保存读取后保持一致，拒绝重复键和危险标签。
+    execution_records: []
+  - id: G10
+    title: 新旧真实模型对照
+    acceptance_status: not_run
+    expected: 使用相同目标、模型和输入，比较正确实体关系、漏发现、误判、未决与调用开销。
+    execution_records: []

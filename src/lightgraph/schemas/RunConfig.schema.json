@@ -27,13 +27,19 @@
       "additionalProperties": false,
       "description": "Operator intent and output scope; these never grant source permissions.",
       "properties": {
+        "target": {
+          "const": "graph",
+          "default": "graph",
+          "title": "Target",
+          "type": "string"
+        },
         "goal_id": {
-          "default": "analysis_knowledge",
+          "default": "user_graph",
           "title": "Goal Id",
           "type": "string"
         },
         "purpose": {
-          "default": "构建业务分析所需的实体和关系，避免展开逐笔业务观测。",
+          "default": "根据用户目的，从授权数据和材料中发现相关对象、属性及关系并构建图谱。",
           "maxLength": 4000,
           "title": "Purpose",
           "type": "string"
@@ -129,6 +135,41 @@
       "title": "ExtractionGoal",
       "type": "object"
     },
+    "GraphScopeBinding": {
+      "additionalProperties": false,
+      "description": "Operator-owned visibility mapping; never accepted from an Agent draft.",
+      "properties": {
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "schema": {
+          "default": "public",
+          "title": "Schema",
+          "type": "string"
+        },
+        "table": {
+          "minLength": 1,
+          "title": "Table",
+          "type": "string"
+        },
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Columns",
+          "type": "array"
+        }
+      },
+      "required": [
+        "source_id",
+        "table"
+      ],
+      "title": "GraphScopeBinding",
+      "type": "object"
+    },
     "ModelConfig": {
       "additionalProperties": false,
       "properties": {
@@ -219,12 +260,13 @@
               "type": "null"
             }
           ],
-          "default": 120000,
+          "default": null,
+          "description": "Legacy cumulative-token setting retained for configuration migration; Harness budgets physical calls and wall time.",
           "title": "Max Tokens"
         },
         "max_discovery_steps": {
           "default": 16,
-          "description": "Maximum model turns per discovery task, including submission and correction; shared call and time limits still apply.",
+          "description": "Legacy per-table setting, accepted when reading old configurations; not used by Harness.",
           "maximum": 32,
           "minimum": 1,
           "title": "Max Discovery Steps",
@@ -232,6 +274,7 @@
         },
         "max_tool_calls": {
           "default": 16,
+          "description": "Legacy source-tool allowance; not used by Harness.",
           "maximum": 64,
           "minimum": 1,
           "title": "Max Tool Calls",
@@ -260,7 +303,7 @@
             }
           ],
           "default": null,
-          "description": "Optional UTF-8 request-byte guard; null disables it. This is not the input token window.",
+          "description": "Legacy request-byte guard retained for configuration migration; not applied by Harness.",
           "title": "Max Prompt Bytes"
         },
         "max_prompt_tokens": {
@@ -302,7 +345,7 @@
             }
           ],
           "default": 32768,
-          "description": "Soft discovery input target: compact old source results proactively; null disables it. Pinned evidence can exceed this target, subject to hard limits.",
+          "description": "Harness working-context target; null disables automatic compaction including overflow recovery. Token-meter estimates are calibrated from provider usage.",
           "title": "Working Context Tokens"
         },
         "max_response_bytes": {
@@ -316,7 +359,7 @@
             }
           ],
           "default": null,
-          "description": "Optional response-byte guard; null disables it. max_output_tokens controls model generation.",
+          "description": "Legacy response-byte guard retained for configuration migration; not applied by Harness.",
           "title": "Max Response Bytes"
         },
         "retries": {
@@ -800,6 +843,20 @@
     "goal": {
       "$ref": "#/$defs/ExtractionGoal"
     },
+    "goal_markdown": {
+      "anyOf": [
+        {
+          "maxLength": 64000,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "User-authored Markdown construction objective. Null renders the legacy goal fields; source authorization remains in typed configuration.",
+      "title": "Goal Markdown"
+    },
     "limits": {
       "$ref": "#/$defs/QueryLimits"
     },
@@ -822,6 +879,15 @@
         "type": "string"
       },
       "title": "Scopes",
+      "type": "array"
+    },
+    "scope_bindings": {
+      "description": "Operator-owned source/table columns determining each result support scope. No binding means public; never inferred from identity keys.",
+      "items": {
+        "$ref": "#/$defs/GraphScopeBinding"
+      },
+      "maxItems": 1024,
+      "title": "Scope Bindings",
       "type": "array"
     },
     "max_working_bytes": {

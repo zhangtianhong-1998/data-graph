@@ -44,12 +44,41 @@ jobs:
         run: python -m pip check
       - name: Check credential retention lifecycle
         run: python -m pytest -q src/lightgraph/tests/test_web_credentials.py
-      - name: Check experiment recovery and portability
-        run: python -m pytest -q src/lightgraph/tests/test_evaluation.py src/lightgraph/tests/test_frozen_resume.py src/lightgraph/tests/test_frozen_portability.py src/lightgraph/tests/test_recovery_evidence.py src/lightgraph/tests/test_reference_display.py src/lightgraph/tests/test_submission_scope_options.py src/lightgraph/tests/test_relation_foundation_wait.py src/lightgraph/tests/test_discovery_outcome_status.py src/lightgraph/tests/test_context_operator_pipeline.py
+      - name: Check construction persistence and source safety
+        run: python -m pytest -q src/lightgraph/tests/test_graph_yaml_workspace.py src/lightgraph/tests/test_graph_construction_executor.py src/lightgraph/tests/test_construction_process_lifecycle.py src/lightgraph/tests/test_construction_publication_lifecycle.py src/lightgraph/tests/test_construction_entrypoints.py src/lightgraph/tests/test_web_execution.py
       - name: Run complete test suite
         # End a stalled suite before the job deadline, leaving cleanup time.
         timeout-minutes: ${{ startsWith(matrix.os, 'windows') && 55 || 17 }}
         run: python -m pytest -q --durations=15 -o faulthandler_timeout=90
+
+  agent-runtime:
+    name: Native Agent / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      PYTHONUTF8: '1'
+      LIGHTGRAPH_TEST_HARNESS: '1'
+    steps:
+      - name: Enable long checkout paths on Windows
+        if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm install --global pnpm@11.7.0
+      - run: python -m pip install -e ".[test]"
+      - name: Install locked kernel and persistence support
+        run: python scripts/bootstrap_harness.py
+      - name: Exercise actual kernel with loopback model only
+        run: python -m pytest -q src/lightgraph/tests/test_construction_harness.py src/lightgraph/tests/test_construction_harness_integration.py src/lightgraph/tests/test_web_model_settings_runtime.py
 
   frontend:
     runs-on: ubuntu-latest

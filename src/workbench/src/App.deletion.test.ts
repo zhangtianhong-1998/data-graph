@@ -111,11 +111,11 @@ describe('删除项目与输入', () => {
   })
   it('删除输入后保留未保存的目标与模型，不会发送保存配置请求', async () => {
     mount(); await ready(); button('抽取目标').click(); await nextTick(); await input('purpose', '还没保存的目标')
-    button('Agent 与模型').click(); await nextTick(); await input('model-name', 'unsaved-model')
+    button('模型配置').click(); await nextTick(); await input('model-name', 'unsaved-model')
     button('数据接入').click(); await nextTick(); labelled('移除数据表 db.public.metrics').click(); await nextTick(); button('确认删除').click()
     await vi.waitFor(() => expect(dialog()).toBeNull()); await vi.waitFor(() => expect(button('删除项目').disabled).toBe(false))
     button('抽取目标').click(); await nextTick(); expect(root.querySelector<HTMLTextAreaElement>('#purpose')?.value).toBe('还没保存的目标')
-    button('Agent 与模型').click(); await nextTick(); expect(root.querySelector<HTMLInputElement>('#model-name')?.value).toBe('unsaved-model')
+    button('模型配置').click(); await nextTick(); expect(root.querySelector<HTMLInputElement>('#model-name')?.value).toBe('unsaved-model')
     expect(api.request.mock.calls.some(call => call[1]?.method === 'PUT')).toBe(false)
   })
   it('数据列表仅显示数据文件，YAML 随所选数据在右侧预览', async () => {
@@ -165,7 +165,7 @@ describe('删除项目与输入', () => {
     expect(root.querySelector('.input-metadata')?.textContent).not.toContain('metrics_name')
   })
   it('完整 JSON 尚未保存时阻止局部删除，避免之后保存复活旧来源', async () => {
-    mount(); await ready(); button('Agent 与模型').click(); await nextTick(); await input('advanced-config', '{}')
+    mount(); await ready(); button('模型配置').click(); await nextTick(); await input('advanced-config', '{}')
     button('数据接入').click(); await nextTick(); labelled('删除数据库来源 db').click(); await nextTick()
     expect(dialog()).toBeNull(); expect(root.querySelector('.error-strip')?.textContent).toContain('完整项目配置有未保存修改')
     expect(deletes()).toHaveLength(0)

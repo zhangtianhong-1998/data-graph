@@ -17,8 +17,9 @@ from .memory import MemorySource
 from .budget import BudgetedCursor
 
 class ExcelSource(MemorySource):
-    def __init__(self, path: str | Path, *, source_id: str = "excel", limits: QueryLimits | None = None, header_row: int = 1, include_hidden: bool = False, max_file_bytes: int = 200 * 1024 * 1024, max_rows: int = 200000, max_columns: int = 2000, max_memory_bytes: int = 128 * 1024 * 1024, query_budget=None):
+    def __init__(self, path: str | Path, *, source_id: str = "excel", limits: QueryLimits | None = None, header_row: int = 1, include_hidden: bool = False, max_file_bytes: int = 200 * 1024 * 1024, max_rows: int = 200000, max_columns: int = 2000, max_memory_bytes: int = 128 * 1024 * 1024, query_budget=None, metadata_only: bool = False):
         path = Path(path)
+        self.metadata_only = metadata_only
         self.issues: list[dict] = []
         self.issue_counts: dict[str, int] = {}
         self._pending_formula_columns: dict[str, set[str]] = {}
@@ -43,7 +44,7 @@ class ExcelSource(MemorySource):
                                     raise LightGraphError("excel_xml_entities_forbidden")
                                 tail = data[-32:]
             book = openpyxl.load_workbook(path, read_only=True, data_only=False, keep_links=False)
-            values_book = openpyxl.load_workbook(path, read_only=True, data_only=True, keep_links=False)
+            values_book = None if metadata_only else openpyxl.load_workbook(path, read_only=True, data_only=True, keep_links=False)
         except LightGraphError: raise
         except Exception: raise LightGraphError("excel_parse_failed") from None
         tables, rows = [], {}
@@ -52,9 +53,11 @@ class ExcelSource(MemorySource):
                 if ws.sheet_state != "visible" and not include_hidden: continue
                 if (ws.max_column or 0) > max_columns: raise LightGraphError("excel_column_limit")
                 # Count while reading too: dimensions in source files may lie.
-                source_rows = ws.iter_rows(min_row=header_row)
-                value_rows = values_book[ws.title].iter_rows(min_row=header_row)
+                source_rows = ws.iter_rows(min_row=header_row, max_row=header_row if metadata_only else None)
+                value_rows = iter(()) if values_book is None else values_book[ws.title].iter_rows(min_row=header_row)
                 header = next(source_rows, ()); next(value_rows, ())
+                if metadata_only:
+                    source_rows.close()
                 if not header: continue
                 if any(c.data_type == "f" for c in header): raise LightGraphError("excel_formula_header")
                 last = max((i for i,c in enumerate(header) if c.value is not None), default=-1)
@@ -62,12 +65,18 @@ class ExcelSource(MemorySource):
                 names = [str(c.value) if c.value is not None else "" for c in header[:last+1]]
                 if any(not n for n in names): raise LightGraphError("excel_merged_or_missing_header_requires_schema")
                 if len(names) != len(set(names)): raise LightGraphError("excel_duplicate_header")
-                table = TableSpec(source_id=source_id, schema="public", name=ws.title, columns=[ColumnSpec(name=n, comment="Uploaded Excel header") for n in names])
-                hidden_rows, hidden_columns = self._hidden_positions(path, ws, include_hidden)
+                table = TableSpec(source_id=source_id, schema="public", name=ws.title, columns=[ColumnSpec(
+                    name=n, data_type="unknown" if metadata_only else "text", comment="Uploaded Excel header") for n in names])
+                hidden_rows, hidden_columns = self._hidden_positions(path, ws, include_hidden, columns_only=metadata_only)
                 kept = [i for i in range(len(names)) if i + 1 not in hidden_columns]
                 table.columns = [table.columns[i] for i in kept]
                 if not kept: continue
                 tables.append(table)
+                if metadata_only:
+                    # Header-only sources must not look like empty instance tables.
+                    # execute() explicitly rejects queries instead of returning zero rows.
+                    rows[table.qualified_name] = ()
+                    continue
                 def iterate(sheet=ws, sr=source_rows, vr=value_rows, keep=kept, hidden=hidden_rows, column_names=tuple(names)):
                     for index, (raw, cached) in enumerate(zip(sr, vr), header_row + 1):
                         if index - header_row > max_rows: raise LightGraphError("excel_row_limit")
@@ -96,14 +105,18 @@ class ExcelSource(MemorySource):
                 rows[table.qualified_name] = iterate()
             if not tables: raise LightGraphError("excel_no_visible_tables")
             super().__init__(tables, rows, limits=limits, max_memory_bytes=max_memory_bytes, query_budget=query_budget)
-            self._infer_loaded_types()
+            if not metadata_only:
+                self._infer_loaded_types()
         except LightGraphError:
             if hasattr(self, "_db"): self.close()
             raise
         except Exception:
             if hasattr(self, "_db"): self.close()
             raise LightGraphError("excel_parse_failed") from None
-        finally: book.close(); values_book.close()
+        finally:
+            book.close()
+            if values_book is not None:
+                values_book.close()
 
     def _infer_loaded_types(self):
         """Classify all imported non-null cells using value-free SQL aggregates.
@@ -143,6 +156,8 @@ class ExcelSource(MemorySource):
             physical_columns={table.qualified_name: table.column_names for table in self._tables})
 
     def project(self, table, columns, predicate=None, distinct=True, limit=None):
+        if self.metadata_only:
+            raise LightGraphError("metadata_only_query_forbidden")
         required=set(columns)
         def predicate_columns(value):
             if isinstance(value, ScopeConjunction):
@@ -172,6 +187,8 @@ class ExcelSource(MemorySource):
         from a second catalog then catches their use in SELECT, filters, aliases,
         nested queries and joins without guessing references from SQL text.
         """
+        if self.metadata_only:
+            raise LightGraphError("metadata_only_query_forbidden")
         if self._pending_formula_columns:
             self.compiler.guard.validate(query.sql, query.parameters)
             tables = self.describe()
@@ -188,15 +205,21 @@ class ExcelSource(MemorySource):
         yield from super().execute(query, row_limit=row_limit)
 
     @staticmethod
-    def _hidden_positions(path, ws, include_hidden):
+    def _hidden_positions(path, ws, include_hidden, *, columns_only=False):
         if include_hidden: return set(), set()
         hidden_rows, hidden_columns = set(), set()
         # read_only worksheets omit dimension metadata. Inspect XML without
         # materializing the sheet, using the internal path supplied by openpyxl.
         with zipfile.ZipFile(path) as archive:
             with archive.open(ws._worksheet_path) as stream:
-                for event, elem in ET.iterparse(stream, events=("end",)):
+                for event, elem in ET.iterparse(stream, events=("start", "end")):
                     tag = elem.tag.rsplit("}",1)[-1]
+                    # Column dimensions precede sheetData in worksheet XML. A
+                    # metadata-only load has no need to walk instance row flags.
+                    if columns_only and event == "start" and tag == "sheetData":
+                        break
+                    if event != "end":
+                        continue
                     if tag == "row" and elem.attrib.get("hidden") in ("1", "true"):
                         hidden_rows.add(int(elem.attrib["r"]))
                     elif tag == "col" and elem.attrib.get("hidden") in ("1", "true"):

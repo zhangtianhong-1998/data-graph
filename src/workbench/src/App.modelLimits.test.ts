@@ -16,13 +16,13 @@ function button(name: string) { return [...root.querySelectorAll('button')].find
 async function edit(id: string, value: string) { const input = root.querySelector<HTMLInputElement>(`#${id}`)!; input.value = value; input.dispatchEvent(new Event('input', { bubbles: true })); await nextTick() }
 async function mount() {
   root = document.createElement('div'); document.body.append(root); app = createApp(App); app.mount(root)
-  await vi.waitFor(() => expect(button('Agent 与模型')).toBeDefined())
-  button('Agent 与模型').click(); await nextTick()
+  await vi.waitFor(() => expect(button('模型配置')).toBeDefined())
+  button('模型配置').click(); await nextTick()
   await vi.waitFor(() => expect(button('保存配置').disabled).toBe(false))
 }
 beforeEach(() => {
   clearSessions(); sessionStorage.clear(); revision = 1; calls.length = 0; runModels.length = 0; rejectLimits = false
-  limits = { max_discovery_steps: 16, max_prompt_tokens: 1000, max_output_tokens: 200, timeout_seconds: 60, max_prompt_bytes: 131072, max_response_bytes: 262144, context_window_tokens: 2000000 }
+  limits = { max_calls: 240, max_prompt_tokens: 1000, max_output_tokens: 200, timeout_seconds: 60, max_prompt_bytes: 131072, max_response_bytes: 262144, context_window_tokens: 2000000 }
   config = { sources: [{ id: 'data', kind: 'csv_file' }], goal: { purpose: '保留模型输入' }, model: { mode: 'disabled', ...limits, max_calls: 240, max_tokens: null } }
   vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit = {}) => {
     const method = init.method || 'GET', body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined, headers = new Headers(init.headers)
@@ -87,23 +87,6 @@ describe('visible model limits', () => {
     expect(root.querySelector<HTMLInputElement>('#model-context-tokens')!.value).toBe('')
     expect(root.querySelector('[data-testid="effective-input-tokens"]')?.textContent).toContain('1048576 tokens')
   })
-  it.each([false, true])('saves the working target independently of the hard input cap (Agent file: %s)', async separate => {
-    if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }
-    await mount()
-    expect(root.querySelector<HTMLInputElement>('#model-working-context-tokens')!.value).toBe('32768')
-    await edit('model-working-context-tokens', '24576')
-    await edit('model-input-tokens', '1048576')
-    button('保存配置').click()
-    await vi.waitFor(() => expect((separate ? limits : config.model)?.working_context_tokens).toBe(24576))
-    expect((separate ? limits : config.model)?.max_prompt_tokens).toBe(1048576)
-    app.unmount(); root.remove(); await mount()
-    expect(root.querySelector<HTMLInputElement>('#model-working-context-tokens')!.value).toBe('24576')
-    await edit('model-working-context-tokens', '')
-    button('保存配置').click()
-    await vi.waitFor(() => expect((separate ? limits : config.model)?.working_context_tokens).toBeNull())
-    app.unmount(); root.remove(); await mount()
-    expect(root.querySelector<HTMLInputElement>('#model-working-context-tokens')!.value).toBe('')
-  })
   it('applies the saved Agent snapshot without a fallible follow-up config read', async () => {
     delete config.model; config.agent_config = 'files/agent-original.yaml'
     await mount(); await edit('model-output-tokens', '65536')
@@ -124,21 +107,72 @@ describe('visible model limits', () => {
     expect(calls.find(c => c.method === 'POST' && c.url.endsWith('/runs'))!.headers.get('If-Match')).toBe('"2"')
     expect(runModels[0]!.max_output_tokens).toBe(65536)
   })
-  it('saves per-request token and timeout controls without changing the run call budget', async () => {
+  it('saves token, timeout and whole-run model call controls', async () => {
     await mount()
-    await edit('model-discovery-steps', '24'); await edit('model-input-tokens', '1048576'); await edit('model-output-tokens', '65536'); await edit('model-timeout-seconds', '300')
+    await edit('model-max-calls', '24'); await edit('model-input-tokens', '1048576'); await edit('model-output-tokens', '65536'); await edit('model-timeout-seconds', '300')
     button('保存配置').click()
     await vi.waitFor(() => expect(calls.some(c => c.method === 'PUT')).toBe(true))
-    expect(config.model).toMatchObject({ max_discovery_steps: 24, max_prompt_tokens: 1048576, max_output_tokens: 65536, timeout_seconds: 300, max_calls: 240, max_tokens: null, max_prompt_bytes: 131072 })
+    expect(config.model).toMatchObject({ max_calls: 24, max_prompt_tokens: 1048576, max_output_tokens: 65536, timeout_seconds: 300, max_tokens: null, max_prompt_bytes: 131072 })
     await vi.waitFor(() => expect(button('保存配置').disabled).toBe(false))
     expect(root.querySelector<HTMLInputElement>('#model-input-tokens')!.value).toBe('1048576')
   })
-  it('clears optional byte caps only when the user chooses it and persists null', async () => {
-    await mount(); button('取消字节限制').click(); await edit('model-input-tokens', '')
+  it('does not expose obsolete per-table or byte-budget controls', async () => {
+    await mount()
+    expect(root.querySelector('#model-discovery-steps')).toBeNull()
+    expect(root.querySelector('#model-prompt-bytes')).toBeNull()
+    expect(root.textContent).not.toContain('DeepSeek Harness')
+    expect(root.querySelector('#model-working-context-tokens')).toBeNull()
+    await edit('model-input-tokens', '')
     button('保存配置').click()
-    await vi.waitFor(() => expect(config.model?.max_prompt_bytes).toBeNull())
-    expect(config.model?.max_response_bytes).toBeNull(); expect(config.model?.max_prompt_tokens).toBeNull()
-    expect(config.model?.max_calls).toBe(240)
+    await vi.waitFor(() => expect(config.model?.max_prompt_tokens).toBeNull())
+    expect(config.model?.max_prompt_bytes).toBe(131072)
+  })
+  it('keeps an internal HTTP service opt-in explicit and saves it with model settings', async () => {
+    await mount(); await edit('model-url', 'http://models.internal/v1')
+    const checkbox = root.querySelector<HTMLInputElement>('#model-allow-http')!
+    expect(checkbox).not.toBeNull()
+    expect(checkbox.checked).toBe(false)
+    checkbox.checked = true; checkbox.dispatchEvent(new Event('change', { bubbles: true })); await nextTick()
+    button('保存配置').click()
+    await vi.waitFor(() => expect(config.model?.allow_insecure_http).toBe(true))
+    expect(root.textContent).not.toContain('Harness')
+  })
+  it('requires explicit activation of native persistence for an old trace-disabled project', async () => {
+    config.record_trace = false
+    root = document.createElement('div'); document.body.append(root); app = createApp(App); app.mount(root)
+    await vi.waitFor(() => expect(button('模型配置')).toBeDefined())
+    button('模型配置').click(); await nextTick()
+    expect(button('保存配置').disabled).toBe(true)
+    expect(root.textContent).toContain('运行需要保存轨迹')
+    button('启用运行轨迹').click(); await nextTick()
+    button('保存配置').click()
+    await vi.waitFor(() => expect(config.record_trace).toBe(true))
+    expect(root.textContent).toContain('运行后需手动清理')
+  })
+  it('reports the default Harness capacity and rejects disabling persistence in JSON', async () => {
+    delete config.model!.max_prompt_tokens; delete config.model!.context_window_tokens
+    await mount()
+    expect(root.querySelector('[data-testid="effective-input-tokens"]')?.textContent).toContain('未额外设置')
+    await edit('advanced-config', JSON.stringify({ ...config, record_trace: false }))
+    button('保存完整配置').click()
+    await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('record_trace 设为 true'))
+    expect(calls.some(c => c.method === 'PUT')).toBe(false)
+  })
+  it.each([false, true])('persists the whole-run deadline independently of the Agent file (Agent file: %s)', async separate => {
+    if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }
+    await mount(); await edit('run-seconds', '3600')
+    button('保存配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存，下次启动立即生效'))
+    expect(config.max_run_seconds).toBe(3600)
+    app.unmount(); root.remove(); await mount()
+    expect(root.querySelector<HTMLInputElement>('#run-seconds')!.value).toBe('3600')
+  })
+  it('rejects an invalid whole-run deadline without saving or starting', async () => {
+    await mount(); await edit('run-seconds', '0')
+    expect(root.textContent).toContain('整次运行时限须大于 0')
+    expect(button('保存配置').disabled).toBe(true)
+    expect(button('保存并开始抽取').disabled).toBe(true)
+    expect(calls.some(c => c.method === 'PUT')).toBe(false)
   })
   it('blocks invalid limits and oversized output reservation before a write', async () => {
     await mount(); await edit('model-timeout-seconds', '0')
@@ -150,13 +184,13 @@ describe('visible model limits', () => {
   })
   it('updates limits of a separate Agent file through its revision-checked endpoint', async () => {
     delete config.model; config.agent_config = 'files/agent-original.yaml'
-    await mount(); await edit('model-discovery-steps', '24'); await edit('model-input-tokens', '1048576'); await edit('model-output-tokens', '65536'); await edit('model-timeout-seconds', '300')
+    await mount(); await edit('model-max-calls', '24'); await edit('model-input-tokens', '1048576'); await edit('model-output-tokens', '65536'); await edit('model-timeout-seconds', '300')
     button('保存配置').click()
     await vi.waitFor(() => expect(config.agent_config).toBe('files/agent-new.yaml'))
     const write = calls.find(c => c.method === 'PUT')!
     expect(write.url).toBe('/api/projects/p/model-limits?include_config=true')
     expect(write.headers.get('If-Match')).toBe('"1"')
-    expect(write.body).toEqual({ max_discovery_steps: 24, max_prompt_tokens: 1048576, max_output_tokens: 65536, timeout_seconds: 300, context_window_tokens: 2000000, max_prompt_bytes: 131072, max_response_bytes: 262144 })
+    expect(write.body).toEqual({ max_calls: 24, max_prompt_tokens: 1048576, max_output_tokens: 65536, timeout_seconds: 300, context_window_tokens: 2000000 })
     expect(config.model).toBeUndefined()
   })
   it('persists changed separate-file limits before starting a run', async () => {
@@ -171,62 +205,58 @@ describe('visible model limits', () => {
   it.each([false, true])('saved controls apply to the next run and survive reload (Agent file: %s)', async separate => {
     if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }
     await mount()
-    await edit('model-discovery-steps', '20'); await edit('model-input-tokens', '1048576')
+    await edit('model-max-calls', '20'); await edit('model-input-tokens', '1048576')
     await edit('model-output-tokens', '65536'); await edit('model-timeout-seconds', '420')
-    button('取消字节限制').click(); await nextTick(); button('保存配置').click()
+    button('保存配置').click()
     await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存，下次启动立即生效'))
     await vi.waitFor(() => expect(button('开始抽取').disabled).toBe(false))
     button('开始抽取').click()
     await vi.waitFor(() => expect(runModels).toHaveLength(1))
-    expect(runModels[0]).toMatchObject({ max_discovery_steps: 20, max_prompt_tokens: 1048576, max_output_tokens: 65536, timeout_seconds: 420, max_prompt_bytes: null, max_response_bytes: null })
+    expect(runModels[0]).toMatchObject({ max_calls: 20, max_prompt_tokens: 1048576, max_output_tokens: 65536, timeout_seconds: 420 })
     const start = calls.find(c => c.method === 'POST' && c.url.endsWith('/runs'))!
     expect(start.headers.get('If-Match')).toBe('"2"')
     expect(calls.filter(c => c.method === 'PUT')).toHaveLength(1)
     app.unmount(); root.remove(); await mount()
-    expect(root.querySelector<HTMLInputElement>('#model-discovery-steps')!.value).toBe('20')
+    expect(root.querySelector<HTMLInputElement>('#model-max-calls')!.value).toBe('20')
     expect(root.querySelector<HTMLInputElement>('#model-output-tokens')!.value).toBe('65536')
     expect(root.querySelector<HTMLInputElement>('#model-timeout-seconds')!.value).toBe('420')
   })
-  it('saves guidance and vocabulary edits with separate-file controls before starting', async () => {
+  it('saves Markdown target with separate-file controls before starting', async () => {
     delete config.model; config.agent_config = 'files/agent-original.yaml'
-    await mount(); await edit('model-discovery-steps', '24')
-    button('抽取目标').click(); await nextTick(); await edit('purpose', '保存后的目标')
-    button('添加指导').click(); await nextTick(); await edit('guidance-text-0', '同编码跨位置保留来源支持。')
-    const select = root.querySelector<HTMLSelectElement>('#vocabulary-mode')!
-    select.value = 'specified'; select.dispatchEvent(new Event('change', { bubbles: true })); await nextTick()
-    await edit('entity-kinds', 'ReportItem'); await edit('relation-kinds', 'parent_of')
-    button('Agent 与模型').click(); await nextTick(); button('保存配置').click()
+    await mount(); await edit('model-max-calls', '24')
+    button('抽取目标').click(); await nextTick(); await edit('purpose', '# 保存后的目标\n发现对象关系并保留来源。')
+    button('模型配置').click(); await nextTick(); button('保存配置').click()
     await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存，下次启动立即生效'))
     await vi.waitFor(() => expect(button('开始抽取').disabled).toBe(false))
     const writes = calls.filter(c => c.method === 'PUT')
     expect(writes.map(c => c.url)).toEqual(['/api/projects/p/config', '/api/projects/p/model-limits?include_config=true'])
     expect(writes[1]!.headers.get('If-Match')).toBe('"2"')
-    expect(writes[1]!.body).toMatchObject({ max_discovery_steps: 24 })
-    expect(config.goal).toMatchObject({ purpose: '保存后的目标', entity_kinds: ['ReportItem'], relation_kinds: ['parent_of'], runtime_guidance: [{ text: '同编码跨位置保留来源支持。', injection: 'global', stages: [] }] })
+    expect(writes[1]!.body).toMatchObject({ max_calls: 24 })
+    expect(config.goal_markdown).toBe('# 保存后的目标\n发现对象关系并保留来源。')
     button('开始抽取').click(); await vi.waitFor(() => expect(runModels).toHaveLength(1))
-    expect(runModels[0]!.max_discovery_steps).toBe(24)
+    expect(runModels[0]!.max_calls).toBe(24)
     expect(calls.find(c => c.method === 'POST' && c.url.endsWith('/runs'))!.headers.get('If-Match')).toBe('"3"')
   })
   it('retains unsaved controls and does not start after a configuration write fails', async () => {
     delete config.model; config.agent_config = 'files/agent-original.yaml'
-    await mount(); await edit('model-discovery-steps', '24'); rejectLimits = true
+    await mount(); await edit('model-max-calls', '24'); rejectLimits = true
     button('保存并开始抽取').click()
     await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('本地草稿已保留'))
     expect(runModels).toHaveLength(0)
-    expect(limits.max_discovery_steps).toBe(16)
-    expect(root.querySelector<HTMLInputElement>('#model-discovery-steps')!.value).toBe('24')
+    expect(limits.max_calls).toBe(240)
+    expect(root.querySelector<HTMLInputElement>('#model-max-calls')!.value).toBe('24')
   })
-  it.each(['0', '33', '1.5', ''])('rejects invalid discovery turns %s before save or run', async value => {
-    await mount(); await edit('model-discovery-steps', value)
-    expect(root.textContent).toContain('探索轮数须为 1～32 的整数')
+  it.each(['-1', '1.5'])('rejects invalid call budgets %s before save or run', async value => {
+    await mount(); await edit('model-max-calls', value)
+    expect(root.textContent).toContain('模型调用总额度须为非负整数')
     expect(button('保存配置').disabled).toBe(true)
     expect(button('保存并开始抽取').disabled).toBe(true)
     expect(calls.some(c => c.method === 'PUT')).toBe(false)
   })
-  it('shows the current default for configurations without an explicit turn limit', async () => {
-    delete config.model!.max_discovery_steps
+  it('shows the current default for configurations without an explicit call budget', async () => {
+    delete config.model!.max_calls
     await mount()
-    expect(root.querySelector<HTMLInputElement>('#model-discovery-steps')!.value).toBe('16')
+    expect(root.querySelector<HTMLInputElement>('#model-max-calls')!.value).toBe('40')
     expect(button('保存配置').disabled).toBe(false)
   })
   it('keeps the latest Agent load locked when a previous file request returns late', async () => {
@@ -239,26 +269,26 @@ describe('visible model limits', () => {
     })
     root = document.createElement('div'); document.body.append(root); app = createApp(App); app.mount(root)
     await vi.waitFor(() => expect(pending).toHaveLength(1))
-    button('Agent 与模型').click(); await nextTick()
+    button('模型配置').click(); await nextTick()
     await edit('advanced-config', JSON.stringify({ ...config, agent_config: 'files/agent-second.yaml' }, null, 2))
     button('保存完整配置').click()
     await vi.waitFor(() => expect(pending).toHaveLength(2))
-    pending[0]!(response({ ...limits, max_discovery_steps: 8 }))
+    pending[0]!(response({ ...limits, max_calls: 8 }))
     await nextTick(); await nextTick()
     expect(root.textContent).toContain('正在读取模型额度')
     expect(button('保存配置').disabled).toBe(true)
     expect(button('开始抽取').disabled).toBe(true)
-    pending[1]!(response({ ...limits, max_discovery_steps: 24 }))
+    pending[1]!(response({ ...limits, max_calls: 24 }))
     await vi.waitFor(() => expect(button('保存配置').disabled).toBe(false))
-    expect(root.querySelector<HTMLInputElement>('#model-discovery-steps')!.value).toBe('24')
+    expect(root.querySelector<HTMLInputElement>('#model-max-calls')!.value).toBe('24')
   })
   it('supports positive fractional timeout but only integral token and byte limits', () => {
     expect(modelLimitError({ max_prompt_tokens: null, timeout_seconds: .5 })).toBe('')
     expect(modelLimitError({ max_output_tokens: .5 })).not.toBe('')
-    expect(modelLimitError({ max_response_bytes: .5 })).not.toBe('')
+    expect(modelLimitError({ max_calls: .5 })).not.toBe('')
     expect(modelLimitError({ max_output_tokens: null })).not.toBe('')
-    expect(modelLimitError({ max_discovery_steps: 1 })).toBe('')
-    expect(modelLimitError({ max_discovery_steps: 32 })).toBe('')
+    expect(modelLimitError({ max_calls: 1 })).toBe('')
+    expect(modelLimitError({ max_calls: 32 })).toBe('')
     expect(modelLimitError({ context_window_tokens: null })).toBe('')
     expect(modelLimitError({ context_window_tokens: .5 })).not.toBe('')
   })

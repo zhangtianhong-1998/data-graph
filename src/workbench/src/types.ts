@@ -8,6 +8,8 @@ export interface ProjectFile {
 export interface Project { project_id: string; name: string; created_at: string; updated_at: string; files: ProjectFile[] }
 export interface SourceConfig { id: string; kind: string; [key: string]: unknown }
 export interface RunConfig {
+  max_run_seconds?: number
+  goal_markdown?: string | null
   goal?: { runtime_guidance?: RuntimeGuidance[]; purpose?: string; entity_kinds?: string[]; relation_kinds?: string[]; include?: string[]; exclude?: string[]; discovery_guidance?: string[]; [key: string]: unknown }
   sources?: SourceConfig[]
   model?: { mode?: string; base_url?: string; model?: string; api_key_env?: string; stream?: boolean; [key: string]: unknown }

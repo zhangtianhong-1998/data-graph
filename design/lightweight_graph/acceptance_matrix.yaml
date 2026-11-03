@@ -1,4 +1,6 @@
 # This index records coverage; it is not a generated passing report.
+# Historical F scenarios remain valid within their original scope. Generic Harness
+# construction acceptance is tracked separately in construction_acceptance.yaml.
 schema_version: 1
 updated: '2026-10-27'
 purpose: F 场景的工程覆盖索引与独立验收台账；测试存在不代表整个场景通过。

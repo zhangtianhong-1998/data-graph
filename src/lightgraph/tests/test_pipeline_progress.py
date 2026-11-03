@@ -22,49 +22,8 @@ from lightgraph.tests.test_model_streaming import model
 CANARY='SOURCE_VALUE_MUST_NOT_ENTER_PROGRESS_09231'
 
 
-def test_pipeline_progress_is_visible_before_rule_execution_and_tracks_publications(tmp_path, monkeypatch):
-    progress=tmp_path/'run_000000000000000000000001.progress.json'
-    tables,data=build_sample(20)
-    rules=sample_rules()
-    observed=[]
-    original=RuleEngine.execute
-
-    def during_execution(self, adapter, rule, **kwargs):
-        state=json.loads(progress.read_text(encoding='utf-8'))
-        event=state['events'][-1]
-        assert event['code']=='rule_started' and event['rule_id']==rule.rule_id
-        assert state['stage']=='extraction'
-        assert state['completed']<state['total']
-        observed.append(rule.rule_id)
-        return original(self,adapter,rule,**kwargs)
-
-    monkeypatch.setattr(RuleEngine,'execute',during_execution)
-    config=RunConfig(sources=[],output_dir=str(tmp_path/'output'),scopes=['A','B','public'])
-    with MemorySource(tables,data) as source, bind_progress(RunProgress(progress)):
-        report=run_pipeline(config,[source],rules=rules)
-    state=json.loads(progress.read_text(encoding='utf-8'))
-    events=state['events']
-    assert len(observed)==len(rules)
-    assert len([e for e in events if e['code']=='rule_completed'])==len(rules)
-    assert set(observed)==set(report.rules_published)
-    assert state['counters']['published_rules']==len(report.rules_published)
-    metadata=next(e for e in events if e['stage']=='metadata' and e['code']=='stage_completed')
-    assert metadata['completed']==metadata['total']==len(tables)
-    assert any(e['code']=='publication_started' for e in events)
-    assert all('message' not in e for e in events)
 
 
-def test_rule_rejection_still_has_a_terminal_event_without_claiming_publication(tmp_path):
-    tables,data=build_sample(10)
-    rule=sample_rules()[0]
-    rule.source.source_id='absent_source'
-    events=[]
-    with MemorySource(tables,data) as source, bind_progress(events.append):
-        report=run_pipeline(RunConfig(sources=[],output_dir=str(tmp_path/'output')),[source],rules=[rule])
-    rejected=[e for e in events if e['code']=='rule_rejected']
-    assert len(rejected)==1 and rejected[0]['rule_id']==rule.rule_id
-    assert rejected[0]['level']=='warning'
-    assert rule.rule_id in report.rules_skipped and not report.rules_published
 
 
 @pytest.mark.parametrize('failure',[False,True])
@@ -121,29 +80,3 @@ def test_discovery_progress_counts_only_selected_tables_and_keeps_rejection_visi
     assert [(e['table'],e['completed'],e['total']) for e in finished]==[('s.public.a',1,2),('s.public.b',2,2)]
     assert all(e['level']=='warning' for e in finished)
     assert not result.rules
-
-
-def test_publication_failure_does_not_emit_publication_completed(tmp_path,monkeypatch):
-    from lightgraph.store import GraphStore
-    tables,data=build_sample(10)
-    rules=sample_rules()
-    rule_ids={rule.rule_id for rule in rules}
-    original=GraphStore.publish_partitions
-    attempted=[]
-
-    def reject_business(self, completions, **kwargs):
-        if any(self._publication(item.publication_id)['logical_rule_id'] in rule_ids for item in completions):
-            attempted.append(True)
-            raise LightGraphError('publication_failed')
-        return original(self,completions,**kwargs)
-
-    monkeypatch.setattr(GraphStore,'publish_partitions',reject_business)
-    events=[]
-    with MemorySource(tables,data) as source, bind_progress(events.append):
-        report=run_pipeline(RunConfig(sources=[],output_dir=str(tmp_path/'output'),scopes=['A','B','public']),
-            [source],rules=rules)
-    assert attempted and not report.rules_published
-    assert not any(e['code']=='publication_completed' for e in events)
-    issues=[e for e in events if e['stage']=='publishing' and e['code']=='issue_detected']
-    assert issues and all(e['counters']['published_rules']==0 for e in issues)
-    assert issues[-1]['completed']==issues[-1]['total']

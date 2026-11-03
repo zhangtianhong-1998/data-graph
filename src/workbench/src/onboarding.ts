@@ -5,7 +5,7 @@ export type ConfigurationTab = 'inputs' | 'documents' | 'goal' | 'settings'
 export type ResultTab = 'metadata' | 'business' | 'runs'
 export type WorkbenchTab = ConfigurationTab | ResultTab
 export const configurationTabs: Array<{ id: ConfigurationTab; label: string }> = [
-  { id: 'inputs', label: '数据接入' }, { id: 'documents', label: '知识文档' }, { id: 'goal', label: '抽取目标' }, { id: 'settings', label: 'Agent 与模型' },
+  { id: 'inputs', label: '数据接入' }, { id: 'documents', label: '知识文档' }, { id: 'goal', label: '抽取目标' }, { id: 'settings', label: '模型配置' },
 ]
 export const resultTabs: Array<{ id: ResultTab; label: string }> = [
   { id: 'metadata', label: '元数据图' }, { id: 'business', label: '业务图谱' }, { id: 'runs', label: '运行记录' },

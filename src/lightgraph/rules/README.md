@@ -1,5 +1,7 @@
 # 层级规则与根视图
 
+本文保留旧规则格式及执行算法说明。当前发现入口已按 [按用户目标自主构图](../../../design/lightweight_graph/GENERIC_GRAPH_CONSTRUCTION.md) 设计为 Harness 与新 YAML 映射；旧 RuleSpec 不作为新 Agent 的过渡提交格式。投影、身份与关系检查等算法可被重新使用，下面的旧提案要求不构成新入口依赖。
+
 `level_qualified` 和 `code_with_fill_merge` 保留原有行为。不同记录中的 L1/L2 表示相对路径位置时，使用 `IdentitySpec.level_policy="relative_path"`，并声明以下内容：
 
 - `semantic_resolution="verified_identity_domain"`、`identity_domain` 和 `identity_evidence`：明确业务键所属身份域及其依据。同名、同码、同类型本身不是共享依据。

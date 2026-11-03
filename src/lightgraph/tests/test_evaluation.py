@@ -39,21 +39,6 @@ def inputs(tmp_path):
     return source,gold,config
 
 
-def test_frozen_worker_uses_verified_snapshot_without_gold_or_model_calls(tmp_path):
-    _,gold,config=inputs(tmp_path);bundle=tmp_path/'bundle'
-    manifest=prepare(config,bundle,gold_path=gold)
-    assert manifest['gold_copied'] is False and not (bundle/'gold.json').exists()
-    assert verify(bundle)==manifest
-    code=launch(bundle)
-    execution=load(bundle/'execution.json')
-    assert code in (0,2) and execution['status'] in ('COMPLETED','COMPLETED_WITH_GAPS','PARTIAL')
-    assert execution['loaded_package']==str(bundle/'code/lightgraph/__init__.py')
-    assert execution['frozen_files_unchanged'] and execution['gold_loaded_by_worker'] is False
-    assert load(bundle/'model_usage.json')['usage']=={}
-    assert (bundle/'output/report.json').exists()
-    with pytest.raises(LightGraphError,match='already_started'):launch(bundle)
-    (bundle/'inputs/source_0.csv').write_text('changed')
-    with pytest.raises(LightGraphError,match='frozen_file_changed'):verify(bundle)
 
 
 def test_gold_cannot_be_input_even_under_different_name(tmp_path):
@@ -61,28 +46,6 @@ def test_gold_cannot_be_input_even_under_different_name(tmp_path):
     with pytest.raises(LightGraphError,match='gold_in_model_inputs'):prepare(config,tmp_path/'bad',gold_path=gold)
 
 
-def test_frozen_experiment_preserves_uncapped_tokens_and_finite_calls(tmp_path):
-    from lightgraph.runtime.config import load_config
-    from lightgraph.pipeline import make_model
-    from lightgraph.discovery.budget import Cost
-    from lightgraph.errors import BudgetExceeded
-    _,gold,config=inputs(tmp_path)
-    data=load(config);data['model']={'mode':'approved_external','model':'offline',
-        'base_url':'https://example.invalid/v1','max_calls':240,'max_tokens':None}
-    write(config,data)
-    bundle=tmp_path/'bundle';manifest=prepare(config,bundle,gold_path=gold)
-    assert verify(bundle)==manifest
-    assert manifest['budgets']['calls']==240 and manifest['budgets']['tokens'] is None
-    frozen=load(bundle/'config.json')
-    assert 'max_tokens' in frozen['model'] and frozen['model']['max_tokens'] is None
-    budget=make_model(load_config(bundle/'config.json')).budget
-    budget.charge(Cost(llm_calls=240,llm_tokens=100000000))
-    assert budget.used.llm_tokens==100000000
-    with pytest.raises(BudgetExceeded,match='llm_calls_budget_exhausted'):
-        budget.admit(Cost(llm_calls=1))
-    data['model']['max_calls']=None;write(config,data)
-    with pytest.raises(LightGraphError,match='evaluation_requires_finite_call_budget'):
-        prepare(config,tmp_path/'uncapped_calls',gold_path=gold)
 
 
 def test_scope_scores_aggregate_verified_supports_and_reject_unknowns(tmp_path):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections import OrderedDict
 from uuid import uuid4
 
@@ -153,12 +154,33 @@ class DiscoveryChatModel(ChatModelBase):
         self.submission_reason=None
         self.phase_corrections=0
         self.references=references
+        self.call_durations=[]
+        self.timeout_submission_attempts=0
+
+    def _submission_reserve(self):
+        # Recent successful turn latency is a scheduling estimate, not a new
+        # deadline or permission to exceed shared model/time allowances.
+        return 2*max(self.call_durations[-3:],default=0.0)
 
     def _request_context(self, messages, reason):
         """Add runtime-owned counters, never tool arguments or source values."""
-        return with_discovery_runtime_control(messages,turn=self.steps+1,max_turns=self.max_steps,
+        from .context_projection import deduplicate_request_context
+        # Initial request preflight has no running clock. Keep its exact wire
+        # contract stable; attach timing only when it changes submission policy.
+        timing=({'remaining_seconds':self.client.budget.remaining_seconds(),
+                 'submission_reserve_seconds':self._submission_reserve()}
+                if reason in {'time_submission_window','request_timeout_submission'} else {})
+        prepared=with_discovery_runtime_control(messages,turn=self.steps+1,max_turns=self.max_steps,
             remaining_tool_calls=self.max_tool_calls-self.source_calls,submission_reason=reason,
-            remaining_submission_calls=MAX_SUBMISSION_CALLS-self.submission_calls)
+            remaining_submission_calls=MAX_SUBMISSION_CALLS-self.submission_calls,
+            **timing)
+        projected,metrics=deduplicate_request_context(prepared)
+        if metrics['projected_results']:
+            for field,value in metrics.items():
+                key='request_context_'+field
+                self.client.usage[key]=self.client.usage.get(key,0)+value
+            emit_trace('request_context_deduplicated',{'step':self.steps+1,**metrics})
+        return projected
 
     def _reject_phase_batch(self, messages, available, reason, calls, *, can_retry):
         """Reject the whole batch; expose only runtime counters and issued names."""
@@ -208,6 +230,13 @@ class DiscoveryChatModel(ChatModelBase):
                     reason='submission_window'
                 if reason is None and tool_choice=='none':
                     reason='caller_requested'
+                if (reason is None and self.submission_names and self.call_durations
+                        and self.client.budget.remaining_seconds()<=self._submission_reserve()):
+                    self.submission_reason=reason='time_submission_window'
+                    self.client.usage['time_submission_windows']=self.client.usage.get('time_submission_windows',0)+1
+                    emit_trace('discovery_time_submission',{'step':self.steps+1,
+                        'remaining_seconds':self.client.budget.remaining_seconds(),
+                        'submission_reserve_seconds':self._submission_reserve()})
                 available=tools or []
                 if reason:
                     available=[spec for spec in available
@@ -272,6 +301,7 @@ class DiscoveryChatModel(ChatModelBase):
                         'after_estimated_tokens':prompt_size(request_messages,available,mode)[1],
                         'reason':reason,'token_limit':token_limit,'byte_limit':byte_limit})
                 self.steps+=1
+                request_started_at=time.monotonic()
                 try:
                     # Source access ends at its configured allowance or final
                     # turn. Bounded local submissions can still preserve work.
@@ -282,6 +312,31 @@ class DiscoveryChatModel(ChatModelBase):
                                        submission_reason=reason,phase_correction=correcting_phase):
                         parsed=self.client._request(request_messages,parse,available or None,
                             tool_choice=choice)
+                    self.call_durations.append(max(0.0,time.monotonic()-request_started_at))
+                except LightGraphError as exc:
+                    # An unread response executed no tools. If the transport
+                    # declined a hopeless same-payload retry, spend at most one
+                    # remaining discovery turn switching to local submission.
+                    # A timeout during submission itself gets no extra loop.
+                    if (exc.code=='model_transport_error' and getattr(exc,'retry_suppressed',False)
+                            and getattr(exc,'failure_kind',None)=='read_timeout'
+                            and not reason and self.submission_names and self.steps<self.max_steps
+                            and self.submission_calls<MAX_SUBMISSION_CALLS
+                            and not self.timeout_submission_attempts):
+                        self.client.budget.check_deadline()
+                        self.timeout_submission_attempts+=1
+                        self.submission_reason='request_timeout_submission'
+                        key='timeout_submission_attempts'
+                        self.client.usage[key]=self.client.usage.get(key,0)+1
+                        emit_trace('discovery_timeout_submission',{'failed_step':self.steps,
+                            'remaining_turns':self.max_steps-self.steps,
+                            'remaining_seconds':self.client.budget.remaining_seconds(),
+                            'reason':getattr(exc,'retry_skip_reason',None),'executed_tools':0})
+                        messages.append({'role':'user','content':canonical({'runtime_feedback':{
+                            'code':'request_timeout_submission','executed_tools':0,
+                            'next_action':'Submit retained findings and finish. Missing evidence stays pending.'}})})
+                        continue
+                    raise
                 finally:
                     request_messages.clear()
                 if 'final' in parsed or 'finish' in parsed:

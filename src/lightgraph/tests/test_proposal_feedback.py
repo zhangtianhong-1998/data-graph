@@ -98,39 +98,3 @@ def test_feedback_is_bounded_and_never_rewrites_business_words():
     assert not session.drafts
     assert arguments['claim']['members'][0]['role'] == CANARY
     assert CANARY not in json.dumps(result)
-
-
-def test_corrected_tool_submission_publishes_and_does_not_repeat_discovery(monkeypatch, tmp_path):
-    from lightgraph.pipeline import run_pipeline
-    from lightgraph.runtime.config import RunConfig
-    from lightgraph.sources import MemorySource
-    from lightgraph.tests.test_agent_pipeline import client, group as pipeline_group, input_packet as read_packet, table
-    source_table = table('feedback', ['key', 'label'])
-    turns = []
-    def handler(request):
-        body, packet = read_packet(request)
-        turns.append(packet['task'])
-        assert packet['task'] == 'T0_discovery'
-        proposal = pipeline_group(packet, 'key', 'label')['proposals'][0]
-        proposal.pop('kind')
-        if len(turns) == 1:
-            proposal['claim']['members'][0]['role'] = CANARY
-            return tools_response(('submit_column_group', proposal))
-        assert len(turns) == 2
-        error = json.loads(body['messages'][-1]['content'])
-        assert error['code'] == 'invalid_tool_arguments'
-        assert CANARY not in json.dumps(error)
-        proposal['resolves_rejections']=[error['rejection_id']]
-        return tools_response(('submit_column_group', proposal), ('finish_discovery', {'pending': False}))
-    model = client(monkeypatch, handler)
-    config = RunConfig(sources=[], output_dir=str(tmp_path), max_identity_reviews=0)
-    with MemorySource([source_table], {'public.feedback': [('K', 'Name')]}) as source:
-        first = run_pipeline(config, [source], model=model)
-        second = run_pipeline(config, [source], model=model)
-    assert first.status == second.status == 'COMPLETED'
-    assert first.counts['business_nodes'] == second.counts['business_nodes'] == 1
-    assert first.counts['discovery_invalid_drafts'] == 1
-    assert not any(i['code'] == 'discovery_invalid_drafts' for i in first.issues)
-    assert first.counts.get('discovery_pending_submissions', 0) == 0
-    assert first.counts['work_deferred'] == second.counts['work_deferred'] == 0
-    assert len(turns) == 2 and second.counts['reused_rules'] == 1

@@ -91,8 +91,9 @@ class RuntimeGuidance(StrictModel):
 
 class ExtractionGoal(StrictModel):
     """Operator intent and output scope; these never grant source permissions."""
-    goal_id: str = "analysis_knowledge"
-    purpose: str = Field(default="构建业务分析所需的实体和关系，避免展开逐笔业务观测。", max_length=4000)
+    target: Literal["graph"] = "graph"
+    goal_id: str = "user_graph"
+    purpose: str = Field(default="根据用户目的，从授权数据和材料中发现相关对象、属性及关系并构建图谱。", max_length=4000)
     include: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=16)
     exclude: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=16)
     discovery_guidance: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=16)

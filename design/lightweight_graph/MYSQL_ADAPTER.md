@@ -1,5 +1,7 @@
 # MySQL 与 Gauss 并存接入
 
+> 设计状态（2026-11-03）：本页保留原版本的方案、故障与验证记录。当前通用构图目标、Harness 迁移与 YAML 产物规范见 [按用户目标自主构图](GENERIC_GRAPH_CONSTRUCTION.md)。本文的历史通过结果不证明新路径已验收；未被迁移改变的接入、执行、权限及平台约束继续适用。
+
 更新：2026-10-21。MySQL 接入沿用已有 SourceAdapter 契约，不替换 Gauss。一个项目的 sources 可以同时包含 mysql_database、gauss_database、excel_workbook 和 csv_file。
 
 ## 配置与首次连接

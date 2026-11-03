@@ -55,51 +55,6 @@ def group(packet, key, label, kind='ReportItem', namespace=None, extra=()):
         'claim':{'group_id':'local','entity_kind_hint':kind,'members':members},'evidence_cited':[ids[key]]}]}
 
 
-def test_agent_reads_opaque_columns_and_emits_only_goal_values(monkeypatch,tmp_path):
-    marker='SOURCE_OBSERVATION_CANARY_8712'
-    t=table('demo',['field_a','sort_order','field_u','amount'])
-    data={'public.demo':[('K1','销售费用','元',marker),('K1','销售费用','元',marker+'2')]}
-    seen=[]
-    def handler(request):
-        payload,p=input_packet(request);seen.append(p['goal']['purpose'])
-        if len(payload['messages'])==2:
-            assert set(c['name'] for c in p['metadata_digest']['columns'])==set(t.column_names)
-            return response(call={'sql':'SELECT field_a, sort_order, field_u, amount FROM public.demo','max_rows':4})
-        observations=[json.loads(m['content']) for m in payload['messages'] if m['role']=='tool']
-        data=observations[-1]['data']
-        assert data['row_format']=='positional_values'
-        row=dict(zip(data['columns'],data['rows'][0]))
-        assert row['sort_order']=='销售费用'
-        assert row['amount']==marker
-        return response(group(p,'field_a','sort_order',extra=[
-            ('field_u',{'role':'semantic_attribute','property_name':'unit'}),
-            ('amount',{'role':'fact_value','exclude_from_projection':True})]))
-    model=client(monkeypatch,handler)
-    config=RunConfig(sources=[],output_dir=str(tmp_path/'out'),
-        goal=ExtractionGoal(purpose='只构建经营指标分析图，不输出观测金额'))
-    with MemorySource([t],data) as source:
-        first=run_pipeline(config,[source],model=model)
-        assert first.rules_published and not first.rules_skipped
-        assert model.usage['calls']==2
-        second=run_pipeline(config,[source],model=model)
-        assert second.counts['reused_rules']==1 and model.usage['calls']==2
-        config.goal.purpose='保留指标的名称与计量单位'
-        third=run_pipeline(config,[source],model=model)
-        assert third.rules_published and model.usage['calls']==4
-    with GraphStore(tmp_path/'out/graph.sqlite') as store:
-        graph=store.view({'public'})
-        business=[n for n in graph['nodes'] if n['layer']=='business']
-        assert len(business)==1 and business[0]['label']=='销售费用'
-        assert business[0]['properties']['unit']=='元'
-        rule=store.get_rules()[0]
-        assert 'amount' not in rule.identity.key_columns
-        assert 'amount' not in rule.attributes.single_valued.values()
-    # Observations stay out of graph/report artifacts, while the user-requested
-    # local trace now preserves the exact tool result for diagnosis.
-    assert retain_check([p for p in (tmp_path/'out').iterdir() if p.name!='traces'],[marker])['violations']==0
-    traces=list((tmp_path/'out'/'traces').glob('*.trace.jsonl'))
-    assert traces and any(marker in p.read_text(encoding='utf-8') for p in traces)
-    assert seen==['只构建经营指标分析图，不输出观测金额']*2+['保留指标的名称与计量单位']*2
 
 
 def test_fd_counterexample_gets_fresh_tool_session_and_revised_key(monkeypatch):
@@ -126,38 +81,6 @@ def test_fd_counterexample_gets_fresh_tool_session_and_revised_key(monkeypatch):
     assert model.budget.snapshot()['reserved']=={}
 
 
-def test_cross_table_different_column_names_become_verified_rule(monkeypatch,tmp_path):
-    tables=[table('metrics',['metric_pk','title']),table('measures',['measure_pk','caption']),
-            table('mapping',['left_ref','right_ref'])]
-    rows={'public.metrics':[('I1','销售收入')],'public.measures':[('M1','累计金额')],
-          'public.mapping':[('I1','M1'),('I1','M1')]}
-    calls=[]
-    def handler(request):
-        _,p=input_packet(request);name=p['scope']['table'];calls.append((p['task'],name))
-        if p['task']=='semantic_review':return response(supported_semantic_review(p))
-        if p['task']=='T0_discovery':
-            if name=='metrics':return response(group(p,'metric_pk','title','Metric'))
-            if name=='measures':return response(group(p,'measure_pk','caption','Measure'))
-        if p['task']=='T2_cross_table' and name=='mapping':
-            bindings={b['entity_kind']:b['rule_id'] for b in p['entity_bindings']}
-            ids={c['name']:c['id'] for c in p['metadata_digest']['columns']}
-            return response({'task':p['task'],'proposals':[{'kind':'reference','claim':{
-                'source_entity':bindings['Metric'],'target_entity':bindings['Measure'],
-                'source_columns':[ids['left_ref']],'target_columns':[ids['right_ref']],
-                'relation_kind':'uses_measure'},'evidence_cited':[ids['left_ref']]}]})
-        return response({'task':p['task'],'abstain':True})
-    model=client(monkeypatch,handler)
-    doc=load_document('context.md',text='---\npurpose: data_description\napplies_to: [public.mapping]\n---\n# 关联\nmapping 记录指标使用度量的引用关系。')
-    cfg=RunConfig(sources=[],output_dir=str(tmp_path/'out'))
-    with MemorySource(tables,rows) as source:
-        report=run_pipeline(cfg,[source],model=model,documents=[doc])
-    assert not report.rules_skipped
-    with GraphStore(tmp_path/'out/graph.sqlite') as store:
-        edges=[e for e in store.view({'public'})['edges'] if e['relation']=='uses_measure']
-        assert len(edges)==1
-        refs=[r for r in store.get_rules() if r.kind=='reference']
-        assert len(refs)==1 and refs[0].relation.source_columns==['left_ref']
-    assert ('T2_cross_table','mapping') in calls
 
 
 def test_evidence_only_column_cannot_enter_output_even_if_model_says_label(monkeypatch):
@@ -181,23 +104,6 @@ def test_out_of_goal_entity_kind_is_not_silently_published(monkeypatch):
     assert not result.rules and any(i['code']=='outside_extraction_goal' for i in result.issues)
 
 
-def test_goal_change_with_no_replacement_retires_old_interpretation(monkeypatch,tmp_path):
-    t=table('t',['k','label'])
-    def handler(request):
-        _,p=input_packet(request)
-        if p['goal']['purpose']=='first':return response(group(p,'k','label'))
-        return response({'task':p['task'],'abstain':True})
-    model=client(monkeypatch,handler)
-    cfg=RunConfig(sources=[],output_dir=str(tmp_path/'out'),goal=ExtractionGoal(purpose='first'))
-    with MemorySource([t],{'public.t':[('K','Old interpretation')]}) as source:
-        assert run_pipeline(cfg,[source],model=model).rules_published
-        cfg.goal.purpose='second'
-        report=run_pipeline(cfg,[source],model=model)
-        assert not report.rules_published and report.counts['goal_invalidated_rules']==1
-    with GraphStore(tmp_path/'out/graph.sqlite') as store:
-        assert not store.get_rules()
-        assert store.get_rules(include_stale=True)
-        assert not [n for n in store.view({'public'})['nodes'] if n['layer']=='business']
 
 
 def test_sibling_fact_role_cannot_be_reintroduced_as_label(monkeypatch):
@@ -240,41 +146,8 @@ def test_query_exclusion_applies_to_rule_filter_not_only_projection(monkeypatch,
     assert _goal_violation(rule,ExtractionGoal(evidence_only_columns=['amount']),['k']) is None
 
 
-def test_agent_long_hierarchy_with_opaque_parent_column(monkeypatch,tmp_path):
-    t=table('tree',['a','b','c'])
-    def handler(request):
-        _,p=input_packet(request);ids={c['name']:c['id'] for c in p['metadata_digest']['columns']}
-        if p['task']=='semantic_review':return response(supported_semantic_review(p))
-        return response({'task':p['task'],'proposals':[{'kind':'long_hierarchy','claim':{
-            'group_id':'tree','entity_kind_hint':'DimensionMember','key_column':ids['a'],
-            'label_column':ids['b'],'parent_column':ids['c']},'evidence_cited':[ids['a']]}]})
-    doc=load_document('tree.md',text='---\npurpose: data_description\napplies_to: [public.tree]\n---\n# 层级\ntree 的 c 指向父成员编码 a，根成员的 c 为空。')
-    cfg=RunConfig(sources=[],output_dir=str(tmp_path/'out'))
-    with MemorySource([t],{'public.tree':[('root','根',None),('child','子','root')]}) as source:
-        report=run_pipeline(cfg,[source],model=client(monkeypatch,handler),documents=[doc])
-    assert report.rules_published and not report.rules_skipped
-    with GraphStore(tmp_path/'out/graph.sqlite') as store:
-        assert len([e for e in store.view({'public'})['edges'] if e['relation']=='parent_of'])==1
 
 
-def test_agent_preserves_documented_shared_definition(monkeypatch,tmp_path):
-    t=table('registry',['area','code_x','text_y','meaning_z'])
-    def handler(request):
-        _,p=input_packet(request)
-        if p['task']=='semantic_review':return response(supported_semantic_review(p))
-        proposal=group(p,'code_x','text_y',namespace='area',extra=[
-            ('meaning_z',{'role':'semantic_attribute','property_name':'definition'})])
-        proposal['proposals'][0]['claim']['identity_resolution']='shared_definition'
-        return response(proposal)
-    doc=load_document('registry.md',text='---\npurpose: data_description\napplies_to: [public.registry]\n---\n# 定义\nregistry 中 meaning_z 是完整定义。同一完整定义可由多个租户引用。')
-    cfg=RunConfig(sources=[],output_dir=str(tmp_path/'out'),scopes=['A','B','public'])
-    data={'public.registry':[('A','1','费用','完整业务定义'),('B','2','费用','完整业务定义')]}
-    with MemorySource([t],data) as source:
-        report=run_pipeline(cfg,[source],model=client(monkeypatch,handler),documents=[doc])
-    assert report.rules_published and not report.rules_skipped
-    with GraphStore(tmp_path/'out/graph.sqlite') as store:
-        assert store.get_rules()[0].identity.semantic_resolution=='verified_definition_registry'
-        assert len([n for n in store.view({'A','B','public'})['nodes'] if n['layer']=='business'])==1
 
 
 def test_agent_mode_keeps_documented_json_reference_verifier(monkeypatch):

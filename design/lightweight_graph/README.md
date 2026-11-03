@@ -1,5 +1,21 @@
 # 轻量知识图谱架构设计
 
+## 当前设计（2026-11-03）
+
+当前规范为 [按用户目标自主构图](GENERIC_GRAPH_CONSTRUCTION.md)。产品提供按用户目的从事实数据、元数据和补充文档发现图谱或本体的通用能力；经营分析只是一个场景。当前先实施图谱，使用 DeepSeek Harness 和图谱构建 skill，所有图谱知识产物采用 YAML。Data Agent 与问数应用不在本轮范围。
+
+阅读顺序：[用户故事](US.md) → [当前架构](GENERIC_GRAPH_CONSTRUCTION.md) → [实施计划](IMPLEMENTATION_PLAN.md) → [实施状态](../../IMPLEMENTATION_STATUS.md)。SDD、发现流程和目标驱动方案开头列出迁移后的约束，后续旧章节只解释历史实现与历史决策。
+
+`run`、`discover` 与工作台运行入口统一替换为 DeepSeek Harness，使用新的通用 YAML 映射完成探查、保存、验证、修订和构建。旧 AgentScope、ProposalSession 与 RuleSpec 提案不作为兼容入口或隐藏回退。当前正在实施替换，实际完成状态见实施记录；旧测试结果不能代替新入口、正式发布与真实模型验收。
+
+规则由 Agent 发现后生成。命名匹配只能提供候选线索；通用投影、连接、去重和验证算法继续复用。关于留存，完整轨迹与授权缓存按项目配置保存，由用户主动清理；旧章节的全面“不留存任何轨迹”不再是统一要求。
+
+---
+
+## 迁移前设计与实现记录
+
+以下保留原文。涉及当前目标、发现内核、调度、知识产物格式或留存策略的差异，以本文开头与新的通用构图设计为准。
+
 当前需求与验收基线为 2026-10-27 更新的 [US](US.md) 和 [工作台 US](WORKBENCH_US.md)。新增运行流程见[目标驱动的迭代构图方案](GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)，历史缺陷证据见[审查复核](AUDIT_REVIEW_20261025.md)。最新修复见[两份评审后的继续修复](REVIEW_CONTINUATION_20261027.md)，2026-10-26 协议修复见[真实数据反馈记录](REAL_DATA_DISCOVERY_REPAIR.md)，更早能力见[迭代引擎实施记录](ITERATIVE_ENGINE_IMPLEMENTATION.md)，更早的验证保留在[历史实施记录](../../IMPLEMENTATION_STATUS.md)。
 
 本文保留整体架构与有效约束。旧的 W0～W6 计划、AgentScope 接入和 Markdown/层级增补用于解释历史实现，不再重复充当当前进度说明。

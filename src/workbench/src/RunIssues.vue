@@ -30,6 +30,11 @@ function columnNames(issue: RunIssue): string[] {
 }
 const issueKey = (issue: RunIssue) => JSON.stringify([issue.code, issue.table, enumLabel(issue.status, states), columnNames(issue), ...(isDiagnostic(issue) ? [diagnosticCode(issue.reason_code), fieldPath(issue.field_path), diagnosticConstraint(issue.constraint), enumLabel(issue.stage, protocolStages)] : [])])
 const hints: Record<string, string> = {
+  construction_scoped_access_not_supported: '这是旧版本运行记录：当时的构建流程不支持此访问范围。当前版本已支持按来源证据过滤结果，原权限不会自动扩大。',
+  scope_binding_conflict: '同一来源表配置了不同的可见范围列。请核对 scope_bindings，明确采用哪一组列；系统不会自动选择或改动授权。',
+  graph_support_visibility_missing: '该图缺少逐条来源证据的可见范围，暂不能安全展示。请保留历史文件，按当前范围绑定重新验证和发布。',
+  business_graph_filtered_by_scopes: '当前访问范围内没有可见业务节点。未配置范围列的结果默认归入 public。请核对既有范围绑定，不要为了显示结果扩大权限。',
+  graph_access_context_changed: '图谱发布后，来源或访问权限已改变。旧图暂不展示，历史文件保留；请按当前授权重新验证和发布。',
   discovery_draft_rejected: '这次提交未被接纳，原因和次数保留在此。输入错误本身不会产生待办。',
   discovery_draft_field_diagnostic: '按字段路径和约束修正提交。此处只展示参数结构，不展示被拒绝的输入值。',
   discovery_invalid_drafts: '存在尚未解决的保留草案冲突，或最终提交仍不合法。查看同表诊断和当前任务状态。',

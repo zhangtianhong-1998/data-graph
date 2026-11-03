@@ -1,5 +1,7 @@
 # Vue 3 数据图谱工作台
 
+2026-11-03 重构范围：工作台运行器与 CLI 统一接入 DeepSeek Harness 实际内核和新 YAML 映射，不保留旧发现引擎回退。当前实现与验证状态见 [实施记录](../../IMPLEMENTATION_STATUS.md)，目标和接口职责见 [按用户目标自主构图](../../design/lightweight_graph/GENERIC_GRAPH_CONSTRUCTION.md)。
+
 这是通过 HTTP API 连接 Python 后端的 Vue 3 + TypeScript + Vite 工程。页面不生成演示项目或模拟抽取结果；项目、文件、配置、元数据、运行状态和图谱都来自 `/api`。
 
 ## 开发与构建

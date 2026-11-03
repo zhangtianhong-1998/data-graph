@@ -50,33 +50,3 @@ def test_windows_keys_keep_hash_membership_and_boundary_checks(tmp_path,change,c
             manifest['files']['..\\outside.txt']=frozen.fingerprint(outside)
         frozen.write(bundle/'bundle.json',manifest)
     with pytest.raises(LightGraphError,match=code):frozen.verify(bundle)
-
-
-def test_resume_closes_sqlite_handles_before_freezing_and_supports_windows_seed_keys(tmp_path,monkeypatch):
-    _,gold,config,parent=parent_run(tmp_path)
-    real_connect=sqlite3.connect;opened=[]
-    class TrackedConnection(sqlite3.Connection):
-        closed=False
-        def close(self):
-            self.closed=True
-            return super().close()
-    def tracked_connect(*args,**kwargs):
-        connection=real_connect(*args,**kwargs,factory=TrackedConnection)
-        opened.append(connection)
-        return connection
-    child=tmp_path/'child'
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(frozen.sqlite3,'connect',tracked_connect)
-            manifest=frozen.prepare(config,child,gold_path=gold,resume_from=parent)
-        assert len(opened)==3 and all(connection.closed for connection in opened)
-        assert not list((child/'resume_seed').glob('graph.sqlite-*'))
-        converted=windows_keys(child,manifest)
-        assert frozen.verify(child)==converted
-        assert frozen.launch(child) in (0,2)
-        (child/'resume_seed/added.txt').write_text('extra',encoding='utf-8')
-        with pytest.raises(LightGraphError,match='evaluation_frozen_seed_changed'):
-            frozen.verify(child)
-    finally:
-        for connection in opened:
-            if not connection.closed:connection.close()

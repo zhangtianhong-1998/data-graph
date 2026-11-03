@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatTraceValue, traceBlocks } from './tracePresentation'
+import { formatTraceValue, traceBlocks, traceContext, traceToolName } from './tracePresentation'
 const event = (kind: string, data: unknown) => ({ seq: 7, time: '', kind, data })
 describe('actual recorded agent conversation', () => {
   it('reads actual wire messages in order with tools and roles intact', () => {
@@ -22,5 +22,25 @@ describe('actual recorded agent conversation', () => {
   it('shows tool inputs and results without replacing them with progress counters', () => {
     expect(traceBlocks(event('tool_call', { call: { name: 'profile_columns', input: { columns: ['编码'] } } }))[0]).toEqual({ title: '工具输入 · profile_columns', value: { columns: ['编码'] } })
     expect(traceBlocks(event('tool_result', { name: 'profile_columns', content: [{ type: 'text', text: '{"rows":9}' }] }))[0]!.value).toBe('{"rows":9}')
+  })
+  it('renders native Harness message blocks and the actual dispatch input', () => {
+    const blocks = traceBlocks(event('model_request', { recording_source: 'native_llm_stream_hook', payload: {
+      messages: [{ role: 'assistant', content: [{ type: 'tool-call', name: 'mcp__graph__describe_sources', arguments: '{}' }] },
+        { role: 'tool', content: [{ type: 'text', text: '{"tables":[]}' }] }], tools: [], model: 'local',
+    } }))
+    expect(blocks[0]).toEqual({ title: '消息 1 · 请求调用工具 · mcp__graph__describe_sources', value: '{}' })
+    expect(blocks[1]).toEqual({ title: '消息 2 · 工具返回', value: '{"tables":[]}' })
+    expect(blocks.some(block => block.title === '记录范围')).toBe(true)
+    const response = traceBlocks(event('model_response', { response: { message: { role: 'assistant', content: [
+      { type: 'reasoning', text: '服务返回的内容' }, { type: 'text', text: '已完成' },
+    ] }, usage: { inputTokens: 100 }, finish_reason: 'stop' }, native: { original: true } }))
+    expect(response.map(block => block.value)).toEqual(['服务返回的内容', '已完成', 'stop', { inputTokens: 100 }])
+    expect(traceBlocks(event('model_response', { response: { message: { role: 'assistant', content: [{ type: 'text', text: '仅正文' }] } } })).some(block => block.title.includes('推理'))).toBe(false)
+  })
+  it('shows native step and tool-call associations without relabeling them as discovery quotas', () => {
+    const call = event('tool_call', { name: 'mcp__graph__inspect_source', call_id: 'call-1', harness_turn: 1, harness_step: 3, arguments: '{}' })
+    expect(traceToolName(call)).toBe('mcp__graph__inspect_source')
+    expect(traceContext(call)).toBe('会话第 1 轮 · 执行第 3 步 · 工具调用 call-1')
+    expect(traceBlocks(call)[0]!.value).toBe('{}')
   })
 })

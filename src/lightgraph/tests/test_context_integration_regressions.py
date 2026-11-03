@@ -52,45 +52,6 @@ def _global_reference_document():
         "---\n# 关系\n引用。"))
 
 
-def test_transient_model_failure_is_retried_without_redoing_completed_table(tmp_path, monkeypatch):
-    tables = [_table("a"), _table("b")]
-    calls = []
-
-    def model(fail_b):
-        def handle(request):
-            _, packet = input_packet(request)
-            calls.append((packet["task"], packet["scope"]["table"]))
-            if packet["task"] == "T2_cross_table":
-                return response({"task": packet["task"], "abstain": True})
-            if fail_b and packet["scope"]["table"] == "b":
-                return httpx.Response(503, text="synthetic temporary provider failure")
-            return response(group(packet, "key", "label"))
-        model=client(monkeypatch, handle)
-        # Two provider failures are charged conservatively for the complete
-        # schema-bearing prompt. This case tests retry state, not token limits.
-        from dataclasses import replace
-        model.budget.limits=replace(model.budget.limits,llm_tokens=200000)
-        return model
-
-    config = RunConfig(sources=[], output_dir=str(tmp_path / "out"))
-    with MemorySource(tables, {"public.a": [("A", "Alpha")],
-                               "public.b": [("B", "Beta")]}) as source:
-        first = run_pipeline(config, [source], model=model(True))
-        assert first.rules_published
-        assert first.status == "PARTIAL", first.issues
-        assert any(issue["code"] == "model_http_error" for issue in first.issues)
-        calls.clear()
-        second = run_pipeline(config, [source], model=model(False))
-        assert [name for stage, name in calls if stage == "T0_discovery"] == ["b"]
-        assert not any(issue["code"] == "no_confirmable_entity_group" for issue in second.issues)
-        calls.clear()
-        third = run_pipeline(config, [source], model=model(False))
-        assert calls==[]  # recovered HTTP failure does not reopen finished abstentions
-        assert third.status=='COMPLETED_WITH_GAPS'
-        assert third.counts["reused_rules"] == 2
-    with GraphStore(tmp_path / "out" / "graph.sqlite") as store:
-        business = [node for node in store.view({"public"})["nodes"] if node["layer"] == "business"]
-        assert {node["label"] for node in business} == {"Alpha", "Beta"}
 
 
 def test_automatic_cross_source_verification_honors_512_byte_memory_budget(monkeypatch):
@@ -159,31 +120,6 @@ def test_automatic_target_reads_cannot_skip_target_document_conditions(monkeypat
             assert b.stats.queries == 0
 
 
-def test_forced_rediscovery_includes_t2_for_unchanged_tables(tmp_path, monkeypatch):
-    tables = [_table("a"), _table("b")]
-    calls = []
-
-    def handle(request):
-        _, packet = input_packet(request)
-        calls.append((packet["task"], packet["scope"]["table"]))
-        return response({"task": packet["task"], "abstain": True}
-                        if packet["task"] == "T2_cross_table"
-                        else group(packet, "key", "label"))
-
-    model = client(monkeypatch, handle)
-    config = RunConfig(sources=[], output_dir=str(tmp_path / "out"))
-    with MemorySource(tables, {"public.a": [("A", "Alpha")],
-                               "public.b": [("B", "Beta")]}) as source:
-        assert len(run_pipeline(config, [source], model=model).rules_published) == 2
-        added = load_document("a.md", text=(
-            "---\nid: a_only\npurpose: data_description\n"
-            "applies_to: [s:public.a]\n---\n# 定义\n编码标识业务项目。"))
-        calls.clear()
-        config.rediscover = True
-        report = run_pipeline(config, [source], model=model, documents=[added])
-        assert report.rules_published
-        assert {name for stage, name in calls if stage == "T0_discovery"} == {"a", "b"}
-        assert {name for stage, name in calls if stage == "T2_cross_table"} == {"a", "b"}
 
 
 def test_requested_last_table_is_not_starved_by_64_unrelated_catalog_entries(monkeypatch):

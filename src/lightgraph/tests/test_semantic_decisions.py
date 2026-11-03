@@ -31,35 +31,8 @@ def description(name, text):
         '---\npurpose: data_description\napplies_to: [public.'+name+']\n---\n# 说明\n'+text))
 
 
-@pytest.mark.parametrize('text',[
-    'mapping 中的指标不使用度量；两个编码仅为历史备份，不表示业务关系。',
-    '假如指标使用度量，这两个字段可以作为关联；实际尚未确认。',
-    '历史系统的指标使用度量；当前 mapping 保存的是作废关联，不再适用。',
-    '其他项目中的指标使用度量，当前 mapping 不涉及该关系。',
-])
-def test_prose_never_promotes_overlap_to_accepted_relation(tmp_path,text):
-    tables=[table('metrics',['metric_code','metric_name']),table('measures',['measure_code','measure_name']),
-        table('mapping',['metric_code','measure_code'])]
-    rows={'public.metrics':[('I','收入')],'public.measures':[('M','金额')],'public.mapping':[('I','M')]}
-    cfg=RunConfig(sources=[],output_dir=str(tmp_path/'out'))
-    with MemorySource(tables,rows) as source:
-        report=run_pipeline(cfg,[source],documents=[description('mapping',text)])
-    with GraphStore(tmp_path/'out/graph.sqlite') as store:
-        assert not [e for e in store.view({'public'})['edges'] if e['relation']=='uses_measure']
-    assert report.counts['llm_calls']==0
-    assert any(i['code'] in ('technical_overlap_semantics_unresolved','semantic_evidence_unresolved') for i in report.issues)
 
 
-def test_negated_shared_definition_preserves_two_tenant_entities(tmp_path):
-    t=table('items',['tenant_id','item_code','item_name','definition'])
-    rows={'public.items':[('A','1','费用','同一完整定义'),('B','1','费用','同一完整定义')]}
-    doc=description('items','同一完整定义在多个租户中并不共享，每个租户独立维护，不得跨租户合并。')
-    with MemorySource([t],rows) as source:
-        run_pipeline(RunConfig(sources=[],output_dir=str(tmp_path/'out'),
-            goal=ExtractionGoal(entity_kinds=['BusinessConcept'])),[source],documents=[doc])
-    with GraphStore(tmp_path/'out/graph.sqlite') as store:
-        assert len([n for n in store.view({'A','B','public'})['nodes'] if n['layer']=='business'])==2
-        assert store.get_rules()[0].identity.semantic_resolution=='source_scoped'
 
 
 def test_exact_declaration_has_direction_condition_scope_and_denial():
@@ -273,35 +246,6 @@ def test_rule_engine_requires_checked_discovery_semantics_but_keeps_fixed_rules(
         if not published:assert any(code.startswith('semantic_evidence_') for code in result.codes)
 
 
-def test_agent_relation_proposal_is_refuted_by_independent_review(monkeypatch,tmp_path):
-    tables=[table('metrics',['metric_code','name']),table('measures',['measure_code','name']),
-        table('mapping',['left_ref','right_ref'])]
-    calls=[]
-    def handler(request):
-        _,p=input_packet(request);calls.append(p['task']);name=p['scope']['table']
-        if p['task']=='semantic_review':
-            return response({'proposition':p['semantic_proposition'],'decision':'refuted',
-                'basis':'document_interpretation','evidence':[
-                    {'reference':document_ref(d),'stance':'refutes'} for d in p['document_snippets']]})
-        if p['task']=='T0_discovery' and name in ('metrics','measures'):
-            return response(group(p,'metric_code' if name=='metrics' else 'measure_code','name',
-                'Metric' if name=='metrics' else 'Measure'))
-        if p['task']=='T2_cross_table' and name=='mapping':
-            ids={c['name']:c['id'] for c in p['metadata_digest']['columns']}
-            bindings={b['entity_kind']:b['rule_id'] for b in p['entity_bindings']}
-            return response({'task':p['task'],'proposals':[{'kind':'reference','claim':{
-                'source_entity':bindings['Metric'],'target_entity':bindings['Measure'],
-                'source_columns':[ids['left_ref']],'target_columns':[ids['right_ref']],
-                'relation_kind':'uses_measure'},'evidence_cited':[ids['left_ref']]}]})
-        return response({'task':p['task'],'abstain':True})
-    rows={'public.metrics':[('I','收入')],'public.measures':[('M','金额')],'public.mapping':[('I','M')]}
-    with MemorySource(tables,rows) as source:
-        report=run_pipeline(RunConfig(sources=[],output_dir=str(tmp_path/'out')),[source],
-            model=client(monkeypatch,handler),documents=[description('mapping','指标不使用度量；仅历史备份。')])
-    assert 'semantic_review' in calls
-    assert any(i['code']=='semantic_claim_refuted' for i in report.issues)
-    with GraphStore(tmp_path/'out/graph.sqlite') as store:
-        assert not [edge for edge in store.view({'public'})['edges'] if edge['relation']=='uses_measure']
 
 
 def test_revision_task_receives_goal_context_and_preserves_logical_rule(monkeypatch):

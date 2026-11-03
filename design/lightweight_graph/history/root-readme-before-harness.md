@@ -1,0 +1,352 @@
+# 迁移前 README 与实验记录
+
+归档日期：2026-11-03。以下仅保留历史实现、命令和实验事实；不作为当前启动或验收说明。当前内容见[项目 README](../../../README.md)与[实施状态](../../../IMPLEMENTATION_STATUS.md)。
+
+
+
+以下保留旧版本的运行说明和各日期实验结果，不作为当前启动、配置和抽取协议。AgentScope、旧 RuleSpec、阶段调度等内容仅说明历史行为；当前统一入口与 YAML 映射以以上设计及实际实现记录为准。
+
+根据用户填写的抽取目标，从 Gauss、MySQL、Excel 和 CSV 中发现表内实体、跨表关系，并将已确认的规则应用到数据，生成图谱。对象可以由多个字段共同定义；字段关系作为实体关系的推导依据保留。Markdown 提供全局说明、表列定义和带出处与条件的分析知识。图中分开显示业务实体、表与列、文档来源。
+
+**所有源码均在 `src/`：Python 后端与引擎位于 `src/lightgraph/`，Vue 3 工作台位于 `src/workbench/`。** 本项目不需要图数据库。SQLite 保存抽取结果、规则、来源支持、发布记录，以及不含源值的字段认识与统计计数；数据库查询返回的行、抽样、模型请求和响应不会进入结果库。
+
+依赖的本轮实测版本记录在 `requirements.lock`；需要复现环境时先安装该文件，再安装项目。
+
+2026-11-02 最新完成的 `full-extraction-v2-evidence-recovery-20261102T033309Z` 为 PARTIAL：79 次调用、2,101,752 tokens。报表项层级与英文名仍缺失；492 个节点、1,440 条边中，同一批 240 个联合组合被两种算子重复建模，不能算业务覆盖增加。本轮修复历史空类型阻断恢复、正常未决与程序错误混用，以及工作台合并两种终态的问题；新增竞争算子检查，保留已验证方案并阻止第二套组合直接发布。本地 Python 2,312 项、前端 157 项及构建通过，详见[修改与验收边界](../../../design/lightweight_graph/RECOVERY_STATUS_REPAIR_20261102.md)。新模型实验从无重复组合的十条有效规则继续，全量重验五表；真实发现结果另行评分。完整的分阶段发布检查点尚未实现。
+
+冻结实验支持从已结束的实验继续，保存有效规则和字段模型，再对全部数据重验，详见[可恢复发现](../../../design/lightweight_graph/RESUMABLE_DISCOVERY_20261101.md)。五表固定规则对照为 462 节点 / 930 边、全部声明评分 exact；自动发现质量须独立评测。全量实验限 240 次调用 / 2 小时，累计 tokens 不限。
+
+当前运行能力与验证边界见 [实施与验收记录](../../../IMPLEMENTATION_STATUS.md)。最新的持续发现、可选关系、整组身份复核与运行指导改动见[两份评审后的继续修复](../../../design/lightweight_graph/REVIEW_CONTINUATION_20261027.md)，上一轮协议修复见[真实数据反馈记录](../../../design/lightweight_graph/REAL_DATA_DISCOVERY_REPAIR.md)。工程验证使用合成输入和离线模型替身，用户另一台机器上的真实数据仍待复跑。当前需求见 [用户故事](../../../design/lightweight_graph/US.md) 和 [目标驱动迭代方案](../../../design/lightweight_graph/GOAL_DRIVEN_ITERATIVE_GRAPH_DESIGN.md)；[设计索引](../../../design/lightweight_graph/README.md) 保留各项约束与历史边界。
+
+## 启动 Vue 工作台
+
+当前工作台按源码 checkout 交付，Python wheel 尚未包含 Vue 构建产物。单独安装 wheel 不会得到完整页面。以下命令在仓库根目录运行：先安装下面的 Python 依赖，再构建前端（Node.js 22.12+ 的 22.x、24.x 或 26+）：
+
+```bash
+npm --prefix src/workbench ci
+npm --prefix src/workbench run build
+.venv/bin/lightgraph serve
+```
+
+打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。同一个服务提供前端页面和 `/api`，页面显示实际项目、运行报告、元数据图和业务图。页面分为“配置”和“运行与结果”：前者配置数据来源、知识文档、抽取目标和 Agent，后者查看元数据图、业务图谱和运行记录。新建项目后上传 Excel/CSV 会自动解析表结构；数据库按“连接 → 选表 → 读取元数据”接入。默认关闭模型，启用 AgentScope 时可在页面填写模型地址、模型名、API key 和流式开关。已有结果会作为同项目增量构建的基础。
+
+项目目录不存在时自动创建，默认布局如下：
+
+```text
+workspace/<项目编号>/
+  project.yaml         # 项目信息、配置修订和文件清单
+  config.yaml          # 目标、来源、模型和预算配置
+  files/               # 上传的 Excel、CSV、YAML、Markdown
+  output/              # 元数据 YAML、图谱与引擎报告
+  runs/                # 历次任务状态和安全报告
+```
+
+上传文件是用户提供的项目资产，可以保存；数据库检索结果不会进入图谱结果库，启用完整轨迹时会单独保存在本地轨迹文件中。`workspace/` 不提交 Git。YAML 配置只允许引用本项目登记的文件，Markdown 默认全局，可绑定读取到的具体表。MySQL/Gauss 可以直接填写连接信息并测试、读取表清单，也支持手动输入表名或导入 Excel 表清单。数据库连接可以按项目加密保存在本机，刷新页面或重启服务后加载；取消保存则仅保留在会话内存。模型 API key 仍只在当前会话内使用。明文凭据不进入配置、导出的 YAML 或运行记录。已有 `api_key_env` / `dsn_env` 配置仍可使用。高级列权限和 CSV 格式通过“Agent 与模型”中的完整 JSON 配置编辑器设置，保存后由服务端写成 YAML。普通数据上传入口接收 Excel/CSV，文档入口接收 Markdown，不提供通用运行 YAML 上传按钮。元数据提供 tables.yaml、constraints.yaml 和 foreign_keys.yaml 的预览与下载；本轮不开放物理声明的在线改写。
+
+新项目及省略类型列表的 CLI/一般配置默认“由 Agent 根据目标发现”对象与关系类型，支持人员、组织或用户定义的业务对象；显式指定的非空类型列表继续限制范围，已有配置保留。关闭模型时只执行已有规则和可核验的声明，结构匹配或自然语言关键词不能自动证明业务关系。启用模型后，发现与独立语义复核分别检查提案、条件、反证和出处。用户无需编写 JSON 声明，也无需预先提供统一编号；无模型合成实验中的结构化声明仅用于固定验收输入。
+
+目标中的运行指导可分别作用于全局、普通任务、每轮发现或语义复核，并限定具体阶段。新 Agent 会按本次冻结配置重新获得适用指导；上传 Markdown 继续作为有出处的知识证据，不自动改写运行指令。对象发现、剩余列覆盖和关系发现分别记录进度，弃权或空结果不代表后续运行无需再探索。图谱已经发布但后续处理失败时，收尾仍尝试导出当前可见结果；运行状态、业务节点/边和导出状态分别查看。
+
+配置保存带持久化修订号。高级 JSON 会在启动、上传或刷新元数据前保存；若普通表单和 JSON 同时修改，页面要求明确选择，不能静默覆盖。其他页面已保存新版本时，旧页面收到冲突并保留草稿；运行记录显示启动时冻结的配置修订。
+
+业务图默认只显示已接受事实，可显式打开候选与未决视图。点击节点或边可查看状态、规则、来源绑定、文档及字段映射。归并候选面板展示原始对象与依据，允许确认为同一对象、确认为不同对象以及撤销裁决。裁决按版本保存，合法的多种业务关系分别保留；原始事实与历史不改写，相关依据变化后需要重新检查。当前面板不提供任意关系冲突的完整裁决工具，也不替代客户语义验收。
+
+数据库连接窗口的“运行权限与高级选项”提供能力清单生成指引、YAML 上传和绑定。先在获准环境用 `lightgraph connect-check <运行配置.yaml> --verify-runtime --output capabilities.yaml` 生成与来源对应的结果，再上传选择。上传只校验清单格式；实际运行仍核对数据库产品、版本、驱动、一致快照和所需能力。读取元数据不代表实例抽取已通过验证。
+
+服务默认只监听本机，每个 workspace 只允许一个服务。“运行记录”每秒更新当前阶段、阶段进度和运行日志。处理表或规则时显示已完成数与总数；等待模型等无法确定工作量的阶段显示活动进度条，不将时间或调用额度换算成完成百分比。日志保留最近 200 条结构化事件，可暂停自动跟随；页面显示模型调用次数和 token 用量。进度日志仍只含代码和计数；另设“运行轨迹”面板，默认在本地保存模型实际输入、返回内容和工具结果，可逐步查看、导出 JSONL，确认后手动清理。密钥和连接凭据脱敏，不会发送到第三方追踪服务。旧运行未记录过的原始输入无法事后恢复。详细接口、当前范围和启动方式见 [Vue 工作台实现](../../../design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md)。原 [交互设计](../../../design/lightweight_graph/WORKBENCH_DESIGN.md) 和 [用户故事](../../../design/lightweight_graph/WORKBENCH_US.md) 中的后续能力仍单独列出。旧合成原型保留在 `src/lightgraph/workbench_prototype/`，不再作为实际工作台入口。
+
+工作台支持删除项目、上传的数据文件和 Markdown，以及移除数据库连接或已选表。数据接入列表只展示数据库表与 Excel/CSV；自动生成的元数据 YAML 在右侧预览，随对应数据一并清理。移除数据库表只调整本项目的抽取范围，不修改源数据库。删除输入保留已有图谱发布和运行记录；删除整个项目则清除该项目的本地文件、配置、连接信息和结果。操作前显示确认，运行中的项目暂不允许删除。
+
+公开仓库包含源码、测试、设计文档和示例配置。合成 Excel、运行结果与安装包由下面的命令在本地生成；不会随源码提交。
+
+## 安装与小实验
+
+需要 Python 3.11 或更新版本。在项目目录执行：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[test]'
+.venv/bin/python -m pytest -q
+.venv/bin/lightgraph verify --output runs/acceptance --rows 5000
+```
+
+Windows 的安装、测试与启动命令见 [Windows 兼容说明](../../../design/lightweight_graph/WINDOWS_COMPATIBILITY.md)。输出目录和工作台服务使用跨进程文件锁；Windows 不会跳过单写者检查。
+
+`verify` 分别执行固定规则实验 E 和声明驱动的确定性发现实验 D，并核对共享实体、缺层、同层兄弟节点、指标与度量关系、重复运行及输出中不含排除列内容。它使用合成数据与明确语义声明，不调用模型；不能证明自然语言理解质量或客户业务正确性。真实 Gauss/MySQL 接入、真实模型发现质量、客户 Gold 对照与部署留存分别验收。F 场景的已有测试映射及剩余验收见 [验收台账](../../../design/lightweight_graph/acceptance_matrix.yaml)。
+
+前端验证及本轮发现调度的定向回归可直接执行：
+
+```bash
+npm --prefix src/workbench test
+npm --prefix src/workbench run build
+.venv/bin/python -m pytest -q src/lightgraph/tests/test_discovery_continuation.py
+```
+
+可选关系、身份整组复核、角色反馈、统计传递和运行指导的完整回归入口见[继续修复记录中的复跑命令](../../../design/lightweight_graph/REVIEW_CONTINUATION_20261027.md#复跑命令)。
+
+结果位于 `runs/acceptance/acceptance.json`，两份可视化在 `runs/acceptance/E/viewer.html` 和 `runs/acceptance/D/viewer.html`。验收目录必须为空，避免把两次实验混在一起。
+
+## Excel、CSV 与 Markdown
+
+生成一个含 8 张表、约 5,000 行的合成输入包：
+
+```bash
+.venv/bin/lightgraph sample examples/sample --rows 5000
+.venv/bin/lightgraph run examples/run.yaml
+.venv/bin/lightgraph run examples/discovery.yaml
+```
+
+`run.yaml` 使用已写好的规则；`discovery.yaml` 根据数据和合成说明文档中的明确声明发现规则。两者使用不同结果目录。只发现并验证规则、暂不保存图谱时：
+
+```bash
+.venv/bin/lightgraph discover examples/discovery.yaml
+```
+
+随后可将生成的 `rules.yaml` 配入 `rules:`，或直接再次 `run`：正常运行会从同一结果库复用依赖仍有效的规则，重新查询当前数据。新增判别值、schema 或说明文档变化会进入复核。复用规则不等于复用数据库查询结果。分析文档只修改一个章节时，仅重抽受影响章节；上级条件改变会使相应子章节失效。章节缓存只含已形成的候选主张，不保存抽样或模型原文。
+
+Excel 每张工作表对应一张表；支持常规表头、前导零、日期、隐藏行列和已有公式缓存。关键列缺公式缓存会阻止发布。合并表头、多块区域需要先拆成明确的工作表；程序不执行 Excel 公式或外链。
+
+CSV 必须明确指定编码、分隔符、是否有表头、NULL 标记和类型解析方式。当前只支持 `type_inference: text`，保留 `001` 等前导零和原有空格；NULL 标记按完整字段匹配。无表头时还需配置 `columns`。编码错误、重复表头、列数不一致和格式错误会停止解析，不会自动修正。Excel 与 CSV 使用内存 SQLite，不生成解析缓存或临时数据库文件。
+
+先生成上面的合成输入包，再运行 [混合文件示例](../../../examples/mixed_sources.yaml)：
+
+```bash
+.venv/bin/lightgraph discover examples/mixed_sources.yaml
+```
+
+示例同时读取 Excel 和仓库中的合成 CSV，无需数据库或模型密钥。各来源的 `id` 必须唯一；表的完整身份由 `source_id`、`schema` 和表名组成。跨源比较分别在两端执行必要列的 DISTINCT，再在有上限的内存中核验复合键、NULL、未匹配和歧义。两端覆盖不足、预算用尽或一致性无法证明时返回 `unresolved`，不能发布完整引用或据此撤回旧结果。比较使用各来源独立的一致快照，不提供分布式同一时点快照，也不执行任意联邦 SQL。当前自动跨表发现最多处理 64 张参与表和 64 个已验证实体端点；超限明确延期，尚未实现跨表端点分页。
+
+Markdown 用 front matter 分开声明用途和范围：
+
+```yaml
+---
+purpose: data_description
+scope:
+  source_ids: [gauss]
+  tables: [gauss.finance.report_item, gauss.finance.report_tree]
+---
+```
+
+`data_description` 提供定义依据；`analysis_knowledge` 可以指导探索，也独立抽取相关分析主张；`mixed` 允许按章节区分用途。未绑定表列的文档在当前授权目录内全局适用，正文不必出现表名。`scope` 可限定来源、表和列；兼容 `applies_to`，但短表名必须能唯一解析。不存在或有歧义的绑定报错，不会回退为全局文档。
+
+`sections` 用完整标题路径配置章节的 `purpose` 和 `scope`，子章节继承或收窄父级范围。示例见 [mixed_context.md](../../../examples/mixed_context.md)。跨表任务会补齐实际涉及表的说明；检索得到的章节登记文档版本、位置、范围和完整读取状态，编译时再次核对。必要上下文超过预算时延期，不截掉定义、条件或例外。文档中的建议、可能性和适用条件会保留；分析主张默认是候选，分析经验不能单独批准实体共享。自动生成的说明标记为 `derived`，不会充当独立证据。
+
+## Gauss 接入
+
+参考 [examples/gauss.yaml](../../../examples/gauss.yaml)。数据库连接串通过配置指定的环境变量读取。模型密钥可用环境变量，也可放在不提交 Git 的本地 Agent 配置中，详见下面的模型配置；密钥不进入运行报告。
+
+使用工作台时，可直接填写 `jdbc:gaussdb://主机:8000/数据库`，单独填写用户名、密码并选择 SSL 模式。默认勾选“保存连接信息到本机”，填写时即按项目加密保存草稿，无须先测试或抽取元数据，刷新后继续填写。接入成功后另存正式连接，供后续运行加载；可取消保存或删除已保存连接。存储位置与访问边界见 [工作台实现说明](../../../design/lightweight_graph/WORKBENCH_IMPLEMENTATION.md#数据库连接保存与会话凭据)。运行轨迹默认会保留 Agent 实际查看过的查询结果；它们与已发布图谱分开保存，直到手动清理。需要严格不留存原始会话时设置 `record_trace: false`，这不会删除以前的轨迹。
+
+```bash
+.venv/bin/lightgraph connect-check examples/gauss.yaml
+.venv/bin/lightgraph connect-check examples/gauss.yaml --verify-runtime --output gauss-capabilities.json
+```
+
+第二条命令包含受控的超时和取消探针，适用于已批准的隔离测试环境。能力清单绑定实际产品、版本和驱动；变化后必须重新检查。配置 `capability_manifest` 指向清单，并在客户完成运行环境保留检查后设置 `deployment_retention_verified: true`，再执行 `run`。
+
+只读账号权限、只读事务、表列白名单、工具内 SQL AST 检查共同限制源库操作。发现 Agent 可以调用统计工具，也可以提交只读 SQL；两者都经过同一查询检查，不通过的 SQL 整条拒绝。系统检查查询次数、返回行数、字节和截止时间，不把截断当作完整分区。`LIMIT` 不能限制扫描成本；实际 Gauss 的超时和取消仍需环境验收。租户行权限应由数据库账号、授权视图或数据库行策略提供，`goal.source_scope` 和结果导出的 `scopes` 都不能替代源库权限。
+
+## MySQL 接入
+
+MySQL 与 Gauss 可以同时配置，示例见 [examples/mysql.yaml](../../../examples/mysql.yaml)。设置 `kind: mysql_database`、`dsn_env` 和 `allowed_tables`；MySQL 授权表写成 `database.table`。环境变量保存 `mysql://user:password@host:3306/database` 形式的连接串，非本机连接默认使用系统 CA 验证 TLS 和主机名，可通过 `ssl_ca` 指定客户 CA。
+
+```bash
+.venv/bin/lightgraph connect-check examples/mysql.yaml
+.venv/bin/lightgraph connect-check examples/mysql.yaml --verify-runtime --output mysql-capabilities.yaml
+```
+
+首期目标是 Oracle MySQL 8.0/8.4 的 InnoDB 基础表，使用 PyMySQL 流式游标、只读一致快照与相同 SQL 守卫。实例抽取前仍需匹配的能力清单和部署留存确认。当前已完成替身驱动和方言测试，尚未连接真实 MySQL/Gauss；兼容产品、特殊类型和客户环境验证边界见 [MySQL 接入说明](../../../design/lightweight_graph/MYSQL_ADAPTER.md)。
+
+## 抽取方向与发现 Agent
+
+运行前在 `goal` 中说明本次要构建什么图。下面的配置不指定业务表名或字段映射：
+
+```yaml
+goal:
+  purpose: 构建经营分析所需的指标、度量和维度图谱
+  include: [指标定义与计算依赖, 维度成员与上下级关系]
+  exclude: [每笔交易记录, 具体收入与成本观测值]
+  discovery_guidance:
+    - 结合元数据、统计、样本和说明文档判断列组
+    - 规则验证后对必要列去重，不逐行调用模型
+  observation_values: false
+```
+
+启用模型后，每次发现、元数据解释、反例修订和文档抽取调用都携带目标、阶段和子任务。Agent 提出假设、调用工具、读取临时结果，再决定继续查询还是提交结构化规则候选；程序随后验证规则并批量构图。工具根据参数和 SQL AST 更新实际涉及表，下一轮调用使用相应说明；切换任务时重新组装上下文。Agent 路径不要求列名匹配预设的 `_code`、`_name` 等模式。`model.mode: disabled` 保留确定性发现，适合离线合成实验，不能据此判断任意业务数据的语义发现效果。
+
+`include`、`exclude` 和 `discovery_guidance` 是文字指引；`entity_kinds`、`relation_kinds`、`source_scope`、`excluded_columns` 和 `evidence_only_columns` 是程序检查的范围。两个类型列表省略或为空表示按目标发现，非空时只接受指定类别；新类别仍须经过 SemanticSchema 的类型、属性和关系端点检查。`excluded_columns` 不允许查询或投影；`evidence_only_columns` 可以辅助探查，但不能成为输出的实体键、名称、属性或关系端点。无需为每个任务手写列清单，发现阶段也会提出各列的用途。数值列的定义可以代表指标或度量，排除观测值不等于丢弃这些列的元数据。目标配置变更会使发现依赖失效，重新发现规则。
+
+目标不能放宽数据库权限、SQL 策略或数据保留要求。工具返回值、模型对话和查询参数只在当前运行的内存中使用；结果库保存通过验证的规则和图事实。完整流程及限制见 [发现 Agent 更新](../../../design/lightweight_graph/AGENT_DISCOVERY_UPDATE.md)。
+
+## AgentScope 与模型配置
+
+发现 Agent 使用 AgentScope 1.0.21 的 `ReActAgent`，工具注册到 AgentScope Toolkit；OpenAI SDK 3.35.1 负责 Chat Completions 请求、SSE 解码和工具参数分片组装。项目适配层保留完整响应检查、查询权限、SQL 守卫和预算。工具回合只发送 `tools` / `tool_choice`，不混用最终回答的 `response_format`；工具调用 ID 沿用服务端值。只有普通文本或 JSON 输出能力的接口无法完成工具探查。
+
+独立配置示例是 [agent.example.yaml](../../../examples/agent.example.yaml)，运行入口见 [agentscope_discovery.yaml](../../../examples/agentscope_discovery.yaml)。先复制配置，再填写模型地址、名称和密钥来源：
+
+```bash
+cp examples/agent.example.yaml examples/agent.local.yaml
+```
+
+```yaml
+# examples/agent.local.yaml
+framework: agentscope
+name: lightgraph-discovery
+llm:
+  mode: metadata_only
+  base_url: https://your-model-gateway.example/v1
+  model: your-deployed-model
+  api_key: ""
+  api_key_env: LIGHTGRAPH_API_KEY
+  stream: true
+  stream_options_include_usage: true
+  allow_insecure_http: false
+  timeout_seconds: 60
+  max_calls: 40
+  max_tokens: 120000
+  max_discovery_steps: 16
+  max_tool_calls: 16
+```
+
+`api_key` 非空时使用直填密钥，为空时读取 `api_key_env` 指定的环境变量。推荐使用环境变量。`agent.local.yaml` 和 `agents.local.yaml` 已加入 Git 忽略规则；使用其他文件名时需自行避免提交密钥。密钥在内存中使用 `SecretStr`，配置导出和对象显示均不包含该字段，配置读取失败只报告错误代码。
+
+运行 YAML 使用 `agent_config: agent.local.yaml` 引用它，路径相对运行 YAML 所在目录解析。独立配置与运行文件中的非空 `model:` 不能同时出现，避免地址或密钥被另一处静默覆盖。旧的内嵌 `model:` 格式继续可用，字段与 `llm:` 相同；没有配置时仍为 `mode: disabled`。
+
+准备合成输入并配置好模型后，可执行：
+
+```bash
+.venv/bin/lightgraph sample examples/sample --rows 5000
+.venv/bin/lightgraph discover examples/agentscope_discovery.yaml
+```
+
+模型的无工具结构化回合默认使用 `response_format: json_schema`，把完整输出契约交给支持严格结构化输出的服务端；本地格式、引用、语义和发布验证仍会继续执行。若网关不支持该模式，须显式设置 `response_format: json_object` 使用兼容模式；程序不会静默降级或删除约束。严格输出中的 Schema 也计入请求容量和用量估算。火山端点的能力应以实际模型与配置验证，不能只凭兼容接口名称判断；参见[官方结构化输出说明](https://docs.volcengine.com/docs/ark/structured-output-beta?lang=zh)。
+
+`stream: true` 使用模型 SSE 流，`false` 接收完整 JSON；旧配置默认 `false`。两种模式使用相同的工具和输出校验，工具名称与参数完整到达后才执行工具，不执行半截参数。`stream_options_include_usage` 控制是否请求流末尾的 token 用量；网关不支持该选项时设为 `false`，缺少用量的输入和输出分别估算，并在报告的 `estimated_input_tokens` / `estimated_output_tokens` 中单列。传输中断导致用量未知时，保守预留单列为 `unknown_usage_reserved_tokens`。Vue 工作台采用 HTTP 轮询显示任务阶段和结构化运行日志；另可在“运行轨迹”中展开和导出已脱敏的模型输入输出。
+
+远端默认要求 HTTPS。客户的可信内网网关只有 HTTP 时，可以显式设置 `allow_insecure_http: true`；该设置不改变数据查询权限或允许发送的内容。
+
+`metadata_only` 只向模型提供授权元数据与相关知识文档；模型工具拒绝实例查询，包括统计、只读 SQL 和跨源核验。后续程序端的规则验证仍受来源权限和查询预算约束。`in_environment` 或 `approved_external` 表示相应数据使用条件已确认，允许发送经过列过滤、长度限制的内存样本。外部服务自身的日志与保留策略必须在客户环境验证；本地测试无法证明这一点。
+
+`max_discovery_steps` 限制单次发现任务的模型轮数，包含探查、提交和纠正，默认 16，允许 1～32；旧配置明确填写的 8 仍按 8 执行，需要增加时应修改该配置。`max_tool_calls` 默认 16，限制源数据工具调用数，允许 1～64。这两项额度分别计数：模型一轮可以请求多个工具，提交工具不消耗源数据工具额度。全程仍受 `max_calls`、`max_tokens`、查询预算和运行截止时间约束。到达上限时保留覆盖缺口，不将未验证提案当作完成。前端可设置 `max_discovery_steps`（探索轮数）、`max_prompt_tokens`（最大输入 token）、`max_output_tokens`（最大输出 token）和 `timeout_seconds`（接口等待超时）。保存后下一次启动立即使用新配置，无需重启服务；正在运行的任务保留启动时配置。可选的 `context_window_tokens` 限制输入与输出的总窗口，并为输出预留空间。
+
+`max_prompt_bytes` 和 `max_response_bytes` 仅作为独立的传输保护，默认 `null`，不再用固定的 128 KiB / 256 KiB 上限压缩 token 窗口。旧配置中明确保存的字节限制仍生效，可在前端高级设置中查看或取消；`1048576` bytes 始终是 1 MiB，不能等同于 1,048,576 tokens。工具 Schema 计入输入 token 估算，目录选择、历史裁剪和发送前检查使用同一算法。累计用量优先取提供方 usage，缺失时单列估算；本地估算不保证与任意模型的分词器完全一致。SQL 返回量和本地内存仍按字节限制，不属于模型上下文。完整字段见 [AgentConfig Schema](../../../src/lightgraph/schemas/AgentConfig.schema.json) 和 [上下文窗口与用量计量](../../../design/lightweight_graph/CONTEXT_WINDOW_ACCOUNTING_20261102.md)。
+
+`timeout_seconds` 控制 HTTP 连接、读写等待等网络超时，并非整次模型调用的总耗时；总耗时仍受运行预算限制。报告用 `transport_read_timeout` 等固定计数区分读超时、连接错误和协议错误，不记录异常原文。调大窗口不会自动调大网络超时。历史超时不能直接说明模型曾提交半截 JSON：当前传输层会在执行工具前拒绝未完成响应。
+
+提交阶段误返回探查工具时，整批调用不执行，最多使用一次剩余轮次纠正，并保留此前的有效草案。真正用完轮数才报步数耗尽；报告和完整轨迹分别记录阶段拒绝与恢复。详见[提交窗口修复](../../../design/lightweight_graph/SUBMISSION_WINDOW_RECOVERY_20261102.md)。
+
+具体调用路径和实现边界见 [AgentScope 接入设计](../../../design/lightweight_graph/AGENTSCOPE_RUNTIME.md)。
+
+运行 YAML 新增三个调度参数：`discovery_time_fraction: 0.75`、`discovery_query_fraction: 0.75`、`max_relation_discovery_attempts: 2`。前两项把探索限制在运行时间和查询额度的前 75%，为完整验证和发布保留余量；第三项限制每表关系探索与关系修订的合计次数。探索延期不会撤销已经完整验证的无关规则；真正发生修改时重建受影响规则及其关系依赖。全局预算和原子发布检查始终有效。
+
+工具拒绝参数时返回字段路径、约束类型和静态允许值，不回显输入值。显式完成提交后，已纠正或撤回的错误只累计为历史计数，不再自动标成未完成。跨运行按任务保存受控失败类别，并在 `iteration_context.prior_discovery_feedback` 中提供给下次发现；跨运行自动反馈不加载拒绝提案正文，也不凭错误码改变语义判定；调试轨迹会单独保存本次实际输入输出，供人工查看。coverage 可以为已有规则增补名称、别名和不改变身份的属性，重新完整验证；改变身份、定义或关系含义仍须普通修订。
+
+## 独立概念与联合条件
+
+`concept_mapping` 规则用于将独立列或有文档声明的名称片段映射为概念。Agent 可调用 `submit_concept_mapping`，引用已签发的文档版本和定义段落，经过独立语义审查后编译。组件的 `role`、`entity_kind`、`column`、`definition_ref`、`relation` 分别说明业务角色、类型、取值列、定义依据和上下文指向概念的关系。只有声明 `delimiter`、零基 `position` 和准确 `segment_count` 后才拆名称；不默认按连字符拆分。
+
+“应收账款占用、柑橘、批发渠道”成为三个可独立复用的概念；来源编号另建联合上下文，保存三个角色同时成立的条件。第二行“应收账款占用、苹果、零售渠道”复用指标概念，但不会推出“柑橘、零售渠道”的组合。概念身份由类型、角色、定义引用、命名空间和单个值确定；不同定义不凭同名合并。上下文身份还区分映射与联合赋值；空命名空间、分段错误或同一来源键的相互矛盾赋值使本次规则验证失败。
+
+画布把已验证的联合上下文显示为“联合适用：应收账款占用 · 柑橘 · 批发渠道”。短名称来自同一已发布规则的组件关系和名称，不拆解原来的长字符串。作用范围单独显示，完整名称和唯一编码留在节点详情；现有节点身份、属性事实和关系保持原样。同一短名称可以对应不同来源或范围，评测仍检查唯一编码和准确的联合赋值，同时报告重复短名称；范围必须与导出的来源支持一致。
+
+可运行固定规则示例（零模型调用），预期 5 个概念、2 个上下文、6 条关系：
+
+```bash
+.venv/bin/python examples/concept_mapping_demo.py
+```
+
+示例验证执行能力，不代表模型能够自动发现这些语义；现有报表项图也不会被静默改写为概念图。合并评审、实施记录及剩余范围见[统一修改文档](../../../design/lightweight_graph/CONSOLIDATED_REPAIR_20261028.md)。
+
+## 结果、范围和增量
+
+正常 `run` 生成 `report.json`、`graph.sqlite`、`graph.json`、`graph.yaml`、节点/边 CSV 和独立 HTML 浏览页；`discover` 输出验证后的规则与报告，不保存业务图结果库。默认还在 `traces/` 中按运行保存完整轨迹；工作台轨迹位于项目 `runs/<run_id>.trace.jsonl`。结束运行只释放连接、事务和内存，不删除轨迹或 worker 结果文件。详细配置、导出与清理边界见 [运行轨迹说明](../../../design/lightweight_graph/DURABLE_RUN_TRACE_20261102.md)。两种流程都输出 `metadata.yaml`，并在 `metadata/declarations/` 与 `metadata/interpretations/` 保留不可变修订。报告区分完成、有缺口、部分完成与失败；E/D/I 的验证状态独立列出。
+
+排查空图时，先看 `validation.business_graph` 和业务节点、边计数。只有元数据图不代表已生成业务图。若 `business_graph_reason` 为 `scope_filtered`，表示本次已发布的业务支持不在请求的结果范围中，应检查 `scopes` 是否包含已获授权的结果标签。当前规则把身份命名空间值同时用作这些标签；系统不会自动把它们加入可见范围，也不会在诊断中公开被过滤的值。结果范围不能替代数据库行权限。
+
+Agent 现在通过提交工具逐条保存内存草稿，再用简短的结束信号提交结果；单条提案失败不会清空其他草稿。 每批提案的合同错误明确延期，独立有效计划继续执行，不再为格式或属性错误自动串联多个修订 Agent。完整数据出现 FD 冲突或新模式时，仍保留必要的数据反例迭代。层级计划只填写对象、列映射、身份范围、位置含义和关系选择，程序统一生成执行字段。源工具额度耗尽或进入最后一步后仍可提交本地草稿，本地提交最多 16 次、保留最多 6 条草稿。中途失败会标明发现未完成，只有通过原语义和完整数据验证的规则才可发布；显式全局弃权则撤回本轮草稿。语义复核由调用程序绑定原提案，模型无需抄写提案或引用编号，只返回判断、证据及条件。 引用补正只返回引用映射及缺失的文档分类，程序保留首答的结论和业务条件。流式传输分别限制实际回复内容、单个事件和总传输量，协议封装及推理事件不再占用实际回复的大小额度。
+
+需要取消 API 累计上限时，可把 `model.max_calls`、`model.max_tokens` 分别设为 `null`；默认上限和 `0` 的含义不变。每个 Agent 仍保留提交回合和无进展边界，SQL 权限、内存和运行超时继续生效。报告中的 `schema_repairs_succeeded`、`reference_repairs_succeeded` 和 `column_references_normalized` 分别记录格式纠正、引用纠正和精确列名规范的次数；这些过程不等于业务语义已确认。
+
+语义失败现在保存为独立的待处理提案，仅保留已签发引用、失败类别和修订记录。实体发现每批最多追加一次结构修订：缩小身份键、重排既有层级位置或修正长表父子方向；原样重提、改名、换类型或删除原条件不能换取第二次投票。替代提案仍须独立语义审查和完整数据验证。工作台支持搁置、恢复及请求下次重新探索；这些操作不批准业务事实。关系提案的语义失败也进入列表，下一次运行按现有关系流程重新探索。
+
+业务图 API 支持 `offset`、`limit`、`q`、`kind`，画布按页检索完整授权图，显示总量、匹配量和跨页边数。无身份裁决时在 SQLite 中筛选再聚合本页；存在身份裁决时保留完整投影检查。来源详情仍使用完整授权视图，十万节点性能尚未验收。离线 HTML 不内嵌事实与支持账本，完整来源保留在 `graph.json` 和工作台详情中。
+
+离线评测和冻结运行入口：
+
+```bash
+.venv/bin/lightgraph prepare-evaluation CONFIG.json --gold GOLD.json --output runs/NEW_RUN
+# 继续已结束的同输入实验，复制旧状态到新目录并全量重验：
+.venv/bin/lightgraph prepare-evaluation CONFIG.json --gold GOLD.json --output runs/RESUME_RUN --resume-from runs/OLD_RUN
+.venv/bin/lightgraph run-frozen runs/NEW_RUN
+.venv/bin/lightgraph evaluate runs/NEW_RUN/output/graph.json --gold GOLD.json --output evaluation.json
+```
+
+Gold 独立于执行包；冻结工具复制完整代码、输入和配置，并核对哈希与依赖版本。评测分别计量已接受结果、含候选结果、身份、边、名称、来源位置和范围，不通过合并重复节点来提高召回。代码与输入冻结不等于抽取验收通过。
+
+当前发现工作流为 `goal_driven_iterations/23`。仅调度版本变化时保留已验证规则，优先补缺失对象、属性和关系；规则仍做完整数据重验，目标、模式、权限、文档变化及数据反例仍可触发失效或复核。冻结续跑只接受输入及授权一致的已结束实验，并明确记录父实验，不能作为从空白库发现的独立样本。多表知识查询、文档重复及历史窗口修复见[请求超限诊断与离线复现](../../../design/lightweight_graph/PROMPT_WINDOW_DIAGNOSIS_20261030.md)。
+
+引用规则默认禁止实体指向自身。自定义关系确实允许反身语义时，须在关系定义中显式声明 `allow_self_links: true`，并通过独立语义复核；换一个关系名不会自动获得许可。升级后，缺少新版自环验证标记的旧引用发布会退出当前视图，下一次运行重新验证；正确的实体、宽层级及历史记录保留。已有合法缓存可直接重验，发现反例则进入关系复核。
+
+`metadata.yaml` 中的 `declared` 保留表列、原注释、主键/唯一键/组合外键，以及连接器能力和约束读取范围；`type_origin` 区分数据库声明、Excel 解析推断和 CSV 文本类型。`semantic_annotations` 单独记录目标相关的列角色、冲突代码、覆盖范围、规则和文档依赖，状态为 `candidate` 或 `rule_validated`。目标变化不会改写原声明。目录不保存样本、原始值域、SQL 参数或模型对话，也不会把派生解释当成独立业务依据。
+
+```bash
+.venv/bin/lightgraph report runs/example
+.venv/bin/lightgraph inspect runs/example/graph.sqlite --scope A --scope public --domain customer_demo
+.venv/bin/lightgraph search runs/example/graph.sqlite 销售费用 --scope A --scope public --domain customer_demo
+.venv/bin/lightgraph export runs/example/graph.sqlite runs/export-a --scope A --scope public --domain customer_demo --include-candidates
+.venv/bin/lightgraph import-graph runs/example/graph.json runs/imported/graph.sqlite
+.venv/bin/lightgraph retain-check runs/example --marker RETENTION_CANARY_9f2d17
+.venv/bin/lightgraph validate examples/sample/rules.yaml
+.venv/bin/lightgraph schema src/lightgraph/schemas
+```
+
+`--scope` 控制本地导出的支持范围，调用方仍须先取得对应授权；CLI 本身不是多用户登录系统。导入只接受空结果库，恢复已导出的图事实及范围，不恢复源库连接、执行规则或源数据快照。
+
+同义实体的共享依赖已确认的定义与身份规则，不按重名合并。别名、属性、节点和边分别有来源支持；撤回 A 的引用不会删除 B 仍支持的实体。改变定义或共享策略会生成绑定修订。
+
+新发布通过完整性、依赖和端点检查后才切换可见结果。有关联的实体与引用规则一起提交。目标和依赖未变时，源读取中断、发现冲突、分区不完整或发布失败不会被当成删除证据。改变目标、发现模式或工作流版本会先使旧解释失效；历史仍保留，新发现失败时也不会把旧解释冒充新目标的结果。文档主张与其对实体的候选对齐分开维护，避免文档引用阻挡实体删除。
+
+增量依赖记录每张表实际适用的文档集合，新增文档、绑定变化和章节修订都会触发相关表复核；无关表可继续复用。文档抽取缓存同时包含目标、子任务和上下文选择版本。失败、延期和未访问表不写成已完成，下次运行继续尝试；已完成表不必随其他表的失败重复调用模型。发布后的标记写入失败会单独报告，不能把已经发布的事实记成已回滚。
+
+显式移除输入用 `removed_rule_ids` / `removed_document_ids`；遗漏路径不自动表示删除。规则回滚命令会使用旧定义重新核验当前来源，不能恢复没有保存过的历史单元格：
+
+```bash
+.venv/bin/lightgraph rollback examples/run.yaml items 1
+```
+
+## 相对路径与层级入口
+
+宽表中的 L1/L2 表示相对路径位置时，可在经过验证的身份域内使用 `level_policy: relative_path`。规则需声明 `verified_identity_domain`、身份与属性依据、层级体系、层序和位置含义。同一实体可以出现在不同路径深度；深度和 taxonomy 不进入该实体的 ID，实际来源代码列组仍有独立绑定。成员位置以带来源支持的 `source_position` 保存。
+
+`ordinal_slots` 将 L1/L3 之间视为缺 L2；`ordered_slots` 表示编号只排列现有槽位。NULL 始终切段。连续重复只有在填充含义获确认后才能压缩；跨规则的环和多父在同一体系、业务条件及版本中核验，`allow_dag` 也不允许环。旧的 `level_qualified` 和 `code_with_fill_merge` 保留原有行为。字段和固定规则示例见 [层级规则说明](../../../src/lightgraph/rules/README.md)。
+
+已发布图可按入口查看，入口的 `display_depth` 为 0。下面的 ID 需替换为当前授权图中的实体 ID：
+
+```bash
+.venv/bin/lightgraph hierarchy-view runs/example/graph.sqlite \
+  --root ENTITY_ID --taxonomy finance --scope A --domain customer_demo --max-depth 3
+```
+
+可用重复的 `--context key=value` 指定业务条件或层级版本，`--publication ID` 查看历史发布。入口变化只查询已发布图，不查询来源、不调用模型、不改变父子事实。旧身份改为相对路径时，需要同一逻辑规则的新修订完整重投影；发布事务核对迁移候选、属性冲突和依赖闭包，保存旧绑定与迁移审计。不能按显示名称批量合并。
+
+## 目录
+
+```text
+src/lightgraph/
+  contracts.py          输入、规则、事实、支持、报告契约
+  sources/  query/       接入、短期内存批次、SQL、预算
+  discovery/            结构发现、模型候选、反例修订、缓存漂移检查
+  documents/            Markdown、章节、说明上下文、分析主张
+  rules/                规则编译、完整核验、批量执行
+  identity/  store/      实体身份、支持账本、原子发布与历史
+  metadata*.py          表列图、语义角色对齐候选
+  catalog.py            版本化声明与解释 YAML
+  context.py            每次调用的目标、任务、范围与文档引用
+  cross_source.py       两端 DISTINCT 的有界只读比较
+  runtime/              配置、运行锁、允许的输出写入
+  presentation/         JSON/YAML/CSV、导入、HTML
+  tests/                单元、契约、端到端与保留路径测试
+examples/                示例配置与用户可生成的合成上传包
+design/lightweight_graph/  SDD、US、工作流、架构依据
+runs/                    运行结果；不提交到版本库
+```

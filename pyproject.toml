@@ -22,6 +22,7 @@ test = ["pytest>=8,<9", "jsonschema>=4,<5"]
 
 [project.scripts]
 lightgraph = "lightgraph.cli:main"
+lightgraph-harness = "lightgraph.construction.launcher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -29,7 +30,7 @@ include = ["lightgraph*"]
 exclude = ["lightgraph.tests*"]
 
 [tool.setuptools.package-data]
-lightgraph = ["presentation/*.html", "schemas/*.json"]
+lightgraph = ["presentation/*.html", "schemas/*.json", "construction/runtime/*.mjs", "construction/skills/build-graph/*.md", "construction/skills/build-graph/references/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["src/lightgraph/tests"]

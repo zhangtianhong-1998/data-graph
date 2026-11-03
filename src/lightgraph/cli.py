@@ -19,7 +19,7 @@ def parser():
     p=argparse.ArgumentParser(prog='lightgraph',description='只读数据探索与轻量知识图谱构建')
     p.add_argument('--version',action='version',version='lightgraph 1.0.0')
     sub=p.add_subparsers(dest='command',required=True)
-    for name in ('run','discover','connect-check'):
+    for name in ('run','discover','build-graph','connect-check'):
         c=sub.add_parser(name);c.add_argument('config')
         if name=='connect-check':
             c.add_argument('--verify-runtime',action='store_true',help='执行有界超时和取消探针；请在隔离测试环境使用')
@@ -29,8 +29,6 @@ def parser():
     c.add_argument('--workspace',help='项目文件根目录；默认仓库根目录 workspace')
     c.add_argument('--frontend-dir',help='已构建的 Vue dist 目录')
     c=sub.add_parser('sample');c.add_argument('directory');c.add_argument('--rows',type=int,default=5000)
-    c=sub.add_parser('demo');c.add_argument('--output',default='runs/demo');c.add_argument('--rows',type=int,default=5000)
-    c=sub.add_parser('verify');c.add_argument('--output',default='runs/acceptance');c.add_argument('--rows',type=int,default=5000)
     for name in ('inspect','search','export'):
         c=sub.add_parser(name);c.add_argument('store');c.add_argument('--scope',action='append',default=[])
         c.add_argument('--domain',default='default');c.add_argument('--include-candidates',action='store_true')
@@ -48,17 +46,12 @@ def parser():
     c=sub.add_parser('evaluate-concepts',help='按明确类型和关系映射评分独立概念及联合组合，不调用模型')
     c.add_argument('graph');c.add_argument('--gold',required=True);c.add_argument('--output',required=True)
     c.add_argument('--mapping',required=True,help='JSON with role_kinds, role_relations and context_kind; mapping is not inferred.')
-    c=sub.add_parser('prepare-evaluation',help='冻结本地输入、配置及完整 Python 包，不执行模型')
-    c.add_argument('config');c.add_argument('--gold',required=True);c.add_argument('--output',required=True)
-    c.add_argument('--resume-from',help='从已结束冻结实验的结果副本继续；输入、目标和权限须一致，旧规则全量重验')
-    c=sub.add_parser('run-frozen',help='核验冻结清单后从快照代码执行一次；使用配置中的模型预算')
-    c.add_argument('bundle')
     c=sub.add_parser('report');c.add_argument('path')
     c=sub.add_parser('import-graph');c.add_argument('snapshot');c.add_argument('store')
-    c=sub.add_parser('validate');c.add_argument('rules',nargs='+')
+    c=sub.add_parser('validate',help='校验新图谱 YAML 草稿格式，不查询数据');c.add_argument('drafts',nargs='+')
+    c=sub.add_parser('export-graph',help='导出当前授权范围内已发布的图谱 YAML');c.add_argument('config');c.add_argument('output')
     c=sub.add_parser('schema');c.add_argument('output')
     c=sub.add_parser('retain-check');c.add_argument('paths',nargs='+');c.add_argument('--marker',action='append',required=True)
-    c=sub.add_parser('rollback');c.add_argument('config');c.add_argument('rule_id');c.add_argument('revision',type=int)
     return p
 
 
@@ -76,46 +69,27 @@ def run(args):
                         usage=args.usage,manifest=args.manifest)
         atomic_text(args.output,result.model_dump_json(indent=2))
         emit(result);return 1 if result.status=='GRAPH_FILE_MISSING' else 0
-    if args.command=='prepare-evaluation':
-        from .evaluation.frozen import prepare
-        result=prepare(args.config,args.output,gold_path=args.gold,resume_from=args.resume_from)
-        emit({'status':'PREPARED','bundle':result['bundle_root'],'budgets':result['budgets'],
-              'gold_copied':result['gold_copied']});return 0
     if args.command=='evaluate-concepts':
         from .evaluation.concepts import evaluate_concepts
         mapping=json.loads(Path(args.mapping).read_text())
         result=evaluate_concepts(args.graph,args.gold,**mapping)
         atomic_text(args.output,json.dumps(result,ensure_ascii=False,indent=2)+'\n')
         emit(result);return 0
-    if args.command=='run-frozen':
-        from .evaluation.frozen import launch
-        return launch(args.bundle)
-    from .pipeline import run_pipeline,load_rules,make_model
-    from .documents import load_documents
+    from .pipeline import run_pipeline
     if args.command=='sample':
         from .sample import write_sample
         if not 100 <= args.rows <= 100000:raise LightGraphError('sample_size_out_of_range')
         write_sample(args.directory,args.rows)
         emit({'status':'created','directory':str(Path(args.directory).resolve()),'synthetic':True});return 0
-    if args.command=='verify':
-        from .acceptance import verify
-        if not 100 <= args.rows <= 100000:raise LightGraphError('sample_size_out_of_range')
-        result=verify(args.output,args.rows);emit(result);return 1 if result['status']=='FAIL' else 0
-    if args.command=='demo':
-        from .sample import build_sample,sample_rules,DESCRIPTION,ANALYSIS
-        from .sources import MemorySource
-        from .documents import load_document
-        if not 100 <= args.rows <= 100000:raise LightGraphError('sample_size_out_of_range')
-        tables,rows=build_sample(args.rows)
-        source=MemorySource(tables,rows)
-        config=RunConfig(sources=[],output_dir=str(Path(args.output).resolve()),scopes=['public','A','B'])
-        documents=[load_document('description.md',text=DESCRIPTION),load_document('analysis.md',text=ANALYSIS)]
-        try:report=run_pipeline(config,[source],rules=sample_rules(),documents=documents)
-        finally:source.close()
-        emit(report);return 2 if report.status=='PARTIAL' else (1 if report.status=='FAILED' else 0)
-    if args.command in ('run','discover','connect-check','rollback'):
+    if args.command in ('run','discover','build-graph','connect-check'):
         config=load_config(args.config)
-        sources=open_sources(config,metadata_only=args.command=='connect-check')
+        if args.command != 'connect-check':
+            from .construction.access import ensure_supported_access
+            ensure_supported_access(config)
+            if config.rules:
+                raise LightGraphError('legacy_rule_input_removed')
+        sources=open_sources(config,metadata_only=args.command=='connect-check' or
+                             config.resolved_model.mode in {"disabled", "metadata_only"})
         try:
             if args.command=='connect-check':
                 manifests={}
@@ -129,74 +103,29 @@ def run(args):
                     manifests[sid]=manifest.model_dump(mode='json')
                 if args.output:atomic_text(args.output,json.dumps(manifests,ensure_ascii=False,indent=2))
                 emit(manifests);return 0
-            rules=load_rules(config.rules) if config.rules else None
-            documents=load_documents(config.documents)
-            if args.command=='rollback':
-                from .store import GraphStore
-                from .rules import RuleEngine
-                from .contracts import Dependencies
-                with GraphStore(Path(config.output_dir)/'graph.sqlite') as store:
-                    history=store.get_rules(include_stale=True)
-                    valid=store.get_rules()
-                    old=next((r for r in history if r.rule_id==args.rule_id and r.revision==args.revision),None)
-                    if old is None:raise LightGraphError('rollback_revision_missing')
-                    table=next((t for source in sources for t in source.describe()
-                        if (t.source_id,t.schema_name,t.name)==(old.source.source_id,old.source.schema_name,old.source.table)),None)
-                    if table is None:raise LightGraphError('rollback_source_unavailable')
-                    document_versions={d.document_id+'@'+d.revision for d in documents}
-                    dependencies=Dependencies().model_dump(mode='json',by_alias=True)
-                    dependencies['schema']=RuleEngine.schema_fingerprint(table)
-                    dependencies['documents']=[d for d in old.dependencies.documents if d in document_versions]
-                    old=store.prepare_rule_rollback(args.rule_id,args.revision,dependencies)
-
-                def latest(items):
-                    selected={}
-                    for item in items:
-                        if item.rule_id not in selected or item.revision>selected[item.rule_id].revision:
-                            selected[item.rule_id]=item
-                    return selected
-                historical=latest(history);current=latest(valid);configured=latest(rules or [])
-                candidates={**historical,**current,**configured}
-                related={args.rule_id}
-                # The current and old definition can point to different parents.
-                # Revalidate both dependency sides, including referencing rules
-                # whose old supports would otherwise keep stale identity edges.
-                changed=True
-                while changed:
-                    changed=False
-                    for candidate in list(candidates.values())+[old]:
-                        if not candidate.relation:continue
-                        endpoints={candidate.relation.source_rule_id,candidate.relation.target_rule_id}
-                        if candidate.rule_id in related or endpoints&related:
-                            addition={candidate.rule_id}|endpoints
-                            if not addition<=related:
-                                related.update(addition);changed=True
-                if related&set(config.removed_rule_ids):
-                    raise LightGraphError('rollback_dependency_explicitly_removed')
-                selected=dict(configured)
-                valid_revisions={(r.rule_id,r.revision) for r in valid}
-                historical_revisions={(r.rule_id,r.revision) for r in history}
-                newest=latest(history+list(configured.values()))
-                for rid in sorted(related):
-                    candidate=old if rid==args.rule_id else candidates.get(rid)
-                    if candidate is None:raise LightGraphError('rollback_dependency_missing')
-                    stale=(candidate.rule_id,candidate.revision) in historical_revisions and (candidate.rule_id,candidate.revision) not in valid_revisions
-                    if rid==args.rule_id or stale:
-                        candidate=candidate.model_copy(deep=True)
-                        candidate.revision=newest[rid].revision+1
-                        candidate.status='draft';candidate.validation_ref=None
-                    selected[rid]=candidate
-                rules=list(selected.values())
-            report=run_pipeline(config,sources,rules=rules,documents=documents,
-                model=make_model(config),discover_only=args.command=='discover')
+            report=run_pipeline(config,sources,discover_only=args.command=='discover')
             emit(report);return 2 if report.status=='PARTIAL' else (1 if report.status=='FAILED' else 0)
         finally:
             for source in sources:source.close()
     if args.command=='validate':
-        from .rules.compiler import validate_plan
-        rules=load_rules(args.rules)
-        for rule in rules:validate_plan(rule)
-        emit({'status':'schema_valid','rules':len(rules),'source_validation':'not_run'});return 0
+        from .construction.workspace import parse_graph_draft
+        from pydantic import ValidationError
+        drafts=[]
+        try:
+            for name in args.drafts:
+                drafts.append(parse_graph_draft(Path(name).read_text(encoding='utf-8')))
+        except ValidationError:
+            raise LightGraphError('invalid_graph_draft') from None
+        emit({'status':'schema_valid','drafts':[d.draft_id for d in drafts],
+              'data_validation':'not_run','semantic_assessment':'not_run'});return 0
+    if args.command=='export-graph':
+        from .web.construction_graph import load_graph
+        from .construction.workspace import write_yaml
+        config=load_config(args.config)
+        graph=load_graph(config)
+        write_yaml(Path(args.output), graph)
+        emit({'status':'exported','nodes':len(graph['nodes']),'edges':len(graph['edges']),
+              'output':str(Path(args.output).resolve()),'format':'yaml'});return 0
     if args.command=='schema':
         out=Path(args.output);out.mkdir(parents=True,exist_ok=True)
         from .catalog import DeclaredCatalog,SemanticCatalog
@@ -205,6 +134,9 @@ def run(args):
         for cls in (RuleSpec,RunConfig,AgentConfig,RunReport,CapabilityManifest,DeclaredCatalog,
                     SemanticCatalog,HierarchyView,TaskPacket,ProposalBatch):
             atomic_text(out/(cls.__name__+'.schema.json'),json.dumps(cls.model_json_schema(),ensure_ascii=False,indent=2))
+        from .construction.models import GraphDraft, DataValidation, EvidenceRecord
+        for cls in (GraphDraft,DataValidation,EvidenceRecord):
+            atomic_text(out/(cls.__name__+'.schema.json'),json.dumps(cls.model_json_schema(),ensure_ascii=False,indent=2))
         from .presentation.schema import snapshot_schema
         atomic_text(out/'GraphSnapshot.schema.json',json.dumps(snapshot_schema(),ensure_ascii=False,indent=2))
         emit({'status':'created','output':str(out.resolve())});return 0
@@ -212,8 +144,11 @@ def run(args):
         from .presentation.importer import import_graph
         emit(import_graph(args.snapshot,args.store));return 0
     if args.command=='report':
-        path=Path(args.path);path=path/'report.json' if path.is_dir() else path
-        emit(RunReport.model_validate_json(path.read_text()));return 0
+        from .construction.workspace import safe_load_yaml
+        path=Path(args.path)
+        if path.is_dir():path=path/('report.yaml' if (path/'report.yaml').exists() else 'report.json')
+        value=safe_load_yaml(path.read_text(encoding='utf-8')) if path.suffix in {'.yaml','.yml'} else json.loads(path.read_text(encoding='utf-8'))
+        emit(RunReport.model_validate(value));return 0
     if args.command=='retain-check':
         result=retain_check(args.paths,args.marker);emit(result)
         return 1 if result.get('violations') else 0

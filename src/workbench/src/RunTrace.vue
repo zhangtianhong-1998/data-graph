@@ -27,6 +27,9 @@ const labels: Record<string, string> = {
   agent_start: 'Agent 开始', context_window: '上下文组装', context_compaction: '上下文压缩', model_wire_response: '模型接口原始响应',
   agent_end: 'Agent 结束', pipeline_completed: '抽取流程结束', pipeline_error: '抽取流程异常',
   discovery_phase_feedback: '提交阶段工具纠正',
+  model_retry_skipped: '模型重试跳过', discovery_time_submission: '按剩余时间进入提交',
+  discovery_timeout_submission: '超时后提交已有发现',
+  request_context_deduplicated: '复用重复上下文',
 }
 let epoch = 0, controller: AbortController | undefined, timer: ReturnType<typeof setTimeout> | undefined
 function schedule() {

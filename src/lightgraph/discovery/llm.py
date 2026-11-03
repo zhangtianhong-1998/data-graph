@@ -644,9 +644,33 @@ class StructuredModelClient:
         retry_request=False
         retried_request=False
         last_request_failure=False
+        last_read_timeout_seconds=None
         for attempt in range(retry_limit + 1):
             correcting=feedback is not None
             retrying_request=retry_request
+            if retrying_request and last_read_timeout_seconds is not None:
+                remaining=self.budget.remaining_seconds()
+                effective_timeout=min(self.config.timeout_seconds,remaining)
+                # A shorter phase cannot safely repeat the same long attempt.
+                # Socket read timeouts measure silence, not total stream time:
+                # keep their effective value diagnostic-only in this decision.
+                # Allow small scheduling/measurement overhead at the boundary.
+                tolerance=max(0.1,last_read_timeout_seconds*.01)
+                if remaining+tolerance<last_read_timeout_seconds:
+                    reason='insufficient_time_for_same_request'
+                    self.usage['request_retry_skipped']=self.usage.get('request_retry_skipped',0)+1
+                    counter='request_retry_skipped_insufficient_time'
+                    self.usage[counter]=self.usage.get(counter,0)+1
+                    emit_trace('model_retry_skipped',{'request_id':request_id,'attempt':attempt+1,
+                        'task':request_task,'failure_kind':'read_timeout','reason':reason,
+                        'failed_attempt_elapsed_seconds':last_read_timeout_seconds,
+                        'remaining_phase_seconds':remaining,
+                        'effective_retry_timeout_seconds':effective_timeout})
+                    error=LightGraphError('model_transport_error')
+                    error.failure_kind='read_timeout'
+                    error.retry_suppressed=True
+                    error.retry_skip_reason=reason
+                    raise error from None
             retry_request=False
             last_request_failure=False
             request_messages=([*messages,{'role':'user','content':canonical(feedback)}]
@@ -859,10 +883,12 @@ class StructuredModelClient:
                 last_request_failure=True
             finally:
                 if request_started:
+                    elapsed=max(0.0,time.monotonic()-request_started_at)
+                    last_read_timeout_seconds=(elapsed if failure_kind=='read_timeout' else None)
                     emit_trace('model_request_completed' if request_succeeded else 'model_error',{
                         'request_id':request_id,'attempt':attempt+1,'task':request_task,
                         'status':'completed' if request_succeeded else 'failed',
-                        'elapsed_seconds':max(0.0,time.monotonic()-request_started_at),
+                        'elapsed_seconds':elapsed,
                         **({'failure_kind':failure_kind} if failure_kind is not None else {}),
                         **({} if request_succeeded else {'code':last_code,'stage':protocol_stage,
                             'diagnostic':protocol_problem})})

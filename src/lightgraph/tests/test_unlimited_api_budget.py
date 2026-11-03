@@ -9,13 +9,17 @@ from lightgraph.pipeline import make_model
 from lightgraph.runtime.config import RunConfig
 
 
-def test_null_api_totals_survive_config_and_do_not_disable_query_limits():
+def test_null_api_totals_survive_config_and_do_not_disable_query_limits(tmp_path):
     config = RunConfig(sources=[], max_db_queries=2, model={
         "mode": "approved_external", "model": "offline", "base_url": "https://example.invalid/v1",
         "max_calls": None, "max_tokens": None,
     })
     roundtrip = RunConfig.model_validate_json(config.model_dump_json())
-    budget = make_model(roundtrip).budget
+    from lightgraph.construction.tools import ConstructionTools
+    assert make_model(roundtrip).max_calls == 2**53 - 1
+    assert not hasattr(make_model(roundtrip), "max_tokens")
+    tools = ConstructionTools(roundtrip, tmp_path)
+    budget = tools.budget
     charge = Cost(llm_calls=1000, llm_tokens=100000000)
     budget.reserve("work", charge)
     budget.admit(charge, "work")
@@ -29,6 +33,7 @@ def test_null_api_totals_survive_config_and_do_not_disable_query_limits():
     json.dumps(snapshot, allow_nan=False)
     with pytest.raises(BudgetExceeded, match="db_cu_budget_exhausted"):
         budget.admit(Cost(db_cu=3))
+    tools.close()
 
 
 def test_zero_is_still_a_limit_and_each_api_total_is_independent():

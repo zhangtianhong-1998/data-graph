@@ -116,66 +116,10 @@ def pipeline_rules():
     return [base.model_copy(deep=True,update={'rule_id':rid,'source':base.source.model_copy(update={'table':rid})}) for rid in ('a','b','c')]
 
 
-def test_pipeline_publishes_independent_c_and_keeps_failed_mapping_for_retry(tmp_path):
-    from lightgraph.pipeline import run_pipeline
-    from lightgraph.runtime.config import RunConfig
-    from lightgraph.runtime.candidates import CandidateQueue
-    rules=pipeline_rules();tables=[table(rid,['code','name']) for rid in ('a','b','c')]
-    config=RunConfig(sources=[],output_dir=str(tmp_path),max_identity_reviews=0)
-    data={'public.a':[('M1','First')],'public.b':[('M1','Other')],'public.c':[('M2','Independent')]}
-    with MemorySource(tables,data) as source:report=run_pipeline(config,[source],rules=rules)
-    assert report.status=='PARTIAL' and report.rules_published==['c']
-    assert set(report.rules_skipped)=={'a','b'}
-    assert report.counts['publication_groups']==2 and report.counts['publication_groups_failed']==1
-    with GraphStore(tmp_path/'graph.sqlite') as store:
-        assert [n['label'] for n in store.view({'public'})['nodes'] if n['layer']=='business']==['Independent']
-        candidates=CandidateQueue(store,config.goal,config.scopes,config.isolation_domain,config.sources).listing()['candidates']
-        assert {r for c in candidates for r in c['rule_refs']}=={'a','b'}
-        assert all(c['mappings'] for c in candidates)
 
 
-def test_new_global_conflict_preserves_old_head_and_independent_update(tmp_path,monkeypatch):
-    from lightgraph.pipeline import run_pipeline
-    from lightgraph.runtime.config import RunConfig
-    from lightgraph.discovery.models import DiscoveryResult
-    rules=pipeline_rules();tables=[table(rid,['code','name','bad']) for rid in ('a','b','c')]
-    config=RunConfig(sources=[],output_dir=str(tmp_path),max_identity_reviews=0)
-    data={'public.a':[('M1','Same','Wrong')],'public.b':[('M1','Same','Wrong')],'public.c':[('M2','Independent','Independent')]}
-    monkeypatch.setattr('lightgraph.discovery.discover',lambda *a,**kw:DiscoveryResult(rules=[r.model_copy(deep=True) for r in rules]))
-    monkeypatch.setattr('lightgraph.discovery.discover_references',lambda *a,**kw:DiscoveryResult())
-    monkeypatch.setattr('lightgraph.discovery.coverage.discover_uncovered',lambda **kw:([],{},[]))
-    with MemorySource(tables,data) as source:first=run_pipeline(config,[source])
-    assert set(first.rules_published)=={'a','b','c'}
-    with GraphStore(tmp_path/'graph.sqlite') as store:old={h['logical_rule_id']:h['publication_id'] for h in store.heads() if h['valid']}
-    rules[0].attributes.single_valued={'label':'bad'}
-    config.rediscover=True
-    with MemorySource(tables,data) as source:again=run_pipeline(config,[source])
-    assert 'a' not in again.rules_published and 'c' in again.rules_published
-    with GraphStore(tmp_path/'graph.sqlite') as store:
-        heads={h['logical_rule_id']:h['publication_id'] for h in store.heads() if h['valid']}
-        assert heads['a']==old['a']
-        assert {n['label'] for n in store.view({'public'})['nodes'] if n['layer']=='business'}=={'Same','Independent'}
-        feedback=[dict(r) for r in store.connection.execute("SELECT pattern_codes,rule_revisions FROM iteration_work WHERE task='review_pattern'")]
-        assert feedback and all('"c"' not in r['rule_revisions'] for r in feedback)
 
 
-def test_failed_new_local_mapping_does_not_withdraw_previous_valid_head(tmp_path,monkeypatch):
-    from lightgraph.pipeline import run_pipeline
-    from lightgraph.runtime.config import RunConfig
-    from lightgraph.discovery.models import DiscoveryResult
-    rules=pipeline_rules()[:1];tables=[table('a',['code','name','bad'])]
-    config=RunConfig(sources=[],output_dir=str(tmp_path),max_identity_reviews=0)
-    data={'public.a':[('M1','Same','Wrong1'),('M1','Same','Wrong2')]}
-    monkeypatch.setattr('lightgraph.discovery.discover',lambda *a,**kw:DiscoveryResult(rules=[r.model_copy(deep=True) for r in rules]))
-    monkeypatch.setattr('lightgraph.discovery.coverage.discover_uncovered',lambda **kw:([],{},[]))
-    with MemorySource(tables,data) as source:assert run_pipeline(config,[source]).rules_published==['a']
-    with GraphStore(tmp_path/'graph.sqlite') as store:old=next(h['publication_id'] for h in store.heads() if h['logical_rule_id']=='a')
-    rules[0].attributes.single_valued={'label':'bad'};config.rediscover=True
-    with MemorySource(tables,data) as source:again=run_pipeline(config,[source])
-    assert not again.rules_published
-    with GraphStore(tmp_path/'graph.sqlite') as store:
-        assert any(h['logical_rule_id']=='a' and h['publication_id']==old and h['valid'] for h in store.heads())
-        assert [n['label'] for n in store.view({'public'})['nodes'] if n['layer']=='business']==['Same']
 
 
 def test_shared_binding_revision_migration_moves_all_contributors_together():

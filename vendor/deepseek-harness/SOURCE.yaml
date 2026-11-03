@@ -1,0 +1,50 @@
+schema_version: 1
+component: DeepSeek Harness
+upstream_repository: https://github.com/deepseek-ai/deepseek-harness
+source_revision: 5badb15009ae1756c3afe0ae0cef1faafc290ccc
+source_location_for_provenance_only: /Users/sanjiuganmaoling/Desktop/deepseek-harness-master
+source_worktree_clean: true
+license: MIT
+license_files:
+- LICENSE
+- THIRD_PARTY_NOTICES.md
+- vendor/README.md
+copied_files: 9170
+copied_file_bytes: 94947564
+excluded_files: 5038
+source_tree_sha256: b2560a8152fc2150f7764e1ec83015b90b49d40ba7e000f1f2efa7afc1ea0d1a
+files_manifest:
+  path: SOURCE_FILES.yaml
+  sha256: b4cfcca416db1e118b50efee4dab6d2310c347364d43d6c703f60825b25ad05f
+exclusions_manifest:
+  path: SOURCE_EXCLUSIONS.yaml
+  sha256: ecf8a818c1fe73c7a2684f789eb3b7e26a53825cd2ebf1df092a03ebc9f5d4d0
+integration:
+  python_sdk: python/sdk/src/deepseek_harness
+  runtime_source_entry: apps/cli/src/bin.ts
+  runtime_package_script: pnpm dsh
+  runtime_binary_included: false
+  node_modules_included: false
+  node_requirement: ^22.19.0 || >=24.0.0
+  package_manager: pnpm@11.7.0
+  build_lock: pnpm-lock.yaml
+validation:
+  source_copy_integrity: passed
+  workspace_dependency_paths: passed
+  source_runtime_build: native_system_built
+  cross_platform_runtime: not_run
+  real_model_discovery: not_run
+  workspace_dependency_references: 5225
+  workspace_named_manifests: 355
+  profile_source_smoke: passed
+  full_desktop_distribution_build: not_run
+  source_smoke_scope: Actual vendored SDK and source runtime; two local mock gateway
+    turns with domain tool execution. No external model call.
+notes:
+- Original source files and modes are preserved. ICT provenance manifests and VENDOR_README.md
+  are additions.
+- Recorded sessions, agent notes, dataset/binary fixtures and documentation/test images
+  are excluded; full upstream snapshot and documentation image gates cannot be claimed.
+- Runtime UI assets outside docs/tests remain where needed by source builds.
+- The vendored source runtime was launched after host native-module build; this does
+  not claim a full Desktop distribution build or cross-platform runtime acceptance.

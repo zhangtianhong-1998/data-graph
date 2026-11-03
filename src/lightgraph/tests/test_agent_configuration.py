@@ -1,6 +1,5 @@
-"""Separate AgentScope configuration, precedence and secret handling (offline)."""
+"""Harness configuration migration, precedence and secret handling (offline)."""
 from pathlib import Path
-from types import SimpleNamespace
 import json
 
 import pytest
@@ -101,30 +100,20 @@ def test_missing_or_unloaded_agent_file_is_explicit(tmp_path):
         load_agent_config(tmp_path / "missing.yaml")
 
 
-def test_model_client_receives_all_agent_settings_and_budgets(tmp_path, monkeypatch):
-    import lightgraph.discovery.llm as llm
-    settings = {
-        "mode": "in_environment", "base_url": "http://gateway.internal/v1", "model": "offline",
-        "api_key": CANARY, "api_key_env": "OFFLINE_AGENT_KEY", "stream": True,
-        "response_format": "json_schema",
-        "stream_options_include_usage": False, "allow_insecure_http": True,
-        "timeout_seconds": 32, "max_output_tokens": 800, "max_prompt_bytes": 9000,
-        "max_response_bytes": 10000, "retries": 0, "max_calls": 9,
-        "max_tokens": 22000, "max_discovery_steps": 5, "max_tool_calls": 7,
-    }
+def test_harness_receives_active_settings_and_ignores_retired_loop_controls(tmp_path):
+    settings = {"mode": "in_environment", "base_url": "http://gateway.internal/v1", "model": "offline",
+        "api_key": CANARY, "api_key_env": "OFFLINE_AGENT_KEY", "allow_insecure_http": True,
+        "timeout_seconds": 32, "max_output_tokens": 800, "max_prompt_tokens": 9000,
+        "working_context_tokens": 5000, "retries": 0, "max_calls": 9,
+        "max_tokens": 22000, "max_discovery_steps": 5, "max_tool_calls": 7}
     config = load_config(write_config(tmp_path, agent={"name": "custom-explorer", "llm": settings}))
-    monkeypatch.setattr(llm, "ModelConfig", lambda **kwargs: SimpleNamespace(**kwargs))
-    monkeypatch.setattr(llm, "StructuredModelClient", lambda config, budget: SimpleNamespace(config=config, budget=budget))
-    client = make_model(config)
-    for key, value in settings.items():
-        if key in ("mode", "max_calls", "max_tokens", "api_key"):
-            continue
-        assert getattr(client.config, key) == value
-    assert client.config.api_key.get_secret_value() == CANARY
-    assert client.config.agent_name == "custom-explorer"
-    assert client.config.allow_source_samples is True
-    assert client.budget.limits.llm_calls == 9
-    assert client.budget.limits.llm_tokens == 22000
+    selected = make_model(config)
+    for key in ("model", "base_url", "api_key_env", "timeout_seconds", "max_output_tokens",
+                "working_context_tokens", "retries", "max_calls"):
+        assert getattr(selected, key) == settings[key]
+    assert selected.max_input_tokens == 9000
+    assert not hasattr(selected, "max_tokens") and not hasattr(selected, "max_discovery_steps")
+    assert CANARY not in repr(selected)
 
 
 def test_legacy_inline_defaults_and_disabled_mode_remain_compatible():
@@ -151,19 +140,18 @@ def test_discovery_default_and_explicit_limit_reach_client_without_expanding_sha
         path = tmp_path / "inline.yaml"
         path.write_text(yaml.safe_dump({"sources": [], "model": settings}), encoding="utf-8")
         config = load_config(path)
-    client = make_model(config)
-    assert client.config.max_discovery_steps == expected_steps
-    assert client.config.max_tool_calls == 16
-    assert client.budget.limits.llm_calls == 5
-    assert client.budget.limits.llm_tokens == 9000
+    selected = make_model(config)
+    assert config.resolved_model.max_discovery_steps == expected_steps  # readable migration field
+    assert selected.max_calls == 5
+    assert not hasattr(selected, "max_discovery_steps") and not hasattr(selected, "max_tokens")
 
 
 def test_example_agent_and_schema_are_valid():
     root = Path(__file__).resolve().parents[3]
     config = load_agent_config(root / "examples/agent.example.yaml")
-    assert config.framework == "agentscope"
-    assert config.llm.stream is True
-    assert config.llm.max_discovery_steps == 16
+    assert config.framework == "deepseek_harness"
+    assert config.llm.max_calls == 240
+    assert config.llm.max_prompt_tokens == 1048576
     assert not config.llm.api_key.get_secret_value()
     schema = json.loads((root / "src/lightgraph/schemas/RunConfig.schema.json").read_text(encoding="utf-8"))
     assert schema == RunConfig.model_json_schema()
@@ -172,36 +160,21 @@ def test_example_agent_and_schema_are_valid():
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("direct_key", ["", CANARY])
 def test_loaded_configuration_drives_transport_and_key_precedence(tmp_path, monkeypatch, stream, direct_key):
-    import httpx
+    from lightgraph.construction.runner import run_construction
     monkeypatch.setenv("CONFIG_TEST_ENV_KEY", "offline-environment-key")
     config = load_config(write_config(tmp_path, agent={"llm": {
         "mode": "metadata_only", "model": "offline", "base_url": "https://model.invalid/v1",
-        "response_format": "json_object",
-        "api_key": direct_key, "api_key_env": "CONFIG_TEST_ENV_KEY", "stream": stream,
-        "stream_options_include_usage": False,
-    }}))
-    calls = []
-    def handler(request):
-        payload = json.loads(request.content)
-        calls.append(payload)
-        assert request.headers["Authorization"] == "Bearer " + (direct_key or "offline-environment-key")
-        assert payload["stream"] is stream
-        assert "stream_options" not in payload
-        if stream:
-            events = [
-                {"choices": [{"index": 0, "delta": {"content": '{"ok":true}'}, "finish_reason": None}]},
-                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
-            ]
-            content = "".join("data: " + json.dumps(e) + "\n\n" for e in events) + "data: [DONE]\n\n"
-            return httpx.Response(200, text=content, headers={"content-type": "text/event-stream"})
-        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok":true}'}, "finish_reason": "stop"}]})
-    client = make_model(config)
-    client.transport = httpx.MockTransport(handler)
-    result = client._request([{"role": "user", "content": "synthetic"}], lambda message: json.loads(message["content"]))
-    assert result == {"ok": True}
-    assert len(calls) == 1
-    assert client.config.agent_name == "lightgraph-discovery"
-    assert CANARY not in client.config.model_dump_json()
+        "api_key": direct_key, "api_key_env": "CONFIG_TEST_ENV_KEY", "stream": stream}}))
+    config.output_dir = str(tmp_path / "output")
+    captured = []
+    def runtime(goal, **kwargs):
+        captured.append(kwargs)
+        return {"finish_reason": "completed", "budget": {"calls": 1}}
+    report = run_construction(config, runtime=runtime)
+    assert report.status == "COMPLETED_WITH_GAPS"
+    assert captured[0]["environment"]["CONFIG_TEST_ENV_KEY"] == (direct_key or "offline-environment-key")
+    assert not hasattr(captured[0]["options"], "stream")  # protocol belongs to native SDK
+    assert CANARY not in (tmp_path / "output/construction/config.yaml").read_text()
 
 
 def test_internal_http_requires_explicit_configuration(tmp_path):
@@ -211,7 +184,7 @@ def test_internal_http_requires_explicit_configuration(tmp_path):
         make_model(config)
     settings["allow_insecure_http"] = True
     config = load_config(write_config(tmp_path, agent={"llm": settings}))
-    assert make_model(config).config.allow_insecure_http is True
+    assert make_model(config).base_url == settings["base_url"]
 
 
 def test_agent_schema_matches_contract_and_cli_exports_it(tmp_path, capsys):
@@ -234,28 +207,23 @@ def test_separate_agent_mode_is_used_by_cli_even_when_inline_default_is_disabled
     settings = {"mode": mode, "model": "offline", "base_url": "https://model.invalid/v1",
                 "max_calls": 3, "max_tokens": 9000, "max_discovery_steps": 4, "max_tool_calls": 5}
     path = write_config(tmp_path, agent={"name": "cli-agent", "llm": settings})
-    monkeypatch.setattr(cli, "open_sources", lambda config, metadata_only=False: [])
+    opened = []
+    monkeypatch.setattr(cli, "open_sources", lambda config, metadata_only=False: opened.append(metadata_only) or [])
     seen = []
-    def run_pipeline(config, sources, *, rules, documents, model, discover_only):
+    def run_pipeline(config, sources, *, discover_only):
         assert config.model.mode == "disabled"
         assert config.resolved_model.mode == mode
-        assert model is not None
-        assert model.allow_source_samples is samples
-        assert model.config.agent_name == "cli-agent"
-        assert model.config.max_discovery_steps == 4
-        assert model.config.max_tool_calls == 5
-        assert model.budget.limits.llm_calls == 3
-        assert model.budget.limits.llm_tokens == 9000
+        assert make_model(config).max_calls == 3
         assert discover_only
         seen.append(mode)
         return RunReport(run_id="offline-config-check")
     monkeypatch.setattr(pipeline, "run_pipeline", run_pipeline)
     assert cli.run(cli.parser().parse_args(["discover", str(path)])) == 0
     assert seen == [mode]
+    assert opened == [not samples]
 
 
-def test_transport_config_validation_hides_secret_input():
-    from lightgraph.discovery.llm import ModelConfig as TransportConfig
+def test_runtime_config_validation_hides_secret_input():
     with pytest.raises(ValidationError) as exc:
-        TransportConfig.model_validate({"api_key": CANARY})
+        ModelConfig.model_validate({"api_key": CANARY, "timeout_seconds": 0})
     assert CANARY not in str(exc.value)

@@ -264,7 +264,8 @@ class RunManager:
                 raise LightGraphError("project_run_active")
             project, runs = self._paths(pid)
             config = self.workspace.resolved_config(pid).model_copy(deep=True)
-            if not config.goal.purpose.strip():
+            from ..construction.intent import effective_goal_markdown
+            if not effective_goal_markdown(config).strip():
                 raise LightGraphError("extraction_purpose_required")
             if not config.sources and not config.documents:
                 raise LightGraphError("project_inputs_required")
@@ -458,6 +459,10 @@ def read_graph(workspace, pid, layer="business", *, include_candidates=False,off
     if layer == "metadata":
         return read_metadata(workspace, pid, focus=focus, hops=hops)
     config = workspace.resolved_config(pid)
+    from . import construction_graph
+    if construction_graph.available(config):
+        return construction_graph.graph_page(config, layer=layer, offset=offset, limit=limit,
+            q=q, kind=kind, focus=focus, hops=hops, include_candidates=include_candidates)
     path = Path(config.output_dir) / "graph.sqlite"
     if path.is_symlink():
         raise LightGraphError("workspace_path_invalid")
@@ -485,6 +490,10 @@ def read_graph_details(workspace, pid, *, entity_id=None, fact_id=None, include_
     if bool(entity_id) == bool(fact_id) or offset < 0:
         raise LightGraphError("graph_selection_invalid")
     config = workspace.resolved_config(pid)
+    from . import construction_graph
+    if construction_graph.available(config):
+        return construction_graph.graph_details(config, entity_id=entity_id, fact_id=fact_id,
+            offset=offset, include_candidates=include_candidates)
     path = Path(config.output_dir) / "graph.sqlite"
     if path.is_symlink():
         raise LightGraphError("workspace_path_invalid")

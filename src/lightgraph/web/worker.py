@@ -12,7 +12,7 @@ def execute(payload, result_path):
     from ..contracts import RunReport
     from ..documents import load_documents
     from ..errors import LightGraphError
-    from ..pipeline import load_rules, make_model, run_pipeline
+    from ..construction.runner import run_construction
     from ..runtime.config import AgentConfig, RunConfig, open_sources
     from ..runtime.progress import RunProgress, bind_progress, emit_progress, progress_path
     from .execution import check_dependencies, write_metadata_context, _safe_code, _safe_report, _save, _cancel_path
@@ -82,24 +82,24 @@ def execute(payload, result_path):
         project = result_path.parent.parent
         check_dependencies(payload["dependencies"], project)
         check_cancelled()
+        from ..construction.access import ensure_supported_access
+        ensure_supported_access(config)
+        if config.rules:
+            raise LightGraphError("legacy_rule_input_removed")
         opening_sources = True
         emit_progress("initializing", "source_open_started")
         # Direct credentials arrive through the parent's private stdin pipe.
         # They never enter the persisted RunConfig or process environment.
         options = {"source_credentials": payload["source_credentials"]} if payload.get("source_credentials") else {}
-        sources = open_sources(config, **options)
+        sources = open_sources(config,
+            metadata_only=config.resolved_model.mode in {"disabled", "metadata_only"}, **options)
         opening_sources = False
         emit_progress("initializing", "source_open_completed")
         check_cancelled()
-        rules = load_rules(config.rules) if config.rules else None
-        check_cancelled()
-        documents = load_documents(config.documents)
-        check_cancelled()
         metadata_path = Path(config.output_dir) / "metadata.yaml"
         metadata_before = metadata_path.stat().st_mtime_ns if metadata_path.exists() else None
-        model = make_model(config)
-        check_cancelled()
-        report = run_pipeline(config, sources, rules=rules, documents=documents, model=model)
+        report = run_construction(config, sources,
+            cancel_requested=lambda: cancelled or _cancel_path(result_path).exists())
         check_cancelled()
         status = {"COMPLETED": "completed", "COMPLETED_WITH_GAPS": "completed_with_gaps",
                   "PARTIAL": "partial", "FAILED": "failed"}[report.status]

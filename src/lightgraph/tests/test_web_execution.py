@@ -9,7 +9,7 @@ import time
 import pytest
 import yaml
 
-from lightgraph.contracts import (ColumnSpec, GraphFact, PartitionCompletion, RuleSpec,
+from lightgraph.contracts import (ColumnSpec, GraphFact, PartitionCompletion,
                                   RunReport, SupportSpec, TableSpec)
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import RunConfig
@@ -64,18 +64,12 @@ def prepare_csv(workspace):
     project = workspace.project_path('alpha')
     data = project / 'metrics.csv'
     data.write_text('metric_code,metric_name,amount\nK1,收入,RETENTION_SECRET_312\nK1,收入,999\nK2,费用,100\n', encoding='utf-8')
-    rule = RuleSpec(rule_id='metrics', kind='column_group_entity',
-                    source={'source_id': 'input', 'table': 'metrics'},
-                    identity={'key_columns': ['metric_code'], 'entity_kind': 'Metric'},
-                    attributes={'single_valued': {'label': 'metric_name'},
-                                'excluded': [{'column': 'amount', 'reason': 'observation_value'}]},
-                    evidence={'semantic_basis': ['fixture:E:approved_definition']})
-    rules = project / 'rules.yaml'
-    rules.write_text(yaml.safe_dump([rule.model_dump(mode='json', by_alias=True)]), encoding='utf-8')
     workspace.configs['alpha'] = RunConfig(
         sources=[dict(id='input', kind='csv_file', path=str(data), encoding='utf-8', delimiter=',',
                       header=True, null_values=[''], type_inference='text', table_name='metrics')],
-        rules=[str(rules)], output_dir=str(project / 'output'), isolation_domain='alpha')
+        model={'mode': 'in_environment', 'model': 'scripted-test', 'base_url': 'http://127.0.0.1:9999/v1'},
+        goal={'purpose': '发现指标对象', 'excluded_columns': ['amount']},
+        output_dir=str(project / 'output'), isolation_domain='alpha')
     return data
 
 
@@ -89,7 +83,9 @@ def wait_run(manager, pid, rid, timeout=30):
     pytest.fail('worker did not finish')
 
 
-def test_real_worker_csv_publishes_and_incremental_reuses_output(workspace):
+def test_real_worker_csv_publishes_and_incremental_reuses_output(workspace, monkeypatch):
+    from lightgraph.tests.construction_worker_fixture import install_scripted_worker
+    install_scripted_worker(monkeypatch)
     prepare_csv(workspace)
     manager = RunManager(workspace)
     try:
@@ -98,7 +94,7 @@ def test_real_worker_csv_publishes_and_incremental_reuses_output(workspace):
         assert result['status'] == 'completed', result
         assert result['report']['rules_published'] == ['metrics']
         assert result['cleanup_status'] == 'completed'
-        metadata = read_metadata(workspace, 'alpha')
+        metadata = read_metadata(workspace, 'alpha', refresh=True)
         assert metadata['requires_refresh'] is False and metadata['tables'][0]['name'] == 'metrics'
         before = read_graph(workspace, 'alpha')
         assert {n['label'] for n in before['nodes']} == {'收入', '费用'}
@@ -179,7 +175,7 @@ def test_real_worker_cooperative_cancel_cleans_sources_and_keeps_report(workspac
     code = r'''
 import sys,time
 from pathlib import Path
-import lightgraph.pipeline as pipeline
+import lightgraph.construction.runner as construction
 import lightgraph.runtime.config as config
 from lightgraph.contracts import RunReport, TableSpec, ColumnSpec, QueryLimits
 from lightgraph.errors import LightGraphError
@@ -192,7 +188,7 @@ def closed():
     close()
     Path('source-closed').touch()
 source.close=closed
-config.open_sources=lambda _: [source]
+config.open_sources=lambda _, **_kw: [source]
 def run(*a,**kw):
     try:
         for batch in source.project(table,['code']):
@@ -202,7 +198,7 @@ def run(*a,**kw):
         if exc.code!='query_cancelled': raise
         return RunReport(run_id='cancelled',status='PARTIAL',rules_published=['already_published'])
     raise AssertionError('query was not cancelled')
-pipeline.run_pipeline=run
+construction.run_construction=run
 sys.exit(main())
 '''
     real_popen = subprocess.Popen
@@ -250,7 +246,7 @@ def test_restart_marks_old_records_interrupted_without_signalling_pid(workspace,
 
 def test_worker_error_redacts_exception_and_credentials(workspace, monkeypatch):
     config = workspace.configs['alpha']
-    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _config: (_ for _ in ()).throw(RuntimeError('SOURCE_ROW_SECRET password=secret')))
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _config, **_kw: (_ for _ in ()).throw(RuntimeError('SOURCE_ROW_SECRET password=secret')))
     path = workspace.project_path('alpha') / 'runs' / 'result.json'
     execute(_resolved_payload(config, workspace.project_path('alpha')), path)
     raw = path.read_text(encoding='utf-8')
@@ -262,11 +258,11 @@ def test_worker_error_redacts_exception_and_credentials(workspace, monkeypatch):
 def test_worker_dependency_change_is_partial_with_safe_report(workspace, monkeypatch, pipeline_status):
     data = prepare_csv(workspace)
     config = workspace.configs['alpha']
-    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _: [])
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _, **_kw: [])
     def run(*_args, **_kwargs):
         data.write_text('metric_code,metric_name\nnew,new\n')
         return RunReport(run_id='test', status=pipeline_status, rules_published=['existing'])
-    monkeypatch.setattr('lightgraph.pipeline.run_pipeline', run)
+    monkeypatch.setattr('lightgraph.construction.runner.run_construction', run)
     result = workspace.project_path('alpha') / 'runs' / 'result.json'
     execute(_resolved_payload(config, workspace.project_path('alpha')), result)
     record = json.loads(result.read_text(encoding='utf-8'))
@@ -286,8 +282,8 @@ def test_worker_and_manager_preserve_completion_with_gaps(workspace, monkeypatch
         report_status, expected_status, exit_code):
     config = workspace.configs['alpha']
     project = workspace.project_path('alpha')
-    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _: [])
-    monkeypatch.setattr('lightgraph.pipeline.run_pipeline', lambda *_a, **_kw: RunReport(
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _, **_kw: [])
+    monkeypatch.setattr('lightgraph.construction.runner.run_construction', lambda *_a, **_kw: RunReport(
         run_id='test', status=report_status, issues=[{'code': 'semantic_claim_refuted'}]))
     manager = RunManager(workspace)
     rid = 'run_' + 'b' * 24
@@ -526,11 +522,11 @@ def test_refresh_cannot_be_replaced_by_stale_published_metadata(workspace, monke
 def test_graceful_cancel_preserves_published_report_and_closes_sources(workspace, monkeypatch):
     import signal
     source = MemorySource([], {})
-    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _config: [source])
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _config, **_kw: [source])
     def run(*_a, **_kw):
         signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
         return RunReport(run_id='cancelled', status='PARTIAL', rules_published=['already_published'])
-    monkeypatch.setattr('lightgraph.pipeline.run_pipeline', run)
+    monkeypatch.setattr('lightgraph.construction.runner.run_construction', run)
     path = workspace.project_path('alpha') / 'runs' / 'cancel.json'
     execute(_resolved_payload(workspace.configs['alpha'], workspace.project_path('alpha')), path)
     record = json.loads(path.read_text(encoding='utf-8'))
@@ -549,8 +545,8 @@ def test_late_cancel_marker_cannot_interrupt_source_cleanup(workspace, monkeypat
         time.sleep(.1)
         close()
     source.close = closing
-    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _config: [source])
-    monkeypatch.setattr('lightgraph.pipeline.run_pipeline', lambda *_a, **_kw: RunReport(run_id='done'))
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _config, **_kw: [source])
+    monkeypatch.setattr('lightgraph.construction.runner.run_construction', lambda *_a, **_kw: RunReport(run_id='done'))
     execute(_resolved_payload(workspace.configs['alpha'], workspace.project_path('alpha')), path)
     record = json.loads(path.read_text(encoding='utf-8'))
     assert record['status'] == 'completed'
@@ -561,7 +557,7 @@ def test_preexisting_cancel_marker_still_runs_worker_finally(workspace, monkeypa
     path = workspace.project_path('alpha') / 'runs' / 'early.json'
     path.parent.mkdir()
     path.with_suffix('.cancel').write_text('cancel\n', encoding='utf-8')
-    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _: pytest.fail('cancelled startup must not open sources'))
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _, **_kw: pytest.fail('cancelled startup must not open sources'))
     execute(_resolved_payload(workspace.configs['alpha'], workspace.project_path('alpha')), path)
     record = json.loads(path.read_text(encoding='utf-8'))
     assert record['status'] == 'cancelled'
@@ -579,12 +575,12 @@ def test_cancel_during_opening_closes_new_sources_without_starting_pipeline(work
         cancel_calls.append(True)
         cancel()
     source.cancel = cancelled
-    def opening(_config):
+    def opening(_config, **_kw):
         # Inject at an explicit phase, without relying on timer scheduling.
         path.with_suffix('.cancel').write_text('cancel\n', encoding='utf-8')
         return [source]
     monkeypatch.setattr('lightgraph.runtime.config.open_sources', opening)
-    monkeypatch.setattr('lightgraph.pipeline.run_pipeline', lambda *_a, **_kw: pytest.fail('cancelled opening must not run pipeline'))
+    monkeypatch.setattr('lightgraph.construction.runner.run_construction', lambda *_a, **_kw: pytest.fail('cancelled opening must not run pipeline'))
     execute(_resolved_payload(workspace.configs['alpha'], workspace.project_path('alpha')), path)
     record = json.loads(path.read_text(encoding='utf-8'))
     assert record['status'] == 'cancelled' and record['cleanup_status'] == 'completed'
@@ -596,8 +592,8 @@ def test_signal_at_exact_cleanup_instruction_never_skips_finally(workspace, monk
     import inspect
     import signal
     source = MemorySource([], {})
-    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _: [source])
-    monkeypatch.setattr('lightgraph.pipeline.run_pipeline', lambda *_a, **_kw: RunReport(run_id='done'))
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _, **_kw: [source])
+    monkeypatch.setattr('lightgraph.construction.runner.run_construction', lambda *_a, **_kw: RunReport(run_id='done'))
     lines, start = inspect.getsourcelines(execute)
     target_line = next(start + i for i, line in enumerate(lines) if line.strip() == statement)
     injected = []
@@ -729,12 +725,12 @@ def test_live_worker_progress_survives_polling_without_source_rows(workspace, mo
     code = r'''
 import sys,time
 from pathlib import Path
-import lightgraph.pipeline as pipeline
+import lightgraph.construction.runner as construction
 import lightgraph.runtime.config as config
 from lightgraph.contracts import RunReport
 from lightgraph.runtime.progress import emit_progress
 from lightgraph.web.worker import main
-config.open_sources=lambda _: []
+config.open_sources=lambda _, **_kw: []
 def run(*a,**kw):
     emit_progress('discovery','table_started',completed=0,total=2,unit='tables',table='fruit.public.items')
     emit_progress(None,'model_call_completed',counters={'model_calls':1,'input_tokens':20,'output_tokens':5})
@@ -743,7 +739,7 @@ def run(*a,**kw):
     while not Path('progress-release').exists() and time.monotonic()<until: time.sleep(.02)
     emit_progress('discovery','table_completed',completed=1,total=2,unit='tables')
     return RunReport(run_id='progress',status='COMPLETED_WITH_GAPS')
-pipeline.run_pipeline=run
+construction.run_construction=run
 sys.exit(main())
 '''
     real_popen = subprocess.Popen

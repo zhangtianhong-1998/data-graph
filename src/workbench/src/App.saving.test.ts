@@ -13,7 +13,7 @@ const response = (value: unknown, status = 200, etag?: string) => new Response(J
 function button(label: string) { const el = [...root.querySelectorAll('button')].find(b => b.textContent?.trim() === label); if (!el) throw new Error(`Missing ${label}`); return el }
 async function edit(selector: string, text: string) { const el = root.querySelector<HTMLTextAreaElement>(selector)!; el.value = text; el.dispatchEvent(new Event('input', { bubbles: true })); await nextTick() }
 async function ready() { root = document.createElement('div'); document.body.append(root); app = createApp(App); app.mount(root); await vi.waitFor(() => expect(root.querySelector('.page-empty')).toBeNull()) }
-async function editAdvanced(value: unknown) { button('Agent 与模型').click(); await nextTick(); await edit('#advanced-config', typeof value === 'string' ? value : JSON.stringify(value, null, 2)) }
+async function editAdvanced(value: unknown) { button('模型配置').click(); await nextTick(); await edit('#advanced-config', typeof value === 'string' ? value : JSON.stringify(value, null, 2)) }
 const writes = () => requests.filter(r => r.method !== 'GET' && !r.url.endsWith('/session'))
 beforeEach(() => {
   clearSessions(); sessionStorage.clear(); requests.length = 0; revision = 5; conflict = false
@@ -43,16 +43,16 @@ beforeEach(() => {
 afterEach(() => { app?.unmount(); root?.remove(); vi.unstubAllGlobals(); vi.restoreAllMocks(); clearSessions(); sessionStorage.clear() })
 
 describe('完整配置与修订', () => {
-  it('运行时指导按位置保存，刷新后恢复 Markdown 原文和阶段', async () => {
-    await ready(); button('抽取目标').click(); await nextTick(); button('添加指导').click(); await nextTick()
-    await edit('#guidance-text-0', '# 复核要求\n保留未决并核对反证。')
-    const select = root.querySelector<HTMLSelectElement>('#guidance-injection-0')!
-    select.value = 'semantic_review'; select.dispatchEvent(new Event('change', { bubbles: true })); await nextTick()
+  it('目标使用 Markdown，保存并刷新后保留原文', async () => {
+    await ready(); button('抽取目标').click(); await nextTick()
+    const markdown = '# 本次目标\n\n发现设备归属。\n\n## 验收要求\n保留来源和未决。'
+    await edit('#purpose', markdown)
     button('保存目标').click(); await vi.waitFor(() => expect(writes()).toHaveLength(1))
-    expect(config.goal!.runtime_guidance).toEqual([{ text: '# 复核要求\n保留未决并核对反证。', injection: 'semantic_review', stages: [] }])
-    await vi.waitFor(() => expect(button('保存目标').disabled).toBe(false))
-    expect(root.querySelector<HTMLTextAreaElement>('#guidance-text-0')!.value).toBe('# 复核要求\n保留未决并核对反证。')
-    expect(root.querySelector<HTMLSelectElement>('#guidance-injection-0')!.value).toBe('semantic_review')
+    expect(config.goal_markdown).toBe(markdown)
+    expect(config.goal!.purpose).toBe('原目标')
+    app?.unmount(); root.remove(); await ready(); button('抽取目标').click(); await nextTick()
+    expect(root.querySelector<HTMLTextAreaElement>('#purpose')!.value).toBe(markdown)
+    expect(root.querySelector('#guidance-injection-0')).toBeNull()
   })
 
   it('保存高级 JSON 后按新 ETag 启动，保留 goal 与 scopes', async () => {
@@ -80,7 +80,7 @@ describe('完整配置与修订', () => {
     Object.defineProperty(input, 'files', { value: [new File(['a\nx'], 'table.csv', { type: 'text/csv' })] })
     input.dispatchEvent(new Event('change', { bubbles: true }))
     await vi.waitFor(() => expect(button('删除项目').disabled).toBe(false))
-    button('Agent 与模型').click(); await nextTick()
+    button('模型配置').click(); await nextTick()
     expect(root.querySelector<HTMLTextAreaElement>('#advanced-config')!.value).toBe('{broken draft'); expect(writes()).toEqual([])
   })
   it('再次点击当前项目保留完整配置草稿', async () => {
@@ -104,15 +104,15 @@ describe('完整配置与修订', () => {
     expect(writes()).toEqual([]); button('抽取目标').click(); await nextTick()
     expect(root.querySelector<HTMLTextAreaElement>('#purpose')!.value).toBe('普通表单草稿')
   })
-  it('旧项目保存保留指定类型，切换自动后不再写入指标模板', async () => {
+  it('旧目标转为 Markdown，既有程序权限和类型约束不会被文字修改解除', async () => {
     config.goal!.entity_kinds = ['Person']; config.goal!.relation_kinds = ['knows']
-    await ready(); button('抽取目标').click(); await nextTick(); await edit('#purpose', '人员关联')
-    expect(root.querySelector<HTMLSelectElement>('#vocabulary-mode')!.value).toBe('specified')
+    await ready(); button('抽取目标').click(); await nextTick()
+    expect(root.querySelector<HTMLTextAreaElement>('#purpose')!.value).toContain('## 指定对象类型\n\nPerson')
+    expect(root.querySelector('#vocabulary-mode')).toBeNull()
+    await edit('#purpose', '# 人员关联\n以当前材料为准。')
     button('保存目标').click(); await vi.waitFor(() => expect(writes()).toHaveLength(1))
+    expect(config.goal_markdown).toBe('# 人员关联\n以当前材料为准。')
     expect(config.goal!.entity_kinds).toEqual(['Person']); expect(config.goal!.relation_kinds).toEqual(['knows'])
-    await vi.waitFor(() => expect(button('保存目标').disabled).toBe(false))
-    const select = root.querySelector<HTMLSelectElement>('#vocabulary-mode')!; select.value = 'automatic'; select.dispatchEvent(new Event('change', { bubbles: true })); await nextTick()
-    button('保存目标').click(); await vi.waitFor(() => expect(writes()).toHaveLength(2))
-    expect(config.goal!.entity_kinds).toEqual([]); expect(config.goal!.relation_kinds).toEqual([])
+    expect(config.scopes).toEqual(['public'])
   })
 })

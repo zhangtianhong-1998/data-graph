@@ -1,0 +1,534 @@
+date: '2026-11-03'
+authorization: 用户明确允许删除已不具备的旧功能测试。
+scope: 退役旧入口测试函数；无剩余测试且无引用的旧夹具文件一并删除。仍可用的数据接入、SQL只读、凭据、存储及离线评分测试继续运行，不以skip/xfail代替迁移。
+unmigrated_capabilities: 精细依赖恢复、旧RuleSpec/SQLite发布及独立文档事实抽取不作为当前能力声明。
+files:
+- file: src/lightgraph/tests/test_agent_failure_retry.py
+  removed_tests:
+  - test_agent_failure_keeps_only_affected_table_pending_until_next_run
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+  file_removed: true
+- file: src/lightgraph/tests/test_agent_pipeline.py
+  removed_tests:
+  - test_agent_long_hierarchy_with_opaque_parent_column
+  - test_agent_preserves_documented_shared_definition
+  - test_agent_reads_opaque_columns_and_emits_only_goal_values
+  - test_cross_table_different_column_names_become_verified_rule
+  - test_goal_change_with_no_replacement_retires_old_interpretation
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_catalog_context_pipeline.py
+  removed_tests:
+  - test_catalog_keeps_declaration_goal_revisions_and_never_observations
+  - test_cross_source_agent_reference_is_verified_and_published
+  - test_new_table_document_rediscovers_only_affected_table
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_concept_identity_domain.py
+  removed_tests:
+  - test_agent_code_domain_review_and_compilation_reuse_existing_concept
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_concept_identity_domains.py
+  removed_tests:
+  - test_automatic_domain_proposal_receives_independent_review
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_concept_mapping.py
+  removed_tests:
+  - test_agent_proposal_is_reviewed_compiled_and_published
+  - test_narrowed_goal_retires_old_concept_publication
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_context_integration_regressions.py
+  removed_tests:
+  - test_forced_rediscovery_includes_t2_for_unchanged_tables
+  - test_transient_model_failure_is_retried_without_redoing_completed_table
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_context_operator_pipeline.py
+  removed_tests:
+  - test_new_operator_preserves_prior_node_and_independent_rule_and_retains_candidate
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+  file_removed: true
+- file: src/lightgraph/tests/test_coverage_reference_rebuild.py
+  removed_tests:
+  - test_scope_replacement_rebuilds_reference_before_atomic_publication
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+  file_removed: true
+- file: src/lightgraph/tests/test_discovery_candidate_queue.py
+  removed_tests:
+  - test_retry_request_reopens_unresolved_table_without_requiring_global_rediscovery
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_discovery_continuation.py
+  removed_tests:
+  - test_abstention_does_not_cache_empty_table_as_complete
+  - test_entity_repair_enables_t2_before_publication
+  - test_failed_followup_rule_cannot_complete_column_coverage
+  - test_finished_relation_abstention_is_not_repeated_without_new_context
+  - test_new_role_occurrence_reaches_revision_without_persisting_source_keys
+  - test_post_publication_failure_still_exports_committed_graph
+  - test_role_event_can_discover_relation_without_changing_entity_rules
+  - test_structured_output_failure_remains_pending_for_later_run
+  - test_unexplained_columns_trigger_bounded_followup_preserving_first_group
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_discovery_followup_priority.py
+  removed_tests:
+  - test_hierarchy_alias_coverage_keeps_complete_mapping_and_precedes_relations
+  - test_single_hierarchy_does_not_start_optional_cross_rule_discovery
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_discovery_outcome_status.py
+  removed_tests:
+  - test_one_table_failure_keeps_healthy_publication_and_distinguishes_decision
+  - test_rejected_endpoint_proposals_close_without_losing_entities_or_repeating
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_discovery_repair.py
+  removed_tests:
+  - test_valid_wide_hierarchy_publishes_despite_unbound_entity_attribute
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_discovery_sibling_isolation.py
+  removed_tests:
+  - test_coverage_retains_gaps_but_only_broken_revisions_stay_deferred
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_dynamic_discovery.py
+  removed_tests:
+  - test_agent_defines_people_organizations_and_materializes_many_to_many
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+  file_removed: true
+- file: src/lightgraph/tests/test_evaluation.py
+  removed_tests:
+  - test_frozen_experiment_preserves_uncapped_tokens_and_finite_calls
+  - test_frozen_worker_uses_verified_snapshot_without_gold_or_model_calls
+  reason: 旧 Python-only 冻结启动及 SQLite RuleSpec 续跑入口已移除；保留独立评分与历史完整性读取测试。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_graph_yaml_workspace.py
+  - test_construction_entrypoints.py
+- file: src/lightgraph/tests/test_frozen_portability.py
+  removed_tests:
+  - test_resume_closes_sqlite_handles_before_freezing_and_supports_windows_seed_keys
+  reason: 旧 Python-only 冻结启动及 SQLite RuleSpec 续跑入口已移除；保留独立评分与历史完整性读取测试。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_graph_yaml_workspace.py
+  - test_construction_entrypoints.py
+- file: src/lightgraph/tests/test_frozen_resume.py
+  removed_tests:
+  - test_frozen_resume_reuses_state_and_leaves_parent_untouched
+  - test_resume_rebinds_only_the_same_verified_candidate_scope
+  - test_resume_rejects_different_inputs_or_authorization
+  - test_resume_requires_a_terminal_parent_and_protects_seed
+  reason: 旧 Python-only 冻结启动及 SQLite RuleSpec 续跑入口已移除；保留独立评分与历史完整性读取测试。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_graph_yaml_workspace.py
+  - test_construction_entrypoints.py
+- file: src/lightgraph/tests/test_generation_before_relations.py
+  removed_tests:
+  - test_new_local_cycle_keeps_repair_work_when_old_global_cycle_disappears
+  - test_shared_name_repair_precedes_relation_calls
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_graph_scope_diagnostics.py
+  removed_tests:
+  - test_published_private_business_graph_is_diagnosed_without_exposing_scopes
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_iteration_runtime.py
+  removed_tests:
+  - test_cached_data_counterexample_starts_new_agent_and_then_reuses
+  - test_repairing_one_column_group_keeps_sibling_new_entities
+  - test_unresolved_counterexample_does_not_repeat_same_agent_task
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_namespace_coverage_revision.py
+  removed_tests:
+  - test_failed_scope_revision_keeps_old_rule_and_actionable_work
+  - test_scope_coverage_requests_explicit_review_and_replaces_public_rule
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_partial_feedback_repair.py
+  removed_tests:
+  - test_one_repaired_rule_does_not_resolve_sibling_no_progress
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+  file_removed: true
+- file: src/lightgraph/tests/test_pipeline.py
+  removed_tests:
+  - test_atomic_dependency_update_and_deletion
+  - test_cache_hit_does_not_silently_hide_unmodeled_table
+  - test_discover_only_exports_valid_rules_without_graph
+  - test_discovery_can_reuse_rules_without_calling_model
+  - test_document_alignment_does_not_block_source_deletion
+  - test_document_partial_preserves_prior_claims
+  - test_document_support_is_not_public_when_scope_private
+  - test_excel_roundtrip_and_cli
+  - test_explicit_document_removal_retracts_its_claims
+  - test_export_import_roundtrip_preserves_graph_and_scope
+  - test_export_schema_and_repeat_bytes
+  - test_failed_reference_cannot_publish_changed_target
+  - test_full_execution_duplicates_hierarchy_references_and_retention
+  - test_incremental_repetition_stable_identity_and_fact_set
+  - test_narrowed_extraction_goal_invalidates_previous_out_of_scope_supports
+  - test_new_table_is_discovered_on_cached_source
+  - test_pipeline_partition_supports_and_withdrawal
+  - test_relation_goal_removes_previously_published_reference
+  - test_schema_change_removes_dependent_metadata_edges_before_catalog_replacement
+  - test_shared_alias_withdrawal_preserves_other_scope
+  - test_small_budget_reports_partial_without_false_completion
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_pipeline_progress.py
+  removed_tests:
+  - test_pipeline_progress_is_visible_before_rule_execution_and_tracks_publications
+  - test_publication_failure_does_not_emit_publication_completed
+  - test_rule_rejection_still_has_a_terminal_event_without_claiming_publication
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_proposal_feedback.py
+  removed_tests:
+  - test_corrected_tool_submission_publishes_and_does_not_repeat_discovery
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_publication_groups.py
+  removed_tests:
+  - test_failed_new_local_mapping_does_not_withdraw_previous_valid_head
+  - test_new_global_conflict_preserves_old_head_and_independent_update
+  - test_pipeline_publishes_independent_c_and_keeps_failed_mapping_for_retry
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_publication_upgrade_regressions.py
+  removed_tests:
+  - test_marker_failure_preserves_published_accounting_and_cleans_staging
+  - test_workflow_upgrade_refreshes_metadata_with_old_document_alignment
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_relation_foundation_wait.py
+  removed_tests:
+  - test_pipeline_does_not_spend_relation_calls_on_missing_path_endpoint
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_relation_self_links.py
+  removed_tests:
+  - test_pipeline_self_link_counterexample_reaches_fresh_t2_without_source_values
+  - test_same_goal_pipeline_restores_valid_legacy_reference_without_model_calls
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_repair_phase_budget.py
+  removed_tests:
+  - test_coverage_can_add_english_alias_without_new_identity
+  - test_exploration_deadline_does_not_abort_validated_core
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_request_retry_isolation_pipeline.py
+  removed_tests:
+  - test_exhausted_request_retry_defers_only_affected_task_and_preserves_other_rules
+  - test_invalid_json_retries_same_request_and_keeps_validated_draft_obligations
+  - test_request_retry_cannot_exceed_global_model_call_budget
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_resume_pipeline.py
+  removed_tests:
+  - test_failed_requested_retry_does_not_drop_existing_rule_from_same_table
+  - test_manual_rule_is_not_mutated_to_project_an_excluded_name
+  - test_relation_retry_sees_the_newly_validated_source_object
+  - test_same_column_names_and_domain_do_not_delete_an_independent_projection
+  - test_workflow_upgrade_keeps_published_rules_and_only_discovers_missing_table
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_retention_lifecycle.py
+  removed_tests:
+  - test_actual_process_kill_recovers_staging_without_source_retention
+  - test_provider_retry_accounts_requests_without_recording_packets_or_error_body
+  - test_source_cancel_mid_projection_keeps_previous_head_and_no_raw_data
+  - test_source_exception_body_is_never_reported_or_written
+  - test_source_success_excludes_canary_from_every_application_output
+  - test_streamed_http_response_never_enters_artifacts_or_captured_output
+  reason: 旧模型传输/SQL暂存发布入口已移除；用户现要求完整授权轨迹留存，零轨迹断言不再适用。凭据、排除列、异常脱敏与原子写入保障迁往当前实现。
+  current_contract_tests:
+  - test_web_credentials.py
+  - test_construction_publication_lifecycle.py
+  - test_graph_construction_executor.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_rules_engine.py
+  removed_tests:
+  - test_pipeline_two_runs_and_dependency_delete_are_consistent
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_semantic_decisions.py
+  removed_tests:
+  - test_agent_relation_proposal_is_refuted_by_independent_review
+  - test_negated_shared_definition_preserves_two_tenant_entities
+  - test_prose_never_promotes_overlap_to_accepted_relation
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_shared_label_coverage.py
+  removed_tests:
+  - test_pipeline_enriches_cached_shared_rule_and_keeps_reference_publication
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+- file: src/lightgraph/tests/test_staged_discovery_publication.py
+  removed_tests:
+  - test_valid_draft_is_revalidated_while_unfinished_discovery_resumes
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+  file_removed: true
+- file: src/lightgraph/tests/test_submission_completion_pipeline.py
+  removed_tests:
+  - test_bad_reference_attempt_then_finish_preserves_graph_and_actual_work
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+  file_removed: true
+- file: src/lightgraph/tests/test_submission_phase_publication.py
+  removed_tests:
+  - test_submission_phase_correction_publishes_within_eight_calls
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+  file_removed: true
+- file: src/lightgraph/tests/test_wide_table_recovery.py
+  removed_tests:
+  - test_no_business_graph_is_reported_separately_from_metadata
+  - test_rejected_hierarchy_does_not_hide_independent_entities
+  - test_unrepaired_contract_is_not_cached_as_completed_and_next_run_recovers
+  - test_wide_hierarchy_publishes_with_invalid_center_contract_recorded_as_gap
+  reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
+    自主选择工具，不恢复旧路径来满足用例。
+  current_contract_tests:
+  - test_construction_runner.py
+  - test_construction_tools.py
+  - test_graph_construction_executor.py
+  - test_graph_yaml_workspace.py
+  - test_construction_harness_integration.py
+  file_removed: true

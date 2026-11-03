@@ -6,7 +6,6 @@ import pytest
 import yaml
 from lightgraph.tests.web_client import RevisionClient as TestClient
 
-from lightgraph.contracts import RuleSpec
 from lightgraph.web.app import MAX_REQUEST_BYTES, create_app
 
 
@@ -122,22 +121,18 @@ def test_active_run_blocks_all_input_mutations(client, monkeypatch):
     assert client.get('/api/projects/alpha').json()['name'] == '经营分析'
 
 
-def test_actual_api_run_publishes_graph_and_reuses_project_output(client):
+def test_actual_api_run_publishes_graph_and_reuses_project_output(client, monkeypatch):
+    from lightgraph.tests.construction_worker_fixture import install_scripted_worker
+    install_scripted_worker(monkeypatch)
     create(client)
     create(client, 'beta')
     data = upload(client, 'metrics.csv', 'metric_code,metric_name,amount\nK1,收入,PRIVATE_OBSERVATION_CANARY\nK1,收入,300\nK2,费用,10\n'.encode())
     config = client.get('/api/projects/alpha/config').json()
     config['goal']['purpose'] = '构建指标定义，不保留业务观测值'
+    config['goal']['excluded_columns'] = ['amount']
     config['sources'][0]['table_name'] = 'metrics'
-    sid = config['sources'][0]['id']
-    rule = RuleSpec(rule_id='metrics', kind='column_group_entity',
-        source={'source_id': sid, 'table': 'metrics'},
-        identity={'key_columns': ['metric_code'], 'entity_kind': 'Metric'},
-        attributes={'single_valued': {'label': 'metric_name'},
-                    'excluded': [{'column': 'amount', 'reason': 'observation_value'}]},
-        evidence={'semantic_basis': ['fixture:E:approved_definition']})
-    rules = upload(client, 'rules.yaml', yaml.safe_dump([rule.model_dump(mode='json', by_alias=True)]).encode())
-    config['rules'] = [rules['relative_path']]
+    config['model'].update(mode='in_environment', model='scripted-test',
+                           base_url='http://127.0.0.1:9999/v1')
     assert client.put('/api/projects/alpha/config', json=config).status_code == 200
     metadata = client.post('/api/projects/alpha/metadata/refresh')
     assert metadata.status_code == 200, metadata.text
@@ -157,6 +152,7 @@ def test_actual_api_run_publishes_graph_and_reuses_project_output(client):
             time.sleep(.03)
         assert run['status'] == 'completed', run
         assert run['cleanup_status'] == 'completed'
+        assert run['report']['validation']['D'] == 'test_double'
         graph = client.get('/api/projects/alpha/graph').json()
         assert {n['label'] for n in graph['nodes']} == {'收入', '费用'}
         current = {n['id'] for n in graph['nodes']}

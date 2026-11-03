@@ -114,8 +114,8 @@ def test_export_lease_blocks_clear_until_download_or_cancel_releases(client,monk
 
 def test_model_limits_save_for_inline_and_agent_file(client):
     path='/api/projects/p/model-limits'
-    desired={'max_discovery_steps':24,'max_prompt_tokens':1048576,'max_output_tokens':65536,'timeout_seconds':300,
-        'max_prompt_bytes':None,'max_response_bytes':None}
+    desired={'max_calls':24,'max_prompt_tokens':1048576,'max_output_tokens':65536,'timeout_seconds':300,
+        'context_window_tokens':1114112,'working_context_tokens':32768}
     assert client.put(path,json=desired).status_code==428
     before=client.get(path)
     changed=client.put(path,json=desired,headers={'If-Match':before.headers['etag']})
@@ -130,18 +130,19 @@ def test_model_limits_save_for_inline_and_agent_file(client):
     response=client.put(path,json=desired,headers={'If-Match':client.get(path).headers['etag']})
     assert response.status_code==200,response.text
     resolved=workspace.resolved_config('p')
-    assert resolved.resolved_model.max_calls==240 and resolved.agent_name=='custom-agent'
+    assert resolved.resolved_model.max_calls==24 and resolved.agent_name=='custom-agent'
     assert resolved.resolved_model.max_prompt_tokens==1048576
-    assert resolved.resolved_model.max_discovery_steps==24
+    assert resolved.resolved_model.working_context_tokens==32768
     assert workspace.file_path('p',asset['file_id']).read_bytes()==original
     assert workspace.get_config('p')['agent_config']!=asset['relative_path']
     assert 'model' not in workspace.get_config('p')
     etag=client.get(path).headers['etag']
     assert client.put(path,json={'api_key':'secret'},headers={'If-Match':etag}).status_code==400
     assert client.put(path,json={'max_output_tokens':0},headers={'If-Match':etag}).status_code==400
-    for invalid in (0,33,1.5,None):
-        assert client.put(path,json={'max_discovery_steps':invalid},headers={'If-Match':etag}).status_code==400
-    assert client.get(path).json()['max_discovery_steps']==24
+    assert client.put(path,json={'max_discovery_steps':24},headers={'If-Match':etag}).status_code==400
+    for invalid in (-1,1.5):
+        assert client.put(path,json={'max_calls':invalid},headers={'If-Match':etag}).status_code==400
+    assert client.get(path).json()['max_calls']==24
 
 
 def test_filtered_trace_pages_preserve_actual_sequence_and_complete_export(client):

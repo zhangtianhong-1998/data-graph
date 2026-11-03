@@ -1,4 +1,8 @@
 const messages: Record<string, string> = {
+  construction_scoped_access_not_supported: '该历史运行使用的版本尚不支持此访问范围。当前版本已支持逐条来源证据过滤，请保留原权限配置。',
+  scope_binding_conflict: '同一来源表存在不同的范围列绑定，请核对 scope_bindings 后重试。',
+  graph_support_visibility_missing: '该图缺少逐条来源证据的可见范围，请按当前绑定重新验证和发布。',
+  graph_access_context_changed: '来源或访问权限已改变，旧图暂不展示。历史文件保留，请按当前授权重新验证和发布。',
   network_unavailable: '无法连接服务，请确认后端已启动。', invalid_response: '服务返回的内容无法读取，请刷新后重试。',
   request_timeout: '请求超时，请检查后端服务、数据库地址和网络后重试。',
   request_cancelled: '请求已取消。',

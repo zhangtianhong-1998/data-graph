@@ -112,24 +112,6 @@ def test_source_permissions_and_discovery_semantic_review_are_required():
         assert not result.published and 'null_identity_namespace' in result.codes
 
 
-@pytest.mark.parametrize('restricted',['entity','relation'])
-def test_narrowed_goal_retires_old_concept_publication(tmp_path,restricted):
-    from lightgraph.documents import load_document
-    from lightgraph.pipeline import run_pipeline
-    from lightgraph.runtime.config import RunConfig
-    doc=load_document('declaration.md',text='---\npurpose: data_description\n---\n# 概念\n指标、产品、渠道独立定义。')
-    rule=concept_rule();version=doc.document_id+'@'+doc.revision
-    rule.concept_mapping.evidence_ref=version;rule.dependencies.documents=[version]
-    config=RunConfig(sources=[],output_dir=str(tmp_path),max_identity_reviews=0)
-    def run():
-        with MemorySource([table(['id','label'])],{'public.items':[('1','占用-柑橘-批发')]}) as source:
-            return run_pipeline(config,[source],rules=[rule],documents=[doc])
-    assert run().counts['business_nodes']==4
-    if restricted=='entity':config.goal.entity_kinds=['ConceptBinding','Product','Channel']
-    else:config.goal.relation_kinds=['binds_product','binds_channel']
-    assert run().counts['business_nodes']==0
-    with GraphStore(tmp_path/'graph.sqlite') as store:
-        assert not [n for n in store.view({'public'})['nodes'] if n['layer']=='business']
 
 
 def test_declaration_is_mandatory_and_segment_contract_is_complete():
@@ -142,41 +124,6 @@ def test_declaration_is_mandatory_and_segment_contract_is_complete():
         RuleSpec.model_validate(raw)
 
 
-@pytest.mark.parametrize('coded',[False,True])
-def test_agent_proposal_is_reviewed_compiled_and_published(monkeypatch,tmp_path,coded):
-    from lightgraph.documents import load_document
-    from lightgraph.pipeline import run_pipeline
-    from lightgraph.runtime.config import RunConfig
-    from lightgraph.tests.test_agent_pipeline import client,input_packet,response
-    from lightgraph.discovery.semantics import document_ref
-    stages=[]
-    def handler(request):
-        _,packet=input_packet(request);stages.append(packet['task'])
-        if packet['task']=='semantic_review':
-            return response({'proposition_ref':packet['semantic_proposition_ref'],'decision':'supported',
-                'basis':'document_interpretation','evidence':[
-                    {'reference':document_ref(d),'stance':'supports'} for d in packet['document_snippets']]})
-        if packet['task']!='T0_discovery':return response({'task':packet['task'],'abstain':True})
-        ids={c['name']:c['id'] for c in packet['metadata_digest']['columns']}
-        doc=packet['document_snippets'][0]
-        rule=coded_rule() if coded else concept_rule();mapping=rule.concept_mapping.model_dump()
-        mapping['evidence_ref']=doc['doc_id']+'@'+doc['revision']
-        for component in mapping['components']:
-            component['column']=ids[component['role']] if coded else ids['label'];component['definition_ref']=document_ref(doc)
-            if coded:
-                component['key_column']=ids[component['role']+'_code'];component['scope_evidence_ref']=document_ref(doc)
-        return response({'task':packet['task'],'semantic_schema':rule.semantic_schema.model_dump(),
-            'proposals':[{'kind':'concept_mapping','claim':{**mapping,'group_id':'concepts',
-                'entity_kind_hint':'ConceptBinding','key_columns':[ids['id']],
-                'namespace_columns':[ids['subject']] if coded else []},'evidence_cited':[document_ref(doc)]}]})
-    doc=load_document('concepts.md',text='---\npurpose: data_description\n---\n# 定义\n名称按连字符分为指标、产品、渠道三段，每段在此定义内独立复用；原编码表示三者的联合上下文。')
-    rows=[coded_row()] if coded else [{'id':'1','label':'占用-柑橘-批发'}]
-    with MemorySource([table(list(rows[0]))],{'public.items':rows}) as source:
-        report=run_pipeline(RunConfig(sources=[],output_dir=str(tmp_path),scopes=['public','A'],max_identity_reviews=0),
-            [source],model=client(monkeypatch,handler),documents=[doc])
-    assert 'semantic_review' in stages
-    assert report.counts['business_nodes']==4,report.model_dump()
-    assert report.counts['business_edges']==3
 
 
 def coded_rule():

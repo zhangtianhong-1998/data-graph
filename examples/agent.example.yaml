@@ -1,36 +1,26 @@
-# Copy to agent.local.yaml; the local filename is ignored by Git.
-# In your run YAML, replace the entire model section with:
-#   agent_config: agent.local.yaml
-# The path is relative to the run YAML, not the current working directory.
-framework: agentscope
-name: lightgraph-discovery
+# Copy to agent.local.yaml, then set agent_config: agent.local.yaml in the run YAML.
+# Paths resolve relative to the run YAML. Only the Harness runtime is supported.
+framework: deepseek_harness
+name: goal-driven-graph
 llm:
-  # metadata_only: no instance statistics or samples are sent to the model.
-  # in_environment: a model service within the approved data environment.
-  # approved_external: an external service explicitly approved to receive samples.
+  # metadata_only permits catalog/documents; in_environment allows source probes.
+  # approved_external requires authorization to send samples outside the environment.
   mode: metadata_only
   base_url: https://your-model-gateway.example/v1
   model: your-deployed-model
-  # A nonempty direct key takes precedence; an empty key uses api_key_env.
-  # Direct keys never enter config dumps. Prefer the environment variable.
   api_key: ""
   api_key_env: LIGHTGRAPH_API_KEY
-  # Use json_object explicitly only when the gateway lacks strict schema output.
-  response_format: json_schema
-  stream: true
-  # Set false if the model gateway rejects stream_options.include_usage.
-  stream_options_include_usage: true
-  # Set true only for a trusted internal HTTP gateway; HTTPS is the default.
   allow_insecure_http: false
-  timeout_seconds: 60
-  max_output_tokens: 4096
-  max_prompt_tokens: 32768
-  max_prompt_bytes: null
-  max_response_bytes: null
+  timeout_seconds: 600
+  # Hard admission uses the native token estimate, including tools and history.
+  # Provider usage calibrates later estimates; this is not an exact tokenizer.
+  max_prompt_tokens: 1048576
+  max_output_tokens: 65536
+  context_window_tokens: 1114112
+  # Active context is compacted before the hard limit; full history stays on disk.
+  # null disables automatic compaction. Input/context null disables its input cap.
+  working_context_tokens: 32768
   retries: 1
-  # Explicit null removes the corresponding API total, while retaining usage counters.
-  max_calls: 40
-  max_tokens: 120000
-  # Includes exploration, submission and corrections within the shared call/time budgets.
-  max_discovery_steps: 16
-  max_tool_calls: 16
+  # Counts physical model requests, including retries and compaction summaries.
+  # null removes this call cap; zero prevents model calls. No cumulative token cap.
+  max_calls: 240

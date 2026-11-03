@@ -1,9 +1,10 @@
 from __future__ import annotations
 import os
+import re
 from pathlib import Path
 from typing import Literal
 import yaml
-from pydantic import ConfigDict, Field, PrivateAttr, SecretStr, model_serializer, model_validator
+from pydantic import ConfigDict, Field, PrivateAttr, SecretStr, field_validator, model_serializer, model_validator
 from ..contracts import StrictModel, QueryLimits, ExtractionGoal
 from ..errors import LightGraphError
 
@@ -58,25 +59,42 @@ class ModelConfig(StrictModel):
     allow_insecure_http: bool = False
     # Explicit null disables only this API total; counters and other limits remain.
     max_calls: int | None = Field(default=40, ge=0)
-    max_tokens: int | None = Field(default=120000, ge=0)
+    max_tokens: int | None = Field(default=None, ge=0,
+        description="Legacy cumulative-token setting retained for configuration migration; Harness budgets physical calls and wall time.")
     max_discovery_steps: int = Field(default=16, ge=1, le=32,
-        description="Maximum model turns per discovery task, including submission and correction; shared call and time limits still apply.")
-    max_tool_calls: int = Field(default=16, ge=1, le=64)
+        description="Legacy per-table setting, accepted when reading old configurations; not used by Harness.")
+    max_tool_calls: int = Field(default=16, ge=1, le=64,
+        description="Legacy source-tool allowance; not used by Harness.")
     timeout_seconds: float = Field(default=60, gt=0)
     max_output_tokens: int = Field(default=4096, gt=0)
-    # Optional transport guards are independent of the model's token window.
-    # Old explicit byte limits retain their units; new configurations have none.
+    # Read legacy byte settings without presenting them as Harness controls.
     max_prompt_bytes: int | None = Field(default=None, gt=0,
-        description="Optional UTF-8 request-byte guard; null disables it. This is not the input token window.")
+        description="Legacy request-byte guard retained for configuration migration; not applied by Harness.")
     max_prompt_tokens: int | None = Field(default=None, gt=0,
         description="Optional estimated input token cap, including tool schemas; independent of byte limits.")
     context_window_tokens: int | None = Field(default=None, gt=0,
         description="Optional combined input/output token window; max_output_tokens is reserved from it.")
     working_context_tokens: int | None = Field(default=32768, gt=0,
-        description="Soft discovery input target: compact old source results proactively; null disables it. Pinned evidence can exceed this target, subject to hard limits.")
+        description="Harness working-context target; null disables automatic compaction including overflow recovery. Token-meter estimates are calibrated from provider usage.")
     max_response_bytes: int | None = Field(default=None, gt=0,
-        description="Optional response-byte guard; null disables it. max_output_tokens controls model generation.")
+        description="Legacy response-byte guard retained for configuration migration; not applied by Harness.")
     retries: int = Field(default=1, ge=0, le=1)
+
+    @field_validator("base_url")
+    @classmethod
+    def normalize_endpoint(cls, value):
+        from .model_endpoint import normalize_model_base_url
+        return normalize_model_base_url(value)
+
+    @field_validator("model", "api_key_env")
+    @classmethod
+    def normalize_model_identifier(cls, value, info):
+        value = value.strip()
+        if info.field_name == "api_key_env" and not value:
+            value = "LIGHTGRAPH_API_KEY"
+        if info.field_name == "api_key_env" and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError("invalid_model_key_environment")
+        return value
 
     @model_validator(mode="after")
     def check_context_window(self):
@@ -86,11 +104,32 @@ class ModelConfig(StrictModel):
 
 
 class AgentConfig(StrictModel):
-    """Separate reusable AgentScope settings; secrets never enter dumps or repr."""
+    """Harness configuration; old framework names migrate, never select an old engine."""
     model_config = ConfigDict(hide_input_in_errors=True)
-    framework: Literal["agentscope"] = "agentscope"
+    framework: Literal["deepseek_harness"] = "deepseek_harness"
     name: str = Field(default="lightgraph-discovery", min_length=1, max_length=64)
     llm: ModelConfig
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_framework(cls, value):
+        if isinstance(value, dict) and value.get("framework") == "agentscope":
+            return {**value, "framework": "deepseek_harness"}
+        return value
+
+
+class GraphScopeBinding(StrictModel):
+    """Operator-owned visibility mapping; never accepted from an Agent draft."""
+    source_id: str = Field(min_length=1)
+    schema_name: str = Field(default='public', alias='schema')
+    table: str = Field(min_length=1)
+    columns: list[str] = Field(default_factory=list, max_length=32)
+
+    @model_validator(mode='after')
+    def check_columns(self):
+        if any(not column for column in self.columns) or len(set(self.columns)) != len(self.columns):
+            raise ValueError('invalid_scope_binding_columns')
+        return self
 
 
 class RunConfig(StrictModel):
@@ -102,19 +141,22 @@ class RunConfig(StrictModel):
     documents: list[str] = Field(default_factory=list)
     rules: list[str] = Field(default_factory=list)
     goal: ExtractionGoal = Field(default_factory=ExtractionGoal)
+    goal_markdown: str | None = Field(default=None, max_length=64000,
+        description="User-authored Markdown construction objective. Null renders the legacy goal fields; source authorization remains in typed configuration.")
     limits: QueryLimits = Field(default_factory=QueryLimits)
     model: ModelConfig = Field(default_factory=ModelConfig)
     output_dir: str = "runs/default"
     record_trace: bool = Field(default=True,
         description="Record the complete local run trajectory with credentials redacted; retain until manually cleared.")
     scopes: list[str] = Field(default_factory=lambda:["public"])
+    scope_bindings: list[GraphScopeBinding] = Field(default_factory=list, max_length=1024,
+        description='Operator-owned source/table columns determining each result support scope. No binding means public; never inferred from identity keys.')
     max_working_bytes: int = Field(default=32*1024*1024, gt=0)
     max_db_queries: int = Field(default=240, gt=0)
     max_partitions: int = Field(default=256, ge=1, le=4096)
     max_discovery_rounds: int = Field(default=3, ge=1, le=8)
-    # Exploration stops early enough to leave source queries and wall time for
-    # complete rule validation and atomic publication. These are ceilings, not
-    # a guarantee that an arbitrarily large projection fits the remaining run.
+    # Accepted only to read old project configurations. Harness does not split
+    # discovery into fixed object/relation windows.
     discovery_time_fraction: float = Field(default=0.75, gt=0, lt=1)
     discovery_query_fraction: float = Field(default=0.75, gt=0, lt=1)
     max_relation_discovery_attempts: int = Field(default=2, ge=1, le=8)
@@ -208,7 +250,7 @@ def open_sources(config, *, metadata_only=False, source_credentials=None):
                 if not s.path:raise LightGraphError("config_invalid")
                 sources.append(ExcelSource(s.path,source_id=s.id,limits=config.limits,
                     header_row=s.header_row,include_hidden=s.include_hidden,query_budget=budget,
-                    max_memory_bytes=config.max_working_bytes))
+                    max_memory_bytes=config.max_working_bytes,metadata_only=metadata_only))
             elif s.kind=="csv_file":
                 sources.append(CSVSource(s.path,source_id=s.id,limits=config.limits,
                     encoding=s.encoding,delimiter=s.delimiter,header=s.header,

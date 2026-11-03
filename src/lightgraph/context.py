@@ -114,13 +114,18 @@ def wire_call_context(packet, stage, *, constraints=None, output_contract=None):
 
 
 def with_discovery_runtime_control(messages, *, turn, max_turns, remaining_tool_calls,
-                                   submission_reason=None, remaining_submission_calls=16):
+                                   submission_reason=None, remaining_submission_calls=16,
+                                   remaining_seconds=None, submission_reserve_seconds=None):
     """Build the exact runtime-owned control envelope for preflight and calls."""
     control={'turn':turn,'max_turns':max_turns,
         'remaining_turns_including_current':max_turns-turn+1,
         'remaining_tool_calls':max(0,remaining_tool_calls),
         'remaining_submission_calls':max(0,remaining_submission_calls),
         'submission_required':submission_reason is not None,'submission_reason':submission_reason}
+    if remaining_seconds is not None:
+        control['remaining_seconds']=round(max(0,remaining_seconds),3)
+    if submission_reserve_seconds is not None:
+        control['submission_reserve_seconds']=round(max(0,submission_reserve_seconds),3)
     prepared=[dict(message) for message in messages]
     for message in prepared:
         if message.get('role')=='system':
@@ -129,6 +134,8 @@ def with_discovery_runtime_control(messages, *, turn, max_turns, remaining_tool_
                 'turns reserve their last two turns for local submission, field feedback and finishing. '
                 'Use the final turn to correct rejected fields and finish retained drafts; '
                 'submit each proposal early enough to receive feedback. '
+                'The runtime may open submission earlier when recent calls indicate little time remains, '
+                'or after a timed-out request whose output was never executed. '
                 'remaining_tool_calls counts source tools only; local submission tools have their own allowance. '
                 'When submission_required is true, source queries are forbidden. Use the remaining local '
                 'declare_*, submit_* and finish_discovery tools, or the small final response. '
