@@ -52,7 +52,7 @@ def _catalog(adapter, goal):
 
 def _ask(model, packet, tools, observations):
     return model.explore(packet, tools,
-        max_steps=getattr(model.config,'max_discovery_steps',8),
+        max_steps=getattr(model.config,'max_discovery_steps',16),
         max_tool_calls=getattr(model.config,'max_tool_calls',16),
         review_observations=observations)
 
@@ -107,7 +107,19 @@ def _record_submission_state(result, table, batch):
                'discovery_tool_calls_exhausted','discovery_final_response_required',
                'model_schema_invalid','model_response_invalid','model_response_truncated',
                'model_stream_invalid','model_http_error','model_rate_limited',
-               'object_model_mapping_conflict'}
+               'object_model_mapping_conflict'} | SEMANTIC_REVIEW_PROTOCOL_CODES | {
+               # These runtime-owned failures must survive alongside the more
+               # general incomplete marker. Do not admit arbitrary prefixed
+               # strings: exception/provider text cannot become report codes.
+               'model_transport_error','model_json_duplicate_key','model_json_nonfinite',
+               'model_stream_incomplete','model_stream_event_too_large',
+               'model_stream_transport_too_large','model_packet_too_large',
+               'model_response_too_large','model_context_window_exceeded',
+               'llm_calls_budget_exhausted','llm_tokens_budget_exhausted',
+               'db_cu_budget_exhausted','memory_budget_exhausted',
+               'wall_time_budget_exhausted','run_time_budget_exhausted',
+               'discovery_time_budget_exhausted','discovery_query_budget_exhausted',
+               'query_budget_exhausted'}
     pending = set(getattr(batch, '_runtime_pending_codes', ())) & allowed
     invalid = getattr(batch, '_runtime_invalid_drafts', 0)
     invalid = invalid if type(invalid) is int and invalid >= 0 else 0
@@ -549,7 +561,7 @@ def _bounded_catalog_window(table, tables, packet, model, tool_specs):
     from .token_estimation import prompt_token_limit
     candidates=[table]+[t for t in tables
         if (t.source_id,t.qualified_name)!=(table.source_id,table.qualified_name)][:63]
-    byte_limit=getattr(model.config,'max_prompt_bytes',131072)
+    byte_limit=getattr(model.config,'max_prompt_bytes',None)
     context_limit=prompt_token_limit(model.config)
     budget_limit=None
     # Request bytes, context tokens and cumulative spend are separate limits.
@@ -561,7 +573,7 @@ def _bounded_catalog_window(table, tables, packet, model, tool_specs):
             available=tokens-allowance['used']['llm_tokens']-sum(
                 cost['llm_tokens'] for cost in allowance['reserved'].values())
             budget_limit=available-getattr(model.config,'max_output_tokens',4096)
-    control={'max_steps':getattr(model.config,'max_discovery_steps',8),
+    control={'max_steps':getattr(model.config,'max_discovery_steps',16),
              'max_tool_calls':getattr(model.config,'max_tool_calls',16),
              'response_format':getattr(model.config,'response_format','json_schema')}
     def candidate(size):
@@ -572,14 +584,14 @@ def _bounded_catalog_window(table, tables, packet, model, tool_specs):
                 'in this call; the task table is included. Unlisted tables have not been examined.')}
     selected=candidate(1)
     required_bytes,required_tokens=initial_agent_prompt_sizes(selected,tool_specs,**control)
-    if required_bytes>byte_limit:raise LightGraphError('model_packet_too_large')
+    if byte_limit is not None and required_bytes>byte_limit:raise LightGraphError('model_packet_too_large')
     if context_limit is not None and required_tokens>context_limit:
         raise LightGraphError('model_context_window_exceeded')
     if budget_limit is not None and required_tokens>budget_limit:
         raise BudgetExceeded('llm_tokens_budget_exhausted')
     # Optional catalog entries must leave room for tools and refreshed evidence.
     # Keep the mandatory task table even if it alone consumes this headroom.
-    window_bytes=max(required_bytes,byte_limit-min(65536,byte_limit//4))
+    window_bytes=max(required_bytes,byte_limit-min(65536,byte_limit//4)) if byte_limit is not None else None
     token_limits=[limit for limit in (context_limit,budget_limit) if limit is not None]
     token_limit=min(token_limits) if token_limits else None
     window_tokens=(max(required_tokens,token_limit-min(16384,token_limit//4))
@@ -589,7 +601,7 @@ def _bounded_catalog_window(table, tables, packet, model, tool_specs):
         middle=(low+high+1)//2
         trial=candidate(middle)
         trial_bytes,trial_tokens=initial_agent_prompt_sizes(trial,tool_specs,**control)
-        if trial_bytes<=window_bytes and (window_tokens is None or trial_tokens<=window_tokens):
+        if (window_bytes is None or trial_bytes<=window_bytes) and (window_tokens is None or trial_tokens<=window_tokens):
             low=middle
             selected=trial
         else:high=middle-1

@@ -209,6 +209,7 @@ def test_requested_last_table_is_not_starved_by_64_unrelated_catalog_entries(mon
         return response(group(packet, "key", "label"))
 
     model = client(monkeypatch, handle)
+    model.config.max_prompt_bytes = 131072  # This case explicitly exercises a byte-limited gateway.
     original_limit = model.config.max_prompt_bytes
     with MemorySource(tables, {table.qualified_name: [("K", table.name)] for table in tables}) as source:
         result = discover_with_agent(source, model=model, table_refs={"public.t064"})

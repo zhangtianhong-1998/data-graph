@@ -1,7 +1,7 @@
 """AgentScope tool functions over the existing guarded discovery executor.
 
-Tool observations remain ephemeral. This module neither logs nor persists tool
-inputs, outputs, or exception messages. SQL authorization and query budgets stay
+Tool observations can be retained by an explicitly bound local run trace.
+Exception messages and credentials are never written. SQL authorization and query budgets stay
 inside ToolExecutor; Agent-level dispatch may add loop and metadata-only checks.
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from copy import deepcopy
 from typing import Any
+from uuid import uuid4
 
 from agentscope import _config
 from agentscope.message import TextBlock, ToolUseBlock
@@ -19,6 +20,7 @@ from agentscope.tool import Toolkit, ToolResponse
 from jsonschema import Draft202012Validator
 
 from lightgraph.errors import BudgetExceeded, LightGraphError
+from lightgraph.runtime.trace import emit_trace
 from .validation_feedback import schema_diagnostics
 
 
@@ -75,8 +77,15 @@ class GuardedToolkit(Toolkit):
 
         async def responses():
             name = tool_call.get("name") if isinstance(tool_call, dict) else None
+            invocation_id='tool_'+uuid4().hex
+            emit_trace('tool_call',{'invocation_id':invocation_id,'call':tool_call})
+            def observed(response):
+                emit_trace('tool_result',{'invocation_id':invocation_id,'name':name,
+                    'tool_call_id':tool_call.get('id') if isinstance(tool_call,dict) else None,
+                    'content':response.content})
+                return response
             if not isinstance(name, str) or name not in self.tools:
-                yield _error("unknown_tool")
+                yield observed(_error("unknown_tool"))
                 return
             arguments = tool_call.get("input", {})
             diagnostics = self._argument_diagnostics(name, arguments)
@@ -84,9 +93,9 @@ class GuardedToolkit(Toolkit):
                 if self.invalid_argument_handler is not None:
                     feedback=self.invalid_argument_handler(name,arguments,diagnostics)
                     if feedback is not None:
-                        yield _response(feedback)
+                        yield observed(_response(feedback))
                         return
-                yield _error("invalid_tool_arguments", name, diagnostics=diagnostics)
+                yield observed(_error("invalid_tool_arguments", name, diagnostics=diagnostics))
                 return
             failures: list[BudgetExceeded] = []
             token = self._failure.set(failures)
@@ -97,9 +106,14 @@ class GuardedToolkit(Toolkit):
                 async for chunk in result:
                     if failures:
                         raise failures[0]
-                    yield chunk
+                    yield observed(chunk)
                 if failures:
                     raise failures[0]
+            except BaseException as error:
+                emit_trace('tool_error',{'invocation_id':invocation_id,'name':name,
+                    'code':error.code if isinstance(error,LightGraphError) else 'tool_execution_interrupted',
+                    'exception_type':type(error).__name__})
+                raise
             finally:
                 failures.clear()
                 self._failure.reset(token)

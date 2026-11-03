@@ -1,8 +1,9 @@
-"""Bounded OpenAI-compatible structured calls; request/response bodies stay in memory."""
+"""Bounded OpenAI-compatible calls with optional local diagnostic history."""
 from __future__ import annotations
 import json
 import math
 import os
+from uuid import uuid4
 from typing import Callable, Literal, TypeVar
 from urllib.parse import urlparse
 import httpx
@@ -120,7 +121,7 @@ def _recover_final_json(message, usage, max_bytes):
     if not changes:return message
     try:_strict_json_loads(candidate)
     except json.JSONDecodeError:return message  # Let the caller report the original failure.
-    if len(candidate.encode())>max_bytes:raise LightGraphError('model_response_too_large')
+    if max_bytes is not None and len(candidate.encode())>max_bytes:raise LightGraphError('model_response_too_large')
     usage['json_syntax_recoveries']=usage.get('json_syntax_recoveries',0)+1
     for kind,count in changes.items():
         key='json_'+kind+'_recoveries';usage[key]=usage.get(key,0)+count
@@ -149,7 +150,7 @@ MODEL_PROTOCOL_CODES = frozenset({'extra_forbidden', 'missing', 'literal_error',
     'less_than_equal', 'string_too_long', 'string_too_short', 'int_parsing',
     'float_parsing', 'bool_parsing', 'value_error', 'json_invalid',
     'schema_validation_error', 'invalid_json_or_message', 'invalid_usage',
-    'tool_calls_forbidden', 'meaning_changed', 'model_response_invalid',
+    'tool_calls_forbidden', 'meaning_changed', 'comparison_unavailable', 'model_response_invalid',
     'model_stream_invalid', 'model_json_duplicate_key', 'model_json_nonfinite'})
 MODEL_PROTOCOL_FIELDS = frozenset(_schema_fields(ProposalBatch.model_json_schema()) | {
     'choices', 'index', 'message', 'content', 'role', 'tool_calls', 'function',
@@ -486,14 +487,14 @@ class ModelConfig(StrictModel):
     stream_options_include_usage: bool = True
     allow_insecure_http: bool = False
     timeout_seconds: float = 45
-    max_response_bytes: int = 262144
-    max_prompt_bytes: int = 131072
+    max_response_bytes: int | None = Field(default=None, gt=0)
+    max_prompt_bytes: int | None = Field(default=None, gt=0)
     max_prompt_tokens: int | None = Field(default=None, gt=0)
     context_window_tokens: int | None = Field(default=None, gt=0)
     max_output_tokens: int = 4096
     retries: int = 1
     allow_source_samples: bool = False
-    max_discovery_steps: int = Field(default=8,ge=1,le=32)
+    max_discovery_steps: int = Field(default=16,ge=1,le=32)
     max_tool_calls: int = Field(default=16,ge=1,le=64)
     @classmethod
     def from_env(cls):
@@ -509,8 +510,8 @@ from .sdk_transport import request_completion, stream_transport_limit as _stream
 class StructuredModelClient:
     """A transport can be injected for offline acceptance tests; no retries by SDK.
 
-    Usage records contain counters and safe error codes only. The component never
-    stores prompt hashes, response text, HTTP response bodies or provider exceptions.
+    Usage records contain counters and safe error codes. A separately bound local
+    trace can retain requests and responses with runtime credentials redacted.
     """
     def __init__(self, config: ModelConfig, budget: BudgetAllocator | None = None,
                  transport: httpx.BaseTransport | None = None):
@@ -521,7 +522,8 @@ class StructuredModelClient:
             raise LightGraphError('invalid_model_endpoint')
         if parsed.scheme == 'http' and parsed.hostname not in ('localhost','127.0.0.1','::1') and not config.allow_insecure_http:
             raise LightGraphError('insecure_model_endpoint')
-        if config.timeout_seconds <= 0 or config.max_response_bytes <= 0 or config.max_prompt_bytes <= 0 or config.max_output_tokens <= 0:
+        if config.timeout_seconds <= 0 or config.max_output_tokens <= 0 or any(
+                limit is not None and limit <= 0 for limit in (config.max_response_bytes,config.max_prompt_bytes)):
             raise LightGraphError('invalid_model_limits')
         if config.context_window_tokens is not None and config.context_window_tokens <= config.max_output_tokens:
             raise LightGraphError('invalid_model_limits')
@@ -533,7 +535,7 @@ class StructuredModelClient:
         """Keep transport bytes, per-request context and cumulative tokens separate."""
         from .token_estimation import estimate_tokens, prompt_token_limit
         size = len(content.encode())
-        if size > self.config.max_prompt_bytes:
+        if self.config.max_prompt_bytes is not None and size > self.config.max_prompt_bytes:
             self.usage['prompt_packets_rejected'] = self.usage.get('prompt_packets_rejected', 0) + 1
             self.usage['prompt_rejected_peak_bytes'] = max(self.usage.get('prompt_rejected_peak_bytes', 0), size)
             raise LightGraphError('model_packet_too_large')
@@ -609,7 +611,9 @@ class StructuredModelClient:
                  tool_specs: list[dict] | None = None, *, tool_choice: str = 'auto',
                  semantic_review: bool = False, correction_contract: type[BaseModel] | None = None,
                  allow_schema_repair: bool = True) -> T:
-        """One bounded provider turn. Only counters survive the call, never messages."""
+        """One bounded provider turn, optionally archived by the run trace sink."""
+        from ..runtime.trace import current_trace, emit_trace, trace_context
+        request_id='request_'+uuid4().hex
         schema=_request_schema(messages)
         response_format=None if tool_specs else response_format_for(schema,self.config.response_format)
         content = canonical(request_envelope_for(messages,tool_specs,response_format))
@@ -618,6 +622,7 @@ class StructuredModelClient:
         key = key or os.environ.get(self.config.api_key_env)
         if not key:
             raise LightGraphError('model_api_key_missing')
+        if current_trace() is not None:current_trace().add_secrets([key])
         request_task=_request_task(messages)
         # complete() supplies a final-only contract. AgentScope instead infers
         # its final schema below while retaining legitimate tool turns.
@@ -630,9 +635,17 @@ class StructuredModelClient:
         correction_anchor=None
         original_candidate=None
         last_code = 'model_failed'
-        retry_limit=self.config.retries if allow_schema_repair else 0
+        # Request failures and schema repairs share the original attempt budget.
+        # Disabling semantic repairs must not disable network/JSON retries.
+        retry_limit=self.config.retries
+        retry_request=False
+        retried_request=False
+        last_request_failure=False
         for attempt in range(retry_limit + 1):
             correcting=feedback is not None
+            retrying_request=retry_request
+            retry_request=False
+            last_request_failure=False
             request_messages=([*messages,{'role':'user','content':canonical(feedback)}]
                               if correcting else messages)
             request_tools=None if correcting else tool_specs
@@ -662,6 +675,9 @@ class StructuredModelClient:
                 # Charge the call immediately: transport failures can still incur cost.
                 self.budget.charge(Cost(llm_calls=1),reserved)
                 self.usage['calls'] += 1
+                if retrying_request:
+                    retried_request=True
+                    self.usage['request_retry_attempts']=self.usage.get('request_retry_attempts',0)+1
                 if correcting:
                     self.usage['schema_repair_attempts']=self.usage.get('schema_repair_attempts',0)+1
                 payload = {'model':self.config.model,'messages':request_envelope['messages'],
@@ -671,10 +687,16 @@ class StructuredModelClient:
                     payload['stream_options']={'include_usage':True}
                 if request_tools:
                     payload.update(tools=request_tools,tool_choice=tool_choice,parallel_tool_calls=False)
+                emit_trace('model_request',{'request_id':request_id,'attempt':attempt+1,
+                    'task':request_task,'schema_repair':correcting,'request_retry':retrying_request,
+                    'estimated_input_tokens':estimated_input_tokens,
+                    'timeout_seconds':self.config.timeout_seconds,'payload':payload})
                 request_started = True
                 emit_progress(None,'model_call_started',counters={'model_calls':self.usage['calls'],
                     'input_tokens':self.usage['input_tokens'],'output_tokens':self.usage['output_tokens']})
-                envelope = request_completion(self.config, self.budget, self.transport, key, payload)
+                with trace_context(request_id=request_id,attempt=attempt+1):
+                    envelope = request_completion(self.config, self.budget, self.transport, key, payload)
+                emit_trace('model_response',{'request_id':request_id,'attempt':attempt+1,'response':envelope})
                 self.budget.check_deadline()
                 protocol_stage = 'provider_usage'
                 usage = envelope.get('usage')
@@ -737,20 +759,30 @@ class StructuredModelClient:
                         if terminal:raise LightGraphError(terminal)
                     if not _schema_correction_matches(correction_anchor,candidate_message,correction_contract):
                         protocol_stage = 'repair_contract'
-                        protocol_problem = {'field':[], 'code':'meaning_changed'}
+                        protocol_problem = {'field':[], 'code':('meaning_changed' if correction_anchor.get('verifiable')
+                        else 'comparison_unavailable')}
                         raise LightGraphError('semantic_review_protocol_invalid' if semantic_review else 'llm_schema_invalid')
                     final=(result.get('final') if isinstance(result,dict) else result)
                     counter=('schema_repair_abstentions' if isinstance(final,ProposalBatch) and final.abstain
                              else 'schema_repairs_succeeded')
                     self.usage[counter]=self.usage.get(counter,0)+1
                 request_succeeded = True
+                if retried_request:
+                    self.usage['request_retry_succeeded']=self.usage.get('request_retry_succeeded',0)+1
                 return result
-            except BudgetExceeded:
+            except BudgetExceeded as exc:
+                last_code=exc.code
                 self.usage['failures'] += 1
                 raise
             except (ValidationError,KeyError,IndexError,TypeError,ValueError,json.JSONDecodeError) as exc:
                 last_code = 'semantic_review_protocol_invalid' if semantic_review else 'llm_schema_invalid'
                 self.usage['failures'] += 1
+                # An unreadable response never became a proposal or verdict.
+                # Retry the same request, not a semantic correction against an
+                # impossible-to-parse comparison anchor. Parsed model validation
+                # failures retain the existing slot-limited repair protocol.
+                request_failure=(not isinstance(exc,ValidationError) or protocol_stage in {
+                    'provider_envelope','provider_usage','response_message'})
                 if not semantic_review:
                     diagnostics = _schema_feedback(candidate_message,exc,schema)[
                         'schema_protocol_correction']['diagnostics']
@@ -771,10 +803,17 @@ class StructuredModelClient:
                         if key in histogram or len(histogram)<64:
                             histogram[key]=histogram.get(key,0)+1
                     terminal=_invalid_review_terminal(candidate_message)
-                    if terminal:raise LightGraphError(terminal) from None
-                    # A second malformed verdict cannot earn another model
-                    # judgment even if transport retries are configured higher.
-                    if correcting:raise LightGraphError(last_code) from None
+                    if terminal and (not request_failure or terminal!='semantic_review_protocol_invalid'):
+                        raise LightGraphError(terminal) from None
+                    # A second parsed malformed verdict cannot earn another
+                    # judgment. An unreadable retry keeps this same anchor.
+                    if correcting and not request_failure:raise LightGraphError(last_code) from None
+                if request_failure:
+                    retry_request=True
+                    last_request_failure=True
+                    continue
+                if not allow_schema_repair:
+                    raise LightGraphError(last_code) from None
                 if attempt<retry_limit:
                     if correction_anchor is None:
                         correction_anchor=_schema_correction_anchor(candidate_message,correction_contract,exc)
@@ -788,6 +827,8 @@ class StructuredModelClient:
                 self.usage[counter]=self.usage.get(counter,0)+1
                 last_code = 'model_transport_error'
                 self.usage['failures'] += 1
+                retry_request=True
+                last_request_failure=True
             except LightGraphError as exc:
                 if not semantic_review and (protocol_problem is not None or exc.code in {
                         'model_response_invalid','model_stream_invalid',
@@ -801,10 +842,20 @@ class StructuredModelClient:
                     self.usage[counter]=self.usage.get(counter,0)+1
                 last_code = exc.code
                 self.usage['failures'] += 1
-                if not exc.retryable:
+                request_failure=(exc.retryable or exc.code in {'model_response_invalid','model_stream_invalid',
+                        'model_json_duplicate_key','model_json_nonfinite'}
+                    or exc.code=='llm_schema_invalid' and protocol_stage=='provider_usage')
+                if not request_failure:
                     raise LightGraphError(last_code) from None
+                retry_request=True
+                last_request_failure=True
             finally:
                 if request_started:
+                    emit_trace('model_request_completed' if request_succeeded else 'model_error',{
+                        'request_id':request_id,'attempt':attempt+1,'task':request_task,
+                        'status':'completed' if request_succeeded else 'failed',
+                        **({} if request_succeeded else {'code':last_code,'stage':protocol_stage,
+                            'diagnostic':protocol_problem})})
                     emit_progress(None,'model_call_completed' if request_succeeded else 'model_call_failed',
                         level='info' if request_succeeded else 'warning',
                         counters={'model_calls':self.usage['calls'],'input_tokens':self.usage['input_tokens'],
@@ -821,6 +872,8 @@ class StructuredModelClient:
                     request_envelope['messages'].clear()
                     payload = envelope = value = candidate_message = None
                     content=''
+        if last_request_failure:
+            self.usage['request_retry_exhausted']=self.usage.get('request_retry_exhausted',0)+1
         raise LightGraphError(last_code) from None
 
     def explore(self, packet: dict, tool_executor, *, max_steps: int | None = None,

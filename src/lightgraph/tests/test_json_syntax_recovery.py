@@ -100,7 +100,7 @@ def test_cosmetic_negative_review_cannot_trigger_a_positive_retry(monkeypatch,de
 
 
 @pytest.mark.parametrize('bad_kind',['truncated','unclosed_string','outside_prose','two_objects','empty_item'])
-def test_unrecoverable_suffix_or_extra_content_cannot_be_replaced_by_an_unbound_batch(monkeypatch,bad_kind):
+def test_unparseable_response_retries_original_request_without_adopting_bad_text(monkeypatch,bad_kind):
     value=candidate();raw=json.dumps(value)
     malformed={'truncated':raw[:-1],'unclosed_string':'{"notes":"'+CANARY,
         'outside_prose':'Do not publish this interpretation.\n'+raw,
@@ -108,17 +108,16 @@ def test_unrecoverable_suffix_or_extra_content_cannot_be_replaced_by_an_unbound_
         'empty_item':raw.replace('"c_a", "c_b"','"c_a",, "c_b"')}[bad_kind]
     calls=[]
     def handler(request):
-        calls.append(1)
+        calls.append(json.loads(request.content))
         if len(calls)==1:return wire(malformed)
-        feedback=json.loads(json.loads(request.content)['messages'][-1]['content'])['schema_protocol_correction']
-        diagnostic=feedback['syntax_diagnostic']
-        assert CANARY not in json.dumps(diagnostic)
-        assert diagnostic['content_chars']==len(malformed)
+        assert calls[0]==calls[1]
         return response(value)
     model=client(monkeypatch,handler)
-    with pytest.raises(LightGraphError,match='llm_schema_invalid'):
-        model.explore(input_packet(),Toolbox())
-    assert calls==[1,1] and model.usage.get('json_syntax_recoveries',0)==0
+    result=model.explore(input_packet(),Toolbox())
+    assert result.model_dump()==ProposalBatch.model_validate(value).model_dump()
+    assert len(calls)==2 and model.usage.get('json_syntax_recoveries',0)==0
+    assert model.usage['request_retry_attempts']==model.usage['request_retry_succeeded']==1
+    assert not model.usage.get('schema_repair_attempts')
 
 
 @pytest.mark.parametrize('raw,code',[
@@ -128,12 +127,12 @@ def test_unrecoverable_suffix_or_extra_content_cannot_be_replaced_by_an_unbound_
     ('{"notes":Infinity}', 'model_json_nonfinite'),
     ('{"notes":1e999}', 'model_json_nonfinite'),
 ])
-def test_ambiguous_json_is_terminal_and_cannot_build_a_last_wins_anchor(monkeypatch,raw,code):
+def test_ambiguous_json_is_never_accepted_or_used_as_a_last_wins_anchor(monkeypatch,raw,code):
     calls=[]
     def handler(request):calls.append(1);return wire(raw)
     model=client(monkeypatch,handler)
     with pytest.raises(LightGraphError,match=code):model.explore(input_packet(),Toolbox())
-    assert calls==[1]
+    assert calls==[1,1] and model.usage['request_retry_exhausted']==1
     assert not _schema_correction_anchor({'content':raw},ProposalBatch)['verifiable']
     assert _invalid_review_terminal({'content':raw})=='semantic_review_protocol_invalid'
 

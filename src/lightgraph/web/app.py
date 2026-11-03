@@ -563,6 +563,20 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             workspace.require_config_revision(pid,if_match)
             return versioned(pid,workspace.import_config(pid,data.file_id))
 
+    @app.get('/api/projects/{pid}/model-limits')
+    def model_limits(pid:str):
+        from .model_limits import read_model_limits
+        with workspace.lock(pid):
+            return versioned(pid,read_model_limits(workspace,pid))
+
+    @app.put('/api/projects/{pid}/model-limits')
+    def update_model_limits(pid:str,data:dict,if_match:str|None=Header(default=None)):
+        from .model_limits import save_model_limits
+        with workspace.lock(pid):
+            mutable(pid)
+            workspace.require_config_revision(pid,if_match)
+            return versioned(pid,save_model_limits(workspace,pid,data))
+
     @app.get('/api/projects/{pid}/config/export')
     def export_config(pid:str):
         content=yaml.safe_dump(workspace.get_config(pid),allow_unicode=True,sort_keys=False)
@@ -591,11 +605,12 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return read_metadata(workspace,pid,refresh=True,**options)
 
     @app.get('/api/projects/{pid}/graph')
-    def graph(pid:str,layer:str='business',include_candidates:bool=False,offset:int=0,limit:int=240,q:str='',kind:str='',focus:str=''):
+    def graph(pid:str,layer:str='business',include_candidates:bool=False,offset:int=0,limit:int=240,q:str='',kind:str='',focus:str='',hops:int=1):
         if layer not in ('business','metadata'):raise LightGraphError('graph_layer_invalid')
+        if hops not in (1,2):raise LightGraphError('graph_page_invalid')
         with workspace.lock(pid):
             workspace.get(pid)
-            return read_graph(workspace,pid,layer,include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus)
+            return read_graph(workspace,pid,layer,include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus,hops=hops)
 
     @app.get('/api/projects/{pid}/graph/details')
     def graph_details(pid:str,entity_id:str|None=None,fact_id:str|None=None,include_candidates:bool=False,offset:int=0):
@@ -665,6 +680,28 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     def cancel_run(pid:str,rid:str):
         workspace.get(pid)
         return manager.cancel(pid,rid)
+
+    @app.get('/api/projects/{pid}/runs/{rid}/trace')
+    def run_trace(pid:str,rid:str,offset:int=0,limit:int=10):
+        from .run_traces import read_run_trace
+        with workspace.lock(pid):
+            return read_run_trace(manager,pid,rid,offset=offset,limit=limit)
+
+    @app.get('/api/projects/{pid}/runs/{rid}/trace/export')
+    def run_trace_export(pid:str,rid:str):
+        from .run_traces import export_run_trace, TraceResponse
+        with workspace.lock(pid):
+            stream=export_run_trace(manager,pid,rid)
+        return TraceResponse(stream,media_type='application/x-ndjson',headers={
+            'Content-Disposition':f'attachment; filename="{rid}.trace.jsonl"',
+            'Cache-Control':'no-store'})
+
+    @app.delete('/api/projects/{pid}/runs/{rid}/trace')
+    def delete_run_trace(pid:str,rid:str,if_match:str|None=Header(default=None)):
+        from .run_traces import clear_run_trace
+        with workspace.lock(pid):
+            workspace.require_config_revision(pid,if_match)
+            return clear_run_trace(manager,pid,rid)
 
     @app.api_route('/api/{path:path}',methods=['GET','POST','PUT','PATCH','DELETE'])
     def missing_api(path:str):

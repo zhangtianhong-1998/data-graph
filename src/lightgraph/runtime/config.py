@@ -59,17 +59,21 @@ class ModelConfig(StrictModel):
     # Explicit null disables only this API total; counters and other limits remain.
     max_calls: int | None = Field(default=40, ge=0)
     max_tokens: int | None = Field(default=120000, ge=0)
-    max_discovery_steps: int = Field(default=8, ge=1, le=32)
+    max_discovery_steps: int = Field(default=16, ge=1, le=32,
+        description="Maximum model turns per discovery task, including submission and correction; shared call and time limits still apply.")
     max_tool_calls: int = Field(default=16, ge=1, le=64)
     timeout_seconds: float = Field(default=60, gt=0)
     max_output_tokens: int = Field(default=4096, gt=0)
-    # Revision requests include both the typed tool schema and the prior rule.
-    max_prompt_bytes: int = Field(default=131072, gt=0)
+    # Optional transport guards are independent of the model's token window.
+    # Old explicit byte limits retain their units; new configurations have none.
+    max_prompt_bytes: int | None = Field(default=None, gt=0,
+        description="Optional UTF-8 request-byte guard; null disables it. This is not the input token window.")
     max_prompt_tokens: int | None = Field(default=None, gt=0,
         description="Optional estimated input token cap, including tool schemas; independent of byte limits.")
     context_window_tokens: int | None = Field(default=None, gt=0,
         description="Optional combined input/output token window; max_output_tokens is reserved from it.")
-    max_response_bytes: int = Field(default=262144, gt=0)
+    max_response_bytes: int | None = Field(default=None, gt=0,
+        description="Optional response-byte guard; null disables it. max_output_tokens controls model generation.")
     retries: int = Field(default=1, ge=0, le=1)
 
     @model_validator(mode="after")
@@ -99,6 +103,8 @@ class RunConfig(StrictModel):
     limits: QueryLimits = Field(default_factory=QueryLimits)
     model: ModelConfig = Field(default_factory=ModelConfig)
     output_dir: str = "runs/default"
+    record_trace: bool = Field(default=True,
+        description="Record the complete local run trajectory with credentials redacted; retain until manually cleared.")
     scopes: list[str] = Field(default_factory=lambda:["public"])
     max_working_bytes: int = Field(default=32*1024*1024, gt=0)
     max_db_queries: int = Field(default=240, gt=0)

@@ -11,10 +11,12 @@ const relations: Record<string, string> = {
   documented_by: '文档说明', supported_by_rule: '规则支持', has_sheet: '包含工作表',
   sheet_has_column: '包含字段', has_section: '包含章节', has_constraint: '具有约束',
   constraint_column: '约束字段', constraint_target: '约束目标',
+  binds_metric: '关联指标', binds_product: '关联产品', binds_channel: '关联渠道',
 }
 const kinds: Record<string, string> = {
   Metric: '指标', Measure: '度量', Dimension: '维度', DimensionMember: '维度成员', ReportItem: '报表项',
   AnalysisMethod: '分析方法', AnalysisQuestion: '分析问题', BusinessConcept: '业务概念',
+  ConceptBinding: '联合适用', Product: '产品', Channel: '渠道',
   Database: '数据库', Schema: '模式', Table: '表', Column: '字段', ColumnGroup: '字段组',
   SemanticSlot: '语义角色', Workbook: '工作簿', Worksheet: '工作表', Constraint: '约束',
   Document: '文档', DocumentSection: '文档章节', Rule: '规则', GraphFact: '图谱事实',

@@ -112,8 +112,14 @@ def test_real_worker_csv_publishes_and_incremental_reuses_output(workspace):
             if path.is_file():
                 assert b'RETENTION_SECRET_312' not in path.read_bytes()
         for path in (workspace.root / 'alpha' / 'runs').iterdir():
-            assert path.suffix == '.json'
+            assert path.suffix in {'.json','.jsonl'}
             assert b'RETENTION_SECRET_312' not in path.read_bytes()
+        # Completion releases source handles but preserves both runs' artifacts.
+        from lightgraph.web.run_traces import read_run_trace
+        for record in (first,second):
+            trace=read_run_trace(manager,'alpha',record['run_id'])
+            assert trace['status']=='available' and trace['total_events']>0
+            assert (workspace.root/'alpha'/'runs'/(record['run_id']+'.result.json')).exists()
     finally:
         manager.shutdown()
 

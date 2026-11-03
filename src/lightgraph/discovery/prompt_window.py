@@ -17,7 +17,7 @@ def prompt_size(messages, tools, mode):
 
 def prompt_fits(messages, tools, mode, byte_limit, token_limit=None):
     byte_count,token_count=prompt_size(messages,tools,mode)
-    return byte_count<=byte_limit and (token_limit is None or token_count<=token_limit)
+    return (byte_limit is None or byte_count<=byte_limit) and (token_limit is None or token_count<=token_limit)
 
 
 def fit_source_history(messages, tools, mode, limit, submission_names, *, token_limit=None):

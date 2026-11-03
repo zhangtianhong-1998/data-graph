@@ -67,12 +67,13 @@ def test_catalog_window_counts_provider_schema_and_honors_compatibility_mode():
     tools=Toolbox().tool_specs()
     configuration=SimpleNamespace(max_prompt_bytes=1000000,response_format='json_schema',
                                   max_discovery_steps=8,max_tool_calls=16)
+    sizing={'max_steps':configuration.max_discovery_steps,'max_tool_calls':configuration.max_tool_calls}
     client=SimpleNamespace(config=configuration)
     all_tables,full=_bounded_catalog_window(primary,[primary,other],input_packet(),client,tools)
     assert len(all_tables)==2
     one={**full,'catalog':full['catalog'][:1],
          'subtask':full['subtask'].replace('2 of 2 authorized tables','1 of 2 authorized tables')}
-    full_sizes={mode:initial_agent_prompt_bytes(full,tools,response_format=mode)
+    full_sizes={mode:initial_agent_prompt_bytes(full,tools,response_format=mode,**sizing)
                 for mode in ('json_schema','json_object')}
     assert full_sizes['json_schema']==full_sizes['json_object']
     configuration.max_prompt_bytes=full_sizes['json_schema']
@@ -81,7 +82,7 @@ def test_catalog_window_counts_provider_schema_and_honors_compatibility_mode():
     configuration.max_prompt_bytes=full_sizes['json_schema']*2
     selected,_=_bounded_catalog_window(primary,[primary,other],input_packet(),client,tools)
     assert selected==[primary,other]
-    threshold=initial_agent_prompt_bytes(one,tools)
+    threshold=initial_agent_prompt_bytes(one,tools,**sizing)
     configuration.max_prompt_bytes=threshold
     selected,packet=_bounded_catalog_window(primary,[primary,other],input_packet(),client,tools)
     assert selected==[primary]
@@ -95,7 +96,7 @@ def test_catalog_window_counts_provider_schema_and_honors_compatibility_mode():
     from lightgraph.errors import BudgetExceeded
     configuration.max_prompt_bytes=1000000
     configuration.max_output_tokens=4096
-    token_threshold=initial_agent_prompt_tokens(one,tools)
+    token_threshold=initial_agent_prompt_tokens(one,tools,**sizing)
     client.budget=BudgetAllocator(Cost(llm_tokens=token_threshold+4096+1000,seconds=60))
     client.budget.reserve('other_work',Cost(llm_tokens=1000))
     selected,_=_bounded_catalog_window(primary,[primary,other],input_packet(),client,tools)

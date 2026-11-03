@@ -234,7 +234,7 @@ def test_unverifiable_schema_correction_can_abstain_from_whole_batch(monkeypatch
     assert model.usage.get('schema_repairs_succeeded', 0) == 0
 
 
-def test_unparseable_candidate_can_only_abstain_in_requested_task(monkeypatch):
+def test_unparseable_candidate_can_retry_and_abstain_in_requested_task(monkeypatch):
     calls = []
     def handler(request):
         calls.append(1)
@@ -244,8 +244,8 @@ def test_unparseable_candidate_can_only_abstain_in_requested_task(monkeypatch):
     model = client(monkeypatch, handler)
     result = legacy_batch(model, input_packet(), Toolbox())
     assert result.abstain and not result.proposals
-    assert model.usage['schema_repair_abstentions'] == 1
-    assert model.usage.get('schema_repairs_succeeded', 0) == 0
+    assert model.usage['request_retry_succeeded'] == 1
+    assert model.usage.get('schema_repair_attempts', 0) == 0
 
 
 def test_correction_transport_failure_cannot_start_an_unconstrained_attempt(monkeypatch):

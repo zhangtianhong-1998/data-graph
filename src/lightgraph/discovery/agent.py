@@ -1,4 +1,4 @@
-"""Bounded discovery through model-selected tools; transcripts exist only in memory."""
+"""Bounded discovery through guarded tools with optional local execution traces."""
 from __future__ import annotations
 
 import hashlib
@@ -118,6 +118,12 @@ Physical hierarchy levels are occurrence positions. When evidence establishes re
 within the same code domain and scope, use relative_path for one object with multiple
 supports. Different L positions alone do not split identity; equal names alone never
 merge objects across scopes.
+Pair each position's code with that position's own name and alternate-name columns
+unless evidence explicitly establishes another mapping. A repeated parent code can
+have several child codes and names: parent-to-child is not an identity-to-name FD.
+Check each scoped position code against its mapped name, then compare the same scoped
+code across positions in a shared domain. Do not diagnose same-code/different-name
+from a parent's varying child names or mistake one parent's many children for multiple parents.
 Candidate knowledge is not independent semantic evidence. Include known English names and
 aliases in the initial proposal rather than intentionally deferring them to coverage.
 For concept_mapping, key_column identifies the concept and column supplies its name.
@@ -268,12 +274,12 @@ def _record_observation(packet: dict, result: dict, name: str) -> None:
         observations.append(observation)
 
 
-def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
+def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=16,
             max_tool_calls: int=16, review_observations=None) -> ProposalBatch:
     """Run AgentScope ReActAgent with ephemeral memory and guarded Toolkit tools.
 
     The framework owns the reasoning/acting loop. Our adapters retain domain
-    validation, query permissions, budgets and the no-source-retention boundary.
+    validation, query permissions, budgets and source-value isolation from rules.
     """
     import asyncio
     from .agentscope_runtime import run_agent
@@ -320,7 +326,7 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
                     result={'status':'error','code':'tool_execution_failed','operator':name}
                 result=_visible_result(result,name,client.allow_source_samples)
             client.budget.check_deadline()
-            if len(canonical(result).encode())>client.config.max_response_bytes:
+            if client.config.max_response_bytes is not None and len(canonical(result).encode())>client.config.max_response_bytes:
                 return {'status':'error','code':'tool_response_too_large','operator':name}
             _record_probe(checked,result,name)
             if client.allow_source_samples:_record_observation(checked,result,name)

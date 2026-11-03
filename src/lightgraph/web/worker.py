@@ -28,6 +28,7 @@ def execute(payload, result_path):
     closing = threading.Event()
     cancelled_sources = set()
     cancellation_lock = threading.Lock()
+    trace_context = None
 
     def cancel_sources():
         for source in tuple(sources):
@@ -72,6 +73,12 @@ def execute(payload, result_path):
         watcher.start()
         config = RunConfig.model_validate(payload["config"])
         config._agent = AgentConfig(name=payload.get("agent_name", "lightgraph-discovery"), llm=config.model)
+        from ..runtime.trace_lifecycle import execution_trace
+        from ..runtime.trace import trace_path, emit_trace
+        trace_context = execution_trace(config,path=trace_path(result_path),
+            secrets=(payload.get('source_credentials') or {}).values())
+        trace_context.__enter__()
+        emit_trace('run_started', {'run_id':result_path.name.removesuffix('.result.json')})
         project = result_path.parent.parent
         check_dependencies(payload["dependencies"], project)
         check_cancelled()
@@ -137,6 +144,8 @@ def execute(payload, result_path):
             result = {"status": status, "report": _safe_report(report) if report is not None else None,
                       "cleanup_status": cleanup, "error_code": error_code}
             _save(result_path, result)
+            from ..runtime.trace import emit_trace
+            emit_trace('run_completed', result)
             emit_progress("finished", "run_" + status,
                           level="error" if status == "failed" else "warning" if status in {"partial", "cancelled"} else "info",
                           counters={"published_rules": len(report.rules_published)} if report is not None else None)
@@ -144,7 +153,11 @@ def execute(payload, result_path):
             try:
                 signal.signal(signal.SIGTERM, previous)
             finally:
-                progress_context.__exit__(None, None, None)
+                try:
+                    if trace_context is not None:
+                        trace_context.__exit__(None, None, None)
+                finally:
+                    progress_context.__exit__(None, None, None)
     # A completed interpretation may legitimately leave unsupported candidates.
     # That is distinct from an interrupted or otherwise unfinished execution.
     return 0 if status in {"completed", "completed_with_gaps"} else 2

@@ -56,7 +56,7 @@ const labels: Record<string, string> = {
   rule_started: '开始处理规则', rule_completed: '规则处理结束', rule_rejected: '规则未通过验证',
   model_call_started: '已发起模型调用，等待返回', model_call_completed: '模型调用已返回', model_call_failed: '模型调用失败',
   publication_started: '开始发布', publication_completed: '发布完成',
-  cleanup_started: '开始清理临时数据', cleanup_completed: '临时数据清理结束', issue_detected: '发现需要处理的问题',
+  cleanup_started: '开始释放运行资源', cleanup_completed: '运行资源已释放', issue_detected: '发现需要处理的问题',
 }
 const levelLabels: Record<string, string> = { info: '信息', warning: '注意', error: '错误' }
 const eventLabel = (event: RunEvent) => labels[event.code] || '运行事件'

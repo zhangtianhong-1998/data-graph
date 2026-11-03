@@ -14,6 +14,7 @@ from openai.lib.streaming.chat import ChatCompletionStreamState
 from openai.types.chat import ChatCompletionChunk
 
 from lightgraph.errors import LightGraphError
+from lightgraph.runtime.trace import current_trace, emit_trace
 
 
 TRANSPORT_FAILURE_KINDS = frozenset({
@@ -49,7 +50,7 @@ class _ModelTransportError(LightGraphError):
 
 
 def stream_transport_limit(max_response_bytes, max_output_tokens):
-    return 6 * max_response_bytes + 2048 * max_output_tokens + 65536
+    return 6 * max_response_bytes + 2048 * max_output_tokens + 65536 if max_response_bytes is not None else None
 
 
 class _BoundedLines(_SSELineDecoder):
@@ -58,7 +59,7 @@ class _BoundedLines(_SSELineDecoder):
         self.limit = limit
 
     def _append(self, chunk, start, end):
-        if len(self._buffer) + end - start > self.limit:
+        if self.limit is not None and len(self._buffer) + end - start > self.limit:
             raise LightGraphError('model_stream_event_too_large')
         super()._append(chunk, start, end)
 
@@ -73,7 +74,7 @@ class _CompleteDecoder(SSEDecoder):
 
     def decode(self, line):
         self.event_bytes += len(line.encode()) + 1
-        if self.event_bytes > self.limit:
+        if self.limit is not None and self.event_bytes > self.limit:
             raise LightGraphError('model_stream_event_too_large')
         event = super().decode(line)
         if not line or line.startswith(':'):
@@ -106,23 +107,40 @@ class _CompleteDecoder(SSEDecoder):
 
 
 class _LimitedBytes(httpx.SyncByteStream):
-    def __init__(self, stream, budget, limit, streaming):
+    def __init__(self, stream, budget, limit, streaming, *, capture=True, status_code=200):
         self.stream, self.budget, self.limit = stream, budget, limit
         self.streaming = streaming
+        self.captured=bytearray() if capture and current_trace() is not None else None
+        self.complete=False
+        self.status_code=status_code
+
+    def _trace_response(self):
+        if self.captured is None:return
+        # Decode once, after joining chunks: a credential or UTF-8 character can
+        # cross transport chunk boundaries. The sink redacts the whole body.
+        emit_trace('model_wire_response',{'status_code':self.status_code,
+            'stream':self.streaming,'complete':self.complete,
+            'body':self.captured.decode('utf-8',errors='replace')})
+        self.captured=None
 
     def __iter__(self):
         received = 0
-        for chunk in self.stream:
+        try:
+            for chunk in self.stream:
+                if self.captured is not None:self.captured.extend(chunk)
+                self.budget.check_deadline()
+                received += len(chunk)
+                if self.limit is not None and received > self.limit:
+                    raise LightGraphError('model_stream_transport_too_large' if self.streaming
+                                          else 'model_response_too_large')
+                yield chunk
+            self.complete=True
             self.budget.check_deadline()
-            received += len(chunk)
-            if received > self.limit:
-                raise LightGraphError('model_stream_transport_too_large' if self.streaming
-                                      else 'model_response_too_large')
-            yield chunk
-        self.budget.check_deadline()
+        finally:self._trace_response()
 
     def close(self):
-        self.stream.close()
+        try:self.stream.close()
+        finally:self._trace_response()
 
 
 class _LimitedTransport(httpx.BaseTransport):
@@ -132,9 +150,21 @@ class _LimitedTransport(httpx.BaseTransport):
 
     def handle_request(self, request):
         response = self.transport.handle_request(request)
+        consumed=response.is_stream_consumed
+        if consumed:
+            emit_trace('model_wire_response',{'status_code':response.status_code,
+                'stream':self.streaming,'complete':True,'body':response.content.decode('utf-8',errors='replace')})
+        response.stream = _LimitedBytes(response.stream, self.budget, self.limit, self.streaming,
+            capture=not consumed and response.status_code==200,status_code=response.status_code)
         self.budget.check_deadline()
         if response.status_code != 200:
             status = response.status_code
+            if not consumed:
+                # Logging must not turn an immediately retryable HTTP status
+                # into a slow error-body read. Keep only bytes already received.
+                emit_trace('model_wire_response',{'status_code':status,
+                    'stream':self.streaming,'complete':False,'body_unavailable':True,
+                    'reason':'status_rejected_without_body_read'})
             response.close()
             if self.strict and status in (400, 422):
                 raise LightGraphError('model_structured_output_rejected')
@@ -143,10 +173,9 @@ class _LimitedTransport(httpx.BaseTransport):
         if response.headers.get('content-encoding', 'identity') != 'identity':
             response.close()
             raise LightGraphError('model_content_encoding_unsupported')
-        if response.is_stream_consumed and len(response.content) > self.limit:
+        if self.limit is not None and response.is_stream_consumed and len(response.content) > self.limit:
             response.close()
             raise LightGraphError('model_stream_transport_too_large' if self.streaming else 'model_response_too_large')
-        response.stream = _LimitedBytes(response.stream, self.budget, self.limit, self.streaming)
         return response
 
     def close(self):
@@ -258,7 +287,8 @@ def request_completion(config, budget, transport, key, payload):
                        timeout=min(config.timeout_seconds, budget.remaining_seconds()))
     try:
         with _CompletionClient(api_key=key, base_url=config.base_url, max_retries=0,
-                               http_client=http, event_limit=6 * config.max_response_bytes + 65536,
+                               http_client=http, event_limit=(6 * config.max_response_bytes + 65536
+                                                             if config.max_response_bytes is not None else None),
                                default_headers={'Accept-Encoding': 'identity'}) as sdk:
             response = sdk.chat.completions.create(**payload)
             if not streaming:
@@ -294,7 +324,7 @@ def request_completion(config, budget, transport, key, payload):
                             content_bytes += len((call.get('id') or '').encode())
                             content_bytes += sum(len((call.get('function', {}).get(k) or '').encode())
                                                  for k in ('name', 'arguments'))
-                        if content_bytes > config.max_response_bytes:
+                        if config.max_response_bytes is not None and content_bytes > config.max_response_bytes:
                             raise LightGraphError('model_response_too_large')
                         reason = choice.get('finish_reason')
                         if reason is not None and reason not in ('stop', 'tool_calls', 'length', 'content_filter'):

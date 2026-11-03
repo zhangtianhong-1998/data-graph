@@ -24,11 +24,13 @@ llm:
   allow_insecure_http: false
   timeout_seconds: 60
   max_output_tokens: 4096
-  max_prompt_bytes: 65536
-  max_response_bytes: 262144
+  max_prompt_tokens: 32768
+  max_prompt_bytes: null
+  max_response_bytes: null
   retries: 1
   # Explicit null removes the corresponding API total, while retaining usage counters.
   max_calls: 40
   max_tokens: 120000
-  max_discovery_steps: 8
+  # Includes exploration, submission and corrections within the shared call/time budgets.
+  max_discovery_steps: 16
   max_tool_calls: 16

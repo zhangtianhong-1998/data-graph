@@ -115,7 +115,9 @@ def with_discovery_runtime_control(messages, *, turn, max_turns, remaining_tool_
                 'submit each proposal early enough to receive feedback. '
                 'remaining_tool_calls counts source tools only; local submission tools have their own allowance. '
                 'When submission_required is true, source queries are forbidden. Use the remaining local '
-                'submit_* and finish_discovery tools, or the small final response. Set pending=true '
+                'declare_*, submit_* and finish_discovery tools, or the small final response. '
+                'A source call in this phase rejects its entire batch without executing submissions; '
+                'use any correction opportunity to resubmit only allowed tools. Set pending=true '
                 'if work remains. Do not invent evidence to finish. '
                 'A rejected tool batch has executed no tools. ')+canonical(control)
             break
@@ -155,7 +157,7 @@ def discovery_envelope(visible):
             'output_schema':DiscoveryFinish.model_json_schema()}
 
 
-def initial_agent_prompt_sizes(packet, tool_specs, *, max_steps=8, max_tool_calls=16,
+def initial_agent_prompt_sizes(packet, tool_specs, *, max_steps=16, max_tool_calls=16,
                                response_format='json_schema'):
     """Measure the first Agent request, including schema, context and tool specs.
 

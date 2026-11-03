@@ -48,8 +48,8 @@ def test_malformed_usage_is_distinct_from_output_schema(monkeypatch, usage, fiel
     model = client(monkeypatch, lambda request: httpx.Response(200, json=body))
     with pytest.raises(LightGraphError, match='llm_schema_invalid'):
         legacy_batch(model, input_packet(), Toolbox())
-    assert diagnostics(model) == {('provider_usage', field, code): 1}
-    assert model.usage['calls'] == 1  # Diagnostics do not add retries.
+    assert diagnostics(model) == {('provider_usage', field, code): 2}
+    assert model.usage['calls'] == 2 and model.usage['request_retry_exhausted'] == 1
 
 
 def test_invalid_provider_envelope_has_its_own_stage(monkeypatch):
@@ -57,7 +57,8 @@ def test_invalid_provider_envelope_has_its_own_stage(monkeypatch):
         'choices': [], CANARY: CANARY}))
     with pytest.raises(LightGraphError, match='model_response_invalid'):
         legacy_batch(model, input_packet(), Toolbox())
-    assert diagnostics(model) == {('provider_envelope', (), 'model_response_invalid'): 1}
+    assert diagnostics(model) == {('provider_envelope', (), 'model_response_invalid'): 2}
+    assert model.usage['request_retry_exhausted'] == 1
     assert CANARY not in json.dumps(model.usage)
 
 

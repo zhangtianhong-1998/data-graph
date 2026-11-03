@@ -25,6 +25,6 @@ goal:
   observation_values: false
 model:
   mode: disabled
-  max_discovery_steps: 8
+  max_discovery_steps: 16
   max_tool_calls: 16
 max_db_queries: 240

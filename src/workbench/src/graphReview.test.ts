@@ -177,7 +177,16 @@ describe('业务图来源与归并裁决', () => {
     expect(notes[0]!.textContent).toContain('usage.prompt_tokens')
     expect(notes[0]!.classList.contains('amber')).toBe(false)
     expect(notes[1]!.textContent).toContain('阶段：格式修复结果')
-    expect(notes[2]!.textContent).toContain('本任务尚未完成')
+    expect(notes[2]!.textContent).toContain('已发布的结果继续保留')
+  })
+  it('请求重试与最终任务状态分开显示', () => {
+    mount(RunIssues, { report: { status: 'COMPLETED', counts: {
+      request_retry_attempts: 2, request_retry_succeeded: 2, request_retry_exhausted: 0,
+    }, issues: [{ code: 'model_protocol_diagnostic', stage: 'response_json',
+      field_path: '[]', constraint: 'json_invalid', count: 2, status: 'diagnostic' }] } })
+    expect(root.querySelector('[aria-label="请求重试"]')!.textContent).toContain('2 个请求恢复成功')
+    expect(root.textContent).toContain('任务状态按最终结果判断')
+    expect(root.querySelectorAll('.amber')).toHaveLength(0)
   })
   it('覆盖问题展示受控列名，其他问题不接受任意列名正文', () => {
     mount(RunIssues, { report: { issues: [

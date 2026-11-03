@@ -32,6 +32,11 @@ def composite_columns(rule):
     return fields
 
 
+def concept_components(rule):
+    """Declared component roles, never guesses based on a generated label."""
+    return (rule.get('concept_mapping') or {}).get('components', []) if rule.get('kind')=='concept_mapping' else []
+
+
 def project_display_labels(graph, rules):
     """Join exact published endpoints, keeping labels scoped to their supports."""
     nodes={n['id']:n for n in graph.get('nodes',[]) if n.get('status')=='accepted'}
@@ -59,14 +64,50 @@ def project_display_labels(graph, rules):
                 if s['scope_ref']!=scope and not global_name:continue
                 value=facts[fid]['payload']['value'];found[canonical(value)]=value;proof.add(fid)
         return list(found.values()),proof
+    def concept_caption(nid, existence_id, support, rule, components):
+        # All three sides of each assignment must belong to the accepted
+        # publication and scope that produced this context. In particular an
+        # unrelated reference or a similarly named role is not display evidence.
+        origin=('rule_id','rule_revision','publication_id','scope_ref')
+        def same_origin(other):return all(other.get(key)==support.get(key) for key in origin)
+        parts=[];proof={existence_id}
+        for component in components:
+            matches={};refs=set()
+            for edge_id in edges[nid]:
+                edge=facts[edge_id]['payload'];target=edge['target']
+                if edge.get('relation')!=component['relation'] or target not in nodes:
+                    continue
+                if not any(same_origin(es) and es.get('source_binding')==support.get('source_binding')
+                           for es in supports[edge_id]):
+                    continue
+                targets={fid for fid in existence[target]
+                         if facts[fid]['payload'].get('kind')==component['entity_kind']
+                         and any(same_origin(ts) for ts in supports[fid])}
+                if not targets:continue
+                labels,label_refs=scoped_values(target,'label',support['scope_ref'])
+                if (len(labels)!=1 or not isinstance(labels[0],str) or not labels[0]
+                        or not any(same_origin(ls) for fid in label_refs for ls in supports[fid])):
+                    return None
+                matches[target]=labels[0];refs.update(label_refs|targets|{edge_id})
+            if len(matches)!=1:return None
+            parts.append(next(iter(matches.values())));proof.update(refs)
+        return '联合适用：'+' · '.join(parts),proof
     projected=0
     for nid,node in nodes.items():
         if node.get('layer')!='business':continue
         # Each source interpretation must produce the same complete caption.
-        captions=set();proof=set();blocked=False;eligible=False
+        captions=set();proof=set();methods=set();blocked=False;eligible=False
         for existence_id in existence[nid]:
             for support in supports[existence_id]:
-                rule=contract(support);fields=composite_columns(rule)
+                rule=contract(support);components=concept_components(rule)
+                if components and node.get('kind')==rule.get('identity',{}).get('entity_kind'):
+                    eligible=True
+                    caption=concept_caption(nid,existence_id,support,rule,components)
+                    if caption is None:blocked=True;continue
+                    text,refs=caption;captions.add(text);proof.update(refs)
+                    methods.add('accepted_concept_components')
+                    continue
+                fields=composite_columns(rule)
                 if not fields:continue
                 eligible=True;scope=support['scope_ref'];keys=rule['identity']['key_columns']
                 codes,code_refs=scoped_values(nid,'business_code',scope)
@@ -111,9 +152,12 @@ def project_display_labels(graph, rules):
                         # remain distinguishable without merging identities.
                         parts.append(f'{column}={name} [{value}]')
                     else:parts.append(f'{column}={value}')
-                captions.add(' · '.join(parts));proof.update(refs)
+                captions.add(' · '.join(parts));proof.update(refs);methods.add('accepted_reference_components')
         if eligible and not blocked and len(captions)==1:
             node['display_label']=next(iter(captions))
-            node['display_label_basis']={'method':'accepted_reference_components','fact_ids':sorted(proof)}
+            node['display_label_basis']={'method':next(iter(methods)) if len(methods)==1 else 'accepted_components',
+                                         'fact_ids':sorted(proof)}
+            if 'accepted_concept_components' in methods:
+                node['scopes']=sorted({s['scope_ref'] for fid in existence[nid] for s in supports[fid]})
             projected+=1
     return projected

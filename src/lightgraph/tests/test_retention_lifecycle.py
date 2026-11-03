@@ -43,7 +43,9 @@ def fixed_rule():
 
 
 def run_config(tmp_path):
-    return RunConfig(sources=[],output_dir=str(tmp_path/'output'),
+    # Legacy strict-retention mode remains available by explicit configuration.
+    # The default now records local diagnostic traces at the user's request.
+    return RunConfig(sources=[],output_dir=str(tmp_path/'output'),record_trace=False,
         goal=ExtractionGoal(excluded_columns=['private_note']))
 
 

@@ -91,7 +91,11 @@ def test_agent_reads_opaque_columns_and_emits_only_goal_values(monkeypatch,tmp_p
         rule=store.get_rules()[0]
         assert 'amount' not in rule.identity.key_columns
         assert 'amount' not in rule.attributes.single_valued.values()
-    assert retain_check([tmp_path/'out'],[marker])['violations']==0
+    # Observations stay out of graph/report artifacts, while the user-requested
+    # local trace now preserves the exact tool result for diagnosis.
+    assert retain_check([p for p in (tmp_path/'out').iterdir() if p.name!='traces'],[marker])['violations']==0
+    traces=list((tmp_path/'out'/'traces').glob('*.trace.jsonl'))
+    assert traces and any(marker in p.read_text(encoding='utf-8') for p in traces)
     assert seen==['只构建经营指标分析图，不输出观测金额']*2+['保留指标的名称与计量单位']*2
 
 

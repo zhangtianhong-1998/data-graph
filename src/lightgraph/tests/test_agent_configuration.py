@@ -136,11 +136,34 @@ def test_legacy_inline_defaults_and_disabled_mode_remain_compatible():
     assert make_model(config) is None
 
 
+@pytest.mark.parametrize("separate_agent", [False, True])
+@pytest.mark.parametrize("configured_steps, expected_steps", [(None, 16), (8, 8)])
+def test_discovery_default_and_explicit_limit_reach_client_without_expanding_shared_budget(
+        tmp_path, separate_agent, configured_steps, expected_steps):
+    settings = {"mode": "metadata_only", "model": "offline",
+                "base_url": "https://model.invalid/v1", "api_key": CANARY,
+                "max_calls": 5, "max_tokens": 9000}
+    if configured_steps is not None:
+        settings["max_discovery_steps"] = configured_steps
+    if separate_agent:
+        config = load_config(write_config(tmp_path, agent={"llm": settings}))
+    else:
+        path = tmp_path / "inline.yaml"
+        path.write_text(yaml.safe_dump({"sources": [], "model": settings}), encoding="utf-8")
+        config = load_config(path)
+    client = make_model(config)
+    assert client.config.max_discovery_steps == expected_steps
+    assert client.config.max_tool_calls == 16
+    assert client.budget.limits.llm_calls == 5
+    assert client.budget.limits.llm_tokens == 9000
+
+
 def test_example_agent_and_schema_are_valid():
     root = Path(__file__).resolve().parents[3]
     config = load_agent_config(root / "examples/agent.example.yaml")
     assert config.framework == "agentscope"
     assert config.llm.stream is True
+    assert config.llm.max_discovery_steps == 16
     assert not config.llm.api_key.get_secret_value()
     schema = json.loads((root / "src/lightgraph/schemas/RunConfig.schema.json").read_text(encoding="utf-8"))
     assert schema == RunConfig.model_json_schema()

@@ -1,8 +1,8 @@
 """Project-isolated background execution and bounded, published graph views.
 
-Typed run reports, bounded event codes/counts and hashes of user-uploaded files
-survive a process. Model transcripts, database query results and subprocess output
-never become run logs.
+Reports, progress events and worker results survive a process. When enabled,
+the separate local run trace retains redacted model and tool inputs/outputs
+until the user explicitly clears it; subprocess output is not a run transcript.
 """
 from __future__ import annotations
 
@@ -348,7 +348,8 @@ class RunManager:
         finish_progress(progress_path(record_path), record["run_id"], record["status"])
         _save(record_path, record)
         try:
-            entry["result"].unlink(missing_ok=True)
+            # Preserve worker results and trace artifacts until explicit user
+            # cleanup. Only the obsolete cancellation control signal is removed.
             _cancel_path(entry["result"]).unlink(missing_ok=True)
         except OSError:
             pass
@@ -451,11 +452,11 @@ def _bounded_view(view, layer):
             "limits": {"nodes": MAX_GRAPH_NODES, "edges": MAX_GRAPH_EDGES}}
 
 
-def read_graph(workspace, pid, layer="business", *, include_candidates=False,offset=0,limit=240,q='',kind='',focus=''):
+def read_graph(workspace, pid, layer="business", *, include_candidates=False,offset=0,limit=240,q='',kind='',focus='',hops=1):
     """Publication heads, not stale graph.json exports, determine current results."""
     from ..store import GraphStore
     if layer == "metadata":
-        return read_metadata(workspace, pid)
+        return read_metadata(workspace, pid, focus=focus, hops=hops)
     config = workspace.resolved_config(pid)
     path = Path(config.output_dir) / "graph.sqlite"
     if path.is_symlink():
@@ -465,12 +466,14 @@ def read_graph(workspace, pid, layer="business", *, include_candidates=False,off
     with GraphStore(path) as store:
         from ..store.paging import graph_page
         view = graph_page(store,set(config.scopes),config.isolation_domain,layer=layer,
-                          include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus)
+                          include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus,hops=hops)
         from .graph_display import display_schema
         vocabulary = display_schema(store, view)
     result = _bounded_view(view, layer)
     result.update({key:view[key] for key in ('total_nodes','total_edges','matched_nodes','boundary_edges',
-        'next_offset','offset','page_size','generation','query_strategy','kinds','kind_counts','focus_node_id','focus_neighbor_count')})
+        'next_offset','offset','page_size','generation','query_strategy','kinds','kind_counts','focus_node_id','focus_neighbor_count',
+        'focus_hops','neighborhood_truncated')})
+    result['truncated'] = result['truncated'] or view['truncated']
     result["include_candidates"] = include_candidates
     result["display_schema"] = vocabulary
     return result
@@ -594,7 +597,30 @@ def write_metadata_context(config, project_path):
     _save(Path(config.output_dir) / "metadata-context.json", _metadata_context(config, project_path))
 
 
-def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, source_ids=None):
+def _metadata_neighborhood(view, focus, hops):
+    """Select the neighborhood before the response cap, using authorized metadata."""
+    nodes={n['id']:n for n in view['nodes'] if n['layer']=='metadata'}
+    adjacency={nid:set() for nid in nodes}
+    for edge in view['edges']:
+        if edge['source'] in nodes and edge['target'] in nodes:
+            adjacency[edge['source']].add(edge['target'])
+            adjacency[edge['target']].add(edge['source'])
+    found={focus} if focus in nodes else set()
+    ordered=sorted(found);frontier=set(found)
+    for _ in range(hops):
+        frontier=set().union(*(adjacency[nid] for nid in frontier))-found
+        ordered.extend(sorted(frontier));found.update(frontier)
+    subset={**view,'nodes':[nodes[nid] for nid in ordered],
+        'edges':[e for e in view['edges'] if e['source'] in found and e['target'] in found]}
+    graph=_bounded_view(subset,'metadata')
+    graph.update(focus_node_id=focus if focus in nodes else None,focus_hops=hops,
+        focus_neighbor_count=len(found-{focus}),matched_nodes=len(found-{focus}),
+        next_offset=None,neighborhood_truncated=len(found)>MAX_GRAPH_NODES,
+        total_nodes=len(nodes),total_edges=sum(e['source'] in nodes and e['target'] in nodes for e in view['edges']))
+    return graph
+
+
+def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, source_ids=None, focus='', hops=1):
     """Cached GETs never connect; explicit refresh reads authorized declarations."""
     import yaml
     from ..catalog import CATALOG_VERSION, DeclaredCatalog, declared_catalog, semantic_catalog, write_catalog, read_semantic_catalog
@@ -721,7 +747,7 @@ def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, sou
             if _metadata_context(workspace.resolved_config(pid), project) != context:
                 raise LightGraphError("input_dependency_changed")
             _save(output / "metadata-context.json", context)
-        graph = _bounded_view(view, "metadata")
+        graph = _metadata_neighborhood(view,focus,hops) if focus else _bounded_view(view, "metadata")
         tables = [{"id": t.source_id + "." + t.qualified_name,
                    **t.model_dump(mode="json", by_alias=True)} for t in declared.tables]
         missing_sources = sorted({s.id for s in config.sources} - {s.source_id for s in declared.sources})

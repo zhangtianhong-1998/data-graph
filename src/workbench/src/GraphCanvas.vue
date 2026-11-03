@@ -5,6 +5,7 @@ import type { Graph, GraphNode, GraphEdge } from './types'
 import { fitCamera, zoomCamera } from './graphViewport'
 import { SCENE_LIMIT, SCENE_EDGE_LIMIT, mergeScene, placeNodes, sceneBounds, hitNode } from './graphScene'
 import type { Point } from './graphScene'
+import { twoHopNeighborhood } from './graphNeighborhood'
 import PropertyTable from './PropertyTable.vue'
 import TechnicalDetails from './TechnicalDetails.vue'
 import { mergeDisplaySchema, nodeCaption, nodeProperties, vocabularyDescription, vocabularyLabel } from './graphLabels'
@@ -14,7 +15,14 @@ const props = defineProps<{ graph: Graph; layer: string; loading?: boolean; proj
 const search = ref('')
 const selectedKind = ref('')
 const remote = ref<Graph | null>(null), pageLoading = ref(false), pageError = ref('')
-const graph = computed(() => remote.value ?? props.graph)
+const neighborhood = ref<{ center: GraphNode; graph: Graph } | null>(null)
+const baseGraph = computed(() => remote.value ?? props.graph)
+const graph = computed(() => neighborhood.value?.graph ?? baseGraph.value)
+const neighborhoodNodeLimit = computed(() => props.projectId ? 1000 : SCENE_LIMIT)
+const neighborhoodCount = computed(() => Number(graph.value.focus_neighbor_count ?? Math.max(0, graph.value.nodes.length - 1)) + 1)
+const neighborhoodIncomplete = computed(() => neighborhood.value && (visible.value.length < neighborhoodCount.value || graph.value.truncated === true || graph.value.next_offset != null))
+let savedScene: { positions: Map<string, Point>; zoom: number; offset: Point; generation: unknown } | null = null
+let resettingSearch = false
 const serverPaging = computed(() => !!props.projectId && props.graph.page_size !== undefined)
 let pageGeneration = 0, searchTimer: ReturnType<typeof setTimeout> | undefined
 const searchMatches = ref<string[] | null>(null)
@@ -96,6 +104,39 @@ async function loadDetails(more = false) {
 function selectNode(node: GraphNode) { selected.value = node; selectedEdge.value = null; void loadDetails() }
 function selectEdge(edge: GraphEdge) { selectedEdge.value = edge; void loadDetails() }
 function clearSelection() { detailGeneration++; selected.value = null; selectedEdge.value = null; details.value = null; detailsError.value = ''; detailsLoading.value = false; detailNodes.value = {}; detailSchema.value = {} }
+function clearFilters() {
+  resettingSearch = true; search.value = ''; selectedKind.value = ''; searchMatches.value = null; resettingSearch = false
+}
+async function showTwoHops(node: GraphNode) {
+  const epoch = ++pageGeneration
+  sceneController?.abort(); sceneController = new AbortController(); clearTimeout(searchTimer)
+  pageLoading.value = true; pageError.value = ''
+  try {
+    // Query the published graph, not just the currently loaded scene or viewport.
+    const params = new URLSearchParams({ layer: props.layer, include_candidates: String(props.includeCandidates === true), focus: node.id, hops: '2', limit: '1000', offset: '0' })
+    const value = props.projectId
+      ? await request<Graph>(`${projectPath(props.projectId)}/graph?${params}`, { signal: sceneController.signal })
+      : twoHopNeighborhood(baseGraph.value, node.id)
+    if (epoch !== pageGeneration) return
+    const center = value.nodes.find(item => item.id === node.id)
+    if (!center) { pageError.value = '当前图谱中已找不到这个节点，请刷新图谱。'; return }
+    if (!neighborhood.value) savedScene = { positions: new Map(positions.value), zoom: zoom.value, offset: { ...offset.value }, generation: baseGraph.value.generation }
+    clearFilters(); clearSelection(); positions.value = placeNodes(value)
+    neighborhood.value = { center, graph: value }; selectNode(center)
+    await nextTick(); if (epoch === pageGeneration) fit()
+  } catch (error) { if (epoch === pageGeneration) pageError.value = error instanceof Error ? error.message : '两跳关联读取失败' }
+  finally { if (epoch === pageGeneration) pageLoading.value = false }
+}
+async function returnToGraph() {
+  const changed = !!neighborhood.value?.graph.generation && neighborhood.value.graph.generation !== savedScene?.generation
+  pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); pageLoading.value = false; pageError.value = ''
+  neighborhood.value = null; clearFilters(); clearSelection()
+  if (changed && props.projectId) {
+    savedScene = null; await loadScene({ replace: true }); return
+  }
+  if (savedScene) { positions.value = savedScene.positions; zoom.value = savedScene.zoom; offset.value = savedScene.offset }
+  savedScene = null
+}
 
 const zoom = ref(1)
 const offset = ref({ x: 0, y: 0 })
@@ -153,15 +194,24 @@ function focusNode(node: GraphNode) {
 function wheel(event: WheelEvent) { setZoom(zoom.value * (event.deltaY > 0 ? .9 : 1.1)) }
 let pointerStart: { x: number; y: number } | null = null
 function bitmapDown(event: PointerEvent) { pointerStart = { x: event.clientX, y: event.clientY }; start(event) }
-function bitmapUp(event: PointerEvent) {
-  drag = null
-  if (!pointerStart || Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y) > 5) return
-  const rect = bitmap.value!.getBoundingClientRect()
+function bitmapNode(event: MouseEvent) {
+  if (!bitmap.value) return
+  const rect = bitmap.value.getBoundingClientRect()
+  if (!rect.width || !rect.height) return
   const x = ((event.clientX - rect.left) * viewport.value.width / rect.width - offset.value.x) / zoom.value
   const y = ((event.clientY - rect.top) * viewport.value.height / rect.height - offset.value.y) / zoom.value
-  const node = hitNode(visible.value, points.value, x, y, Math.max(22, 6 / zoom.value))
+  return hitNode(visible.value, points.value, x, y, Math.max(22, 6 / zoom.value))
+}
+function bitmapUp(event: PointerEvent) {
+  drag = null
+  const start = pointerStart; pointerStart = null
+  if (!start || Math.hypot(event.clientX - start.x, event.clientY - start.y) > 5) return
+  const node = bitmapNode(event)
   if (node) selectNode(node)
-  pointerStart = null
+}
+function bitmapDoubleClick(event: MouseEvent) {
+  const node = bitmapNode(event)
+  if (node) void showTwoHops(node)
 }
 function paint() {
   const element = bitmap.value
@@ -200,16 +250,18 @@ function paint() {
   ctx.globalAlpha = 1
 }
 watch([bitmap, positions, zoom, offset, viewport, selected, selectedEdge, search, selectedKind], paint, { flush: 'post' })
-watch(() => props.graph, () => {
-  pageGeneration++; sceneController?.abort(); remote.value = null; pageLoading.value = false; positions.value = placeNodes({ ...props.graph, nodes: props.graph.nodes.slice(0, SCENE_LIMIT) })
+watch([() => props.graph, () => props.layer, () => props.projectId, () => props.includeCandidates], () => {
+  pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); neighborhood.value = null; savedScene = null; remote.value = null; pageLoading.value = false; positions.value = placeNodes({ ...props.graph, nodes: props.graph.nodes.slice(0, SCENE_LIMIT) })
   search.value = ''; searchMatches.value = null; selectedKind.value = ''; expansionOffsets.value.clear(); clearSelection(); reset()
   if (serverPaging.value && Number(props.graph.total_nodes) <= 1000 && props.graph.next_offset != null) void loadScene()
 }, { immediate: true })
 watch([search, selectedKind], () => {
+  if (resettingSearch) return
+  if (neighborhood.value) { if (filtered.value[0]) focusNode(filtered.value[0]); return }
   pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); pageLoading.value = false; searchMatches.value = null
   if (serverPaging.value && (search.value || selectedKind.value)) searchTimer = setTimeout(() => { void loadScene({ q: search.value, kind: selectedKind.value }) }, 200)
   else if (filtered.value[0]) focusNode(filtered.value[0])
-})
+}, { flush: 'sync' })
 watch(canvas, element => {
   observer?.disconnect()
   if (!element) return
@@ -230,14 +282,15 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
         <div class="actions"><input v-model="search" class="graph-search" aria-label="搜索图节点" placeholder="搜索名称或编号"/><select v-model="selectedKind" aria-label="筛选节点类型"><option value="">全部类型</option><option v-for="kind in kinds" :key="kind" :value="kind">{{ kindName(kind) }}</option></select></div>
         <div class="actions"><button class="btn small" aria-label="缩小图谱" @click="setZoom(zoom / 1.2)">−</button><span class="muted">{{ Math.round(zoom * 100) }}%</span><button class="btn small" aria-label="放大图谱" @click="setZoom(zoom * 1.2)">+</button><button class="btn small" @click="fit">适配画布</button><button class="btn small" @click="reset">原始大小</button></div>
       </div>
-      <div v-if="overview" class="kind-overview" aria-label="全图类型概览"><button v-for="(count, kind) in overview" :key="kind" class="btn small" @click="selectedKind = String(kind)">{{ kindName(kind) }} · {{ count }}</button></div>
-      <p v-if="pageLoading" role="status">正在扩展画布…</p>
+      <div v-if="overview && !neighborhood" class="kind-overview" aria-label="全图类型概览"><button v-for="(count, kind) in overview" :key="kind" class="btn small" @click="selectedKind = String(kind)">{{ kindName(kind) }} · {{ count }}</button></div>
+      <div v-if="neighborhood" class="neighborhood-toolbar" aria-label="两跳关联范围"><span>两跳关联 · {{ display(neighborhood.center) }}</span><span class="muted small-text">沿任意方向查看最多两条关系可到达的节点；搜索仅作用于当前范围。</span><button class="btn small" @click="returnToGraph">返回全图</button></div>
+      <p v-if="pageLoading" role="status">正在读取图谱关联…</p>
       <p v-if="pageError" role="alert">{{ pageError }}</p>
       <div v-if="loading" class="empty-state"><div class="spinner"></div>正在读取图谱</div>
       <div v-else-if="!graph.nodes.length && !search && !selectedKind" class="empty-state graph-empty"><div class="empty-graphic">◇</div><h3>{{ layer === 'metadata' ? '还没有元数据图' : '还没有业务图谱' }}</h3><p>{{ layer === 'metadata' ? '上传数据并读取元数据后，这里会展示真实的表、列及其关系。' : '完成抽取后，这里会展示已发布的实体与关系。现有图谱会在后续运行中保留并更新。' }}</p></div>
       <div v-else-if="!visible.length" class="empty-state">没有匹配的节点，请调整搜索或类型。</div>
       <div v-else ref="canvas" class="graph-canvas" @wheel.prevent="wheel">
-        <canvas v-if="largeScene" ref="bitmap" class="graph-bitmap" role="img" :aria-label="`连续图谱画布，${visible.length} 个节点；使用节点列表选择对象`" @pointerdown="bitmapDown" @pointermove="move" @pointerup="bitmapUp" @pointercancel="drag = null" @lostpointercapture="drag = null"/>
+        <canvas v-if="largeScene" ref="bitmap" class="graph-bitmap" role="img" :aria-label="`连续图谱画布，${visible.length} 个节点；使用节点列表选择对象`" @dblclick.stop="bitmapDoubleClick" @pointerdown="bitmapDown" @pointermove="move" @pointerup="bitmapUp" @pointercancel="drag = null" @lostpointercapture="drag = null"/>
         <svg v-else :viewBox="`0 0 ${viewport.width} ${viewport.height}`" role="group" :aria-label="layer === 'metadata' ? '元数据关联图' : '业务知识图谱'" @pointerdown="start" @pointermove="move" @pointerup="drag = null" @pointercancel="drag = null" @lostpointercapture="drag = null">
           <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#b6c4da"/></marker></defs>
           <g :transform="`translate(${offset.x} ${offset.y}) scale(${zoom})`">
@@ -245,15 +298,15 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
               <path :d="`M ${points.get(edge.source)!.x} ${points.get(edge.source)!.y} L ${points.get(edge.target)!.x} ${points.get(edge.target)!.y}`" marker-end="url(#arrow)"/><title>{{ relationName(edge.relation) }} · {{ statusName(edge.status) }}</title>
               <text v-if="selected && (edge.source === selected.id || edge.target === selected.id)" :x="(points.get(edge.source)!.x + points.get(edge.target)!.x) / 2" :y="(points.get(edge.source)!.y + points.get(edge.target)!.y) / 2 - 7">{{ relationName(edge.relation) }}</text>
             </g>
-            <g v-for="node in visible" :key="node.id" class="graph-node" :class="{ dimmed: (search || selectedKind) && !filtered.includes(node), selected: selected?.id === node.id, candidate: node.status === 'candidate', unresolved: node.status === 'unresolved' }" :transform="`translate(${points.get(node.id)!.x} ${points.get(node.id)!.y})`" tabindex="0" role="button" :aria-label="display(node)" @click="selectNode(node)" @keydown.enter="selectNode(node)" @keydown.space.prevent="selectNode(node)">
+            <g v-for="node in visible" :key="node.id" class="graph-node" :class="{ dimmed: (search || selectedKind) && !filtered.includes(node), selected: selected?.id === node.id, candidate: node.status === 'candidate', unresolved: node.status === 'unresolved' }" :transform="`translate(${points.get(node.id)!.x} ${points.get(node.id)!.y})`" tabindex="0" role="button" :aria-label="display(node)" @click="selectNode(node)" @dblclick.stop="showTwoHops(node)" @keydown.enter="selectNode(node)" @keydown.space.prevent="selectNode(node)">
               <circle r="22" :fill="kindColor(node) + '18'" :stroke="kindColor(node)"/><circle r="5" :fill="kindColor(node)"/>
               <text class="node-label" y="43">{{ shortLabel(node) }}</text><text class="node-kind" y="59">{{ kindName(node.kind || node.layer) }} · {{ statusName(node.status) }}</text><text v-if="scopeLabel(node)" class="node-kind node-scope" y="75">{{ shortScope(node) }}</text><title>{{ display(node) }} · {{ statusName(node.status) }} · {{ scopeLabel(node) }}</title>
             </g>
           </g>
         </svg>
       </div>
-      <div class="panel-footer"><span>画布已加载 {{ visible.length }} / 全图 {{ graph.total_nodes ?? graph.nodes.length }} 个节点 · 已加载 {{ edges.length }} / 全图 {{ graph.total_edges ?? graph.edges.length }} 条关系</span><span v-if="search || selectedKind">匹配 {{ matchedCount }} 个节点（结果最多 1000 个）</span><span v-if="graph.truncated">来源返回部分图谱，尚未加载的节点和边不表示不存在</span><span v-else-if="serverPaging && visible.length < Number(graph.total_nodes)">全图搜索或选择节点展开关联；画布保留已加载内容</span><span v-else>拖动平移 · 滚轮缩放 · 点击节点查看来源</span><span v-if="atCapacity">画布已达上限（{{ SCENE_LIMIT }} 个节点 / {{ SCENE_EDGE_LIMIT }} 条关系），请清空后定位新的对象</span><button v-if="serverPaging && (atCapacity || visible.length > 1000)" class="btn small" @click="loadScene({ q: search, kind: selectedKind, replace: true })">清空并聚焦当前检索</button></div>
-      <details v-if="largeScene || search || selectedKind" class="scene-node-list"><summary>定位节点 · {{ filtered.length }} 个匹配</summary><button v-for="node in accessibleNodes" :key="node.id" class="btn small" @click="selectNode(node); focusNode(node)">{{ display(node) }} · {{ statusName(node.status) }} · {{ scopeLabel(node) }}</button><p v-if="filtered.length > 40">列表展示前 40 个匹配，请搜索缩小范围；画布仍保留已加载节点。</p></details>
+      <div class="panel-footer"><span v-if="!neighborhood">画布已加载 {{ visible.length }} / 全图 {{ graph.total_nodes ?? graph.nodes.length }} 个节点 · 已加载 {{ edges.length }} / 全图 {{ graph.total_edges ?? graph.edges.length }} 条关系</span><span v-else>两跳范围已加载 {{ visible.length }} / {{ neighborhoodCount }} 个节点 · {{ edges.length }} 条关系</span><span v-if="search || selectedKind">匹配 {{ matchedCount }} 个节点（结果最多 1000 个）</span><span v-if="neighborhoodIncomplete">部分关联尚未完整显示（最多 {{ neighborhoodNodeLimit }} 个节点，关系也有显示上限）；可双击范围内的节点继续查看其两跳关联。</span><span v-else-if="graph.truncated">来源返回部分图谱，尚未加载的节点和边不表示不存在</span><span v-else-if="!neighborhood && serverPaging && visible.length < Number(graph.total_nodes)">全图搜索或选择节点展开关联；画布保留已加载内容</span><span v-else>拖动平移 · 滚轮缩放 · 单击查看来源 · 双击查看两跳关联</span><span v-if="atCapacity">画布已达上限（{{ SCENE_LIMIT }} 个节点 / {{ SCENE_EDGE_LIMIT }} 条关系），请清空后定位新的对象</span><button v-if="!neighborhood && serverPaging && (atCapacity || visible.length > 1000)" class="btn small" @click="loadScene({ q: search, kind: selectedKind, replace: true })">清空并聚焦当前检索</button></div>
+      <details v-if="largeScene || search || selectedKind" class="scene-node-list"><summary>定位节点 · {{ filtered.length }} 个匹配</summary><button v-for="node in accessibleNodes" :key="node.id" class="btn small" @click="selectNode(node); focusNode(node)" @dblclick.stop="showTwoHops(node)">{{ display(node) }} · {{ statusName(node.status) }} · {{ scopeLabel(node) }}</button><p v-if="filtered.length > 40">列表展示前 40 个匹配，请搜索缩小范围；画布仍保留已加载节点。</p></details>
     </section>
     <aside class="panel graph-detail">
       <div class="panel-head"><h2>{{ selectedEdge ? '关系详情' : '节点详情' }}</h2></div>
@@ -274,7 +327,8 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
           <div class="divider"></div><h3>节点属性</h3>
           <PropertyTable :values="nodeProperties(selected)" :label="propertyName" /><TechnicalDetails :value="selected" />
           <h3>已加载关联 · {{ adjacent.length }}</h3>
-          <button v-if="serverPaging" class="btn small" :disabled="pageLoading || atCapacity || expansionOffsets.get(selected.id) === null" @click="expandNode">{{ expansionOffsets.has(selected.id) ? '继续展开关联' : '展开相邻节点' }}</button>
+          <button class="btn small" :disabled="pageLoading" @click="showTwoHops(selected)">查看两跳关联</button>
+          <button v-if="serverPaging && !neighborhood" class="btn small" :disabled="pageLoading || atCapacity || expansionOffsets.get(selected.id) === null" @click="expandNode">{{ expansionOffsets.has(selected.id) ? '继续展开关联' : '展开相邻节点' }}</button>
           <button v-for="(edge, i) in adjacent.slice(0, 40)" :key="i" type="button" class="edge-detail relation-selection" @click="selectEdge(edge)">
             <span class="badge" :title="relationDescription(edge.relation)">{{ relationName(edge.relation) }} · {{ statusName(edge.status) }}</span>
             <p>{{ endpointName(edge.source) }} → {{ endpointName(edge.target) }}</p>
@@ -316,6 +370,7 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
 <style scoped>
 .graph-bitmap { display: block; width: 100%; height: 480px; touch-action: none; }
 .graph-node.dimmed { opacity: .25; }
+.neighborhood-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 8px 16px; }
 .kind-overview, .scene-node-list { padding: 8px 16px; display: flex; flex-wrap: wrap; gap: 8px; }
 .graph-edge { cursor: pointer; }
 .graph-edge.candidate path, .graph-node.candidate > circle:first-child { stroke-dasharray: 6 4; }

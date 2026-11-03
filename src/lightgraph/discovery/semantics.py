@@ -346,6 +346,13 @@ def _review_stage_contract(proposition):
         'supported_decision_allows':'draft_rule_compilation_only',
         'publication_authorized':False,
         'programmatic_checks':{'state':'pending_if_rule_compiles','checks':checks}}
+    if kind=='wide_hierarchy':
+        contract['code_label_interpretation']={
+            'mapping':'each position code is paired with that position declared label column; verify the mapping against evidence',
+            'repeated_parent':'one parent code may repeat across rows with different children; this is not a name conflict or multiple-parent violation',
+            'label_conflict':'different names for the same scoped identity under the declared code-label mappings; varying child names do not establish this',
+            'fd_scope':'a parent-code to child-name FD is not required; check code to its own mapped name within the claimed scope',
+        }
     if kind=='wide_hierarchy' and claim.get('path_semantics')=='relative_path':
         contract['identity_interpretation']={
             'identity':'code within the explicitly claimed identity domain and scope',

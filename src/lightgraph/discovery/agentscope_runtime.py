@@ -1,4 +1,4 @@
-"""AgentScope runtime adapters; no sessions, trace exporters or source snapshots.
+"""AgentScope runtime adapters with optional local, credential-redacted run history.
 
 ReActAgent owns the loop, Toolkit owns registered tool dispatch, and the native
 OpenAI adapter owns protocol parsing. Only complete model responses reach the
@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import OrderedDict
+from uuid import uuid4
 
 from agentscope import _config as framework_config
 from agentscope.agent import ReActAgent
@@ -21,6 +22,7 @@ from lightgraph.context import (discovery_envelope, bounded_discovery_packet,
                                 with_discovery_runtime_control)
 from lightgraph.contracts import canonical
 from lightgraph.errors import BudgetExceeded, LightGraphError
+from lightgraph.runtime.trace import emit_trace, trace_context
 from .models import ProposalBatch
 from .proposal_session import (DiscoveryFinish, ProposalSession, proposal_tool_specs,
                                MAX_SUBMISSION_CALLS)
@@ -134,7 +136,8 @@ class DiscoveryChatModel(ChatModelBase):
 
     Providers may return multiple tools even when parallel calls are disabled.
     An oversized batch executes nothing; its remaining turn is used to submit
-    the evidence already obtained, without increasing either allowance.
+    the evidence already obtained, without increasing either allowance. A stale
+    source call during submission receives one correction within that same limit.
     """
 
     def __init__(self, client, max_tool_calls: int, max_steps: int, submission_names=(), references=None):
@@ -148,6 +151,7 @@ class DiscoveryChatModel(ChatModelBase):
         self.submission_names=set(submission_names)
         self.steps=0
         self.submission_reason=None
+        self.phase_corrections=0
         self.references=references
 
     def _request_context(self, messages, reason):
@@ -155,6 +159,23 @@ class DiscoveryChatModel(ChatModelBase):
         return with_discovery_runtime_control(messages,turn=self.steps+1,max_turns=self.max_steps,
             remaining_tool_calls=self.max_tool_calls-self.source_calls,submission_reason=reason,
             remaining_submission_calls=MAX_SUBMISSION_CALLS-self.submission_calls)
+
+    def _reject_phase_batch(self, messages, available, reason, calls, *, can_retry):
+        """Reject the whole batch; expose only runtime counters and issued names."""
+        feedback={'code':'source_tool_unavailable_during_submission','executed_tools':0,
+            'requested_tools':len(calls),'submission_reason':reason,
+            'remaining_turns':self.max_steps-self.steps,
+            'allowed_tools':[spec['function']['name'] for spec in available],
+            'retry_available':can_retry,
+            'next_action':'No tool in this batch executed, including submissions. '
+                'Use the listed declaration/submission tools to submit retained findings and '
+                'finish_discovery. Resubmit any local proposals from this rejected batch. '
+                'If evidence is insufficient, finish with pending=true; never invent evidence.'}
+        usage=self.client.usage
+        usage['discovery_phase_rejections']=usage.get('discovery_phase_rejections',0)+1
+        emit_trace('discovery_phase_feedback',{'step':self.steps,**feedback})
+        if can_retry:
+            messages.append({'role':'user','content':canonical({'runtime_feedback':feedback})})
 
     async def __call__(self, messages: list[dict], tools=None, tool_choice=None, **kwargs):
         from .agent import _message
@@ -168,6 +189,7 @@ class DiscoveryChatModel(ChatModelBase):
         def parse(message):
             return _message(self.references.response(message,self.submission_names)
                             if self.references else message)
+        correcting_phase=False
         try:
             while True:
                 if self.steps>=self.max_steps:
@@ -222,28 +244,49 @@ class DiscoveryChatModel(ChatModelBase):
                     usage['prompt_peak_after_window_estimated_tokens']=max(
                         usage.get('prompt_peak_after_window_estimated_tokens',0),
                         prompt_size(request_messages,available,mode)[1])
+                    emit_trace('context_window',{'step':self.steps+1,'removed_exchanges':removed,
+                        'before_estimated_tokens':estimated_tokens,
+                        'after_estimated_tokens':prompt_size(request_messages,available,mode)[1],
+                        'reason':reason,'token_limit':token_limit,'byte_limit':byte_limit})
                 self.steps+=1
                 try:
                     # Source access ends at its configured allowance or final
                     # turn. Bounded local submissions can still preserve work.
-                    parsed=self.client._request(request_messages,parse,available or None,
-                        tool_choice=(tool_choice or 'auto') if available else 'none')
+                    # A correction uses only the currently offered tools. This
+                    # consumes an ordinary turn and the shared model budget.
+                    choice=('required' if correcting_phase else (tool_choice or 'auto')) if available else 'none'
+                    with trace_context(discovery_step=self.steps,max_discovery_steps=self.max_steps,
+                                       submission_reason=reason,phase_correction=correcting_phase):
+                        parsed=self.client._request(request_messages,parse,available or None,
+                            tool_choice=choice)
                 finally:
                     request_messages.clear()
                 if 'final' in parsed or 'finish' in parsed:
+                    if correcting_phase:
+                        usage=self.client.usage
+                        usage['discovery_phase_recoveries']=usage.get('discovery_phase_recoveries',0)+1
                     break
                 calls=parsed['calls']
                 source_count=sum(call['name'] not in self.submission_names for call in calls)
                 local_count=len(calls)-source_count
                 if tool_choice=='none' or reason and source_count:
-                    if reason in {'tool_allowance_exhausted','tool_batch_rejected'}:
-                        raise BudgetExceeded('discovery_tool_calls_exhausted')
-                    if reason in {'last_turn','submission_window'}:
+                    if reason and source_count and tool_choice!='none':
+                        can_retry=(self.steps<self.max_steps and self.phase_corrections<1 and bool(available))
+                        self._reject_phase_batch(messages,available,reason,calls,can_retry=can_retry)
+                        if can_retry:
+                            self.phase_corrections+=1
+                            correcting_phase=True
+                            parsed.clear()
+                            continue
+                    if self.steps>=self.max_steps:
                         raise BudgetExceeded('discovery_steps_exhausted')
                     raise LightGraphError('discovery_final_response_required')
                 if self.submission_calls+local_count>MAX_SUBMISSION_CALLS:
                     raise BudgetExceeded('discovery_tool_calls_exhausted')
                 if self.source_calls+source_count<=self.max_tool_calls:
+                    if correcting_phase:
+                        usage=self.client.usage
+                        usage['discovery_phase_recoveries']=usage.get('discovery_phase_recoveries',0)+1
                     break
                 # The last turn was reserved before the request. Reject the
                 # entire oversized batch instead of executing a changed subset.
@@ -363,11 +406,17 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
     agent.set_console_output_enabled(False)
     agent._proposal_session=session
     reply=None
+    termination_code=None
+    trace_binding=trace_context(agent_id='agent_'+uuid4().hex,task=packet.get('task'))
+    trace_binding.__enter__()
+    emit_trace('agent_start',{'packet':packet,'system':system,
+        'max_steps':max_steps,'max_tool_calls':max_tool_calls})
     try:
         # The actual AgentScope loop, not the former hand-written while loop.
         try:
             reply=await agent.reply(Msg('user','discovery task','user'))
         except LightGraphError as exc:
+            termination_code=exc.code
             # Recover only transport/shape/allowance failures. Authorization,
             # tracing policy changes and cancellation still terminate the run.
             recoverable=(exc.code.startswith(('llm_','model_transport_','model_json_','model_stream_')) or exc.code in {
@@ -421,7 +470,18 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
             session.pending=True
         session.finished=True
         return session.batch()
+    except BaseException as exc:
+        termination_code=exc.code if isinstance(exc,LightGraphError) else type(exc).__name__
+        raise
     finally:
+        emit_trace('agent_end',{'pending':session.pending,'finished':session.finished,
+            'drafts':session.drafts,'object_models':session.object_models,
+            'invalid_count':session.invalid_count,'steps':model.steps,
+            'max_steps':model.max_steps,'source_calls':model.source_calls,
+            'submission_calls':model.submission_calls,'phase_corrections':model.phase_corrections,
+            'termination_code':termination_code,
+            'reply':reply.content if reply is not None else None})
+        trace_binding.__exit__(None,None,None)
         # InMemoryMemory stores copies; clear originals as well as the returned
         # message, and remove closures retaining the executor or packet.
         for message in await memory.get_memory():

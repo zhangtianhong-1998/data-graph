@@ -21,7 +21,9 @@ from .reference_validation import validate_proposal_references
 class PlanPosition(StrictModel):
     position: int = Field(ge=1, le=1024, description='Declared position in the path, not an entity identity.')
     code: str = Field(min_length=1, description='Issued column ID containing this position object code.')
-    label: str | None = Field(default=None, description='Issued display-name column ID, if present.')
+    label: str | None = Field(default=None, description=
+        'Issued display-name column ID for this position code, if present. Usually the name column '
+        'at the same position; any other pairing needs evidence. A child name is not the parent code label.')
     alias: str | None = Field(default=None, description='Issued alternate-name column ID, if present.')
     aliases: list[str] = Field(default_factory=list,max_length=16,description=
         'All additional alternate-name or English-name column IDs for this same object position. '

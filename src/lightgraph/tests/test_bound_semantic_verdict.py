@@ -226,7 +226,7 @@ def test_compact_condition_is_bounded_without_truncation_and_schema_is_smaller()
     assert len(canonical(BoundSemanticVerdict.model_json_schema()))<len(canonical(SemanticReview.model_json_schema()))
 
 
-def test_malformed_json_patch_is_not_retried(monkeypatch):
+def test_malformed_json_patch_retries_request_without_nested_schema_repair(monkeypatch):
     calls=[]
     def handler(request):
         calls.append(1)
@@ -234,10 +234,11 @@ def test_malformed_json_patch_is_not_retried(monkeypatch):
             return response(verdict(evidence=[{'reference':'not_issued','stance':'supports'}]))
         return httpx.Response(200,json={'choices':[{'message':{'content':'{"replacements":['},
             'finish_reason':'stop'}]})
-    model=client(monkeypatch,handler);model.config.retries=3
+    model=client(monkeypatch,handler)
     with pytest.raises(LightGraphError,match='semantic_review_patch_invalid'):
         review_semantics(model,PACKET,PROPOSITION,[])
-    assert len(calls)==2 and not model.usage.get('schema_repair_attempts',0)
+    assert len(calls)==3 and not model.usage.get('schema_repair_attempts',0)
+    assert model.usage['request_retry_attempts']==model.usage['request_retry_exhausted']==1
 
 
 def test_invalid_reference_cannot_hide_a_later_unknown_condition(monkeypatch):

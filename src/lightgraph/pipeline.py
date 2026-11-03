@@ -92,6 +92,13 @@ def _context_versions(marker):
     return result
 
 
+def _unfinished_metadata_tables(ledger):
+    """Published rules do not prove that their interrupted investigation ended."""
+    return {(item.source.source_id,item.source.schema_name+'.'+item.source.table)
+        for item in ledger.items() if item.task=='metadata_discovery'
+        and item.state in {'pending','running','deferred'}}
+
+
 def _abort_staging(store, publications):
     # Later reporting failures must not attempt to undo a committed publication.
     for publication in publications:
@@ -362,8 +369,20 @@ def _goal_violation(rule,goal,projected):
 
 def run_pipeline(config,adapters, *, rules=None,documents=(),model=None,discover_only=False):
     from .runtime.locking import run_lock
-    with run_lock(config.output_dir):
-        return _run(config,adapters,rules=rules,documents=documents,model=model,discover_only=discover_only)
+    from .runtime.trace_lifecycle import execution_trace
+    from .runtime.trace import emit_trace
+    with run_lock(config.output_dir), execution_trace(config):
+        if rules is not None: rules=list(rules)
+        emit_trace('pipeline_started', {'discover_only':discover_only,
+            'rules':[r.model_dump(mode='json') for r in rules] if rules is not None else None})
+        try:
+            report=_run(config,adapters,rules=rules,documents=documents,model=model,discover_only=discover_only)
+        except BaseException as exc:
+            emit_trace('pipeline_error', {'error_type':type(exc).__name__,
+                'code':exc.code if isinstance(exc,LightGraphError) else 'pipeline_interrupted'})
+            raise
+        emit_trace('pipeline_completed', {'report':report.model_dump(mode='json')})
+        return report
 
 
 def _run(config,adapters,*,rules,documents,model,discover_only):
@@ -546,6 +565,10 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         pattern_review_tables=set()
         need_discovery={sid for sid in rules_by_source if old_catalog[sid]!=store.current_versions('catalog:'+sid)}
         discovery_tables={sid:set(contexts[sid]) for sid in need_discovery}
+        unfinished_metadata=_unfinished_metadata_tables(ledger)
+        for sid,name in unfinished_metadata:
+            if name in contexts.get(sid,{}):
+                need_discovery.add(sid);discovery_tables.setdefault(sid,set()).add(name)
         for sid,names in changed_contexts.items():
             if names:
                 need_discovery.add(sid);discovery_tables.setdefault(sid,set()).update(names)
@@ -605,9 +628,10 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 selected=set(contexts[sid]) if config.rediscover else discovery_tables.get(sid,set(contexts[sid]))
                 if not config.rediscover:
                     selected=selected-ledger.unresolved_tables(sid,contexts[sid])
-                    # A partial tool session need not rediscover its published
-                    # objects. Coverage and relation tasks resume independently.
+                    # Reuse published objects, but resume an explicitly
+                    # interrupted investigation even if its columns are covered.
                     selected={name for name in selected if (sid,name) not in stable_tables
+                        or (sid,name) in unfinished_metadata
                         or name in invalidating_contexts.get(sid,set())
                         or (sid,name) in pattern_review_tables}
                     selected.update(retry_tables.get(sid,set()))
@@ -1156,13 +1180,15 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 elif item.state=='running':ledger.transition(item,'unresolved')
         if auto:
             from .discovery.coverage import unexplained_columns
+            unfinished_metadata=_unfinished_metadata_tables(ledger)
             for table in tables:
                 if table.qualified_name not in contexts.get(table.source_id,{}):continue
                 if not unexplained_columns(table,prepared_rules,understandings,config.goal,engine):
                     ledger.resolve_exploration(SourceRef(source_id=table.source_id,schema=table.schema_name,table=table.name),
                                                'coverage_discovery')
-                    if any(r.source.source_id==table.source_id and r.source.schema_name==table.schema_name
-                           and r.source.table==table.name for r in prepared_rules):
+                    if ((table.source_id,table.qualified_name) not in unfinished_metadata
+                        and any(r.source.source_id==table.source_id and r.source.schema_name==table.schema_name
+                           and r.source.table==table.name for r in prepared_rules)):
                         ledger.resolve_exploration(SourceRef(source_id=table.source_id,
                             schema=table.schema_name,table=table.name),'metadata_discovery')
                     report.issues[:]=[i for i in report.issues if not (
@@ -1233,6 +1259,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
             source_rules={r.rule_id for r in allrules if r.source==rule.source}
             if source_rules <= set(report.rules_published):ledger.resolve_table(rule.source)
         if auto:
+            unfinished_metadata=_unfinished_metadata_tables(ledger)
             for sid in need_discovery:
                 previous=store.current_versions('discovery:'+sid) or {}
                 matching=(previous.get('goal')==digest(config.goal.model_dump()) and
@@ -1248,6 +1275,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                 complete_tables=set(discovery_completed.get(sid,set()))
                 complete_tables.update(t.qualified_name for t in tables if t.source_id==sid
                     and (sid,t.qualified_name) in stable_tables
+                    and (sid,t.qualified_name) not in unfinished_metadata
                     and not unexplained_columns(t,prepared_rules,understandings,config.goal,engine))
                 completed_versions.update({name:contexts[sid][name]
                     for name in complete_tables if name in contexts[sid]
@@ -1339,6 +1367,8 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
         report.counts['elapsed_seconds']=round(time.monotonic()-started,3)
         report.counts['llm_calls']=model.usage['calls'] if model else 0
         for counter in ('reference_repair_attempts','reference_repairs_succeeded','reference_repair_abstentions',
+                        'request_retry_attempts','request_retry_succeeded','request_retry_exhausted',
+                        'discovery_phase_rejections','discovery_phase_recoveries',
                         'column_references_normalized','schema_repair_attempts','schema_repairs_succeeded',
                         'schema_repair_abstentions','json_syntax_recoveries','json_bom_recoveries',
                         'json_fence_recoveries','json_control_char_recoveries','json_trailing_comma_recoveries',

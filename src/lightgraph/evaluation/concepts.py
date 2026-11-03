@@ -54,13 +54,15 @@ def evaluate_concepts(graph_path,gold_path,*,role_kinds,role_relations,context_k
         context_codes=defaultdict(list);context_labels=defaultdict(list);missing_codes=[];unreadable=[]
         for nid,node in nodes.items():
             if node.get('kind')!=context_kind:continue
-            bindings={r:[] for r in roles};bad=ids[nid]!=1
+            bindings={r:[] for r in roles};names={r:[] for r in roles};bad=ids[nid]!=1
             for edge in edges[nid]:
                 role=next((r for r,rel in role_relations.items() if rel==edge.get('relation')),None)
                 if role is None:continue
                 key=keys.get(edge['target'])
                 if not key or key[0]!=role:bad=True
-                else:bindings[role].append(key[1])
+                else:
+                    bindings[role].append(key[1])
+                    names[role].extend(scalars(nodes[edge['target']].get('label',[])))
             if any(len(v)!=1 for v in bindings.values()) or not scopes[nid]:bad=True
             codes=list(scalars(node.get('properties',{}).get('business_code',[])))
             if len(codes)!=1 or not isinstance(codes[0],str) or not codes[0]:
@@ -70,11 +72,19 @@ def evaluate_concepts(graph_path,gold_path,*,role_kinds,role_relations,context_k
             # name scoring above; assess what the exported viewer actually shows.
             label=node.get('display_label') or node.get('label')
             if isinstance(label,str):context_labels[label].append(nid)
-            # Check observable display content, not semantic identity. Equal
-            # captions are never merged and this check cannot improve recall.
+            # Short captions need not be unique: codes identify contexts and
+            # the UI shows scope separately. Trust that separate scope only if
+            # it exactly agrees with authorized existence supports in the export.
+            displayed_scopes=node.get('scopes')
+            visible_scope=(isinstance(displayed_scopes,list) and all(isinstance(s,str) for s in displayed_scopes)
+                           and set(displayed_scopes)==scopes[nid]) if displayed_scopes is not None else (
+                               isinstance(label,str) and all(subject in label for subject in scopes[nid]))
+            # Re-read component name facts, so a stale display_label cannot hide
+            # corrupted facts or make the independent concept-name score pass.
             if (bad or not isinstance(label,str) or label in {nid,'组合上下文'} or
                     any(expected.get((role,bindings[role][0]),'') not in label for role in roles) or
-                    any(subject not in label for subject in scopes[nid])):
+                    any(len(names[role])!=1 or not isinstance(names[role][0],str) or
+                        not names[role][0] or names[role][0] not in label for role in roles) or not visible_scope):
                 unreadable.append(nid)
             if bad:invalid+=ids[nid];continue
             # Each authorized support scope is an explicit subject assignment;
@@ -95,9 +105,8 @@ def evaluate_concepts(graph_path,gold_path,*,role_kinds,role_relations,context_k
                     for label,nids in sorted(context_labels.items()) if len(nids)>1],
                 'unreadable_label_nodes':sorted(unreadable),
                 'passed':bool(context_nodes) and not (missing_codes or unreadable)
-                    and all(len(nids)==1 for nids in context_codes.values())
-                    and all(len(nids)==1 for nids in context_labels.values()),
-                'method':'Nonempty unique context codes and distinct displayed captions containing assigned concept names and source scopes; display_label is presentation only and never changes identity or concept-name scoring.'}}
+                    and all(len(nids)==1 for nids in context_codes.values()),
+                'method':'Unique nonempty context codes; captions contain current assigned concept names; scopes appear in captions or a separate scopes field matching exported existence supports. Duplicate captions are reported but do not merge identities or fail presentation; concept identity and name scores remain independent.'}}
     return {'version':'lightgraph.concepts-evaluation/1','graph_sha256':fingerprint(graph_path),
         'gold_sha256':fingerprint(gold_path),'role_kinds':role_kinds,'role_relations':role_relations,
         'context_kind':context_kind,'accepted':evaluate_mode({'accepted'}),

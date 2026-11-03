@@ -6,6 +6,7 @@ import pytest
 
 from lightgraph.discovery.budget import BudgetAllocator, Cost
 from lightgraph.discovery.llm import ModelConfig, StructuredModelClient
+from lightgraph.discovery.models import ProposalBatch
 from lightgraph.errors import BudgetExceeded, LightGraphError
 
 
@@ -198,18 +199,21 @@ def test_duplicate_call_is_not_reexecuted_and_model_can_finish(monkeypatch):
     assert tools.executed==['get_metadata'] and tools.closed
 
 
-def test_tool_budget_requests_final_then_rejects_additional_call(monkeypatch):
+def test_tool_budget_requests_final_then_offers_one_phase_correction(monkeypatch):
     turns=[]
     def handler(request):
         body=json.loads(request.content);turns.append(1)
-        if len(turns)==2:
+        if len(turns)>=2:
             assert all(item['function']['name'].startswith(('submit_','declare_','finish_'))
                        for item in body.get('tools',[]))
+        if len(turns)==3:
+            assert body['tool_choice']=='required'
+            assert json.loads(body['messages'][-1]['content'])['runtime_feedback']['executed_tools']==0
         return response(tool='get_metadata')
     model=client(monkeypatch,handler);tools=Toolbox()
-    with pytest.raises(BudgetExceeded,match='discovery_tool_calls_exhausted'):
+    with pytest.raises(LightGraphError,match='discovery_final_response_required'):
         model.explore(input_packet(),tools,max_tool_calls=1)
-    assert model.usage['calls']==2 and tools.executed==['get_metadata'] and tools.closed
+    assert model.usage['calls']==3 and tools.executed==['get_metadata'] and tools.closed
 
 
 def test_step_budget_stops_endless_exploration(monkeypatch):
@@ -229,7 +233,7 @@ def test_final_reference_check_remains_required(monkeypatch,evidence):
     assert tools.closed
 
 
-def test_unverifiable_final_json_correction_and_invalid_packet_cleanup(monkeypatch):
+def test_invalid_json_request_recovery_and_invalid_packet_cleanup(monkeypatch):
     turns=[]
     def handler(request):
         turns.append(1)
@@ -237,10 +241,11 @@ def test_unverifiable_final_json_correction_and_invalid_packet_cleanup(monkeypat
             return httpx.Response(200,json={'choices':[{'message':{'content':'bad'},'finish_reason':'stop'}]})
         return response(final())
     model=client(monkeypatch,handler);tools=Toolbox()
-    # An unparseable candidate cannot prove that a second business claim kept
-    # its exclusions/conditions. The retry must not silently replace its meaning.
-    with pytest.raises(LightGraphError,match='llm_schema_invalid'):
-        model.explore(input_packet(),tools)
+    # The unreadable response did not establish a proposal. Retry the same
+    # authorized request and validate the new response normally.
+    result=model.explore(input_packet(),tools)
+    assert result.model_dump()==ProposalBatch.model_validate(final()).model_dump()
+    assert model.usage['request_retry_succeeded']==1
     assert model.usage['calls']==2 and tools.closed
     tools=Toolbox()
     with pytest.raises(LightGraphError,match='model_packet_schema_invalid'):

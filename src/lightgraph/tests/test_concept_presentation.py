@@ -80,6 +80,8 @@ def test_evaluator_rejects_unreadable_contexts_even_with_exact_assignments(tmp_p
     assert result['concepts']['exact'] and result['joint_contexts']['exact']
     assert result['context_presentation']['passed']
     ids={n['id'] for n in graph['nodes'] if n['kind']=='ConceptBinding'}
+    for node in graph['nodes']:
+        if node['id'] in ids:node['display_label']='组合上下文'
     for fact in graph['facts']:
         p=fact['payload']
         if fact['fact_kind']=='PropertyValue' and p['entity_id'] in ids:

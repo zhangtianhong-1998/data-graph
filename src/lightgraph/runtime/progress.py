@@ -96,6 +96,9 @@ def bind_progress(sink):
 def emit_progress(stage, code, *, completed=None, total=None, unit=None, table=None,
                   rule_id=None, level='info', counters=None):
     """Emit a fixed event. None stage preserves the current worker phase."""
+    from .trace import emit_trace
+    emit_trace('progress', {'stage':stage,'code':code,'completed':completed,'total':total,
+        'unit':unit,'table':table,'rule_id':rule_id,'level':level,'counters':counters})
     sink = _sink.get()
     if sink is None:
         return

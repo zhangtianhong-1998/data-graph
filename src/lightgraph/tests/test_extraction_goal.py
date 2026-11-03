@@ -16,12 +16,12 @@ def table():
                      columns=[ColumnSpec(name="amount"), ColumnSpec(name="item")])
 
 
-def test_default_goal_uses_automatic_vocabulary_without_changing_resource_limits():
+def test_default_goal_uses_automatic_vocabulary_with_bounded_discovery_allowance():
     config = RunConfig(sources=[])
     assert not config.goal.observation_values
     assert config.goal.entity_kinds == config.goal.relation_kinds == []
     assert config.goal.include == config.goal.exclude == config.goal.evidence_only_columns == []
-    assert config.model.max_discovery_steps == 8
+    assert config.model.max_discovery_steps == 16
     assert config.model.max_tool_calls == 16
 
 
