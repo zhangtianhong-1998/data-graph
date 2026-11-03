@@ -24,7 +24,7 @@ const labels: Record<string, string> = {
   agent_started: 'Agent 开始', agent_completed: 'Agent 结束', agent_finished: 'Agent 结束',
   proposal_submitted: '提交提案', proposal_result: '提案结果',
   run_configuration: '本次运行配置', pipeline_started: '抽取流程开始', progress: '阶段进展',
-  agent_start: 'Agent 开始', context_window: '上下文组装', model_wire_response: '模型接口原始响应',
+  agent_start: 'Agent 开始', context_window: '上下文组装', context_compaction: '上下文压缩', model_wire_response: '模型接口原始响应',
   agent_end: 'Agent 结束', pipeline_completed: '抽取流程结束', pipeline_error: '抽取流程异常',
   discovery_phase_feedback: '提交阶段工具纠正',
 }

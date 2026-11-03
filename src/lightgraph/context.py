@@ -157,11 +157,11 @@ def discovery_envelope(visible):
     documents, observations and the issued-reference registry for validation.
     """
     from lightgraph.discovery.proposal_session import DiscoveryFinish
-    from lightgraph.discovery.table_presentation import present_observations
+    from lightgraph.discovery.table_presentation import present_observations, TABLE_READING
     visible=present_observations(visible)
     from lightgraph.discovery.reference_validation import definition_sections
     context=wire_call_context(visible,visible['task'],output_contract={'schema_ref':'output_schema'})
-    return {'task':visible['task'],'input':visible,'call_context':context,
+    return {'task':visible['task'],'input':visible,'call_context':context,'table_reading':TABLE_READING,
             'reference_options':{'definition_sections':sorted(definition_sections(visible)),
                 'usage':'For verified_identity_domain identity/attribute/global scope evidence, '
                     'select applicable complete definition sections exactly as doc_id@revision:section_id. '

@@ -179,7 +179,8 @@ class DiscoveryChatModel(ChatModelBase):
 
     async def __call__(self, messages: list[dict], tools=None, tool_choice=None, **kwargs):
         from .agent import _message
-        from .prompt_window import prompt_bytes, prompt_size, prompt_fits, fit_source_history
+        from .prompt_window import (prompt_bytes, prompt_size, prompt_fits,
+                                    fit_source_history, compact_source_history)
         from .token_estimation import prompt_token_limit
 
         _check_runtime_policy()
@@ -221,6 +222,24 @@ class DiscoveryChatModel(ChatModelBase):
                 size,estimated_tokens=prompt_size(request_messages,available,mode)
                 token_limit=prompt_token_limit(self.client.config)
                 byte_limit=self.client.config.max_prompt_bytes
+                working_target=self.client.config.working_context_tokens
+                if working_target is not None:
+                    request_messages,compaction=compact_source_history(request_messages,available,mode,
+                        self.submission_names,target_tokens=min(working_target,token_limit)
+                            if token_limit is not None else working_target)
+                    if compaction['compressed_results'] or compaction['omitted_source_exchanges'] or compaction['target_unmet']:
+                        usage=self.client.usage
+                        usage['context_compaction_turns']=usage.get('context_compaction_turns',0)+1
+                        for metric in ('compressed_results','omitted_source_exchanges'):
+                            key='context_compaction_'+metric
+                            usage[key]=usage.get(key,0)+compaction[metric]
+                        if compaction['target_unmet']:
+                            key='context_compaction_target_unmet'
+                            usage[key]=usage.get(key,0)+1
+                        for stage in ('before','after'):
+                            key='context_compaction_peak_'+stage+'_estimated_tokens'
+                            usage[key]=max(usage.get(key,0),compaction[stage+'_tokens'])
+                        emit_trace('context_compaction',{'step':self.steps+1,**compaction})
                 if not prompt_fits(request_messages,available,mode,byte_limit,token_limit) and any(m.get('role')=='tool' for m in messages):
                     # First trim old complete exchanges while retaining the
                     # ability to reread evidence within the discovery allowance.
@@ -231,6 +250,10 @@ class DiscoveryChatModel(ChatModelBase):
                         available=[spec for spec in available
                             if spec['function']['name'] in self.submission_names]
                         request_messages=self._request_context(messages,reason)
+                        if working_target is not None:
+                            request_messages,_=compact_source_history(request_messages,available,mode,
+                                self.submission_names,target_tokens=min(working_target,token_limit)
+                                    if token_limit is not None else working_target)
                         request_messages,removed=fit_source_history(request_messages,available,mode,
                             byte_limit,self.submission_names,token_limit=token_limit)
                     usage=self.client.usage

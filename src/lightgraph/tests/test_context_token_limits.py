@@ -84,11 +84,12 @@ def test_config_roundtrip_preserves_explicit_windows_and_legacy_byte_unit():
     config=RunConfig(sources=[],model={'mode':'approved_external','model':'offline',
         'base_url':'https://example.invalid/v1','max_calls':240,'max_tokens':None,
         'max_prompt_bytes':1048576,'max_prompt_tokens':1048576,
-        'context_window_tokens':1114112,'max_output_tokens':65536})
+        'context_window_tokens':1114112,'max_output_tokens':65536,'working_context_tokens':24576})
     client=make_model(RunConfig.model_validate_json(config.model_dump_json()))
     assert client.config.max_prompt_bytes==1048576
     assert prompt_token_limit(client.config)==1048576
     assert client.config.max_output_tokens==65536
+    assert client.config.working_context_tokens==24576
     assert client.budget.limits.llm_tokens is None
     legacy=RunConfig(sources=[],model={'max_prompt_bytes':1048576,'max_output_tokens':65536})
     assert legacy.model.max_prompt_tokens is None and legacy.model.context_window_tokens is None

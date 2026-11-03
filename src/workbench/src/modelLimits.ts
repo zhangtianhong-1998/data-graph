@@ -1,7 +1,7 @@
-export const modelLimitKeys = ['max_discovery_steps', 'max_prompt_tokens', 'max_output_tokens', 'timeout_seconds', 'context_window_tokens', 'max_prompt_bytes', 'max_response_bytes'] as const
+export const modelLimitKeys = ['max_discovery_steps', 'max_prompt_tokens', 'max_output_tokens', 'timeout_seconds', 'context_window_tokens', 'working_context_tokens', 'max_prompt_bytes', 'max_response_bytes'] as const
 export type ModelLimitKey = typeof modelLimitKeys[number]
 export function modelLimitError(model: Record<string, unknown>): string {
-  const optional = new Set<ModelLimitKey>(['max_prompt_tokens', 'context_window_tokens', 'max_prompt_bytes', 'max_response_bytes'])
+  const optional = new Set<ModelLimitKey>(['max_prompt_tokens', 'context_window_tokens', 'working_context_tokens', 'max_prompt_bytes', 'max_response_bytes'])
   for (const key of modelLimitKeys) {
     const value = model[key]
     if (value === undefined || value === null && optional.has(key)) continue

@@ -62,10 +62,10 @@ def test_saved_limits_reach_next_worker_and_request_without_restart(
     monkeypatch.setenv('SETTINGS_RUNTIME_TEST_KEY', 'synthetic-settings-runtime-secret')
     limits_versions = [
         {'max_discovery_steps': 12, 'max_prompt_tokens': 100000,
-         'max_output_tokens': 2048, 'timeout_seconds': 17.5,
+         'max_output_tokens': 2048, 'timeout_seconds': 17.5, 'working_context_tokens': 24576,
          'max_prompt_bytes': 1048576, 'max_response_bytes': 1048576},
         {'max_discovery_steps': 24, 'max_prompt_tokens': 200000,
-         'max_output_tokens': 4096, 'timeout_seconds': 29.25,
+         'max_output_tokens': 4096, 'timeout_seconds': 29.25, 'working_context_tokens': None,
          'max_prompt_bytes': None, 'max_response_bytes': None},
     ]
     prefix = '/api/projects/settings'

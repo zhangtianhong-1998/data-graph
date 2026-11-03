@@ -42,7 +42,9 @@ def test_history_pressure_retains_draft_without_forcing_submission(capsys,caplog
             return {'status':'ok','operator':name,'probe_id':f'probe_{len(self.executed):04d}',
                 'data':{'text':('OLD_EVIDENCE' if len(self.executed)==1 else 'LATEST_EVIDENCE')+'x'*33000}}
     seen=[]
-    limit=90000
+    # Leave room for pinned repair feedback and table-reading instructions;
+    # two 33KB results still cannot fit, so the eviction assertions remain real.
+    limit=95000
     def handle(request):
         body=json.loads(request.content)
         seen.append(body)
@@ -68,7 +70,7 @@ def test_history_pressure_retains_draft_without_forcing_submission(capsys,caplog
             return response(tool='submit_column_group',args={**{k:v for k,v in proposal.items() if k!='kind'},
                 'resolves_rejections':[error['rejection_id']]})
         return response(tool='finish_discovery',args={'pending':False})
-    client=model(handle,stream=False,max_prompt_bytes=limit,max_discovery_steps=8)
+    client=model(handle,stream=False,max_prompt_bytes=limit,max_discovery_steps=8,working_context_tokens=None)
     tools=LargeTools()
     batch=client.explore(input_packet(),tools)
     assert len(batch.proposals)==1 and not batch._runtime_pending_codes
@@ -100,7 +102,7 @@ def test_trimmed_history_can_reread_source_before_finishing():
             proposal=final()['proposals'][0]
             return response(tool='submit_column_group',args={k:v for k,v in proposal.items() if k!='kind'})
         return response(tool='finish_discovery',args={'pending':False})
-    client=model(handler,stream=False,max_prompt_bytes=90000,max_discovery_steps=8)
+    client=model(handler,stream=False,max_prompt_bytes=90000,max_discovery_steps=8,working_context_tokens=None)
     source=SourceTools()
     assert client.explore(input_packet(),source).proposals
     assert source.executed==['get_metadata']*3 and source.closed

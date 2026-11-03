@@ -492,6 +492,7 @@ class ModelConfig(StrictModel):
     max_prompt_bytes: int | None = Field(default=None, gt=0)
     max_prompt_tokens: int | None = Field(default=None, gt=0)
     context_window_tokens: int | None = Field(default=None, gt=0)
+    working_context_tokens: int | None = Field(default=32768, gt=0)
     max_output_tokens: int = 4096
     retries: int = 1
     allow_source_samples: bool = False
@@ -567,11 +568,12 @@ class StructuredModelClient:
     def _complete_messages(self,task,packet,response_model):
         if not self.config.allow_source_samples and task != 'T4_document':
             packet={**packet,'strata_samples':[],'tool_observations':[]}
-        from .table_presentation import present_observations
+        from .table_presentation import present_observations, TABLE_READING
         packet=present_observations(packet)
         context=wire_call_context(packet,task,output_contract={'schema_ref':'output_schema'})
         packet={**packet,'goal':context['goal'],'stage':task,'call_context':context}
-        content = canonical({'task':task,'input':packet,'output_schema':response_model.model_json_schema()})
+        content = canonical({'task':task,'input':packet,'table_reading':TABLE_READING,
+                             'output_schema':response_model.model_json_schema()})
         return [{'role':'system','content':SYSTEM+'\n\n'+build_goal_instructions(context['goal'],stage=task)},
                 {'role':'user','content':content}]
 

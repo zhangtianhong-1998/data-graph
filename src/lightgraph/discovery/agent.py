@@ -32,6 +32,12 @@ Document section citations use the exact doc_id@revision:section_id shown in con
 failed tool calls are not registered evidence. Do not cite an unregistered probe.
 Analytical guidance can suggest exploration but cannot confirm business semantics.
 A tool success is not business-semantic confirmation.
+Older source exchanges may be compacted to evidence digests or omitted from the
+current request. Missing rows are not negative evidence; compression does not
+confirm a candidate. Current schema knowledge and proposal feedback remain authoritative
+about their recorded status. Requery authorized sources when omitted detail is needed;
+never reconstruct missing rows from memory. Full diagnostic traces, when enabled,
+are retained separately from this working context.
 For column_group and entity_key, propose shared_definition identity_resolution
 when the complete definition denotes the same object across the stated namespaces;
 matching labels or codes alone are insufficient. A documented common code domain

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import math
 import re
+import time
+from contextlib import ExitStack, contextmanager
 from typing import Any
 
 import sqlglot
@@ -336,19 +338,37 @@ class ToolExecutor:
                 "coverage": {"source_scope": "scoped_documents", "result_complete": len(pages)==1,
                 "truncated": len(pages)>1, "selection": "document_window"}}
 
+    @contextmanager
+    def _query_deadlines(self, adapters):
+        # All adapters in a run may share one budget. Enter each distinct budget
+        # once so local timeouts are classified against its enclosing ceiling.
+        budgets = {id(adapter.query_budget): adapter.query_budget for adapter in adapters
+                   if getattr(adapter, 'query_budget', None) is not None}
+        enclosing_deadline = min((budget.deadline for budget in budgets.values()), default=math.inf)
+        try:
+            with ExitStack() as stack:
+                for budget in budgets.values():
+                    stack.enter_context(budget.deadline_scope(self.budget.deadline_monotonic))
+                yield
+        except BudgetExceeded as exc:
+            # Separate source budgets can have different outer ceilings. A
+            # longer-lived endpoint must not relabel the other's run timeout.
+            if exc.code in {'run_time_budget_exhausted', 'wall_time_budget_exhausted'} and time.monotonic() > enclosing_deadline:
+                raise BudgetExceeded('run_time_budget_exhausted') from None
+            raise
+
     def _query(self, query, *, row_limit):
         # Both compiler and this executor use the narrowed catalog. The adapter
         # then revalidates again against its own connection-bound catalog.
         query = self.compiler.guard.validate(query.sql, query.parameters, operator=query.operator)
         self._activate_query(query.sql)
         self.budget.admit(Cost(db_cu=1, memory_bytes=self._max_bytes))
-        if hasattr(self.adapter, "query_budget"):
-            self.adapter.query_budget.deadline = min(self.adapter.query_budget.deadline, self.budget.deadline_monotonic)
-        began = self.adapter.stats.queries
-        try:
-            yield from self.adapter.execute(query, row_limit=row_limit)
-        finally:
-            self.budget.charge(Cost(db_cu=max(0, self.adapter.stats.queries - began)))
+        with self._query_deadlines([self.adapter]):
+            began = self.adapter.stats.queries
+            try:
+                yield from self.adapter.execute(query, row_limit=row_limit)
+            finally:
+                self.budget.charge(Cost(db_cu=max(0, self.adapter.stats.queries - began)))
 
     def _aggregate(self, query):
         result = None
@@ -399,15 +419,13 @@ class ToolExecutor:
             adapters=[self.source_adapters[source.source_id],self.source_adapters[target.source_id]]
             # Each endpoint uses count, bounded DISTINCT and version recheck.
             self.budget.admit(Cost(db_cu=6,memory_bytes=self._max_bytes))
-            for adapter in adapters:
-                if hasattr(adapter,'query_budget'):
-                    adapter.query_budget.deadline=min(adapter.query_budget.deadline,self.budget.deadline_monotonic)
-            before=[a.stats.queries for a in adapters]
-            try:
-                result=check_cross_source_reference(adapters[0],source,source_columns,adapters[1],target,target_columns,
-                    max_working_bytes=self._max_bytes,metadata_only=not self.allow_source_samples)
-            finally:
-                self.budget.charge(Cost(db_cu=sum(max(0,a.stats.queries-n) for a,n in zip(adapters,before))))
+            with self._query_deadlines(adapters):
+                before=[a.stats.queries for a in adapters]
+                try:
+                    result=check_cross_source_reference(adapters[0],source,source_columns,adapters[1],target,target_columns,
+                        max_working_bytes=self._max_bytes,metadata_only=not self.allow_source_samples)
+                finally:
+                    self.budget.charge(Cost(db_cu=sum(max(0,a.stats.queries-n) for a,n in zip(adapters,before))))
             counts={'source_ref_tuples','null_refs','partial_null_refs','unmatched','ambiguous','unique_matches'}
             return {'aggregates':{k:v for k,v in result.items() if k in counts},
                     'coverage':{k:v for k,v in result.items() if k not in counts|{'sample','rows'}}}

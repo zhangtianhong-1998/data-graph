@@ -17,6 +17,29 @@ class QueryBudget:
     def check_time(self):
         if time.monotonic() > self.deadline: raise BudgetExceeded("run_time_budget_exhausted")
     @contextmanager
+    def deadline_scope(self, deadline: float):
+        """Borrow a shorter deadline until the query iterator closes.
+
+        Source orchestration is sequential. A task timeout must not lower the
+        next task's ceiling or masquerade as exhaustion of the enclosing phase.
+        """
+        previous_deadline = self.deadline
+        self.deadline = min(previous_deadline, deadline)
+        try:
+            self.check_time()
+            yield
+            self.check_time()
+        except BudgetExceeded as exc:
+            now = time.monotonic()
+            if exc.code in {'run_time_budget_exhausted', 'wall_time_budget_exhausted'}:
+                if now > previous_deadline:
+                    raise BudgetExceeded('run_time_budget_exhausted') from None
+                if exc.code == 'run_time_budget_exhausted' and now > self.deadline:
+                    raise BudgetExceeded('wall_time_budget_exhausted') from None
+            raise
+        finally:
+            self.deadline = previous_deadline
+    @contextmanager
     def exploration(self, *, deadline: float, query_limit: int):
         """Apply a smaller phase ceiling without resetting consumed resources.
 
@@ -33,7 +56,7 @@ class QueryBudget:
                 raise BudgetExceeded('discovery_query_budget_exhausted')
             yield
         except BudgetExceeded as exc:
-            if exc.code == 'run_time_budget_exhausted':
+            if exc.code == 'run_time_budget_exhausted' and time.monotonic() < previous_deadline:
                 raise BudgetExceeded('discovery_time_budget_exhausted') from None
             if exc.code == 'query_budget_exhausted':
                 raise BudgetExceeded('discovery_query_budget_exhausted') from None

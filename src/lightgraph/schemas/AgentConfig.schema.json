@@ -162,6 +162,20 @@
           "description": "Optional combined input/output token window; max_output_tokens is reserved from it.",
           "title": "Context Window Tokens"
         },
+        "working_context_tokens": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 32768,
+          "description": "Soft discovery input target: compact old source results proactively; null disables it. Pinned evidence can exceed this target, subject to hard limits.",
+          "title": "Working Context Tokens"
+        },
         "max_response_bytes": {
           "anyOf": [
             {

@@ -87,6 +87,23 @@ describe('visible model limits', () => {
     expect(root.querySelector<HTMLInputElement>('#model-context-tokens')!.value).toBe('')
     expect(root.querySelector('[data-testid="effective-input-tokens"]')?.textContent).toContain('1048576 tokens')
   })
+  it.each([false, true])('saves the working target independently of the hard input cap (Agent file: %s)', async separate => {
+    if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }
+    await mount()
+    expect(root.querySelector<HTMLInputElement>('#model-working-context-tokens')!.value).toBe('32768')
+    await edit('model-working-context-tokens', '24576')
+    await edit('model-input-tokens', '1048576')
+    button('保存配置').click()
+    await vi.waitFor(() => expect((separate ? limits : config.model)?.working_context_tokens).toBe(24576))
+    expect((separate ? limits : config.model)?.max_prompt_tokens).toBe(1048576)
+    app.unmount(); root.remove(); await mount()
+    expect(root.querySelector<HTMLInputElement>('#model-working-context-tokens')!.value).toBe('24576')
+    await edit('model-working-context-tokens', '')
+    button('保存配置').click()
+    await vi.waitFor(() => expect((separate ? limits : config.model)?.working_context_tokens).toBeNull())
+    app.unmount(); root.remove(); await mount()
+    expect(root.querySelector<HTMLInputElement>('#model-working-context-tokens')!.value).toBe('')
+  })
   it('applies the saved Agent snapshot without a fallible follow-up config read', async () => {
     delete config.model; config.agent_config = 'files/agent-original.yaml'
     await mount(); await edit('model-output-tokens', '65536')

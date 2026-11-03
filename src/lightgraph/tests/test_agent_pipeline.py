@@ -66,8 +66,11 @@ def test_agent_reads_opaque_columns_and_emits_only_goal_values(monkeypatch,tmp_p
             assert set(c['name'] for c in p['metadata_digest']['columns'])==set(t.column_names)
             return response(call={'sql':'SELECT field_a, sort_order, field_u, amount FROM public.demo','max_rows':4})
         observations=[json.loads(m['content']) for m in payload['messages'] if m['role']=='tool']
-        assert observations[-1]['data']['rows'][0]['sort_order']=='销售费用'
-        assert observations[-1]['data']['rows'][0]['amount']==marker
+        data=observations[-1]['data']
+        assert data['row_format']=='positional_values'
+        row=dict(zip(data['columns'],data['rows'][0]))
+        assert row['sort_order']=='销售费用'
+        assert row['amount']==marker
         return response(group(p,'field_a','sort_order',extra=[
             ('field_u',{'role':'semantic_attribute','property_name':'unit'}),
             ('amount',{'role':'fact_value','exclude_from_projection':True})]))

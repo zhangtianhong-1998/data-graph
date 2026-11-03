@@ -72,6 +72,8 @@ class ModelConfig(StrictModel):
         description="Optional estimated input token cap, including tool schemas; independent of byte limits.")
     context_window_tokens: int | None = Field(default=None, gt=0,
         description="Optional combined input/output token window; max_output_tokens is reserved from it.")
+    working_context_tokens: int | None = Field(default=32768, gt=0,
+        description="Soft discovery input target: compact old source results proactively; null disables it. Pinned evidence can exceed this target, subject to hard limits.")
     max_response_bytes: int | None = Field(default=None, gt=0,
         description="Optional response-byte guard; null disables it. max_output_tokens controls model generation.")
     retries: int = Field(default=1, ge=0, le=1)

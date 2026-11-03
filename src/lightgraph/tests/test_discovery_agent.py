@@ -94,7 +94,9 @@ def test_model_observes_tool_result_and_changes_next_query(monkeypatch,tmp_path,
         if len(turns)==2:
             assert observed['data']['tables'][0]['columns']==['opaque_a','opaque_b']
             return response(tool='execute_readonly_sql',args={'sql':'SELECT opaque_a, opaque_b FROM t LIMIT 8'})
-        assert observed['data']['rows']==[{'label':CANARY}]
+        assert observed['data']['columns']==['label']
+        assert observed['data']['row_format']=='positional_values'
+        assert observed['data']['rows']==[[CANARY]]
         return response(final(evidence=observed['probe_id'],role='alias'))
     model=client(monkeypatch,handler)
     tools=Toolbox();data=input_packet()

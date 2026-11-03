@@ -5,7 +5,7 @@ from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import AgentConfig, ModelConfig
 
 LIMIT_FIELDS = frozenset({'max_discovery_steps', 'max_prompt_tokens', 'max_output_tokens', 'timeout_seconds',
-    'max_prompt_bytes', 'max_response_bytes', 'context_window_tokens'})
+    'max_prompt_bytes', 'max_response_bytes', 'context_window_tokens', 'working_context_tokens'})
 
 
 def read_model_limits(workspace, pid):
