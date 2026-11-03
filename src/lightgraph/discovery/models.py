@@ -253,6 +253,9 @@ Proposal = Annotated[Union[ColumnGroupProposal,EntityKeyProposal,HierarchyPropos
                            DiscriminatorProposal,ExclusionProposal,ConceptMappingProposal],Field(discriminator='kind')]
 class ProposalBatch(StrictModel):
     _runtime_completed_empty: bool = PrivateAttr(default=False)
+    # Only the runtime can attest that an invocation ended without pending
+    # work. Empty/error batches also set abstain, so that flag is insufficient.
+    _runtime_submission_complete: bool = PrivateAttr(default=False)
     _runtime_pending_codes: list[str] = PrivateAttr(default_factory=list)
     _runtime_invalid_drafts: int = PrivateAttr(default=0)
     _runtime_invalid_codes: dict[str,int] = PrivateAttr(default_factory=dict)

@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 const props = defineProps<{ report: unknown }>()
-type RunIssue = { code?: string; table?: string; status?: unknown; column_names?: unknown; reason_code?: unknown; field_path?: unknown; constraint?: unknown; count?: unknown; category?: unknown; next_action?: unknown }
+type RunIssue = { code?: string; table?: string; status?: unknown; stage?: unknown; column_names?: unknown; reason_code?: unknown; field_path?: unknown; constraint?: unknown; count?: unknown; category?: unknown; next_action?: unknown }
 const categories: Record<string, string> = { semantic_decision: '业务判断', evidence_gap: '证据不足', proposal_contract: '提案格式或约束', review_protocol: '审查响应错误', internal_error: '程序错误' }
 const actions: Record<string, string> = { continue_other_candidates: '继续处理其他候选', gather_evidence: '补充证据', revise_proposal: '修订提案', retry_review: '重新审查', fix_code: '修复代码后续跑' }
 const states: Record<string, string> = { rejected: '已拒绝，提案已结束', resolved: '已处理', unresolved: '分析已结束，结论仍有缺口', deferred: '工作尚未完成', partial: '执行未完成', diagnostic: '过程记录' }
 const enumLabel = (value: unknown, labels: Record<string, string>) => typeof value === 'string' && Object.prototype.hasOwnProperty.call(labels, value) ? labels[value] : ''
+const protocolStages: Record<string, string> = { provider_envelope: '接口响应结构', provider_usage: '用量字段', response_message: '消息结构', response_json: 'JSON 解析', response_schema: '输出字段校验', repair_contract: '格式修复结果' }
 const diagnosticCode = (value: unknown) => typeof value === 'string' && /^[a-z][a-z0-9_]{0,127}$/.test(value) ? value : ''
 const diagnosticConstraint = (value: unknown) => typeof value === 'string' && /^[a-z][A-Za-z0-9_]{0,63}$/.test(value) ? value : ''
 function fieldPath(value: unknown): string {
@@ -19,7 +20,7 @@ function fieldPath(value: unknown): string {
   } catch { return '' }
 }
 const diagnosticCount = (issue: RunIssue) => typeof issue.count === 'number' && Number.isSafeInteger(issue.count) && issue.count > 0 ? issue.count : null
-const isDiagnostic = (issue: RunIssue) => issue.code === 'discovery_draft_rejected' || issue.code === 'discovery_draft_field_diagnostic'
+const isDiagnostic = (issue: RunIssue) => issue.code === 'discovery_draft_rejected' || issue.code === 'discovery_draft_field_diagnostic' || issue.code === 'model_protocol_diagnostic'
 function columnNames(issue: RunIssue): string[] {
   if (!['unexplained_columns', 'coverage_shared_label_unresolved'].includes(issue.code || '') || typeof issue.column_names !== 'string' || issue.column_names.length > 32768) return []
   try {
@@ -27,13 +28,15 @@ function columnNames(issue: RunIssue): string[] {
     return Array.isArray(names) && names.length <= 32 && names.every(name => typeof name === 'string' && name.length > 0 && name.length <= 256 && !/[\u0000-\u001f\u007f]/.test(name)) ? names : []
   } catch { return [] }
 }
-const issueKey = (issue: RunIssue) => JSON.stringify([issue.code, issue.table, enumLabel(issue.status, states), columnNames(issue), ...(isDiagnostic(issue) ? [diagnosticCode(issue.reason_code), fieldPath(issue.field_path), diagnosticConstraint(issue.constraint)] : [])])
+const issueKey = (issue: RunIssue) => JSON.stringify([issue.code, issue.table, enumLabel(issue.status, states), columnNames(issue), ...(isDiagnostic(issue) ? [diagnosticCode(issue.reason_code), fieldPath(issue.field_path), diagnosticConstraint(issue.constraint), enumLabel(issue.stage, protocolStages)] : [])])
 const hints: Record<string, string> = {
-  discovery_draft_rejected: '以下是本次草案被拒绝的原因及次数；是否仍待处理，以提交状态为准。',
+  discovery_draft_rejected: '这次提交未被接纳，原因和次数保留在此。输入错误本身不会产生待办。',
   discovery_draft_field_diagnostic: '按字段路径和约束修正提交。此处只展示参数结构，不展示被拒绝的输入值。',
-  discovery_invalid_drafts: '仍有未处理的草案提交错误。查看字段诊断，纠正参数或明确撤回该草案后再完成提交。',
+  discovery_invalid_drafts: '存在尚未解决的保留草案冲突，或最终提交仍不合法。查看同表诊断和当前任务状态。',
   discovery_submission_incomplete: '发现过程提前中断。已有合法草案继续验证；检查预算、超时或响应截断后续跑。',
-  discovery_submission_pending: 'Agent 标记仍有待探索工作。已发布结果与未完成工作分别保留。',
+  discovery_submission_pending: '本次调查明确仍有工作待完成。已发布结果保留；过程记录中的旧待办不再阻塞已结束的调查。',
+  model_protocol_diagnostic: '模型响应校验的过程记录。下方显示出错阶段、字段和约束；是否已恢复，以当前任务状态为准。',
+  llm_schema_invalid: '模型响应在格式修复后仍未通过协议校验。查看响应诊断定位出错阶段，本任务尚未完成。',
   semantic_claim_unresolved: '现有证据不能确认业务含义。补充定义、适用条件或反例，不要直接放宽审核。',
   semantic_claim_refuted: '提案存在反证。先修正业务解释，不要重复提交相同主张。',
   semantic_review_protocol_invalid: '语义审查响应不符合接口约定。检查模型兼容性；这不代表业务主张已被否定。',
@@ -74,4 +77,4 @@ const issues = computed(() => {
   return (report?.issues || []).filter((item, index, items) => item.code && hints[item.code] && items.findIndex(other => issueKey(other) === issueKey(item)) === index)
 })
 </script>
-<template><section v-if="issues.length" aria-label="问题与处理建议"><h3>问题与处理建议</h3><p v-for="issue in issues" :key="issueKey(issue)" class="note" :class="{ amber: !['rejected', 'resolved', 'diagnostic'].includes(String(issue.status)) }"><strong>{{ issue.table || issue.code }}</strong><span v-if="enumLabel(issue.status, states)"> · {{ enumLabel(issue.status, states) }}</span><br/>{{ hints[issue.code!] }}<template v-if="columnNames(issue).length"><br/>相关列：{{ columnNames(issue).join('、') }}<span v-if="diagnosticCount(issue) && diagnosticCount(issue)! > columnNames(issue).length">（共 {{ diagnosticCount(issue) }} 列，仅展示前 {{ columnNames(issue).length }} 列）</span></template><template v-if="enumLabel(issue.category, categories) || enumLabel(issue.next_action, actions)"><br/><span v-if="enumLabel(issue.category, categories)">问题类型：{{ enumLabel(issue.category, categories) }}；</span><span v-if="enumLabel(issue.next_action, actions)">处理：{{ enumLabel(issue.next_action, actions) }}</span></template><template v-if="isDiagnostic(issue)"><br/><span v-if="diagnosticCode(issue.reason_code)">拒绝原因：<code>{{ diagnosticCode(issue.reason_code) }}</code>；</span><span v-if="fieldPath(issue.field_path)">字段：<code>{{ fieldPath(issue.field_path) }}</code>；</span><span v-if="diagnosticConstraint(issue.constraint)">约束：<code>{{ diagnosticConstraint(issue.constraint) }}</code>；</span><span v-if="diagnosticCount(issue)">发生 {{ diagnosticCount(issue) }} 次</span></template></p></section></template>
+<template><section v-if="issues.length" aria-label="问题与处理建议"><h3>问题与处理建议</h3><p v-for="issue in issues" :key="issueKey(issue)" class="note" :class="{ amber: !['rejected', 'resolved', 'diagnostic'].includes(String(issue.status)) }"><strong>{{ issue.table || issue.code }}</strong><span v-if="enumLabel(issue.status, states)"> · {{ enumLabel(issue.status, states) }}</span><br/>{{ hints[issue.code!] }}<template v-if="columnNames(issue).length"><br/>相关列：{{ columnNames(issue).join('、') }}<span v-if="diagnosticCount(issue) && diagnosticCount(issue)! > columnNames(issue).length">（共 {{ diagnosticCount(issue) }} 列，仅展示前 {{ columnNames(issue).length }} 列）</span></template><template v-if="enumLabel(issue.category, categories) || enumLabel(issue.next_action, actions)"><br/><span v-if="enumLabel(issue.category, categories)">问题类型：{{ enumLabel(issue.category, categories) }}；</span><span v-if="enumLabel(issue.next_action, actions)">处理：{{ enumLabel(issue.next_action, actions) }}</span></template><template v-if="isDiagnostic(issue)"><br/><span v-if="issue.code === 'model_protocol_diagnostic' && enumLabel(issue.stage, protocolStages)">阶段：{{ enumLabel(issue.stage, protocolStages) }}；</span><span v-if="diagnosticCode(issue.reason_code)">拒绝原因：<code>{{ diagnosticCode(issue.reason_code) }}</code>；</span><span v-if="fieldPath(issue.field_path)">字段：<code>{{ fieldPath(issue.field_path) }}</code>；</span><span v-if="diagnosticConstraint(issue.constraint)">约束：<code>{{ diagnosticConstraint(issue.constraint) }}</code>；</span><span v-if="diagnosticCount(issue)">发生 {{ diagnosticCount(issue) }} 次</span></template></p></section></template>

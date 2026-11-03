@@ -127,12 +127,17 @@ def test_finish_exposes_conflict_from_later_knowledge_and_accepts_explicit_repai
     session.execute('declare_object_model',mapping)
     rejected=session.execute('finish_discovery',{})
     assert rejected['code']=='object_model_mapping_conflict' and not session.finished
+    assert rejected['blocks_completion']
+    forced_finish=session.execute('finish_discovery',{'pending':False,
+        'withdraw_rejections':[rejected['rejection_id']]})
+    assert forced_finish['code']=='object_model_mapping_conflict' and not session.finished
     assert rejected['replace_draft_id']==old['draft_id']
     assert rejected['diagnostics'][0]['field']==path
     assert session.execute('finish_discovery',{})['rejection_id']==rejected['rejection_id']
     assert session.invalid_count==1
     forced=session.batch(pending_code='discovery_submission_incomplete')
     assert not forced.proposals and 'object_model_mapping_conflict' in forced._runtime_pending_codes
+    assert not forced._runtime_submission_complete
     assert len(session.drafts)==1 and session.invalid_count==1
     assert session.batch(abstain=True).abstain
     fixed=deepcopy(bad);set_path(fixed,path,ids['n1'])
@@ -154,6 +159,8 @@ def test_legacy_final_cannot_skip_persisted_explicit_mapping_feedback():
     batch=client.explore(packet,Toolbox(),max_steps=1)
     assert batch.abstain and not batch.proposals
     assert batch._runtime_invalid_codes['object_model_mapping_conflict']==1
+    assert not batch._runtime_submission_complete
+    assert 'discovery_submission_pending' in batch._runtime_pending_codes
 
 
 def test_mapping_and_replacement_feedback_survives_restart_without_payload(tmp_path):

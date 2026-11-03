@@ -61,6 +61,7 @@ def test_precise_diagnostics_and_repair_preserve_siblings_and_exclusion(monkeypa
     assert result.proposals[1].model_dump(mode='json') == ProposalBatch.model_validate(raw).proposals[1].model_dump(mode='json')
     assert result.proposals[2].model_dump(mode='json') == ProposalBatch.model_validate(raw).proposals[2].model_dump(mode='json')
     assert tools.closed and model.usage['reference_repairs_succeeded'] == 1
+    assert result._runtime_submission_complete and not result._runtime_pending_codes
     assert UNKNOWN not in capsys.readouterr().out + caplog.text
     assert set(vars(model)) == {'config', 'budget', 'transport', 'usage'}
 

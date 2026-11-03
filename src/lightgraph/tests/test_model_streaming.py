@@ -93,7 +93,8 @@ def test_modes_produce_same_multi_turn_agent_result_and_usage(stream,capsys,capl
     packet=input_packet()
     packet['strata_samples'][0]['rows'][0]['c_a']=CANARY
     result=client.explore(packet,toolbox)
-    assert result==type(result).model_validate(final(evidence='probe_0001'))
+    assert result.model_dump()==type(result).model_validate(final(evidence='probe_0001')).model_dump()
+    assert result._runtime_submission_complete and not result._runtime_pending_codes
     assert toolbox.executed==['get_metadata'] and toolbox.closed
     assert client.usage=={'calls':2,'input_tokens':60,'output_tokens':40,'failures':0}
     assert client.budget.used.llm_tokens==100 and client.budget.snapshot()['reserved']=={}

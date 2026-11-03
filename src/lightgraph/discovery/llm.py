@@ -140,6 +140,37 @@ def _schema_fields(schema):
     return names
 
 
+MODEL_PROTOCOL_STAGES = frozenset({'provider_envelope', 'provider_usage',
+    'response_message', 'response_json', 'response_schema', 'repair_contract'})
+MODEL_PROTOCOL_CODES = frozenset({'extra_forbidden', 'missing', 'literal_error', 'enum',
+    'string_type', 'int_type', 'float_type', 'bool_type', 'list_type', 'dict_type',
+    'model_type', 'model_attributes_type', 'union_tag_invalid', 'union_tag_not_found',
+    'too_long', 'too_short', 'greater_than', 'greater_than_equal', 'less_than',
+    'less_than_equal', 'string_too_long', 'string_too_short', 'int_parsing',
+    'float_parsing', 'bool_parsing', 'value_error', 'json_invalid',
+    'schema_validation_error', 'invalid_json_or_message', 'invalid_usage',
+    'tool_calls_forbidden', 'meaning_changed', 'model_response_invalid',
+    'model_stream_invalid', 'model_json_duplicate_key', 'model_json_nonfinite'})
+MODEL_PROTOCOL_FIELDS = frozenset(_schema_fields(ProposalBatch.model_json_schema()) | {
+    'choices', 'index', 'message', 'content', 'role', 'tool_calls', 'function',
+    'arguments', 'name', 'finish_reason', 'usage', 'prompt_tokens', 'completion_tokens',
+    'total_tokens', 'delta', 'action', 'pending', 'withdraw_rejections', '<unknown_field>', '*'})
+
+
+def _record_model_protocol(usage, stage, diagnostics):
+    """Retain bounded static diagnostics, never rejected bodies, keys or values."""
+    histogram = usage.setdefault('model_protocol_diagnostics', {})
+    for item in diagnostics[:64]:
+        field = [part if type(part) is int and 0 <= part < 1000000 else
+                 part if isinstance(part, str) and part in MODEL_PROTOCOL_FIELDS
+                 else '<unknown_field>' for part in item.get('field', [])[:16]]
+        key = canonical({'stage': stage if stage in MODEL_PROTOCOL_STAGES else 'response_schema',
+            'field': field, 'code': item['code'] if item.get('code') in MODEL_PROTOCOL_CODES
+            else 'schema_validation_error'})
+        if key in histogram or len(histogram) < 64:
+            histogram[key] = histogram.get(key, 0) + 1
+
+
 def _request_schema(messages):
     for message in messages:
         if message.get('role')!='user' or not isinstance(message.get('content'),str):continue
@@ -624,6 +655,8 @@ class StructuredModelClient:
             request_started = False
             request_succeeded = False
             payload = envelope = value = candidate_message = None
+            protocol_stage = 'provider_envelope'
+            protocol_problem = None
             try:
                 self.budget.admit(cost,reserved)
                 # Charge the call immediately: transport failures can still incur cost.
@@ -643,13 +676,18 @@ class StructuredModelClient:
                     'input_tokens':self.usage['input_tokens'],'output_tokens':self.usage['output_tokens']})
                 envelope = request_completion(self.config, self.budget, self.transport, key, payload)
                 self.budget.check_deadline()
-                usage = envelope.get('usage') or {}
+                protocol_stage = 'provider_usage'
+                usage = envelope.get('usage')
+                if usage is None:usage = {}
                 if not isinstance(usage,dict):
+                    protocol_problem = {'field':['usage'], 'code':'dict_type'}
                     raise LightGraphError('llm_schema_invalid')
                 # Provider usage, when present, is the actual accounting source.
                 # Missing usage is marked explicitly instead of calling bytes tokens.
                 from .token_estimation import estimate_tokens
+                protocol_stage = 'response_message'
                 estimated_output_tokens = estimate_tokens(canonical(envelope['choices'][0]['message']))
+                protocol_stage = 'provider_usage'
                 token_counts = []
                 for name, fallback, counter in (
                         ('prompt_tokens', estimated_input_tokens, 'estimated_input_tokens'),
@@ -660,6 +698,7 @@ class StructuredModelClient:
                         self.usage[counter] = self.usage.get(counter, 0) + fallback
                         self.usage[counter+'_calls'] = self.usage.get(counter+'_calls', 0) + 1
                     elif isinstance(measured, bool) or not isinstance(measured, int) or measured < 0:
+                        protocol_problem = {'field':['usage',name], 'code':'invalid_usage'}
                         raise LightGraphError('llm_schema_invalid')
                     token_counts.append(measured)
                 input_tokens, output_tokens = token_counts
@@ -673,6 +712,7 @@ class StructuredModelClient:
                 if choice.get('finish_reason') == 'content_filter':
                     raise LightGraphError('model_response_refused')
                 candidate_message=choice['message']
+                protocol_stage = 'response_message'
                 if correcting:
                     # Count received protocol corrections, not network retries
                     # which returned no judgment and consumed no semantic vote.
@@ -680,11 +720,15 @@ class StructuredModelClient:
                 if (correcting or final_only) and isinstance(candidate_message,dict) and candidate_message.get('tool_calls'):
                     # A review must not use the outer protocol retry to turn
                     # an ambiguous or negative tool-bearing response positive.
+                    protocol_stage = 'repair_contract' if correcting else 'response_message'
+                    protocol_problem = {'field':['tool_calls'], 'code':'tool_calls_forbidden'}
                     raise LightGraphError((_invalid_review_terminal(candidate_message)
                         or 'semantic_review_protocol_invalid') if semantic_review else 'llm_schema_invalid')
+                protocol_stage = 'response_json'
                 candidate_message=_recover_final_json(candidate_message,self.usage,self.config.max_response_bytes)
                 if semantic_review:
                     candidate_message=_normalize_review_containers(candidate_message,self.usage)
+                protocol_stage = 'response_schema'
                 result = parse_message(candidate_message)
                 self.budget.check_deadline()
                 if correcting:
@@ -692,6 +736,8 @@ class StructuredModelClient:
                         terminal=_invalid_review_terminal(candidate_message)
                         if terminal:raise LightGraphError(terminal)
                     if not _schema_correction_matches(correction_anchor,candidate_message,correction_contract):
+                        protocol_stage = 'repair_contract'
+                        protocol_problem = {'field':[], 'code':'meaning_changed'}
                         raise LightGraphError('semantic_review_protocol_invalid' if semantic_review else 'llm_schema_invalid')
                     final=(result.get('final') if isinstance(result,dict) else result)
                     counter=('schema_repair_abstentions' if isinstance(final,ProposalBatch) and final.abstain
@@ -705,6 +751,15 @@ class StructuredModelClient:
             except (ValidationError,KeyError,IndexError,TypeError,ValueError,json.JSONDecodeError) as exc:
                 last_code = 'semantic_review_protocol_invalid' if semantic_review else 'llm_schema_invalid'
                 self.usage['failures'] += 1
+                if not semantic_review:
+                    diagnostics = _schema_feedback(candidate_message,exc,schema)[
+                        'schema_protocol_correction']['diagnostics']
+                    if isinstance(exc,json.JSONDecodeError):
+                        # A wire JSON failure belongs to the provider envelope;
+                        # a final-content parser failure belongs to response JSON.
+                        if protocol_stage != 'provider_envelope':protocol_stage = 'response_json'
+                        diagnostics = [{'field':[], 'code':'json_invalid'}]
+                    _record_model_protocol(self.usage,protocol_stage,diagnostics)
                 if semantic_review:
                     # Fixed paths/codes only: never retain the malformed body,
                     # unexpected field names or Pydantic's input values.
@@ -734,6 +789,11 @@ class StructuredModelClient:
                 last_code = 'model_transport_error'
                 self.usage['failures'] += 1
             except LightGraphError as exc:
+                if not semantic_review and (protocol_problem is not None or exc.code in {
+                        'model_response_invalid','model_stream_invalid',
+                        'model_json_duplicate_key','model_json_nonfinite','llm_schema_invalid'}):
+                    _record_model_protocol(self.usage,protocol_stage,[protocol_problem or {
+                        'field':[], 'code':exc.code}])
                 if exc.code=='model_transport_error':
                     from .sdk_transport import TRANSPORT_FAILURE_KINDS
                     kind=getattr(exc,'failure_kind','unknown')

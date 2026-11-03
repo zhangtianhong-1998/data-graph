@@ -129,6 +129,25 @@ def _record_submission_state(result, table, batch):
         result.stats['discovery_pending_submissions'] = result.stats.get('discovery_pending_submissions', 0) + 1
 
 
+def _record_relation_submission_state(result, table, batch, previous):
+    """A completed reconsideration replaces this investigation's prior submission.
+
+    Endpoint documents can require a fresh Agent session for the same task.
+    Keep earlier diagnostics and counters, but only a runtime-confirmed finish
+    (including explicit abstention) can retire their blocking submission state.
+    The caller owns the prior entries, so unrelated tables and execution or
+    semantic failures cannot be cleared merely because their codes match.
+    """
+    if batch._runtime_submission_complete and not batch._runtime_pending_codes:
+        for issue in previous:
+            issue['status'] = 'diagnostic'
+        previous = []
+    start = len(result.issues)
+    _record_submission_state(result, table, batch)
+    return [*previous, *[issue for issue in result.issues[start:]
+                         if issue.get('status') == 'deferred']]
+
+
 def _preflight(rule, goal):
     """Check the same output contract as execution without registering anything."""
     from lightgraph.store.policy import PersistencePolicy, KINDS
@@ -1013,7 +1032,7 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                 allow_source_samples=getattr(model.config,'allow_source_samples',False),
                 allowed_tables=tool_tables,source_adapters=source_adapters)
             batch=_ask(model,packet,tools,observations)
-            _record_submission_state(result, table, batch)
+            submission_issues=_record_relation_submission_state(result,table,batch,[])
             docs=tools.context_documents()
             # A final proposal can name an endpoint without using a read tool.
             # Backend verification is a read too: first let the model reconsider
@@ -1043,7 +1062,7 @@ def discover_references_with_agent(adapter, validated_rules, documents=None, mod
                     allow_source_samples=getattr(model.config,'allow_source_samples',False),
                     allowed_tables=tool_tables,source_adapters=source_adapters)
                 batch=_ask(model,packet,tools,observations)
-                _record_submission_state(result, table, batch)
+                submission_issues=_record_relation_submission_state(result,table,batch,submission_issues)
                 docs=tools.context_documents()
             if batch.abstain and not batch._runtime_completed_empty:
                 _issue(result,table,'model_abstained')

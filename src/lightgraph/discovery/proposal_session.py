@@ -26,10 +26,11 @@ class DiscoveryFinish(StrictModel):
     """Small final response; hypotheses have already been submitted as tools."""
     action: Literal['finish_discovery', 'abstain']
     pending: bool = Field(default=False, description=
-        'Set true if relevant work remains. False cannot resolve rejected attempts; '
-        'resubmit successfully with resolves_rejections or explicitly withdraw their IDs.')
+        'Set true if relevant work remains. Rejected input attempts are diagnostics, not '
+        'unfinished work. False finishes with the retained valid drafts; it cannot bypass their conflicts.')
     withdraw_rejections: list[str] = Field(default_factory=list, max_length=16, description=
-        'Explicit rejection IDs to withdraw without creating a draft or confirming a fact.')
+        'Optional rejection IDs to acknowledge as withdrawn. Finishing does not require '
+        'listing ordinary input errors and never confirms the rejected input.')
 
 
 PROPOSAL_MODELS = {
@@ -141,8 +142,8 @@ def proposal_tool_specs(task, packet=None):
         specs.append(_spec('submit_' + kind,
             'Validate and retain one candidate. This does not confirm semantics or publish it. '
             'Use issued references; an error leaves prior drafts intact and does not retain '
-            'the rejected input. Correct the diagnosed fields and resubmit, or withdraw '
-            'the rejected attempt when finishing.', schema))
+            'the rejected input. Correct the diagnosed fields and resubmit, or finish without '
+            'that input. Ordinary rejection records do not create pending business work.', schema))
     if hierarchy and 'wide_hierarchy' in TASK_PROPOSAL_KINDS[task]:
         from .hierarchy_plan import hierarchy_plan_tool_schema
         specs.insert(0,hierarchy_plan_tool_schema())
@@ -168,9 +169,9 @@ def proposal_tool_specs(task, packet=None):
         SemanticSchema.model_json_schema()))
     specs.append(_spec('finish_discovery',
         'Finish using all retained drafts. Set pending=true if relevant work remains. '
-        'When no supported correction remains, finish with withdraw_rejections listing the issued rejection IDs. '
-        'This closes rejected attempts without confirming or publishing them. '
-        'Use withdraw_rejections for explicit rejected-attempt withdrawal; pending=false cannot clear them. '
+        'When no supported correction remains, finish without the rejected inputs. '
+        'Ordinary input errors remain diagnostics and do not require individual rejection IDs. '
+        'Retained-draft conflicts must still be repaired or globally abandoned. '
         'Never resubmit the full batch; finishing does not approve semantics.',
         {'type':'object','properties':{'pending':{'type':'boolean','default':False,
             'description':DiscoveryFinish.model_json_schema()['properties']['pending']['description']},
@@ -181,8 +182,8 @@ def proposal_tool_specs(task, packet=None):
         spec['function']['parameters']['properties']['resolves_rejections']={
             'type':'array','items':{'type':'string'},'maxItems':16,'default':[],
             'description':'IDs of rejected attempts corrected by this same tool and same group_id/plan_id. '
-                'They resolve only after validation. If feedback says resolution=explicit_withdrawal, '
-                'submit the correction without this field, then explicitly withdraw the old rejection ID when finishing.'}
+                'Optional bookkeeping only; they resolve after validation. Without a stable candidate ID, '
+                'submit a correction without this field. No rejected input becomes valid merely by finishing.'}
         if spec['function']['name'].startswith('submit_') and spec['function']['name'] not in {
                 'submit_reference','submit_exclusion','submit_discriminator'}:
             spec['function']['parameters']['properties']['replace_draft_id']={
@@ -238,15 +239,15 @@ class ProposalSession:
             self.invalid_diagnostics[(field_code if field_code in allowed else code,tuple(path),constraint)]+=1
         result = {'status':'error', 'code':code,
                   'rejection_id':rejection_id,
-                  'resolution':'same_target_submission' if self._active_target is not None else 'explicit_withdrawal',
+                  'resolution':'same_target_submission' if self._active_target is not None else 'optional_withdrawal',
+                  'blocks_completion':False,
                   'retained_drafts':len(self.drafts), 'confirmed':False}
         if self._active_operator in self.names:
             result['operator']=self._active_operator
         if self._active_target is None:
             result['repair_instruction'] = ('This attempt has no stable proposal ID. Submit the corrected '
-                'candidate without resolves_rejections. After it succeeds, explicitly withdraw this '
-                'rejection ID in finish_discovery.withdraw_rejections; a successful unrelated draft '
-                'does not resolve it automatically.')
+                'candidate without resolves_rejections, or finish without it. This rejection is a '
+                'diagnostic, not pending business work; optional withdrawal never confirms the rejected input.')
         if diagnostics:
             result['diagnostics'] = diagnostics
         evidence_codes={'dangling_evidence_reference','identity_domain_evidence_unresolved',
@@ -256,7 +257,10 @@ class ProposalSession:
             result['definition_sections']=sorted(definition_sections(self.packet))[:32]
         if self._active_operator == 'submit_reference' and (
                 code == 'unauthorized_column_reference' or any(
-                    item.get('code') == 'unauthorized_column_reference' for item in (diagnostics or []))):
+                    item.get('code') == 'unauthorized_column_reference' or
+                    (code == 'invalid_tool_arguments' and item.get('constraint') == 'enum'
+                     and item.get('path', [])[:2] in (['claim','source_columns'], ['claim','target_columns']))
+                    for item in (diagnostics or []))):
             result['column_scope'] = 'current_table'
             result['local_columns'] = [{'id': c['id'], 'name': c['name']}
                 for c in self.packet.get('metadata_digest', {}).get('columns', [])]
@@ -267,7 +271,7 @@ class ProposalSession:
                 if target == (self._active_operator, self._active_target) and self._active_target is not None]
             result['withdrawable_rejections'] = list(self.open_rejections)[:16]
             result['instruction'] = ('Only listed rejection IDs can be resolved by this submission. '
-                'For a changed target, submit without resolves_rejections and explicitly withdraw the old IDs when finishing.')
+                'For a changed target, submit without resolves_rejections. Rejection bookkeeping is optional when finishing.')
         return result
 
     def execute(self, name, arguments):
@@ -338,13 +342,20 @@ class ProposalSession:
                 if conflicts:
                     return {**conflicts[0][1],'drafts_requiring_revision':[result for _,result in conflicts]}
                 if any(r not in self.open_rejections for r in command.withdraw_rejections):
-                    return self.reject('unknown_rejection_id')
+                    # Withdrawal IDs acknowledge diagnostic history; a stale ID
+                    # cannot create new business work or block a valid finish.
+                    self.reject('unknown_rejection_id')
                 for r in command.withdraw_rejections:self.open_rejections.pop(r,None)
-                self.pending = command.pending or bool(self.open_rejections)
+                # Invalid inputs never became retained work. Keep their counters
+                # and field diagnostics, but do not demand a second ID protocol
+                # merely to finish the already validated retained drafts.
+                closed_rejections=list(self.open_rejections)
+                self.open_rejections.clear()
+                self.pending = command.pending
                 self.finished = True
                 return {'status':'ok','finished':True,'retained_drafts':len(self.drafts),
                         'confirmed':False,'pending':self.pending,
-                        'unresolved_rejections':list(self.open_rejections)}
+                        'unresolved_rejections':[], 'closed_rejections':closed_rejections}
             if name == 'declare_semantic_schema':
                 contract = SemanticSchema
                 incoming = contract.model_validate(arguments)
@@ -488,7 +499,7 @@ class ProposalSession:
                 self._active_operator,self._active_target=operator,target
                 try:result=self.reject('object_model_mapping_conflict',diagnostics=diagnostics)
                 finally:self._active_operator,self._active_target=previous
-                result.update(replace_draft_id=f'draft_{index+1}',draft_operator=operator)
+                result.update(replace_draft_id=f'draft_{index+1}',draft_operator=operator,blocks_completion=True)
                 cached=(signature,result);self._mapping_rejections[index]=cached
             conflicts.append((index,deepcopy(cached[1])))
         return conflicts
@@ -510,11 +521,10 @@ class ProposalSession:
             codes.add(pending_code)
         if self.pending:
             codes.add('discovery_submission_pending')
-        # Finishing alone cannot hide rejected work. Only a validated correction,
-        # explicit ID withdrawal or global abstention closes rejected attempts.
-        if self.open_rejections and not abstain:
-            codes.add('discovery_invalid_drafts')
+        # Rejected new inputs are diagnostic history. Only retained conflicts,
+        # explicit pending work or runtime interruption can block completion.
         batch._runtime_pending_codes = sorted(codes)
+        batch._runtime_submission_complete = bool((self.finished or abstain) and not codes)
         # An explicit, clean finish with no drafts is a completed exploration.
         # Preserve the legacy abstain flag while distinguishing it internally
         # from an actual abstention or an interrupted/blocked submission.

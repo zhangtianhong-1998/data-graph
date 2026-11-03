@@ -100,10 +100,10 @@ and namespace columns. Choose the remaining identity, fill and parent semantics
 from this table's evidence. Reusing mappings does not establish their meaning.
 Rejection feedback includes a rejection_id. Resubmit with resolves_rejections containing
 that ID only for the same submission tool and same group_id/plan_id; it closes after validation.
-When feedback says resolution=explicit_withdrawal, no stable candidate ID was available:
-submit the correction without resolves_rejections and explicitly withdraw the old rejection.
-To withdraw an attempt, list its ID in finish_discovery.withdraw_rejections. pending=false alone
-cannot clear unresolved rejections. Never conceal unfinished work by merely finishing.
+Without a stable candidate ID, submit a correction without resolves_rejections.
+Rejected inputs are diagnostic history, not pending business work. Correct them when useful,
+or finish without them; listing rejection IDs is optional. Set pending=true only for work
+that actually remains. Finishing cannot bypass conflicts in retained drafts or confirm rejected inputs.
 For verified code domains, use exact applicable complete section IDs from
 reference_options.definition_sections in identity_evidence, attribute_evidence and
 global_scope_evidence. Probe IDs, columns and bare document names cannot prove a code domain.
@@ -338,12 +338,16 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=8,
         final=asyncio.run(run_agent(client,checked,executor,dispatch,system,
                                    max_steps=max_steps,max_tool_calls=max_tool_calls))
         pending_codes=list(final._runtime_pending_codes)
+        submission_complete=final._runtime_submission_complete
+        completed_empty=final._runtime_completed_empty
         invalid_drafts=final._runtime_invalid_drafts
         invalid_codes=dict(final._runtime_invalid_codes)
         invalid_diagnostics=list(final._runtime_invalid_diagnostics)
         object_models=list(final._runtime_object_models)
         final=validate_or_repair(client,final,checked)
         final._runtime_pending_codes=pending_codes
+        final._runtime_submission_complete=submission_complete and not pending_codes
+        final._runtime_completed_empty=completed_empty and not final.proposals and not pending_codes
         final._runtime_invalid_drafts=invalid_drafts
         final._runtime_invalid_codes=invalid_codes
         final._runtime_invalid_diagnostics=invalid_diagnostics

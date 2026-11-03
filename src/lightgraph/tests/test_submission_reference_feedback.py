@@ -69,15 +69,18 @@ def test_unusable_definition_sections_cannot_enter_shared_code_evidence(change):
     assert response['status']=='error' and response['diagnostics'][0]['allowed_references']==choices
 
 
-def test_finish_cannot_hide_rejected_work_and_failed_correction_does_not_close_it():
+def test_failed_correction_remains_diagnostic_after_explicit_finish():
     session=ProposalSession(input_packet())
     bad=group();bad['claim']['members'][0]['role']='PRIVATE_INVALID_VALUE'
     rejected=session.execute('submit_column_group',bad)
     failed=session.execute('submit_column_group',{**bad,'resolves_rejections':[rejected['rejection_id']]})
     assert failed['status']=='error'
     response=session.execute('finish_discovery',{'pending':False})
-    assert response['pending'] and len(response['unresolved_rejections'])==2
-    assert set(session.batch()._runtime_pending_codes)=={'discovery_invalid_drafts','discovery_submission_pending'}
+    assert not response['pending'] and response['unresolved_rejections']==[]
+    assert len(response['closed_rejections'])==2
+    batch=session.batch()
+    assert batch._runtime_submission_complete and not batch._runtime_pending_codes
+    assert batch.proposals==[] and batch._runtime_invalid_drafts==2
 
 
 def test_successful_unrelated_submission_cannot_claim_to_fix_different_group():
@@ -107,7 +110,7 @@ def test_diagnostics_survive_interrupted_session_even_when_no_draft_was_valid():
     assert batch.abstain and batch.proposals==[] and client.usage['calls']==2
     assert batch._runtime_invalid_codes=={'invalid_tool_arguments':1}
     assert batch._runtime_invalid_diagnostics
-    assert {'discovery_submission_incomplete','discovery_invalid_drafts','model_response_truncated'}<=set(batch._runtime_pending_codes)
+    assert {'discovery_submission_incomplete','model_response_truncated'}<=set(batch._runtime_pending_codes)
     assert 'CANARY' not in json.dumps(batch._runtime_invalid_diagnostics)
 
 
@@ -117,7 +120,7 @@ def test_reference_candidates_without_stable_ids_cannot_resolve_each_others_reje
     original={'evidence_cited':['c_a'],'claim':{'source_entity':'source','source_columns':['c_a'],
         'target_entity':'target_a','target_columns':['c_b'],'cardinality_hint':'invalid_cardinality'}}
     rejected=session.execute('submit_reference',original)
-    assert rejected['resolution']=='explicit_withdrawal'
+    assert rejected['resolution']=='optional_withdrawal'
     assert 'without resolves_rejections' in rejected['repair_instruction']
     other=deepcopy(original)
     other['claim'].update(target_entity='target_b',cardinality_hint='n_to_1')
@@ -140,7 +143,7 @@ def test_reference_candidates_without_stable_ids_cannot_resolve_each_others_reje
 def test_missing_group_id_cannot_be_treated_as_wildcard_for_successful_submission():
     session=ProposalSession(input_packet())
     rejected=session.execute('submit_column_group',{'claim':{}})
-    assert rejected['resolution']=='explicit_withdrawal'
+    assert rejected['resolution']=='optional_withdrawal'
     corrected={**group(),'resolves_rejections':[rejected['rejection_id']]}
     assert session.execute('submit_column_group',corrected)['code']=='invalid_rejection_resolution'
     assert session.drafts==[] and rejected['rejection_id'] in session.open_rejections

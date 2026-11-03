@@ -165,6 +165,20 @@ describe('业务图来源与归并裁决', () => {
     expect(notes[1]!.textContent).toContain('关系探索已结束')
     expect(notes[2]!.textContent).toContain('工作尚未完成')
   })
+  it('协议诊断区分阶段，过程记录不会显示为未完成', () => {
+    mount(RunIssues, { report: { issues: [
+      { code: 'model_protocol_diagnostic', status: 'diagnostic', stage: 'provider_usage', field_path: '["usage","prompt_tokens"]', constraint: 'invalid_usage', count: 2 },
+      { code: 'model_protocol_diagnostic', status: 'diagnostic', stage: 'repair_contract', field_path: '[]', constraint: 'meaning_changed', count: 1 },
+      { code: 'llm_schema_invalid', status: 'deferred' },
+    ] } })
+    const notes = [...root.querySelectorAll('.note')]
+    expect(notes).toHaveLength(3)
+    expect(notes[0]!.textContent).toContain('阶段：用量字段')
+    expect(notes[0]!.textContent).toContain('usage.prompt_tokens')
+    expect(notes[0]!.classList.contains('amber')).toBe(false)
+    expect(notes[1]!.textContent).toContain('阶段：格式修复结果')
+    expect(notes[2]!.textContent).toContain('本任务尚未完成')
+  })
   it('覆盖问题展示受控列名，其他问题不接受任意列名正文', () => {
     mount(RunIssues, { report: { issues: [
       { code: 'unexplained_columns', table: 'public.items', count: 3, column_names: '["指标名称","产品名称","渠道名称"]', status: 'unresolved' },

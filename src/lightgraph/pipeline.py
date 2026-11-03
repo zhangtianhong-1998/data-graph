@@ -304,6 +304,27 @@ def _issues(report, items):
         if safe:report.issues.append(safe)
 
 
+def _model_protocol_issues(usage):
+    """Expose bounded parser diagnostics without retaining responses or values."""
+    from .discovery.llm import MODEL_PROTOCOL_STAGES, MODEL_PROTOCOL_CODES, MODEL_PROTOCOL_FIELDS
+    from .discovery.validation_feedback import _path
+    histogram=usage.get('model_protocol_diagnostics',{})
+    if not isinstance(histogram,dict):return []
+    issues=[]
+    for key,count in list(histogram.items())[:64]:
+        if type(count) is not int or count<=0 or not isinstance(key,str) or len(key)>4096:continue
+        try:diagnostic=json.loads(key)
+        except (ValueError,TypeError):continue
+        if not isinstance(diagnostic,dict):continue
+        stage=diagnostic.get('stage');code=diagnostic.get('code');field=diagnostic.get('field')
+        if not isinstance(stage,str) or stage not in MODEL_PROTOCOL_STAGES:continue
+        if not isinstance(code,str) or code not in MODEL_PROTOCOL_CODES or not isinstance(field,list):continue
+        issues.append({'code':'model_protocol_diagnostic','status':'diagnostic',
+            'stage':stage,'field_path':canonical(_path(field,MODEL_PROTOCOL_FIELDS-{'<unknown_field>'})),
+            'constraint':code,'count':count})
+    return issues
+
+
 def _latest(rules):
     latest={}
     for rule in rules:
@@ -1334,6 +1355,7 @@ def _run(config,adapters,*,rules,documents,model,discover_only):
                         'semantic_reference_repairs_failed'):
             report.counts[counter]=model.usage.get(counter,0) if model else 0
         if model:
+            report.issues.extend(_model_protocol_issues(model.usage))
             for key,count in model.usage.get('semantic_review_protocol_diagnostics',{}).items():
                 diagnostic=json.loads(key)
                 report.issues.append({'code':'semantic_review_protocol_diagnostic','status':'diagnostic',

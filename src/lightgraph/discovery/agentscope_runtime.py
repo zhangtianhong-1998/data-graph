@@ -389,7 +389,13 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
         if isinstance(raw,dict) and 'action' in raw:
             finish=DiscoveryFinish.model_validate(raw)
             if finish.action!='abstain':
-                session.execute('finish_discovery',finish.model_dump(exclude={'action'}))
+                result=session.execute('finish_discovery',finish.model_dump(exclude={'action'}))
+                if result.get('status')!='ok':
+                    return session.batch(pending_code='discovery_submission_incomplete')
+            else:
+                # Withdrawing drafts does not cancel an explicit declaration
+                # that relevant work remains unfinished.
+                session.pending=finish.pending
             return session.batch(abstain=finish.action=='abstain')
         legacy=ProposalBatch.model_validate(raw)
         if legacy.abstain:
@@ -399,6 +405,7 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
         if not session.drafts and session.schema.is_empty() and not session.invalid_count and not session.object_models:
             from .object_mapping_feedback import object_mapping_diagnostics
             if not any(object_mapping_diagnostics(proposal,packet) for proposal in legacy.proposals):
+                legacy._runtime_submission_complete=True
                 return legacy
         # A legacy final cannot replace staged exclusions or silently drop an
         # earlier valid hypothesis. Union all locally valid drafts instead.

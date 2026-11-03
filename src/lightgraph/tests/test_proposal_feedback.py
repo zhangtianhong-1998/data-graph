@@ -20,9 +20,9 @@ CANARY = 'PRIVATE_VALUE_AND_FIELD_82413'
 
 
 @pytest.mark.parametrize('finished,pending,expected', [
-    (False, False, ['discovery_invalid_drafts']),
-    (True, True, ['discovery_invalid_drafts', 'discovery_submission_pending']),
-    (True, False, ['discovery_invalid_drafts', 'discovery_submission_pending']),
+    (False, False, []),
+    (True, True, ['discovery_submission_pending']),
+    (True, False, []),
 ])
 def test_rejected_attempt_count_is_distinct_from_remaining_work(finished, pending, expected):
     session = ProposalSession(input_packet())
@@ -41,6 +41,7 @@ def test_rejected_attempt_count_is_distinct_from_remaining_work(finished, pendin
     assert len(batch.proposals) == 1
     assert batch._runtime_invalid_drafts == 1
     assert batch._runtime_pending_codes == expected
+    assert batch._runtime_submission_complete is (finished and not pending)
     assert '_runtime_invalid_drafts' not in batch.model_dump_json()
 
 

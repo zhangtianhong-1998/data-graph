@@ -91,6 +91,18 @@ def _safe_issue(item):
         or key in _ISSUE_ENUMS and value in _ISSUE_ENUMS[key]}
     if type(item.get('count')) is int and item['count']>=0:
         safe['count']=item['count']
+    if item.get('code')=='model_protocol_diagnostic':
+        from ..discovery.llm import MODEL_PROTOCOL_STAGES, MODEL_PROTOCOL_CODES, MODEL_PROTOCOL_FIELDS
+        from ..discovery.validation_feedback import _path
+        stage=item.get('stage');constraint=item.get('constraint')
+        if isinstance(stage,str) and stage in MODEL_PROTOCOL_STAGES:safe['stage']=stage
+        if isinstance(constraint,str) and constraint in MODEL_PROTOCOL_CODES:safe['constraint']=constraint
+        raw=item.get('field_path')
+        if isinstance(raw,str) and len(raw)<=4096:
+            try:path=json.loads(raw)
+            except (TypeError,ValueError):path=None
+            if isinstance(path,list):
+                safe['field_path']=json.dumps(_path(path,MODEL_PROTOCOL_FIELDS-{'<unknown_field>'}),ensure_ascii=False,separators=(',',':'))
     if item.get('code') in {'unexplained_columns','coverage_shared_label_unresolved'}:
         # The coverage stage supplies authorized metadata names, never row values.
         # Keep this field restricted to its two producers and bounded JSON shape.

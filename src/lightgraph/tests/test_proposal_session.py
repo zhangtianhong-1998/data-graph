@@ -19,15 +19,16 @@ def group():
 
 
 @pytest.mark.parametrize('withdraw',[False,True])
-def test_explicitly_withdrawn_errors_can_finish_without_publishing_or_implicit_repair(withdraw):
+def test_rejected_input_is_diagnostic_and_finish_never_publishes_it(withdraw):
     session=ProposalSession(input_packet())
     rejection=session.execute('submit_column_group',{'claim':{'bad':CANARY}})
     session.execute('finish_discovery',{'pending':False,
         'withdraw_rejections':[rejection['rejection_id']] if withdraw else []})
     batch=session.batch()
     assert batch.proposals==[] and batch._runtime_invalid_drafts==1
-    assert batch._runtime_completed_empty is withdraw
-    assert bool(batch._runtime_pending_codes) is (not withdraw)
+    assert batch._runtime_completed_empty and batch._runtime_submission_complete
+    assert not batch._runtime_pending_codes
+    assert not session.open_rejections
     assert '_runtime_completed_empty' not in batch.model_dump_json()
     assert CANARY not in str(batch._runtime_invalid_diagnostics)
 
@@ -60,7 +61,8 @@ def test_individual_error_keeps_draft_and_definitions_are_append_only():
     assert len(batch.proposals)==1
     assert batch.semantic_schema.entity_types[0].description=='First business definition'
     assert batch._runtime_invalid_drafts==2
-    assert batch._runtime_pending_codes==['discovery_invalid_drafts']
+    assert batch._runtime_pending_codes==[]
+    assert not batch._runtime_submission_complete  # No finish command yet.
     assert '_runtime_pending_codes' not in batch.model_dump_json()
     assert CANARY not in json.dumps(session.reject('invalid_proposal_arguments'))
     session.clear()
@@ -169,11 +171,11 @@ def test_invalid_submission_recovers_next_tool_and_retains_valid_sibling(framewo
         if len(calls)==2:return response(tool='submit_entity_key',args={'claim':{'invalid':CANARY}})
         error=json.loads(body['messages'][-1]['content'])
         assert error['code']=='invalid_tool_arguments' and CANARY not in json.dumps(error)
-        return response(tool='finish_discovery',args={'withdraw_rejections':[error['rejection_id']]})
+        return response(tool='finish_discovery',args={'pending':False})
     client=model(handler,stream=False);tools=Toolbox()
     batch=client.explore(input_packet(),tools,max_steps=5)
     assert len(batch.proposals)==1 and batch._runtime_invalid_drafts==1
-    assert batch._runtime_pending_codes==[]  # Explicit rejection ID withdrawal.
+    assert batch._runtime_pending_codes==[] and batch._runtime_submission_complete
     assert client.usage['calls']==3 and tools.executed==[]
     assert_cleared(framework_spy)
     assert CANARY not in capsys.readouterr().out+caplog.text
@@ -233,6 +235,7 @@ def test_failed_final_preserves_draft_but_marks_pending_without_extra_turn(failu
            'ignored_none':'discovery_steps_exhausted','truncated':'model_response_truncated',
            'duplicate':'model_json_duplicate_key'}.get(failure,failure)
     assert batch._runtime_pending_codes==['discovery_submission_incomplete',cause]
+    assert not batch._runtime_submission_complete
     assert client.usage['calls']==2 and tools.executed==[] and tools.closed
     assert_cleared(framework_spy)
 
@@ -265,6 +268,7 @@ def test_explicit_global_abstention_withdraws_all_staged_proposals(legacy,framew
     batch=client.explore(input_packet(),tools)
     assert batch.abstain and batch.proposals==[]
     assert batch._runtime_pending_codes==[] and batch._runtime_invalid_drafts==0
+    assert batch._runtime_submission_complete
     assert client.usage['calls']==2 and tools.executed==[]
     assert_cleared(framework_spy)
 
@@ -279,6 +283,7 @@ def test_pending_finish_preserves_drafts_without_treating_it_as_abstention(frame
     batch=client.explore(input_packet(),tools)
     assert not batch.abstain and len(batch.proposals)==1
     assert batch._runtime_pending_codes==['discovery_submission_pending']
+    assert not batch._runtime_submission_complete
     assert client.usage['calls']==2 and tools.executed==[]
     assert_cleared(framework_spy)
 
@@ -345,3 +350,56 @@ def test_submissions_have_separate_finite_cap_and_do_not_expand_query_budget(fra
     assert client.usage['calls']==2 and tools.executed==[]
     agent=assert_cleared(framework_spy)
     assert agent.model.source_calls==0 and agent.model.submission_calls==1
+
+
+@pytest.mark.parametrize('finish_tool',[False,True])
+def test_reference_enum_error_then_finish_is_complete_without_any_draft(finish_tool,framework_spy):
+    from lightgraph.tests.test_submission_scope_options import fixture
+    packet,proposal=fixture()
+    proposal['claim']['source_columns']=['c_foreign']
+    calls=[]
+    def handler(request):
+        body=json.loads(request.content);calls.append(body)
+        if len(calls)==1:return response(tool='submit_reference',args=proposal)
+        feedback=json.loads(body['messages'][-1]['content'])
+        assert feedback['code']=='invalid_tool_arguments'
+        assert feedback['column_scope']=='current_table'
+        assert {c['id'] for c in feedback['local_columns']}=={'c_a','c_b'}
+        assert not feedback['blocks_completion']
+        return response(tool='finish_discovery',args={'pending':False}) if finish_tool else response({
+            'action':'finish_discovery','pending':False})
+    client=model(handler,stream=False)
+    batch=client.explore(packet,Toolbox(),max_steps=3)
+    assert batch.proposals==[] and batch._runtime_invalid_drafts==1
+    assert not batch._runtime_pending_codes
+    assert batch._runtime_submission_complete and batch._runtime_completed_empty
+    assert client.usage['calls']==2
+    assert_cleared(framework_spy)
+
+
+def test_stale_optional_withdrawal_id_does_not_block_final_finish(framework_spy):
+    client=model(lambda request:response({'action':'finish_discovery',
+        'withdraw_rejections':['unissued_rejection']}),stream=False)
+    batch=client.explore(input_packet(),Toolbox(),max_steps=1)
+    assert batch._runtime_submission_complete and batch._runtime_completed_empty
+    assert not batch._runtime_pending_codes
+    assert batch._runtime_invalid_codes=={'unknown_rejection_id':1}
+    assert not batch.proposals
+    assert_cleared(framework_spy)
+
+
+@pytest.mark.parametrize('retained_draft',[False,True])
+def test_abstention_with_explicit_pending_does_not_authorize_completion(retained_draft,framework_spy):
+    calls=[]
+    def handler(request):
+        calls.append(1)
+        if retained_draft and len(calls)==1:
+            return response(tool='submit_column_group',args=group())
+        return response({'action':'abstain','pending':True})
+    client=model(handler,stream=False)
+    batch=client.explore(input_packet(),Toolbox(),max_steps=3)
+    assert batch.abstain and not batch.proposals
+    assert batch._runtime_pending_codes==['discovery_submission_pending']
+    assert not batch._runtime_submission_complete and not batch._runtime_completed_empty
+    assert client.usage['calls']==1+int(retained_draft)
+    assert_cleared(framework_spy)

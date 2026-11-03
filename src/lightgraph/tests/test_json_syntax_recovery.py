@@ -49,7 +49,8 @@ def test_cosmetic_legacy_final_recovers_on_last_step_without_source_tools_or_ext
         return wire(decorate(value,kind))
     model=client(monkeypatch,handler);tools=Toolbox()
     checked=model.explore(input_packet(),tools,max_steps=1)
-    assert checked==ProposalBatch.model_validate(value)
+    assert checked.model_dump()==ProposalBatch.model_validate(value).model_dump()
+    assert checked._runtime_submission_complete and not checked._runtime_pending_codes
     assert calls==[1] and model.usage['calls']==1 and model.usage['failures']==0
     assert model.usage['json_syntax_recoveries']==1
     assert model.usage.get('schema_repair_attempts',0)==0
