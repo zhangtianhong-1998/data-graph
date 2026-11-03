@@ -121,6 +121,53 @@ def test_invalid_wire_json_and_error_http_body_are_not_lost(monkeypatch,tmp_path
     assert 'PRIVATE_PASSWORD' not in path.read_text()
 
 
+@pytest.mark.parametrize('remaining,expected,limited_by',[
+    (200,200,'phase_deadline'), (750,500,'configuration'),
+])
+def test_trace_records_applied_http_timeout_not_only_configuration(
+        monkeypatch,tmp_path,remaining,expected,limited_by):
+    applied=[]
+    def handler(request):
+        applied.append(request.extensions['timeout'])
+        return response({'answer':'ok'})
+    model=client(monkeypatch,handler)
+    model.config.timeout_seconds=500
+    monkeypatch.setattr(model.budget,'remaining_seconds',lambda:remaining)
+    path=tmp_path/'timeout.trace.jsonl'
+    with bind_trace(RunTrace(path)):
+        assert model.complete('test',{},Answer).answer=='ok'
+    records=events(path)
+    request=next(e for e in records if e['kind']=='model_request')
+    transport=next(e for e in records if e['kind']=='model_transport_config')
+    assert transport['data']=={
+        'configured_timeout_seconds':500,'effective_timeout_seconds':expected,
+        'remaining_phase_seconds':remaining,'timeout_limited_by':limited_by,
+        'timeout_scope':'http_io','stream':False,
+        'request_id':request['data']['request_id'],'attempt':1,
+    }
+    assert set(applied[0].values())=={expected}
+
+
+def test_retry_trace_records_its_reduced_phase_allowance(monkeypatch,tmp_path):
+    applied=[]
+    def handler(request):
+        applied.append(request.extensions['timeout']['read'])
+        if len(applied)==1:raise httpx.ReadTimeout('temporary delay',request=request)
+        return response({'answer':'ok'})
+    model=client(monkeypatch,handler)
+    model.config.timeout_seconds=500
+    monkeypatch.setattr(model.budget,'remaining_seconds',lambda:50 if applied else 200)
+    path=tmp_path/'retry_timeout.trace.jsonl'
+    with bind_trace(RunTrace(path)):
+        assert model.complete('test',{},Answer).answer=='ok'
+    records=events(path)
+    transports=[e for e in records if e['kind']=='model_transport_config']
+    assert applied==[200,50]
+    assert [e['data']['effective_timeout_seconds'] for e in transports]==applied
+    assert [e['data']['attempt'] for e in transports]==[1,2]
+    assert len({e['data']['request_id'] for e in transports})==1
+
+
 @pytest.mark.parametrize('status',[429,503])
 def test_error_response_trace_never_reads_a_lazy_body_before_retry(monkeypatch,tmp_path,status):
     class UnreadErrorStream(httpx.SyncByteStream):

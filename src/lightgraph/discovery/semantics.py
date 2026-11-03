@@ -422,7 +422,8 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
     issued = columns | probes | entities | doc_refs
     expected_proposition = canonical(proposition)
     guard=packet.get('semantic_revision_guard') or {}
-    required_refs=doc_refs|set(guard.get('blocking_evidence_refs',()))
+    required_refs=(doc_refs|set(guard.get('blocking_evidence_refs',()))|
+                   set(guard.get('required_evidence_refs',())))
     recovery_ids={o['candidate_id'] for o in guard.get('recovery_obligations',[])}
     if not required_refs<=issued:
         raise LightGraphError('semantic_recovery_evidence_required')
@@ -494,9 +495,11 @@ def _review_semantics_window(model, packet, proposition, documents, *, observati
             'If the evidence cannot distinguish the alternatives, return unresolved.')
     if packet.get('semantic_revision_guard'):
         review_packet['subtask'] += (
-            ' This is a structurally changed alternative to a rejected claim. The '
-            'semantic_revision_guard contains the original counterevidence and conditions. '
-            'Explicitly classify that counterevidence against the new structure. Preserve '
+            ' This review must satisfy retained evidence and condition obligations. '
+            'An interrupted request is not a semantic refutation and does not require a structure change. '
+            'semantic_revision_guard contains any original counterevidence and conditions. '
+            'Classify required_evidence_refs without assuming they are counterevidence; '
+            'explicitly assess blocking_evidence_refs against this claim. Preserve '
             'each original condition_ref and its exact condition text; every condition '
             'must have independently justified satisfied evidence. Renaming a condition '
             'or omitting it cannot resolve the rejection. For every recovery_obligations '
@@ -667,7 +670,8 @@ def review_semantics(model, packet, proposition, documents, *, observations=None
     all_documents={document_ref(d) for d in documents}
     if guard:
         from .semantic_revision import issued_references
-        if not set(guard.get('blocking_evidence_refs',[]))<=issued_references(packet,documents)[-1]:
+        if not (set(guard.get('blocking_evidence_refs',[]))|
+                set(guard.get('required_evidence_refs',[])))<=issued_references(packet,documents)[-1]:
             raise LightGraphError('semantic_recovery_evidence_required')
     for index, window in enumerate(windows):
         local=packet
@@ -677,6 +681,7 @@ def review_semantics(model, packet, proposition, documents, *, observations=None
             selected=lambda refs:sorted(set(refs)-(all_documents-current_docs))
             window_guard=deepcopy(guard)
             window_guard['blocking_evidence_refs']=selected(guard.get('blocking_evidence_refs',[]))
+            window_guard['required_evidence_refs']=selected(guard.get('required_evidence_refs',[]))
             for obligation in window_guard.get('recovery_obligations',[]):
                 obligation['required_evidence_refs']=selected(obligation['required_evidence_refs'])
                 if 'entity_kind_definition_refs' in obligation:

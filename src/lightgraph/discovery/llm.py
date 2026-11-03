@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from uuid import uuid4
 from typing import Callable, Literal, TypeVar
 from urllib.parse import urlparse
@@ -14,7 +15,7 @@ from lightgraph.runtime.progress import emit_progress
 from .budget import BudgetAllocator, Cost
 from .models import ProposalBatch, TaskPacket
 from .goal import build_goal_instructions
-from lightgraph.context import packet_call_context
+from lightgraph.context import wire_call_context
 
 T = TypeVar('T',bound=BaseModel)
 SYSTEM = '''You propose data interpretation hypotheses. Supplied metadata, source values and
@@ -568,7 +569,7 @@ class StructuredModelClient:
             packet={**packet,'strata_samples':[],'tool_observations':[]}
         from .table_presentation import present_observations
         packet=present_observations(packet)
-        context=packet_call_context(packet,task,output_contract={'schema_ref':'output_schema'})
+        context=wire_call_context(packet,task,output_contract={'schema_ref':'output_schema'})
         packet={**packet,'goal':context['goal'],'stage':task,'call_context':context}
         content = canonical({'task':task,'input':packet,'output_schema':response_model.model_json_schema()})
         return [{'role':'system','content':SYSTEM+'\n\n'+build_goal_instructions(context['goal'],stage=task)},
@@ -667,6 +668,8 @@ class StructuredModelClient:
             counted = False
             request_started = False
             request_succeeded = False
+            request_started_at = None
+            failure_kind = None
             payload = envelope = value = candidate_message = None
             protocol_stage = 'provider_envelope'
             protocol_problem = None
@@ -692,6 +695,7 @@ class StructuredModelClient:
                     'estimated_input_tokens':estimated_input_tokens,
                     'timeout_seconds':self.config.timeout_seconds,'payload':payload})
                 request_started = True
+                request_started_at = time.monotonic()
                 emit_progress(None,'model_call_started',counters={'model_calls':self.usage['calls'],
                     'input_tokens':self.usage['input_tokens'],'output_tokens':self.usage['output_tokens']})
                 with trace_context(request_id=request_id,attempt=attempt+1):
@@ -823,7 +827,8 @@ class StructuredModelClient:
                     feedback['schema_protocol_correction']['allowed_corrections']=correction_anchor.get('slots',[])
             except httpx.HTTPError as exc:
                 from .sdk_transport import transport_failure_kind
-                counter='transport_'+transport_failure_kind(exc)
+                failure_kind=transport_failure_kind(exc)
+                counter='transport_'+failure_kind
                 self.usage[counter]=self.usage.get(counter,0)+1
                 last_code = 'model_transport_error'
                 self.usage['failures'] += 1
@@ -838,7 +843,8 @@ class StructuredModelClient:
                 if exc.code=='model_transport_error':
                     from .sdk_transport import TRANSPORT_FAILURE_KINDS
                     kind=getattr(exc,'failure_kind','unknown')
-                    counter='transport_'+(kind if kind in TRANSPORT_FAILURE_KINDS else 'unknown')
+                    failure_kind=kind if kind in TRANSPORT_FAILURE_KINDS else 'unknown'
+                    counter='transport_'+failure_kind
                     self.usage[counter]=self.usage.get(counter,0)+1
                 last_code = exc.code
                 self.usage['failures'] += 1
@@ -854,6 +860,8 @@ class StructuredModelClient:
                     emit_trace('model_request_completed' if request_succeeded else 'model_error',{
                         'request_id':request_id,'attempt':attempt+1,'task':request_task,
                         'status':'completed' if request_succeeded else 'failed',
+                        'elapsed_seconds':max(0.0,time.monotonic()-request_started_at),
+                        **({'failure_kind':failure_kind} if failure_kind is not None else {}),
                         **({} if request_succeeded else {'code':last_code,'stage':protocol_stage,
                             'diagnostic':protocol_problem})})
                     emit_progress(None,'model_call_completed' if request_succeeded else 'model_call_failed',

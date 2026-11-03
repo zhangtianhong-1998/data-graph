@@ -76,6 +76,47 @@ def candidate_record(proposal, table, packet, documents, failure):
         dependency_fingerprint=packet.get('iteration_context',{}).get('candidate_dependency'))
 
 
+def review_guard_fingerprint(guard):
+    """Only non-replayable conditions/obligations need an exact reconstruction."""
+    if guard.get('conditions') or guard.get('recovery_obligations'):
+        return digest({key:guard.get(key,[]) for key in ('conditions','recovery_obligations')})
+    return None
+
+
+def interrupted_review_candidate(proposal,table,packet,documents,code,stage):
+    """Retain an interrupted review without turning it into a semantic rejection."""
+    from types import SimpleNamespace
+    from .repair import SEMANTIC_REVIEW_INTERRUPTION_CODES
+    if code not in SEMANTIC_REVIEW_INTERRUPTION_CODES:
+        raise ValueError('unsupported_review_interruption')
+    guard=packet.get('semantic_revision_guard') or {}
+    _,_,docs,_=issued_references(packet,documents)
+    failure=SimpleNamespace(code='semantic_review_interrupted',stage=stage,
+        blocking=guard.get('blocking_evidence_refs',[]),
+        required=sorted(set(guard.get('required_evidence_refs',[]))|docs|
+            {ref for obligation in guard.get('recovery_obligations',[]) for ref in obligation.get('required_evidence_refs',[]) }|
+            {ref for condition in guard.get('conditions',[]) for ref in condition.get('evidence_refs',[])}))
+    candidate=candidate_record(proposal,table,packet,documents,failure)
+    candidate.failure_details=[code]
+    # Conditions may contain source text and cannot enter the durable queue.
+    # Require their reconstruction rather than silently dropping them.
+    candidate.review_guard_fingerprint=review_guard_fingerprint(guard)
+    return candidate
+
+
+def interrupted_review_matches(proposal,table,packet):
+    """Only the same retained interpretation may resolve this unfinished review."""
+    from .conflicts import proposal_shape
+    context=packet.get('iteration_context',{})
+    source=SourceRef(source_id=table.source_id,schema=table.schema_name,table=table.name)
+    shape=proposal_shape(proposal)
+    return [raw for raw in context.get('pending_candidates',[])
+        if raw.get('failure_code')=='semantic_review_interrupted'
+        and raw.get('source')==source.model_dump(mode='json',by_alias=True)
+        and raw.get('dependency_fingerprint')==context.get('candidate_dependency')
+        and any(m.get('variant_id')==shape for m in raw.get('mappings',[]))]
+
+
 def revision_shape(proposal):
     """Executable semantic fields only; cosmetic changes cannot create a vote."""
     claim = _claim(proposal)
@@ -132,7 +173,8 @@ def eligible_alternative(original, alternative):
 def validate_prior_obligations(reviewed, guard, issued):
     """A renamed condition or missing counterevidence cannot pass a revision."""
     evidence = {item.reference for item in reviewed.evidence}
-    if not set(guard.get('blocking_evidence_refs', ())) <= evidence:
+    if not (set(guard.get('blocking_evidence_refs', ()))|
+            set(guard.get('required_evidence_refs', ()))) <= evidence:
         raise LightGraphError('semantic_revision_evidence_missing')
     for obligation in guard.get('recovery_obligations',[]):
         matches=[o for o in reviewed.recovery_obligations if o.candidate_id==obligation['candidate_id']]

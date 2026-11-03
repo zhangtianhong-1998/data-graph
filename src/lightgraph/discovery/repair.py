@@ -45,7 +45,7 @@ PROPOSAL_REPAIR_GUIDANCE = {
     'object_model_supersession_requires_new_id': 'A replacing object model needs its own object_id. Preserve the old candidate and identify it with supersedes_object_ids.',
     'object_model_supersession_target_invalid': 'Only issued metadata_name_family candidates from this table and dependency version can be superseded. Column overlap alone does not authorize replacement.',
     'object_model_supersession_scope_mismatch': 'The new field model must preserve the namespace columns of every superseded candidate. A change of identity scope requires an independent rule revision.',
-    'object_model_supersession_mapping_loss': 'Preserve each superseded candidate code/name/English-name/alias mapping at its original position. A union of column sets is insufficient; do not exchange names between positions or drop aliases.',
+    'object_model_supersession_mapping_loss': 'Preserve each superseded candidate code/name/English-name/alias mapping at its original position and restore missing namespace columns listed in required_references. Candidate mappings may append issued namespace columns; sharing a namespace across objects is allowed and is not exclusive ownership. A union of column sets is insufficient; do not exchange names between positions, drop aliases or remove a remembered scope.',
     'object_model_supersession_limit': 'The replacement exceeds the bounded field-model history. Submit a smaller explicit replacement while preserving every current validated mapping.',
     'object_model_mapping_conflict': 'The proposal uses a code column as its label despite an explicit object model with a distinct name column for the same key and namespace. Reuse the issued name mapping, or explicitly revise the candidate object model if that understanding is wrong. Existing drafts need their current-session replace_draft_id. This feedback is not semantic confirmation; preserve independent evidence and validation.',
     'reference_source_object_missing': 'This table has no validated entity rule that matches the reference source columns. Record or repair the object field model first; do not invent a second object to force the edge. After an object rule for this table executes, relation discovery runs once more in this round.',
@@ -123,6 +123,14 @@ SEMANTIC_REVIEW_PROTOCOL_CODES = frozenset({
     'semantic_revision_evidence_missing','semantic_recovery_evidence_required',
     'semantic_recovery_obligation_missing',
 })
+# Only failures of the request or its allowance, not semantic decisions. These
+# retain an unreviewed proposal for a later run without soliciting a new vote now.
+SEMANTIC_REVIEW_INTERRUPTION_CODES = frozenset({
+    'model_transport_error','model_rate_limited','model_http_error',
+    'model_stream_incomplete','model_response_truncated',
+    'llm_calls_budget_exhausted','llm_tokens_budget_exhausted',
+    'wall_time_budget_exhausted','discovery_time_budget_exhausted','run_time_budget_exhausted',
+})
 # A reviewer can finish its work without finding support for the replacement.
 # Keep that decision as an unresolved candidate, not a broken model protocol.
 SEMANTIC_RECOVERY_DECISION_CODES = frozenset({'semantic_recovery_obligation_unresolved'})
@@ -133,6 +141,8 @@ def issue_classification(code):
     """Separate decisions, missing evidence and compiler faults without source text."""
     if code in DISCOVERY_INTERNAL_CODES:
         return {'category':'internal_error','next_action':'fix_code'}
+    if code=='semantic_review_interrupted' or code in SEMANTIC_REVIEW_INTERRUPTION_CODES:
+        return {'category':'review_interrupted','next_action':'retry_review'}
     if code in {'semantic_recovery_evidence_required','identity_domain_evidence_unresolved',
                 'concept_scope_evidence_required'}:
         return {'category':'evidence_gap','next_action':'gather_evidence'}

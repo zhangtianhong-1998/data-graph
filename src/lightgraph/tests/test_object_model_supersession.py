@@ -5,6 +5,7 @@ import json
 import pytest
 
 from lightgraph.discovery.proposal_session import ProposalSession
+from lightgraph.discovery.engine import _column_id
 from lightgraph.discovery.schema_knowledge import (ObjectModelDraft, SchemaKnowledgeLedger,
     apply_object_model, current_object_knowledge, seed_knowledge, relation_candidates, _mapped_columns)
 from lightgraph.errors import LightGraphError
@@ -201,3 +202,84 @@ def test_mapping_loss_returns_position_and_issued_fields_for_a_successful_scoped
     assert any(item['path']==['positions',2,'aliases'] for item in diagnostics)
     assert 'required_references' not in json.dumps(diagnostics)
     assert positional['object_id'] not in json.dumps(diagnostics)
+
+
+@pytest.mark.parametrize('has_seed_scope',[False,True])
+@pytest.mark.parametrize('phase',['metadata_supersession','agent_revision'])
+def test_candidate_can_add_unrecognized_namespace_without_losing_seed_mappings(tmp_path,has_seed_scope,phase):
+    """A missing naming heuristic is not a confirmed global identity scope."""
+    t=table('paths',(['tenant_id'] if has_seed_scope else [])+['责任中心']+
+        [f'item_l{level}_{suffix}' for level in (1,2) for suffix in ('code','cn_name','en_name')])
+    with GraphStore(tmp_path/'knowledge.sqlite') as store:
+        ledger=setup_ledger(store,[t]);knowledge=ledger.context(t)
+        model={'object_id':'path_model','supersedes_object_ids':[o['object_id'] for o in knowledge['objects']]}
+        for field in ('key_columns','label_columns','english_name_columns','alias_columns','namespace_columns'):
+            model[field]=list(dict.fromkeys(c for o in knowledge['objects'] for c in o[field]))
+        model['positions']=[deepcopy(p) for o in knowledge['objects'] for p in o['positions']]
+        if phase=='agent_revision':
+            p=packet(t);p['schema_knowledge']=knowledge
+            session=ProposalSession(p)
+            assert session.execute('declare_object_model',model)['status']=='ok'
+            ledger.record_models(t,session.batch()._runtime_object_models,p)
+            # Resume the persisted candidate using its issued ID and inherited mappings.
+            candidate=next(o for o in ledger.context(t)['objects'] if o['basis']=='agent_field_model')
+            model.update(object_id=candidate['object_id'],supersedes_object_ids=[])
+        model['namespace_columns'].append(_column_id(t,'责任中心'))
+        p=packet(t);p['schema_knowledge']=ledger.context(t)
+        session=ProposalSession(p)
+        result=session.execute('declare_object_model',model)
+        assert result['status']=='ok',result
+        assert result['candidate'] is True and result['confirmed'] is False
+        assert len(p['schema_knowledge']['objects'])==1
+        ledger.record_models(t,session.batch()._runtime_object_models,p)
+        active=ledger.context(t)['objects'][0]
+        assert active['status']=='candidate' and active['basis']=='agent_field_model'
+        assert active['namespace_columns']==model['namespace_columns']
+        assert active['positions']==model['positions']
+        assert active['english_name_columns']==model['english_name_columns']
+        assert len(active['supersedes_object_ids'])==2
+
+
+def test_namespace_can_be_shared_by_independent_objects_without_merging_identities():
+    t=table('dimensions',['责任中心','metric_code','metric_cn_name','product_code','product_cn_name'])
+    knowledge=seed_knowledge(t)
+    for seed in list(knowledge['objects']):
+        candidate={field:seed[field] for field in ('key_columns','label_columns','positions')}
+        candidate.update(object_id='model_'+str(len(knowledge['objects'])),
+            namespace_columns=[_column_id(t,'责任中心')],supersedes_object_ids=[seed['object_id']])
+        knowledge=apply_object_model(knowledge,candidate)
+    active=current_object_knowledge(knowledge)['objects']
+    assert len(active)==2
+    assert all(o['namespace_columns']==[_column_id(t,'责任中心')] for o in active)
+    assert active[0]['key_columns']!=active[1]['key_columns']
+
+
+@pytest.mark.parametrize('phase',['metadata_supersession','agent_revision'])
+def test_candidate_namespace_addition_does_not_authorize_replacing_existing_scope(phase):
+    t,knowledge,model=fixture()
+    if phase=='agent_revision':
+        knowledge=current_object_knowledge(apply_object_model(knowledge,model))
+        model={**model,'supersedes_object_ids':[]}
+    old_scope=model['namespace_columns'][0]
+    # Reusing another authorized field cannot hide removal of the original scope.
+    model['namespace_columns']=[model['positions'][0]['code']]
+    p=packet(t);p['schema_knowledge']=knowledge;session=ProposalSession(p)
+    result=session.execute('declare_object_model',model)
+    assert result['code']=='object_model_supersession_mapping_loss'
+    diagnostic=next(d for d in result['diagnostics'] if d['path']==['namespace_columns'])
+    assert diagnostic['required_references']==[old_scope]
+    assert diagnostic['constraint']=='preserve_identity_scope'
+    repeated=session.execute('declare_object_model',model)
+    assert repeated['code']==result['code'] and repeated['diagnostics']==result['diagnostics']
+    assert p['schema_knowledge']==knowledge and not session.object_models
+
+
+@pytest.mark.parametrize('status',['local_validated','published'])
+def test_namespace_enrichment_of_verified_model_still_requires_rule_revision(status):
+    _,knowledge,model=fixture()
+    knowledge=current_object_knowledge(apply_object_model(knowledge,model))
+    knowledge['objects'][0]['status']=status
+    model={**model,'supersedes_object_ids':[],
+        'namespace_columns':model['namespace_columns']+[model['positions'][0]['code']]}
+    with pytest.raises(LightGraphError,match='object_model_verified_revision_required'):
+        apply_object_model(knowledge,model)

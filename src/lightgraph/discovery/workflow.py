@@ -21,10 +21,11 @@ from .semantics import (declared_evidence, review_semantics, rule_evidence,
     hierarchy_identity_context, entity_granularity_identity, entity_granularity_context,
     entity_granularity_context_signatures, review_entity_granularity)
 from .observations import ReviewObservations
-from .semantic_revision import SemanticReviewFailure, candidate_record, revise_once
+from .semantic_revision import (SemanticReviewFailure, candidate_record, revise_once,
+    interrupted_review_candidate, interrupted_review_matches, review_guard_fingerprint)
 from lightgraph.semantic_schema import SemanticSchema, EntityTypeDefinition
 from lightgraph.rules.endpoints import endpoint_columns
-from .repair import (REPAIRABLE_PROPOSAL_CODES, SEMANTIC_REVIEW_PROTOCOL_CODES,
+from .repair import (REPAIRABLE_PROPOSAL_CODES, SEMANTIC_REVIEW_PROTOCOL_CODES, SEMANTIC_REVIEW_INTERRUPTION_CODES,
     SEMANTIC_RECOVERY_DECISION_CODES, DISCOVERY_INTERNAL_CODES, issue_classification,
     PROPOSAL_REPAIR_GUIDANCE, MAX_PROPOSAL_REPAIR_ROUNDS, compiled_contract_error,
     HIERARCHY_IDENTITY_REPAIR_CODES, CONTRACT_CANDIDATE_CODES,
@@ -282,6 +283,8 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
     for p in batch.proposals:
         if p.kind=='exclusion': continue
         review_packet=packet or {}
+        active_review=None
+        retry_reviews=[]
         try:
             if goal.entity_kinds and getattr(p.claim,'entity_kind_hint',None) not in goal.entity_kinds:
                 raise LightGraphError('outside_extraction_goal')
@@ -291,6 +294,7 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
             # Candidate snapshots must see this batch's registered types too;
             # otherwise a valid newly declared kind is persisted as unknown.
             review_packet={**(packet or {}),'semantic_schema':schema.model_dump(mode='json')}
+            retry_reviews=interrupted_review_matches(p,table,review_packet)
             from .conflicts import proposal_logical_id,guard_shape
             conflict_context=[item for item in review_packet.get('iteration_context',{}).get('rule_conflict_requests',[])
                 if proposal_logical_id(p,table) in item.get('candidate',{}).get('rule_refs',[])]
@@ -306,6 +310,14 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                 validate_recovery_shape(p,review_packet['semantic_revision_guard'],
                     allowed_entity_kinds=KINDS['business']|set(goal.entity_kinds)|
                         {definition.name for definition in schema.entity_types})
+            if retry_reviews:
+                guard=dict(review_packet.get('semantic_revision_guard') or {})
+                if any(item.get('review_guard_fingerprint') and item['review_guard_fingerprint']!=review_guard_fingerprint(guard)
+                        for item in retry_reviews):
+                    raise LightGraphError('semantic_recovery_evidence_required')
+                for field in ('blocking_evidence_refs','required_evidence_refs'):
+                    guard[field]=sorted(set(guard.get(field,[]))|{ref for item in retry_reviews for ref in item.get(field,[])})
+                review_packet={**review_packet,'semantic_revision_guard':guard}
             if p.kind=='wide_hierarchy':
                 if related_requests and len(requests)>MAX_HIERARCHY_IDENTITY_REQUESTS:
                     raise LightGraphError('hierarchy_identity_repair_context_limit')
@@ -333,15 +345,19 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
                 # Narrowing the key cannot make an obligatory review disappear.
                 grain_context={'identity_columns':sorted(entity_granularity_identity(p)[-1])
                     if isinstance(entity_granularity_identity(p),tuple) else [], 'hierarchies':hierarchies}
+            if not grain_context and any(item.get('review_stage')=='entity_granularity' for item in retry_reviews):
+                raise LightGraphError('semantic_recovery_evidence_required')
             if grain_context:
                 # A negative grain judgment remains terminal across sibling
                 # repairs; changing a group ID or attribute cannot solicit a
                 # different vote for the same entity identity.
                 try:
+                    active_review='entity_granularity'
                     granularity_review=review_entity_granularity(model,
-                        {**(packet or {}),'goal':goal.model_dump(mode='json'),
+                        {**review_packet,'goal':goal.model_dump(mode='json'),
                          'semantic_schema':schema.model_dump(mode='json')},
                         p,grain_context,docs,observations=observations)
+                    active_review=None
                 except LightGraphError as exc:
                     if exc.code in ('semantic_claim_refuted','semantic_claim_unresolved',
                                     'semantic_condition_unresolved'):
@@ -354,10 +370,13 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
             scope_revision_review='namespace_scope_missing' in (packet or {}).get('allowed_revision_codes',[])
             if model is not None and (p.kind in ('long_hierarchy','wide_hierarchy','concept_mapping')
                                      or sharing_requested or domain_requested or scope_revision_review
-                                     or conflict_context):
+                                     or conflict_context or retry_reviews):
+                active_review=('hierarchy' if p.kind in ('long_hierarchy','wide_hierarchy') else
+                    'concept_mapping' if p.kind=='concept_mapping' else 'entity_definition')
                 review=review_semantics(model,{**review_packet,'semantic_schema':schema.model_dump(mode='json')},{
                     'kind':p.kind,'scope':(packet or {}).get('scope'),
                     'claim':p.claim.model_dump(mode='json')},docs,observations=observations)
+                active_review=None
             candidates=_compile_model(local,table,goal,docs,excluded,semantic_evidence=review)
             if not candidates:
                 raise LightGraphError('entity_identity_missing')
@@ -404,7 +423,13 @@ def _compile(batch, table, goal, docs, result, *, model=None,packet=None,observa
             code=(exc.code if isinstance(exc,LightGraphError) else compiled_contract_error(exc))
             if code is None:
                 raise
-            if isinstance(exc, SemanticReviewFailure):
+            if retry_reviews and code=='semantic_recovery_evidence_required':
+                from .models import PendingCandidate
+                result.pending_candidates.extend(PendingCandidate.model_validate(raw) for raw in retry_reviews)
+            elif active_review and code in SEMANTIC_REVIEW_INTERRUPTION_CODES:
+                result.pending_candidates.append(interrupted_review_candidate(
+                    p,table,review_packet,docs,code,active_review))
+            elif isinstance(exc, SemanticReviewFailure):
                 candidate = candidate_record(p, table, review_packet, docs, exc)
                 result.pending_candidates.append(candidate)
                 if semantic_failures is not None:
@@ -539,6 +564,13 @@ def _compile_candidates(batch,table,goal,docs,result,*,model,packet,observations
         counter=('deferred_proposals' if code in MISSING_PROPOSAL_EVIDENCE_CODES |
                  SEMANTIC_REVIEW_PROTOCOL_CODES else 'unresolved_proposals')
         result.stats[counter]=result.stats.get(counter,0)+1
+    for rule in rules:
+        if rule.evidence.semantic_status!='supported':continue
+        proposal=compiled_proposals[rule.rule_id][0]
+        for candidate in interrupted_review_matches(proposal,table,packet):
+            cid=candidate['candidate_id']
+            if cid not in result.resolved_candidate_ids:result.resolved_candidate_ids.append(cid)
+            result.candidate_replacement_rules[cid]=[rule.rule_id]
     return rules,docs,batch,packet,(projection_excluded,identity_excluded)
 
 

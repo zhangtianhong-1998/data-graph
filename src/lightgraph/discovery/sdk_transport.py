@@ -283,8 +283,21 @@ def request_completion(config, budget, transport, key, payload):
                   if streaming else config.max_response_bytes)
     bounded = _LimitedTransport(transport, budget, wire_limit, streaming,
                                 payload.get('response_format', {}).get('type') == 'json_schema')
+    remaining = budget.remaining_seconds()
+    timeout = min(config.timeout_seconds, remaining)
+    # The configured HTTP timeout can be shortened by the current phase. Record
+    # the value actually passed to httpx, rather than suggesting every retry
+    # received the full configured allowance. This is an I/O timeout, not a
+    # promise that an entire streamed response finishes within this duration.
+    emit_trace('model_transport_config', {
+        'configured_timeout_seconds': config.timeout_seconds,
+        'effective_timeout_seconds': timeout,
+        'remaining_phase_seconds': remaining,
+        'timeout_limited_by': 'phase_deadline' if remaining < config.timeout_seconds else 'configuration',
+        'timeout_scope': 'http_io', 'stream': streaming,
+    })
     http = httpx.Client(transport=bounded, follow_redirects=False, trust_env=False,
-                       timeout=min(config.timeout_seconds, budget.remaining_seconds()))
+                       timeout=timeout)
     try:
         with _CompletionClient(api_key=key, base_url=config.base_url, max_retries=0,
                                http_client=http, event_limit=(6 * config.max_response_bytes + 65536

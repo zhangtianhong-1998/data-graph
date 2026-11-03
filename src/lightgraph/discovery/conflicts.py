@@ -349,6 +349,12 @@ def prepare_candidate_context(packet, table, goal, corpus):
         if not referenced<=columns:continue
         kept.append(item)
     context['pending_candidates']=kept[:16]
+    context['interrupted_review_requests']=[{
+        'candidate_id':item['candidate_id'],'next_action':'retry_review',
+        'requires_structural_change':False,
+        'instruction':'The previous review request did not finish. Reuse the retained mapping when still supported; '
+            'a fresh independent review is required. Preserve all existing counterevidence and conditions.'}
+        for item in kept[:16] if item.get('failure_code')=='semantic_review_interrupted']
 
 
 def retain_unchanged_conflicts(batch, packet, documents, result, table):

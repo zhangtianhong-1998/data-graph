@@ -58,6 +58,14 @@ class CandidateQueue:
                 payload=canonical(candidate.model_dump(mode='json',by_alias=True))
                 row=self.connection.execute('SELECT payload,state,revision FROM discovery_candidate WHERE scope_key=? AND candidate_id=?',
                     (self.scope_key,candidate.candidate_id)).fetchone()
+                if row and candidate.failure_code=='semantic_review_interrupted':
+                    old=json.loads(row['payload'])
+                    if (old.get('failure_code')!='semantic_review_interrupted'
+                            and old.get('dependency_fingerprint')==candidate.dependency_fingerprint
+                            and old.get('document_refs',[])==candidate.document_refs):
+                        # A failed request supplies no new judgment and cannot
+                        # erase a prior verdict or its counterevidence.
+                        continue
                 if row and row['state']=='rejected' and candidate.status!='rejected':
                     old=json.loads(row['payload'])
                     changed=(old.get('dependency_fingerprint')!=candidate.dependency_fingerprint

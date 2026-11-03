@@ -78,7 +78,7 @@ def test_dynamic_map_keys_and_validator_exception_context_are_redacted():
     schema = {'type': 'object', 'properties': {'mapping': {'type': 'object',
               'additionalProperties': {'type': 'integer'}}}}
     result = schema_diagnostics(Draft202012Validator(schema), {'mapping': {CANARY: CANARY}})
-    assert result == [{'path': ['mapping', '*'], 'constraint': 'type'}]
+    assert result == [{'path': ['mapping', '*'], 'constraint': 'type', 'expected_type': 'integer'}]
     value = {'column_id': CANARY, 'role': 'fact_value', 'in_identity': True}
     with pytest.raises(ValidationError) as caught:
         Member.model_validate(value)

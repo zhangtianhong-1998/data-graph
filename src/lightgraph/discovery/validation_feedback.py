@@ -41,6 +41,17 @@ _SAFE_VALUE_CODES = frozenset({
     'hierarchy_plan_condition_unsupported', 'hierarchy_plan_empty_condition',
     'hierarchy_plan_fixed_level_conditions_unsupported',
 })
+_CONTRACT_REPAIR_INSTRUCTIONS = {
+    'hierarchy_plan_shared_domain_required':
+        'namespace/global means cross-source identity sharing and requires an evidence-supported '
+        'shared_identity_domain. If the intended identity is confined to this table, explicitly choose '
+        'identity_scope=source and omit the domain; source still preserves namespace_columns. '
+        'Do not invent a domain to clear this error.',
+    'hierarchy_plan_unrequested_shared_domain':
+        'source uses a derived table-local domain and preserves namespace_columns. Omit '
+        'shared_identity_domain or use null. Choose namespace/global only when evidence establishes sharing.',
+}
+_JSON_TYPES = frozenset({'object', 'array', 'string', 'number', 'integer', 'boolean', 'null'})
 
 
 def _property_names(schema):
@@ -92,6 +103,12 @@ def schema_diagnostics(validator: Draft202012Validator, arguments) -> list[dict]
                     result.append(entry)
         else:
             entry = {'path': path, 'constraint': constraint}
+            if constraint == 'type':
+                expected = error.validator_value
+                if isinstance(expected, str) and expected in _JSON_TYPES:
+                    entry['expected_type'] = expected
+                elif isinstance(expected, list) and all(isinstance(t, str) and t in _JSON_TYPES for t in expected):
+                    entry['expected_type'] = expected
             if constraint in ('enum', 'const'):
                 allowed = _static_values(error.validator_value if constraint == 'enum'
                                          else [error.validator_value])
@@ -119,5 +136,8 @@ def model_diagnostics(error: ValidationError, schema: dict, arguments) -> list[d
             arguments=getattr(cause,'args',())
             if len(arguments)==1 and isinstance(arguments[0], str) and arguments[0] in _SAFE_VALUE_CODES:
                 constraint=arguments[0]
-        diagnostics.append({'path': _path(item['loc'], names), 'constraint': constraint})
+        diagnostic={'path': _path(item['loc'], names), 'constraint': constraint}
+        if constraint in _CONTRACT_REPAIR_INSTRUCTIONS:
+            diagnostic['instruction']=_CONTRACT_REPAIR_INSTRUCTIONS[constraint]
+        diagnostics.append(diagnostic)
     return diagnostics

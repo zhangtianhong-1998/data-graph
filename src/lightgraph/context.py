@@ -97,6 +97,22 @@ def packet_call_context(packet, stage, *, constraints=None, output_contract=None
     return context
 
 
+def wire_call_context(packet, stage, *, constraints=None, output_contract=None):
+    """Reference evidence already in input, retaining its sole complete copy.
+
+    Discovery and independent review use the same projection. This changes no
+    evidence selection: required documents, counterevidence and observations
+    remain in the input packet, with their original issued references.
+    """
+    context=packet_call_context(packet,stage,constraints=constraints,output_contract=output_contract)
+    for field,source in (('document_snippets','document_snippets'),
+                         ('observations','strata_samples'),('iteration_context','iteration_context')):
+        if source in packet:
+            context.pop(field,None)
+            context[field+'_ref']='input.'+source
+    return context
+
+
 def with_discovery_runtime_control(messages, *, turn, max_turns, remaining_tool_calls,
                                    submission_reason=None, remaining_submission_calls=16):
     """Build the exact runtime-owned control envelope for preflight and calls."""
@@ -144,11 +160,7 @@ def discovery_envelope(visible):
     from lightgraph.discovery.table_presentation import present_observations
     visible=present_observations(visible)
     from lightgraph.discovery.reference_validation import definition_sections
-    context=packet_call_context(visible,visible['task'],output_contract={'schema_ref':'output_schema'})
-    for field,source in (('document_snippets','document_snippets'),
-                         ('observations','strata_samples'),('iteration_context','iteration_context')):
-        context.pop(field,None)
-        context[field+'_ref']='input.'+source
+    context=wire_call_context(visible,visible['task'],output_contract={'schema_ref':'output_schema'})
     return {'task':visible['task'],'input':visible,'call_context':context,
             'reference_options':{'definition_sections':sorted(definition_sections(visible)),
                 'usage':'For verified_identity_domain identity/attribute/global scope evidence, '

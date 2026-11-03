@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from lightgraph.contracts import StrictModel, SourceRef, canonical
 from lightgraph.errors import LightGraphError
@@ -16,6 +16,26 @@ from lightgraph.semantic_schema import EntityTypeDefinition, SemanticSchema
 from lightgraph.store.policy import KINDS
 from .models import HierarchyProposal, HypothesisLevel, ProposalBatch, WideHierarchy
 from .reference_validation import validate_proposal_references
+
+
+IDENTITY_SCOPE_DESCRIPTION = (
+    'source isolates this physical table AND still separates objects by namespace_columns. '
+    'A responsibility-center/tenant column alone does not require namespace scope. '
+    'namespace explicitly shares an identity domain across physical sources only within equal namespace values; '
+    'global explicitly shares across namespace values too. Choose namespace/global only with evidence of sharing.')
+SHARED_DOMAIN_DESCRIPTION = (
+    'Evidence-supported business identity domain, required and nonblank for namespace/global sharing. '
+    'For source scope omit this field or use null; the program derives a table-local domain. '
+    'Do not invent a shared domain merely to satisfy validation.')
+
+
+def validate_shared_identity_domain(scope, domain):
+    """Validate the sharing choice without guessing a domain or changing scope."""
+    if scope == 'source' and domain is not None:
+        raise ValueError('hierarchy_plan_unrequested_shared_domain')
+    if scope in {'namespace', 'global'} and (not domain or not domain.strip()):
+        raise ValueError('hierarchy_plan_shared_domain_required')
+    return domain
 
 
 class PlanPosition(StrictModel):
@@ -33,11 +53,9 @@ class PlanPosition(StrictModel):
 class HierarchyPlan(StrictModel):
     plan_id: str = Field(min_length=1, max_length=128)
     entity_type: str = Field(min_length=1, max_length=64)
-    identity_scope: Literal['source', 'namespace', 'global'] = Field(description=
-        'source isolates this physical table. namespace explicitly shares an identity domain across '
-        'sources only within equal namespace values; global explicitly shares across namespace values too.')
-    shared_identity_domain: str | None = Field(default=None, max_length=256, description=
-        'Evidence-supported business identity domain, required only for namespace/global sharing.')
+    identity_scope: Literal['source', 'namespace', 'global'] = Field(description=IDENTITY_SCOPE_DESCRIPTION)
+    shared_identity_domain: str | None = Field(default=None, max_length=256, validate_default=True,
+        description=SHARED_DOMAIN_DESCRIPTION)
     namespace_columns: list[str] = Field(max_length=16, description='Issued column IDs separating identity namespaces.')
     positions: list[PlanPosition] = Field(min_length=2, max_length=16)
     position_meaning: Literal['relative_ordinal', 'relative_ordered', 'fixed_levels'] = Field(description=
@@ -54,17 +72,20 @@ class HierarchyPlan(StrictModel):
         json_schema_extra={'propertyNames': {'enum': ['condition', 'valid_period', 'period', 'hierarchy_version']}}, description=
         'Preserve applicable condition, valid_period, period or hierarchy_version qualifiers; never copy row values.')
 
+    @field_validator('shared_identity_domain')
+    @classmethod
+    def shared_domain_matches_scope(cls, value, info):
+        return validate_shared_identity_domain(info.data.get('identity_scope'), value)
+
     @model_validator(mode='after')
     def coherent_scope(self):
+        # Field validation gives useful creation errors; this also rechecks the
+        # pairing when validate_assignment changes identity_scope later.
+        validate_shared_identity_domain(self.identity_scope, self.shared_identity_domain)
         if len({position.position for position in self.positions}) != len(self.positions):
             raise ValueError('hierarchy_plan_duplicate_position')
         if len(set(self.namespace_columns)) != len(self.namespace_columns):
             raise ValueError('hierarchy_plan_duplicate_namespace')
-        if self.identity_scope == 'source':
-            if self.shared_identity_domain is not None:
-                raise ValueError('hierarchy_plan_unrequested_shared_domain')
-        elif not self.shared_identity_domain or not self.shared_identity_domain.strip():
-            raise ValueError('hierarchy_plan_shared_domain_required')
         if self.identity_scope == 'namespace' and not self.namespace_columns:
             raise ValueError('hierarchy_plan_namespace_required')
         if self.position_meaning == 'fixed_levels' and (

@@ -352,7 +352,7 @@ class PendingCandidate(StrictModel):
         'concept_mapping_document_required','concept_binding_must_be_source_scoped',
         'duplicate_concept_relation','concept_identity_domain_evidence_required',
         'concept_identity_domain_required','conflicting_rule_proposals','rule_execution_failed',
-        'semantic_review_protocol_invalid','semantic_review_reference_mismatch',
+        'semantic_review_interrupted','semantic_review_protocol_invalid','semantic_review_reference_mismatch',
         'semantic_review_proposition_mismatch','semantic_review_proposition_missing',
         'semantic_review_unissued_evidence','semantic_review_patch_invalid','llm_schema_invalid',
         'reference_contract_unresolved']
@@ -366,8 +366,13 @@ class PendingCandidate(StrictModel):
     differences: list[Literal['label_mapping','attribute_mapping','identity_policy','hierarchy_mapping',
                               'schema_definition','other_contract']] = Field(default_factory=list,max_length=6)
     dependency_fingerprint: str | None = Field(default=None,pattern=r'^[a-f0-9]{64}$')
+    review_guard_fingerprint: str | None = Field(default=None,pattern=r'^[a-f0-9]{64}$',description=
+        'Interrupted reviews with conditions require the same reconstructed guard before retry; never publication evidence.')
     attempted_fingerprints: list[str] = Field(default_factory=list,max_length=8)
-    failure_details: list[Literal['fd_violation','same_code_diff_label','hierarchy_cycle',
+    failure_details: list[Literal['model_transport_error','model_rate_limited','model_http_error',
+        'model_stream_incomplete','model_response_truncated',
+        'llm_calls_budget_exhausted','llm_tokens_budget_exhausted','discovery_time_budget_exhausted',
+        'fd_violation','same_code_diff_label','hierarchy_cycle',
         'multiple_parent','identity_domain_attribute_conflict','reference_self_link_forbidden',
         'dangling_edge_requires_dependency_publication','binding_revision_requires_dependency_publication',
         'dependency_rule_failed','wall_time_budget_exhausted','run_time_budget_exhausted',

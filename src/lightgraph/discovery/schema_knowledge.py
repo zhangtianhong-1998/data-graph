@@ -39,7 +39,10 @@ class ObjectModelDraft(StrictModel):
     label_columns: list[str] = Field(default_factory=list, max_length=16)
     english_name_columns: list[str] = Field(default_factory=list, max_length=32)
     alias_columns: list[str] = Field(default_factory=list, max_length=32)
-    namespace_columns: list[str] = Field(default_factory=list, max_length=16)
+    namespace_columns: list[str] = Field(default_factory=list, max_length=16, description=
+        'Issued columns proposed to limit object identity. Candidate mappings may add scope columns, '
+        'but supersession must retain every previously mapped namespace column. '
+        'Sharing a namespace column across objects is allowed. Validated scope changes require rule revision.')
     positions: list[ObjectPosition] = Field(default_factory=list, max_length=32)
     evidence_refs: list[str] = Field(default_factory=list, max_length=32, description=
         'Issued definition sections for this table only.')
@@ -119,8 +122,13 @@ def _mapping_loss_diagnostics(previous,incoming):
     for field in fields:
         absent=role_refs(previous,field)-role_refs(incoming,field)
         if absent:missing([field],absent)
-    if set(previous.get('namespace_columns',[]))!=set(incoming.get('namespace_columns',[])):
-        missing(['namespace_columns'],previous.get('namespace_columns',[]),constraint='same_identity_scope')
+    # These are candidate field roles, not verified identity scopes. A naming
+    # heuristic may omit a scope column; adding it loses no remembered mapping.
+    # Removal/replacement still loses scope, and verified objects are rejected
+    # by apply_object_model before this candidate-preservation check is reached.
+    absent=set(previous.get('namespace_columns',[]))-set(incoming.get('namespace_columns',[]))
+    if absent:
+        missing(['namespace_columns'],absent,constraint='preserve_identity_scope')
     positions={p['position']:(i,p) for i,p in enumerate(incoming.get('positions',[]))}
     for old in previous.get('positions',[]):
         index,new=positions.get(old['position'],(None,None))
