@@ -97,6 +97,72 @@ def test_truncated_probe_evidence_never_claims_full_results(tmp_path):
         tools.close()
 
 
+@pytest.mark.parametrize('sql', [
+    'INSERT INTO public."资料" ("编码", "名称") VALUES (\'003\', \'新增\')',
+    'UPDATE public."资料" SET "名称" = \'被修改\' WHERE "编码" = \'001\'',
+    'DELETE FROM public."资料" WHERE "编码" = \'001\'',
+    'DROP TABLE public."资料"',
+    'CREATE TABLE public."新表" ("编码" TEXT)',
+    'WITH changed AS (DELETE FROM public."资料" RETURNING "编码") SELECT "编码" FROM changed',
+    'SELECT "编码" FROM public."资料"; DELETE FROM public."资料"',
+], ids=['insert', 'update', 'delete', 'drop', 'create', 'write_cte', 'multiple_statements'])
+@pytest.mark.parametrize('excel', [False, True], ids=['csv', 'excel'])
+def test_inspect_source_rejects_writes_before_adapter_query(tmp_path, monkeypatch, sql, excel):
+    config = config_for(tmp_path, excel=excel)
+    source_path = tmp_path / ('input.xlsx' if excel else 'input.csv')
+    original_file = source_path.read_bytes()
+    tools = ConstructionTools(config, tmp_path / 'work')
+    try:
+        table = tools.describe_sources()['tables'][0]['table']
+        select = {'sql': 'SELECT "编码", "名称" FROM public."资料" ORDER BY "编码"'}
+        before = tools.call('inspect_source', table=table, operation='execute_readonly_sql', arguments=select)
+        assert before['status'] == 'ok', before
+        adapter = tools.adapters[0]
+        queries_before = adapter.stats.queries
+        attempted_queries = []
+
+        def forbidden_query(*args, **kwargs):
+            attempted_queries.append((args, kwargs))
+            raise AssertionError('Write SQL reached the source adapter')
+
+        # Prove the new public tool entry point rejects before adapter execution,
+        # rather than relying on the adapter or file format to reject a write.
+        with monkeypatch.context() as patch:
+            patch.setattr(adapter, 'execute', forbidden_query)
+            rejected = tools.call('inspect_source', table=table, operation='execute_readonly_sql',
+                                  arguments={'sql': sql})
+        assert rejected['status'] == 'error' and rejected['code'] == 'unsafe_sql', rejected
+        assert attempted_queries == []
+        assert adapter.stats.queries == queries_before
+        after = tools.call('inspect_source', table=table, operation='execute_readonly_sql', arguments=select)
+        assert after['status'] == 'ok', after
+        assert after['data'] == before['data']
+        assert source_path.read_bytes() == original_file
+    finally:
+        tools.close()
+
+
+@pytest.mark.parametrize('sql', [
+    'SELECT "编码", "名称" FROM public."资料" ORDER BY "编码"',
+    'WITH items AS (SELECT "编码", "名称" FROM public."资料") '
+    'SELECT "编码", "名称" FROM items ORDER BY "编码"',
+], ids=['select', 'read_cte'])
+@pytest.mark.parametrize('excel', [False, True], ids=['csv', 'excel'])
+def test_inspect_source_allows_select_and_readonly_cte(tmp_path, sql, excel):
+    tools = ConstructionTools(config_for(tmp_path, excel=excel), tmp_path / 'work')
+    try:
+        table = tools.describe_sources()['tables'][0]['table']
+        before = tools.adapters[0].stats.queries
+        result = tools.call('inspect_source', table=table, operation='execute_readonly_sql',
+                            arguments={'sql': sql})
+        assert result['status'] == 'ok', result
+        assert result['data'] == {'columns': ['编码', '名称'], 'rows': [['001', '设备甲'], ['002', '设备乙']]}
+        assert tools.adapters[0].stats.queries == before + 1
+        assert result['coverage']['result_complete']
+    finally:
+        tools.close()
+
+
 def test_draft_repair_preserves_other_drafts_and_exact_validated_graph(tmp_path):
     tools = ConstructionTools(config_for(tmp_path), tmp_path / 'work')
     try:
