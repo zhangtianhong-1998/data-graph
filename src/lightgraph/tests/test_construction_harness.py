@@ -26,7 +26,7 @@ def test_profile_is_domain_only_and_uses_working_target(tmp_path):
     plugins = {p["id"]: p for p in patch[-1]["insert"]}
     skill = plugins["graph-skill-filesystem"]["config"]
     assert skill["includeDefaultRoots"] is False
-    assert skill["customSkillDirs"][0].endswith("construction/skills")
+    assert Path(skill["customSkillDirs"][0]).parts[-2:] == ("construction", "skills")
     compaction = plugins["graph-compaction"]["config"]
     assert compaction["thresholdRatio"] * (1048576 + 65536) == 32768
     assert compaction["retainTokens"] < 32768
@@ -45,6 +45,31 @@ def test_secrets_are_not_written_into_profile(tmp_path, monkeypatch):
     text = patch.read_text()
     assert "private_password" not in text and "private_api_key" not in text
     assert "SOURCE_DSN" not in text and "OPENAI_API_KEY" in text
+
+
+@pytest.mark.parametrize("windows,virtualenv", [(True, False), (True, True), (False, True)])
+def test_launcher_resolves_current_python_script_directory(tmp_path, monkeypatch, windows, virtualenv):
+    """setup-python Windows installs python.exe above its Scripts directory."""
+    import lightgraph.construction.harness as harness
+    import lightgraph.construction.launcher as launcher
+    vendor = tmp_path / "vendor"
+    for file in [vendor / "node_modules/tsx/dist/esm/index.mjs",
+                 vendor / "python/sdk/src/deepseek_harness/__init__.py"]:
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.touch()
+    prefix = tmp_path / "Python with spaces"
+    scripts = prefix / ("Scripts" if windows else "bin")
+    scripts.mkdir(parents=True)
+    executable = (scripts if virtualenv else prefix) / ("python.exe" if windows else "python")
+    binary = scripts / ("lightgraph-harness.exe" if windows else "lightgraph-harness")
+    executable.touch(); binary.touch()
+    monkeypatch.setattr(launcher, "vendor_root", lambda: vendor)
+    monkeypatch.setattr(harness, "os", SimpleNamespace(name="nt" if windows else "posix"))
+    monkeypatch.setattr(harness.sys, "executable", str(executable))
+    monkeypatch.setattr(harness.sysconfig, "get_path", lambda key: str(scripts) if key == "scripts" else None)
+    resolved = harness.resolved_options(options())
+    assert resolved.dsh_bin == str(binary)
+    assert resolved.sdk_source == str(vendor / "python/sdk/src")
 
 
 def test_run_uses_sdk_sessions_without_legacy_loop(tmp_path):

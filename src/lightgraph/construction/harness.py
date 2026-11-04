@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import sysconfig
 import subprocess
 import threading
 import time
@@ -96,8 +97,14 @@ def resolved_options(options: HarnessOptions) -> HarnessOptions:
         source = str(vendor / "python/sdk/src")
     binary = options.dsh_bin
     if binary is None and (vendor / "node_modules/tsx/dist/esm/index.mjs").is_file():
-        candidate = Path(sys.executable).parent / ("lightgraph-harness.exe" if os.name == "nt" else "lightgraph-harness")
-        binary = str(candidate) if candidate.is_file() else None
+        # Global Windows Python puts console scripts in prefix/Scripts while
+        # python.exe lives in prefix. A venv and POSIX often colocate them.
+        # Use this interpreter's install scheme, never an unrelated PATH dsh.
+        name = "lightgraph-harness.exe" if os.name == "nt" else "lightgraph-harness"
+        script_dir = sysconfig.get_path("scripts")
+        directories = ([Path(script_dir)] if script_dir else []) + [Path(sys.executable).parent]
+        binary = next((str(directory / name) for directory in directories
+                       if (directory / name).is_file()), None)
     if binary is None:
         raise LightGraphError("harness_runtime_not_installed")
     return replace(options, sdk_source=source, dsh_bin=binary)
