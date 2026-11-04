@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import yaml
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from ..contracts import StrictModel
 from ..documents.core import DocumentScope, load_document
@@ -526,6 +526,9 @@ class Workspace:
             return RunConfig.model_validate(data).model_dump(mode="json")
         except LightGraphError:
             raise
+        except ValidationError as exc:
+            from .config_validation import ConfigValidationError
+            raise ConfigValidationError(exc) from None
         except Exception:
             raise LightGraphError("invalid_project_config") from None
 

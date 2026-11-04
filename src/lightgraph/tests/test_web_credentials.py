@@ -1,4 +1,4 @@
-"""Browser-only credentials, project boundaries, and declaration-only onboarding."""
+"""Credential boundaries, encrypted local profiles, and declaration-only onboarding."""
 import json
 import os
 
@@ -79,7 +79,7 @@ def test_secret_audit_does_not_ignore_unreadable_files(tmp_path, monkeypatch):
         _scan_workspace(tmp_path, ['SECRET_AUDIT'])
 
 
-def test_model_key_is_project_session_only_and_binds_endpoint(client, monkeypatch):
+def test_model_key_survives_new_session_and_binds_project_endpoint(client, monkeypatch):
     config=set_model(client)
     headers=session(client)
     other=session(client)
@@ -88,7 +88,7 @@ def test_model_key_is_project_session_only_and_binds_endpoint(client, monkeypatc
     assert result.json()=={'model':True,'database_sources':[]}
     assert key not in result.text
     assert client.get('/api/projects/alpha/credentials').json()['model'] is False
-    assert client.get('/api/projects/alpha/credentials',headers=other).json()['model'] is False
+    assert client.get('/api/projects/alpha/credentials',headers=other).json()['model'] is True
     assert client.get('/api/projects/beta/credentials',headers=headers).status_code==400
     sent=[]
     monkeypatch.setattr(client.app.state.manager,'start',lambda pid,**kwargs: sent.append(kwargs) or {'run_id':'fake'})

@@ -1,4 +1,4 @@
-"""Encrypted, project-scoped database connection profiles.
+"""Encrypted, project-scoped database connections and model credentials.
 
 Only connection configuration enters this store, never query results. The local
 key and ciphertext require the same host account to restore a connection; this
@@ -146,10 +146,62 @@ class SavedConnections:
         raise LightGraphError("saved_connection_corrupt") from None
 
     def _has_saved_content(self) -> bool:
-        # Drafts share the key with runnable profiles. Rotating while either
-        # collection remains would destroy recoverable connection information.
+        # All profiles share the key. Never rotate it while any saved secret
+        # remains, including model credentials with no database connections.
         return any(next(self.root.glob(pattern), None) is not None for pattern in
-                   ("*/.connections/*.enc", "*/.connection-drafts/*.enc"))
+                   ("*/.connections/*.enc", "*/.connection-drafts/*.enc",
+                    "*/.model-credentials/*.enc"))
+
+    def _model_path(self, pid: str) -> Path:
+        if not isinstance(pid, str) or not _PROJECT_ID.fullmatch(pid):
+            raise LightGraphError("saved_connection_invalid")
+        path = self.root / pid / ".model-credentials" / "model.enc"
+        _safe_path(path)
+        return path
+
+    def save_model(self, pid: str, config, api_key: str) -> None:
+        """Bind a key to the saved, normalized endpoint; never put it in config."""
+        with _LOCK, _safe_storage_errors():
+            model = config.resolved_model
+            if not model.base_url or not model.model:
+                raise LightGraphError("model_endpoint_required")
+            if not isinstance(api_key, str) or not api_key or len(api_key) > 32768:
+                raise LightGraphError("saved_connection_invalid")
+            path = self._model_path(pid)
+            _private_directory(path.parent)
+            cipher = self._cipher(create=True)
+            payload = {"version": 1, "project_id": pid, "base_url": model.base_url,
+                       "model": model.model, "api_key": api_key}
+            encoded = cipher.encrypt(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            if len(encoded) > _MAX_PROFILE_BYTES:
+                raise LightGraphError("saved_connection_invalid")
+            _atomic_write(path, encoded)
+
+    def load_model(self, pid: str, config) -> str | None:
+        """Only trusted worker dispatch receives the decrypted key, never the UI."""
+        with _LOCK, _safe_storage_errors():
+            path = self._model_path(pid)
+            if not path.exists():
+                return None
+            cipher = self._cipher(create=False)
+            try:
+                payload = json.loads(cipher.decrypt(_read(path, _MAX_PROFILE_BYTES)))
+                if (not isinstance(payload, dict) or payload.get("version") != 1 or
+                        not isinstance(payload.get("api_key"), str) or
+                        not 1 <= len(payload["api_key"]) <= 32768):
+                    raise ValueError("invalid_profile")
+            except (InvalidToken, ValueError, TypeError, KeyError):
+                raise LightGraphError("saved_connection_corrupt") from None
+            model = config.resolved_model
+            binding = (payload.get("project_id"), payload.get("base_url"), payload.get("model"))
+            if binding != (pid, model.base_url, model.model):
+                return None
+            return payload["api_key"]
+
+    def delete_model(self, pid: str) -> None:
+        # Forgetting remains possible even when the local key is lost or corrupt.
+        with _LOCK, _safe_storage_errors():
+            self._model_path(pid).unlink(missing_ok=True)
 
     def _draft_path(self, pid: str, key: str) -> Path:
         if (not isinstance(pid, str) or not _PROJECT_ID.fullmatch(pid) or

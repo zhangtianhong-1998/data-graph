@@ -1,5 +1,6 @@
 """Project-owned model limits, including versioned standalone Agent files."""
 import yaml
+from pydantic import ValidationError
 
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import AgentConfig, ModelConfig
@@ -20,6 +21,9 @@ def save_model_limits(workspace, pid, patch):
     resolved = workspace.resolved_config(pid)
     try:
         model = ModelConfig.model_validate({**resolved.resolved_model.model_dump(), **patch})
+    except ValidationError as exc:
+        from .config_validation import ConfigValidationError
+        raise ConfigValidationError(exc, code='invalid_model_limits', prefix=('model',)) from None
     except ValueError:
         raise LightGraphError('invalid_model_limits') from None
     if config.get('agent_config'):

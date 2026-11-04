@@ -50,6 +50,77 @@ beforeEach(() => {
 })
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); clearSessions(); sessionStorage.clear() })
 describe('visible model limits', () => {
+  it('explicitly discards form changes even when JSON changed the same previewed field', async () => {
+    await mount(); await edit('model-max-calls', '80')
+    const draft = JSON.parse(root.querySelector<HTMLTextAreaElement>('#advanced-config')!.value)
+    draft.model.max_calls = 120
+    await edit('advanced-config', JSON.stringify(draft)); button('放弃表单修改').click()
+    await vi.waitFor(() => expect(root.querySelector<HTMLInputElement>('#model-max-calls')!.value).toBe('240'))
+    button('保存完整配置').click()
+    await vi.waitFor(() => expect(config.model?.max_calls).toBe(120))
+    expect(root.querySelector('.error-strip')).toBeNull()
+  })
+  it('keeps JSON in sync with model edits and accepts formatting without a false conflict', async () => {
+    await mount(); await edit('model-name', 'new-model'); await edit('model-output-tokens', '65536')
+    const draft = JSON.parse(root.querySelector<HTMLTextAreaElement>('#advanced-config')!.value)
+    expect(draft.model).toMatchObject({ model: 'new-model', max_output_tokens: 65536 })
+    await edit('advanced-config', JSON.stringify(draft))
+    button('保存配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存'))
+    expect(config.model).toMatchObject({ model: 'new-model', max_output_tokens: 65536 })
+    expect(root.querySelector('.error-strip')).toBeNull()
+  })
+  it('does not block configuration on a pending or failed graph read', async () => {
+    const original = vi.mocked(fetch).getMockImplementation()!
+    let rejectGraph!: (reason: Error) => void
+    vi.mocked(fetch).mockImplementation((input, init) => String(input).includes('/graph?') ? new Promise((_, reject) => { rejectGraph = reject }) : original(input, init))
+    await mount(); await edit('model-output-tokens', '65536'); button('保存配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存'))
+    rejectGraph(new Error('graph unavailable')); await nextTick(); await nextTick()
+    expect(root.querySelector('.error-strip')).toBeNull()
+    expect(root.querySelector<HTMLInputElement>('#model-output-tokens')!.value).toBe('65536')
+  })
+  it('does not report a committed config write as failed when credential status cannot refresh', async () => {
+    await mount(); await edit('model-output-tokens', '65536')
+    const original = vi.mocked(fetch).getMockImplementation()!
+    vi.mocked(fetch).mockImplementation((input, init) => String(input).endsWith('/credentials') ? Promise.reject(new Error('status unavailable')) : original(input, init))
+    button('保存配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存'))
+    expect(config.model?.max_output_tokens).toBe(65536)
+    expect(root.querySelector('.error-strip')).toBeNull()
+  })
+  it('retains an unsaved key after failure and restores saved status in a new page session', async () => {
+    let fail = true, saved = false
+    const original = vi.mocked(fetch).getMockImplementation()!
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      if (String(input).endsWith('/credentials/model')) {
+        if (fail) return Promise.reject(new Error('key save unavailable'))
+        saved = true
+        return Promise.resolve(response({ model: true, database_sources: [] }))
+      }
+      if (String(input).endsWith('/credentials')) return Promise.resolve(response({ model: saved, database_sources: [] }))
+      return original(input, init)
+    })
+    await mount(); await edit('model-key', 'synthetic-key'); button('保存配置').click()
+    await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('API key 保存失败，输入已保留'))
+    expect(root.querySelector<HTMLInputElement>('#model-key')!.value).toBe('synthetic-key')
+    expect(root.querySelector<HTMLTextAreaElement>('#advanced-config')!.value).not.toContain('synthetic-key')
+    fail = false; button('保存配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存'))
+    expect(root.querySelector<HTMLInputElement>('#model-key')!.value).toBe('')
+    app.unmount(); root.remove(); await mount()
+    expect(root.textContent).toContain('已在本机保存密钥')
+    expect(root.querySelector<HTMLInputElement>('#model-key')!.value).toBe('')
+  })
+  it('shows a safe field diagnostic and retains invalid JSON values for correction', async () => {
+    await mount()
+    await edit('advanced-config', JSON.stringify({ ...config, model: { ...config.model, max_output_tokens: 'wrong' } }))
+    const original = vi.mocked(fetch).getMockImplementation()!
+    vi.mocked(fetch).mockImplementation((input, init) => String(input).endsWith('/config') && init?.method === 'PUT' ? Promise.resolve(new Response(JSON.stringify({ error: { code: 'invalid_project_config', diagnostics: [{ path: 'model.max_output_tokens', type: 'int_parsing', hint: '请填写整数。' }] } }), { status: 400 })) : original(input, init))
+    button('保存完整配置').click()
+    await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('model.max_output_tokens：请填写整数'))
+    expect(root.querySelector<HTMLTextAreaElement>('#advanced-config')!.value).toContain('wrong')
+  })
   it.each([false, true])('the complete-config button saves edited controls when JSON is unchanged (Agent file: %s)', async separate => {
     if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }
     await mount()
@@ -62,16 +133,17 @@ describe('visible model limits', () => {
     expect(root.querySelector<HTMLInputElement>('#model-output-tokens')!.value).toBe('65536')
   })
   it('does not overwrite edited controls with a separately edited JSON draft', async () => {
-    await mount(); await edit('model-output-tokens', '65536')
-    await edit('advanced-config', JSON.stringify({ ...config, goal: { purpose: 'JSON 中的新目标' } }, null, 2))
+    await mount()
+    await edit('advanced-config', JSON.stringify({ ...config, model: { ...config.model, max_output_tokens: 300 }, goal: { purpose: 'JSON 中的新目标' } }, null, 2))
+    await edit('model-output-tokens', '65536')
     button('保存完整配置').click()
-    await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('表单和完整 JSON 都有修改'))
+    await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('model.max_output_tokens'))
     expect(calls.some(c => c.method === 'PUT')).toBe(false)
     expect(root.querySelector<HTMLInputElement>('#model-output-tokens')!.value).toBe('65536')
     expect(root.querySelector<HTMLTextAreaElement>('#advanced-config')!.value).toContain('JSON 中的新目标')
     button('放弃表单修改').click(); await nextTick(); button('保存完整配置').click()
     await vi.waitFor(() => expect(config.goal?.purpose).toBe('JSON 中的新目标'))
-    expect(config.model?.max_output_tokens).toBe(200)
+    expect(config.model?.max_output_tokens).toBe(300)
   })
   it.each([false, true])('persists the total window and shows the actual input cap (Agent file: %s)', async separate => {
     if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }

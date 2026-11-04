@@ -69,6 +69,13 @@ class SessionCredentials:
         with self._lock:
             self._get(pid, token).model = None
 
+    def clear_model_sessions(self, pid):
+        """Explicitly forgetting a project key revokes all tab-local copies."""
+        with self._lock:
+            for item in self._sessions.values():
+                if item.project_id == pid:
+                    item.model = None
+
     def set_source(self, pid, token, source, dsn):
         with self._lock:
             self._get(pid, token).sources[source.id] = (source.kind, source.credential_revision, dsn)

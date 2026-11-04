@@ -106,12 +106,72 @@ def test_web_passes_hop_depth_and_preserves_scope(tmp_path):
         assert not client.get('/api/projects/p/graph?focus=hidden&hops=2').json()['nodes']
 
 
-def test_two_hops_follow_reviewed_identity_and_stop_at_two_edges(tmp_path):
+def chain_sample(store, domain='d'):
+    publish(store, 'chains', ['a', 'parent', 'grandparent', 'b', 'c', 'd', 'org', 'sibling', 'uncle'],
+        [('grandparent', 'parent'), ('parent', 'a'), ('a', 'b'), ('b', 'c'), ('c', 'd'),
+         ('a', 'org'), ('sibling', 'org'), ('parent', 'uncle')], domain=domain)
+    # A visible endpoint reached only through a hidden bridge must stay hidden
+    # from the neighborhood, even though it is otherwise a public node.
+    publish(store, 'private_bridge', ['private'], [('a', 'private'), ('private', 'd')],
+        scope='private', domain=domain)
+
+
+def test_chain_sql_traversal_does_not_turn_at_shared_endpoints(monkeypatch):
+    with GraphStore() as store:
+        chain_sample(store)
+        monkeypatch.setattr(store, 'view', lambda *a, **k: pytest.fail('full graph aggregation'))
+        chains = graph_page(store, {'public'}, 'd', focus='a', hops=2, traversal='chains')
+        assert ids(chains) == {'a', 'parent', 'grandparent', 'b', 'c', 'org'}
+        assert chains['focus_traversal'] == 'chains' and chains['focus_neighbor_count'] == 5
+        assert len(chains['edges']) == 5
+        all_links = graph_page(store, {'public'}, 'd', focus='a', hops=2)
+        assert ids(all_links) == ids(chains) | {'sibling', 'uncle'}
+        assert all_links['focus_traversal'] == 'all'
+        one = graph_page(store, {'public'}, 'd', focus='a', hops=1, traversal='chains')
+        assert ids(one) == {'a', 'parent', 'b', 'org'}
+        first = graph_page(store, {'public'}, 'd', focus='a', hops=2, traversal='chains', limit=3)
+        second = graph_page(store, {'public'}, 'd', focus='a', hops=2, traversal='chains',
+                            limit=3, offset=first['next_offset'])
+        assert ids(second) == ids(chains) and len(second['edges']) == 5
+        assert 'private' not in str(chains)
+
+
+def test_web_accepts_chain_traversal_and_rejects_unknown_mode(tmp_path):
+    with TestClient(create_app(tmp_path/'workspace', frontend_dir=tmp_path/'missing')) as client:
+        client.post('/api/projects', json={'name': 'chains', 'project_id': 'p'})
+        config = client.app.state.workspace.resolved_config('p')
+        with GraphStore(config.output_dir+'/graph.sqlite') as store:
+            chain_sample(store, 'p')
+        response = client.get('/api/projects/p/graph?focus=a&hops=2&traversal=chains')
+        assert response.status_code == 200
+        assert ids(response.json()) == {'a', 'parent', 'grandparent', 'b', 'c', 'org'}
+        assert response.json()['focus_traversal'] == 'chains'
+        assert client.get('/api/projects/p/graph?focus=a&hops=2&traversal=unknown').status_code == 400
+
+
+@pytest.mark.parametrize('traversal', ['', 'unknown', None, True])
+def test_traversal_mode_is_validated(traversal):
+    with GraphStore() as store, pytest.raises(LightGraphError, match='graph_page_invalid'):
+        graph_page(store, {'public'}, 'd', focus='a', hops=2, traversal=traversal)
+
+
+def test_metadata_chain_view_excludes_siblings_but_keeps_direct_shared_target():
+    view = {'nodes': [{'id': nid, 'layer': 'metadata'} for nid in ('a', 'table', 'sibling', 'database')],
+            'edges': [{'source': 'a', 'target': 'table'}, {'source': 'sibling', 'target': 'table'},
+                      {'source': 'table', 'target': 'database'}]}
+    graph = _metadata_neighborhood(view, 'a', 2, 'chains')
+    assert ids(graph) == {'a', 'table', 'database'}
+    assert graph['focus_traversal'] == 'chains' and graph['focus_neighbor_count'] == 2
+
+
+@pytest.mark.parametrize('traversal', ['all', 'chains'])
+def test_two_hops_follow_reviewed_identity_and_stop_at_two_edges(tmp_path, traversal):
     with TestClient(create_app(tmp_path/'workspace',frontend_dir=tmp_path/'missing')) as client:
         client.post('/api/projects',json={'name':'reviewed graph','project_id':'p'})
         config=client.app.state.workspace.resolved_config('p')
         with GraphStore(config.output_dir+'/graph.sqlite') as store:
-            publish(store,'visible',['a','alias','b','c','d'],[('alias','b'),('b','c'),('c','d')],domain='p')
+            publish(store,'visible',['a','alias','b','c','d','org','sibling'],
+                [('alias','b'),('b','c'),('c','d'),('alias','org'),('sibling','org')],domain='p')
             publication=store.begin_publication('visible',1,'names',{})
             support=SupportSpec(origin='user_input',source_binding='visible',scope_ref='public',
                 partition_id='names',rule_id='visible',rule_revision=1)
@@ -129,7 +189,9 @@ def test_two_hops_follow_reviewed_identity_and_stop_at_two_edges(tmp_path):
         assert response.status_code==200,response.text
         graph=client.get('/api/projects/p/graph').json()
         center=next(n['id'] for n in graph['nodes'] if n.get('label')=='同一项目')
-        two=client.get('/api/projects/p/graph',params={'focus':center,'hops':2}).json()
-        assert ids(two)=={center,'b','c'} and len(two['edges'])==2
+        two=client.get('/api/projects/p/graph',params={'focus':center,'hops':2,'traversal':traversal}).json()
+        expected = {center,'b','c','org'} | ({'sibling'} if traversal == 'all' else set())
+        assert ids(two)==expected and len(two['edges'])==len(expected)-1
         assert two['query_strategy']=='validated_identity_projection'
-        assert two['focus_neighbor_count']==2
+        assert two['focus_neighbor_count']==len(expected)-1
+        assert two['focus_traversal']==traversal

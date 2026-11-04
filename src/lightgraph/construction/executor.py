@@ -203,11 +203,14 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                 if adapter is None:
                     continue
                 capability = adapter.capabilities()
-                if (not capability.consistent_snapshot
-                        or any(capability.capabilities.get(c) != 'verified' for c in
-                               ('metadata_reading', 'read_only_transaction', 'parameter_binding', 'distinct_projection'))):
+                if any(capability.capabilities.get(c) != 'verified' for c in
+                       ('metadata_reading', 'read_only_transaction', 'parameter_binding', 'distinct_projection')):
                     raise LightGraphError('snapshot_or_projection_unavailable')
                 stack.enter_context(adapter.snapshot())
+                # Database adapters attest snapshot consistency only while the
+                # read-only transaction is open; files can attest it at rest.
+                if not adapter.capabilities().consistent_snapshot:
+                    raise LightGraphError('snapshot_or_projection_unavailable')
             for entity in draft.entities:
                 if goal is not None and goal.entity_kinds and entity.type not in goal.entity_kinds:
                     diagnostic('outside_extraction_goal', entity_type=entity.type)

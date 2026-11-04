@@ -2,6 +2,7 @@ const messages: Record<string, string> = {
   construction_scoped_access_not_supported: '该历史运行使用的版本尚不支持此访问范围。当前版本已支持逐条来源证据过滤，请保留原权限配置。',
   scope_binding_conflict: '同一来源表存在不同的范围列绑定，请核对 scope_bindings 后重试。',
   graph_support_visibility_missing: '该图缺少逐条来源证据的可见范围，请按当前绑定重新验证和发布。',
+  graph_read_conflict: '图谱读取期间项目配置已变化，请重新加载图谱。',
   graph_access_context_changed: '来源或访问权限已改变，旧图暂不展示。历史文件保留，请按当前授权重新验证和发布。',
   network_unavailable: '无法连接服务，请确认后端已启动。', invalid_response: '服务返回的内容无法读取，请刷新后重试。',
   request_timeout: '请求超时，请检查后端服务、数据库地址和网络后重试。',
@@ -30,9 +31,12 @@ const messages: Record<string, string> = {
   resolution_requires_accepted_endpoints: '候选对象尚未接受，请先完成语义确认。',
   resolution_evidence_changed: '候选的来源依据已变化，请重新运行并检查。',
   config_invalid: '配置未通过校验，请检查来源、模型和抽取范围。',
-  model_credential_missing: '请在 Agent 与模型中填写当前会话的 API key，或配置服务器环境变量。', source_credential_missing: '请重新连接数据库，或检查服务器的连接环境变量。',
-  session_required: '连接会话已失效，请刷新页面后重新填写凭据。', session_invalid: '连接会话已失效，请刷新页面后重新填写凭据。',
-  credential_session_invalid: '连接会话已失效，请刷新页面后重新填写凭据。', credential_session_capacity_reached: '服务当前会话已满，请稍后重试。',
+  invalid_project_config: '项目配置未通过校验，请检查以下字段。',
+  config_path_must_be_unambiguous_project_file: '配置中的文件未在当前项目注册，请从数据接入或知识文档页面上传后再选择。',
+  config_path_must_be_project_file: '配置路径必须指向当前项目已上传的文件。',
+  model_credential_missing: '请在模型配置中保存 API key，或配置服务器环境变量。', source_credential_missing: '请重新连接数据库，或检查服务器的连接环境变量。',
+  session_required: '页面会话已失效，请刷新后继续，已保存的密钥和连接信息会自动恢复。', session_invalid: '页面会话已失效，请刷新后继续，已保存的密钥和连接信息会自动恢复。',
+  credential_session_invalid: '页面会话已失效，请刷新后继续，已保存的密钥和连接信息会自动恢复。', credential_session_capacity_reached: '服务当前会话已满，请稍后重试。',
   model_endpoint_required: '请先填写并保存模型服务地址和模型名称。',
   database_tls_required: '远程数据库要求 TLS 证书校验，请使用包含 TLS 配置的连接串。',
   database_sslmode_invalid: '连接串中的 sslmode 无效，请修正该参数，或删除该参数后在表单中选择。',
@@ -79,7 +83,10 @@ const messages: Record<string, string> = {
   source_scope_missing: '数据库来源需要填写允许查询的表。', credentials_not_allowed: '配置中不能包含明文密钥，请使用服务器环境变量。',
 }
 export class ApiError extends Error {
-  constructor(public code: string, public status = 0) { super(messages[code] || `操作未完成（${code}）`); this.name = 'ApiError' }
+  constructor(public code: string, public status = 0, diagnostics: unknown = []) {
+    const fields = Array.isArray(diagnostics) ? diagnostics.slice(0, 16).filter(item => item && typeof item.path === 'string' && /^[A-Za-z0-9_.\[\]<>-]{1,160}$/.test(item.path) && typeof item.hint === 'string' && item.hint.length <= 200).map(item => `${item.path}：${item.hint}`) : []
+    super([messages[code] || `操作未完成（${code}）`, ...fields].join('\n')); this.name = 'ApiError'
+  }
 }
 // Tokens and credentials stay in this page's memory, never browser storage.
 const sessions = new Map<string, string>()
@@ -125,7 +132,8 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     if (!response.ok) {
       const code = (data as { error?: { code?: unknown } })?.error?.code
       // Render only the short public error code; never reflect raw server errors or HTML.
-      throw new ApiError(typeof code === 'string' && /^[a-zA-Z0-9_.:-]{1,100}$/.test(code) ? code : `http_${response.status}`, response.status)
+      throw new ApiError(typeof code === 'string' && /^[a-zA-Z0-9_.:-]{1,100}$/.test(code) ? code : `http_${response.status}`, response.status,
+        ['invalid_project_config', 'invalid_model_limits'].includes(String(code)) ? (data as { error?: { diagnostics?: unknown } })?.error?.diagnostics : [])
     }
     if (data !== null && typeof data === 'object' && response.headers.get('etag')) responseRevisions.set(data, response.headers.get('etag')!)
     return data as T

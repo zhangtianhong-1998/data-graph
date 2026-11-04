@@ -46,6 +46,43 @@ def test_two_hop_view_preserves_paths_and_reports_excluded_neighbor(data):
     assert result["semantic_origin"] == "agent_authored"
 
 
+def test_chain_view_keeps_both_directions_without_expanding_shared_parent_or_target(data):
+    names = ('a', 'b', 'c', 'd', 'parent', 'grandparent', 'org', 'sibling', 'uncle')
+    data['nodes'] = [{'id': nid, 'kind': 'custom_type'} for nid in names]
+    data['edges'] = [{'id': str(index), 'source': source, 'target': target, 'relation': 'custom_relation'}
+        for index, (source, target) in enumerate([
+            ('grandparent', 'parent'), ('parent', 'a'), ('a', 'b'), ('b', 'c'), ('c', 'd'),
+            ('a', 'org'), ('sibling', 'org'), ('parent', 'uncle'), ('a', 'hidden'), ('hidden', 'd')])]
+    result = views.graph_page(None, focus='a', hops=2, traversal='chains')
+    assert {n['id'] for n in result['nodes']} == {'a', 'parent', 'grandparent', 'b', 'c', 'org'}
+    assert len(result['edges']) == 5 and result['focus_neighbor_count'] == 5
+    assert result['focus_traversal'] == 'chains'
+    assert result['focus_loaded_edges'] == 3
+    # Small pages retain complete center-to-node paths, not detached endpoints.
+    visited, cursor = set(), 0
+    while cursor is not None:
+        page = views.graph_page(None, focus='a', hops=2, traversal='chains', limit=3, offset=cursor)
+        reached = {'a'}
+        for _ in range(2):
+            reached |= {endpoint for edge in page['edges'] if edge['source'] in reached or edge['target'] in reached
+                        for endpoint in (edge['source'], edge['target'])}
+        assert {node['id'] for node in page['nodes']} == reached
+        visited |= reached
+        following = page['next_offset']
+        assert following is None or following > cursor
+        cursor = following
+    assert visited == {n['id'] for n in result['nodes']}
+
+
+def test_chain_traversal_tracks_both_directions_even_for_bidirectional_edges(data):
+    data['edges'] = [
+        {'id': 'a', 'source': '0', 'target': '1'}, {'id': 'b', 'source': '1', 'target': '0'},
+        {'id': 'c', 'source': '1', 'target': '2'}, {'id': 'd', 'source': '3', 'target': '1'}]
+    result = views.graph_page(None, focus='0', hops=2, traversal='chains')
+    assert {n['id'] for n in result['nodes']} == {'0', '1', '2', '3'}
+    assert result['focus_neighbor_count'] == 3
+
+
 def test_dense_graph_edge_limit_is_explicit_even_when_nodes_fit(data):
     data["edges"] = [{**data["edges"][0], "id": f"edge{i}"} for i in range(3100)]
     result = views.graph_page(None, focus="0", limit=100)

@@ -2,10 +2,11 @@
 import json
 from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
+from lightgraph.graph_neighborhood import neighborhood_paths
 
 
-def graph_page(store,scopes,domain,*,layer='business',include_candidates=False,offset=0,limit=240,q='',kind='',focus='',hops=1):
-    if type(offset) is not int or offset<0 or type(limit) is not int or not 1<=limit<=1000 or len(q)>256 or not isinstance(focus,str) or len(focus)>256 or type(hops) is not int or hops not in (1,2):
+def graph_page(store,scopes,domain,*,layer='business',include_candidates=False,offset=0,limit=240,q='',kind='',focus='',hops=1,traversal='all'):
+    if type(offset) is not int or offset<0 or type(limit) is not int or not 1<=limit<=1000 or len(q)>256 or not isinstance(focus,str) or len(focus)>256 or type(hops) is not int or hops not in (1,2) or traversal not in ('all','chains'):
         raise LightGraphError('graph_page_invalid')
     if focus:limit=min(limit,999)  # The anchor counts toward the 1000-node response cap.
     # Two-hop pages retain the earlier prefix so second-hop nodes never lose
@@ -24,14 +25,9 @@ def graph_page(store,scopes,domain,*,layer='business',include_candidates=False,o
         allnodes=[n for n in view['nodes'] if n['layer']==layer]
         allids={n['id'] for n in allnodes}
         edges=[e for e in view['edges'] if e['source'] in allids and e['target'] in allids]
-        adjacency={nid:set() for nid in allids}
-        for edge in edges:
-            adjacency[edge['source']].add(edge['target'])
-            adjacency[edge['target']].add(edge['source'])
-        first=adjacency.get(focus,set())
-        neighbors=set(first)
-        if two_hops:
-            for nid in first:neighbors.update(adjacency[nid])
+        order, parents = neighborhood_paths(allids, edges, focus, hops, traversal)
+        first = {nid for nid, parent in parents.items() if parent == focus}
+        neighbors = set(order) - {focus}
         matching=[n for n in allnodes if (not focus or n['id'] in neighbors-{focus}) and (not kind or n['kind']==kind) and
                   (not q or q.casefold() in json.dumps(n,ensure_ascii=False).casefold())]
         matching.sort(key=lambda n:(n['id'] not in first if two_hops else False,n['id']))
@@ -44,6 +40,7 @@ def graph_page(store,scopes,domain,*,layer='business',include_candidates=False,o
             'kinds':sorted({n['kind'] for n in allnodes}),
             'kind_counts':{k:sum(n['kind']==k for n in allnodes) for k in {n['kind'] for n in allnodes}},
             'focus_node_id':focus if focus in allids else None,'focus_neighbor_count':len(neighbors-{focus}),'focus_hops':hops,
+            'focus_traversal':traversal,
             'boundary_edges':sum((e['source'] in ids) != (e['target'] in ids) for e in edges),
             'neighborhood_truncated':two_hops and len(matching)>999,
             'offset':offset,'page_size':limit,'truncated':two_hops and len(matching)>999,'query_strategy':'validated_identity_projection',
@@ -64,17 +61,20 @@ def graph_page(store,scopes,domain,*,layer='business',include_candidates=False,o
         FROM visible WHERE fact_kind='Edge' AND json_extract(payload,'$.source') IN (SELECT id FROM nodes)
         AND json_extract(payload,'$.target') IN (SELECT id FROM nodes)),
       anchor AS (SELECT id FROM nodes WHERE id=?),
-      first_hop AS (SELECT dst id FROM edges WHERE src IN (SELECT id FROM anchor)
-        UNION SELECT src id FROM edges WHERE dst IN (SELECT id FROM anchor)),
+      first_out AS (SELECT dst id FROM edges WHERE src IN (SELECT id FROM anchor)),
+      first_in AS (SELECT src id FROM edges WHERE dst IN (SELECT id FROM anchor)),
+      first_hop AS (SELECT id FROM first_out UNION SELECT id FROM first_in),
       neighbors AS (SELECT id FROM first_hop
-        UNION SELECT dst id FROM edges WHERE ?=2 AND src IN (SELECT id FROM first_hop)
-        UNION SELECT src id FROM edges WHERE ?=2 AND dst IN (SELECT id FROM first_hop)),
+        UNION SELECT dst id FROM edges WHERE ?=2 AND (src IN (SELECT id FROM first_out)
+          OR (?='all' AND src IN (SELECT id FROM first_hop)))
+        UNION SELECT src id FROM edges WHERE ?=2 AND (dst IN (SELECT id FROM first_in)
+          OR (?='all' AND dst IN (SELECT id FROM first_hop)))),
       matched AS (SELECT * FROM nodes n WHERE (?='' OR (n.id!=? AND n.id IN (SELECT id FROM neighbors))) AND (?='' OR n.kind=?) AND (?='' OR instr(lower(n.id),lower(?))>0
         OR EXISTS (SELECT 1 FROM visible v WHERE v.fact_kind='PropertyValue' AND json_extract(v.payload,'$.entity_id')=n.id
            AND instr(lower(CAST(json_extract(v.payload,'$.value') AS TEXT)),lower(?))>0))),
       chunk AS (SELECT * FROM matched ORDER BY CASE WHEN id IN (SELECT id FROM first_hop) THEN 0 ELSE 1 END,id LIMIT ? OFFSET ?),
       page AS (SELECT * FROM chunk UNION SELECT * FROM nodes WHERE id=?) '''
-    args=[domain,*scopes,*states,layer,focus,hops,hops,focus,focus,kind,kind,q,q,q,page_limit,page_offset,focus]
+    args=[domain,*scopes,*states,layer,focus,hops,traversal,hops,traversal,focus,focus,kind,kind,q,q,q,page_limit,page_offset,focus]
     with store._lock:
         store.connection.execute('BEGIN')
         try:
@@ -123,7 +123,7 @@ def graph_page(store,scopes,domain,*,layer='business',include_candidates=False,o
             return {**result,'total_nodes':counts[0],'total_edges':counts[1],'matched_nodes':counts[2],
                 'boundary_edges':counts[3],'kinds':kinds,'kind_counts':kind_counts,
                 'focus_node_id':focus if any(n['id']==focus for n in result['nodes']) else None,
-                'focus_neighbor_count':counts[4] if focus else 0,'focus_hops':hops,'offset':offset,'page_size':limit,
+                'focus_neighbor_count':counts[4] if focus else 0,'focus_hops':hops,'focus_traversal':traversal,'offset':offset,'page_size':limit,
                 'next_offset':end if end<counts[2] and (not two_hops or end<999) else None,
                 'neighborhood_truncated':two_hops and counts[2]>999,'truncated':two_hops and counts[2]>999,
                 'generation':digest(publications),'query_strategy':'authorized_sql_page'}

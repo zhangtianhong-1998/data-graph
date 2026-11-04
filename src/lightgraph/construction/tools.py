@@ -143,6 +143,7 @@ class ConstructionTools:
                     "scope_bindings": [binding.model_dump(mode='json', by_alias=True) for binding in self.config.scope_bindings],
                     "unbound_scope": "public", "managed_by": "operator"},
                 "tables": [{"table": key, "source": t.source_id, "schema": t.schema_name,
+                            "sql_dialect": self.executors[t.source_id].compiler.dialect,
                             "name": t.name, "columns": [c.model_dump(mode="json") for c in t.columns],
                             "declared_unique_keys": t.unique_keys,
                             "declared_foreign_keys": [fk.model_dump(mode="json") for fk in t.foreign_keys]}
@@ -251,6 +252,9 @@ class ConstructionTools:
                         'sql_identifier only in SQL. Declarations are evidence, not confirmed semantics.')
                 elif function['name'] == 'execute_readonly_sql':
                     function['description'] = function['description'].replace(
+                        f'in the {executor.compiler.dialect} dialect over authorized objects on this source.',
+                        'using the sql_dialect returned by get_metadata for the selected source. '
+                        'Only tables on that source can appear in its SQL.').replace(
                         'tool_table_id and opaque column.id are not SQL identifiers.',
                         'Use physical table and column names, with the supplied SQL quoting.')
             return {"status": "ok", "operations": operations}

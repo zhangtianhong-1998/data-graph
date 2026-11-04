@@ -7,6 +7,7 @@ import TechnicalDetails from './TechnicalDetails.vue'
 import RunProgress from './RunProgress.vue'
 import RunTrace from './RunTrace.vue'
 import { effectiveInputTokenLimit, modelLimitError, modelLimitKeys } from './modelLimits'
+import { configTextChanged, mergeConfigDraft } from './configDraft'
 import type { ModelLimitKey } from './modelLimits'
 import IdentityCandidates from './IdentityCandidates.vue'
 import DiscoveryCandidates from './DiscoveryCandidates.vue'
@@ -85,11 +86,11 @@ watch([() => project.value?.project_id, () => config.value.agent_config], async 
 async function saveModelLimits() {
   if (limitsError.value) throw new Error(limitsError.value)
   if (!config.value.agent_config) { await saveForms(); notify('模型配置已保存，下次启动立即生效'); return }
-  if (advancedDirty.value) throw new Error('完整 JSON 配置有未保存修改，请先保存完整配置或放弃其中的修改。')
+  if (advancedDirty.value && advancedConfig().agent_config !== config.value.agent_config) throw new Error('完整 JSON 更换了独立模型文件，请先保存文件选择，再调整其模型额度。')
   const value = Object.fromEntries(modelLimitKeys.filter(key => key in agentLimits.value).map(key => [key, agentLimits.value[key]]))
   // Save all edited form fields before refreshing the versioned Agent reference.
   // Otherwise a refresh can erase pending guidance or vocabulary changes.
-  if (formDirty.value || modelKey.value) await saveForms()
+  if (formDirty.value || modelKey.value || advancedDirty.value) await saveForms()
   // The saved Agent path, limits and revision must come from the same write.
   // A second GET could fail after a successful save or read another tab's edit.
   const saved = await request<{ config: RunConfig; limits: Record<string, unknown> }>(`${path.value}/model-limits?include_config=true`, { method: 'PUT', body: json(value), headers: revisionHeaders() })
@@ -101,10 +102,14 @@ async function saveModelLimits() {
   notify('模型配置已保存，下次启动立即生效')
 }
 const advanced = ref('')
+const advancedBaseline = ref('')
 const modelKey = ref('')
-const credentials = ref<{ database_sources: string[]; model: boolean }>({ database_sources: [], model: false })
+type CredentialStatus = { database_sources: string[]; model: boolean; model_error?: string; model_environment?: boolean }
+const credentials = ref<CredentialStatus>({ database_sources: [], model: false })
 const metadata = ref<Metadata>({ tables: [], nodes: [], edges: [] })
 const business = ref<Graph>({ nodes: [], edges: [] })
+const graphLoading = ref(false), graphError = ref('')
+let graphRequestEpoch = 0
 const runs = ref<Run[]>([])
 const selectedRun = ref<Run | null>(null)
 const runPollError = ref<string | null>(null)
@@ -131,7 +136,20 @@ const locked = computed(() => busy.value || loading.value || !!activeRun.value)
 const path = computed(() => projectPath(project.value?.project_id || ''))
 const formDirty = computed(() => traceRecording.value !== (config.value.record_trace !== false) || runSeconds.value !== (config.value.max_run_seconds ?? 1800) || purpose.value !== goalMarkdown(config.value) || JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}))
 const dirty = computed(() => !!modelKey.value || formDirty.value || agentLimitsDirty.value)
-const advancedDirty = computed(() => advanced.value !== JSON.stringify(config.value, null, 2))
+const advancedDirty = computed(() => configTextChanged(advanced.value, advancedBaseline.value))
+function previewConfig(): RunConfig {
+  const value = { ...config.value }
+  if (purpose.value !== goalMarkdown(config.value)) value.goal_markdown = purpose.value
+  if (runSeconds.value !== (config.value.max_run_seconds ?? 1800)) value.max_run_seconds = runSeconds.value!
+  if (traceRecording.value !== (config.value.record_trace !== false)) value.record_trace = traceRecording.value
+  if (!value.agent_config && JSON.stringify(model.value) !== JSON.stringify(config.value.model || {})) value.model = { ...model.value }
+  return value
+}
+function resetAdvanced() { advanced.value = advancedBaseline.value = JSON.stringify(previewConfig(), null, 2) }
+watch([purpose, runSeconds, traceRecording, model], () => {
+  // The JSON view follows the form until the user edits the JSON itself.
+  if (!advancedDirty.value) resetAdvanced()
+}, { deep: true })
 const deletionTitle = computed(() => deletion.value?.kind === 'project' ? '删除项目' : deletion.value?.kind === 'source' ? '删除数据库来源' : deletion.value?.kind === 'table' ? '移除数据表' : '删除文件')
 const deletionDescription = computed(() => {
   const target = deletion.value
@@ -155,7 +173,7 @@ function fillForms(value: RunConfig) {
   purpose.value = goalMarkdown(value)
   runSeconds.value = value.max_run_seconds ?? 1800
   traceRecording.value = value.record_trace !== false
-  model.value = structuredClone(value.model || {}); advanced.value = JSON.stringify(value, null, 2)
+  model.value = JSON.parse(JSON.stringify(value.model || {})); advanced.value = advancedBaseline.value = JSON.stringify(value, null, 2)
 }
 function formConfig(): RunConfig {
   const problem = limitsError.value
@@ -190,12 +208,14 @@ async function loadProject(id: string) {
     if (epoch !== generation) return
     configRevision.value = undefined; project.value = values[0]; fillForms(values[1]); await ensureSession(id); metadata.value = { tables: [], nodes: [], edges: [] }; business.value = { nodes: [], edges: [] }; runs.value = []
     // An unavailable database must not prevent opening and repairing its project configuration.
-    const details = await Promise.allSettled([request<Metadata>(`${p}/metadata`), request<Graph>(`${p}/graph?layer=business&include_candidates=${includeCandidates.value}&limit=1000`), request<{ runs: Run[] }>(`${p}/runs`), request<{ database_sources: string[]; model: boolean }>(`${p}/credentials`)])
+    // Graph loading can take longer than opening configuration. A graph read
+    // must not lock model fields or report a successful config load as failed.
+    void loadBusinessGraph(p, epoch)
+    const details = await Promise.allSettled([request<Metadata>(`${p}/metadata`), request<{ runs: Run[] }>(`${p}/runs`), request<CredentialStatus>(`${p}/credentials`)])
     if (epoch !== generation) return
     if (details[0].status === 'fulfilled') { metadata.value = details[0].value }
-    if (details[1].status === 'fulfilled') business.value = details[1].value
-    if (details[2].status === 'fulfilled') runs.value = details[2].value.runs
-    if (details[3].status === 'fulfilled') credentials.value = details[3].value
+    if (details[1].status === 'fulfilled') runs.value = details[1].value.runs
+    if (details[2].status === 'fulfilled') credentials.value = details[2].value
     const failed = details.find(result => result.status === 'rejected')
     if (failed?.status === 'rejected') report(failed.reason)
     selectedRun.value = runs.value[0] || null
@@ -216,10 +236,11 @@ function applyProjectConfig(nextProject: Project, nextConfig: RunConfig, preserv
     model: JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}) ? JSON.parse(JSON.stringify(model.value)) as typeof model.value : undefined,
   } : null
   const draft = preserveEdits && advancedDirty.value ? advanced.value : undefined
+  const draftBaseline = advancedBaseline.value
   const draftRevision = configRevision.value
   const agentConfigRemoved = preserveEdits && !!config.value.agent_config && !nextConfig.agent_config
   project.value = nextProject; fillForms(nextConfig)
-  if (draft !== undefined) { advanced.value = draft; configRevision.value = draftRevision }
+  if (draft !== undefined) { advanced.value = draft; advancedBaseline.value = draftBaseline; configRevision.value = draftRevision }
   if (agentConfigRemoved) modelKey.value = ''
   if (edits) {
     if (edits.traceRecording !== undefined) traceRecording.value = edits.traceRecording
@@ -234,9 +255,22 @@ async function refreshProjectConfig(preserveEdits = false) {
   applyProjectConfig(values[0], values[1], preserveEdits)
 }
 async function refreshGraphs() {
-  const p = path.value, epoch = generation
-  const values = await Promise.all([request<Metadata>(`${p}/metadata`), request<Graph>(`${p}/graph?layer=business&include_candidates=${includeCandidates.value}&limit=1000`)])
-  if (epoch === generation) { metadata.value = values[0]; business.value = values[1] }
+  const p = path.value, epoch = generation, requestEpoch = ++graphRequestEpoch
+  graphLoading.value = true; graphError.value = ''
+  try {
+    const values = await Promise.all([request<Metadata>(`${p}/metadata`), request<Graph>(`${p}/graph?layer=business&include_candidates=${includeCandidates.value}&limit=1000`)])
+    if (epoch === generation && requestEpoch === graphRequestEpoch) { metadata.value = values[0]; business.value = values[1] }
+  } finally { if (epoch === generation && requestEpoch === graphRequestEpoch) graphLoading.value = false }
+}
+async function loadBusinessGraph(p = path.value, epoch = generation) {
+  const requestEpoch = ++graphRequestEpoch
+  graphLoading.value = true; graphError.value = ''
+  try {
+    const graph = await request<Graph>(`${p}/graph?layer=business&include_candidates=${includeCandidates.value}&limit=1000`)
+    if (epoch === generation && requestEpoch === graphRequestEpoch) business.value = graph
+  } catch (exception) {
+    if (epoch === generation && requestEpoch === graphRequestEpoch) graphError.value = exception instanceof Error ? exception.message : '图谱读取失败，请重试。'
+  } finally { if (epoch === generation && requestEpoch === graphRequestEpoch) graphLoading.value = false }
 }
 function schedulePoll(epoch: number) {
   clearTimeout(pollTimer)
@@ -259,7 +293,7 @@ function schedulePoll(epoch: number) {
   }, 1000)
 }
 async function refreshCredentials() {
-  credentials.value = await request<{ database_sources: string[]; model: boolean }>(`${path.value}/credentials`)
+  credentials.value = await request<CredentialStatus>(`${path.value}/credentials`)
 }
 function revisionHeaders(): Record<string, string> { return configRevision.value ? { 'If-Match': configRevision.value } : {} }
 function advancedConfig(): RunConfig {
@@ -274,19 +308,29 @@ async function persistConfiguration(value: RunConfig) {
   fillForms(await request<RunConfig>(`${path.value}/config`, { method: 'PUT', headers: revisionHeaders(), body: json(value) }))
 }
 async function saveForms() {
-  if (advancedDirty.value) throw new Error('完整 JSON 配置有未保存修改，请先保存完整配置或放弃其中的修改。')
-  await persistConfiguration(formConfig())
+  const value = advancedDirty.value ? mergeConfigDraft(JSON.parse(advancedBaseline.value), previewConfig(), advancedConfig()) : formConfig()
+  await persistConfiguration(value)
+  await saveModelCredential()
+}
+async function saveModelCredential() {
   if (modelKey.value) {
-    const key = modelKey.value; modelKey.value = ''
-    try { await request(`${path.value}/credentials/model`, { method: 'PUT', body: json({ api_key: key }) }) }
-    finally { await refreshCredentials() }
-  } else await refreshCredentials()
+    const key = modelKey.value
+    try {
+      credentials.value = await request<CredentialStatus>(`${path.value}/credentials/model`, { method: 'PUT', body: json({ api_key: key }) })
+      modelKey.value = ''
+    } catch (exception) {
+      throw new Error(`项目配置已保存，但 API key 保存失败，输入已保留。${exception instanceof Error ? exception.message : '请重试。'}`)
+    }
+  } else {
+    // Presence is secondary to the committed configuration. A failed GET must
+    // not turn a successful save into an apparent failed write.
+    try { await refreshCredentials() } catch { notify('配置已保存；密钥状态暂未刷新。') }
+  }
 }
 async function saveDraft() {
   if (advancedDirty.value) {
-    if (formDirty.value || agentLimitsDirty.value) throw new Error('表单和完整 JSON 都有修改，请先选择保存完整配置，或放弃 JSON 修改后保存表单。')
-    await persistConfiguration(advancedConfig())
-    if (modelKey.value) await saveForms()
+    if (agentLimitsDirty.value) await saveModelLimits()
+    else await saveForms()
   } else {
     if (agentLimitsDirty.value) await saveModelLimits()
     if (dirty.value) await saveForms()
@@ -297,7 +341,7 @@ async function reloadConfiguration() {
   await action(async () => { closeDatabaseSource(); await refreshProjectConfig(); notify('已读取服务器配置') })
 }
 async function clearModelCredential() {
-  await action(async () => { modelKey.value = ''; await request(`${path.value}/credentials/model`, { method: 'DELETE' }); await refreshCredentials(); notify('已清除本次会话的模型密钥') })
+  await action(async () => { credentials.value = await request<CredentialStatus>(`${path.value}/credentials/model`, { method: 'DELETE' }); modelKey.value = ''; notify('已清除本机保存的模型密钥') })
 }
 async function previewFileMetadata(file: ProjectFile) {
   await request(`${path.value}/files/${encodeURIComponent(file.file_id)}/metadata`)
@@ -423,10 +467,12 @@ async function saveAdvanced() {
   })
 }
 function discardFormEdits() {
-  const jsonDraft = advanced.value
-  fillForms(JSON.parse(JSON.stringify(config.value)) as RunConfig)
-  agentLimits.value = JSON.parse(agentLimitsSaved.value)
-  advanced.value = jsonDraft
+  try {
+    const jsonDraft = JSON.stringify(mergeConfigDraft(JSON.parse(advancedBaseline.value), JSON.parse(JSON.stringify(config.value)), advancedConfig(), 'draft'), null, 2)
+    fillForms(JSON.parse(JSON.stringify(config.value)) as RunConfig)
+    agentLimits.value = JSON.parse(agentLimitsSaved.value)
+    advanced.value = jsonDraft
+  } catch (exception) { report(exception) }
 }
 async function openDatabaseSource(source: SourceConfig | null = null) {
   await action(async () => {
@@ -501,9 +547,9 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
             <div class="intro"><div><h2>知识文档</h2></div><button class="btn primary" :disabled="locked" @click="documentInput?.click()">＋ 上传 Markdown</button><input ref="documentInput" type="file" hidden multiple accept=".md,.markdown" @change="upload"/></div>
             <div class="document-layout"><section class="panel"><div class="panel-head"><h2>Markdown 知识材料</h2><span class="badge">{{ documentFiles.length }} 个文档</span></div><div v-if="!documentFiles.length" class="empty-state"><h3>添加知识材料</h3><p>支持 Markdown 数据说明、业务定义和分析经验；运行时按需要读取，不会一次性塞入全部原文。</p></div><div v-for="file in documentFiles" :key="file.file_id" class="doc-row"><span class="file-icon">MD</span><div class="file-info"><h3>{{ file.name }}</h3><div class="chips"><span v-if="!Array.isArray(config.documents) || !config.documents.includes(file.relative_path)" class="badge amber">未参与抽取</span><span class="badge blue">{{ purposeLabels[file.purpose] || '待分类' }}</span><span class="badge">{{ file.scope?.tables?.length ? `绑定 ${file.scope.tables.length} 张表` : file.scope?.source_ids?.length || file.scope?.columns?.length ? '限定范围' : '全局使用' }}</span></div><p v-if="file.scope?.tables?.length" class="break">{{ file.scope.tables.join('、') }}</p><p>{{ size(file.size) }}</p><div class="actions"><button class="btn small" :disabled="busy" @click="showContent(file)">查看原文</button><button class="btn small" :disabled="locked" @click="openBinding(file)">设置用途与范围</button><button class="btn small danger-text" :disabled="locked" :aria-label="`删除文档 ${file.name}`" @click="askDeletion({ kind: 'file', file })">删除</button></div></div></div></section></div>
           </template>
-          <template v-if="tab === 'metadata' || tab === 'business'"><div class="intro"><div><h2>{{ tab === 'metadata' ? '元数据关联图' : '业务知识图谱' }}</h2></div><button class="btn" :disabled="busy" @click="action(refreshGraphs)">刷新图谱</button></div><p v-if="tab === 'metadata' && metadata.requires_refresh" class="note graph-notice">{{ metadata.tables.length ? '目前仅显示已读取来源的元数据；其他来源仍需连接并读取。' : '尚未读取元数据。请在「项目配置 → 数据接入」连接来源并读取元数据。' }}</p><p v-if="tab === 'metadata' && metadata.stale_engine_metadata" class="note amber graph-notice">元数据声明已更新。重新运行抽取后，会刷新与新声明对应的关系。</p><label v-if="tab === 'business'" class="checkbox-line"><input v-model="includeCandidates" type="checkbox" :disabled="busy"/>显示候选与未决关系</label><GraphCanvas :graph="tab === 'metadata' ? metadata : business" :layer="tab" :loading="busy" :project-id="project.project_id" :include-candidates="includeCandidates"/><IdentityCandidates v-if="tab === 'business'" :project-id="project.project_id" :config-revision="configRevision" :graph="business" :disabled="locked || dirty || advancedDirty" @changed="action(refreshGraphs)"/><DiscoveryCandidates v-if="tab === 'business'" :project-id="project.project_id" :config-revision="configRevision" :refresh-key="business" :disabled="locked || dirty || advancedDirty"/><section v-if="tab === 'metadata' && metadata.tables.length" class="panel metadata-table"><div class="panel-head"><h2>表与列</h2></div><details v-for="table in metadata.tables" :key="tableKey(table)"><summary>{{ tableKey(table) }} <span class="muted">{{ table.columns.length }} 列</span></summary><div class="table-scroll"><table><thead><tr><th>字段</th><th>类型</th><th>注释</th></tr></thead><tbody><tr v-for="column in table.columns" :key="column.name"><td>{{ column.name }}</td><td>{{ column.data_type || '—' }}</td><td>{{ column.comment || '—' }}</td></tr></tbody></table></div></details></section></template>
+          <template v-if="tab === 'metadata' || tab === 'business'"><div class="intro"><div><h2>{{ tab === 'metadata' ? '元数据关联图' : '业务知识图谱' }}</h2></div><button class="btn" :disabled="busy" @click="action(refreshGraphs)">刷新图谱</button></div><p v-if="tab === 'metadata' && metadata.requires_refresh" class="note graph-notice">{{ metadata.tables.length ? '目前仅显示已读取来源的元数据；其他来源仍需连接并读取。' : '尚未读取元数据。请在「项目配置 → 数据接入」连接来源并读取元数据。' }}</p><p v-if="tab === 'metadata' && metadata.stale_engine_metadata" class="note amber graph-notice">元数据声明已更新。重新运行抽取后，会刷新与新声明对应的关系。</p><label v-if="tab === 'business'" class="checkbox-line"><input v-model="includeCandidates" type="checkbox" :disabled="busy"/>显示候选与未决关系</label><p v-if="tab === 'business' && graphError" class="note amber" role="alert">图谱读取失败：{{ graphError }} <button class="text-button" @click="loadBusinessGraph()">重试读取图谱</button></p><GraphCanvas :graph="tab === 'metadata' ? metadata : business" :layer="tab" :loading="busy || (tab === 'business' && graphLoading)" :project-id="project.project_id" :include-candidates="includeCandidates"/><IdentityCandidates v-if="tab === 'business'" :project-id="project.project_id" :config-revision="configRevision" :graph="business" :disabled="locked || dirty || advancedDirty" @changed="action(refreshGraphs)"/><DiscoveryCandidates v-if="tab === 'business'" :project-id="project.project_id" :config-revision="configRevision" :refresh-key="business" :disabled="locked || dirty || advancedDirty"/><section v-if="tab === 'metadata' && metadata.tables.length" class="panel metadata-table"><div class="panel-head"><h2>表与列</h2></div><details v-for="table in metadata.tables" :key="tableKey(table)"><summary>{{ tableKey(table) }} <span class="muted">{{ table.columns.length }} 列</span></summary><div class="table-scroll"><table><thead><tr><th>字段</th><th>类型</th><th>注释</th></tr></thead><tbody><tr v-for="column in table.columns" :key="column.name"><td>{{ column.name }}</td><td>{{ column.data_type || '—' }}</td><td>{{ column.comment || '—' }}</td></tr></tbody></table></div></details></section></template>
           <template v-if="tab === 'runs'"><div class="intro"><div><h2>运行记录</h2></div></div><section class="panel"><div v-if="!runs.length" class="empty-state"><h3>尚未开始抽取</h3><p>先上传数据、配置目标和模型，再开始第一轮运行。</p></div><div v-else class="table-scroll"><table><thead><tr><th>运行编号</th><th>状态</th><th>当前阶段</th><th>创建时间</th><th>资源释放</th><th></th></tr></thead><tbody><tr v-for="run in runs" :key="run.run_id"><td class="mono">{{ run.run_id }}</td><td><span class="badge" :class="run.status === 'completed' ? 'green' : run.status === 'failed' ? 'red' : 'blue'">{{ runLabels[run.status] }}</span></td><td>{{ stageLabel(run.progress?.stage || run.stage) }}</td><td>{{ time(run.created_at) }}</td><td>{{ run.cleanup_status === 'completed' ? '已完成' : run.cleanup_status === 'pending' ? '待完成' : '未确认' }}</td><td><button class="btn small" :disabled="busy" @click="inspectRun(run)">{{ isActive(run) ? '查看进度' : '查看报告' }}</button></td></tr></tbody></table></div></section><RunProgress v-if="selectedRun" :key="`${selectedRun.project_id}:${selectedRun.run_id}`" :run="selectedRun" :refresh-error="runPollError === selectedRun.run_id"/><section v-if="selectedRun" class="panel run-report"><div class="panel-head"><h2>运行详情</h2><span class="badge">{{ selectedRun.run_id }}</span></div><div class="panel-body"><div class="report-summary"><div><small>执行状态</small><strong>{{ runLabels[selectedRun.status] }}</strong></div><div><small>当前阶段</small><strong>{{ stageLabel(selectedRun.progress?.stage || selectedRun.stage) }}</strong></div><div><small>配置修订</small><strong>{{ selectedRun.config_revision ?? '历史记录未提供' }}</strong></div><div><small>结束时间</small><strong>{{ time(selectedRun.finished_at) }}</strong></div></div><p v-if="graphOutcome(selectedRun.report)" class="note">{{ graphOutcome(selectedRun.report) }}</p><p v-if="selectedRun.error_code" class="note amber">{{ new ApiError(selectedRun.error_code).message }}</p><p class="field-hint">资源释放指关闭连接和释放运行内存；运行轨迹保留，需在下方主动清理。</p><ConstructionReport :report="selectedRun.report"/><RunIssues :report="selectedRun.report"/><TechnicalDetails v-if="selectedRun.report" :value="selectedRun.report" title="报告原始结构"/><p v-else class="note">{{ isActive(selectedRun) ? '运行尚未结束，报告会在后端生成后显示。' : '此运行没有可读取的报告，请结合状态和错误码判断。' }}</p></div></section><RunTrace v-if="selectedRun" :key="`${selectedRun.project_id}:${selectedRun.run_id}`" :run="selectedRun" :config-revision="configRevision"/></template>
-          <template v-if="tab === 'settings'"><div class="intro"><div><h2>模型配置</h2></div></div><div class="layout-two"><section class="panel"><div class="panel-head"><h2>模型连接</h2><span class="badge blue">运行设置</span></div><div class="panel-body"><p v-if="config.agent_config" class="note amber">当前配置引用独立模型文件 {{ config.agent_config }}。连接信息在该文件中配置，下方可调整额度和超时；保存时会生成新配置，保留原文件。</p><template v-else><div class="field"><label for="model-mode">模型模式</label><select id="model-mode" v-model="model.mode" :disabled="locked"><option value="disabled">关闭模型，暂不启动自主构建</option><option value="metadata_only">仅元数据，不向模型发送样本</option><option value="in_environment">环境内模型，可使用受限样本</option><option value="approved_external">已批准的外部模型</option></select></div><div class="field"><label for="model-url">服务 Base URL</label><input id="model-url" v-model="model.base_url" :disabled="locked" placeholder="https://model.example.com/v1" autocomplete="off"/><p class="field-hint">使用兼容 Chat Completions 的地址；不要在 URL 中包含密钥。</p></div><div class="two-fields"><div class="field"><label for="model-name">模型名称</label><input id="model-name" v-model="model.model" :disabled="locked" placeholder="模型服务提供的名称"/></div><div class="field"><label for="model-key">API key</label><input id="model-key" v-model="modelKey" :disabled="locked" type="password" autocomplete="new-password" :placeholder="credentials.model ? '本次会话已设置，留空保留' : '填写模型服务的 API key'"/></div></div><p class="credential-status field-hint"><span class="badge" :class="credentials.model ? 'green' : ''">{{ credentials.model ? '本次会话已配置密钥' : '尚未配置会话密钥' }}</span><button v-if="credentials.model" class="text-button" :disabled="locked" @click="clearModelCredential">清除密钥</button></p><details class="model-advanced"><summary>使用服务器环境变量（可选）</summary><div class="field"><label for="model-key-env">API key 环境变量名</label><input id="model-key-env" v-model="model.api_key_env" :disabled="locked" placeholder="LIGHTGRAPH_API_KEY" autocomplete="off"/></div></details><p class="field-hint">连接和接口参数由后台自动适配。</p><label v-if="internalHttpEndpoint" class="checkbox-line"><input id="model-allow-http" v-model="model.allow_insecure_http" type="checkbox" :disabled="locked"/>允许使用此内部 HTTP 服务</label></template>
+          <template v-if="tab === 'settings'"><div class="intro"><div><h2>模型配置</h2></div></div><div class="layout-two"><section class="panel"><div class="panel-head"><h2>模型连接</h2><span class="badge blue">运行设置</span></div><div class="panel-body"><p v-if="config.agent_config" class="note amber">当前配置引用独立模型文件 {{ config.agent_config }}。连接信息在该文件中配置，下方可调整额度和超时；保存时会生成新配置，保留原文件。</p><template v-else><div class="field"><label for="model-mode">模型模式</label><select id="model-mode" v-model="model.mode" :disabled="locked"><option value="disabled">关闭模型，暂不启动自主构建</option><option value="metadata_only">仅元数据，不向模型发送样本</option><option value="in_environment">环境内模型，可使用受限样本</option><option value="approved_external">已批准的外部模型</option></select></div><div class="field"><label for="model-url">服务 Base URL</label><input id="model-url" v-model="model.base_url" :disabled="locked" placeholder="https://model.example.com/v1" autocomplete="off"/><p class="field-hint">使用兼容 Chat Completions 的地址；不要在 URL 中包含密钥。</p></div><div class="two-fields"><div class="field"><label for="model-name">模型名称</label><input id="model-name" v-model="model.model" :disabled="locked" placeholder="模型服务提供的名称"/></div><div class="field"><label for="model-key">API key</label><input id="model-key" v-model="modelKey" :disabled="locked" type="password" autocomplete="new-password" :placeholder="credentials.model ? '已在本机保存，留空保留' : credentials.model_environment ? '服务器已配置，可留空' : '填写模型服务的 API key'"/></div></div><p class="credential-status field-hint"><span class="badge" :class="credentials.model || credentials.model_environment ? 'green' : ''">{{ credentials.model ? '已在本机保存密钥' : credentials.model_environment ? '已配置服务器环境变量' : '尚未配置密钥' }}</span><button v-if="credentials.model || credentials.model_error" class="text-button" :disabled="locked" @click="clearModelCredential">清除密钥</button></p><p v-if="credentials.model_error" class="note amber" role="alert">{{ new ApiError(credentials.model_error).message }}</p><details class="model-advanced"><summary>使用服务器环境变量（可选）</summary><div class="field"><label for="model-key-env">API key 环境变量名</label><input id="model-key-env" v-model="model.api_key_env" :disabled="locked" placeholder="LIGHTGRAPH_API_KEY" autocomplete="off"/></div></details><p class="field-hint">连接和接口参数由后台自动适配。</p><label v-if="internalHttpEndpoint" class="checkbox-line"><input id="model-allow-http" v-model="model.allow_insecure_http" type="checkbox" :disabled="locked"/>允许使用此内部 HTTP 服务</label></template>
 <p v-if="agentLimitsLoading" role="status">正在读取模型额度…</p>
 <div class="two-fields"><div class="field"><label for="model-max-calls">模型调用总额度</label><input id="model-max-calls" type="number" min="0" step="1" :value="limitModel.max_calls === undefined ? 40 : limitModel.max_calls ?? ''" :disabled="locked || agentLimitsLoading" placeholder="留空不额外限制" @input="setModelLimit('max_calls', $event)"/><p class="field-hint">整次运行的模型请求次数，包含重试和压缩调用。0 表示不允许调用模型。</p></div><div class="field"><label for="run-seconds">整次运行时限（秒）</label><input id="run-seconds" type="number" min="0.1" step="any" :value="runSeconds ?? ''" :disabled="locked || agentLimitsLoading" @input="runSeconds = ($event.target as HTMLInputElement).value === '' ? null : Number(($event.target as HTMLInputElement).value)"/><p class="field-hint">由同一时限覆盖发现、验证与构建，</p></div></div>
 <div class="two-fields"><div class="field"><label for="model-input-tokens">最大输入 tokens</label><input id="model-input-tokens" type="number" min="1" step="1" :value="limitModel.max_prompt_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="留空不另设输入限制" @input="setModelLimit('max_prompt_tokens', $event)"/><p class="field-hint">请求派发前按估算值检查输入，包括系统提示、历史消息和工具定义。额度估算会结合接口实际用量校准，不代表精确分词结果。</p></div><div class="field"><label for="model-output-tokens">最大输出 tokens</label><input id="model-output-tokens" type="number" min="1" step="1" :value="limitModel.max_output_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="默认 4096" @input="setModelLimit('max_output_tokens', $event)"/><p class="field-hint">单次请求的输出上限，不是整轮抽取的 token 预算。</p></div></div>
@@ -514,7 +560,7 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
 <p class="field-hint">模型输入、返回及工具结果保留在本地，供排查与恢复使用；运行后需手动清理。</p>
 <button v-if="!traceRecording" class="btn" :disabled="locked" @click="traceRecording = true">启用运行轨迹</button>
 <p v-if="limitsError" class="note amber" role="alert">{{ limitsError }}</p>
-</div><div class="panel-footer"><span>API key 仅本次会话有效，刷新后须重新填写</span><button class="btn primary" :disabled="locked || agentLimitsLoading || !!limitsError" @click="action(saveModelLimits)">保存配置</button></div></section><aside class="panel"><div class="panel-head"><h2>运行前检查</h2></div><div class="panel-body"><div class="setup-check"><strong>{{ config.sources?.length || 0 }} 个数据来源</strong><button class="text-button" @click="tab = 'inputs'">配置数据接入</button></div><div class="setup-check"><strong>{{ documentFiles.length }} 个知识文档</strong><button class="text-button" @click="tab = 'documents'">配置知识文档</button></div><div class="setup-check"><strong>{{ purpose.trim() ? '已填写抽取目标' : '尚未填写抽取目标' }}</strong><button class="text-button" @click="tab = 'goal'">配置抽取目标</button></div></div></aside></div><section class="panel advanced-panel"><div class="panel-head"><h2>完整项目配置</h2><span class="badge">JSON 编辑 · 服务端保存 YAML</span></div><div class="panel-body"><p class="field-hint editor-hint">开始抽取前会保存此处修改；与普通表单同时修改时，会先提示选择。</p><label class="sr-only" for="advanced-config">完整项目 JSON 配置</label><textarea id="advanced-config" v-model="advanced" class="code-editor" :disabled="locked" spellcheck="false"/></div><div class="panel-footer"><span>完整配置不接受明文密码或 API key，请使用上方连接表单</span><div class="actions"><button v-if="advancedDirty && (formDirty || agentLimitsDirty)" class="btn" :disabled="locked" @click="discardFormEdits">放弃表单修改</button><button v-if="advancedDirty" class="btn" :disabled="locked" @click="advanced = JSON.stringify(config, null, 2)">放弃修改</button><button class="btn primary" :disabled="locked" @click="saveAdvanced">保存完整配置</button></div></div></section></template>
+</div><div class="panel-footer"><span>API key 加密保存在服务端本机，刷新后无需重填</span><button class="btn primary" :disabled="locked || agentLimitsLoading || !!limitsError" @click="action(saveModelLimits)">保存配置</button></div></section><aside class="panel"><div class="panel-head"><h2>运行前检查</h2></div><div class="panel-body"><div class="setup-check"><strong>{{ config.sources?.length || 0 }} 个数据来源</strong><button class="text-button" @click="tab = 'inputs'">配置数据接入</button></div><div class="setup-check"><strong>{{ documentFiles.length }} 个知识文档</strong><button class="text-button" @click="tab = 'documents'">配置知识文档</button></div><div class="setup-check"><strong>{{ purpose.trim() ? '已填写抽取目标' : '尚未填写抽取目标' }}</strong><button class="text-button" @click="tab = 'goal'">配置抽取目标</button></div></div></aside></div><section class="panel advanced-panel"><div class="panel-head"><h2>完整项目配置</h2><span class="badge">JSON 编辑 · 服务端保存 YAML</span></div><div class="panel-body"><p class="field-hint editor-hint">此处与上方表单同步；两处修改不同字段时一并保存，同一字段有冲突时会提示。</p><label class="sr-only" for="advanced-config">完整项目 JSON 配置</label><textarea id="advanced-config" v-model="advanced" class="code-editor" :disabled="locked" spellcheck="false"/></div><div class="panel-footer"><span>完整配置不接受明文密码或 API key，请使用上方连接表单</span><div class="actions"><button v-if="advancedDirty && (formDirty || agentLimitsDirty)" class="btn" :disabled="locked" @click="discardFormEdits">放弃表单修改</button><button v-if="advancedDirty" class="btn" :disabled="locked" @click="resetAdvanced">放弃修改</button><button class="btn" :disabled="locked" @click="action(async () => { advanced = JSON.stringify(advancedConfig(), null, 2) })">格式化 JSON</button><button class="btn primary" :disabled="locked" @click="saveAdvanced">保存完整配置</button></div></div></section></template>
         </div>
       </template>
     </main>

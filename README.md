@@ -22,6 +22,8 @@ Windows 使用 `.venv\Scripts\python.exe` 和 `.venv\Scripts\lightgraph.exe`。�
 
 打开 [http://127.0.0.1:8001](http://127.0.0.1:8001)，配置来源、知识文档、构建目标和模型后保存并启动。配置保存后，下一次运行立即使用新值；运行中的任务保持启动时快照。
 
+页面填写的模型 API key 加密保存在本机，刷新页面或重启服务后无需重填；密钥绑定项目、服务地址与模型名，可主动清除，服务器环境变量方式仍可使用。
+
 仓库的 `vendor/deepseek-harness/` 包含固定版本内核与 Python SDK，实际从该目录启动，不依赖个人机器上的 Desktop 应用。来源 commit、许可证、文件哈希和排除清单见[内核来源说明](vendor/deepseek-harness/VENDOR_README.md)。`bootstrap_harness.py --check` 检查已安装依赖及官方 CLI 启动，不调用模型。
 
 ## 输入与配置

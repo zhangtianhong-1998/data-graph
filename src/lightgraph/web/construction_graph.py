@@ -8,6 +8,7 @@ from lightgraph.contracts import digest, canonical
 from lightgraph.construction.access import access_fingerprint, ensure_supported_access, filter_graph_scopes
 from lightgraph.construction.workspace import GraphWorkspace, safe_load_yaml
 from lightgraph.errors import LightGraphError
+from lightgraph.graph_neighborhood import neighborhood_paths
 from lightgraph.web.graph_view_cache import cached_generation, load_graph_view, remember_graph, view_token
 
 
@@ -112,26 +113,12 @@ def _search_text(node):
     return " ".join(str(value) for value in values).casefold()
 
 
-def _focused_page(nodes, edges, focus, hops, offset, limit):
+def _focused_page(nodes, edges, focus, hops, offset, limit, traversal='all'):
     """Page an authorized neighborhood with its center and connecting paths."""
     by_id = {node['id']: node for node in nodes}
     if focus not in by_id:
         raise LightGraphError('graph_item_not_found')
-    adjacent = {identifier: set() for identifier in by_id}
-    for edge in edges:
-        if edge['source'] in by_id and edge['target'] in by_id:
-            adjacent[edge['source']].add(edge['target'])
-            adjacent[edge['target']].add(edge['source'])
-    parents, order, frontier = {focus: None}, [focus], [focus]
-    for _ in range(hops):
-        following = []
-        for current in frontier:
-            for neighbor in sorted(adjacent[current]):
-                if neighbor not in parents:
-                    parents[neighbor] = current
-                    order.append(neighbor)
-                    following.append(neighbor)
-        frontier = following
+    order, parents = neighborhood_paths(by_id, edges, focus, hops, traversal)
     retained, cursor = {focus}, offset
     while cursor < len(order):
         path, current = set(), order[cursor]
@@ -149,7 +136,9 @@ def _focused_page(nodes, edges, focus, hops, offset, limit):
 
 
 def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", focus="", hops=1,
-               include_candidates=False):
+               include_candidates=False, traversal='all'):
+    if traversal not in ('all', 'chains'):
+        raise LightGraphError('graph_page_invalid')
     if layer not in {"business", "metadata", "provenance", "all"} or offset < 0 or not 1 <= limit <= 1000 or hops not in {1, 2}:
         raise LightGraphError("graph_selection_invalid")
     graph = load_graph(config)
@@ -165,7 +154,7 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
         selected = [n for n in selected if n["kind"] == kind]
     if focus:
         # Search chooses a center; its name/type cannot restrict its neighbors.
-        selected, page, parents, next_offset = _focused_page(nodes, edges, focus, hops, offset, limit)
+        selected, page, parents, next_offset = _focused_page(nodes, edges, focus, hops, offset, limit, traversal)
     else:
         page = selected[offset:offset + limit]
         next_offset = offset + len(page) if offset + len(page) < len(selected) else None
@@ -193,6 +182,7 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
             "generation": generation, "query_strategy": "published_yaml", "kinds": sorted(counts),
             "kind_counts": dict(counts), "focus_node_id": focus or None,
             "focus_neighbor_count": max(0, len(selected) - 1) if focus else 0, "focus_hops": hops,
+            "focus_traversal": traversal,
             "focus_total_edges": sum(focus in (e['source'], e['target']) for e in edges) if focus else None,
             "focus_loaded_edges": sum(focus in (e['source'], e['target']) for e in local_edges) if focus else None,
             "view_scope": "neighborhood" if focus else "search_results" if q or kind else "graph_page",

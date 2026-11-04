@@ -463,16 +463,36 @@ def _bounded_view(view, layer):
             "limits": {"nodes": MAX_GRAPH_NODES, "edges": MAX_GRAPH_EDGES}}
 
 
-def read_graph(workspace, pid, layer="business", *, include_candidates=False,offset=0,limit=240,q='',kind='',focus='',hops=1):
+def read_graph_consistently(workspace, pid, reader, **options):
+    """Read a frozen view without blocking configuration behind graph parsing.
+
+    A concurrent configuration change or project replacement invalidates the
+    result before it reaches the response, including any now-hidden supports.
+    """
+    with workspace.lock(pid):
+        project = workspace.get(pid)
+        revision = project['config_revision']
+        config = workspace.resolved_config(pid).model_copy(deep=True)
+    result = reader(workspace, pid, config=config, **options)
+    with workspace.lock(pid):
+        current = workspace.get(pid)
+        if (current['created_at'] != project['created_at']
+                or current['config_revision'] != revision
+                or workspace.resolved_config(pid) != config):
+            raise LightGraphError('graph_read_conflict')
+    return result
+
+
+def read_graph(workspace, pid, layer="business", *, include_candidates=False,offset=0,limit=240,q='',kind='',focus='',hops=1,traversal='all',config=None):
     """Publication heads, not stale graph.json exports, determine current results."""
     from ..store import GraphStore
     if layer == "metadata":
-        return read_metadata(workspace, pid, focus=focus, hops=hops)
-    config = workspace.resolved_config(pid)
+        return read_metadata(workspace, pid, focus=focus, hops=hops, traversal=traversal, config=config)
+    config = config if config is not None else workspace.resolved_config(pid)
     from . import construction_graph
     if construction_graph.available(config):
         return construction_graph.graph_page(config, layer=layer, offset=offset, limit=limit,
-            q=q, kind=kind, focus=focus, hops=hops, include_candidates=include_candidates)
+            q=q, kind=kind, focus=focus, hops=hops, traversal=traversal, include_candidates=include_candidates)
     path = Path(config.output_dir) / "graph.sqlite"
     if path.is_symlink():
         raise LightGraphError("workspace_path_invalid")
@@ -481,25 +501,25 @@ def read_graph(workspace, pid, layer="business", *, include_candidates=False,off
     with GraphStore(path) as store:
         from ..store.paging import graph_page
         view = graph_page(store,set(config.scopes),config.isolation_domain,layer=layer,
-                          include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus,hops=hops)
+                          include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus,hops=hops,traversal=traversal)
         from .graph_display import display_schema
         vocabulary = display_schema(store, view)
     result = _bounded_view(view, layer)
     result.update({key:view[key] for key in ('total_nodes','total_edges','matched_nodes','boundary_edges',
         'next_offset','offset','page_size','generation','query_strategy','kinds','kind_counts','focus_node_id','focus_neighbor_count',
-        'focus_hops','neighborhood_truncated')})
+        'focus_hops','focus_traversal','neighborhood_truncated')})
     result['truncated'] = result['truncated'] or view['truncated']
     result["include_candidates"] = include_candidates
     result["display_schema"] = vocabulary
     return result
 
 
-def read_graph_details(workspace, pid, *, entity_id=None, fact_id=None, include_candidates=False, offset=0):
+def read_graph_details(workspace, pid, *, entity_id=None, fact_id=None, include_candidates=False, offset=0, config=None):
     """Return bounded fact-level provenance only after support authorization."""
     from ..store import GraphStore
     if bool(entity_id) == bool(fact_id) or offset < 0:
         raise LightGraphError("graph_selection_invalid")
-    config = workspace.resolved_config(pid)
+    config = config if config is not None else workspace.resolved_config(pid)
     from . import construction_graph
     if construction_graph.available(config):
         return construction_graph.graph_details(config, entity_id=entity_id, fact_id=fact_id,
@@ -616,30 +636,23 @@ def write_metadata_context(config, project_path):
     _save(Path(config.output_dir) / "metadata-context.json", _metadata_context(config, project_path))
 
 
-def _metadata_neighborhood(view, focus, hops):
+def _metadata_neighborhood(view, focus, hops, traversal='all'):
     """Select the neighborhood before the response cap, using authorized metadata."""
     nodes={n['id']:n for n in view['nodes'] if n['layer']=='metadata'}
-    adjacency={nid:set() for nid in nodes}
-    for edge in view['edges']:
-        if edge['source'] in nodes and edge['target'] in nodes:
-            adjacency[edge['source']].add(edge['target'])
-            adjacency[edge['target']].add(edge['source'])
-    found={focus} if focus in nodes else set()
-    ordered=sorted(found);frontier=set(found)
-    for _ in range(hops):
-        frontier=set().union(*(adjacency[nid] for nid in frontier))-found
-        ordered.extend(sorted(frontier));found.update(frontier)
+    from ..graph_neighborhood import neighborhood_paths
+    ordered, _ = neighborhood_paths(nodes, view['edges'], focus, hops, traversal)
+    found = set(ordered)
     subset={**view,'nodes':[nodes[nid] for nid in ordered],
         'edges':[e for e in view['edges'] if e['source'] in found and e['target'] in found]}
     graph=_bounded_view(subset,'metadata')
-    graph.update(focus_node_id=focus if focus in nodes else None,focus_hops=hops,
+    graph.update(focus_node_id=focus if focus in nodes else None,focus_hops=hops,focus_traversal=traversal,
         focus_neighbor_count=len(found-{focus}),matched_nodes=len(found-{focus}),
         next_offset=None,neighborhood_truncated=len(found)>MAX_GRAPH_NODES,
         total_nodes=len(nodes),total_edges=sum(e['source'] in nodes and e['target'] in nodes for e in view['edges']))
     return graph
 
 
-def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, source_ids=None, focus='', hops=1):
+def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, source_ids=None, focus='', hops=1, traversal='all', config=None):
     """Cached GETs never connect; explicit refresh reads authorized declarations."""
     import yaml
     from ..catalog import CATALOG_VERSION, DeclaredCatalog, declared_catalog, semantic_catalog, write_catalog, read_semantic_catalog
@@ -647,7 +660,7 @@ def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, sou
     from ..metadata import publish_metadata
     from ..runtime.config import open_sources
     from ..store import GraphStore
-    config = workspace.resolved_config(pid)
+    config = config if config is not None else workspace.resolved_config(pid)
     output = Path(config.output_dir)
     path = output / "metadata.yaml"
     adapters = []
@@ -766,7 +779,7 @@ def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, sou
             if _metadata_context(workspace.resolved_config(pid), project) != context:
                 raise LightGraphError("input_dependency_changed")
             _save(output / "metadata-context.json", context)
-        graph = _metadata_neighborhood(view,focus,hops) if focus else _bounded_view(view, "metadata")
+        graph = _metadata_neighborhood(view,focus,hops,traversal) if focus else _bounded_view(view, "metadata")
         tables = [{"id": t.source_id + "." + t.qualified_name,
                    **t.model_dump(mode="json", by_alias=True)} for t in declared.tables]
         missing_sources = sorted({s.id for s in config.sources} - {s.source_id for s in declared.sources})

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+import os
 import uuid
 import re
 from typing import Literal
@@ -24,7 +25,7 @@ from starlette.staticfiles import StaticFiles
 
 from lightgraph.errors import LightGraphError
 from .workspace import Workspace
-from .execution import RunManager, read_graph, read_graph_details, read_metadata, identity_review, resolve_identity
+from .execution import RunManager, read_graph, read_graph_details, read_graph_consistently, read_metadata, identity_review, resolve_identity
 from .credentials import SessionCredentials
 from .saved_connections import SavedConnections
 from .connection_drafts import SaveConnectionDraft
@@ -188,6 +189,10 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
 
     @app.exception_handler(LightGraphError)
     async def safe_error(request,exc):
+        from .config_validation import ConfigValidationError
+        if isinstance(exc, ConfigValidationError):
+            return JSONResponse({'error': {'code': exc.code, 'diagnostics': exc.diagnostics}},
+                                status_code=400, headers={'Cache-Control': 'no-store'})
         return error_response(exc.code,error_status(exc.code))
 
     @app.exception_handler(RequestValidationError)
@@ -205,11 +210,21 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         workspace.get(pid)
         if manager.active(pid):raise LightGraphError('project_run_active')
 
-    def resolved_credentials(pid, token, *, source_ids=None, profile_errors=None):
+    def resolved_credentials(pid, token, *, source_ids=None, profile_errors=None, model_errors=None,
+                             include_model=True):
         if not token:
             return {}, None
         config=workspace.resolved_config(pid)
-        sources,model=credentials.resolve(pid,token,config)
+        sources,_=credentials.resolve(pid,token,config)
+        # The saved profile is authoritative across refreshes and open tabs.
+        # A deleted key must never be revived from another session's cache.
+        try:
+            model=saved_connections.load_model(pid,config) if include_model else None
+        except LightGraphError as exc:
+            if model_errors is None or not exc.code.startswith('saved_connection_'):
+                raise
+            model_errors.append(exc.code)
+            model=None
         for source in config.sources:
             if source_ids is not None and source.id not in source_ids:
                 continue
@@ -229,11 +244,18 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     def credential_status(pid, token):
         # A broken profile must not block editing other sources or model settings.
         # Execution still requires every needed profile to load successfully.
-        errors={}
-        sources, model=resolved_credentials(pid,token,profile_errors=errors)
+        errors={}; model_errors=[]
+        sources, model=resolved_credentials(pid,token,profile_errors=errors,model_errors=model_errors)
         result={'database_sources':sorted(sources),'model':model is not None}
+        if model_errors:
+            result['model_error']=model_errors[0]
         if errors:
             result['database_errors']=errors
+        # A server-configured key is usable without a browser-saved profile.
+        # Expose presence only; it cannot be deleted by the model-key endpoint.
+        environment_name=workspace.resolved_config(pid).resolved_model.api_key_env
+        if os.environ.get(environment_name):
+            result['model_environment']=True
         return result
 
     @app.get('/api/health')
@@ -308,14 +330,18 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     def model_credential(pid:str,data:ModelCredential,x_workbench_session:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
-            credentials.set_model(pid,x_workbench_session,workspace.resolved_config(pid),data.api_key.get_secret_value())
+            credentials.require(pid,x_workbench_session)
+            saved_connections.save_model(pid,workspace.resolved_config(pid),data.api_key.get_secret_value())
+            credentials.clear_model_sessions(pid)
             return credential_status(pid,x_workbench_session)
 
     @app.delete('/api/projects/{pid}/credentials/model')
     def clear_model_credential(pid:str,x_workbench_session:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
-            credentials.clear_model(pid,x_workbench_session)
+            credentials.require(pid,x_workbench_session)
+            saved_connections.delete_model(pid)
+            credentials.clear_model_sessions(pid)
             return credential_status(pid,x_workbench_session)
 
     @app.post('/api/projects/{pid}/database/test')
@@ -382,7 +408,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             source=next(s for s in workspace.resolved_config(pid).sources if s.id==data.source_id)
             credentials.set_source(pid,x_workbench_session,source,dsn)
             try:
-                secrets_by_source,_=resolved_credentials(pid,x_workbench_session,source_ids={data.source_id})
+                secrets_by_source,_=resolved_credentials(pid,x_workbench_session,source_ids={data.source_id},include_model=False)
                 metadata=read_metadata(workspace,pid,refresh=True,source_credentials=secrets_by_source,
                                        source_ids=[data.source_id])
                 # Commit the profile only after metadata succeeds. A failed
@@ -604,23 +630,20 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     def refresh_metadata(pid:str,x_workbench_session:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
-            sources,_=resolved_credentials(pid,x_workbench_session)
+            sources,_=resolved_credentials(pid,x_workbench_session,include_model=False)
             options={'source_credentials':sources} if sources else {}
             return read_metadata(workspace,pid,refresh=True,**options)
 
     @app.get('/api/projects/{pid}/graph')
-    def graph(pid:str,layer:str='business',include_candidates:bool=False,offset:int=0,limit:int=240,q:str='',kind:str='',focus:str='',hops:int=1):
+    def graph(pid:str,layer:str='business',include_candidates:bool=False,offset:int=0,limit:int=240,q:str='',kind:str='',focus:str='',hops:int=1,traversal:str='all'):
         if layer not in ('business','metadata'):raise LightGraphError('graph_layer_invalid')
-        if hops not in (1,2):raise LightGraphError('graph_page_invalid')
-        with workspace.lock(pid):
-            workspace.get(pid)
-            return read_graph(workspace,pid,layer,include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus,hops=hops)
+        if hops not in (1,2) or traversal not in ('all','chains'):raise LightGraphError('graph_page_invalid')
+        return read_graph_consistently(workspace,pid,read_graph,layer=layer,
+            include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus,hops=hops,traversal=traversal)
 
     @app.get('/api/projects/{pid}/graph/details')
     def graph_details(pid:str,entity_id:str|None=None,fact_id:str|None=None,include_candidates:bool=False,offset:int=0):
-        with workspace.lock(pid):
-            workspace.get(pid)
-            return read_graph_details(workspace,pid,entity_id=entity_id,fact_id=fact_id,
+        return read_graph_consistently(workspace,pid,read_graph_details,entity_id=entity_id,fact_id=fact_id,
                                       include_candidates=include_candidates,offset=offset)
 
     @app.get('/api/projects/{pid}/graph/identity-candidates')

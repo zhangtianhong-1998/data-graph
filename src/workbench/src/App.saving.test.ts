@@ -97,12 +97,14 @@ describe('完整配置与修订', () => {
     expect(root.querySelector<HTMLTextAreaElement>('#advanced-config')!.value).toBe(draft)
     expect(writes()).toHaveLength(1); expect(button('重新加载配置')).toBeDefined()
   })
-  it('同时修改普通表单和 JSON 时让用户选择，不隐式覆盖任一份', async () => {
-    await ready(); button('抽取目标').click(); await nextTick(); await edit('#purpose', '普通表单草稿')
-    await editAdvanced({ ...config, scopes: ['public', 'draft'] }); button('保存并开始抽取').click()
-    await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('表单和完整 JSON 都有修改'))
-    expect(writes()).toEqual([]); button('抽取目标').click(); await nextTick()
-    expect(root.querySelector<HTMLTextAreaElement>('#purpose')!.value).toBe('普通表单草稿')
+  it('合并表单和 JSON 对不同字段的修改后再启动', async () => {
+    await ready(); await editAdvanced({ ...config, scopes: ['public', 'draft'] })
+    button('抽取目标').click(); await nextTick(); await edit('#purpose', '普通表单草稿')
+    button('保存并开始抽取').click()
+    await vi.waitFor(() => expect(writes().map(r => r.url)).toEqual(['/api/projects/p/config', '/api/projects/p/runs']))
+    expect(config.goal_markdown).toBe('普通表单草稿')
+    expect(config.scopes).toEqual(['public', 'draft'])
+    expect(root.querySelector('.error-strip')).toBeNull()
   })
   it('旧目标转为 Markdown，既有程序权限和类型约束不会被文字修改解除', async () => {
     config.goal!.entity_kinds = ['Person']; config.goal!.relation_kinds = ['knows']
