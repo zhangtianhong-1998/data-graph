@@ -60,3 +60,31 @@ def test_missing_fact_is_not_an_empty_success(data):
     from lightgraph.errors import LightGraphError
     with pytest.raises(LightGraphError, match="graph_item_not_found"):
         views.graph_details(SimpleNamespace(isolation_domain="default"), fact_id="missing")
+
+
+def test_search_includes_identity_and_aliases_but_not_provenance(data):
+    data['nodes'][0].update(identity={'机构': '华东分部', '设备编号': 'EQ-102'},
+                            aliases=['Assembly Robot'], display_label='装配机器人')
+    data['nodes'][0]['provenance'][0]['internal_marker'] = 'PRIVATE-MARKER'
+    for query in ('华东分部', 'eq-102', 'assembly robot', '装配机器人'):
+        assert [node['id'] for node in views.graph_page(None, q=query)['nodes']] == ['0']
+    assert views.graph_page(None, q='PRIVATE-MARKER')['matched_nodes'] == 0
+
+
+def test_details_explain_actual_visible_mapping_without_inventing_revision(data):
+    origin = {'definition': '设备', 'mapping': 2,
+              'source': {'source_id': 'factory', 'schema': 'public', 'table': 'equipment'},
+              'columns': ['org', 'code', 'name'], 'key_columns': ['org', 'code'],
+              'scope_columns': ['org'], 'label_column': 'name', 'scope_ref': 'east'}
+    data['nodes'][0]['provenance'] = [origin]
+    result = views.graph_details(None, entity_id='0')
+    support = next(s for s in result['supports'] if s['fact_id'] == '0')
+    assert support['status'] == 'accepted' and support['origin'] == 'source_query'
+    assert support['id'] == support['support_id']
+    assert support['source_binding'] == 'factory.public.equipment'
+    assert 'rule_revision' not in support
+    mapping = result['rules'][0]
+    assert mapping['identity_columns'] == ['org', 'code']
+    assert mapping['label_column'] == 'name'
+    assert mapping['source']['table'] == 'equipment'
+    assert mapping['description'] == '设备档案'

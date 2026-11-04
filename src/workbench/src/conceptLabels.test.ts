@@ -9,7 +9,8 @@ describe('concept context display', () => {
       properties: { business_code: 'ctx_unique_code' }, scopes: ['A'],
     }
     expect(nodeCaption(node)).toBe('联合适用：占用 · 梨 · 批发')
-    expect(nodeProperties(node)).toMatchObject({ label: node.label, business_code: 'ctx_unique_code', scopes: ['A'] })
+    expect(nodeProperties(node)).toMatchObject({ label: node.label, business_code: 'ctx_unique_code' })
+    expect(nodeProperties(node)).not.toHaveProperty('scopes')
     expect(nodeCaption({ id: 'ordinary', label: '收入 | 费用-差额' })).toBe('收入 | 费用-差额')
   })
 

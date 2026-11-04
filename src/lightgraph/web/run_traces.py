@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.retention import atomic_text
+from lightgraph.construction.trace import reclassify_trace_event
 
 _readers = {}
 _reader_lock = threading.RLock()
@@ -61,7 +62,7 @@ def _read_event(stream, item):
             raise ValueError
     except (ValueError, TypeError):
         raise LightGraphError('run_trace_invalid') from None
-    return event
+    return reclassify_trace_event(event)
 
 
 def _index(trace, index, *, offset=0, limit=0, view='all'):
@@ -94,7 +95,7 @@ def _index(trace, index, *, offset=0, limit=0, view='all'):
             include = True
             if view != 'all':
                 kind = item.get('kind')
-                if kind is None:
+                if kind is None or kind == 'tool_result':
                     cache_key = (item['seq'], item['offset'], item['length'])
                     with _kind_lock:
                         kind = kinds.get(cache_key)

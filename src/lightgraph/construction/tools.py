@@ -59,7 +59,7 @@ class ConstructionTools:
             for adapter in self.adapters:
                 executor = ToolExecutor(adapter, config.goal, budget, documents=self.documents,
                     allow_source_samples=config.resolved_model.mode in {"in_environment", "approved_external"},
-                    source_adapters=mapping)
+                    source_adapters=mapping, include_document_context=False)
                 for source_id in executor._local_source_ids:
                     self.executors[source_id] = executor
             self.tables = {key: table for executor in self.executors.values()
@@ -124,7 +124,7 @@ class ConstructionTools:
                     "next_action": "Read draft_schema and revise this draft. Other drafts are retained."}
             except LightGraphError as exc:
                 return {"status": "error", "code": exc.code,
-                        "next_action": "Correct the affected request or retain it as unresolved; other drafts remain available."}
+                        "next_action": "Correct the affected request. Record only unmet user requirements as unresolved; optional suggestions are not blockers. Other drafts remain available."}
             except (TypeError, ValueError, KeyError):
                 return {"status": "error", "code": "invalid_construction_arguments"}
             except Exception:
@@ -317,7 +317,9 @@ class ConstructionTools:
         current = self.workspace.record_validation(draft_id, revision=record.revision,
             passed=result["passed"], diagnostics=result["diagnostics"], metrics=result["metrics"],
             evidence_refs=[evidence.ref], graph=graph)
-        return {"status": "ok", "state": current.status, **result,
+        from .statistics import graph_statistics
+        statistics = graph_statistics(filter_graph_scopes(graph, self.config.scopes))
+        return {"status": "ok", "state": current.status, **result, "statistics": statistics,
                 "evidence_ref": evidence.ref, "candidate_graph": relative,
                 "semantic_assessment": "agent_authored", "published": False}
 
@@ -349,10 +351,11 @@ class ConstructionTools:
         publication = self.workspace.publish(draft_id, revision=record.revision, graph=graph)
         manifest = self.workspace.read_summary()
         merged = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes)
+        from .statistics import graph_statistics
         return {"status": "ok", "draft_id": draft_id, "publication": publication,
                 "graph": "manifest.yaml:current_graph", "publications": len(manifest['publications']),
                 "nodes": len(merged['nodes']), "edges": len(merged['edges']),
-                "semantic_assessment": "agent_authored"}
+                "statistics": graph_statistics(merged), "semantic_assessment": "agent_authored"}
 
     def _check_current_inputs(self):
         try:
@@ -365,4 +368,13 @@ class ConstructionTools:
 
     def read_workspace(self, draft_id: str | None = None):
         value = self.workspace.get_draft(draft_id).model_dump(mode="json", by_alias=True) if draft_id else self.workspace.read_summary()
+        if draft_id is None:
+            from .statistics import graph_statistics
+            try:
+                graph = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes)
+                value['statistics'] = graph_statistics(graph)
+            except LightGraphError as exc:
+                if exc.code != 'stale_published_graph':
+                    raise
+                value['statistics_status'] = 'stale_published_graph'
         return {"status": "ok", "format": "yaml", "content": dump_yaml(value)}

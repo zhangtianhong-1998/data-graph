@@ -161,7 +161,8 @@ def test_runtime_failure_keeps_published_revision_when_new_candidate_exists(tmp_
     assert report.rules_published == ['资料对象']
     assert report.counts['rules_published'] == 1
     assert report.counts['business_nodes'] == 2
-    assert report.issues == [{'code': 'scripted_transport_failed', 'status': 'partial'}]
+    assert {'code': 'scripted_transport_failed', 'status': 'partial'} in report.issues
+    assert any(i['code'] == 'construction_goal_gap' and i['message'] == '新增属性仍需证据' for i in report.issues)
     workspace = scripted_bridge['tools'].workspace
     assert workspace.get_draft('资料对象').status == 'candidate'
     assert workspace.read_summary()['publications'][0]['revision'] == 1

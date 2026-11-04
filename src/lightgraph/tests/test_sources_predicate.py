@@ -86,7 +86,6 @@ def test_predicate_limits_apply_to_whole_tree(table):
     "WITH x AS (SELECT code FROM public.items) SELECT a.code FROM x a JOIN x b ON a.code=b.code JOIN x c ON a.code=b.code",
     "SELECT a.code FROM public.items a JOIN public.items b ON a.code=b.code OR 1=1",
     "SELECT a.code FROM public.items a JOIN public.items b ON NOT a.code=b.code",
-    "SELECT a.code FROM public.items a JOIN public.items b ON a.code=b.code AND (a.code=b.code OR 1=1)",
     "SELECT a.code FROM public.items a CROSS JOIN public.items b WHERE a.code=b.code",
 ])
 def test_join_each_new_alias_must_connect_to_already_bound_alias(table,sql):

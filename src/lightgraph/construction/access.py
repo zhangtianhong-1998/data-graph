@@ -2,6 +2,7 @@
 from copy import deepcopy
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
+from .display import derive_display_graph
 
 
 def ensure_supported_access(config) -> None:
@@ -102,8 +103,7 @@ def filter_graph_scopes(graph, scopes):
         labels = sorted({support['label'] for support in supports if support.get('label') is not None})
         aliases = sorted({alias for support in supports for alias in support.get('aliases', [])})
         properties, provenance = attributes(supports)
-        fallback = next(reversed(node.get('identity', {}).values()), node['id'])
-        nodes.append({**deepcopy(node), 'label': labels[0] if labels else str(fallback),
+        nodes.append({**deepcopy(node), 'label': labels[0] if labels else '',
             'aliases': aliases, 'properties': properties, 'provenance': provenance,
             'supports': supports, 'scopes': sorted({support['scope_ref'] for support in supports})})
     visible = {node['id'] for node in nodes}
@@ -120,6 +120,6 @@ def filter_graph_scopes(graph, scopes):
     entity_types = {node['type'] for node in nodes}
     relation_types = {edge['type'] for edge in edges}
     definitions = graph.get('definitions', {})
-    return {**deepcopy(graph), 'nodes': nodes, 'edges': edges,
+    return derive_display_graph({**deepcopy(graph), 'nodes': nodes, 'edges': edges,
         'definitions': {'entities': [deepcopy(item) for item in definitions.get('entities', []) if item['type'] in entity_types],
-                        'relations': [deepcopy(item) for item in definitions.get('relations', []) if item['type'] in relation_types]}}
+                        'relations': [deepcopy(item) for item in definitions.get('relations', []) if item['type'] in relation_types]}})

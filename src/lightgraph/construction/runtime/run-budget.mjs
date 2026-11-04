@@ -2,6 +2,7 @@
  * No transport parsing or business inference is performed by this plugin.
  */
 import { writeFileSync, renameSync, appendFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 
 export const name = 'graph-run-budget'
 export const inject = ['llm', 'tools', 'agents', 'tokenMeter']
@@ -15,6 +16,7 @@ export function apply(ctx, config) {
   let stopped = ''
   let diagnostic = null
   let peakInputTokens = 0
+  const executionId = randomUUID()
   const permitted = name => name.startsWith('mcp__graph__') || [
     'skill', 'session_search', 'session_event_search', 'session_trace',
     'session_event_trace', 'session_event_read',
@@ -33,6 +35,7 @@ export function apply(ctx, config) {
   function save(stopReason = '') {
     if (stopReason) stopped = stopReason
     const text = `scope: harness_llm_stream_dispatch\ncalls: ${calls}\nmax_calls: ${config.maxCalls}\n`
+      + `execution_id: '${executionId}'\n`
       + `elapsed_seconds: ${(performance.now() - start) / 1000}\nstop_reason: '${stopped}'\n`
       + `estimated_input_peak: ${peakInputTokens}\ninput_diagnostic: ${JSON.stringify(diagnostic)}\n`
     writeFileSync(`${config.output}.tmp`, text, { encoding: 'utf8', mode: 0o600 })
@@ -76,15 +79,35 @@ export function apply(ctx, config) {
       throw error
     }
     calls += 1
+    const dispatchIndex = calls
     save()
     if (config.requestLog) {
       const { provider, model, messages, tools, system, maxTokens, temperature, reasoningEffort } = options
       const record = { type: 'model/request', seq: calls, time: Date.now(),
+        execution_id: executionId,
         purpose: options.purpose ?? 'agent', session_id: options.sessionId,
         estimated_input_tokens: estimate, measurement: basis, exact: false,
         request: { provider, model, messages, tools, system, maxTokens, temperature, reasoningEffort } }
       appendFileSync(config.requestLog, JSON.stringify(record) + '\n', { encoding: 'utf8', mode: 0o600 })
     }
-    try { yield* next() } finally { save() }
+    let usage = null
+    let finish = null
+    try {
+      for await (const chunk of next()) {
+        // Usage chunks are cumulative for one request; only the last sample
+        // counts. Cache buckets are disjoint in the native TokenUsage contract.
+        if (chunk.type === 'usage') usage = chunk.usage
+        if (chunk.type === 'finish') finish = chunk.reason?.kind ?? null
+        yield chunk
+      }
+    } finally {
+      if (config.usageLog) appendFileSync(config.usageLog, JSON.stringify({
+        type: 'model/usage', seq: dispatchIndex, time: Date.now(),
+        execution_id: executionId,
+        session_id: options.sessionId, purpose: options.purpose ?? 'agent',
+        usage, finish_reason: finish,
+      }) + '\n', { encoding: 'utf8', mode: 0o600 })
+      save()
+    }
   })
 }

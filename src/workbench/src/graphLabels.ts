@@ -40,8 +40,10 @@ const properties: Record<string, string> = {
   json_array_columns: '数组字段', source: '来源', identity_columns: '身份字段', attribute_columns: '属性字段',
   properties: '属性', conflicts: '属性冲突', property: '属性', values: '取值',
   hierarchy_columns: '层位字段', reference_columns: '关联字段', concept_columns: '概念字段',
-  namespace_columns: '命名空间字段', source_columns: '来源端字段', target_columns: '目标端字段',
+  namespace_columns: '命名空间字段', source_columns: '使用字段', target_columns: '目标端字段',
   code: '编码字段', key_column: '身份编码字段',
+  identity: '业务身份', source_key_columns: '来源端身份字段', target_key_columns: '目标端身份字段',
+  scope_columns: '可见范围字段', label_column: '名称字段',
 }
 const chinese = (value: string) => /[\u3400-\u9fff]/.test(value)
 export function vocabularyLabel(category: keyof DisplaySchema, raw: unknown, schema: DisplaySchema = {}): string {
@@ -51,7 +53,7 @@ export function vocabularyLabel(category: keyof DisplaySchema, raw: unknown, sch
   // Descriptions are definitions, not invented translations. Long definitions
   // remain available as tooltips and in the detail panel.
   const builtin = (category === 'relations' ? relations : category === 'entity_types' ? kinds : properties)[name]
-  const declared = entry?.display_label || builtin || entry?.description
+  const declared = entry?.display_label || builtin || (chinese(name) ? name : entry?.description)
   if (declared && chinese(declared)) {
     // Prefer the definition's own opening name/clause, without inventing a translation.
     const opening = declared.split(/[：:，,；;。\n]/, 1)[0].trim()
@@ -73,9 +75,17 @@ export function mergeDisplaySchema(...schemas: Array<DisplaySchema | undefined>)
   return result
 }
 export const nodeCaption = (node: GraphNode) => String([node.display_label, node.label, node.name].find(value => value && value !== node.id) || '未命名节点')
+export function nodeIdentity(node: GraphNode): Record<string, unknown> {
+  return node.identity && typeof node.identity === 'object' && !Array.isArray(node.identity) ? node.identity as Record<string, unknown> : {}
+}
+export function nodeSearchText(node: GraphNode): string {
+  return [nodeCaption(node), node.kind || '', ...Object.entries(nodeIdentity(node)).flat(),
+    ...(Array.isArray(node.aliases) ? node.aliases : [])].map(String).join(' ').toLocaleLowerCase()
+}
 export function nodeProperties(node: GraphNode): Record<string, unknown> {
   const fields = Object.fromEntries(Object.entries(node).filter(([key, value]) =>
-    !['id', 'kind', 'layer', 'status', 'display_label', 'display_label_basis', 'entity_members', 'members', 'support_ids', 'fact_ids', 'properties'].includes(key) &&
+    !['id', 'type', 'kind', 'layer', 'status', 'display_label', 'display_label_basis', 'label_origin', 'identity', 'scopes',
+      'provenance', 'supports', 'entity_members', 'members', 'support_ids', 'fact_ids', 'properties'].includes(key) &&
     !(key === 'label' && value === node.id) && !(key === 'conflicts' && Array.isArray(value) && !value.length)))
   return { ...fields, ...(node.properties && typeof node.properties === 'object' ? node.properties : {}) }
 }

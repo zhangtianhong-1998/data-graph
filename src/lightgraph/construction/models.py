@@ -18,6 +18,15 @@ class EntityMapping(SourceMapping):
     key_columns: list[str] = Field(min_length=1, max_length=32)
     label_column: str | None = None
     alias_columns: list[str] = Field(default_factory=list, max_length=32)
+    display_columns: dict[str, str] = Field(default_factory=dict, max_length=32,
+        description='Optional display component names mapped to physical columns; never changes identity.')
+
+    @field_validator('display_columns')
+    @classmethod
+    def nonempty_display_columns(cls, value):
+        if any(not name.strip() or not column.strip() for name, column in value.items()):
+            raise ValueError('invalid_display_column')
+        return value
 
 
 class EntityDefinition(StrictModel):
@@ -25,6 +34,8 @@ class EntityDefinition(StrictModel):
     description: str = Field(default="", max_length=4000)
     key_names: list[str] = Field(min_length=1, max_length=32)
     mappings: list[EntityMapping] = Field(min_length=1, max_length=128)
+    display_mode: Literal['auto', 'identity', 'relations'] = Field(default='auto',
+        description='For objects without a source label: derive from visible relations or the complete identity. Explicit source labels always take precedence.')
 
     @model_validator(mode="after")
     def consistent_key_arity(self):
@@ -58,7 +69,12 @@ class GraphDraft(StrictModel):
     relations: list[RelationDefinition] = Field(default_factory=list, max_length=128)
     evidence_refs: list[str] = Field(default_factory=list, max_length=512)
     rationale: str = Field(default="", max_length=8000)
-    unresolved: list[str] = Field(default_factory=list, max_length=128)
+    unresolved: list[str] = Field(default_factory=list, max_length=128,
+        description="Only unmet requirements of the current user goal. Empty when covered; never invent missing work.")
+    decisions: list[str] = Field(default_factory=list, max_length=128,
+        description="Evidence-backed choices already applied; these do not prevent completion.")
+    suggestions: list[str] = Field(default_factory=list, max_length=128,
+        description="Optional future improvements outside the current goal; these do not prevent completion.")
 
     @field_validator("draft_id")
     @classmethod

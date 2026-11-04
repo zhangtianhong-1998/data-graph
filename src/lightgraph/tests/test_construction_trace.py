@@ -2,7 +2,7 @@
 from copy import deepcopy
 
 from lightgraph.construction.runner import _trace_event
-from lightgraph.construction.trace import project_harness_event
+from lightgraph.construction.trace import project_harness_event, reclassify_trace_event, summarize_harness_usage
 from lightgraph.runtime.trace import bind_trace
 from lightgraph.web.run_traces import AGENT_EVENTS
 
@@ -78,3 +78,55 @@ def test_run_callback_emits_existing_workbench_kinds_in_native_order():
     assert [kind for kind, _ in recorded] == ["agent_start", "model_error", "agent_end"]
     assert recorded[1][1]["diagnostic"]["error"]["code"] == "timeout"
     assert all(data["native"] for _, data in recorded)
+
+
+def test_pruner_replacement_is_history_edit_with_original_content_preserved():
+    event = native("tool/result", {"turn": 1, "step": 2, "message": {
+        "toolCallId": "call-1", "content": [{"type": "text", "text": "shortened"}]}}, seq=104)
+    event["payload"]["event"].update(surfaceOp={"op": "replace", "startSeq": 13, "endSeq": 13}, sourceEventSeqs=[13])
+    before = deepcopy(event)
+    kind, data = project_harness_event(event)
+    assert kind == "context_history_edit" and kind not in AGENT_EVENTS
+    assert data["source_event_seqs"] == [13] and data["call_id"] == "call-1"
+    assert data["native"] == before and event == before
+    old = {"seq": 150, "kind": "tool_result", "data": {"native": event, "content": "unchanged archive"}}
+    corrected = reclassify_trace_event(old)
+    assert corrected["kind"] == "context_history_edit"
+    assert corrected["data"]["recorded_kind"] == "tool_result"
+    assert old["kind"] == "tool_result" and old["data"]["content"] == "unchanged archive"
+
+
+def test_usage_includes_summaries_cache_and_retry_attempts_without_double_counting(tmp_path):
+    import json
+    session = tmp_path / "session.jsonl"
+    events = [{"type": "session", "id": "s"},
+        {"type": "assistant/attempt", "seq": 1, "data": {"turn": 1, "step": 1, "stream": [
+            {"type": "chunk", "chunk": {"type": "usage", "usage": {"inputTokens": 10, "outputTokens": 2}}}]}},
+        {"type": "llm/retry-started", "seq": 2, "data": {"turn": 1, "step": 1}},
+        {"type": "assistant/message", "seq": 3, "data": {"turn": 1, "step": 1, "usage": {
+            "inputTokens": 20, "cacheReadTokens": 80, "cacheWriteTokens": 5, "outputTokens": 4, "totalTokens": 109}}},
+        {"type": "compaction/summary", "seq": 4, "data": {"llmStreamCall": True, "usage": {
+            "inputTokens": 3, "cacheReadTokens": 7, "outputTokens": 6, "totalTokens": 16}}},
+        {"type": "tool/result", "seq": 5, "data": {}, "surfaceOp": {"op": "replace"}}]
+    session.write_text(''.join(json.dumps(e) + '\n' for e in events))
+    requests = tmp_path / "requests.jsonl"
+    requests.write_text(''.join(json.dumps({"seq": i, "session_id": "s"})+'\n' for i in range(1,4)))
+    usage = summarize_harness_usage([session, session], request_trace=requests, session_id="s")
+    assert usage["complete"] and usage["measured_calls"] == 3
+    assert usage["input_tokens"] == 125 and usage["output_tokens"] == 12 and usage["total_tokens"] == 137
+    assert usage["max_input_tokens"] == 105
+    assert usage["by_purpose"]["compaction"]["total_tokens"] == 16
+
+
+def test_dispatch_usage_missing_provider_counters_and_resumed_session_are_explicit(tmp_path):
+    import json
+    usage_file, requests = tmp_path / "usage.jsonl", tmp_path / "requests.jsonl"
+    rows = [{"seq": 1, "session_id": "s", "execution_id": "old", "usage": {"inputTokens": 900, "outputTokens": 900}},
+            {"seq": 1, "session_id": "s", "execution_id": "now", "purpose": "compaction", "usage": {"inputTokens": 10, "outputTokens": 1}},
+            {"seq": 2, "session_id": "s", "execution_id": "now", "usage": None}]
+    usage_file.write_text(''.join(json.dumps(e)+'\n' for e in rows))
+    requests.write_text(''.join(json.dumps({k:v for k,v in e.items() if k != "usage"})+'\n' for e in rows))
+    usage = summarize_harness_usage([], usage_trace=usage_file, request_trace=requests, session_id="s", execution_id="now")
+    assert usage["input_tokens"] == 10 and usage["total_tokens"] == 11
+    assert usage["measured_calls"] == 1 and usage["missing_usage_calls"] == 1
+    assert usage["dispatched_calls"] == 2 and not usage["complete"]

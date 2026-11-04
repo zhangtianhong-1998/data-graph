@@ -25,6 +25,7 @@ export function traceContext(event: TraceEvent): string {
   if (data.dispatch_index) items.push(`模型调用第 ${data.dispatch_index} 次`)
   if (data.harness_turn) items.push(`会话第 ${data.harness_turn} 轮`)
   if (data.harness_step) items.push(`执行第 ${data.harness_step} 步`)
+  if (event.kind === 'context_history_edit') items.push('更新历史上下文')
   if (data.call_id) items.push(`工具调用 ${data.call_id}`)
   return items.join(' · ')
 }
@@ -79,6 +80,12 @@ export function traceBlocks(event: TraceEvent): TraceBlock[] {
   if (event.kind === 'tool_result') {
     const content = array(data.content)
     return content.length ? content.map((item, index) => ({ title: `工具返回 ${index + 1} · ${traceToolName(event)}`, value: record(item).text ?? item })) : [{ title: '工具返回', value: data }]
+  }
+  if (event.kind === 'context_history_edit') {
+    const content = array(data.content)
+    return [{ title: '历史结果压缩', value: '工具没有重新执行。原始结果仍保留在完整轨迹中，此记录更新后续模型读取的上下文。' },
+      { title: '被替换的原生记录', value: data.source_event_seqs ?? [] },
+      ...content.map((item, index) => ({ title: `压缩后内容 ${index + 1}`, value: record(item).text ?? item }))]
   }
   if (event.kind === 'agent_start') {
     const blocks = [{ title: 'Agent 系统指令', value: data.system }, { title: 'Agent 初始材料', value: data.packet }].filter(block => block.value != null)

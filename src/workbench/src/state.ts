@@ -22,7 +22,15 @@ export function graphOutcome(report: unknown): string {
     case 'entities_and_relations': return `已发布 ${data.counts?.business_nodes ?? 0} 个业务实体、${data.counts?.business_edges ?? 0} 条业务关系。`
     case 'not_requested': return '本次仅发现规则，未执行图谱实例化。'
     case 'unavailable': return '未能读取业务图谱状态，请查看运行问题。'
-    default: return ''
+    default: {
+      // Earlier construction reports have business counts but no legacy graph
+      // classification. Counts describe published output, not task acceptance.
+      const nodes = data.counts?.business_nodes, edges = data.counts?.business_edges
+      if (Number.isSafeInteger(nodes) && nodes! > 0 && Number.isSafeInteger(edges) && edges! >= 0) {
+        return edges! > 0 ? `已发布 ${nodes} 个业务实体、${edges} 条业务关系。` : `已发布 ${nodes} 个业务实体，尚未确认实体间关系。`
+      }
+      return ''
+    }
   }
 }
 export const stageLabel = (stage: string): string => ({ queued: '等待启动', starting: '初始化', initializing: '初始化', metadata: '读取元数据', discovery: '发现对象与属性', validation: '验证规则', relations: '发现补充关系', extraction: '抽取图谱', extracting: '正在执行抽取', publishing: '发布结果', completed: '处理完成', finished: '运行结束', cleanup: '释放运行资源' } as Record<string, string>)[stage] || stage || '—'

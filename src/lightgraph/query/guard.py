@@ -38,12 +38,22 @@ class ValidatedQuery:
     operator: str = "select"
     result_columns: tuple[str, ...] = ()
     scan_estimate: int | None = None
+    derived_count_sources: tuple[str, ...] = ()
     def __repr__(self) -> str:
         return f"ValidatedQuery(operator={self.operator!r}, parameters={len(self.parameters)})"
     def __reduce_ex__(self, protocol):
         raise LightGraphError("ephemeral_serialization_forbidden")
 
 class SQLGuard:
+    @staticmethod
+    def _conjuncts(expression):
+        """Only an unconditional AND term can establish a bounded join."""
+        if isinstance(expression, exp.Paren):
+            return SQLGuard._conjuncts(expression.this)
+        if isinstance(expression, exp.And):
+            return SQLGuard._conjuncts(expression.left) + SQLGuard._conjuncts(expression.right)
+        return [expression]
+
     def __init__(self, tables: Iterable[TableSpec], *, dialect: str = "postgres",
                  physical_columns: Mapping[str, Iterable[str]] | None = None):
         self.tables = {t.qualified_name: t for t in tables}
@@ -116,12 +126,9 @@ class SQLGuard:
                     on = node.args.get("on")
                     if node.args.get("kind") == "CROSS" or on is None:
                         raise ValueError
-                    parts = list(on.flatten()) if isinstance(on, exp.And) else [on]
-                    if not parts or any(not isinstance(part, exp.EQ) or
-                        not isinstance(part.left, exp.Column) or not isinstance(part.right, exp.Column) or
-                        not part.left.table or not part.right.table or part.left.table == part.right.table
-                        for part in parts):
-                        raise LightGraphError("unbounded_join_forbidden")
+                    # Authorization below requires an equality connecting the
+                    # newly joined source. Other read-only predicates may narrow
+                    # that join without changing ON/WHERE (notably LEFT JOIN).
                 if isinstance(node, exp.Offset):
                     raise ValueError
                 if isinstance(node, exp.Cast) and node.args["to"].sql().lower() not in SAFE_TYPES:
@@ -129,7 +136,10 @@ class SQLGuard:
                 if isinstance(node, exp.Placeholder) and node.name not in (parameters or {}):
                     raise ValueError
             self._authorize(tree)
-            return ValidatedQuery(sql, dict(parameters or {}), operator, tuple(result_columns))
+            derived = tuple(sorted({node.alias_or_name.casefold() for node in tree.find_all(exp.CTE)
+                                    if node.alias_or_name}))
+            return ValidatedQuery(sql, dict(parameters or {}), operator, tuple(result_columns),
+                                  derived_count_sources=derived)
         except LightGraphError:
             raise
         except Exception:
@@ -146,11 +156,14 @@ class SQLGuard:
                 if not alias or alias in bound:
                     raise LightGraphError("invalid_join_alias")
                 on = join.args.get("on")
-                parts = list(on.flatten()) if isinstance(on, exp.And) else [on]
+                parts = self._conjuncts(on)
                 connected = False
                 for part in parts:
+                    if any(column.table and column.table not in bound | {alias}
+                           for column in part.find_all(exp.Column)):
+                        raise LightGraphError("unbound_join_alias")
                     if not isinstance(part, exp.EQ) or not isinstance(part.left, exp.Column) or not isinstance(part.right, exp.Column):
-                        raise LightGraphError("unbounded_join_forbidden")
+                        continue
                     left, right = part.left.table, part.right.table
                     if {left, right} - (bound | {alias}):
                         raise LightGraphError("unbound_join_alias")

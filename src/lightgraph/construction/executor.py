@@ -11,6 +11,7 @@ from lightgraph.query import QueryCompiler
 from lightgraph.sources.base import aggregate_count
 from .models import GraphDraft
 from .access import scope_binding_map, support_scope
+from .display import derive_display_graph
 
 
 def _projection_columns(mapping):
@@ -19,6 +20,7 @@ def _projection_columns(mapping):
     columns = list(keys) + list(mapping.properties.values())
     if hasattr(mapping, 'alias_columns'):
         columns += mapping.alias_columns
+        columns += list(mapping.display_columns.values())
         if mapping.label_column:
             columns.append(mapping.label_column)
     return list(dict.fromkeys(columns))
@@ -164,6 +166,9 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             support['label'] = str(value) if value is not None else None
             support['aliases'] = sorted({str(row[column]) for column in mapping.alias_columns
                                          if row[column] is not None})
+            if mapping.display_columns:
+                support['display_values'] = {name: row[column] for name, column in mapping.display_columns.items()
+                                             if row[column] is not None}
         return support
 
     def properties(item, mapping, row):
@@ -206,6 +211,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                         support['key_columns'] = mapping.key_columns
                         if mapping.label_column:
                             support['label_column'] = mapping.label_column
+                        if mapping.display_columns:
+                            support['display_columns'] = mapping.display_columns
                         for row in rows:
                             clock()
                             key = key_for(row, mapping.key_columns)
@@ -216,7 +223,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                             previous = len(canonical(node).encode()) if node is not None else 0
                             if node is None:
                                 node = nodes[node_id] = {'id': node_id, 'type': entity.type,
-                                    'label': str(label) if label is not None else str(key[-1]),
+                                    'label': str(label) if label is not None else '',
                                     'label_observed': label is not None,
                                     'identity': dict(zip(entity.key_names, key)), 'aliases': [],
                                     'properties': {}, 'provenance': [], 'supports': []}
@@ -324,4 +331,4 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     return {'passed': passed, 'diagnostics': diagnostics,
             'metrics': {'mappings_checked': checked, 'projected_distinct_rows': projected_rows,
                         'nodes': len(nodes), 'edges': len(edges), 'equal_endpoints_omitted': omitted},
-            'graph': graph}
+            'graph': derive_display_graph(graph)}

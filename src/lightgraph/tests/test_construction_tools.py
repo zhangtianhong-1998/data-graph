@@ -228,6 +228,28 @@ def test_material_pages_issue_only_read_sections_and_removed_documents_are_hidde
         assert 'RuleSpec' not in schema and 'EntityMapping' in schema
     finally:
         tools.close()
+
+
+def test_probes_do_not_repeat_document_bodies_or_issue_unread_section_evidence(tmp_path):
+    config = config_for(tmp_path)
+    path = tmp_path / 'guide.md'
+    text = 'DOCUMENT_BODY_ONLY_WHEN_REQUESTED ' * 50
+    path.write_text('---\nid: guide\npurpose: data_description\n---\n# 定义\n' + text, encoding='utf-8')
+    config.documents = [str(path)]
+    tools = ConstructionTools(config, tmp_path / 'work')
+    try:
+        table = tools.describe_sources()['tables'][0]['table']
+        for _ in range(2):
+            probe = tools.call('inspect_source', table=table, operation='execute_readonly_sql',
+                arguments={'sql': 'SELECT COUNT(*) AS count FROM public."资料"'})
+            assert probe['status'] == 'ok'
+            assert 'DOCUMENT_BODY_ONLY_WHEN_REQUESTED' not in str(probe)
+        assert not any(':section_' in ref for ref in tools.workspace.read_summary()['evidence_refs'])
+        material = tools.call('read_material', name='document:guide')
+        assert 'DOCUMENT_BODY_ONLY_WHEN_REQUESTED' in str(material)
+        assert material['evidence_refs']
+    finally:
+        tools.close()
     config.removed_document_ids = ['guide']
     removed = ConstructionTools(config, tmp_path / 'removed')
     try:

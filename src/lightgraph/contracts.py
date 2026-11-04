@@ -460,6 +460,36 @@ class ValidationRecord(StrictModel):
     status: Literal["validated", "unresolved", "rejected", "deferred"]
     codes: list[str] = Field(default_factory=list)
 
+class ConstructionCheckSummary(StrictModel):
+    passed: bool | None = None
+    metrics: dict[str, int | float | bool] = Field(default_factory=dict)
+    diagnostics: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ConstructionDraftSummary(StrictModel):
+    draft_id: str
+    revision: int
+    status: str
+    entity_types: int = 0
+    relation_types: int = 0
+    mappings: int = 0
+    unresolved: list[str] = Field(default_factory=list)
+    decisions: list[str] = Field(default_factory=list)
+    suggestions: list[str] = Field(default_factory=list)
+    validation: ConstructionCheckSummary = Field(default_factory=ConstructionCheckSummary)
+
+
+class ConstructionSummary(StrictModel):
+    """Recorded work and deterministic results, separate from formal acceptance."""
+    drafts: list[ConstructionDraftSummary] = Field(default_factory=list)
+    summary: dict[str, int] = Field(default_factory=dict)
+    execution: dict[str, str] = Field(default_factory=dict)
+    acceptance: dict[str, str] = Field(default_factory=lambda: {
+        'independent_gold': 'not_run', 'customer_database': 'not_run'})
+    statistics: dict[str, Any] = Field(default_factory=dict)
+    usage: dict[str, Any] = Field(default_factory=dict)
+
+
 class RunReport(StrictModel):
     run_id: str
     status: Literal["COMPLETED", "COMPLETED_WITH_GAPS", "PARTIAL", "FAILED"] = "COMPLETED"
@@ -468,3 +498,4 @@ class RunReport(StrictModel):
     issues: list[dict[str, str | int]] = Field(default_factory=list)
     counts: dict[str, int | float] = Field(default_factory=dict)
     validation: dict[str, str] = Field(default_factory=lambda: {"E": "not_run", "D": "not_run", "I": "not_run"})
+    construction: ConstructionSummary | None = None

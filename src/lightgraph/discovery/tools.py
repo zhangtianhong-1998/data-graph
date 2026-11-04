@@ -37,7 +37,7 @@ _SAFE_ERRORS = frozenset({
     "invalid_tool_arguments", "unknown_tool", "metadata_only_query_forbidden",
     "executor_closed", "invalid_result_limit", "invalid_aggregate_shape",
     "memory_budget_exhausted", "query_timeout", "query_cancelled",
-    "query_execution_failed", "query_budget_exhausted", "run_time_budget_exhausted",
+    "query_execution_failed", "query_authorization_failed", "query_budget_exhausted", "run_time_budget_exhausted",
     "returned_rows_budget_exhausted", "returned_bytes_budget_exhausted",
     "db_cu_budget_exhausted", "wall_time_budget_exhausted", "source_closed",
     "source_value_type_unsupported", "non_finite_source_value", "result_truncated",
@@ -64,11 +64,12 @@ class ToolExecutor:
 
     def __init__(self, adapter, goal: ExtractionGoal, budget: BudgetAllocator,
                  documents=None, allow_source_samples: bool = False, allowed_tables=None,
-                 source_adapters=None):
+                 source_adapters=None, include_document_context=True):
         self.adapter = adapter
         self.goal = goal
         self.budget = budget
         self.allow_source_samples = allow_source_samples
+        self.include_document_context = include_document_context
         self.documents = documents if isinstance(documents, DocumentCorpus) else DocumentCorpus(documents or ())
         self._closed = False
         self._sequence = 0
@@ -237,7 +238,7 @@ class ToolExecutor:
             if name not in {"get_metadata", "search_knowledge"} and not self.allow_source_samples:
                 raise LightGraphError("metadata_only_query_forbidden")
             response = getattr(self, "_" + name)(**arguments)
-            if self._context_tables:
+            if self._context_tables and self.include_document_context:
                 from lightgraph.context import bounded_document_window
                 visible=bounded_document_window(self.context_documents(),max_bytes=min(12000,self._max_bytes//3))
                 response['context']={'tables':self.context_tables(),'documents':visible,
@@ -267,6 +268,14 @@ class ToolExecutor:
                     "For HAVING, repeat the aggregate expression or filter an outer SELECT. "
                     "Unknown objects remain forbidden; do not infer permission from this error."
                 )
+            elif code == 'unbounded_join_forbidden':
+                result['guidance'] = ('Each JOIN must contain an unconditional equality between the new '
+                    'table alias and an already bound alias. Additional filters may narrow that join. '
+                    'OR/NOT around the only equality does not establish a bound. Writes remain forbidden.')
+            elif code == 'query_authorization_failed':
+                result['guidance'] = ('The source authorization layer rejected this read after SQL validation. '
+                    'Retain the probe for adapter diagnosis; read the authorized catalog and use a simpler '
+                    'explicit projection if needed. Do not disable source permissions.')
             elif code in {"unauthorized_object", "unauthorized_column", "ambiguous_column"}:
                 result["guidance"] = (
                     "Call get_metadata with no table argument to list the authorized catalog. "

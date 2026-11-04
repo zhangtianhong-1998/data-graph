@@ -234,13 +234,30 @@ class GraphWorkspace:
         entry = self._manifest()["drafts"].get(draft_id)
         if entry is None:
             raise LightGraphError("unknown_graph_draft")
-        record = DraftRecord.model_validate(self._read_record(entry["current"]))
+        payload = self._read_record(entry['current'])
+        record = DraftRecord.model_validate(payload)
         if (record.draft.draft_id != draft_id
-                or digest(record.draft.model_dump(mode="json", by_alias=True)) != record.fingerprint):
+                or digest(payload['draft']) != record.fingerprint):
             raise LightGraphError("invalid_graph_workspace_record")
         if record.context_fingerprint != self.context_fingerprint:
             return record.model_copy(update={"status": "stale", "validation": None})
         return record
+
+    def _draft_record_payload(self, record: DraftRecord) -> dict:
+        """Keep the signed historical draft shape when only state changes.
+
+        Adding optional schema defaults must not rewrite an old draft while
+        retaining its old fingerprint. Explicit save_draft creates a revision
+        with the current schema and a new fingerprint instead.
+        """
+        payload = record.model_dump(mode='json', by_alias=True)
+        if digest(payload['draft']) != record.fingerprint:
+            entry = self._manifest()['drafts'][record.draft.draft_id]
+            original = self._read_record(entry['current'])['draft']
+            if digest(original) != record.fingerprint:
+                raise LightGraphError('invalid_graph_workspace_record')
+            payload['draft'] = original
+        return payload
 
     def record_validation(self, draft_id: str, *, revision: int, passed: bool,
                           diagnostics: list[dict] | None = None, metrics: dict | None = None,
@@ -262,7 +279,7 @@ class GraphWorkspace:
                                            "validation": validation})
         manifest = self._manifest()
         # Do not overwrite the candidate or the previous validation attempt.
-        relative = self._append_record("drafts", record)
+        relative = self._append_record("drafts", self._draft_record_payload(record))
         entry = manifest["drafts"][draft_id]
         entry["history"].append(relative)
         entry["current"] = relative
@@ -308,7 +325,7 @@ class GraphWorkspace:
                                      'access_fingerprint': merged.get('access_fingerprint'),
                                      'path': self._append_record('published', merged)}
         published_record = record.model_copy(update={'status': 'published'})
-        relative = self._append_record('drafts', published_record)
+        relative = self._append_record('drafts', self._draft_record_payload(published_record))
         manifest['drafts'][draft_id]['history'].append(relative)
         manifest['drafts'][draft_id]['current'] = relative
         self._save_manifest(manifest)
@@ -342,6 +359,9 @@ class GraphWorkspace:
                 "drafts": [{"draft_id": item.draft.draft_id, "revision": item.revision,
                             "status": item.status, "entity_types": len(item.draft.entities),
                             "relation_types": len(item.draft.relations),
+                            "mappings": sum(len(d.mappings) for d in item.draft.entities + item.draft.relations),
+                            "decisions": item.draft.decisions,
+                            "suggestions": item.draft.suggestions,
                             "unresolved": item.draft.unresolved,
                             "validation": item.validation.model_dump(mode="json") if item.validation else None}
                            for item in self.list_drafts()],
@@ -374,6 +394,9 @@ def _merge_graphs(graphs):
                 result['evidence_refs'].append(ref)
         for category in definitions:
             for definition in graph.get('definitions', {}).get(category, []):
+                definition = deepcopy(definition)
+                if category == 'entities':
+                    definition.setdefault('display_mode', 'auto')
                 previous = definitions[category].get(definition['type'])
                 if previous is not None and previous != definition:
                     raise LightGraphError('published_definition_conflict')
@@ -424,4 +447,5 @@ def _merge_graphs(graphs):
         if relation.get('acyclic') and _has_cycle({(edge['source'], edge['target'])
                 for edge in result['edges'] if edge['type'] == relation['type']}):
             raise LightGraphError('published_relation_cycle')
-    return result
+    from .display import derive_display_graph
+    return derive_display_graph(result)

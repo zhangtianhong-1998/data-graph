@@ -186,5 +186,25 @@ def test_legacy_kind_cache_does_not_reread_all_payloads_on_each_poll(client,monk
     sink('tool_result',{'name':'check_fd','content':[]})
     calls.clear()
     assert client.get(path).json()['total_events']==24
-    assert calls==[1,2]  # Append reuses old kinds; new entries include the kind.
+    assert calls==[24,1,2]  # Inspect a newly appended tool_result once for legacy pruning.
+    calls.clear()
+    assert client.get(path).json()['total_events']==24
+    assert calls==[1,2]  # Cached classifications retain no result payloads.
     assert sink.index_path.read_text().startswith(original)
+
+
+def test_old_harness_pruning_is_reclassified_without_changing_export(client):
+    rid, _, sink = seed(client)
+    event = {"method": "session.event", "payload": {"sessionId": "s", "event": {
+        "type": "tool/result", "seq": 104, "surfaceOp": {"op": "replace", "startSeq": 13, "endSeq": 13},
+        "sourceEventSeqs": [13], "data": {"message": {"toolCallId": "call1", "content": [{"type": "text", "text": "pruned"}]}}}}}
+    sink('tool_result', {'native': event})
+    before = sink.path.read_bytes()
+    path = f'/api/projects/p/runs/{rid}/trace'
+    assert client.get(path+'?view=agent').json()['total_events'] == 23
+    runtime = client.get(path+'?view=runtime').json()
+    assert runtime['total_events'] == 1
+    assert runtime['events'][0]['kind'] == 'context_history_edit'
+    assert client.get(path+'?view=all&offset=23').json()['events'][0]['data']['source_event_seqs'] == [13]
+    assert client.get(path+'/export').content == before
+    assert sink.path.read_bytes() == before

@@ -105,7 +105,7 @@ def resolved_options(options: HarnessOptions) -> HarnessOptions:
 
 def profile_patch(config_path: Path, workspace: Path, options: HarnessOptions,
                   base_ids: tuple[str, ...] = (), *, mcp_url: str | None = None,
-                  mcp_token_env: str | None = None) -> list[dict]:
+                  mcp_token_env: str | None = None, goal: str = "") -> list[dict]:
     """Build an sdk-minimal overlay containing no shell or unrestricted file tools."""
     home = workspace / "harness"
     from lightgraph.runtime.model_endpoint import output_token_field
@@ -164,11 +164,15 @@ def profile_patch(config_path: Path, workspace: Path, options: HarnessOptions,
             "path": str(home / "session-index.sqlite"), "openAt": "first-search"}),
         row("graph-session-query-tool", "tool-session-query"),
         *([row("graph-domain-tools", "mcp-client", mcp_config)] if mcp_config is not None else []),
+        {"id": "graph-context-contract", "name": str(assets / "context-contract.mjs"),
+         "config": {"goal": goal,
+                    "skillPath": str(Path(__file__).parent / "skills/build-graph/SKILL.md")}},
         {"id": "graph-run-budget", "name": str(assets / "run-budget.mjs"),
          "config": {"maxCalls": options.max_calls,
                     "maxInputTokens": options.max_input_tokens,
                     "maxRunSeconds": options.max_run_seconds,
                     "requestLog": str(home / "model-requests.jsonl"),
+                    "usageLog": str(home / "model-usage.jsonl"),
                     "output": str(home / "budget.yaml")}},
     ]
     safe_base = {"sdk-app-startup", "sdk-jsonrpc-server", "deepseek-llm-api-extensions",
@@ -195,7 +199,8 @@ def profile_patch(config_path: Path, workspace: Path, options: HarnessOptions,
 
 def prepare_runtime(config_path: str | Path, workspace: str | Path,
                     options: HarnessOptions, *, inspect_base: bool = True,
-                    mcp_url: str | None = None, mcp_token_env: str | None = None) -> Path:
+                    mcp_url: str | None = None, mcp_token_env: str | None = None,
+                    goal: str = "") -> Path:
     """Write only non-secret launch settings; retain all existing session history."""
     workspace = Path(workspace).resolve()
     config_path = Path(config_path).resolve()
@@ -206,7 +211,7 @@ def prepare_runtime(config_path: str | Path, workspace: str | Path,
     base_ids = _base_profile(options, home) if inspect_base else ()
     path = home / "graph.patch.yaml"
     path.write_text(yaml.dump(profile_patch(config_path, workspace, options, base_ids,
-                             mcp_url=mcp_url, mcp_token_env=mcp_token_env),
+                             mcp_url=mcp_url, mcp_token_env=mcp_token_env, goal=goal),
                              Dumper=_ProfileDumper, allow_unicode=True, sort_keys=False), encoding="utf-8")
     return path
 
@@ -278,7 +283,7 @@ def run_goal(goal: str, config_path: str | Path, workspace: str | Path,
             raise LightGraphError("construction_mcp_required")
         options = resolved_options(options)
     patch = prepare_runtime(config_path, workspace, options, inspect_base=sdk_factory is None,
-                            mcp_url=mcp_url, mcp_token_env=mcp_token_env)
+                            mcp_url=mcp_url, mcp_token_env=mcp_token_env, goal=goal)
     factory = sdk_factory or _sdk_factory(options)
     version = None
     if sdk_factory is None and options.dsh_bin:
@@ -317,6 +322,9 @@ def run_goal(goal: str, config_path: str | Path, workspace: str | Path,
         kwargs["dsh_bin"] = options.dsh_bin
     # The SDK inherits environment variables; no credential is serialized in the patch.
     request_path = workspace / "harness/model-requests.jsonl"
+    # Empty ledgers distinguish zero admitted calls from missing telemetry.
+    request_path.touch(exist_ok=True)
+    (workspace / "harness/model-usage.jsonl").touch(exist_ok=True)
     request_offset = request_path.stat().st_size if request_path.exists() else 0
     event_lock = threading.RLock()
     def drain_requests():
@@ -380,4 +388,6 @@ def run_goal(goal: str, config_path: str | Path, workspace: str | Path,
             "session_directory": str(workspace / "harness" / "sessions"),
             "trace_files": [str(path) for path in trace_files],
             "request_trace": str(request_path) if request_path.exists() else None,
+            "usage_trace": str(workspace / "harness/model-usage.jsonl")
+                if (workspace / "harness/model-usage.jsonl").exists() else None,
             "budget": budget, "graph_acceptance": "read_published_artifact"}

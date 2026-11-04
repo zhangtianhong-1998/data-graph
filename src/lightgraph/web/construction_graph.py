@@ -43,7 +43,7 @@ def load_graph(config):
     graph = filter_graph_scopes(graph, config.scopes)
     graph["nodes"] = [{**n, "kind": n["type"], "layer": "business", "status": "accepted"}
                       for n in graph.get("nodes", [])]
-    graph["edges"] = [{**e, "relation": e["type"], "status": "accepted"}
+    graph["edges"] = [{**e, "relation": e["type"], "status": "accepted", "qualifiers": e.get("properties", {})}
                       for e in graph.get("edges", [])]
     return graph
 
@@ -54,6 +54,15 @@ def vocabulary(graph):
                              for e in definitions.get("entities", [])],
             "relations": [{"name": e["type"], "description": e.get("description", "")}
                           for e in definitions.get("relations", [])], "properties": []}
+
+
+def _search_text(node):
+    """Search visible business values; never provenance IDs or hidden supports."""
+    values = [node.get("display_label", ""), node.get("label", ""), node.get("kind", "")]
+    values.extend(node.get("aliases", []))
+    for name, value in node.get("identity", {}).items():
+        values.extend((name, value))
+    return " ".join(str(value) for value in values).casefold()
 
 
 def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", focus="", hops=1,
@@ -67,7 +76,7 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
     selected = nodes
     if q:
         needle = q.casefold()
-        selected = [n for n in selected if needle in n.get("label", "").casefold() or needle in n["kind"].casefold()]
+        selected = [n for n in selected if needle in _search_text(n)]
     if kind:
         selected = [n for n in selected if n["kind"] == kind]
     reached = {focus} if focus else set()
@@ -110,9 +119,14 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             return
         selected.append({"id": identifier, "fact_kind": kind, "status": "accepted", "payload": payload})
         for index, source in enumerate(provenance):
-            supports.append({"support_id": digest(identifier, index), "fact_id": identifier,
-                             "rule_id": source.get("definition", ""), "rule_revision": 1,
-                             "binding": source, "scope_ref": source.get('scope_ref', 'public')})
+            binding = source.get("source", {})
+            location = ".".join(str(binding.get(key, "")) for key in ("source_id", "schema", "table") if binding.get(key))
+            support_id = digest(identifier, index)
+            supports.append({"id": support_id, "support_id": support_id, "fact_id": identifier,
+                             "status": "accepted", "origin": "source_query",
+                             "rule_id": source.get("definition", ""),
+                             "source_binding": location, "binding": source,
+                             "scope_ref": source.get('scope_ref', 'public')})
 
     def property_origins(node, name, value):
         origins = []
@@ -152,7 +166,22 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
     fact_ids = {f["id"] for f in facts}
     endpoints = {f["payload"].get(k) for f in facts for k in ("source", "target", "entity_id")}
     retained = [s for s in supports if s["fact_id"] in fact_ids]
-    return {"facts": facts, "supports": retained[:500], "rules": [],
+    # Describe the actual visible supports, not a newer unvalidated draft. Old
+    # publications may lack mapping revision numbers; do not invent revision 1.
+    mappings = {}
+    descriptions = {item["type"]: item.get("description", "") for group in ("entities", "relations")
+                    for item in graph.get("definitions", {}).get(group, [])}
+    for support in retained[:500]:
+        source = support["binding"]
+        key = digest(source)
+        mappings[key] = {"definition": source.get("definition", ""),
+            "description": descriptions.get(source.get("definition"), ""),
+            "source": source.get("source", {}), "mapping_index": source.get("mapping"),
+            "identity_columns": source.get("key_columns", []),
+            "reference_columns": {name: source[name] for name in ("source_key_columns", "target_key_columns") if name in source},
+            "source_columns": source.get("columns", []), "scope_columns": source.get("scope_columns", []),
+            "label_column": source.get("label_column"), "scope_ref": support["scope_ref"]}
+    return {"facts": facts, "supports": retained[:500], "rules": list(mappings.values()),
             "nodes": [n for n in graph["nodes"] if n["id"] in endpoints], "display_schema": vocabulary(graph),
             "total_facts": len(selected), "total_supports": len(retained), "supports_truncated": len(retained) > 500,
             "next_offset": offset + len(facts) if offset + len(facts) < len(selected) else None,

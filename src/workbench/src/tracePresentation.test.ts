@@ -43,4 +43,12 @@ describe('actual recorded agent conversation', () => {
     expect(traceContext(call)).toBe('会话第 1 轮 · 执行第 3 步 · 工具调用 call-1')
     expect(traceBlocks(call)[0]!.value).toBe('{}')
   })
+  it('labels a pruned replacement as a history update, preserving its source link', () => {
+    const replacement = event('context_history_edit', { call_id: 'call-1', source_event_seqs: [13],
+      content: [{ type: 'text', text: 'pruned history' }] })
+    expect(traceBlocks(replacement)[0]!.value).toContain('工具没有重新执行')
+    expect(traceBlocks(replacement)[1]!.value).toEqual([13])
+    expect(traceBlocks(replacement)[2]!.value).toBe('pruned history')
+    expect(traceContext(replacement)).toContain('更新历史上下文')
+  })
 })

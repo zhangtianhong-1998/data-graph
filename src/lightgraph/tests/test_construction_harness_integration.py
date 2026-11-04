@@ -32,7 +32,8 @@ def respond(handler, delta, reason):
          "model": "loopback-model", "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
         {"id": "request1", "object": "chat.completion.chunk", "created": 1,
          "model": "loopback-model", "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
-         "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}},
+         "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+                   "prompt_tokens_details": {"cached_tokens": 60}}},
     ]:
         handler.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
     handler.wfile.write(b"data: [DONE]\n\n")
@@ -62,6 +63,11 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
                 delta = {"role": "assistant", "tool_calls": [{"index": 0, "id": "call1",
                     "type": "function", "function": {"name": "mcp__graph__describe_sources", "arguments": "{}"}}]}
                 reason = "tool_calls"
+            elif 'Graph checkpoint rules:' in json.dumps(request['messages'][-1]):
+                # An intentionally bad checkpoint tests that generated notes
+                # cannot replace the original goal/skill in the next request.
+                delta = {"role": "assistant", "content": "## Pending Jobs\nMUST_REPLACE_GOAL_WITH_INVENTED_UNRESOLVED"}
+                reason = "stop"
             else:
                 delta = {"role": "assistant", "content": "已读取数据源清单。"}
                 reason = "stop"
@@ -125,6 +131,8 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
             assert result["budget"]["input_diagnostic"]["estimated_input_tokens"] > input_limit
         request_events = [event for event in events if event["method"] == "model.request"]
         assert len(request_events) == len(requests)
+        assert all('Graph checkpoint rules:' in json.dumps(event['payload']['request']['messages'][-1])
+                   for event in request_events if event['payload']['purpose'] == 'compaction')
         if requests:
             assert request_events[0]["payload"]["request"]["model"] == "loopback-model"
         assert any(event["method"] == "session.event" for event in events)
@@ -132,6 +140,16 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
             assert any(event.get("payload", {}).get("event", {}).get("type") == "llm/retry" for event in events)
         assert list((tmp_path / "harness/sessions").rglob("*.jsonl"))
         assert token not in (tmp_path / "harness/graph.patch.yaml").read_text()
+        from lightgraph.construction.trace import summarize_harness_usage, project_harness_event
+        usage = summarize_harness_usage(result["trace_files"], request_trace=result["request_trace"],
+            usage_trace=result["usage_trace"], session_id=result["session_id"],
+            execution_id=result["budget"]["execution_id"])
+        successful = len(requests) - int(fail_first)
+        assert usage["input_tokens"] == 100 * successful
+        assert usage["cache_read_tokens"] == 60 * successful
+        assert usage["output_tokens"] == 20 * successful
+        assert usage["total_tokens"] == 120 * successful
+        assert usage["missing_usage_calls"] == int(fail_first)
         assert "vendor/deepseek-harness" in result["sdk_source"].replace("\\", "/")
         if large_result:
             kinds = [e.get("payload", {}).get("event", {}).get("type") for e in events]
@@ -141,6 +159,25 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
                 assert len(requests) >= 3  # Summary dispatches are part of the same call budget.
             assert all("RETRIEVABLE_MIDDLE_MARKER" not in json.dumps(r) for r in requests[1:])
             assert any("RETRIEVABLE_MIDDLE_MARKER" in Path(path).read_text() for path in result["trace_files"])
+            replacements = [project_harness_event(e) for e in events if e.get('method') == 'session.event']
+            assert any(kind == 'context_history_edit' for kind, _ in replacements)
+            compacted = [i for i, request in enumerate(requests)
+                         if 'Graph checkpoint rules:' in json.dumps(request['messages'][-1])]
+            if compacted:
+                assert usage['by_purpose']['compaction']['measured_calls'] == len(compacted)
+                after = requests[compacted[0] + 1]
+                system = '\n'.join(str(m.get('content')) for m in after['messages'] if m['role'] == 'system')
+                assert '发现授权数据中的对象与关系' in system
+                assert 'Pinned build-graph skill (verbatim)' in system
+                assert 'Unresolved may be empty' in system
+                assert 'not new user' in system
+                # The bad checkpoint remains recorded and visible as notes;
+                # the original higher-priority contract is preserved verbatim.
+                assert 'MUST_REPLACE_GOAL_WITH_INVENTED_UNRESOLVED' in json.dumps(after)
+                first_system = '\n'.join(str(m.get('content')) for m in requests[0]['messages'] if m['role'] == 'system')
+                assert system == first_system
+                assert any('MUST_REPLACE_GOAL_WITH_INVENTED_UNRESOLVED' in Path(path).read_text()
+                           for path in result['trace_files'])
     finally:
         server.should_exit = True
         thread.join(timeout=10)

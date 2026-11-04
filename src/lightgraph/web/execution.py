@@ -91,6 +91,16 @@ def _safe_issue(item):
         or key in _ISSUE_ENUMS and value in _ISSUE_ENUMS[key]}
     if type(item.get('count')) is int and item['count']>=0:
         safe['count']=item['count']
+    categories = {'construction_goal_gap': 'goal_gap', 'construction_decision': 'decision',
+                  'construction_suggestion': 'suggestion'}
+    if item.get('code') in categories and item.get('category') == categories[item['code']]:
+        # These are explicit draft statements, never exception bodies. The
+        # source/transport error paths retain their existing closed diagnostics.
+        safe['category'] = item['category']
+        if isinstance(item.get('message'), str):
+            safe['message'] = item['message'][:8000]
+    if item.get('code') in {*categories, 'construction_unpublished_draft', 'construction_draft_validation_failed'} and isinstance(item.get('draft_id'), str):
+        safe['draft_id'] = item['draft_id'][:80]
     if item.get('code')=='model_protocol_diagnostic':
         from ..discovery.llm import MODEL_PROTOCOL_STAGES, MODEL_PROTOCOL_CODES, MODEL_PROTOCOL_FIELDS
         from ..discovery.validation_feedback import _path

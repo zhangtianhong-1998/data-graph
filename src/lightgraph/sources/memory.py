@@ -19,6 +19,7 @@ class MemorySource(SourceAdapter):
         self.query_budget = query_budget or QueryBudget()
         self._tables = [t.model_copy(deep=True) for t in tables]
         self._lock = threading.RLock(); self._depth = 0; self._cancelled = False
+        self._derived_count_sources = frozenset()
         self._db = sqlite3.connect(":memory:", check_same_thread=False)
         self._db.execute("PRAGMA temp_store=MEMORY")
         self._db.execute("PRAGMA cache_size=-16384")
@@ -58,6 +59,12 @@ class MemorySource(SourceAdapter):
         allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_TRANSACTION}
         if action not in allowed: return sqlite3.SQLITE_DENY
         if action == sqlite3.SQLITE_READ:
+            # SQLite can authorize COUNT(*) over a materialized CTE as a
+            # zero-column read without a database name. Only names from the
+            # currently revalidated query qualify; physical reads still pass
+            # the catalog/column check and this grant ends with the cursor.
+            if db is None and arg2 == '' and (arg1 or '').casefold() in self._derived_count_sources:
+                return sqlite3.SQLITE_OK
             table = next((t for t in self._tables if t.schema_name == db and t.name == arg1), None)
             if table is None or arg2 and arg2 not in table.column_names: return sqlite3.SQLITE_DENY
         if action == sqlite3.SQLITE_FUNCTION and (arg2 or "").lower() not in {"count", "sum", "min", "max", "length", "coalesce", "abs", "like", "typeof"}:
@@ -79,21 +86,27 @@ class MemorySource(SourceAdapter):
             if self._closed: raise LightGraphError("source_closed")
             # Revalidate against this source's catalog; validated queries are not
             # transferable authority between adapters.
-            self.compiler.guard.validate(query.sql, query.parameters)
+            validated = self.compiler.guard.validate(query.sql, query.parameters)
             self.query_budget.charge_query()
             start = time.monotonic(); self._cancelled = False; cursor = self._db.cursor()
             self.stats.queries += 1
             self._db.set_progress_handler(lambda: int(self._cancelled or (time.monotonic() - start) * 1000 > self.limits.timeout_ms or time.monotonic() > self.query_budget.deadline), 500)
+            previous_derived = self._derived_count_sources
+            self._derived_count_sources = frozenset(validated.derived_count_sources)
             try:
                 cursor.execute(query.sql, query.parameters)
                 columns = tuple(d[0] for d in cursor.description)
                 yield from cursor_batches(cursor, limits=self.limits, columns=columns, row_limit=row_limit or self.limits.max_result_rows, stats=self.stats, deadline=start + self.limits.timeout_ms / 1000, cancelled=lambda: self._cancelled, budget=self.query_budget)
             except LightGraphError: raise
-            except sqlite3.Error:
+            except sqlite3.Error as exc:
                 self.query_budget.check_time()
-                code = "query_cancelled" if self._cancelled else "query_timeout" if (time.monotonic()-start)*1000 > self.limits.timeout_ms else "query_execution_failed"
+                code = ("query_cancelled" if self._cancelled else
+                        "query_timeout" if (time.monotonic()-start)*1000 > self.limits.timeout_ms else
+                        "query_authorization_failed" if getattr(exc, 'sqlite_errorcode', None) == sqlite3.SQLITE_AUTH else
+                        "query_execution_failed")
                 raise LightGraphError(code) from None
             finally:
+                self._derived_count_sources = previous_derived
                 cursor.close(); self._db.set_progress_handler(None, 0)
                 self.stats.elapsed_seconds += time.monotonic() - start
     def cancel(self, query_id=None): self._cancelled = True; self._db.interrupt()

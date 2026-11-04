@@ -16,6 +16,28 @@ beforeEach(() => { api.request.mockReset(); vi.stubGlobal('ResizeObserver', clas
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('业务图来源与归并裁决', () => {
+  it('业务身份用于定位，可见范围与来源支持不混入业务属性', async () => {
+    mount(GraphCanvas, { graph: { nodes: [{ id: 'hash', label: '采购物流成本', kind: '报表项', status: 'accepted',
+      identity: { 经营主体: '鲜果连锁', 报表项编码: 'RTL_PNL_1410' }, aliases: ['Procurement Logistics'],
+      properties: { 单位: ['元'] }, scopes: ['public'], provenance: [{ secret_id: 'source-marker' }], supports: [{ fact_id: 'support-marker' }],
+    }], edges: [] }, layer: 'business' })
+    const node = root.querySelector('.graph-node')!
+    expect(node.querySelector('title')?.textContent).toContain('经营主体：鲜果连锁')
+    node.dispatchEvent(new MouseEvent('click', { bubbles: true })); await nextTick()
+    const detail = root.querySelector('.graph-detail')!
+    expect(detail.textContent).toContain('业务身份')
+    expect(detail.textContent).toContain('可见范围：public')
+    const tables = [...detail.querySelectorAll('.property-table')].map(table => table.textContent).join(' ')
+    expect(tables).toContain('RTL_PNL_1410')
+    expect(tables).not.toContain('source-marker')
+    expect(tables).not.toContain('support-marker')
+    const input = root.querySelector<HTMLInputElement>('[aria-label="搜索图节点"]')!
+    for (const value of ['鲜果连锁', 'rtl_pnl_1410', 'procurement logistics']) {
+      input.value = value; input.dispatchEvent(new Event('input', { bubbles: true })); await nextTick()
+      expect(root.querySelectorAll('.graph-node:not(.dimmed)')).toHaveLength(1)
+    }
+  })
+
   it('组合节点显示已验证端点名称，保留原始属性并支持画布内搜索', async () => {
     const caption = '主体=A · 指标=占用 [M0] · 产品=梨 [P1]'
     mount(GraphCanvas, { graph: { nodes: [
@@ -79,14 +101,16 @@ describe('业务图来源与归并裁决', () => {
     expect(root.textContent).toContain('匹配 1 个节点')
     expect(root.textContent).toContain('全图 1205')
   })
-  it('错误建议区分业务未决和审查协议错误，隐藏未知正文', () => {
+  it('错误建议区分业务未决和审查协议错误，未知代码可见但不透传异常正文', () => {
     mount(RunIssues, { report: { issues: [
       { code: 'semantic_claim_unresolved', table: 'public.items' },
       { code: 'semantic_claim_unresolved', table: 'public.items' },
       { code: 'semantic_review_protocol_invalid' },
       { code: 'unknown', message: '不应显示的任意正文' },
     ] } })
-    expect(root.querySelectorAll('.note')).toHaveLength(2)
+    expect(root.querySelectorAll('.note')).toHaveLength(3)
+    expect(root.textContent).toContain('unknown')
+    expect(root.textContent).toContain('暂未提供专门说明')
     expect(root.textContent).toContain('现有证据不能确认业务含义')
     expect(root.textContent).toContain('不代表业务主张已被否定')
     expect(root.textContent).not.toContain('不应显示的任意正文')

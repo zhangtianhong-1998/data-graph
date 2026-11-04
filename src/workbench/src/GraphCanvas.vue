@@ -8,7 +8,7 @@ import type { Point } from './graphScene'
 import { twoHopNeighborhood } from './graphNeighborhood'
 import PropertyTable from './PropertyTable.vue'
 import TechnicalDetails from './TechnicalDetails.vue'
-import { mergeDisplaySchema, nodeCaption, nodeProperties, vocabularyDescription, vocabularyLabel } from './graphLabels'
+import { mergeDisplaySchema, nodeCaption, nodeIdentity, nodeProperties, nodeSearchText, vocabularyDescription, vocabularyLabel } from './graphLabels'
 import type { DisplaySchema } from './graphLabels'
 
 const props = defineProps<{ graph: Graph; layer: string; loading?: boolean; projectId?: string; includeCandidates?: boolean }>()
@@ -63,7 +63,7 @@ async function expandNode() {
 }
 const selected = ref<GraphNode | null>(null)
 const selectedEdge = ref<GraphEdge | null>(null)
-type Provenance = { facts: Array<{ id: string; fact_kind: string; status: string; payload: Record<string, unknown> }>; supports: Array<{ id: string; fact_id: string; status: string; origin: string; source_binding: string; rule_id: string; rule_revision: number; publication_id: string; document_ref?: string; scope_ref: string }>; rules: Array<Record<string, unknown>>; nodes?: GraphNode[]; display_schema?: DisplaySchema; next_offset: number | null; supports_truncated: boolean }
+type Provenance = { facts: Array<{ id: string; fact_kind: string; status: string; payload: Record<string, unknown> }>; supports: Array<{ id: string; fact_id: string; status: string; origin: string; source_binding: string; rule_id: string; rule_revision?: number; publication_id?: string; document_ref?: string; scope_ref: string }>; rules: Array<Record<string, unknown>>; nodes?: GraphNode[]; display_schema?: DisplaySchema; next_offset: number | null; supports_truncated: boolean }
 const details = ref<Provenance | null>(null), detailsLoading = ref(false), detailsError = ref('')
 const detailNodes = ref<Record<string, GraphNode>>({})
 const detailSchema = ref<DisplaySchema>({})
@@ -82,7 +82,7 @@ const factTitle = (fact: Provenance['facts'][number]) => fact.fact_kind === 'Pro
 const visibleQualifiers = (value: unknown) => Object.fromEntries(Object.entries((value || {}) as Record<string, unknown>).filter(([key]) => !['semantic_basis', 'document_ref', 'source_group'].includes(key)))
 const factValues = (fact: Provenance['facts'][number]) => fact.fact_kind === 'PropertyValue' ? { [String(fact.payload.name)]: fact.payload.value } : fact.fact_kind === 'Edge' ? visibleQualifiers(fact.payload.qualifiers) : { kind: kindName(fact.payload.kind) }
 const sourceSummary = (rule: Record<string, unknown>) => Object.fromEntries(Object.entries((rule.source || {}) as Record<string, unknown>).filter(([, value]) => value != null && value !== ''))
-const mappingValues = (rule: Record<string, unknown>) => Object.fromEntries(['identity_columns', 'namespace_columns', 'attribute_columns', 'hierarchy_columns', 'reference_columns', 'concept_columns'].filter(key => rule[key] && Object.keys(rule[key] as object).length).map(key => [key, rule[key]]))
+const mappingValues = (rule: Record<string, unknown>) => Object.fromEntries(['identity_columns', 'namespace_columns', 'attribute_columns', 'hierarchy_columns', 'reference_columns', 'concept_columns', 'source_columns', 'scope_columns', 'label_column'].filter(key => rule[key] && (typeof rule[key] === 'string' || Object.keys(rule[key] as object).length)).map(key => [key, rule[key]]))
 let detailGeneration = 0
 const statusName = (value?: unknown) => ({ accepted: '已接受', candidate: '候选', unresolved: '未决', conflict: '冲突' }[String(value)] || '状态未提供')
 async function loadDetails(more = false) {
@@ -148,7 +148,7 @@ const kinds = computed(() => serverPaging.value && Array.isArray(graph.value.kin
 const filtered = computed(() => graph.value.nodes.filter(n =>
   (!selectedKind.value || (n.kind || n.layer || '节点') === selectedKind.value) &&
   (!search.value || (serverPaging.value && searchMatches.value ? searchMatches.value.includes(n.id) :
-    `${n.display_label || ''} ${n.label || n.name || ''} ${n.id}`.toLowerCase().includes(search.value.toLowerCase())))))
+    nodeSearchText(n).includes(search.value.toLocaleLowerCase())))))
 // Searching highlights and locates without removing the surrounding graph.
 const visible = computed(() => graph.value.nodes.slice(0, SCENE_LIMIT))
 const positions = ref<Map<string, Point>>(new Map())
@@ -167,7 +167,12 @@ const adjacent = computed(() => {
   return [...found.values()]
 })
 const display = nodeCaption
-const scopeLabel = (node: GraphNode) => Array.isArray(node.scopes) ? node.scopes.join('、') : ''
+const labelOrigin = (node: GraphNode) => ({ declared: '名称由已声明的展示字段生成', relations: '名称由关联对象和业务身份生成', identity: '名称由业务身份生成' }[String(node.label_origin)] || '')
+const accessLabel = (node: GraphNode) => Array.isArray(node.scopes) ? node.scopes.join('、') : ''
+const scopeLabel = (node: GraphNode) => {
+  const identity = Object.entries(nodeIdentity(node))
+  return identity.length ? identity.map(([key, value]) => `${key}：${String(value)}`).join(' · ') : accessLabel(node)
+}
 const shortScope = (node: GraphNode) => { const text = scopeLabel(node); return text.length > 18 ? text.slice(0, 17) + '…' : text }
 const shortLabel = (node: GraphNode) => { const text = display(node); return text.length > 15 ? text.slice(0, 14) + '…' : text }
 const kindColor = (node: GraphNode) => ['#407ff2', '#20a27e', '#9a6add', '#da9b37', '#54a6bc'][Math.max(0, kinds.value.indexOf(String(node.kind || node.layer || '节点'))) % 5]
@@ -323,7 +328,8 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
         </template>
         <template v-else-if="selected">
           <span class="badge blue">{{ kindName(selected.kind || selected.layer) }}</span> <span class="badge" :class="selected.status === 'accepted' ? 'green' : 'amber'">{{ statusName(selected.status) }}</span>
-          <h2 class="detail-name">{{ display(selected) }}</h2>
+          <h2 class="detail-name">{{ display(selected) }}</h2><p v-if="labelOrigin(selected)" class="muted small-text">{{ labelOrigin(selected) }}</p>
+          <template v-if="Object.keys(nodeIdentity(selected)).length"><h3>业务身份</h3><PropertyTable :values="nodeIdentity(selected)" /></template><p v-if="accessLabel(selected)" class="muted small-text">可见范围：{{ accessLabel(selected) }}（访问授权，不代表业务主体）</p>
           <div class="divider"></div><h3>节点属性</h3>
           <PropertyTable :values="nodeProperties(selected)" :label="propertyName" /><TechnicalDetails :value="selected" />
           <h3>已加载关联 · {{ adjacent.length }}</h3>
@@ -344,15 +350,15 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
               <p v-if="fact.fact_kind === 'Edge'" class="relation-endpoints">{{ endpointName(fact.payload.source) }} → {{ endpointName(fact.payload.target) }}</p>
               <p v-else class="muted small-text">{{ endpointName(fact.payload.entity_id) }}</p>
               <PropertyTable :values="factValues(fact)" :label="propertyName" />
-              <div v-for="support in details.supports.filter(item => item.fact_id === fact.id)" :key="`${support.publication_id}:${support.id}`" class="support-detail">
-                <PropertyTable :values="{ '支持状态': statusName(support.status), '来源类型': originName(support.origin), '范围': support.scope_ref, '规则修订': support.rule_revision }" />
+              <div v-for="support in details.supports.filter(item => item.fact_id === fact.id)" :key="support.id" class="support-detail">
+                <PropertyTable :values="{ '支持状态': statusName(support.status), '来源类型': originName(support.origin), '可见范围': support.scope_ref, '数据位置': support.source_binding, ...(support.rule_revision != null ? { '映射修订': support.rule_revision } : {}) }" />
                 <TechnicalDetails :value="support" title="来源标识与引用" />
               </div>
               <TechnicalDetails :value="fact" title="事实标识与原始结构" />
             </article>
             <details v-if="details.rules.length" class="mapping-details"><summary>字段映射与语义依据</summary>
               <article v-for="(rule, index) in details.rules" :key="index" class="fact-detail">
-                <h4>来源字段映射 · 修订 {{ rule.revision || '未提供' }}</h4>
+                <h4>{{ rule.definition || '来源字段映射' }}<template v-if="rule.mapping_index != null"> · 映射 {{ Number(rule.mapping_index) + 1 }}</template><template v-if="rule.revision"> · 修订 {{ rule.revision }}</template></h4><p v-if="rule.description" class="muted small-text">{{ rule.description }}</p>
                 <PropertyTable :values="sourceSummary(rule)" :label="propertyName" />
                 <PropertyTable :values="mappingValues(rule)" :label="propertyName" />
                 <TechnicalDetails :value="rule" title="规则标识与证据引用" />
