@@ -16,6 +16,18 @@ beforeEach(() => { api.request.mockReset(); vi.stubGlobal('ResizeObserver', clas
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('业务图来源与归并裁决', () => {
+  it('来源详情展示位置与同一行路径上下文，不要求展开原始JSON', async () => {
+    api.request.mockResolvedValue({ facts: [{ id: 'a', fact_kind: 'NodeExistence', status: 'accepted', payload: { entity_id: 'a', kind: '报表项' } }],
+      supports: [{ id: 's1', fact_id: 'a', status: 'accepted', origin: 'source_query', source_binding: 's.public.paths', scope_ref: 'public',
+        binding: { constant_properties: { position: 'slot_b' }, row_context: { id: 'row-1', values: { path: 'path_7', parent: 'P10', child: 'P20' } } } }],
+      rules: [], next_offset: null, supports_truncated: false, total_incident_edges: 5 })
+    mount(GraphCanvas, { graph, layer: 'business', projectId: 'p' })
+    root.querySelector('.graph-node')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await vi.waitFor(() => expect(root.querySelector('.support-detail')?.textContent).toContain('同一行路径上下文'))
+    const tables = [...root.querySelectorAll('.support-detail .property-table')].map(n => n.textContent).join(' ')
+    expect(tables).toContain('slot_b'); expect(tables).toContain('path_7'); expect(tables).toContain('P10'); expect(tables).toContain('P20')
+    expect(root.querySelector('[aria-label="节点关联范围"]')?.textContent).toContain('当前授权图中共有 5 条')
+  })
   it('业务身份用于定位，可见范围与来源支持不混入业务属性', async () => {
     mount(GraphCanvas, { graph: { nodes: [{ id: 'hash', label: '采购物流成本', kind: '报表项', status: 'accepted',
       identity: { 经营主体: '鲜果连锁', 报表项编码: 'RTL_PNL_1410' }, aliases: ['Procurement Logistics'],
@@ -96,8 +108,10 @@ describe('业务图来源与归并裁决', () => {
     await vi.waitFor(() => expect(root.querySelector('.graph-node')?.getAttribute('aria-label')).toBe('新节点'))
     expect(root.querySelectorAll('.graph-node')).toHaveLength(1)
     const reads = api.request.mock.calls.filter(c => !c[0].includes('/details'))
-    expect(reads).toHaveLength(2)
+    expect(reads).toHaveLength(3)
     expect(reads[1][0]).toContain('offset=0')
+    expect(reads[2][0]).toContain('focus=fresh')
+    expect(new URL(reads[2][0], 'http://test').searchParams.has('q')).toBe(false)
     expect(root.textContent).toContain('匹配 1 个节点')
     expect(root.textContent).toContain('全图 1205')
   })

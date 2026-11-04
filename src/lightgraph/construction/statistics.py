@@ -53,6 +53,9 @@ def directed_topology(node_ids, edges):
     return {
         'nodes': len(nodes), 'edges': len(edges), 'distinct_endpoint_pairs': len(pairs),
         'roots': sum(not incoming[node] for node in nodes),
+        'nodes_without_outgoing_edges': sum(not outgoing[node] for node in nodes),
+        'isolated_nodes': sum(not incoming[node] and not outgoing[node] for node in nodes),
+        'nodes_with_incoming_and_outgoing': sum(bool(incoming[node]) and bool(outgoing[node]) for node in nodes),
         'multiple_parent_nodes': sum(len(incoming[node]) > 1 for node in nodes),
         'self_links': sum(edge['source'] == edge['target'] for edge in edges),
         'acyclic': not cyclic, 'cycle_components': cyclic_components, 'cycle_nodes': len(cyclic),
@@ -101,6 +104,8 @@ def graph_statistics(graph):
         'complete': True, 'basis': 'provided_graph_after_visibility_filter',
         'nodes': len(nodes), 'edges': len(edges), 'entity_type_count': len(kinds), 'relation_type_count': len(relations),
         'aliases': sum(item['aliases'] for item in entity_counts.values()),
+        'source_row_contexts': len({support['row_context']['id'] for item in nodes + edges
+                                   for support in item.get('supports', []) if support.get('row_context')}),
         'observed_mappings': {'entities': len(mapping_keys(nodes)), 'relations': len(mapping_keys(edges))},
         'entity_types': entity_counts, 'relation_types': relation_counts,
         'topology': directed_topology(ids, edges),

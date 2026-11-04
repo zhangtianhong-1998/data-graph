@@ -24,6 +24,7 @@ from typing import Callable
 import yaml
 
 from lightgraph.errors import LightGraphError
+from .paths import io_path, logical_path, resolve_path
 
 
 @dataclass(frozen=True)
@@ -209,15 +210,15 @@ def prepare_runtime(config_path: str | Path, workspace: str | Path,
                     mcp_url: str | None = None, mcp_token_env: str | None = None,
                     goal: str = "") -> Path:
     """Write only non-secret launch settings; retain all existing session history."""
-    workspace = Path(workspace).resolve()
-    config_path = Path(config_path).resolve()
-    if not config_path.is_file():
+    workspace = resolve_path(workspace)
+    config_path = resolve_path(config_path)
+    if not io_path(config_path).is_file():
         raise LightGraphError("construction_config_missing")
     home = workspace / "harness"
-    home.mkdir(parents=True, exist_ok=True)
+    io_path(home).mkdir(parents=True, exist_ok=True)
     base_ids = _base_profile(options, home) if inspect_base else ()
     path = home / "graph.patch.yaml"
-    path.write_text(yaml.dump(profile_patch(config_path, workspace, options, base_ids,
+    io_path(path).write_text(yaml.dump(profile_patch(config_path, workspace, options, base_ids,
                              mcp_url=mcp_url, mcp_token_env=mcp_token_env, goal=goal),
                              Dumper=_ProfileDumper, allow_unicode=True, sort_keys=False), encoding="utf-8")
     return path
@@ -282,7 +283,7 @@ def run_goal(goal: str, config_path: str | Path, workspace: str | Path,
         raise LightGraphError("construction_goal_required")
     if session_id is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
         raise LightGraphError("construction_session_id_invalid")
-    workspace = Path(workspace).resolve()
+    workspace = resolve_path(workspace)
     if sdk_factory is None:
         if mcp_url is None:
             # Product sources and their live credentials belong to the parent
@@ -313,11 +314,11 @@ def run_goal(goal: str, config_path: str | Path, workspace: str | Path,
         class Loader(yaml.SafeLoader):
             pass
         Loader.add_constructor("tag:yaml.org,2002:js", lambda loader, node: _Expression(loader.construct_scalar(node)))
-        rows = yaml.load(patch.read_text(encoding="utf-8"), Loader=Loader)
+        rows = yaml.load(io_path(patch).read_text(encoding="utf-8"), Loader=Loader)
         for plugin in rows[-1]["insert"]:
             if plugin["id"] == "graph-run-budget":
                 plugin["config"]["maxRunSeconds"] = remaining
-        patch.write_text(yaml.dump(rows, Dumper=_ProfileDumper, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        io_path(patch).write_text(yaml.dump(rows, Dumper=_ProfileDumper, allow_unicode=True, sort_keys=False), encoding="utf-8")
     session_id = session_id or "graph-" + uuid.uuid4().hex
     kwargs = dict(model=options.model, provider="graph-model",
         max_tokens=options.max_output_tokens, cwd=str(workspace), runtime_cwd=str(workspace),
@@ -329,16 +330,18 @@ def run_goal(goal: str, config_path: str | Path, workspace: str | Path,
         kwargs["dsh_bin"] = options.dsh_bin
     # The SDK inherits environment variables; no credential is serialized in the patch.
     request_path = workspace / "harness/model-requests.jsonl"
+    request_io = io_path(request_path)
+    usage_path = workspace / "harness/model-usage.jsonl"
     # Empty ledgers distinguish zero admitted calls from missing telemetry.
-    request_path.touch(exist_ok=True)
-    (workspace / "harness/model-usage.jsonl").touch(exist_ok=True)
-    request_offset = request_path.stat().st_size if request_path.exists() else 0
+    request_io.touch(exist_ok=True)
+    io_path(usage_path).touch(exist_ok=True)
+    request_offset = request_io.stat().st_size
     event_lock = threading.RLock()
     def drain_requests():
         nonlocal request_offset
-        if on_event is None or not request_path.exists():
+        if on_event is None or not request_io.exists():
             return
-        with event_lock, request_path.open("rb") as stream:
+        with event_lock, request_io.open("rb") as stream:
             stream.seek(request_offset)
             for line in stream:
                 if not line.endswith(b"\n"):
@@ -380,9 +383,11 @@ def run_goal(goal: str, config_path: str | Path, workspace: str | Path,
             stop.set()
             watcher.join(timeout=12)
             drain_requests()
-    budget_path = workspace / "harness" / "budget.yaml"
+    budget_path = io_path(workspace / "harness" / "budget.yaml")
     budget = yaml.safe_load(budget_path.read_text(encoding="utf-8")) if budget_path.exists() else {}
-    trace_files = list((workspace / "harness/sessions").glob(f"**/{session_id}/session*.jsonl"))
+    trace_files = [logical_path(path) for path in
+                   io_path(workspace / "harness/sessions").glob(f"**/{session_id}/session*.jsonl")
+                   if path.is_file()]
     if sdk_factory is None and not trace_files:
         # Upstream SDK close records some flush failures as stderr diagnostics.
         # Never report a durable session when only its lock file was created.
@@ -394,7 +399,6 @@ def run_goal(goal: str, config_path: str | Path, workspace: str | Path,
             "final_response": result.final_response,
             "session_directory": str(workspace / "harness" / "sessions"),
             "trace_files": [str(path) for path in trace_files],
-            "request_trace": str(request_path) if request_path.exists() else None,
-            "usage_trace": str(workspace / "harness/model-usage.jsonl")
-                if (workspace / "harness/model-usage.jsonl").exists() else None,
+            "request_trace": str(request_path) if request_io.exists() else None,
+            "usage_trace": str(usage_path) if io_path(usage_path).exists() else None,
             "budget": budget, "graph_acceptance": "read_published_artifact"}

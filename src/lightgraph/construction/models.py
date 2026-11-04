@@ -12,6 +12,18 @@ class SourceMapping(StrictModel):
     schema_name: str = Field(default="public", alias="schema")
     predicate: dict[str, Any] | None = None
     properties: dict[str, str] = Field(default_factory=dict, max_length=128)
+    constant_properties: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=32,
+        description='Agent-declared mapping annotations, such as the observed slot or endpoint positions. Not identity keys or source-verified values.')
+    context_columns: list[str] = Field(default_factory=list, max_length=32,
+        description='Authorized columns that identify a source-row context shared across mappings. Retained on each support, never added to entity identity. Use the same column set for related mappings.')
+
+    @model_validator(mode='after')
+    def unambiguous_property_sources(self):
+        if set(self.properties) & set(self.constant_properties):
+            raise ValueError('property_source_conflict')
+        if len(set(self.context_columns)) != len(self.context_columns):
+            raise ValueError('duplicate_context_column')
+        return self
 
 
 class EntityMapping(SourceMapping):

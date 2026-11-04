@@ -6,8 +6,9 @@ not full model inputs: only the native llm/stream hook can emit model_request.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
+
+from .paths import io_path
 
 
 def _mapping(value: Any) -> dict:
@@ -112,7 +113,7 @@ def summarize_harness_usage(trace_files, *, request_trace=None, usage_trace=None
         if not path:
             return
         try:
-            with Path(path).open(encoding="utf-8") as stream:
+            with io_path(path).open(encoding="utf-8") as stream:
                 for line in stream:
                     try:
                         value = json.loads(line)

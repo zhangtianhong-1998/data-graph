@@ -17,7 +17,7 @@ from .display import derive_display_graph
 def _projection_columns(mapping):
     keys = (mapping.key_columns if hasattr(mapping, 'key_columns') else
             mapping.source_key_columns + mapping.target_key_columns)
-    columns = list(keys) + list(mapping.properties.values())
+    columns = list(keys) + list(mapping.properties.values()) + mapping.context_columns
     if hasattr(mapping, 'alias_columns'):
         columns += mapping.alias_columns
         columns += list(mapping.display_columns.values())
@@ -155,12 +155,19 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         return {'definition': kind, 'mapping': index,
                 'source': {'source_id': mapping.source_id, 'schema': mapping.schema_name,
                            'table': mapping.table},
-                'columns': _projection_columns(mapping), 'scope_columns': scope_columns(mapping)}
+                'columns': _projection_columns(mapping), 'scope_columns': scope_columns(mapping),
+                **({'constant_properties': mapping.constant_properties} if mapping.constant_properties else {}),
+                **({'context_columns': mapping.context_columns} if mapping.context_columns else {})}
 
     def contribution(mapping, row, origin):
         support = {'scope_ref': support_scope(row, scope_columns(mapping)),
                    'provenance': origin, 'properties': {}}
         properties(support, mapping, row)
+        if mapping.context_columns:
+            # A stable content key links projections of the same authorized row
+            # context. Equal rows share evidence; this is not a physical row ID.
+            values = {name: row[name] for name in sorted(mapping.context_columns)}
+            support['row_context'] = {'id': 'ctx_' + digest(origin['source'], values), 'values': values}
         if hasattr(mapping, 'alias_columns'):
             value = row[mapping.label_column] if mapping.label_column else None
             support['label'] = str(value) if value is not None else None
@@ -172,6 +179,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         return support
 
     def properties(item, mapping, row):
+        for name, value in mapping.constant_properties.items():
+            values = item['properties'].setdefault(name, [])
+            if canonical(value) not in {canonical(v) for v in values}:
+                values.append(value)
         for name, column in mapping.properties.items():
             value = row[column]
             if value is None:

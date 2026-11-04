@@ -65,6 +65,42 @@ def _search_text(node):
     return " ".join(str(value) for value in values).casefold()
 
 
+def _focused_page(nodes, edges, focus, hops, offset, limit):
+    """Page an authorized neighborhood with its center and connecting paths."""
+    by_id = {node['id']: node for node in nodes}
+    if focus not in by_id:
+        raise LightGraphError('graph_item_not_found')
+    adjacent = {identifier: set() for identifier in by_id}
+    for edge in edges:
+        if edge['source'] in by_id and edge['target'] in by_id:
+            adjacent[edge['source']].add(edge['target'])
+            adjacent[edge['target']].add(edge['source'])
+    parents, order, frontier = {focus: None}, [focus], [focus]
+    for _ in range(hops):
+        following = []
+        for current in frontier:
+            for neighbor in sorted(adjacent[current]):
+                if neighbor not in parents:
+                    parents[neighbor] = current
+                    order.append(neighbor)
+                    following.append(neighbor)
+        frontier = following
+    retained, cursor = {focus}, offset
+    while cursor < len(order):
+        path, current = set(), order[cursor]
+        while current is not None and current not in retained:
+            path.add(current)
+            current = parents[current]
+        if len(retained | path) > limit:
+            break
+        retained |= path
+        cursor += 1
+    # A request too small to fit a connecting path must not return a repeating
+    # cursor or pretend the disconnected endpoint is a complete neighborhood.
+    next_offset = cursor if offset < cursor < len(order) else None
+    return [by_id[i] for i in order], [by_id[i] for i in order if i in retained], parents, next_offset
+
+
 def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", focus="", hops=1,
                include_candidates=False):
     if layer not in {"business", "metadata", "provenance", "all"} or offset < 0 or not 1 <= limit <= 1000 or hops not in {1, 2}:
@@ -73,35 +109,46 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
     nodes = graph["nodes"] if layer in {"business", "all"} else []
     edges = graph["edges"] if nodes else []
     counts = Counter(n["kind"] for n in nodes)
-    selected = nodes
-    if q:
+    selected, parents = nodes, {}
+    if q and not focus:
         needle = q.casefold()
         selected = [n for n in selected if needle in _search_text(n)]
-    if kind:
+    if kind and not focus:
         selected = [n for n in selected if n["kind"] == kind]
-    reached = {focus} if focus else set()
     if focus:
-        if not any(n["id"] == focus for n in nodes):
-            raise LightGraphError("graph_item_not_found")
-        for _ in range(hops):
-            adjacent = {endpoint for e in edges if e["source"] in reached or e["target"] in reached
-                        for endpoint in (e["source"], e["target"])}
-            reached |= adjacent
-        selected = [n for n in selected if n["id"] in reached]
-    page = selected[offset:offset + limit]
+        # Search chooses a center; its name/type cannot restrict its neighbors.
+        selected, page, parents, next_offset = _focused_page(nodes, edges, focus, hops, offset, limit)
+    else:
+        page = selected[offset:offset + limit]
+        next_offset = offset + len(page) if offset + len(page) < len(selected) else None
     ids = {n["id"] for n in page}
     page_edges = [e for e in edges if e["source"] in ids and e["target"] in ids]
+    if focus:
+        paths = {frozenset((child, parent)) for child, parent in parents.items() if child in ids and parent in ids}
+        backbone, remaining, seen = [], [], set()
+        for edge in page_edges:
+            pair = frozenset((edge['source'], edge['target']))
+            if pair in paths and pair not in seen:
+                backbone.append(edge)
+                seen.add(pair)
+            else:
+                remaining.append(edge)
+        page_edges = backbone + sorted(remaining, key=lambda e: focus not in (e['source'], e['target']))
     local_edges = page_edges[:3000]
     boundary = sum((e["source"] in ids) != (e["target"] in ids) for e in edges)
     return {"nodes": page, "edges": local_edges, "layer": layer,
             "total_nodes": len(nodes), "total_edges": len(edges), "matched_nodes": len(selected),
-            "offset": offset, "page_size": limit, "next_offset": offset + len(page) if offset + len(page) < len(selected) else None,
+            "offset": offset, "page_size": limit, "next_offset": next_offset,
             "truncated": len(page) < len(selected) or len(local_edges) < len(page_edges),
             "edges_truncated": len(local_edges) < len(page_edges), "matched_edges": len(page_edges),
             "boundary_edges": boundary,
             "generation": digest(graph), "query_strategy": "published_yaml", "kinds": sorted(counts),
             "kind_counts": dict(counts), "focus_node_id": focus or None,
-            "focus_neighbor_count": max(0, len(reached) - 1), "focus_hops": hops,
+            "focus_neighbor_count": max(0, len(selected) - 1) if focus else 0, "focus_hops": hops,
+            "focus_total_edges": sum(focus in (e['source'], e['target']) for e in edges) if focus else None,
+            "focus_loaded_edges": sum(focus in (e['source'], e['target']) for e in local_edges) if focus else None,
+            "view_scope": "neighborhood" if focus else "search_results" if q or kind else "graph_page",
+            "focus_filters_ignored": bool(focus and (q or kind)),
             "neighborhood_truncated": bool(focus and (len(page) < len(selected) or len(local_edges) < len(page_edges))),
             "include_candidates": include_candidates, "candidate_view_available": False,
             "display_schema": vocabulary(graph), "semantic_origin": "agent_authored"}
@@ -140,9 +187,18 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
                 matches = canonical(value) in {canonical(item) for item in support.get('properties', {}).get(name, [])}
             if matches:
                 origin = {**support.get('provenance', {}), 'scope_ref': support['scope_ref']}
+                if support.get('row_context') is not None:
+                    origin['row_context'] = support['row_context']
                 if origin not in origins:
                     origins.append(origin)
         return origins
+
+    def support_origins(item):
+        if 'supports' not in item:
+            return item.get('provenance', [])
+        return [{**support.get('provenance', {}), 'scope_ref': support['scope_ref'],
+                 **({'row_context': support['row_context']} if support.get('row_context') is not None else {})}
+                for support in item['supports']]
 
     if entity_id or fact_id:
         nodes = [n for n in graph["nodes"] if not entity_id or n["id"] == entity_id]
@@ -150,7 +206,7 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             raise LightGraphError("graph_item_not_found")
         for node in nodes:
             identifier = node["id"]
-            add(identifier, "NodeExistence", {"entity_id": identifier, "kind": node["kind"]}, node.get("provenance", []))
+            add(identifier, "NodeExistence", {"entity_id": identifier, "kind": node["kind"]}, support_origins(node))
             properties = {**node.get("properties", {}), "label": [node["label"]], "alias": node.get("aliases", [])}
             for name, values in properties.items():
                 for value in values:
@@ -159,7 +215,7 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
     for edge in graph["edges"]:
         if edge["id"] == fact_id or entity_id and entity_id in {edge["source"], edge["target"]}:
             add(edge["id"], "Edge", {"source": edge["source"], "target": edge["target"],
-                "relation": edge["relation"], "qualifiers": edge.get("properties", {})}, edge.get("provenance", []))
+                "relation": edge["relation"], "qualifiers": edge.get("properties", {})}, support_origins(edge))
     if not selected:
         raise LightGraphError("graph_item_not_found")
     facts = selected[offset:offset + 50]
@@ -173,16 +229,19 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
                     for item in graph.get("definitions", {}).get(group, [])}
     for support in retained[:500]:
         source = support["binding"]
-        key = digest(source)
+        key = digest({name: value for name, value in source.items() if name != 'row_context'})
         mappings[key] = {"definition": source.get("definition", ""),
             "description": descriptions.get(source.get("definition"), ""),
             "source": source.get("source", {}), "mapping_index": source.get("mapping"),
             "identity_columns": source.get("key_columns", []),
             "reference_columns": {name: source[name] for name in ("source_key_columns", "target_key_columns") if name in source},
             "source_columns": source.get("columns", []), "scope_columns": source.get("scope_columns", []),
-            "label_column": source.get("label_column"), "scope_ref": support["scope_ref"]}
+            "label_column": source.get("label_column"), "scope_ref": support["scope_ref"],
+            "constant_properties": source.get('constant_properties', {}),
+            "context_columns": source.get('context_columns', [])}
     return {"facts": facts, "supports": retained[:500], "rules": list(mappings.values()),
             "nodes": [n for n in graph["nodes"] if n["id"] in endpoints], "display_schema": vocabulary(graph),
             "total_facts": len(selected), "total_supports": len(retained), "supports_truncated": len(retained) > 500,
+            "total_incident_edges": sum(entity_id in (e['source'], e['target']) for e in graph['edges']) if entity_id else None,
             "next_offset": offset + len(facts) if offset + len(facts) < len(selected) else None,
             "include_candidates": include_candidates, "semantic_origin": "agent_authored"}

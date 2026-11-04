@@ -3,7 +3,7 @@ import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { request, projectPath } from './api'
 import type { Graph, GraphNode, GraphEdge } from './types'
 import { fitCamera, zoomCamera } from './graphViewport'
-import { SCENE_LIMIT, SCENE_EDGE_LIMIT, mergeScene, placeNodes, sceneBounds, hitNode } from './graphScene'
+import { SCENE_LIMIT, SCENE_EDGE_LIMIT, edgeKey, mergeScene, placeNodes, sceneBounds, hitNode } from './graphScene'
 import type { Point } from './graphScene'
 import { twoHopNeighborhood } from './graphNeighborhood'
 import PropertyTable from './PropertyTable.vue'
@@ -26,9 +26,10 @@ let resettingSearch = false
 const serverPaging = computed(() => !!props.projectId && props.graph.page_size !== undefined)
 let pageGeneration = 0, searchTimer: ReturnType<typeof setTimeout> | undefined
 const searchMatches = ref<string[] | null>(null)
+const searchMatchCount = ref<number | null>(null)
 const expansionOffsets = ref(new Map<string, number | null>())
 let sceneController: AbortController | undefined
-const matchedCount = computed(() => searchMatches.value ? Number(graph.value.matched_nodes ?? searchMatches.value.length) : filtered.value.length)
+const matchedCount = computed(() => searchMatches.value ? searchMatchCount.value ?? searchMatches.value.length : filtered.value.length)
 const overview = computed(() => graph.value.kind_counts as Record<string, number> | undefined)
 const atCapacity = computed(() => graph.value.nodes.length >= SCENE_LIMIT || graph.value.edges.length >= SCENE_EDGE_LIMIT)
 async function loadScene(options: { focus?: string; q?: string; kind?: string; more?: boolean; replace?: boolean } = {}) {
@@ -50,8 +51,26 @@ async function loadScene(options: { focus?: string; q?: string; kind?: string; m
     } else remote.value = options.replace ? value : mergeScene(graph.value, value)
     if (options.replace) { clearSelection(); positions.value = placeNodes(value); expansionOffsets.value.clear() }
     if (focus) expansionOffsets.value.set(focus, value.next_offset as number | null)
-    if (options.q || options.kind) searchMatches.value = value.nodes.map(n => n.id)
-    if (options.q && value.nodes[0]) { if (!graph.value.nodes.some(n => n.id === value.nodes[0]!.id)) { remote.value = value; positions.value = placeNodes(value); expansionOffsets.value.clear() }; selectNode(value.nodes[0]); await nextTick(); focusNode(value.nodes[0]) }
+    if (options.q || options.kind) { searchMatches.value = value.nodes.map(n => n.id); searchMatchCount.value = Number(value.matched_nodes ?? value.nodes.length) }
+    if (options.q && value.nodes[0]) {
+      const center = value.nodes[0]
+      if (!graph.value.nodes.some(n => n.id === center.id)) { remote.value = value; positions.value = placeNodes(value); expansionOffsets.value.clear() }
+      selectNode(center); await nextTick(); focusNode(center)
+      // Search pages contain edges only between matching nodes. Load the
+      // selected result's real neighborhood without forwarding name/type filters.
+      const nearbyParams = new URLSearchParams({ layer: props.layer, include_candidates: String(props.includeCandidates === true), focus: center.id, hops: '1', limit: '1000', offset: '0' })
+      const nearby = await request<Graph>(`${projectPath(props.projectId!)}/graph?${nearbyParams}`, { signal: sceneController.signal })
+      if (epoch !== pageGeneration) return
+      if (value.generation && nearby.generation !== value.generation) { pageError.value = '图谱已更新，请重新搜索以加载同一版本的关联。'; return }
+      const existing = new Set(graph.value.nodes.map(node => node.id))
+      const existingEdges = new Set(graph.value.edges.map(edgeKey))
+      const fits = existing.size + nearby.nodes.filter(node => !existing.has(node.id)).length <= SCENE_LIMIT &&
+        existingEdges.size + nearby.edges.filter(edge => !existingEdges.has(edgeKey(edge))).length <= SCENE_EDGE_LIMIT
+      remote.value = fits ? mergeScene(graph.value, nearby) : nearby
+      if (!fits) positions.value = placeNodes(nearby)
+      expansionOffsets.value.set(center.id, nearby.next_offset as number | null)
+      await nextTick(); if (epoch === pageGeneration) focusNode(center)
+    }
     else if (!focus) { await nextTick(); fit() }
   } catch (e) { if (epoch === pageGeneration) pageError.value = e instanceof Error ? e.message : '图谱读取失败' }
   finally { if (epoch === pageGeneration) pageLoading.value = false }
@@ -63,7 +82,7 @@ async function expandNode() {
 }
 const selected = ref<GraphNode | null>(null)
 const selectedEdge = ref<GraphEdge | null>(null)
-type Provenance = { facts: Array<{ id: string; fact_kind: string; status: string; payload: Record<string, unknown> }>; supports: Array<{ id: string; fact_id: string; status: string; origin: string; source_binding: string; rule_id: string; rule_revision?: number; publication_id?: string; document_ref?: string; scope_ref: string }>; rules: Array<Record<string, unknown>>; nodes?: GraphNode[]; display_schema?: DisplaySchema; next_offset: number | null; supports_truncated: boolean }
+type Provenance = { facts: Array<{ id: string; fact_kind: string; status: string; payload: Record<string, unknown> }>; supports: Array<{ id: string; fact_id: string; status: string; origin: string; source_binding: string; rule_id: string; rule_revision?: number; publication_id?: string; document_ref?: string; scope_ref: string; binding?: { constant_properties?: Record<string, unknown>; row_context?: { values?: Record<string, unknown> } } }>; rules: Array<Record<string, unknown>>; nodes?: GraphNode[]; display_schema?: DisplaySchema; next_offset: number | null; supports_truncated: boolean; total_incident_edges?: number | null }
 const details = ref<Provenance | null>(null), detailsLoading = ref(false), detailsError = ref('')
 const detailNodes = ref<Record<string, GraphNode>>({})
 const detailSchema = ref<DisplaySchema>({})
@@ -82,7 +101,7 @@ const factTitle = (fact: Provenance['facts'][number]) => fact.fact_kind === 'Pro
 const visibleQualifiers = (value: unknown) => Object.fromEntries(Object.entries((value || {}) as Record<string, unknown>).filter(([key]) => !['semantic_basis', 'document_ref', 'source_group'].includes(key)))
 const factValues = (fact: Provenance['facts'][number]) => fact.fact_kind === 'PropertyValue' ? { [String(fact.payload.name)]: fact.payload.value } : fact.fact_kind === 'Edge' ? visibleQualifiers(fact.payload.qualifiers) : { kind: kindName(fact.payload.kind) }
 const sourceSummary = (rule: Record<string, unknown>) => Object.fromEntries(Object.entries((rule.source || {}) as Record<string, unknown>).filter(([, value]) => value != null && value !== ''))
-const mappingValues = (rule: Record<string, unknown>) => Object.fromEntries(['identity_columns', 'namespace_columns', 'attribute_columns', 'hierarchy_columns', 'reference_columns', 'concept_columns', 'source_columns', 'scope_columns', 'label_column'].filter(key => rule[key] && (typeof rule[key] === 'string' || Object.keys(rule[key] as object).length)).map(key => [key, rule[key]]))
+const mappingValues = (rule: Record<string, unknown>) => Object.fromEntries(['identity_columns', 'namespace_columns', 'attribute_columns', 'hierarchy_columns', 'reference_columns', 'concept_columns', 'source_columns', 'scope_columns', 'label_column', 'constant_properties', 'context_columns'].filter(key => rule[key] && (typeof rule[key] === 'string' || Object.keys(rule[key] as object).length)).map(key => [key, rule[key]]))
 let detailGeneration = 0
 const statusName = (value?: unknown) => ({ accepted: '已接受', candidate: '候选', unresolved: '未决', conflict: '冲突' }[String(value)] || '状态未提供')
 async function loadDetails(more = false) {
@@ -105,7 +124,7 @@ function selectNode(node: GraphNode) { selected.value = node; selectedEdge.value
 function selectEdge(edge: GraphEdge) { selectedEdge.value = edge; void loadDetails() }
 function clearSelection() { detailGeneration++; selected.value = null; selectedEdge.value = null; details.value = null; detailsError.value = ''; detailsLoading.value = false; detailNodes.value = {}; detailSchema.value = {} }
 function clearFilters() {
-  resettingSearch = true; search.value = ''; selectedKind.value = ''; searchMatches.value = null; resettingSearch = false
+  resettingSearch = true; search.value = ''; selectedKind.value = ''; searchMatches.value = null; searchMatchCount.value = null; resettingSearch = false
 }
 async function showTwoHops(node: GraphNode) {
   const epoch = ++pageGeneration
@@ -166,6 +185,8 @@ const adjacent = computed(() => {
   for (const edge of [...graph.value.edges, ...fromFacts]) if ([edge.source, edge.target].includes(selected.value.id)) found.set(edge.id || `${edge.source}:${edge.relation}:${edge.target}`, edge)
   return [...found.values()]
 })
+const drawnIncidentEdges = computed(() => selected.value ? edges.value.filter(edge => selected.value!.id === edge.source || selected.value!.id === edge.target).length : 0)
+const knownIncidentEdges = computed(() => details.value?.total_incident_edges ?? (selected.value?.id === graph.value.focus_node_id ? graph.value.focus_total_edges as number | undefined : undefined))
 const display = nodeCaption
 const labelOrigin = (node: GraphNode) => ({ declared: '名称由已声明的展示字段生成', relations: '名称由关联对象和业务身份生成', identity: '名称由业务身份生成' }[String(node.label_origin)] || '')
 const accessLabel = (node: GraphNode) => Array.isArray(node.scopes) ? node.scopes.join('、') : ''
@@ -257,13 +278,13 @@ function paint() {
 watch([bitmap, positions, zoom, offset, viewport, selected, selectedEdge, search, selectedKind], paint, { flush: 'post' })
 watch([() => props.graph, () => props.layer, () => props.projectId, () => props.includeCandidates], () => {
   pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); neighborhood.value = null; savedScene = null; remote.value = null; pageLoading.value = false; positions.value = placeNodes({ ...props.graph, nodes: props.graph.nodes.slice(0, SCENE_LIMIT) })
-  search.value = ''; searchMatches.value = null; selectedKind.value = ''; expansionOffsets.value.clear(); clearSelection(); reset()
+  search.value = ''; searchMatches.value = null; searchMatchCount.value = null; selectedKind.value = ''; expansionOffsets.value.clear(); clearSelection(); reset()
   if (serverPaging.value && Number(props.graph.total_nodes) <= 1000 && props.graph.next_offset != null) void loadScene()
 }, { immediate: true })
 watch([search, selectedKind], () => {
   if (resettingSearch) return
   if (neighborhood.value) { if (filtered.value[0]) focusNode(filtered.value[0]); return }
-  pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); pageLoading.value = false; searchMatches.value = null
+  pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); pageLoading.value = false; searchMatches.value = null; searchMatchCount.value = null
   if (serverPaging.value && (search.value || selectedKind.value)) searchTimer = setTimeout(() => { void loadScene({ q: search.value, kind: selectedKind.value }) }, 200)
   else if (filtered.value[0]) focusNode(filtered.value[0])
 }, { flush: 'sync' })
@@ -289,6 +310,8 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
       </div>
       <div v-if="overview && !neighborhood" class="kind-overview" aria-label="全图类型概览"><button v-for="(count, kind) in overview" :key="kind" class="btn small" @click="selectedKind = String(kind)">{{ kindName(kind) }} · {{ count }}</button></div>
       <div v-if="neighborhood" class="neighborhood-toolbar" aria-label="两跳关联范围"><span>两跳关联 · {{ display(neighborhood.center) }}</span><span class="muted small-text">沿任意方向查看最多两条关系可到达的节点；搜索仅作用于当前范围。</span><button class="btn small" @click="returnToGraph">返回全图</button></div>
+      <p v-if="!neighborhood && (search || selectedKind)" class="note" aria-label="检索局部视图">搜索用于定位节点；已定位结果会补载一跳邻居，名称和类型筛选不排除邻居。画布没有显示的边不代表不存在，可双击节点查看两跳范围。</p>
+      <p v-if="graph.edges_truncated" class="note amber" aria-label="关系截断提示">当前返回的关系有数量上限，画布并未显示此范围内的全部边。请聚焦具体节点，查看来源详情中的完整关系计数。</p>
       <p v-if="pageLoading" role="status">正在读取图谱关联…</p>
       <p v-if="pageError" role="alert">{{ pageError }}</p>
       <div v-if="loading" class="empty-state"><div class="spinner"></div>正在读取图谱</div>
@@ -332,7 +355,7 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
           <template v-if="Object.keys(nodeIdentity(selected)).length"><h3>业务身份</h3><PropertyTable :values="nodeIdentity(selected)" /></template><p v-if="accessLabel(selected)" class="muted small-text">可见范围：{{ accessLabel(selected) }}（访问授权，不代表业务主体）</p>
           <div class="divider"></div><h3>节点属性</h3>
           <PropertyTable :values="nodeProperties(selected)" :label="propertyName" /><TechnicalDetails :value="selected" />
-          <h3>已加载关联 · {{ adjacent.length }}</h3>
+          <h3>已加载关联 · {{ adjacent.length }}</h3><p class="field-hint" aria-label="节点关联范围">当前画布显示 {{ drawnIncidentEdges }} 条相连关系<template v-if="knownIncidentEdges != null">，当前授权图中共有 {{ knownIncidentEdges }} 条</template><template v-else>；完整关系数量尚未读取</template>。<template v-if="knownIncidentEdges == null || drawnIncidentEdges < knownIncidentEdges">当前是局部视图，不能据此判断节点孤立。</template></p>
           <button class="btn small" :disabled="pageLoading" @click="showTwoHops(selected)">查看两跳关联</button>
           <button v-if="serverPaging && !neighborhood" class="btn small" :disabled="pageLoading || atCapacity || expansionOffsets.get(selected.id) === null" @click="expandNode">{{ expansionOffsets.has(selected.id) ? '继续展开关联' : '展开相邻节点' }}</button>
           <button v-for="(edge, i) in adjacent.slice(0, 40)" :key="i" type="button" class="edge-detail relation-selection" @click="selectEdge(edge)">
@@ -352,7 +375,7 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
               <PropertyTable :values="factValues(fact)" :label="propertyName" />
               <div v-for="support in details.supports.filter(item => item.fact_id === fact.id)" :key="support.id" class="support-detail">
                 <PropertyTable :values="{ '支持状态': statusName(support.status), '来源类型': originName(support.origin), '可见范围': support.scope_ref, '数据位置': support.source_binding, ...(support.rule_revision != null ? { '映射修订': support.rule_revision } : {}) }" />
-                <TechnicalDetails :value="support" title="来源标识与引用" />
+                <div v-if="support.binding?.constant_properties && Object.keys(support.binding.constant_properties).length"><h5>来源位置与固定属性</h5><PropertyTable :values="support.binding.constant_properties" :label="propertyName" /></div><div v-if="support.binding?.row_context?.values"><h5>同一行路径上下文</h5><PropertyTable :values="support.binding.row_context.values" /></div><TechnicalDetails :value="support" title="来源标识与引用" />
               </div>
               <TechnicalDetails :value="fact" title="事实标识与原始结构" />
             </article>

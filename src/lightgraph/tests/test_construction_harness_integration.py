@@ -17,6 +17,7 @@ import yaml
 from mcp.server.fastmcp import FastMCP
 
 from lightgraph.construction.harness import HarnessOptions, run_goal
+from lightgraph.construction.paths import io_path
 
 
 pytestmark = pytest.mark.skipif(os.environ.get("LIGHTGRAPH_TEST_HARNESS") != "1",
@@ -40,10 +41,19 @@ def respond(handler, delta, reason):
     handler.wfile.flush()
 
 
-@pytest.mark.parametrize("max_calls, expected_calls, large_result, input_limit, fail_first", [
-    (3, 2, False, 1048576, False), (1, 1, False, 1048576, False), (8, None, True, 1048576, False),
-    (8, None, True, 4096, False), (3, 0, False, 100, False), (3, 2, False, 1048576, True)])
-def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_calls, large_result, input_limit, fail_first):
+@pytest.mark.parametrize("max_calls, expected_calls, large_result, input_limit, fail_first, long_workspace", [
+    (3, 2, False, 1048576, False, False), (1, 1, False, 1048576, False, False),
+    (8, None, True, 1048576, False, False), (8, None, True, 4096, False, False),
+    (3, 0, False, 100, False, False), (3, 2, False, 1048576, True, False),
+    pytest.param(3, 2, False, 1048576, False, True, id="deep-unicode-workspace")])
+def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_calls, large_result, input_limit, fail_first, long_workspace):
+    if long_workspace:
+        # The native project directory repeats an escaped cwd (up to 255
+        # characters). Exercise >260-char session IO without also testing an
+        # unrelated CreateProcess current-directory length limitation.
+        while len(str(tmp_path)) < 180:
+            tmp_path /= "中文 workspace " + "depth-" * 6
+        io_path(tmp_path).mkdir(parents=True)
     requests = []
     tool_calls = []
     token = "local-test-bridge-token"
@@ -100,7 +110,7 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
             time.sleep(0.01)
         assert server.started
         config = tmp_path / "config.yaml"
-        config.write_text("goal: smoke\n")
+        io_path(config).write_text("goal: smoke\n", encoding="utf-8")
         events = []
         result = run_goal("发现授权数据中的对象与关系", config, tmp_path,
             HarnessOptions(model="loopback-model", base_url=f"http://127.0.0.1:{model.server_port}/v1",
@@ -138,8 +148,8 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
         assert any(event["method"] == "session.event" for event in events)
         if fail_first:
             assert any(event.get("payload", {}).get("event", {}).get("type") == "llm/retry" for event in events)
-        assert list((tmp_path / "harness/sessions").rglob("*.jsonl"))
-        assert token not in (tmp_path / "harness/graph.patch.yaml").read_text()
+        assert list(io_path(tmp_path / "harness/sessions").rglob("*.jsonl"))
+        assert token not in io_path(tmp_path / "harness/graph.patch.yaml").read_text(encoding="utf-8")
         from lightgraph.construction.trace import summarize_harness_usage, project_harness_event
         usage = summarize_harness_usage(result["trace_files"], request_trace=result["request_trace"],
             usage_trace=result["usage_trace"], session_id=result["session_id"],
@@ -150,6 +160,15 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
         assert usage["output_tokens"] == 20 * successful
         assert usage["total_tokens"] == 120 * successful
         assert usage["missing_usage_calls"] == int(fail_first)
+        if long_workspace:
+            assert all(len(path) > 260 for path in result["trace_files"])
+            assert usage["complete"] and usage["malformed_records"] == 0
+            # Verify the archived native session can also be read, not just
+            # that the extended-length directory scan found its filename.
+            native_usage = summarize_harness_usage(result["trace_files"],
+                request_trace=result["request_trace"], session_id=result["session_id"])
+            assert native_usage["measured_calls"] == len(requests)
+            assert native_usage["input_tokens"] == 100 * len(requests)
         assert "vendor/deepseek-harness" in result["sdk_source"].replace("\\", "/")
         if large_result:
             kinds = [e.get("payload", {}).get("event", {}).get("type") for e in events]
@@ -158,7 +177,7 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
                 assert "compaction/summary" in kinds
                 assert len(requests) >= 3  # Summary dispatches are part of the same call budget.
             assert all("RETRIEVABLE_MIDDLE_MARKER" not in json.dumps(r) for r in requests[1:])
-            assert any("RETRIEVABLE_MIDDLE_MARKER" in Path(path).read_text() for path in result["trace_files"])
+            assert any("RETRIEVABLE_MIDDLE_MARKER" in io_path(path).read_text(encoding="utf-8") for path in result["trace_files"])
             replacements = [project_harness_event(e) for e in events if e.get('method') == 'session.event']
             assert any(kind == 'context_history_edit' for kind, _ in replacements)
             compacted = [i for i, request in enumerate(requests)
@@ -176,7 +195,7 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
                 assert 'MUST_REPLACE_GOAL_WITH_INVENTED_UNRESOLVED' in json.dumps(after)
                 first_system = '\n'.join(str(m.get('content')) for m in requests[0]['messages'] if m['role'] == 'system')
                 assert system == first_system
-                assert any('MUST_REPLACE_GOAL_WITH_INVENTED_UNRESOLVED' in Path(path).read_text()
+                assert any('MUST_REPLACE_GOAL_WITH_INVENTED_UNRESOLVED' in io_path(path).read_text(encoding="utf-8")
                            for path in result['trace_files'])
     finally:
         server.should_exit = True
@@ -288,7 +307,7 @@ def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatc
         graph = tools.workspace.read_published_graph()
         assert len(graph["nodes"]) == 3 and len(graph["edges"]) == 2
         assert {n["label"] for n in graph["nodes"]} == {"设备甲", "设备乙", "制造组"}
-        assert all(Path(path).is_file() for path in result["trace_files"])
+        assert all(io_path(path).is_file() for path in result["trace_files"])
         assert list(tmp_path.rglob("*.yaml"))
         (tmp_path / "notifications.json").write_text(json.dumps(events, ensure_ascii=False), encoding="utf-8")
         assert any(event["method"] == "session.event" for event in events)

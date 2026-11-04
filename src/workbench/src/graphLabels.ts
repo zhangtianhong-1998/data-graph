@@ -42,7 +42,7 @@ const properties: Record<string, string> = {
   hierarchy_columns: '层位字段', reference_columns: '关联字段', concept_columns: '概念字段',
   namespace_columns: '命名空间字段', source_columns: '使用字段', target_columns: '目标端字段',
   code: '编码字段', key_column: '身份编码字段',
-  identity: '业务身份', source_key_columns: '来源端身份字段', target_key_columns: '目标端身份字段',
+  constant_properties: '来源位置与固定属性', context_columns: '路径上下文字段', identity: '业务身份', source_key_columns: '来源端身份字段', target_key_columns: '目标端身份字段',
   scope_columns: '可见范围字段', label_column: '名称字段',
 }
 const chinese = (value: string) => /[\u3400-\u9fff]/.test(value)

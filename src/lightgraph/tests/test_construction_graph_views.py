@@ -88,3 +88,70 @@ def test_details_explain_actual_visible_mapping_without_inventing_revision(data)
     assert mapping['label_column'] == 'name'
     assert mapping['source']['table'] == 'equipment'
     assert mapping['description'] == '设备档案'
+
+
+def test_focused_search_does_not_filter_neighbors_and_keeps_center_first(data):
+    data['nodes'] = [{'id': str(i), 'kind': '维度', 'type': '维度', 'label': '邻居'} for i in range(5)] + [
+        {'id': 'center', 'kind': '指标', 'type': '指标', 'label': '目标', 'identity': {'编码': 'EBG_PL_92200'}}]
+    data['edges'] = [{'id': 'e'+str(i), 'source': 'center', 'target': str(i), 'relation': '关联'} for i in range(5)]
+    result = views.graph_page(None, q='EBG_PL_92200', kind='指标', focus='center', hops=2, limit=100)
+    assert len(result['nodes']) == 6 and len(result['edges']) == 5
+    assert result['nodes'][0]['id'] == 'center'
+    assert result['focus_filters_ignored']
+    assert result['focus_total_edges'] == result['focus_loaded_edges'] == 5
+    assert not result['neighborhood_truncated']
+
+
+def test_focus_batches_keep_center_and_paths_to_second_hop(data):
+    visited, cursor = set(), 0
+    while cursor is not None:
+        result = views.graph_page(None, focus='1', hops=2, offset=cursor, limit=3)
+        ids = {n['id'] for n in result['nodes']}
+        assert result['nodes'][0]['id'] == '1'
+        assert len(ids) <= 3
+        reached = {'1'}
+        for _ in range(2):
+            reached |= {endpoint for e in result['edges'] if e['source'] in reached or e['target'] in reached
+                        for endpoint in (e['source'], e['target'])}
+        assert ids == reached
+        visited |= ids
+        following = result['next_offset']
+        assert following is None or following > cursor
+        cursor = following
+    assert visited == {'0', '1', '2', '3'}
+
+
+def test_edge_cap_preserves_connecting_edges_and_reports_missing_edges(data):
+    data['edges'] = [{**data['edges'][0], 'id': f'parallel{i}'} for i in range(3100)] + [
+        {'id': 'late', 'source': '0', 'target': '2', 'relation': '连接'}]
+    result = views.graph_page(None, focus='0', hops=1, limit=10)
+    assert len(result['edges']) == 3000
+    assert any(edge['id'] == 'late' for edge in result['edges'])
+    assert result['focus_total_edges'] == 3101 and result['focus_loaded_edges'] == 3000
+    assert result['edges_truncated'] and result['neighborhood_truncated']
+
+
+def test_scope_filtered_nodes_never_reappear_during_focus(data):
+    # load_graph has already applied authorization; hidden endpoints cannot be
+    # supplied by search, kind overrides, or the neighborhood traversal.
+    data['nodes'] = data['nodes'][:2]
+    data['edges'] = data['edges'][:1]
+    result = views.graph_page(None, focus='0', q='设备3', kind='其他', hops=2)
+    assert {node['id'] for node in result['nodes']} == {'0', '1'}
+    from lightgraph.errors import LightGraphError
+    with pytest.raises(LightGraphError, match='graph_item_not_found'):
+        views.graph_page(None, focus='3', hops=2)
+
+
+def test_details_keep_same_row_context_and_mapping_position(data):
+    origin = {'definition': '设备', 'mapping': 0, 'source': {'table': '设备档案'},
+              'constant_properties': {'position': 'slot_b'}, 'context_columns': ['path_id', 'code']}
+    data['nodes'][0]['supports'] = [{'scope_ref': 'public', 'provenance': origin,
+        'row_context': {'id': 'row-1', 'values': {'path_id': 'p1', 'code': 'A'}},
+        'properties': {}, 'label': '设备0', 'aliases': []}]
+    result = views.graph_details(None, entity_id='0')
+    support = next(s for s in result['supports'] if s['fact_id'] == '0')
+    assert support['binding']['row_context']['values']['path_id'] == 'p1'
+    assert result['rules'][0]['constant_properties'] == {'position': 'slot_b'}
+    assert result['rules'][0]['context_columns'] == ['path_id', 'code']
+    assert result['total_incident_edges'] == 1

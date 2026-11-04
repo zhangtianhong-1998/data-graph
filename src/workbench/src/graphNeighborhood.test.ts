@@ -21,6 +21,48 @@ beforeEach(() => { api.request.mockReset(); vi.stubGlobal('ResizeObserver', clas
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('two-hop graph exploration', () => {
+  it('searches an off-page identity then loads its five neighbors without search filters', async () => {
+    const center = { id: 'report', label: '报表项', kind: '指标', identity: { 编码: 'EBG_PL_92200' } }
+    const neighbors = Array.from({ length: 5 }, (_, i) => ({ id: `near${i}`, label: `邻居${i}`, kind: '维度' }))
+    const neighborhood = { ...initial, nodes: [center, ...neighbors],
+      edges: neighbors.map((n, i) => ({ id: `edge${i}`, source: center.id, target: n.id, relation: '关联' })),
+      focus_node_id: center.id, focus_neighbor_count: 5, focus_total_edges: 5, matched_nodes: 6, next_offset: null }
+    api.request.mockImplementation(async (path: string) => {
+      if (path.includes('/details')) return { ...details, total_incident_edges: 5 }
+      const url = new URL(path, 'http://test')
+      return url.searchParams.get('focus') ? neighborhood : { ...initial, nodes: [center], edges: [], matched_nodes: 1, next_offset: null }
+    })
+    mount(); const input = root.querySelector<HTMLInputElement>('[aria-label="搜索图节点"]')!
+    input.value = 'EBG_PL_92200'; input.dispatchEvent(new Event('input', { bubbles: true }))
+    await vi.waitFor(() => expect(root.querySelectorAll('.graph-edge')).toHaveLength(5))
+    const query = new URL(graphCalls()[1]![0], 'http://test').searchParams
+    expect(query.get('focus')).toBe('report'); expect(query.get('hops')).toBe('1')
+    expect(query.has('q')).toBe(false); expect(query.has('kind')).toBe(false)
+    expect(root.textContent).toContain('匹配 1 个节点')
+    expect(root.querySelector('[aria-label="节点关联范围"]')?.textContent).toContain('当前画布显示 5 条相连关系，当前授权图中共有 5 条')
+    node('报表项').dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    await vi.waitFor(() => expect(root.querySelector('[aria-label="两跳关联范围"]')).not.toBeNull())
+    const twoHop = new URL(graphCalls().at(-1)![0], 'http://test').searchParams
+    expect(twoHop.get('hops')).toBe('2'); expect(twoHop.has('q')).toBe(false); expect(twoHop.has('kind')).toBe(false)
+    expect(input.value).toBe('')
+    expect(root.querySelectorAll('.graph-node.dimmed')).toHaveLength(0)
+    expect(root.querySelectorAll('.graph-edge')).toHaveLength(5)
+  })
+
+  it('keeps the search result and explains local edges when neighbor loading fails', async () => {
+    api.request.mockImplementation(async (path: string) => {
+      if (path.includes('/details')) return { ...details, total_incident_edges: 5 }
+      if (new URL(path, 'http://test').searchParams.get('focus')) throw new Error('邻域读取失败')
+      return { ...initial, nodes: [{ id: 'found', label: '查到的对象' }], edges: [], matched_nodes: 1, next_offset: null }
+    })
+    mount(); const input = root.querySelector<HTMLInputElement>('[aria-label="搜索图节点"]')!
+    input.value = '查到'; input.dispatchEvent(new Event('input', { bubbles: true }))
+    await vi.waitFor(() => expect(root.querySelector('[role="alert"]')?.textContent).toBe('邻域读取失败'))
+    expect(node('查到的对象')).not.toBeNull()
+    expect(root.querySelector('[aria-label="节点关联范围"]')?.textContent).toContain('当前画布显示 0 条相连关系，当前授权图中共有 5 条')
+    expect(root.textContent).toContain('不能据此判断节点孤立')
+  })
+
   it('loads two hops from the scoped server graph and restores the original scene', async () => {
     api.request.mockImplementation(async (path: string) => path.includes('/details') ? details : focused)
     mount(initial, { includeCandidates: true }); await nextTick()
