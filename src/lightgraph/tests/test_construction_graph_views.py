@@ -26,6 +26,17 @@ def data(monkeypatch):
     return value
 
 
+def test_pages_omit_support_payloads(data):
+    data['nodes'][0]['supports'] = [{'scope_ref': 'public', 'provenance': {'secret': 'HIDDEN-SUPPORT'}}]
+    data['nodes'][0]['provenance'] = [{'secret': 'HIDDEN-ORIGIN'}]
+    data['edges'][0]['supports'] = [{'scope_ref': 'public', 'provenance': {'secret': 'HIDDEN-EDGE'}}]
+    result = views.graph_page(None, limit=10)
+    assert 'supports' not in result['nodes'][0] and 'provenance' not in result['nodes'][0]
+    assert 'supports' not in result['edges'][0] and 'provenance' not in result['edges'][0]
+    assert 'HIDDEN-SUPPORT' not in str(result) and 'HIDDEN-ORIGIN' not in str(result) and 'HIDDEN-EDGE' not in str(result)
+    assert result['nodes'][0]['label'] == '设备0'
+
+
 def test_two_hop_view_preserves_paths_and_reports_excluded_neighbor(data):
     result = views.graph_page(None, focus="0", hops=2, limit=100)
     assert [n["id"] for n in result["nodes"]] == ["0", "1", "2"]

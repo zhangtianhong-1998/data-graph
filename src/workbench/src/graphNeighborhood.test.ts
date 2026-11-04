@@ -157,6 +157,22 @@ describe('two-hop graph exploration', () => {
     expect(Object.fromEntries(url.searchParams)).toMatchObject({ layer: 'metadata', focus: 'a', hops: '2' })
   })
 
+  it('filters a fully loaded project graph locally and stops after two hops', async () => {
+    const complete: Graph = {
+      generation: 'g1', total_nodes: 4, total_edges: 3, next_offset: null, truncated: false, page_size: 1000,
+      nodes: ['a', 'b', 'c', 'd'].map(id => ({ id, label: `对象${id}` })),
+      edges: [{ source: 'a', target: 'b' }, { source: 'b', target: 'c' }, { source: 'c', target: 'd' }],
+    }
+    api.request.mockResolvedValue(details)
+    mount(complete)
+    node('对象a').dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    await nextTick()
+    expect(graphCalls()).toHaveLength(0)
+    expect(root.querySelectorAll('.graph-node')).toHaveLength(3)
+    expect(node('对象d')).toBeNull()
+    expect(root.textContent).toContain('两跳范围已加载 3 / 3 个节点')
+  })
+
   it('uses the complete local metadata graph for either edge direction, stopping after two hops', async () => {
     const graph: Graph = { nodes: ['a', 'b', 'c', 'd', 'e'].map(id => ({ id, label: `对象${id}` })), edges: [{ source: 'b', target: 'a' }, { source: 'b', target: 'c' }, { source: 'c', target: 'd' }, { source: 'c', target: 'b' }, { source: 'a', target: 'a' }] }
     expect(twoHopNeighborhood(graph, 'a').nodes.map(n => n.id)).toEqual(['a', 'b', 'c'])

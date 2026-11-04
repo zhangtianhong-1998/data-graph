@@ -72,7 +72,9 @@ def test_display_uses_only_visible_edges_neighbor_labels_and_declared_supports()
         [edge('x', 'secret', scope='B'), edge('x', 'open')]))
     # Old cached relation-derived labels must be discarded before deriving A.
     assert '秘密地点' in original['nodes'][0]['label']
+    before_filter = deepcopy(original)
     result = filter_graph_scopes(original, ['A'])
+    assert original == before_filter
     assert '秘密地点' not in str(result) and 'secret' not in str(result)
     assert '公开地点' in result['nodes'][0]['label']
     shared['supports'].append({**deepcopy(shared['supports'][0]), 'scope_ref': 'B',

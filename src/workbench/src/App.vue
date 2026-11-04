@@ -190,7 +190,7 @@ async function loadProject(id: string) {
     if (epoch !== generation) return
     configRevision.value = undefined; project.value = values[0]; fillForms(values[1]); await ensureSession(id); metadata.value = { tables: [], nodes: [], edges: [] }; business.value = { nodes: [], edges: [] }; runs.value = []
     // An unavailable database must not prevent opening and repairing its project configuration.
-    const details = await Promise.allSettled([request<Metadata>(`${p}/metadata`), request<Graph>(`${p}/graph?layer=business&include_candidates=${includeCandidates.value}`), request<{ runs: Run[] }>(`${p}/runs`), request<{ database_sources: string[]; model: boolean }>(`${p}/credentials`)])
+    const details = await Promise.allSettled([request<Metadata>(`${p}/metadata`), request<Graph>(`${p}/graph?layer=business&include_candidates=${includeCandidates.value}&limit=1000`), request<{ runs: Run[] }>(`${p}/runs`), request<{ database_sources: string[]; model: boolean }>(`${p}/credentials`)])
     if (epoch !== generation) return
     if (details[0].status === 'fulfilled') { metadata.value = details[0].value }
     if (details[1].status === 'fulfilled') business.value = details[1].value
@@ -235,7 +235,7 @@ async function refreshProjectConfig(preserveEdits = false) {
 }
 async function refreshGraphs() {
   const p = path.value, epoch = generation
-  const values = await Promise.all([request<Metadata>(`${p}/metadata`), request<Graph>(`${p}/graph?layer=business&include_candidates=${includeCandidates.value}`)])
+  const values = await Promise.all([request<Metadata>(`${p}/metadata`), request<Graph>(`${p}/graph?layer=business&include_candidates=${includeCandidates.value}&limit=1000`)])
   if (epoch === generation) { metadata.value = values[0]; business.value = values[1] }
 }
 function schedulePoll(epoch: number) {

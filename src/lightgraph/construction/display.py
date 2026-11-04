@@ -22,15 +22,17 @@ def _identity_label(node):
     return f"{node['type']}（{details}）" if details else node['type']
 
 
-def derive_display_graph(graph):
+def derive_display_graph(graph, *, copy=True):
     """Return a copy whose labels depend only on included supports and edges.
 
     Original source names remain exact. Missing names can use explicitly mapped
     display values, visible outgoing relationships, then the complete identity.
     Relation fallback is one pass over base labels, so cycles never recurse.
+    Callers that already isolated the graph may set copy=False and allow label
+    fields to be written in place.
     """
-    result = deepcopy(graph)
-    definitions = {item['type']: item for item in graph.get('definitions', {}).get('entities', [])}
+    result = deepcopy(graph) if copy else graph
+    definitions = {item['type']: item for item in result.get('definitions', {}).get('entities', [])}
     by_id = {node['id']: node for node in result.get('nodes', [])}
     base = {}
     for node in by_id.values():

@@ -103,7 +103,7 @@ def filter_graph_scopes(graph, scopes):
         labels = sorted({support['label'] for support in supports if support.get('label') is not None})
         aliases = sorted({alias for support in supports for alias in support.get('aliases', [])})
         properties, provenance = attributes(supports)
-        nodes.append({**deepcopy(node), 'label': labels[0] if labels else '',
+        nodes.append({**_view_shell(node), 'label': labels[0] if labels else '',
             'aliases': aliases, 'properties': properties, 'provenance': provenance,
             'supports': supports, 'scopes': sorted({support['scope_ref'] for support in supports})})
     visible = {node['id'] for node in nodes}
@@ -115,11 +115,22 @@ def filter_graph_scopes(graph, scopes):
         if not supports:
             continue
         properties, provenance = attributes(supports)
-        edges.append({**deepcopy(edge), 'properties': properties, 'provenance': provenance,
+        edges.append({**_view_shell(edge), 'properties': properties, 'provenance': provenance,
                       'supports': supports, 'scopes': sorted({support['scope_ref'] for support in supports})})
     entity_types = {node['type'] for node in nodes}
     relation_types = {edge['type'] for edge in edges}
     definitions = graph.get('definitions', {})
-    return derive_display_graph({**deepcopy(graph), 'nodes': nodes, 'edges': edges,
-        'definitions': {'entities': [deepcopy(item) for item in definitions.get('entities', []) if item['type'] in entity_types],
-                        'relations': [deepcopy(item) for item in definitions.get('relations', []) if item['type'] in relation_types]}})
+    # The published document is not reused. Copy only the small header; nodes and
+    # edges above already own their supports. A second full copy dominated large reads.
+    view = _view_shell(graph)
+    view['nodes'] = nodes
+    view['edges'] = edges
+    view['definitions'] = {'entities': [deepcopy(item) for item in definitions.get('entities', []) if item['type'] in entity_types],
+                           'relations': [deepcopy(item) for item in definitions.get('relations', []) if item['type'] in relation_types]}
+    return derive_display_graph(view, copy=False)
+
+
+def _view_shell(item):
+    """Copy identity and metadata without cloning support evidence again."""
+    return deepcopy({key: value for key, value in item.items()
+                     if key not in {'nodes', 'edges', 'supports', 'provenance', 'properties', 'aliases', 'label', 'scopes', 'definitions'}})

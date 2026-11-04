@@ -5,10 +5,10 @@ import pytest
 
 from lightgraph.construction.access import access_fingerprint
 from lightgraph.construction.tools import ConstructionTools
-from lightgraph.construction.workspace import dump_yaml, safe_load_yaml, write_yaml
+from lightgraph.construction.workspace import GraphWorkspace, dump_yaml, safe_load_yaml, write_yaml
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import RunConfig
-from lightgraph.web.construction_graph import load_graph
+from lightgraph.web.construction_graph import graph_details, load_graph
 
 
 @pytest.fixture
@@ -156,3 +156,62 @@ def test_read_scope_changes_filter_public_graph_without_changing_authority(publi
     assert load_graph(changed)['nodes'] == []
     changed.scopes = ['A', 'public']
     assert len(load_graph(changed)['nodes']) == 2
+
+
+def test_repeated_pages_and_two_hops_read_the_published_file_once(published, monkeypatch):
+    import lightgraph.web.construction_graph as views
+    from lightgraph.web.graph_view_cache import clear_graph_views, flush_graph_views
+
+    config, _tools = published
+    clear_graph_views()
+    calls = {'n': 0}
+    original = GraphWorkspace.read_published_graph
+
+    def wrapped(self):
+        calls['n'] += 1
+        return original(self)
+
+    monkeypatch.setattr(GraphWorkspace, 'read_published_graph', wrapped)
+    graph = load_graph(config)
+    node_id = graph['nodes'][0]['id']
+    details = graph_details(config, entity_id=node_id)
+    assert details['supports']
+    monkeypatch.setattr(views, 'digest', lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('paged view digested the graph')))
+    page = views.graph_page(config, limit=1000)
+    focused = views.graph_page(config, focus=node_id, hops=2, limit=1000)
+    assert calls['n'] == 1
+    assert 'supports' not in page['nodes'][0] and 'provenance' not in page['nodes'][0]
+    assert focused['generation'] == page['generation']
+    assert focused['focus_hops'] == 2 and focused['nodes'][0]['id'] == node_id
+    flush_graph_views()
+    clear_graph_views()
+    restored = views.graph_page(config, focus=node_id, hops=2, limit=1000)
+    assert calls['n'] == 1
+    assert restored['generation'] == page['generation']
+    assert restored['nodes'][0]['id'] == node_id
+
+
+def test_replacing_the_published_file_drops_the_cached_view(published, monkeypatch):
+    import os
+
+    config, tools = published
+    load_graph(config)
+    calls = {'n': 0}
+    original = GraphWorkspace.read_published_graph
+
+    def wrapped(self):
+        calls['n'] += 1
+        return original(self)
+
+    monkeypatch.setattr(GraphWorkspace, 'read_published_graph', wrapped)
+    assert load_graph(config)['nodes']
+    assert calls['n'] == 0
+    manifest = safe_load_yaml((tools.workspace.root / 'manifest.yaml').read_text())
+    path = tools.workspace.root / manifest['current_graph']['path']
+    before = path.stat().st_mtime_ns
+    payload = path.read_bytes()
+    path.write_bytes(payload)
+    if path.stat().st_mtime_ns == before:
+        os.utime(path, ns=(path.stat().st_atime_ns, before + 1))
+    assert len(load_graph(config)['nodes']) == 2
+    assert calls['n'] == 1

@@ -8,6 +8,7 @@ from lightgraph.contracts import digest, canonical
 from lightgraph.construction.access import access_fingerprint, ensure_supported_access, filter_graph_scopes
 from lightgraph.construction.workspace import GraphWorkspace, safe_load_yaml
 from lightgraph.errors import LightGraphError
+from lightgraph.web.graph_view_cache import cached_generation, load_graph_view, remember_graph, view_token
 
 
 def available(config):
@@ -23,28 +24,69 @@ def available(config):
     return bool(value.get('current_graph'))
 
 
-def load_graph(config):
+def _scope_key(config):
+    return sorted(set(config.scopes))
+
+
+def _record_path(root: Path, relative):
+    if not isinstance(relative, str) or not relative:
+        raise LightGraphError('invalid_graph_workspace_record')
+    path = (root / relative).resolve()
+    base = root.resolve()
+    if not path.is_relative_to(base) or path == base:
+        raise LightGraphError('invalid_graph_workspace_record')
+    return path
+
+
+def _view_key(kind, path: Path, stat, access, scopes):
+    # Nanosecond timestamps do not survive a JSON number round trip.
+    return {'version': 1, 'kind': kind, 'path': str(path), 'size': stat.st_size,
+            'mtime_ns': str(stat.st_mtime_ns), 'access': access, 'scopes': scopes}
+
+
+def load_prepared(config):
+    """Return the authorized display graph and the token that identifies it."""
     ensure_supported_access(config)
-    root = Path(config.output_dir) / "construction"
-    manifest = root / "manifest.yaml"
-    if root.is_symlink() or manifest.is_symlink():
-        raise LightGraphError("workspace_path_invalid")
-    value = safe_load_yaml(manifest.read_text(encoding="utf-8"))
-    head = value.get("current_graph")
-    if not head:
-        return {"nodes": [], "edges": [], "definitions": {}, "status": "empty"}
+    root = Path(config.output_dir) / 'construction'
+    manifest_path = root / 'manifest.yaml'
+    if root.is_symlink() or manifest_path.is_symlink():
+        raise LightGraphError('workspace_path_invalid')
+    manifest = safe_load_yaml(manifest_path.read_text(encoding='utf-8'))
+    head = manifest.get('current_graph')
     expected_access = access_fingerprint(config)
+    scopes = _scope_key(config)
+    cache_dir = root / 'view-cache'
+    if not head:
+        key = _view_key('empty', manifest_path.resolve(), manifest_path.stat(), expected_access, scopes)
+        return load_graph_view(cache_dir, key, lambda: (
+            {'nodes': [], 'edges': [], 'definitions': {}, 'status': 'empty'}, view_token(key)))
     if head.get('access_fingerprint') != expected_access:
         raise LightGraphError('graph_access_context_changed')
-    workspace = GraphWorkspace(root, head["context_fingerprint"])
-    graph = workspace.read_published_graph()
-    if graph.get('access_fingerprint') != expected_access:
-        raise LightGraphError('graph_access_context_changed')
-    graph = filter_graph_scopes(graph, config.scopes)
-    graph["nodes"] = [{**n, "kind": n["type"], "layer": "business", "status": "accepted"}
-                      for n in graph.get("nodes", [])]
-    graph["edges"] = [{**e, "relation": e["type"], "status": "accepted", "qualifiers": e.get("properties", {})}
-                      for e in graph.get("edges", [])]
+    published = _record_path(root, head.get('path'))
+    try:
+        stat = published.stat()
+    except OSError:
+        raise LightGraphError('graph_workspace_record_unavailable') from None
+    key = _view_key('published', published, stat, expected_access, scopes)
+
+    def build():
+        workspace = GraphWorkspace(root, head['context_fingerprint'])
+        graph = workspace.read_published_graph()
+        if graph.get('access_fingerprint') != expected_access:
+            raise LightGraphError('graph_access_context_changed')
+        graph = filter_graph_scopes(graph, config.scopes)
+        graph['nodes'] = [{**node, 'kind': node['type'], 'layer': 'business', 'status': 'accepted'}
+                          for node in graph.get('nodes', [])]
+        graph['edges'] = [{**edge, 'relation': edge['type'], 'status': 'accepted',
+                           'qualifiers': edge.get('properties', {})} for edge in graph.get('edges', [])]
+        return graph, view_token(key)
+
+    return load_graph_view(cache_dir, key, build)
+
+
+def load_graph(config):
+    graph, generation = load_prepared(config)
+    remember_graph(graph, generation)
     return graph
 
 
@@ -54,6 +96,11 @@ def vocabulary(graph):
                              for e in definitions.get("entities", [])],
             "relations": [{"name": e["type"], "description": e.get("description", "")}
                           for e in definitions.get("relations", [])], "properties": []}
+
+
+def _listed(item):
+    """Pages identify and draw facts. Row evidence stays on the detail read."""
+    return {key: value for key, value in item.items() if key not in {'supports', 'provenance'}}
 
 
 def _search_text(node):
@@ -106,6 +153,7 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
     if layer not in {"business", "metadata", "provenance", "all"} or offset < 0 or not 1 <= limit <= 1000 or hops not in {1, 2}:
         raise LightGraphError("graph_selection_invalid")
     graph = load_graph(config)
+    generation = cached_generation(graph) or digest(graph)
     nodes = graph["nodes"] if layer in {"business", "all"} else []
     edges = graph["edges"] if nodes else []
     counts = Counter(n["kind"] for n in nodes)
@@ -136,13 +184,13 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
         page_edges = backbone + sorted(remaining, key=lambda e: focus not in (e['source'], e['target']))
     local_edges = page_edges[:3000]
     boundary = sum((e["source"] in ids) != (e["target"] in ids) for e in edges)
-    return {"nodes": page, "edges": local_edges, "layer": layer,
+    return {"nodes": [_listed(node) for node in page], "edges": [_listed(edge) for edge in local_edges], "layer": layer,
             "total_nodes": len(nodes), "total_edges": len(edges), "matched_nodes": len(selected),
             "offset": offset, "page_size": limit, "next_offset": next_offset,
             "truncated": len(page) < len(selected) or len(local_edges) < len(page_edges),
             "edges_truncated": len(local_edges) < len(page_edges), "matched_edges": len(page_edges),
             "boundary_edges": boundary,
-            "generation": digest(graph), "query_strategy": "published_yaml", "kinds": sorted(counts),
+            "generation": generation, "query_strategy": "published_yaml", "kinds": sorted(counts),
             "kind_counts": dict(counts), "focus_node_id": focus or None,
             "focus_neighbor_count": max(0, len(selected) - 1) if focus else 0, "focus_hops": hops,
             "focus_total_edges": sum(focus in (e['source'], e['target']) for e in edges) if focus else None,

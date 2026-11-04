@@ -126,16 +126,22 @@ function clearSelection() { detailGeneration++; selected.value = null; selectedE
 function clearFilters() {
   resettingSearch = true; search.value = ''; selectedKind.value = ''; searchMatches.value = null; searchMatchCount.value = null; resettingSearch = false
 }
+function loadedGraphIsComplete(value: Graph) {
+  const totalNodes = Number(value.total_nodes ?? value.nodes.length)
+  const totalEdges = Number(value.total_edges ?? value.edges.length)
+  return value.next_offset == null && value.truncated !== true && value.edges_truncated !== true
+    && value.neighborhood_truncated !== true && value.nodes.length >= totalNodes && value.edges.length >= totalEdges
+}
 async function showTwoHops(node: GraphNode) {
   const epoch = ++pageGeneration
   sceneController?.abort(); sceneController = new AbortController(); clearTimeout(searchTimer)
   pageLoading.value = true; pageError.value = ''
   try {
-    // Query the published graph, not just the currently loaded scene or viewport.
+    // A complete scene can be filtered here. A paged scene has to ask for the published neighborhood.
     const params = new URLSearchParams({ layer: props.layer, include_candidates: String(props.includeCandidates === true), focus: node.id, hops: '2', limit: '1000', offset: '0' })
-    const value = props.projectId
-      ? await request<Graph>(`${projectPath(props.projectId)}/graph?${params}`, { signal: sceneController.signal })
-      : twoHopNeighborhood(baseGraph.value, node.id)
+    const value = !props.projectId || loadedGraphIsComplete(baseGraph.value)
+      ? twoHopNeighborhood(baseGraph.value, node.id)
+      : await request<Graph>(`${projectPath(props.projectId!)}/graph?${params}`, { signal: sceneController.signal })
     if (epoch !== pageGeneration) return
     const center = value.nodes.find(item => item.id === node.id)
     if (!center) { pageError.value = '当前图谱中已找不到这个节点，请刷新图谱。'; return }
