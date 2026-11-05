@@ -22,7 +22,7 @@ from lightgraph.documents import DocumentCorpus, load_documents
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import open_sources
 
-from .models import GraphDraft, draft_evidence_refs
+from .models import DraftRecord, GraphDraft, draft_evidence_refs
 from .access import access_fingerprint, ensure_supported_access, filter_graph_scopes
 from .executor import execute_draft
 from .intent import effective_goal_markdown, goal_descriptor, read_goal_material
@@ -150,8 +150,14 @@ class ConstructionTools:
             except LightGraphError as exc:
                 if exc.code in TERMINAL_QUERY_CODES:
                     return self._stop_queries(exc.code)
-                return {"status": "error", "code": exc.code,
-                        "next_action": "Correct the affected request. Record only unmet user requirements as unresolved; optional suggestions are not blockers. Other drafts remain available."}
+                from lightgraph.sources.database_errors import safe_database_diagnostic
+                from .failures import failure_guidance
+                detail = safe_database_diagnostic(exc)
+                error = {'code': exc.code, 'retryable': exc.retryable,
+                         **({'database': detail} if detail else {})}
+                return {"status": "error", **error,
+                        "next_action": "Correct the affected request. Record only unmet user requirements as unresolved; optional suggestions are not blockers. Other drafts remain available.",
+                        **failure_guidance([error])}
             except (TypeError, ValueError, KeyError):
                 return {"status": "error", "code": "invalid_construction_arguments"}
             except Exception:
@@ -209,6 +215,12 @@ class ConstructionTools:
         from .models import iter_source_mappings
         self._require_fact_sources(mapping.source_id for mapping in iter_source_mappings(draft))
 
+    def _snapshot_recovery_sources(self, source_ids):
+        """Observe recovery eligibility only after the failed snapshot closes."""
+        return sorted({source_id for source_id in source_ids
+            if source_id in self.executors and getattr(self.executors[source_id].adapter,
+                'new_snapshot_recovery_allowed', False) is True})
+
     def inspect_source(self, table: str, operation: str, arguments: dict | None = None):
         """Run a named read-only probe using physical names, not guessed IDs."""
         self._check_current_inputs()
@@ -227,6 +239,17 @@ class ConstructionTools:
                 raise LightGraphError("probe_table_mismatch")
             arguments["table"] = key
         result = executor.execute(operation, arguments)
+        if result.get('status') == 'error':
+            from .failures import SOURCE_FAILURES, failure_guidance
+            if result.get('code') in SOURCE_FAILURES:
+                involved = [physical.source_id]
+                if operation == 'check_reference':
+                    involved.extend(self._executor(arguments[name])[2].source_id
+                                    for name in ('source_table', 'target_table')
+                                    if isinstance(arguments.get(name), str))
+                recovery = self._snapshot_recovery_sources(involved)
+                result.update(new_snapshot_recovery_available=bool(recovery), recovery_source_ids=recovery)
+            result.update(source_id=physical.source_id, **failure_guidance([result]))
         # The generic draft protocol uses physical column names. Legacy probe
         # aliases are implementation details, not references the Agent must copy.
         result.pop('probe_id', None)
@@ -323,7 +346,14 @@ class ConstructionTools:
                         'Only tables on that source can appear in its SQL.').replace(
                         'tool_table_id and opaque column.id are not SQL identifiers.',
                         'Use physical table and column names, with the supplied SQL quoting.')
-            return {"status": "ok", "operations": operations}
+            return {"status": "ok", "operations": operations,
+                    "query_planning": {
+                        "profile_columns": "One exact aggregate query per selected column; each may scan the table.",
+                        "check_fd": "One key-null aggregate plus one dependency query per selected value column; each may scan the table.",
+                        "check_reference": "Actual paired-key coverage; cross-source checks use bounded projections and may be incomplete.",
+                        "execute_readonly_sql": "LIMIT bounds returned rows, not scanned rows. GROUP BY, DISTINCT and ORDER BY may process the full selected range.",
+                        "sample_boundary": "A small projection suggests roles; it does not prove complete identities or relationships. Save the candidate and its unmet requirements before costly validation.",
+                    }}
         if name.startswith("reference:"):
             filename = name.partition(":")[2]
             permitted = {p.name: p for p in (SKILL_ROOT / "references").glob("*.md")}
@@ -354,10 +384,46 @@ class ConstructionTools:
         raise LightGraphError("unknown_construction_material")
 
     def save_graph_draft(self, yaml_text: str):
+        previous_entries = self.workspace._manifest()['drafts']
         record = self.workspace.save_draft(yaml_text)
+        entry = previous_entries.get(record.draft.draft_id)
+        previous = DraftRecord.model_validate(self.workspace._read_record(entry['current'])) if entry else None
+        from .revision_advice import revision_loss_advice
+        advice = revision_loss_advice(previous.draft, record.draft) if previous and (
+            previous.context_fingerprint == record.context_fingerprint) else []
         return {"status": "ok", "draft_id": record.draft.draft_id,
                 "revision": record.revision, "state": record.status,
+                "previous_revision": previous.revision if previous else None,
+                "revision_advice": advice,
+                "retained_failed_work": self._retained_failed_work(excluding=record.draft.draft_id),
                 "next_action": "Validate this draft, or revise it as new evidence arrives."}
+
+    def _retained_failed_work(self, *, excluding=None):
+        """Keep execution-blocked candidates visible even when a new draft ID is used.
+
+        This is a pointer to retained work, not an automatic goal-completeness
+        judgment: independent drafts and evidence-based scope changes are legal.
+        """
+        from .failures import SOURCE_FAILURES
+        from .models import iter_source_mappings
+        records = []
+        for item in self.workspace.list_drafts():
+            if (item.draft.draft_id == excluding or item.status != 'needs_revision'
+                    or item.context_fingerprint != self.workspace.context_fingerprint
+                    or item.validation is None):
+                continue
+            codes = sorted({d.get('code') for d in item.validation.diagnostics
+                            if isinstance(d.get('code'), str)})
+            if not set(codes).intersection(SOURCE_FAILURES | TERMINAL_QUERY_CODES | {'memory_budget_exhausted'}):
+                continue
+            records.append({'draft_id': item.draft.draft_id, 'revision': item.revision,
+                            'source_ids': sorted({m.source_id for m in iter_source_mappings(item.draft)}),
+                            'entity_types': len(item.draft.entities), 'relation_types': len(item.draft.relations),
+                            'failure_codes': codes})
+        return {'total': len(records), 'items': records[:12], 'omitted': max(0, len(records) - 12),
+                'next_action': 'Read these retained drafts before concluding the goal is complete. '
+                    'A new or smaller draft does not resolve their source/resource failures. '
+                    'These are review pointers, not proof that every candidate belongs in the final graph.'}
 
     def validate_graph_draft(self, draft_id: str, mode: str | None = None):
         mode = mode or self.config.construction_target
@@ -390,6 +456,11 @@ class ConstructionTools:
         self._check_current_inputs()
         from .models import iter_source_mappings
         sources = sorted({m.source_id for m in iter_source_mappings(record.draft)})
+        recovery = self._snapshot_recovery_sources(sources)
+        from .failures import SOURCE_FAILURES
+        for diagnostic in result['diagnostics']:
+            if diagnostic.get('code') in SOURCE_FAILURES:
+                diagnostic['new_snapshot_recovery_available'] = diagnostic.get('source_id') in recovery
         read_window = {'started_at': started, 'finished_at': datetime.now(timezone.utc).isoformat(),
                        'source_ids': sources, 'consistency': 'independent_source_snapshots',
                        'source_read_windows': result.pop('source_read_windows', []),
@@ -409,11 +480,14 @@ class ConstructionTools:
         budget_state = self._stop_queries(stop) if stop else None
         from .statistics import graph_statistics
         from .quality import name_mapping_advice
-        statistics = graph_statistics(filter_graph_scopes(graph, self.config.scopes))
+        visible_graph = filter_graph_scopes(graph, self.config.scopes)
+        statistics = graph_statistics(visible_graph)
+        from .failures import failure_guidance
         return {"status": "ok", "state": current.status, **result, "statistics": statistics,
                 "evidence_ref": evidence.ref, "candidate_graph": current.validation.graph_path,
                 "validation_id": current.validation.validation_id, 'read_window': read_window,
-                'quality_advice': name_mapping_advice(record.draft, graph),
+                'quality_advice': name_mapping_advice(record.draft, visible_graph),
+                **failure_guidance(result['diagnostics']),
                 **({'resource_state': budget_state} if budget_state else {}),
                 "semantic_assessment": "agent_authored", "published": False}
 
@@ -461,6 +535,7 @@ class ConstructionTools:
     def read_workspace(self, draft_id: str | None = None):
         value = self.workspace.get_draft(draft_id).model_dump(mode="json", by_alias=True) if draft_id else self.workspace.read_summary()
         if draft_id is None:
+            value['retained_failed_work'] = self._retained_failed_work()
             from .statistics import graph_statistics
             try:
                 graph = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes)

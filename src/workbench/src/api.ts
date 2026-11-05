@@ -1,4 +1,7 @@
 const messages: Record<string, string> = {
+  graph_generation_changed: '图谱版本或访问配置已变化，已停止合并旧数据，请重新加载。',
+  graph_batch_invalid: '图谱批次不一致，加载已停止，请重新加载。',
+  graph_batch_incomplete: '返回的图谱数量不完整，加载已停止，请重新加载。',
   construction_scoped_access_not_supported: '该历史运行使用的版本尚不支持此访问范围。当前版本已支持逐条来源证据过滤，请保留原权限配置。',
   scope_binding_conflict: '同一来源表存在不同的范围列绑定，请核对 scope_bindings 后重试。',
   graph_support_visibility_missing: '该图缺少逐条来源证据的可见范围，请按当前绑定重新验证和发布。',

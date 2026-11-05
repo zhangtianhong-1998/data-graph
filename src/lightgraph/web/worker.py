@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 import signal
 import sys
@@ -16,7 +17,14 @@ def execute(payload, result_path):
     from ..runtime.config import AgentConfig, RunConfig, open_sources
     from ..runtime.progress import RunProgress, bind_progress, emit_progress, progress_path
     from .execution import check_dependencies, write_metadata_context, _safe_code, _safe_report, _save, _cancel_path
+    from .worker_diagnostics import WorkerDiagnostics, DatabaseDiagnosticHandler
 
+    diagnostics = WorkerDiagnostics(result_path)
+    diagnostics.emit('worker_started', stage='initializing')
+    stage = 'initializing'
+    diagnostic_logger = logging.getLogger('lightgraph.sources')
+    diagnostic_handler = DatabaseDiagnosticHandler(diagnostics, lambda: stage)
+    previous_log_level = diagnostic_logger.level
     config = None
     sources = []
     report = None
@@ -38,8 +46,8 @@ def execute(payload, result_path):
                 cancelled_sources.add(id(source))
             try:
                 source.cancel()
-            except Exception:
-                pass
+            except Exception as exc:
+                diagnostics.emit('worker_cancel_error', stage='cleanup', error=exc)
 
     def stop(_signum, _frame):
         nonlocal cancelled
@@ -70,6 +78,8 @@ def execute(payload, result_path):
     progress_context.__enter__()
     emit_progress("initializing", "run_started")
     try:
+        diagnostic_logger.addHandler(diagnostic_handler)
+        diagnostic_logger.setLevel(min(logging.INFO, diagnostic_logger.getEffectiveLevel()))
         watcher.start()
         config = RunConfig.model_validate(payload["config"])
         config._agent = AgentConfig(name=payload.get("agent_name", "lightgraph-discovery"), llm=config.model)
@@ -87,6 +97,7 @@ def execute(payload, result_path):
         if config.rules:
             raise LightGraphError("legacy_rule_input_removed")
         opening_sources = True
+        stage = 'opening_sources'
         emit_progress("initializing", "source_open_started")
         # Direct credentials arrive through the parent's private stdin pipe.
         # They never enter the persisted RunConfig or process environment.
@@ -94,6 +105,7 @@ def execute(payload, result_path):
         sources = open_sources(config,
             metadata_only=config.resolved_model.mode in {"disabled", "metadata_only"}, **options)
         opening_sources = False
+        stage = 'construction'
         emit_progress("initializing", "source_open_completed")
         check_cancelled()
         metadata_path = Path(config.output_dir) / "metadata.yaml"
@@ -117,9 +129,12 @@ def execute(payload, result_path):
         cancelled = True
     except LightGraphError as exc:
         error_code = _safe_code(exc.code)
-    except Exception:
+        diagnostics.emit('worker_error', stage=stage, error=exc, error_code=error_code)
+    except Exception as exc:
         error_code = "worker_execution_failed"
+        diagnostics.emit('worker_error', stage=stage, error=exc, error_code=error_code)
     finally:
+        stage = 'cleanup'
         # Late cancellation must not interrupt release/report finally blocks.
         emit_progress("cleanup", "cleanup_started")
         closing.set()
@@ -132,8 +147,9 @@ def execute(payload, result_path):
         for source in sources:
             try:
                 source.close()
-            except Exception:
+            except Exception as exc:
                 cleanup = "unknown"
+                diagnostics.emit('worker_cleanup_error', stage='cleanup', error=exc)
         sources.clear()
         payload.clear()
         if cancelled:
@@ -145,6 +161,8 @@ def execute(payload, result_path):
             result = {"status": status, "report": _safe_report(report) if report is not None else None,
                       "cleanup_status": cleanup, "error_code": error_code}
             _save(result_path, result)
+            diagnostics.emit('worker_finished', stage='finished',
+                             **({'error_code': error_code} if error_code else {}))
             from ..runtime.trace import emit_trace
             emit_trace('run_completed', result)
             emit_progress("finished", "run_" + status,
@@ -158,7 +176,12 @@ def execute(payload, result_path):
                     if trace_context is not None:
                         trace_context.__exit__(None, None, None)
                 finally:
-                    progress_context.__exit__(None, None, None)
+                    try:
+                        progress_context.__exit__(None, None, None)
+                    finally:
+                        diagnostic_logger.removeHandler(diagnostic_handler)
+                        diagnostic_handler.close()
+                        diagnostic_logger.setLevel(previous_log_level)
     # A completed interpretation may legitimately leave unsupported candidates.
     # That is distinct from an interrupted or otherwise unfinished execution.
     return 0 if status in {"completed", "completed_with_gaps"} else 2
@@ -169,15 +192,23 @@ def main():
     # A bounded pipe prevents malformed internal requests exhausting memory.
     if len(sys.argv) != 2:
         return 1
-    raw = sys.stdin.buffer.read(2 * 1024 * 1024 + 1)
-    if len(raw) > 2 * 1024 * 1024:
-        return 1
+    from .worker_diagnostics import WorkerDiagnostics
+    diagnostics = WorkerDiagnostics(Path(sys.argv[1]))
     try:
-        payload = json.loads(raw)
-    except (ValueError, TypeError):
+        raw = sys.stdin.buffer.read(2 * 1024 * 1024 + 1)
+        if len(raw) > 2 * 1024 * 1024:
+            diagnostics.emit('worker_input_invalid', stage='initializing')
+            return 1
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            diagnostics.emit('worker_input_invalid', stage='initializing')
+            return 1
+        del raw
+        return execute(payload, Path(sys.argv[1]))
+    except Exception as exc:
+        diagnostics.emit('worker_unhandled_error', stage='result', error=exc)
         return 1
-    del raw
-    return execute(payload, Path(sys.argv[1]))
 
 
 if __name__ == "__main__":

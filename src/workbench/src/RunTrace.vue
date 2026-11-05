@@ -5,6 +5,7 @@ import { isActive } from './state'
 import type { Run } from './types'
 import ConfirmDelete from './ConfirmDelete.vue'
 import TracePayload from './TracePayload.vue'
+import WorkerDiagnostics from './WorkerDiagnostics.vue'
 import { traceContext, traceToolName } from './tracePresentation'
 import type { TraceEvent } from './tracePresentation'
 
@@ -24,6 +25,7 @@ const labels: Record<string, string> = {
   agent_started: 'Agent 开始', agent_completed: 'Agent 结束', agent_finished: 'Agent 结束',
   proposal_submitted: '提交提案', proposal_result: '提案结果',
   run_configuration: '本次运行配置', pipeline_started: '抽取流程开始', progress: '阶段进展',
+  worker_diagnostic: '进程诊断',
   agent_start: 'Agent 开始', context_window: '上下文组装', context_compaction: '上下文压缩', model_wire_response: '模型接口原始响应',
   context_history_edit: '历史结果压缩',
   agent_end: 'Agent 结束', pipeline_completed: '抽取流程结束', pipeline_error: '抽取流程异常',
@@ -96,10 +98,11 @@ onUnmounted(() => { epoch++; clearTimeout(timer); controller?.abort() })
         <summary><span class="badge">记录 #{{ event.seq }}</span><div class="trace-summary"><strong>{{ labels[event.kind] || event.kind }}<span v-if="traceToolName(event)"> · {{ traceToolName(event) }}</span></strong><span v-if="traceContext(event)" class="field-hint">{{ traceContext(event) }}</span></div><time>{{ time(event.time) }}</time></summary>
         <TracePayload v-if="expanded.has(event.seq)" :event="event"/>
       </details>
+      <WorkerDiagnostics :key="`${run.run_id}:${page?.status || 'loading'}`" :run="run"/>
     </div>
     <div v-if="page?.status === 'available'" class="panel-footer"><span>当前显示 {{ page.events.length ? offset + 1 : 0 }}–{{ offset + page.events.length }} / {{ page.total_events }} 条；导出不受筛选与分页限制</span><div class="actions"><button class="btn small" :disabled="!previous.length || loading" @click="previousPage">上一页轨迹</button><button class="btn small" :disabled="page.next_offset == null || loading" @click="nextPage">下一页轨迹</button></div></div>
   </section>
-  <ConfirmDelete v-if="confirming" title="清理运行轨迹" description="删除本次运行保存的模型输入、输出和工具执行轨迹？此操作无法撤销。" detail="运行报告、已发布图谱和原始上传文件会保留。需要留档时，请先导出完整轨迹。" :busy="deleting" :locked="deleting || active || !configRevision" :error="deleteError" @cancel="confirming = false" @confirm="clearTrace"/>
+  <ConfirmDelete v-if="confirming" title="清理运行轨迹" description="删除本次运行保存的模型输入、输出、工具执行轨迹和进程诊断？此操作无法撤销。" detail="运行报告、已发布图谱和原始上传文件会保留。需要留档时，请先导出完整轨迹和进程诊断。" :busy="deleting" :locked="deleting || active || !configRevision" :error="deleteError" @cancel="confirming = false" @confirm="clearTrace"/>
 </template>
 
 <style scoped>

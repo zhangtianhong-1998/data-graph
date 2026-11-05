@@ -23,6 +23,7 @@ from ..errors import LightGraphError
 from ..runtime.locking import FileLock
 from ..runtime.retention import atomic_text
 from ..runtime.progress import finish_progress, progress_path, read_progress
+from .worker_diagnostics import WorkerDiagnostics, StderrCollector, read_worker_log
 
 ACTIVE_STATUSES = frozenset({"queued", "running"})
 TERMINAL_STATUSES = frozenset({"completed", "completed_with_gaps", "partial", "failed", "cancelled", "interrupted"})
@@ -295,6 +296,9 @@ class RunManager:
             env = os.environ.copy()
             source_root = str(Path(__file__).resolve().parents[2])
             env["PYTHONPATH"] = source_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            diagnostics = WorkerDiagnostics(result_path)
+            diagnostics.emit('worker_starting', stage='launch')
+            collector = None
             try:
                 # The inherited lock stays held if this service crashes while
                 # its worker is still publishing. Handle inheritance differs
@@ -302,18 +306,24 @@ class RunManager:
                 with self._service_lock.child_process_options() as child_options:
                     proc = subprocess.Popen([sys.executable, "-m", "lightgraph.web.worker", str(result_path)],
                                             cwd=project, env=env, stdin=subprocess.PIPE,
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                             **child_options)
                 self._processes[pid] = {"process": proc, "record": record, "result": result_path,
-                                        "cancel_requested": False, "forced": False, "config": config}
+                                        "cancel_requested": False, "forced": False, "config": config,
+                                        "diagnostics": diagnostics, "stderr_collector": None}
+                collector = StderrCollector(proc.stderr)
+                self._processes[pid]['stderr_collector'] = collector
                 proc.stdin.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
                 proc.stdin.close()
                 record.update(status="running", stage="extracting")
                 _save(runs / (rid + ".json"), record)
-            except Exception:
+            except Exception as exc:
                 if pid in self._processes:
                     proc = self._processes.pop(pid)["process"]
                     proc.kill(); proc.wait()
+                if collector is not None:
+                    diagnostics.emit('worker_stderr_summary', stage='launch', **collector.finish())
+                diagnostics.emit('worker_start_failed', stage='launch', error=exc, error_code='worker_start_failed')
                 record.update(status="failed", stage="finished", finished_at=_now(),
                               cleanup_status="unknown", error_code="worker_start_failed")
                 _save(runs / (rid + ".json"), record)
@@ -330,6 +340,13 @@ class RunManager:
 
     def _finish(self, pid, entry):
         record = entry["record"]
+        diagnostics = entry.get('diagnostics') or WorkerDiagnostics(entry['result'])
+        if entry.get('stderr_collector') is not None:
+            diagnostics.emit('worker_stderr_summary', stage='finished', **entry['stderr_collector'].finish())
+        if entry.get('process') is not None:
+            diagnostics.emit('worker_process_exited', stage='finished',
+                exit_code=getattr(entry['process'], 'returncode', None),
+                cancel_requested=entry['cancel_requested'], forced=entry['forced'])
         result = None
         try:
             result = _json_file(entry["result"])
@@ -341,6 +358,7 @@ class RunManager:
                           error_code=_safe_code(result.get("error_code")) if result.get("error_code") else None)
         except LightGraphError:
             record.update(status="failed", report=None, cleanup_status="unknown", error_code="worker_result_missing")
+            diagnostics.emit('worker_error', stage='result', error_code='worker_result_missing')
         if entry["cancel_requested"]:
             record.update(status="cancelled", error_code="run_cancelled")
         if entry["forced"]:
@@ -388,6 +406,9 @@ class RunManager:
             record = dict(record, progress=progress)
             if record.get("status") in ACTIVE_STATUSES:
                 record["stage"] = progress["stage"]
+        diagnostics = read_worker_log(path)
+        record = dict(record, worker_diagnostics={key: diagnostics[key] for key in ('status', 'incomplete')},
+                      worker_diagnostic_events=len(diagnostics['events']))
         return record
 
     def list(self, pid):
@@ -440,13 +461,13 @@ class RunManager:
                 self._service_lock = None
 
 
-def _bounded_view(view, layer):
+def _bounded_view(view, layer, *, bounded=True):
     if layer not in {"business", "metadata", "provenance", "all"}:
         raise LightGraphError("graph_layer_invalid")
     all_nodes = [n for n in view.get("nodes", []) if layer == "all" or n.get("layer") == layer]
     ids = {n["id"] for n in all_nodes}
     all_edges = [e for e in view.get("edges", []) if e["source"] in ids and e["target"] in ids]
-    nodes = all_nodes[:MAX_GRAPH_NODES]
+    nodes = all_nodes[:MAX_GRAPH_NODES] if bounded else all_nodes
     # Derive display scope only from already-authorized visible supports.
     fact_entities = {f['id']: f['payload'].get('entity_id') for f in view.get('facts', [])}
     scopes = {}
@@ -456,11 +477,13 @@ def _bounded_view(view, layer):
             scopes.setdefault(entity, set()).add(support['scope_ref'])
     nodes = [{**node, 'scopes': sorted(scopes.get(node['id'], set()))} for node in nodes]
     ids = {n["id"] for n in nodes}
-    edges = [e for e in all_edges if e["source"] in ids and e["target"] in ids][:MAX_GRAPH_EDGES]
+    edges = [e for e in all_edges if e["source"] in ids and e["target"] in ids]
+    if bounded:
+        edges = edges[:MAX_GRAPH_EDGES]
     return {"nodes": nodes, "edges": edges, "layer": layer,
             "total_nodes": len(all_nodes), "total_edges": len(all_edges),
             "truncated": len(nodes) != len(all_nodes) or len(edges) != len(all_edges),
-            "limits": {"nodes": MAX_GRAPH_NODES, "edges": MAX_GRAPH_EDGES}}
+            "limits": {"nodes": MAX_GRAPH_NODES, "edges": MAX_GRAPH_EDGES}, "complete_batches": True}
 
 
 def read_graph_consistently(workspace, pid, reader, **options):
@@ -652,7 +675,7 @@ def _metadata_neighborhood(view, focus, hops, traversal='all'):
     return graph
 
 
-def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, source_ids=None, focus='', hops=1, traversal='all', config=None):
+def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, source_ids=None, focus='', hops=1, traversal='all', config=None, full_graph=False):
     """Cached GETs never connect; explicit refresh reads authorized declarations."""
     import yaml
     from ..catalog import CATALOG_VERSION, DeclaredCatalog, declared_catalog, semantic_catalog, write_catalog, read_semantic_catalog
@@ -779,7 +802,7 @@ def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, sou
             if _metadata_context(workspace.resolved_config(pid), project) != context:
                 raise LightGraphError("input_dependency_changed")
             _save(output / "metadata-context.json", context)
-        graph = _metadata_neighborhood(view,focus,hops,traversal) if focus else _bounded_view(view, "metadata")
+        graph = _metadata_neighborhood(view,focus,hops,traversal) if focus else _bounded_view(view, "metadata", bounded=not full_graph)
         tables = [{"id": t.source_id + "." + t.qualified_name,
                    **t.model_dump(mode="json", by_alias=True)} for t in declared.tables]
         missing_sources = sorted({s.id for s in config.sources} - {s.source_id for s in declared.sources})

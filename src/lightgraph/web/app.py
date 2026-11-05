@@ -644,10 +644,25 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return read_graph_consistently(workspace,pid,read_graph,layer=layer,
             include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus,hops=hops,traversal=traversal)
 
+    @app.get('/api/projects/{pid}/graph/batches')
+    def graph_batches(pid:str,layer:str='business',part:str='nodes',offset:int=0,limit:int=1000,
+                      generation:str='',include_candidates:bool=False,focus:str='',hops:int=2,traversal:str='chains'):
+        from .graph_batches import read_graph_batch
+        return read_graph_consistently(workspace,pid,read_graph_batch,layer=layer,part=part,
+            offset=offset,limit=limit,generation=generation,include_candidates=include_candidates,
+            focus=focus,hops=hops,traversal=traversal)
+
     @app.get('/api/projects/{pid}/graph/details')
     def graph_details(pid:str,entity_id:str|None=None,fact_id:str|None=None,include_candidates:bool=False,offset:int=0):
         return read_graph_consistently(workspace,pid,read_graph_details,entity_id=entity_id,fact_id=fact_id,
                                       include_candidates=include_candidates,offset=offset)
+
+    @app.get('/api/projects/{pid}/graph/structure')
+    def graph_structure(pid:str,draft_id:str|None=None,revision:int|None=None):
+        from ..construction.structure_preview import load_structure_preview
+        def read_structure(_workspace,_pid,*,config,**selection):
+            return load_structure_preview(config,**selection)
+        return read_graph_consistently(workspace,pid,read_structure,draft_id=draft_id,revision=revision)
 
     @app.get('/api/projects/{pid}/graph/identity-candidates')
     def identity_candidates(pid:str,offset:int=0,decision_offset:int=0):
@@ -716,6 +731,21 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         from .run_traces import read_run_trace
         with workspace.lock(pid):
             return read_run_trace(manager,pid,rid,offset=offset,limit=limit,view=view)
+
+    @app.get('/api/projects/{pid}/runs/{rid}/worker-diagnostics')
+    def worker_diagnostics(pid:str,rid:str):
+        from .worker_diagnostics import read_worker_diagnostics
+        with workspace.lock(pid):
+            return read_worker_diagnostics(manager,pid,rid)
+
+    @app.get('/api/projects/{pid}/runs/{rid}/worker-diagnostics/export')
+    def worker_diagnostics_export(pid:str,rid:str):
+        from .worker_diagnostics import export_worker_diagnostics
+        with workspace.lock(pid):
+            content=export_worker_diagnostics(manager,pid,rid)
+        return Response(content,media_type='application/x-ndjson',headers={
+            'Content-Disposition':f'attachment; filename="{rid}.worker.jsonl"',
+            'Cache-Control':'no-store'})
 
     @app.get('/api/projects/{pid}/runs/{rid}/trace/export')
     def run_trace_export(pid:str,rid:str):

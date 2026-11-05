@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mergeScene, placeNodes, SCENE_LIMIT, SCENE_EDGE_LIMIT } from './graphScene'
+import { mergeScene, placeNodes } from './graphScene'
 
 describe('continuous scene', () => {
   it('retains nodes, boundary edges and positions across neighbour batches', () => {
@@ -14,12 +14,12 @@ describe('continuous scene', () => {
     expect(expanded.get('two')!.x).toBeGreaterThan(expanded.get('one')!.x)
     expect(mergeScene(next, { ...initial, generation: 'b' }).nodes).toHaveLength(2)
   })
-  it('bounds loaded nodes and keeps cycles/disconnected nodes visible', () => {
-    const nodes = Array.from({ length: SCENE_LIMIT + 5 }, (_, i) => ({ id: String(i) }))
-    expect(mergeScene({ nodes: [], edges: [] }, { nodes, edges: [] }).nodes).toHaveLength(SCENE_LIMIT)
+  it('retains all nodes and edges beyond the old limits, including cycles and disconnected nodes', () => {
+    const nodes = Array.from({ length: 5005 }, (_, i) => ({ id: String(i) }))
+    expect(mergeScene({ nodes: [], edges: [] }, { nodes, edges: [] }).nodes).toHaveLength(5005)
     const graph = { nodes: nodes.slice(0, 3), edges: [{ source: '0', target: '1' }, { source: '1', target: '0' }] }
     expect(placeNodes(graph).size).toBe(3)
-    const dense = { ...graph, edges: Array.from({ length: SCENE_EDGE_LIMIT + 3 }, (_, i) => ({ id: String(i), source: '0', target: '1' })) }
-    expect(mergeScene({ nodes: [], edges: [] }, dense).edges).toHaveLength(SCENE_EDGE_LIMIT)
+    const dense = { ...graph, edges: Array.from({ length: 17003 }, (_, i) => ({ id: String(i), source: '0', target: '1' })) }
+    expect(mergeScene({ nodes: [], edges: [] }, dense).edges).toHaveLength(17003)
   })
 })

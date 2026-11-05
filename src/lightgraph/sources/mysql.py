@@ -7,11 +7,13 @@ was used to qualify this implementation. Agent SQL never reaches control SQL.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 import ipaddress
 import math
 import re
 import ssl
 import threading
+import sys
 import time
 from typing import Callable
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -21,6 +23,8 @@ from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler
 from .base import SourceAdapter, QueryStats, cursor_batches
 from .budget import BudgetedCursor, QueryBudget
+from .database_errors import connection_is_closed, database_diagnostic, database_error
+from .reconnect import configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary
 
 MYSQL_SQL_MODES = frozenset({"ONLY_FULL_GROUP_BY", "STRICT_TRANS_TABLES", "ERROR_FOR_DIVISION_BY_ZERO", "NO_ENGINE_SUBSTITUTION"})
 
@@ -89,6 +93,7 @@ class MySQLSource(SourceAdapter):
                  verified_capabilities: dict | CapabilityManifest | None = None,
                  connect_factory: Callable | None = None, probe_runtime_limits=False,
                  query_budget: QueryBudget | None = None, metadata_only: bool = False):
+        original_connect_factory = connect_factory
         if not allowed_tables or any(len(t.split(".")) != 2 or any(not p for p in t.split(".")) for t in allowed_tables):
             raise LightGraphError("authorized_catalog_required")
         if len(set(allowed_tables)) != len(allowed_tables):
@@ -139,13 +144,20 @@ class MySQLSource(SourceAdapter):
                 options["cursorclass"] = pymysql.cursors.SSCursor
                 connect_factory = pymysql.connect
             self.query_budget.check_time()
+            options['connect_timeout'] = min(options['connect_timeout'],
+                max(1, math.ceil(self.query_budget.deadline - time.monotonic())))
             self._connection = connect_factory(**options)
+            if connection_is_closed(self._connection):
+                raise LightGraphError('database_connection_failed')
             self.query_budget.check_time()
-            control_options = {**options, "connect_timeout": min(5, options["connect_timeout"]),
+            control_options = {**options, "connect_timeout": min(5, options["connect_timeout"],
+                               max(1, math.ceil(self.query_budget.deadline - time.monotonic()))),
                                "read_timeout": min(2, options["read_timeout"]),
                                "write_timeout": min(2, options["write_timeout"])}
             try:
                 self._control = connect_factory(**control_options)
+                if connection_is_closed(self._control):
+                    raise LightGraphError('database_connection_failed')
             finally:
                 control_options.clear()
             self.query_budget.check_time()
@@ -162,20 +174,33 @@ class MySQLSource(SourceAdapter):
             options.clear()
         self.compiler = QueryCompiler(self._tables, dialect="mysql",
             physical_columns=self._physical_column_names)
+        reopen_options = {'source_id': source_id, 'allowed_tables': list(self.allowed_tables),
+            'allowed_columns': deepcopy(self.allowed_columns), 'limits': self.limits.model_copy(deep=True),
+            'verified_capabilities': deepcopy(self._qualification), 'connect_factory': original_connect_factory,
+            'metadata_only': metadata_only}
+        configure_reconnection(self, lambda probe, budget: MySQLSource(dsn, **reopen_options,
+            probe_runtime_limits=probe, query_budget=budget))
 
     def __repr__(self):
         return f"MySQLSource(source_id={self.source_id!r}, product={self._manifest.product!r})"
 
     def _cursor(self, *, count_returns=True):
+        target = self._control, self._connection_id
+        def cancel():
+            if target[0] is not None and target[1] is not None:
+                self._interrupt(target=target)
         return BudgetedCursor(self._connection.cursor(), self.query_budget,
-                              count_returns=count_returns, cancel=self._interrupt)
+                              count_returns=count_returns, cancel=cancel)
 
     def _rollback(self):
         if not self._broken:
             try:
                 self._connection.rollback()
-            except Exception:
-                raise LightGraphError("snapshot_close_failed") from None
+            except Exception as exc:
+                self._discard_data_connection(reconnect_allowed=connection_is_closed(self._connection))
+                raise database_error('snapshot_close_failed', exc, engine='mysql',
+                    stage='snapshot_close', rollback_succeeded=False,
+                    recovery='reconnect_required') from None
 
     @staticmethod
     def _close_cursor(cursor):
@@ -341,21 +366,25 @@ class MySQLSource(SourceAdapter):
                             target_schema=schema, target_table=remote, target_columns=remote_columns))
         return tables
 
-    def _interrupt(self, *, allow_broken=False):
+    def _interrupt(self, *, allow_broken=False, target=None):
         # Cancellation must remain possible after the query budget is exhausted.
         # This private control connection can only target this adapter's own ID.
         with self._control_lock:
-            if (self._closed or self._data_closed or (self._broken and not allow_broken)
-                    or self._connection_id is None):
-                return
-            cursor = self._control.cursor()
+            if target is None:
+                if (self._closed or self._data_closed or (self._broken and not allow_broken)
+                        or self._connection_id is None):
+                    return
+                target = self._control, self._connection_id
+            control, connection_id = target
+            cursor = control.cursor()
             try:
-                cursor.execute(f"KILL QUERY {int(self._connection_id)}")
+                cursor.execute(f"KILL QUERY {int(connection_id)}")
             finally:
                 self._close_cursor(cursor)
 
-    def _discard_data_connection(self):
+    def _discard_data_connection(self, *, reconnect_allowed=False):
         self._broken = True
+        self._reconnect_allowed = reconnect_allowed
         self._manifest.consistent_snapshot = False
         if not self._data_closed:
             try:
@@ -363,6 +392,16 @@ class MySQLSource(SourceAdapter):
                 self._data_closed = True
             except Exception:
                 pass
+
+    def _reconnect(self):
+        def adopt(replacement):
+            for field in ('_connection', '_control', '_connection_id', '_manifest',
+                          '_tables', '_physical_column_names', 'compiler'):
+                setattr(self, field, getattr(replacement, field))
+            self._closed = self._broken = self._cancelled = self._data_closed = False
+            replacement._closed = replacement._disposed = True
+            replacement._reopen = None
+        reconnect_at_boundary(self, engine='mysql', discard=self._close_connections, adopt=adopt)
 
     def _probe_runtime_control(self, *, cancel):
         self._rollback()
@@ -437,10 +476,16 @@ class MySQLSource(SourceAdapter):
     def capabilities(self):
         return self._manifest.model_copy(deep=True)
 
+    @property
+    def new_snapshot_recovery_allowed(self):
+        return new_snapshot_recovery_allowed(self, required_capabilities=REQUIRED_RUNTIME,
+            disconnected=not self._closed and not self._broken and (
+                connection_is_closed(self._connection) or connection_is_closed(self._control)))
+
     @contextmanager
     def snapshot(self):
         with self._lock:
-            if self._closed or self._broken:
+            if self._disposed or self._reconnect_blocked:
                 raise LightGraphError("source_closed")
             if self.metadata_only:
                 raise LightGraphError("metadata_only_query_forbidden")
@@ -448,13 +493,58 @@ class MySQLSource(SourceAdapter):
                 raise LightGraphError("runtime_capability_unverified")
             outer = self._depth == 0
             if outer:
+                reconnected = False
+                if (self._reconnect_allowed or not self._broken and not self._closed
+                        and (connection_is_closed(self._connection) or connection_is_closed(self._control))):
+                    self._reconnect()
+                    reconnected = True
+                if self._closed or self._broken:
+                    raise LightGraphError('source_closed')
                 try:
                     self._start_readonly()
-                except LightGraphError:
-                    raise
-                except Exception:
-                    raise LightGraphError("read_only_transaction_failed") from None
+                except BaseException as exc:
+                    self._manifest.consistent_snapshot = False
+                    was_closed = connection_is_closed(self._connection) or connection_is_closed(self._control)
+                    try:
+                        self._rollback()
+                        rolled_back = not self._broken
+                    except LightGraphError:
+                        rolled_back = False
+                    if isinstance(exc, LightGraphError) or not isinstance(exc, Exception):
+                        self._reconnect_allowed = False
+                        if isinstance(exc, LightGraphError) and exc.code == 'read_only_transaction_unverified':
+                            self._manifest.capabilities['read_only_transaction'] = 'unknown'
+                        raise
+                    diagnostic = database_diagnostic(exc, engine='mysql', stage='snapshot_start')
+                    if diagnostic['category'] == 'connection' or diagnostic['category'] == 'unknown' and was_closed:
+                        self._discard_data_connection(reconnect_allowed=True)
+                        if not reconnected:
+                            self._reconnect()
+                            try:
+                                self._start_readonly()
+                            except BaseException as second:
+                                self._reconnect_blocked = True
+                                self._discard_data_connection()
+                                if isinstance(second, LightGraphError) or not isinstance(second, Exception):
+                                    raise second from None
+                                raise database_error('read_only_transaction_failed', second,
+                                    engine='mysql', stage='snapshot_start', recovery='reconnect_failed') from None
+                        else:
+                            self._reconnect_blocked = True
+                            raise database_error('read_only_transaction_failed', exc, engine='mysql',
+                                stage='snapshot_start', rollback_succeeded=rolled_back,
+                                recovery='reconnect_failed', connection_closed=was_closed) from None
+                    else:
+                        self._reconnect_allowed = False
+                        if was_closed:
+                            self._discard_data_connection()
+                        raise database_error('read_only_transaction_failed', exc, engine='mysql',
+                            stage='snapshot_start', rollback_succeeded=rolled_back,
+                            recovery='reconnect_required' if self._broken else 'rolled_back',
+                            connection_closed=was_closed) from None
                 self._manifest.consistent_snapshot = True
+            elif self._closed or self._broken:
+                raise LightGraphError('source_closed')
             self._depth += 1
             try:
                 yield self
@@ -462,7 +552,16 @@ class MySQLSource(SourceAdapter):
                 self._depth -= 1
                 if outer:
                     self._manifest.consistent_snapshot = False
-                    self._rollback()
+                    active_error = sys.exc_info()[1]
+                    try:
+                        self._rollback()
+                    except LightGraphError:
+                        if active_error is None:
+                            raise
+                        if isinstance(active_error, LightGraphError):
+                            diagnostic = getattr(active_error, 'database_diagnostic', {})
+                            active_error.database_diagnostic = {**diagnostic,
+                                'rollback_succeeded': False, 'recovery': 'reconnect_required'}
 
     def execute(self, query, *, row_limit=None):
         from lightgraph.query.compiler import mysql_driver_sql
@@ -473,14 +572,16 @@ class MySQLSource(SourceAdapter):
             self.query_budget.check_time()
             cursor = None
             finished = False
+            reconnect_allowed = False
             timed_out = threading.Event()
             self._cancelled = False
             started = time.monotonic()
             self.stats.queries += 1
+            cancel_target = self._control, self._connection_id
             def timeout():
                 timed_out.set()
                 try:
-                    self._interrupt()
+                    self._interrupt(target=cancel_target)
                 except Exception:
                     pass
             timer = threading.Timer(min(self.limits.timeout_ms / 1000,
@@ -501,13 +602,19 @@ class MySQLSource(SourceAdapter):
                     raise LightGraphError("query_timeout")
                 finished = True
                 self._manifest.capabilities["cursor_paging"] = "verified"
-            except LightGraphError:
+            except LightGraphError as exc:
+                reconnect_allowed = exc.code == 'query_timeout'
                 raise
             except Exception as exc:
                 self.query_budget.check_time()
                 code = ("query_cancelled" if self._cancelled else "query_timeout"
                         if timed_out.is_set() or _errno(exc) in {3024, 1205} else "query_execution_failed")
-                raise LightGraphError(code) from None
+                diagnostic = database_diagnostic(exc, engine='mysql', stage='query')
+                reconnect_allowed = (not self._cancelled and (code == 'query_timeout'
+                    or diagnostic['category'] == 'connection'
+                    or diagnostic['category'] == 'unknown' and connection_is_closed(self._connection)))
+                raise database_error(code, exc, engine='mysql', stage='query',
+                    recovery='reconnect_required', connection_closed=connection_is_closed(self._connection)) from None
             finally:
                 timer.cancel()
                 if timer.ident:
@@ -522,7 +629,7 @@ class MySQLSource(SourceAdapter):
                             self._interrupt()
                         except Exception:
                             pass
-                    self._discard_data_connection()
+                    self._discard_data_connection(reconnect_allowed=reconnect_allowed and not timer.is_alive())
                 try:
                     self._close_cursor(cursor)
                 except Exception:
@@ -533,6 +640,7 @@ class MySQLSource(SourceAdapter):
         if query_id is not None:
             raise LightGraphError("query_cancel_target_forbidden")
         self._cancelled = True
+        self._reconnect_allowed = False
         # Revoke reuse before I/O: cancellation can race with query completion.
         self._broken = True
         try:
@@ -545,7 +653,11 @@ class MySQLSource(SourceAdapter):
         for connection in (self._connection, self._control):
             if connection is not None and not (connection is self._connection and self._data_closed):
                 try:
-                    connection.close()
+                    closed = getattr(connection, 'closed', None)
+                    already_closed = (type(closed) in {bool, int} and closed > 0
+                                      or getattr(connection, 'open', None) is False)
+                    if not already_closed:
+                        connection.close()
                     if connection is self._connection:
                         self._data_closed = True
                 except Exception:
@@ -561,5 +673,7 @@ class MySQLSource(SourceAdapter):
 
     def close(self):
         with self._lock:
+            self._disposed = True
+            self._reopen = None
             if not self._closed:
                 self._close_connections(strict=True)

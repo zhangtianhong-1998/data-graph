@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 
@@ -74,6 +74,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     cache_hits = 0
     lookup_matches, lookup_omitted = 0, 0
     source_read_windows = []
+    unavailable_sources = {}
+    incomplete_entity_types = set()
     visibility = scope_binding_map(scope_bindings)
 
     def scope_columns(mapping):
@@ -83,6 +85,36 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         if time.monotonic() > deadline:
             raise LightGraphError('construction_time_exhausted')
 
+    def projection_key(mapping):
+        adapter = by_source.get(mapping.source_id)
+        cap = min(max_rows, adapter.limits.max_result_rows) if adapter else max_rows
+        return canonical([mapping.source_id, mapping.schema_name, mapping.table,
+            sorted(set(_projection_columns(mapping) + scope_columns(mapping))), mapping.predicate, cap])
+
+    # Keep a projection only until its last consumer. Lookup indexes retain
+    # their backing rows for this snapshot and therefore remain pinned.
+    remaining_uses = Counter(projection_key(m) for d in draft.entities + draft.relations for m in d.mappings)
+    pinned_projections = {projection_key(lookup) for d in draft.relations for m in d.mappings
+                          for lookup in (m.source_lookup, m.target_lookup) if lookup is not None}
+    projection_sizes = {}
+    unique_projections = set()
+
+    def release_projection(mapping):
+        nonlocal cache_bytes
+        key = projection_key(mapping)
+        remaining_uses[key] -= 1
+        if remaining_uses[key] <= 0 and key not in pinned_projections:
+            projection_cache.pop(key, None)
+            cache_bytes -= projection_sizes.pop(key, 0)
+
+    def blocked_sources(mapping):
+        ids = {mapping.source_id}
+        for name in ('source_lookup', 'target_lookup'):
+            lookup = getattr(mapping, name, None)
+            if lookup:
+                ids.add(lookup.source_id)
+        return sorted(ids.intersection(unavailable_sources))
+
     @contextmanager
     def source_snapshot(source_id, adapter):
         # These are client-observed transaction windows, not server snapshot IDs
@@ -90,13 +122,20 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         window = {'source_id': source_id, 'requested_at': datetime.now(timezone.utc).isoformat(),
                   'basis': 'client_observed_snapshot_context', 'state': 'opening'}
         source_read_windows.append(window)
+        body_failed = False
         try:
             with adapter.snapshot():
                 window.update(opened_at=datetime.now(timezone.utc).isoformat(), state='open')
-                yield adapter
+                try:
+                    yield adapter
+                except BaseException:
+                    body_failed = True
+                    raise
             window['state'] = 'closed'
         except Exception:
-            window['state'] = 'failed'
+            # An exception from another mapping is not evidence that this
+            # source failed to open its own transaction.
+            window['state'] = 'closed_after_interruption' if body_failed else 'failed'
             raise
         finally:
             window['closed_at'] = datetime.now(timezone.utc).isoformat()
@@ -106,6 +145,23 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         if entry not in diagnostics:
             diagnostics.append(entry)
 
+    def error_diagnostic(error, **location):
+        from lightgraph.sources.database_errors import safe_database_diagnostic
+        detail = safe_database_diagnostic(error)
+        source_id = getattr(error, 'construction_source_id', None)
+        if source_id in by_source:
+            location['source_id'] = source_id
+        diagnostic(error.code, **location, retryable=error.retryable,
+                   **({'database': detail} if detail else {}))
+
+    def failed_operation(error):
+        from .failures import SOURCE_FAILURES
+        source_id = getattr(error, 'construction_source_id', None)
+        if source_id in by_source and error.code in SOURCE_FAILURES:
+            # A failed statement can invalidate the open read transaction.
+            # Never retry later mappings against that same snapshot.
+            unavailable_sources[source_id] = error.code
+
     def update_size(previous, current):
         nonlocal graph_bytes
         graph_bytes += len(canonical(current).encode()) - previous
@@ -113,6 +169,13 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             raise LightGraphError('memory_budget_exhausted')
 
     def rows_for(mapping):
+        try:
+            return _rows_for(mapping)
+        except LightGraphError as exc:
+            exc.construction_source_id = mapping.source_id
+            raise
+
+    def _rows_for(mapping):
         nonlocal cache_bytes, cache_hits
         clock()
         table = allowed.get((mapping.source_id, mapping.schema_name, mapping.table))
@@ -138,8 +201,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         # Compile against the filtered catalog before the adapter uses its own
         # catalog, including columns mentioned only in a predicate.
         compiler.projection(table, columns, predicate=mapping.predicate, limit=cap)
-        cache_key = canonical([mapping.source_id, mapping.schema_name, mapping.table,
-                               sorted(columns), mapping.predicate, cap])
+        cache_key = projection_key(mapping)
         if cache_key in projection_cache:
             cache_hits += 1
             return projection_cache[cache_key]
@@ -179,6 +241,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         # The cache belongs to this execute_draft's open source snapshots only.
         # Retain complete authorized projections, never failed partial streams.
         cache_bytes += retained_bytes
+        projection_sizes[cache_key] = retained_bytes
+        unique_projections.add(cache_key)
         projection_cache[cache_key] = rows
         return rows
 
@@ -254,7 +318,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             support['row_context'] = {'id': 'ctx_' + digest(origin['source'], values), 'values': values}
         if hasattr(mapping, 'alias_columns'):
             value = row[mapping.label_column] if mapping.label_column else None
-            support['label'] = str(value) if value is not None else None
+            support['label'] = str(value) if value not in (None, '') else None
             support['aliases'] = sorted({str(row[column]) for column in mapping.alias_columns
                                          if row[column] is not None})
             if mapping.display_columns:
@@ -283,25 +347,39 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         used_sources = {mapping.source_id for mapping in iter_source_mappings(draft)}
         with ExitStack() as stack:
             for source_id in sorted(used_sources):
+                clock()
                 adapter = by_source.get(source_id)
                 if adapter is None:
                     continue
-                capability = adapter.capabilities()
-                if any(capability.capabilities.get(c) != 'verified' for c in
-                       ('metadata_reading', 'read_only_transaction', 'parameter_binding', 'distinct_projection')):
-                    raise LightGraphError('snapshot_or_projection_unavailable')
-                stack.enter_context(source_snapshot(source_id, adapter))
-                # Database adapters attest snapshot consistency only while the
-                # read-only transaction is open; files can attest it at rest.
-                if not adapter.capabilities().consistent_snapshot:
-                    raise LightGraphError('snapshot_or_projection_unavailable')
+                try:
+                    capability = adapter.capabilities()
+                    if any(capability.capabilities.get(c) != 'verified' for c in
+                           ('metadata_reading', 'read_only_transaction', 'parameter_binding', 'distinct_projection')):
+                        raise LightGraphError('snapshot_or_projection_unavailable')
+                    stack.enter_context(source_snapshot(source_id, adapter))
+                    if not adapter.capabilities().consistent_snapshot:
+                        raise LightGraphError('snapshot_or_projection_unavailable')
+                except LightGraphError as exc:
+                    if isinstance(exc, BudgetExceeded):
+                        raise
+                    unavailable_sources[source_id] = exc.code
+                    error_diagnostic(exc, source_id=source_id, phase='snapshot_open')
+                except Exception:
+                    unavailable_sources[source_id] = 'construction_source_execution_failed'
+                    diagnostic('construction_source_execution_failed', source_id=source_id,
+                               phase='snapshot_open', retryable=False)
             for entity in draft.entities:
                 if goal is not None and goal.entity_kinds and entity.type not in goal.entity_kinds:
                     diagnostic('outside_extraction_goal', entity_type=entity.type)
                     continue
                 for index, mapping in enumerate(entity.mappings):
-                    location = {'entity_type': entity.type, 'mapping': index}
+                    location = {'entity_type': entity.type, 'mapping': index, 'source_id': mapping.source_id}
                     try:
+                        if blocked_sources(mapping):
+                            incomplete_entity_types.add(entity.type)
+                            diagnostic('mapping_source_unavailable', **location,
+                                       blocked_sources=blocked_sources(mapping))
+                            continue
                         rows = rows_for(mapping)
                         checked += 1
                         projected_rows += len(rows)
@@ -316,6 +394,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                             key = key_for(row, mapping.key_columns)
                             node_id = identity(entity.type, key)
                             label = row[mapping.label_column] if mapping.label_column else None
+                            if label == '':
+                                label = None
                             current_support = contribution(mapping, row, support)
                             node = nodes.get(node_id)
                             previous = len(canonical(node).encode()) if node is not None else 0
@@ -344,18 +424,27 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                 node['supports'].append(current_support)
                             update_size(previous, node)
                     except LightGraphError as exc:
+                        incomplete_entity_types.add(entity.type)
+                        failed_operation(exc)
                         if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted',
                                        'run_time_budget_exhausted', 'query_budget_exhausted'}:
                             raise
-                        diagnostic(exc.code, **location)
+                        error_diagnostic(exc, **location)
+                    finally:
+                        rows = None
+                        release_projection(mapping)
             for relation in draft.relations:
                 if goal is not None and goal.relation_kinds and relation.type not in goal.relation_kinds:
                     diagnostic('outside_relation_goal', relation_type=relation.type)
                     continue
                 pairs = set()
                 for index, mapping in enumerate(relation.mappings):
-                    location = {'relation_type': relation.type, 'mapping': index}
+                    location = {'relation_type': relation.type, 'mapping': index, 'source_id': mapping.source_id}
                     try:
+                        if blocked_sources(mapping):
+                            diagnostic('mapping_source_unavailable', **location,
+                                       blocked_sources=blocked_sources(mapping))
+                            continue
                         rows = rows_for(mapping)
                         checked += 1
                         projected_rows += len(rows)
@@ -382,7 +471,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                     source = identity(relation.source_type, source_key)
                                     target = identity(relation.target_type, target_key)
                                     if source not in nodes or target not in nodes:
-                                        diagnostic('unresolved_relation_endpoint', **location)
+                                        dependency_failed = ((source not in nodes and relation.source_type in incomplete_entity_types)
+                                            or (target not in nodes and relation.target_type in incomplete_entity_types))
+                                        diagnostic('relation_dependency_unavailable' if dependency_failed else
+                                                   'unresolved_relation_endpoint', **location)
                                         continue
                                     if source == target:
                                         if mapping.equal_endpoints == 'omit':
@@ -414,14 +506,18 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                         edge['supports'].append(current_support)
                                     update_size(previous, edge)
                     except LightGraphError as exc:
+                        failed_operation(exc)
                         if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted',
                                        'run_time_budget_exhausted', 'query_budget_exhausted'}:
                             raise
-                        diagnostic(exc.code, **location)
+                        error_diagnostic(exc, **location)
+                    finally:
+                        rows = None
+                        release_projection(mapping)
                 if relation.acyclic and _has_cycle(pairs):
                     diagnostic('relation_cycle', relation_type=relation.type)
     except LightGraphError as exc:
-        diagnostic(exc.code)
+        error_diagnostic(exc)
         if exc.code == 'memory_budget_exhausted':
             # Do not return an over-limit graph after stopping its enumeration.
             # The source mappings remain durable and can be retried unchanged.
@@ -449,10 +545,23 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             values.sort(key=canonical)
         item['provenance'].sort(key=canonical)
         item['supports'].sort(key=canonical)
+    # Display derivation adds fields. Do not duplicate the entire support graph
+    # in memory or omit those fields from the serialized working-set boundary.
+    projection_cache.clear()
+    lookup_indexes.clear()
+    rendered = derive_display_graph(graph, copy=False)
+    rendered_bytes = len(canonical(rendered).encode())
+    if rendered_bytes > max_working_bytes:
+        diagnostic('memory_budget_exhausted', phase='display', required_bytes=rendered_bytes,
+                   limit_bytes=max_working_bytes)
+        rendered.update(status='candidate', nodes=[], edges=[])
+        nodes.clear()
+        edges.clear()
+        passed = False
     return {'passed': passed, 'diagnostics': diagnostics,
             'source_read_windows': source_read_windows,
             'metrics': {'mappings_checked': checked, 'projected_distinct_rows': projected_rows,
                         'nodes': len(nodes), 'edges': len(edges), 'equal_endpoints_omitted': omitted,
-                        'projection_cache_hits': cache_hits, 'unique_projections': len(projection_cache),
+                        'projection_cache_hits': cache_hits, 'unique_projections': len(unique_projections),
                         'lookup_matches': lookup_matches, 'lookup_inputs_omitted': lookup_omitted},
-            'graph': derive_display_graph(graph)}
+            'graph': rendered}

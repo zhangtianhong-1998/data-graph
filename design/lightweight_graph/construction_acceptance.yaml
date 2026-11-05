@@ -1,5 +1,5 @@
 schema_version: 1
-updated: '2026-11-04'
+updated: '2026-11-05'
 purpose: 按用户目的从事实数据自主发现图谱；本轮尚未登记真实模型或客户语义验收。
 design: GENERIC_GRAPH_CONSTRUCTION.md
 scope:
@@ -31,6 +31,52 @@ engineering_snapshot:
   status_document: ../../IMPLEMENTATION_STATUS.md
   migration_gaps: CONSTRUCTION_MIGRATION_GAPS.md
 latest_engineering_snapshot:
+  date: '2026-11-05'
+  design: DISCOVERY_RECOVERY_AND_FULL_GRAPH_20261105.md
+  python_passed: 2946
+  python_failed: 0
+  python_skipped: 0
+  native_kernel_enabled: true
+  model_endpoint: loopback_scripted_fixture
+  frontend_passed: 331
+  frontend_build: passed
+  browser_evidence: ../../runs/discovery-recovery-20261105/ui-verification.json
+  browser_nodes: 5001
+  browser_edges: 9999
+  real_database_called: false
+  external_model_called: false
+  autonomous_discovery_acceptance: not_run
+  covered_contracts:
+    - query_cost_feedback_and_retained_failed_drafts
+    - readonly_reconnection_requalification_without_partial_query_replay
+    - safe_worker_diagnostics_view_export_and_explicit_cleanup
+    - full_graph_batches_with_cross_page_edges
+    - circular_canvas_pause_resume_and_complete_neighborhoods
+    - graph_generation_and_access_revision_isolation
+  boundary: 故障注入、模拟网关和合成画布不证明客户库恢复或真实模型发现质量；列级Measure和十万级可视化未验收。
+initial_mixed_source_snapshot:
+  date: '2026-11-05'
+  design: MIXED_SOURCE_FAILURES_20261105.md
+  python_passed: 2880
+  python_failed: 0
+  python_skipped: 0
+  native_kernel_enabled: true
+  model_endpoint: loopback_scripted_fixture
+  frontend_passed: 317
+  frontend_build: passed
+  browser_historical_structure_preview: passed
+  browser_evidence: ../../runs/mixed-source-recovery-20261105/ui-verification.json
+  real_database_called: false
+  external_model_called: false
+  autonomous_discovery_acceptance: not_run
+  covered_contracts:
+    - readonly_setup_cleanup_and_safe_failure_diagnostics
+    - independent_source_candidates_without_partial_publication
+    - projection_cache_release_preserving_names_and_context
+    - primary_name_coverage_and_revision_loss_advice
+    - historical_structure_preview_without_fact_queries
+  boundary: 故障注入和合成预览不能确认客户库故障原因；列级 Measure 概念映射仍未实现。历史记录不与本轮测试数相加。
+previous_engineering_snapshot:
   date: '2026-11-04'
   design: RELATION_MAPPING_AND_PUBLICATION_20261104.md
   python_passed: 2829

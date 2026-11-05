@@ -202,7 +202,9 @@ def test_snapshot_entry_without_consistency_still_blocks_projection(tmp_path):
     with UnverifiedSnapshot([table], {'public.items': [('001',)]}) as adapter:
         result = execute_draft(draft, [adapter], [table])
         assert not result['passed'] and result['graph']['nodes'] == []
-        assert result['diagnostics'] == [{'code': 'snapshot_or_projection_unavailable'}]
+        failure = next(d for d in result['diagnostics'] if d['code'] == 'snapshot_or_projection_unavailable')
+        assert failure['source_id'] == 'db' and failure['phase'] == 'snapshot_open'
+        assert any(d['code'] == 'mapping_source_unavailable' for d in result['diagnostics'])
         assert adapter.stats.queries == 0 and adapter._depth == 0
 
 

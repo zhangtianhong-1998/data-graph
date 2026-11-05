@@ -4,8 +4,10 @@ import { request, projectPath } from './api'
 import type { Graph, GraphNode, GraphEdge } from './types'
 import { fitCamera, zoomCamera } from './graphViewport'
 import { wrapGraphLabel } from './graphLabelLayout'
-import { SCENE_LIMIT, SCENE_EDGE_LIMIT, edgeKey, mergeScene, placeNodes, sceneBounds, hitNode } from './graphScene'
+import { mergeScene, placeNodes, sceneBounds, hitNode } from './graphScene'
 import type { Point } from './graphScene'
+import { invalidatesGraph, newGraphTransfer, transferGraph } from './graphTransfer'
+import type { GraphTransfer } from './graphTransfer'
 import { twoHopNeighborhood } from './graphNeighborhood'
 import type { NeighborhoodTraversal } from './graphNeighborhood'
 import PropertyTable from './PropertyTable.vue'
@@ -13,14 +15,42 @@ import TechnicalDetails from './TechnicalDetails.vue'
 import { mergeDisplaySchema, nodeCaption, nodeIdentity, nodeProperties, nodeSearchText, vocabularyDescription, vocabularyLabel } from './graphLabels'
 import type { DisplaySchema } from './graphLabels'
 
-const props = defineProps<{ graph: Graph; layer: string; loading?: boolean; projectId?: string; includeCandidates?: boolean }>()
+const props = defineProps<{ graph: Graph; layer: string; loading?: boolean; projectId?: string; includeCandidates?: boolean; configRevision?: string | number }>()
 const search = ref('')
 const selectedKind = ref('')
 const remote = ref<Graph | null>(null), pageLoading = ref(false), pageError = ref('')
 const neighborhood = ref<{ center: GraphNode; graph: Graph; traversal: NeighborhoodTraversal; preview?: boolean } | null>(null)
 const baseGraph = computed(() => remote.value ?? props.graph)
 const graph = computed(() => neighborhood.value?.graph ?? baseGraph.value)
-const neighborhoodNodeLimit = computed(() => props.projectId ? 1000 : SCENE_LIMIT)
+const fullTransport = computed(() => !!props.projectId && props.graph.complete_batches === true)
+const fullLoading = ref(false), fullPaused = ref(false), fullError = ref('')
+let fullController: AbortController | undefined, fullEpoch = 0, fullTransfer: GraphTransfer | undefined
+let cameraTouched = false
+const fullComplete = computed(() => loadedGraphIsComplete(baseGraph.value))
+const fullProgress = computed(() => {
+  const total = Number(baseGraph.value.total_nodes || 0) + Number(baseGraph.value.total_edges || 0)
+  return total ? Math.min(100, Math.floor((baseGraph.value.nodes.length + baseGraph.value.edges.length) / total * 100)) : 0
+})
+function pauseFullGraph() { fullEpoch++; fullController?.abort(); fullLoading.value = false; fullPaused.value = true }
+async function loadFullGraph(restart = false) {
+  if (!props.projectId) return
+  const epoch = ++fullEpoch
+  fullController?.abort(); fullController = new AbortController()
+  if (restart || !fullTransfer) fullTransfer = newGraphTransfer()
+  fullLoading.value = true; fullPaused.value = false; fullError.value = ''
+  try {
+    await transferGraph(props.projectId, { layer: props.layer, includeCandidates: props.includeCandidates }, fullTransfer, fullController.signal, value => {
+      if (epoch === fullEpoch) remote.value = value
+    })
+    if (epoch === fullEpoch && !neighborhood.value && !cameraTouched) { await nextTick(); fit() }
+  } catch (error) {
+    if (epoch !== fullEpoch) return
+    if (invalidatesGraph(error)) {
+      remote.value = { nodes: [], edges: [], truncated: true }; neighborhood.value = null; clearSelection(); savedScene = null; fullTransfer = undefined
+    }
+    fullError.value = error instanceof Error ? error.message : '图谱读取失败，已加载的数据保留，可继续读取。'
+  } finally { if (epoch === fullEpoch) fullLoading.value = false }
+}
 const neighborhoodCount = computed(() => Number(graph.value.focus_neighbor_count ?? Math.max(0, graph.value.nodes.length - 1)) + 1)
 const neighborhoodIncomplete = computed(() => neighborhood.value && (visible.value.length < neighborhoodCount.value || graph.value.truncated === true || graph.value.next_offset != null))
 let savedScene: { positions: Map<string, Point>; zoom: number; offset: Point; generation: unknown } | null = null
@@ -33,7 +63,6 @@ const expansionOffsets = ref(new Map<string, number | null>())
 let sceneController: AbortController | undefined
 const matchedCount = computed(() => searchMatches.value ? searchMatchCount.value ?? searchMatches.value.length : filtered.value.length)
 const overview = computed(() => graph.value.kind_counts as Record<string, number> | undefined)
-const atCapacity = computed(() => graph.value.nodes.length >= SCENE_LIMIT || graph.value.edges.length >= SCENE_EDGE_LIMIT)
 async function loadScene(options: { focus?: string; q?: string; kind?: string; more?: boolean; replace?: boolean } = {}) {
   const epoch = ++pageGeneration
   sceneController?.abort(); sceneController = new AbortController()
@@ -64,12 +93,7 @@ async function loadScene(options: { focus?: string; q?: string; kind?: string; m
       const nearby = await request<Graph>(`${projectPath(props.projectId!)}/graph?${nearbyParams}`, { signal: sceneController.signal })
       if (epoch !== pageGeneration) return
       if (value.generation && nearby.generation !== value.generation) { pageError.value = '图谱已更新，请重新搜索以加载同一版本的关联。'; return }
-      const existing = new Set(graph.value.nodes.map(node => node.id))
-      const existingEdges = new Set(graph.value.edges.map(edgeKey))
-      const fits = existing.size + nearby.nodes.filter(node => !existing.has(node.id)).length <= SCENE_LIMIT &&
-        existingEdges.size + nearby.edges.filter(edge => !existingEdges.has(edgeKey(edge))).length <= SCENE_EDGE_LIMIT
-      remote.value = fits ? mergeScene(graph.value, nearby) : nearby
-      if (!fits) positions.value = placeNodes(nearby)
+      remote.value = mergeScene(graph.value, nearby)
       expansionOffsets.value.set(center.id, nearby.next_offset as number | null)
       await nextTick(); if (epoch === pageGeneration) focusNode(center)
     }
@@ -78,7 +102,7 @@ async function loadScene(options: { focus?: string; q?: string; kind?: string; m
   finally { if (epoch === pageGeneration) pageLoading.value = false }
 }
 async function expandNode() {
-  if (!selected.value || atCapacity.value || !serverPaging.value) return
+  if (!selected.value || !serverPaging.value) return
   const id = selected.value.id
   await loadScene({ focus: id, more: expansionOffsets.value.has(id) })
 }
@@ -155,7 +179,7 @@ async function showTwoHops(node: GraphNode, traversal: NeighborhoodTraversal = n
   const epoch = ++pageGeneration
   sceneController?.abort(); sceneController = new AbortController(); clearTimeout(searchTimer)
   pageLoading.value = true; pageError.value = ''
-  const complete = !props.projectId || loadedGraphIsComplete(baseGraph.value)
+  const complete = loadedGraphIsComplete(baseGraph.value)
   const known = neighborhood.value ? mergeScene(baseGraph.value, neighborhood.value.graph) : baseGraph.value
   const preview = twoHopNeighborhood(complete ? baseGraph.value : known, node.id, traversal)
   if (!neighborhood.value) savedScene = { positions: new Map(positions.value), zoom: zoom.value, offset: { ...offset.value }, generation: baseGraph.value.generation }
@@ -167,16 +191,25 @@ async function showTwoHops(node: GraphNode, traversal: NeighborhoodTraversal = n
   try {
     // A complete scene can be filtered here. A paged scene has to ask for the published neighborhood.
     const params = new URLSearchParams({ layer: props.layer, include_candidates: String(props.includeCandidates === true), focus: node.id, hops: '2', traversal, limit: '1000', offset: '0' })
-    const value = complete
+    const value = complete || !props.projectId
       ? preview
-      : await request<Graph>(`${projectPath(props.projectId!)}/graph?${params}`, { signal: sceneController.signal })
+      : fullTransport.value
+        ? await transferGraph(props.projectId, { layer: props.layer, includeCandidates: props.includeCandidates, focus: node.id, hops: 2, traversal }, newGraphTransfer(), sceneController.signal, value => {
+            if (epoch !== pageGeneration) return
+            const center = value.nodes.find(item => item.id === node.id) || node
+            neighborhood.value = { center, graph: value, traversal, preview: value.fully_loaded !== true }
+          })
+        : await request<Graph>(`${projectPath(props.projectId!)}/graph?${params}`, { signal: sceneController.signal })
     if (epoch !== pageGeneration) return
     const center = value.nodes.find(item => item.id === node.id)
     if (!center) { pageError.value = '当前图谱中已找不到这个节点，请刷新图谱。'; return }
     clearFilters(); if (value.generation !== preview.generation) clearSelection(); positions.value = placeNodes(value)
     neighborhood.value = { center, graph: value, traversal }; selectNode(center)
     await nextTick(); if (epoch === pageGeneration) fit()
-  } catch (error) { if (epoch === pageGeneration) pageError.value = error instanceof Error ? error.message : '两跳关联读取失败' }
+  } catch (error) { if (epoch === pageGeneration) {
+    if (invalidatesGraph(error)) { pauseFullGraph(); remote.value = { nodes: [], edges: [], truncated: true }; neighborhood.value = null; fullTransfer = undefined; clearSelection() }
+    pageError.value = error instanceof Error ? error.message : '两跳关联读取失败'
+  } }
   finally { if (epoch === pageGeneration) pageLoading.value = false }
 }
 async function returnToGraph() {
@@ -184,9 +217,12 @@ async function returnToGraph() {
   pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); pageLoading.value = false; pageError.value = ''
   neighborhood.value = null; clearFilters(); clearSelection()
   if (changed && props.projectId) {
-    savedScene = null; await loadScene({ replace: true }); return
+    savedScene = null
+    if (fullTransport.value) { positions.value = placeNodes(baseGraph.value); await nextTick(); fit() }
+    else await loadScene({ replace: true })
+    return
   }
-  if (savedScene) { positions.value = savedScene.positions; zoom.value = savedScene.zoom; offset.value = savedScene.offset }
+  if (savedScene) { positions.value = placeNodes(baseGraph.value, savedScene.positions); zoom.value = savedScene.zoom; offset.value = savedScene.offset }
   savedScene = null
 }
 
@@ -202,15 +238,15 @@ const filtered = computed(() => graph.value.nodes.filter(n =>
   (!search.value || (serverPaging.value && searchMatches.value ? searchMatches.value.includes(n.id) :
     nodeSearchText(n).includes(search.value.toLocaleLowerCase())))))
 // Searching highlights and locates without removing the surrounding graph.
-const visible = computed(() => graph.value.nodes.slice(0, SCENE_LIMIT))
+const visible = computed(() => graph.value.nodes)
 const positions = ref<Map<string, Point>>(new Map())
 const points = computed(() => positions.value)
 const bounds = computed(() => sceneBounds(points.value))
 const largeScene = computed(() => visible.value.length > 300)
 const bitmap = ref<HTMLCanvasElement | null>(null)
-const edges = computed(() => graph.value.edges.filter(edge => points.value.has(edge.source) && points.value.has(edge.target)).slice(0, SCENE_EDGE_LIMIT))
+const edges = computed(() => graph.value.edges.filter(edge => points.value.has(edge.source) && points.value.has(edge.target)))
 const accessibleNodes = computed(() => (search.value || selectedKind.value ? filtered.value : visible.value).slice(0, 40))
-watch(() => graph.value, value => { positions.value = placeNodes({ ...value, nodes: value.nodes.slice(0, SCENE_LIMIT) }, positions.value) }, { immediate: true, flush: 'sync' })
+watch(() => graph.value, value => { positions.value = placeNodes({ ...value, nodes: value.nodes }, positions.value) }, { immediate: true, flush: 'sync' })
 const adjacent = computed(() => {
   if (!selected.value) return []
   const found = new Map<string, GraphEdge>()
@@ -242,6 +278,7 @@ const metadataY = (node: GraphNode) => 43 + labelLines(node).length * 16
 const kindColor = (node: GraphNode) => ['#407ff2', '#20a27e', '#9a6add', '#da9b37', '#54a6bc'][Math.max(0, kinds.value.indexOf(String(node.kind || node.layer || '节点'))) % 5]
 function reset() { zoom.value = 1; offset.value = { x: 0, y: 0 } }
 function setZoom(value: number) {
+  cameraTouched = true
   const camera = zoomCamera({ zoom: zoom.value, offset: offset.value }, Math.max(.001, Math.min(3, value)), viewport.value)
   zoom.value = camera.zoom; offset.value = camera.offset
 }
@@ -251,6 +288,7 @@ function fit() {
 }
 function move(event: PointerEvent) {
   if (!drag || (!drag.moved && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) <= 5)) return
+  cameraTouched = true
   if (!drag.moved) { drag.moved = true; (event.currentTarget as Element).setPointerCapture(event.pointerId) }
   offset.value = { x: drag.ox + (event.clientX - drag.x) * drag.factor, y: drag.oy + (event.clientY - drag.y) * drag.factor }
 }
@@ -260,6 +298,7 @@ function start(event: PointerEvent) {
   drag = { x: event.clientX, y: event.clientY, ox: offset.value.x, oy: offset.value.y, factor: Math.max(viewport.value.width / rect.width, viewport.value.height / rect.height), moved: false }
 }
 function focusNode(node: GraphNode) {
+  cameraTouched = true
   const p = points.value.get(node.id)
   if (p) { zoom.value = 1; offset.value = { x: viewport.value.width / 2 - p.x, y: viewport.value.height / 2 - p.y } }
 }
@@ -348,15 +387,32 @@ function paint() {
 }
 watch([bitmap, positions, zoom, offset, viewport, selected, selectedEdge, search, selectedKind], paint, { flush: 'post' })
 watch([() => props.graph, () => props.layer, () => props.projectId, () => props.includeCandidates], () => {
-  pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); neighborhood.value = null; savedScene = null; remote.value = null; pageLoading.value = false; positions.value = placeNodes({ ...props.graph, nodes: props.graph.nodes.slice(0, SCENE_LIMIT) })
+  fullEpoch++; fullController?.abort(); fullTransfer = undefined; fullLoading.value = false; fullPaused.value = false; fullError.value = ''; cameraTouched = false
+  pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); neighborhood.value = null; savedScene = null; remote.value = null; pageLoading.value = false; positions.value = placeNodes({ ...props.graph, nodes: props.graph.nodes })
   search.value = ''; searchMatches.value = null; searchMatchCount.value = null; selectedKind.value = ''; expansionOffsets.value.clear(); clearSelection(); reset()
-  if (serverPaging.value && Number(props.graph.total_nodes) <= 1000 && props.graph.next_offset != null) void loadScene()
+  if (fullTransport.value && !loadedGraphIsComplete(props.graph) && !props.loading) void loadFullGraph()
+  else if (!fullTransport.value && serverPaging.value && Number(props.graph.total_nodes) <= 1000 && props.graph.next_offset != null) void loadScene()
 }, { immediate: true })
+// A configuration revision can narrow authorization without changing the
+// initial graph prop. Purge every old view before fetching the new scope.
+watch(() => props.configRevision, (revision, previous) => {
+  if (revision === previous || !props.projectId) return
+  fullEpoch++; fullController?.abort(); fullTransfer = undefined
+  fullLoading.value = false; fullPaused.value = false; fullError.value = ''
+  pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer)
+  pageLoading.value = false; pageError.value = ''; neighborhood.value = null; savedScene = null
+  remote.value = { nodes: [], edges: [], truncated: true }
+  positions.value = new Map(); expansionOffsets.value.clear(); clearFilters(); clearSelection(); reset()
+  if (fullTransport.value && !props.loading) void loadFullGraph(true)
+}, { flush: 'sync' })
+watch(() => props.loading, loading => {
+  if (!loading && fullTransport.value && !fullTransfer && !fullPaused.value && !fullLoading.value && !loadedGraphIsComplete(baseGraph.value)) void loadFullGraph()
+})
 watch([search, selectedKind], () => {
   if (resettingSearch) return
   if (neighborhood.value) { if (filtered.value[0]) focusNode(filtered.value[0]); return }
   pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); pageLoading.value = false; searchMatches.value = null; searchMatchCount.value = null
-  if (serverPaging.value && (search.value || selectedKind.value)) searchTimer = setTimeout(() => { void loadScene({ q: search.value, kind: selectedKind.value }) }, 200)
+  if (!fullTransport.value && serverPaging.value && (search.value || selectedKind.value)) searchTimer = setTimeout(() => { void loadScene({ q: search.value, kind: selectedKind.value }) }, 200)
   else if (filtered.value[0]) focusNode(filtered.value[0])
 }, { flush: 'sync' })
 watch(canvas, element => {
@@ -369,7 +425,7 @@ watch(canvas, element => {
   })
   observer.observe(element); void nextTick(fit)
 }, { flush: 'post' })
-onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); observer?.disconnect() })
+onUnmounted(() => { fullEpoch++; fullController?.abort(); pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); observer?.disconnect() })
 </script>
 
 <template>
@@ -388,8 +444,16 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
         <span class="muted small-text neighborhood-explanation">{{ neighborhood.traversal === 'chains' ? '沿箭头向前、向后各查两步，不在途中换向；不会仅因归属同一中心而展开其他指标。' : '可在途中换向：会包含经共同父节点、归属中心等连接的其他对象。' }}</span>
       </div>
       <p v-if="neighborhood?.preview" class="note" aria-label="两跳范围补全状态">当前仅显示已加载数据中的关联节点，{{ pageLoading ? '正在读取完整两跳范围。' : '完整两跳范围尚未读取。' }}<button v-if="!pageLoading" class="btn small" @click="showTwoHops(neighborhood.center)">重试读取两跳关联</button></p>
-      <p v-if="!neighborhood && (search || selectedKind)" class="note" aria-label="检索局部视图">搜索用于定位节点；已定位结果会补载一跳邻居，名称和类型筛选不排除邻居。画布没有显示的边不代表不存在，可双击节点查看两跳范围。</p>
+      <p v-if="!neighborhood && (search || selectedKind)" class="note" aria-label="检索局部视图">搜索用于定位和突出显示已加载的节点，名称和类型筛选不会移除周围节点。全图加载完成前，搜索范围仍在补充；双击节点可单独查看完整两跳范围。</p>
       <p v-if="graph.edges_truncated" class="note amber" aria-label="关系截断提示">当前返回的关系有数量上限，画布并未显示此范围内的全部边。请聚焦具体节点，查看来源详情中的完整关系计数。</p>
+      <div v-if="fullTransport" class="graph-load-progress" aria-label="全图加载进度">
+        <progress :value="fullComplete ? 100 : fullProgress" max="100" :aria-label="fullComplete ? '全图加载完成' : '全图加载进度'"/>
+        <span role="status">{{ fullComplete ? '已加载完整图谱' : fullLoading ? '正在加载全图' : fullPaused ? '全图加载已暂停，当前仅为部分数据' : '全图尚未加载完整' }} · 节点 {{ baseGraph.nodes.length }} / {{ baseGraph.total_nodes ?? '待确认' }} · 关系 {{ baseGraph.edges.length }} / {{ baseGraph.total_edges ?? '待确认' }}</span>
+        <button v-if="fullLoading" class="btn small" @click="pauseFullGraph">暂停加载</button>
+        <button v-else-if="!fullComplete" class="btn small" @click="loadFullGraph()">{{ fullError ? '重试加载' : '继续加载' }}</button>
+        <button v-if="fullError" class="btn small" @click="loadFullGraph(true)">重新加载全图</button>
+        <p v-if="fullError" role="alert">{{ fullError }}</p>
+      </div>
       <p v-if="pageLoading" role="status">正在读取图谱关联…</p>
       <p v-if="pageError" role="alert">{{ pageError }}</p>
       <div v-if="loading" class="empty-state"><div class="spinner"></div>正在读取图谱</div>
@@ -411,7 +475,7 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
           </g>
         </svg>
       </div>
-      <div class="panel-footer"><span v-if="!neighborhood">画布已加载 {{ visible.length }} / 全图 {{ graph.total_nodes ?? graph.nodes.length }} 个节点 · 已加载 {{ edges.length }} / 全图 {{ graph.total_edges ?? graph.edges.length }} 条关系</span><span v-else-if="neighborhood.preview">两跳关联当前显示 {{ visible.length }} 个节点 · {{ edges.length }} 条关系，完整范围待补全</span><span v-else>两跳范围已加载 {{ visible.length }} / {{ neighborhoodCount }} 个节点 · {{ edges.length }} 条关系</span><span v-if="search || selectedKind">匹配 {{ matchedCount }} 个节点（结果最多 1000 个）</span><span v-if="neighborhoodIncomplete">部分关联尚未完整显示（最多 {{ neighborhoodNodeLimit }} 个节点，关系也有显示上限）；可双击范围内的节点继续查看其两跳关联。</span><span v-else-if="graph.truncated">来源返回部分图谱，尚未加载的节点和边不表示不存在</span><span v-else-if="!neighborhood && serverPaging && visible.length < Number(graph.total_nodes)">全图搜索或选择节点展开关联；画布保留已加载内容</span><span v-else>拖动平移 · 滚轮缩放 · 单击查看来源 · 双击查看两跳关联</span><span v-if="atCapacity">画布已达上限（{{ SCENE_LIMIT }} 个节点 / {{ SCENE_EDGE_LIMIT }} 条关系），请清空后定位新的对象</span><button v-if="!neighborhood && serverPaging && (atCapacity || visible.length > 1000)" class="btn small" @click="loadScene({ q: search, kind: selectedKind, replace: true })">清空并聚焦当前检索</button></div>
+      <div class="panel-footer"><span v-if="!neighborhood">画布已加载 {{ visible.length }} / 全图 {{ graph.total_nodes ?? graph.nodes.length }} 个节点 · 已加载 {{ edges.length }} / 全图 {{ graph.total_edges ?? graph.edges.length }} 条关系</span><span v-else-if="neighborhood.preview">两跳关联当前显示 {{ visible.length }} 个节点 · {{ edges.length }} 条关系，完整范围待补全</span><span v-else>两跳范围已加载 {{ visible.length }} / {{ neighborhoodCount }} 个节点 · {{ edges.length }} 条关系</span><span v-if="search || selectedKind">匹配 {{ matchedCount }} 个节点（已加载范围）</span><span v-if="neighborhoodIncomplete">部分关联尚未完整显示，可继续读取或重试两跳关联。<span v-if="!fullTransport">兼容接口单次最多 1000 个节点。</span></span><span v-else-if="graph.truncated">当前为部分图谱，尚未加载的节点和边不表示不存在</span><span v-else>拖动平移 · 滚轮缩放 · 单击查看来源 · 双击查看两跳关联</span></div>
       <details v-if="largeScene || search || selectedKind" class="scene-node-list"><summary>定位节点 · {{ filtered.length }} 个匹配</summary><button v-for="node in accessibleNodes" :key="node.id" class="btn small" @click="nodeClick(node, $event, true)" @dblclick.stop="nodeDoubleClick(node)">{{ display(node) }} · {{ statusName(node.status) }} · {{ scopeLabel(node) }}</button><p v-if="filtered.length > 40">列表展示前 40 个匹配，请搜索缩小范围；画布仍保留已加载节点。</p></details>
     </section>
     <aside class="panel graph-detail">
@@ -435,7 +499,7 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
           <PropertyTable :values="nodeProperties(selected)" :label="propertyName" /><TechnicalDetails :value="selected" />
           <h3>已加载关联 · {{ adjacent.length }}</h3><p class="field-hint" aria-label="节点关联范围">当前画布显示 {{ drawnIncidentEdges }} 条相连关系<template v-if="knownIncidentEdges != null">，当前授权图中共有 {{ knownIncidentEdges }} 条</template><template v-else>；完整关系数量尚未读取</template>。<template v-if="knownIncidentEdges == null || drawnIncidentEdges < knownIncidentEdges">当前是局部视图，不能据此判断节点孤立。</template></p>
           <button class="btn small" :disabled="pageLoading" @click="showTwoHops(selected)">查看两跳关联</button>
-          <button v-if="serverPaging && !neighborhood" class="btn small" :disabled="pageLoading || atCapacity || expansionOffsets.get(selected.id) === null" @click="expandNode">{{ expansionOffsets.has(selected.id) ? '继续展开关联' : '展开相邻节点' }}</button>
+          <button v-if="serverPaging && !fullTransport && !neighborhood" class="btn small" :disabled="pageLoading || expansionOffsets.get(selected.id) === null" @click="expandNode">{{ expansionOffsets.has(selected.id) ? '继续展开关联' : '展开相邻节点' }}</button>
           <button v-for="(edge, i) in adjacent.slice(0, 40)" :key="i" type="button" class="edge-detail relation-selection" @click="selectEdge(edge)">
             <span class="badge" :title="relationDescription(edge.relation)">{{ relationName(edge.relation) }} · {{ statusName(edge.status) }}</span>
             <p>{{ endpointName(edge.source) }} → {{ endpointName(edge.target) }}</p>
@@ -486,4 +550,10 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
 .relation-selection { display: block; width: 100%; text-align: left; background: transparent; color: inherit; cursor: pointer; border: 0; }
 .fact-detail { padding: 12px 0; border-bottom: 1px solid var(--border, #e2e8f0); }
 .relation-endpoints{overflow-wrap:anywhere;line-height:1.7}.support-detail{margin:8px 0;padding:6px;background:var(--surface-alt,#f8fafc)}.mapping-details summary{cursor:pointer}.fact-detail ul { padding-left: 18px; font-size: 12px; }
+</style>
+
+<style scoped>
+.graph-load-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 12px 16px; border-bottom: 1px solid #e4e9f2; font-size: 13px; color: #52617a; }
+.graph-load-progress progress { width: 120px; accent-color: #407ff2; }
+.graph-load-progress [role="alert"] { width: 100%; color: #a3372c; margin: 0; }
 </style>

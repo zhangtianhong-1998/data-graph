@@ -199,6 +199,10 @@ def clear_run_trace(manager, pid, rid):
     if record['status'] in {'queued','running'}:
         raise LightGraphError('run_trace_active')
     trace, index, status, cleared = paths
+    from .worker_diagnostics import check_worker_log_paths, worker_log_artifacts
+    from lightgraph.construction.paths import io_path
+    _, record_path = manager._paths(pid, rid)
+    check_worker_log_paths(record_path)
     # This operation is only exposed by the explicit, revision-checked DELETE.
     with _reader_lock:
         if _readers.get(trace):raise LightGraphError('run_trace_export_active')
@@ -206,5 +210,7 @@ def clear_run_trace(manager, pid, rid):
             _kind_caches.pop(str(trace), None)
         for path in (trace, index, status):
             path.unlink(missing_ok=True)
+        for path in worker_log_artifacts(record_path):
+            io_path(path).unlink(missing_ok=True)
     atomic_text(cleared, json.dumps({'run_id':rid,'cleared':True}))
     return read_run_trace(manager,pid,rid)

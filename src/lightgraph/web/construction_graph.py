@@ -189,7 +189,7 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
             "focus_filters_ignored": bool(focus and (q or kind)),
             "neighborhood_truncated": bool(focus and (len(page) < len(selected) or len(local_edges) < len(page_edges))),
             "include_candidates": include_candidates, "candidate_view_available": False,
-            "display_schema": vocabulary(graph), "semantic_origin": "agent_authored"}
+            "display_schema": vocabulary(graph), "semantic_origin": "agent_authored", "complete_batches": True}
 
 
 def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_candidates=False):

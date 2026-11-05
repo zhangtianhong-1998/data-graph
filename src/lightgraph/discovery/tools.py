@@ -36,10 +36,12 @@ _SAFE_ERRORS = frozenset({
     "untrusted_column_type", "invalid_column_selection", "reference_arity_mismatch",
     "invalid_tool_arguments", "unknown_tool", "metadata_only_query_forbidden",
     "executor_closed", "invalid_result_limit", "invalid_aggregate_shape",
-    "memory_budget_exhausted", "query_timeout", "query_cancelled",
+    "memory_budget_exhausted", "query_timeout", "query_cancelled", "query_cancel_failed",
     "query_execution_failed", "query_authorization_failed", "query_budget_exhausted", "run_time_budget_exhausted",
     "returned_rows_budget_exhausted", "returned_bytes_budget_exhausted",
     "db_cu_budget_exhausted", "wall_time_budget_exhausted", "source_closed",
+    "read_only_transaction_failed", "read_only_transaction_unverified", "snapshot_close_failed",
+    "runtime_capability_unverified", "database_connection_failed", "database_reconnect_failed", "source_catalog_changed",
     "source_value_type_unsupported", "non_finite_source_value", "result_truncated",
     "formula_cache_missing_in_projection",
     "document_context_too_large", "stale_document_reference", "document_reference_scope_mismatch",
@@ -258,6 +260,10 @@ class ToolExecutor:
             if isinstance(error, (TypeError, ValueError, KeyError)):
                 code = "invalid_tool_arguments"
             result = {"status": "error", "operator": operator, "probe_id": probe_id, "code": code}
+            from lightgraph.sources.database_errors import safe_database_diagnostic
+            detail = safe_database_diagnostic(error)
+            if detail:
+                result.update(database=detail, retryable=error.retryable is True)
             if operator == "execute_readonly_sql" and code in {"unauthorized_object", "unauthorized_column", "ambiguous_column"}:
                 # Fixed protocol help, never the rejected SQL, its identifiers,
                 # or parameters. The narrowed metadata tool owns visibility.
