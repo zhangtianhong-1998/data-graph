@@ -1,0 +1,91 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "validation_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Validation Id"
+    },
+    "graph_path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Graph Path"
+    },
+    "read_window": {
+      "additionalProperties": true,
+      "title": "Read Window",
+      "type": "object"
+    },
+    "revision": {
+      "minimum": 1,
+      "title": "Revision",
+      "type": "integer"
+    },
+    "draft_fingerprint": {
+      "title": "Draft Fingerprint",
+      "type": "string"
+    },
+    "context_fingerprint": {
+      "title": "Context Fingerprint",
+      "type": "string"
+    },
+    "passed": {
+      "title": "Passed",
+      "type": "boolean"
+    },
+    "diagnostics": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Diagnostics",
+      "type": "array"
+    },
+    "metrics": {
+      "additionalProperties": true,
+      "title": "Metrics",
+      "type": "object"
+    },
+    "evidence_refs": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Evidence Refs",
+      "type": "array"
+    },
+    "graph_digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Graph Digest"
+    }
+  },
+  "required": [
+    "revision",
+    "draft_fingerprint",
+    "context_fingerprint",
+    "passed"
+  ],
+  "title": "DataValidation",
+  "type": "object"
+}

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
@@ -38,9 +39,12 @@ def create_server(tools):
         return tools.call("save_graph_draft", yaml_text=yaml_text)
 
     @server.tool()
-    def validate_graph_draft(draft_id: str) -> dict:
-        """Check mappings on complete data, save YAML and return specific conflicts to revise."""
-        return tools.call("validate_graph_draft", draft_id=draft_id)
+    def validate_graph_draft(draft_id: str, mode: Literal['instances', 'structure'] | None = None) -> dict:
+        """Check structure without querying facts, or validate complete mapped instances.
+        Omitted mode uses the project's construction_target. Every attempt retains
+        its own YAML artifact. Name quality advice is non-blocking.
+        """
+        return tools.call("validate_graph_draft", draft_id=draft_id, mode=mode)
 
     @server.tool()
     def read_workspace(draft_id: str | None = None) -> dict:
@@ -48,9 +52,14 @@ def create_server(tools):
         return tools.call("read_workspace", draft_id=draft_id)
 
     @server.tool()
-    def publish_graph_draft(draft_id: str) -> dict:
-        """Publish the current fully checked YAML graph version. Preserve prior versions."""
-        return tools.call("publish_graph_draft", draft_id=draft_id)
+    def publish_graph_draft(draft_id: str, validation_id: str | None = None,
+                            mode: Literal['instances', 'structure'] | None = None) -> dict:
+        """Publish a checked immutable artifact without rereading database facts.
+        Omitted mode follows construction_target. Structure publication contains
+        definitions and bindings, not verified instances. validation_id selects
+        an applicable successful instance check explicitly when needed.
+        """
+        return tools.call("publish_graph_draft", draft_id=draft_id, validation_id=validation_id, mode=mode)
 
     return server
 

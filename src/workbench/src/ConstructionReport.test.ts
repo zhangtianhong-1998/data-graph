@@ -11,6 +11,61 @@ function mount(component: typeof ConstructionReport | typeof RunIssues, report: 
 }
 afterEach(() => { app?.unmount(); root?.remove() })
 describe('构建报告与程序统计', () => {
+  it('结构目标展示已发布方案及定义，不将零实例误报为零成果或数据失败', () => {
+    mount(ConstructionReport, { validation: { construction_target: 'structure' }, counts: { structures_published: 1 },
+      construction: { summary: { published_drafts: 0, entity_type_count: 2, relation_type_count: 1, mapping_count: 3 },
+        execution: { model_runtime: 'executed', data_validation: 'not_run', structure_validation: 'passed',
+          instance_enumeration: 'not_requested', structure_publications: [{ draft_id: 'structure', revision: 2,
+            path: 'structures/checked.yaml', validation_id: 'structure_1' }] },
+        statistics: { complete: true, nodes: 0, edges: 0 },
+        drafts: [{ draft_id: 'structure', revision: 2, status: 'candidate', entity_types: 2, relation_types: 1,
+          mappings: 3, validation: { passed: null } }] } })
+    expect(root.textContent).toContain('图谱结构构建结果')
+    expect(root.textContent).toContain('已发布 1 个结构方案 · 2 类对象定义 · 1 类关系定义 · 3 个字段映射')
+    expect(root.textContent).toContain('结构检查已通过')
+    expect(root.textContent).toContain('实例枚举与数据验证本次未请求')
+    expect(root.querySelector('[aria-label="结构产物范围"]')?.textContent).toContain('未枚举或验证实例数据')
+    expect(root.querySelector('[aria-label="已发布结构方案"]')?.textContent).toContain('structures/checked.yaml')
+    expect(root.querySelector('.construction-draft')?.textContent).toContain('结构方案已发布')
+    expect(root.textContent).not.toContain('0 个节点')
+    expect(root.textContent).not.toContain('全量数据检查')
+    expect(root.textContent).not.toContain('0 个图谱草稿包')
+  })
+  it('未完成的结构检查与未请求的实例检查分别说明，历史实例诊断不覆盖结构状态', () => {
+    mount(ConstructionReport, { validation: { construction_target: 'structure' }, counts: { structures_published: 0 },
+      construction: { execution: { structure_validation: 'incomplete', instance_enumeration: 'not_requested',
+          data_validation: 'failed', structure_publications: [] },
+        drafts: [{ draft_id: 'plan', revision: 3, status: 'needs_revision', entity_types: 1, relation_types: 0,
+          mappings: 1, unresolved: ['匹配字段尚未确认'], validation: { passed: false,
+            diagnostics: [{ code: 'old_instance_failure' }] } }] } })
+    expect(root.textContent).toContain('结构检查尚未完成')
+    expect(root.textContent).toContain('实例枚举与数据验证本次未请求')
+    expect(root.textContent).toContain('匹配字段尚未确认')
+    expect(root.textContent).not.toContain('old_instance_failure')
+    expect(root.textContent).not.toContain('数据检查：未通过')
+    expect(root.querySelector('.construction-draft')?.textContent).toContain('未记录单项结果')
+  })
+  it('没有汇总计数时按发布记录计数，旧修订不能代替当前草稿的结构检查', () => {
+    mount(ConstructionReport, { validation: { construction_target: 'structure' }, construction: {
+      execution: { structure_validation: 'incomplete', instance_enumeration: 'not_requested',
+        structure_publications: [{ draft_id: 'plan', revision: 1, path: 'structures/plan.yaml' }] },
+      drafts: [{ draft_id: 'plan', revision: 2, status: 'candidate', entity_types: 1, relation_types: 0,
+        mappings: 1 }] } })
+    expect(root.querySelector('.construction-summary')?.textContent).toContain('已发布 1 个结构方案')
+    expect(root.querySelector('.construction-draft')?.textContent).toContain('结构映射草稿')
+    expect(root.querySelector('.construction-draft')?.textContent).toContain('未记录单项结果')
+    expect(root.querySelector('.construction-draft')?.textContent).not.toContain('结构方案已发布')
+  })
+  it('实例目标仍保留实例统计，同时可以展示结构方案', () => {
+    mount(ConstructionReport, { validation: { construction_target: 'instances' }, construction: {
+      summary: { published_drafts: 1 }, execution: { data_validation: 'passed',
+        structure_publications: [{ draft_id: 'plan', revision: 1, path: 'structures/plan.yaml' }] },
+      statistics: { complete: true, nodes: 4, edges: 2 } } })
+    expect(root.textContent).toContain('4 个节点 · 2 条关系')
+    expect(root.textContent).toContain('全量数据检查已通过')
+    expect(root.querySelector('[aria-label="已发布结构方案"]')?.textContent).toContain('structures/plan.yaml')
+    expect(root.querySelector('[aria-label="结构产物范围"]')).toBeNull()
+  })
   it('用量包含缓存输入并单列已计入合计的摘要调用', () => {
     mount(ConstructionReport, { construction: { usage: { input_tokens: 1500, output_tokens: 120,
       total_tokens: 1620, cache_read_tokens: 700, cache_write_tokens: 50, max_input_tokens: 900,

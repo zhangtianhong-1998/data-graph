@@ -8,7 +8,7 @@ from lightgraph.errors import BudgetExceeded
 
 @dataclass(frozen=True)
 class Cost:
-    db_cu: float = 0
+    db_cu: float | None = 0
     # None is valid only in limits, never in a reservation or measured charge.
     llm_calls: int | None = 0
     llm_tokens: int | None = 0

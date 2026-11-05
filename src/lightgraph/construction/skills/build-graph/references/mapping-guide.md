@@ -12,7 +12,15 @@
 
 名称与身份分开定义。没有单独名称列的关联对象，可以声明 `display_columns`（显示项名到来源列的映射），或使用实体的 `display_mode` 按可见关联对象生成显示名称。具体字段以 schema 为准。不要拿复合身份键的最后一列当作整个对象名称，也不要为显示而改变身份键。
 
+有可靠名称列时明确设置 `label_column`，经确认的其他名称设置 `alias_columns`。未指定主名称时，展示组件会拼成“类型（字段：值）”，再缺少组件才使用关系或身份兜底。组件不会自动成为主名称或别名。校验返回的名称质量提示供修订使用，不要求无名称对象编造名称；同一身份出现矛盾名称应修正身份范围或来源解释，不能把名称改成展示组件掩盖冲突。
+
 关系定义含 `type`、`description`、`source_type`、`target_type`、`mappings`，并按语义选择 `allow_self_links`、`acyclic`。物理映射通过 `source_key_columns`、`target_key_columns` 指向端点键，可含属性与筛选。`equal_endpoints` 明确同一行两端身份相等时应报错、忽略该配对还是保留；选择应有数据或文档依据，不能为通过验证随意忽略关系。
+
+若端点身份需要查找，增加 `source_lookup` 或 `target_lookup`，包含 `source_id`、`schema`、`table`、`match_columns` 和 `key_columns`。关系本行对应端的键列提供匹配值，查找表的 `match_columns` 按顺序匹配，再用匹配行的 `key_columns` 形成端点身份。可指定 `predicate`、`cardinality: one|many` 和 `on_missing: error|omit`；默认缺失和多身份匹配都报错。`many` 只用于业务允许的多匹配，`omit` 必须有目标或材料依据，省略数量会报告。相同表也可作为查找表，用于等值自连接。
+
+例如订单只含客户邮箱，客户表才有客户编号：订单映射的 `target_key_columns` 选择邮箱，`target_lookup.match_columns` 选择客户表邮箱，`target_lookup.key_columns` 选择客户编号。客户身份仍用客户编号，不为了套用映射而改用邮箱。指定目标来源后，必须找到该来源的实际匹配行，全图已有同编码节点不能替代这个检查。
+
+查找条件必须包括真正需要的组织、版本或其他匹配范围；显示名相同不构成身份相等。多来源采用各自只读快照，不宣称分布式同时点。任意不等值或时间区间 JOIN 尚不能用等值查找表达，应记录实现缺口，不能伪造配对。
 
 实体和关系映射都支持 `constant_properties` 与 `context_columns`。前者是依据结构解释声明的固定属性，例如某映射的出现位置或起止位置，不是来源列值，也不参与身份计算。它不能与 `properties` 使用同一个属性名。后者指定需要保留的授权行上下文列；关联的映射使用相同列集合，执行器以来源和列值生成共同的 `row_context.id`，并在各份支持中保留 `values`。相同内容的重复行共享上下文，这不是物理行号或重复次数。
 
@@ -36,10 +44,10 @@
 
 规则中的证据引用说明依据来自哪里，引用存在并不自动证明说明正确。源数据结构验证只能确认所检查的约束，不能让 Agent 自行声明业务语义已获批准。
 
-调用 `save_graph_draft(yaml_text)` 后使用返回的标识执行 `validate_graph_draft(draft_id)`。读取诊断后修改具体失败项；需要更多材料就继续探查。保留正确部分和未决说明，不为获得“成功”状态而删除用户目标中的关键关系。
+调用 `save_graph_draft(yaml_text)` 后可先执行 `validate_graph_draft(draft_id, mode="structure")`，检查字段、权限和匹配参数而不查询事实。完整实例使用 `mode="instances"`；未传 mode 时采用项目 construction_target（默认 instances）；`predicate` 声明本次实例范围。读取诊断后修改具体失败项；需要更多材料就继续探查。保留正确部分和未决说明，不为获得“成功”状态而删除用户目标中的关键关系。校验返回独立产物和验证编号，不再覆盖先前成功图。
 
 ## 产物与后续处理
 
 使用 `read_workspace` 检查保存版本、验证和候选结果。不要仅依据自己的最终文字或 Harness 正常退出宣称完成。
 
-你负责依据证据判断草稿是否解释了用户目标，工具负责数据验证与发布检查。当前修订通过验证后可调用 `publish_graph_draft(draft_id)`；如果来源或草稿变化，先重新验证。发布返回后再报告实际版本。语义评估标记为 `agent_authored`，不要把发布状态称为独立语义 Gold 验收。长期工作区及运行轨迹由用户管理，不在结束时清理。
+你负责依据证据判断草稿是否解释了用户目标，工具负责数据验证与发布检查。当前修订通过验证后可调用 `publish_graph_draft(draft_id)`，发布其固定读取时点的实例图；刷新数据库是新的一次验证。需要选择历史成功验证时使用返回的 `validation_id`，说明该版本范围，不能掩盖后来发现的数据矛盾。结构目标使用 `publish_graph_draft(draft_id, mode="structure")`，报告结构与映射已发布、实例尚未执行。语义评估标记为 `agent_authored`，不要把发布状态称为独立语义 Gold 验收。长期工作区及运行轨迹由用户管理，不在结束时清理。

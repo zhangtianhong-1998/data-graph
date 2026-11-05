@@ -9,6 +9,8 @@ export interface Project { project_id: string; name: string; created_at: string;
 export interface SourceConfig { id: string; kind: string; [key: string]: unknown }
 export interface RunConfig {
   max_run_seconds?: number
+  max_db_queries?: number | null
+  construction_target?: 'instances' | 'structure'
   goal_markdown?: string | null
   goal?: { runtime_guidance?: RuntimeGuidance[]; purpose?: string; entity_kinds?: string[]; relation_kinds?: string[]; include?: string[]; exclude?: string[]; discovery_guidance?: string[]; [key: string]: unknown }
   sources?: SourceConfig[]

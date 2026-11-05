@@ -52,9 +52,9 @@ export function placeNodes(graph: Graph, previous: Map<string, Point> = new Map(
     layer.forEach((id, slot) => {
       if (points.has(id)) return
       const x = left + Math.floor(slot / rows) * 180
-      let y = 70 + (slot % rows) * 110
+      let y = 70 + (slot % rows) * 140
       // New bands may grow, but never move an already visible object.
-      while (occupied.has(`${x}:${y}`)) y += 110
+      while (occupied.has(`${x}:${y}`)) y += 140
       points.set(id, { x, y }); occupied.add(`${x}:${y}`)
     })
     left += Math.ceil(layer.length / rows) * 180 + 50

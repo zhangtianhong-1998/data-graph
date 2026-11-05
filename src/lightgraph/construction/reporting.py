@@ -6,7 +6,13 @@ from .statistics import graph_statistics
 
 
 def draft_is_ready(record, publications, *, discover_only=False):
-    """A retained publication does not override a failed current validation."""
+    """A selected snapshot can be published after an unrelated failed attempt."""
+    published = publications.get(record.draft.draft_id, {})
+    if (not discover_only and record.status == 'published'
+            and published.get('revision') == record.revision
+            and published.get('draft_fingerprint') == record.fingerprint
+            and published.get('context_fingerprint') == record.context_fingerprint):
+        return True
     checked = record.validation
     if (record.status not in {'validated', 'published'} or checked is None or not checked.passed
             or checked.revision != record.revision or checked.draft_fingerprint != record.fingerprint

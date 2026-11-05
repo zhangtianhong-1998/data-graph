@@ -23,6 +23,16 @@ from lightgraph.runtime.retention import atomic_text
 
 from .models import DataValidation, DraftRecord, EvidenceRecord, GraphDraft, draft_evidence_refs
 
+# These failures describe an unsuccessful attempt, not a counterexample to the
+# facts in an earlier completed snapshot. Semantic conflicts are excluded.
+SNAPSHOT_RETRY_FAILURES = frozenset({
+    'query_budget_exhausted', 'db_cu_budget_exhausted', 'run_time_budget_exhausted',
+    'wall_time_budget_exhausted', 'construction_time_exhausted', 'query_timeout',
+    'query_cancelled', 'query_execution_failed', 'construction_source_execution_failed',
+    'returned_rows_budget_exhausted', 'returned_bytes_budget_exhausted',
+    'memory_budget_exhausted', 'source_closed',
+})
+
 
 class _GraphYamlLoader(yaml.SafeLoader):
     """JSON-like scalar semantics with duplicate keys and aliases forbidden."""
@@ -240,7 +250,8 @@ class GraphWorkspace:
                 or digest(payload['draft']) != record.fingerprint):
             raise LightGraphError("invalid_graph_workspace_record")
         if record.context_fingerprint != self.context_fingerprint:
-            return record.model_copy(update={"status": "stale", "validation": None})
+            return record.model_copy(update={"status": "stale", "validation": None,
+                                              "last_successful_validation": None})
         return record
 
     def _draft_record_payload(self, record: DraftRecord) -> dict:
@@ -261,7 +272,8 @@ class GraphWorkspace:
 
     def record_validation(self, draft_id: str, *, revision: int, passed: bool,
                           diagnostics: list[dict] | None = None, metrics: dict | None = None,
-                          evidence_refs: list[str] | None = None, graph: dict | None = None) -> DraftRecord:
+                          evidence_refs: list[str] | None = None, graph: dict | None = None,
+                          read_window: dict | None = None) -> DraftRecord:
         record = self.get_draft(draft_id)
         if record.context_fingerprint != self.context_fingerprint:
             raise LightGraphError("stale_graph_draft")
@@ -270,13 +282,19 @@ class GraphWorkspace:
         if passed and (not record.draft.entities or diagnostics):
             raise LightGraphError("invalid_graph_validation_success")
         self._check_refs(evidence_refs or [])
-        validation = DataValidation(revision=revision, draft_fingerprint=record.fingerprint,
+        validation = DataValidation(validation_id='v_' + uuid.uuid4().hex,
+                                    graph_path=self._append_record('previews', graph) if graph is not None else None,
+                                    read_window=read_window or {},
+                                    revision=revision, draft_fingerprint=record.fingerprint,
                                     context_fingerprint=self.context_fingerprint, passed=passed,
                                     diagnostics=diagnostics or [], metrics=metrics or {},
                                     evidence_refs=evidence_refs or [], graph_digest=digest(graph) if graph is not None else None)
         canonical(validation.model_dump(mode="python"))
+        previous_success = record.last_successful_validation or (
+            record.validation if record.validation and record.validation.passed else None)
         record = record.model_copy(update={"status": "validated" if passed else "needs_revision",
-                                           "validation": validation})
+                                           "validation": validation,
+                                           "last_successful_validation": validation if passed else previous_success})
         manifest = self._manifest()
         # Do not overwrite the candidate or the previous validation attempt.
         relative = self._append_record("drafts", self._draft_record_payload(record))
@@ -286,31 +304,73 @@ class GraphWorkspace:
         self._save_manifest(manifest)
         return record
 
-    def publish(self, draft_id: str, *, revision: int, graph: dict) -> dict:
+    def select_validation(self, draft_id: str, validation_id: str | None = None) -> DataValidation:
+        """Resolve a successful snapshot without erasing the latest attempt.
+
+        Explicit historical selection is required after a data counterexample.
+        Every selection remains bound to the current draft and input context.
+        """
+        record = self.get_draft(draft_id)
+        if record.status == 'stale':
+            raise LightGraphError('stale_graph_draft')
+        selected = record.validation
+        if validation_id is not None:
+            selected = None
+            for path in reversed(self._manifest()['drafts'][draft_id]['history']):
+                candidate = DraftRecord.model_validate(self._read_record(path)).validation
+                if candidate and candidate.validation_id == validation_id:
+                    selected = candidate
+                    break
+        elif selected and not selected.passed:
+            codes = {d.get('code') for d in selected.diagnostics}
+            if codes and codes <= SNAPSHOT_RETRY_FAILURES:
+                selected = record.last_successful_validation
+        if (selected is None or not selected.passed
+                or selected.revision != record.revision
+                or selected.draft_fingerprint != record.fingerprint
+                or selected.context_fingerprint != self.context_fingerprint):
+            raise LightGraphError('graph_validation_required')
+        return selected
+
+    def read_validation_graph(self, draft_id: str, validation: DataValidation) -> dict:
+        relative = validation.graph_path or f'previews/{digest(draft_id)[:16]}-{validation.revision}.yaml'
+        graph = self._read_record(relative)
+        if validation.graph_digest is None or digest(graph) != validation.graph_digest:
+            raise LightGraphError('validated_graph_mismatch')
+        return graph
+
+    def publish(self, draft_id: str, *, revision: int, graph: dict,
+                validation_id: str | None = None) -> dict:
         """Publish the exact validated graph, retaining independent draft outputs.
 
         Semantic definitions remain Agent-authored. Publication attests only to
         the recorded deterministic checks and does not claim independent review.
         """
         record = self.get_draft(draft_id)
-        validation = record.validation
+        validation = self.select_validation(draft_id, validation_id)
         if record.status == 'stale':
             raise LightGraphError('stale_graph_draft')
         if revision != record.revision:
             raise LightGraphError('graph_draft_revision_conflict')
-        if (record.status not in {'validated', 'published'} or validation is None or not validation.passed
-                or validation.context_fingerprint != self.context_fingerprint
-                or validation.revision != revision or validation.draft_fingerprint != record.fingerprint):
-            raise LightGraphError('graph_validation_required')
         if validation.graph_digest is None or digest(graph) != validation.graph_digest:
             raise LightGraphError('validated_graph_mismatch')
         manifest = self._manifest()
         publications = manifest.setdefault('publications', {})
         existing = publications.get(draft_id)
-        if existing and existing['revision'] == revision and existing['context_fingerprint'] == self.context_fingerprint:
+        if (existing and existing['revision'] == revision
+                and existing['context_fingerprint'] == self.context_fingerprint
+                and existing.get('validation_id') == validation.validation_id
+                and existing.get('graph_digest') == validation.graph_digest):
+            if record.status != 'published':
+                restored = record.model_copy(update={'status': 'published'})
+                relative = self._append_record('drafts', self._draft_record_payload(restored))
+                manifest['drafts'][draft_id]['history'].append(relative)
+                manifest['drafts'][draft_id]['current'] = relative
+                self._save_manifest(manifest)
             return existing
         entry = {'draft_id': draft_id, 'revision': revision, 'context_fingerprint': self.context_fingerprint,
                  'draft_fingerprint': record.fingerprint, 'graph_digest': validation.graph_digest,
+                 'validation_id': validation.validation_id, 'read_window': validation.read_window,
                  'semantic_origin': 'agent_authored'}
         published = {**graph, 'status': 'published', 'semantic_origin': 'agent_authored'}
         # Check conflicts against every still-current independent publication
@@ -363,9 +423,13 @@ class GraphWorkspace:
                             "decisions": item.draft.decisions,
                             "suggestions": item.draft.suggestions,
                             "unresolved": item.draft.unresolved,
-                            "validation": item.validation.model_dump(mode="json") if item.validation else None}
+                            "validation": item.validation.model_dump(mode="json") if item.validation else None,
+                            "last_successful_validation": item.last_successful_validation.model_dump(mode='json')
+                                if item.last_successful_validation else None}
                            for item in self.list_drafts()],
                 "evidence_refs": current_refs, "stale_evidence_count": stale_count,
+                "structure_checks": manifest.get('structure_checks', {}),
+                "structure_publications": manifest.get('structure_publications', {}),
                 "publications": [p for p in manifest.get('publications', {}).values()
                                  if p['context_fingerprint'] == self.context_fingerprint]}
 
@@ -389,6 +453,10 @@ def _merge_graphs(graphs):
     if visibility_versions and next(iter(visibility_versions)) is not None:
         result['support_visibility_version'] = next(iter(visibility_versions))
     for graph in graphs:
+        if graph.get('read_window'):
+            result.setdefault('validation_snapshots', []).append({
+                'draft_id': graph.get('draft_id'), 'draft_revision': graph.get('draft_revision'),
+                'read_window': deepcopy(graph['read_window'])})
         for ref in graph.get('evidence_refs', []):
             if ref not in result['evidence_refs']:
                 result['evidence_refs'].append(ref)

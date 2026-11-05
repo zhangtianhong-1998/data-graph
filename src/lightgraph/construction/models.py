@@ -28,10 +28,12 @@ class SourceMapping(StrictModel):
 
 class EntityMapping(SourceMapping):
     key_columns: list[str] = Field(min_length=1, max_length=32)
-    label_column: str | None = None
-    alias_columns: list[str] = Field(default_factory=list, max_length=32)
+    label_column: str | None = Field(default=None,
+        description='Physical column containing the primary source name. Choose a confirmed name column when available; omission generates a display/identity fallback and does not check name consistency. Never omit a known name to bypass a conflict.')
+    alias_columns: list[str] = Field(default_factory=list, max_length=32,
+        description='Confirmed alternate names, translations or abbreviations for the same object. Display columns alone do not become aliases.')
     display_columns: dict[str, str] = Field(default_factory=dict, max_length=32,
-        description='Optional display component names mapped to physical columns; never changes identity.')
+        description='Supplementary display components, or a composite display for objects without an independent name. Does not replace label_column or alias_columns and never changes identity.')
 
     @field_validator('display_columns')
     @classmethod
@@ -58,10 +60,42 @@ class EntityDefinition(StrictModel):
         return self
 
 
+class EndpointLookup(StrictModel):
+    """Resolve one endpoint through actual equal-key matches in an authorized table."""
+    source_id: str = Field(min_length=1)
+    table: str = Field(min_length=1)
+    schema_name: str = Field(default='public', alias='schema')
+    predicate: dict[str, Any] | None = None
+    match_columns: list[str] = Field(min_length=1, max_length=32,
+        description='Columns matched to the corresponding relation key_columns, in order. Include tenant or other required matching scope explicitly.')
+    key_columns: list[str] = Field(min_length=1, max_length=32,
+        description='Columns from the matched row that form the resolved entity identity.')
+    cardinality: Literal['one', 'many'] = Field(default='one',
+        description='one rejects matches to multiple distinct endpoint identities; many explicitly permits all observed matches for this input row.')
+    on_missing: Literal['error', 'omit'] = Field(default='error',
+        description='error diagnoses unmatched references; omit explicitly omits unmatched input rows and reports their count.')
+
+    @model_validator(mode='after')
+    def unique_columns(self):
+        if any(len(columns) != len(set(columns)) for columns in (self.match_columns, self.key_columns)):
+            raise ValueError('duplicate_lookup_column')
+        return self
+
+
 class RelationMapping(SourceMapping):
     source_key_columns: list[str] = Field(min_length=1, max_length=32)
     target_key_columns: list[str] = Field(min_length=1, max_length=32)
+    source_lookup: EndpointLookup | None = None
+    target_lookup: EndpointLookup | None = None
     equal_endpoints: Literal["error", "omit", "include"] = "error"
+
+    @model_validator(mode='after')
+    def matching_arity(self):
+        for end in ('source', 'target'):
+            lookup = getattr(self, end + '_lookup')
+            if lookup and len(getattr(self, end + '_key_columns')) != len(lookup.match_columns):
+                raise ValueError('lookup_match_arity_mismatch')
+        return self
 
 
 class RelationDefinition(StrictModel):
@@ -105,8 +139,8 @@ class GraphDraft(StrictModel):
             if relation.source_type not in kinds or relation.target_type not in kinds:
                 raise ValueError("unknown_relation_entity_type")
             for mapping in relation.mappings:
-                if (len(mapping.source_key_columns) != kinds[relation.source_type]
-                        or len(mapping.target_key_columns) != kinds[relation.target_type]):
+                if (len(mapping.source_lookup.key_columns if mapping.source_lookup else mapping.source_key_columns) != kinds[relation.source_type]
+                        or len(mapping.target_lookup.key_columns if mapping.target_lookup else mapping.target_key_columns) != kinds[relation.target_type]):
                     raise ValueError("relation_key_arity_mismatch")
                 if mapping.equal_endpoints == "include" and not relation.allow_self_links:
                     raise ValueError("self_link_permission_required")
@@ -115,6 +149,17 @@ class GraphDraft(StrictModel):
         except (TypeError, ValueError):
             raise ValueError("unsupported_graph_draft_value") from None
         return self
+
+
+def iter_source_mappings(draft):
+    """Enumerate every physical dependency, including relation lookup tables."""
+    for definition in draft.entities + draft.relations:
+        for mapping in definition.mappings:
+            yield mapping
+            for name in ('source_lookup', 'target_lookup'):
+                lookup = getattr(mapping, name, None)
+                if lookup is not None:
+                    yield lookup
 
 
 class EvidenceRecord(StrictModel):
@@ -126,6 +171,9 @@ class EvidenceRecord(StrictModel):
 
 
 class DataValidation(StrictModel):
+    validation_id: str | None = None
+    graph_path: str | None = None
+    read_window: dict[str, Any] = Field(default_factory=dict)
     revision: int = Field(ge=1)
     draft_fingerprint: str
     context_fingerprint: str
@@ -143,6 +191,7 @@ class DraftRecord(StrictModel):
     context_fingerprint: str
     status: Literal["candidate", "validated", "needs_revision", "stale", "published"] = "candidate"
     validation: DataValidation | None = None
+    last_successful_validation: DataValidation | None = None
 
 
 def draft_evidence_refs(draft: GraphDraft) -> set[str]:

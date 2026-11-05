@@ -43,10 +43,18 @@ def respond(handler, delta, reason):
 
 @pytest.mark.parametrize("max_calls, expected_calls, large_result, input_limit, fail_first, long_workspace", [
     (3, 2, False, 1048576, False, False), (1, 1, False, 1048576, False, False),
-    (8, None, True, 1048576, False, False), (8, None, True, 4096, False, False),
+    (8, None, True, 1048576, False, False),
+    pytest.param(8, 1, True, 4096, False, False, id="immutable-contract-exceeds-small-window"),
+    pytest.param(8, None, True, 8192, False, False, id="bounded-window-prune-recovery"),
     (3, 0, False, 100, False, False), (3, 2, False, 1048576, True, False),
     pytest.param(3, 2, False, 1048576, False, True, id="deep-unicode-workspace")])
 def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_calls, large_result, input_limit, fail_first, long_workspace):
+    narrow_window = large_result and input_limit < 1048576
+    # With the complete pinned skill, 4096 tokens can fit the first request but
+    # cannot fit its reply plus the native pruner's retained head/tail. A lossy
+    # summary is not permission to remove the original contract. Verify that
+    # boundary separately from recovery with enough room for the fixed context.
+    input_exhausted = input_limit in {100, 4096}
     if long_workspace:
         # The native project directory repeats an escaped cwd (up to 255
         # characters). Exercise >260-char session IO without also testing an
@@ -116,8 +124,8 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
             HarnessOptions(model="loopback-model", base_url=f"http://127.0.0.1:{model.server_port}/v1",
                            max_calls=max_calls, max_run_seconds=40,
                            max_input_tokens=input_limit,
-                           include_stream_usage=input_limit != 4096,
-                           working_context_tokens=(500000 if input_limit == 4096 else 2048) if large_result else 32768),
+                           include_stream_usage=not narrow_window,
+                           working_context_tokens=(500000 if narrow_window else 2048) if large_result else 32768),
             mcp_url=f"http://127.0.0.1:{mcp_port}/mcp", mcp_token_env="GRAPH_TEST_TOKEN",
             environment={"GRAPH_TEST_TOKEN": token, "OPENAI_API_KEY": "local-test-only"}, on_event=events.append)
         if expected_calls is not None:
@@ -126,21 +134,22 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
             assert 2 <= len(requests) <= max_calls
         assert tool_calls == (["describe_sources"] if input_limit > 100 and not fail_first else [])
         assert result["budget"]["calls"] == len(requests)
-        assert result["finish_reason"] == ("completed" if max_calls > 1 and input_limit > 100 else "error")
+        assert result["finish_reason"] == ("completed" if max_calls > 1 and not input_exhausted else "error")
         if max_calls == 1:
             assert result["budget"]["stop_reason"] == "construction_call_budget_exhausted"
         if requests:
             assert all("max_tokens" in request and "max_completion_tokens" not in request for request in requests)
             assert all("store" not in request for request in requests)
-            assert all(("stream_options" in request) == (input_limit != 4096) for request in requests)
+            assert all(("stream_options" in request) == (not narrow_window) for request in requests)
             names = {tool["function"]["name"] for tool in requests[0]["tools"]}
             assert names == {"mcp__graph__describe_sources", "skill", "session_search", "session_event_search",
                              "session_trace", "session_event_trace", "session_event_read"}
-        else:
+        if input_exhausted:
             assert result["budget"]["stop_reason"] == "construction_input_limit_exceeded"
             assert result["budget"]["input_diagnostic"]["estimated_input_tokens"] > input_limit
         request_events = [event for event in events if event["method"] == "model.request"]
         assert len(request_events) == len(requests)
+        assert all(event['payload']['estimated_input_tokens'] <= input_limit for event in request_events)
         assert all('Graph checkpoint rules:' in json.dumps(event['payload']['request']['messages'][-1])
                    for event in request_events if event['payload']['purpose'] == 'compaction')
         if requests:
@@ -173,7 +182,7 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
         if large_result:
             kinds = [e.get("payload", {}).get("event", {}).get("type") for e in events]
             assert "compaction/prune" in kinds
-            if input_limit != 4096:
+            if not narrow_window:
                 assert "compaction/summary" in kinds
                 assert len(requests) >= 3  # Summary dispatches are part of the same call budget.
             assert all("RETRIEVABLE_MIDDLE_MARKER" not in json.dumps(r) for r in requests[1:])

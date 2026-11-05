@@ -909,10 +909,28 @@
       "type": "integer"
     },
     "max_db_queries": {
-      "default": 240,
-      "exclusiveMinimum": 0,
-      "title": "Max Db Queries",
-      "type": "integer"
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Total source-query admissions, including metadata and transaction controls. Null removes only the query-count ceiling.",
+      "title": "Max Db Queries"
+    },
+    "construction_target": {
+      "default": "instances",
+      "description": "Build concrete instance nodes and edges, or publish only structure and source mappings with no claim of instance validation.",
+      "enum": [
+        "instances",
+        "structure"
+      ],
+      "title": "Construction Target",
+      "type": "string"
     },
     "max_partitions": {
       "default": 256,

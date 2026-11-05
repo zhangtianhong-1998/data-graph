@@ -28,6 +28,22 @@ describe('业务图来源与归并裁决', () => {
     expect(tables).toContain('slot_b'); expect(tables).toContain('path_7'); expect(tables).toContain('P10'); expect(tables).toContain('P20')
     expect(root.querySelector('[aria-label="节点关联范围"]')?.textContent).toContain('当前授权图中共有 5 条')
   })
+  it('主名称按宽度换行，详情保留全名，查找证据单独显示', async () => {
+    const name = '经营活动产生的短期合同资产原值合计'
+    api.request.mockResolvedValue({ facts: [{ id: 'a', fact_kind: 'NodeExistence', status: 'accepted', payload: { entity_id: 'a' } }],
+      supports: [{ id: 's', fact_id: 'a', status: 'accepted', origin: 'source_query', source_binding: 'orders.public.order', scope_ref: 'public',
+        binding: { lookup_matches: [{ endpoint: 'target', source: 'crm.public.customers', input_columns: ['buyer_mail'], input_values: ['a@example.test'], match_columns: ['email'], key_columns: ['customer_id'], resolved_key: ['C02'], scope_ref: 'public' }] } }],
+      rules: [], next_offset: null, supports_truncated: false })
+    mount(GraphCanvas, { graph: { nodes: [{ id: 'a', label: name, kind: 'Metric', status: 'accepted' }], edges: [] }, layer: 'business', projectId: 'p' })
+    const node = root.querySelector('.graph-node')!
+    expect(node.querySelectorAll('.node-label tspan')).toHaveLength(2)
+    expect(node.querySelector('.node-label')?.textContent).toBe(name)
+    node.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await vi.waitFor(() => expect(root.textContent).toContain('记录匹配依据'))
+    expect(root.querySelector('.detail-name')?.textContent).toBe(name)
+    const table = root.querySelector('.support-detail')?.textContent
+    expect(table).toContain('crm.public.customers'); expect(table).toContain('C02'); expect(table).toContain('a@example.test')
+  })
   it('业务身份用于定位，可见范围与来源支持不混入业务属性', async () => {
     mount(GraphCanvas, { graph: { nodes: [{ id: 'hash', label: '采购物流成本', kind: '报表项', status: 'accepted',
       identity: { 经营主体: '鲜果连锁', 报表项编码: 'RTL_PNL_1410' }, aliases: ['Procurement Logistics'],

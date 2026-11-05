@@ -6,7 +6,9 @@ here. The caller chooses what to inspect and when to save or revise a mapping.
 from __future__ import annotations
 
 import hashlib
-import uuid
+import json
+import os
+from datetime import datetime, timezone
 from copy import deepcopy
 from pathlib import Path
 from threading import RLock
@@ -28,6 +30,9 @@ from .workspace import GraphWorkspace, dump_yaml, write_yaml
 
 
 SKILL_ROOT = Path(__file__).parent / "skills" / "build-graph"
+TERMINAL_QUERY_CODES = frozenset({'query_budget_exhausted', 'db_cu_budget_exhausted',
+    'run_time_budget_exhausted', 'wall_time_budget_exhausted', 'construction_time_exhausted',
+    'returned_rows_budget_exhausted', 'returned_bytes_budget_exhausted'})
 
 
 def _file_hash(path):
@@ -78,10 +83,19 @@ class ConstructionTools:
                 for _, t in sorted(self.tables.items())],
                 self._source_hashes,
                 [s.model_dump(mode='json') for s in config.sources],
-                # A schema fingerprint cannot certify unchanged database rows.
-                uuid.uuid4().hex if any(not s.path for s in config.sources) else None,
+                # Database artifacts describe their recorded read window, not
+                # current live rows. Stable context permits restart recovery;
+                # schema, access, configuration and file/doc checks remain above.
+                {'snapshot_semantics': 'validated_snapshot_v1',
+                 'connection_bindings': [(s.id, digest(value)) for s in config.sources
+                    if not s.path and s.dsn_env and (value := os.getenv(s.dsn_env)) is not None]}
+                    if any(not s.path for s in config.sources) else None,
                 [(d.document_id, d.revision, d.content_hash) for d in self.documents.documents])
             self.workspace = GraphWorkspace(workspace, fingerprint)
+            self.terminal_reason = None
+            # Live control state is reset for this worker; durable attempts remain.
+            from lightgraph.runtime.retention import atomic_text
+            atomic_text(self.workspace.root / 'query-stop.json', json.dumps({'code': None}))
             # Changes in source content or goals invalidate old evidence, even
             # when the source path and the visible schema remain unchanged.
             self._document_refs = {}
@@ -122,6 +136,11 @@ class ConstructionTools:
             try:
                 if tool_name not in methods:
                     raise LightGraphError("unknown_construction_tool")
+                if self.terminal_reason and (tool_name == 'validate_graph_draft'
+                        and (arguments.get('mode') or self.config.construction_target) != 'structure'
+                        or tool_name == 'inspect_source' and arguments.get('operation')
+                        not in {'get_metadata', 'search_knowledge'}):
+                    return self._stop_queries(self.terminal_reason)
                 return methods[tool_name](**arguments)
             except ValidationError as exc:
                 return {"status": "error", "code": "invalid_graph_draft", "diagnostics": [
@@ -129,6 +148,8 @@ class ConstructionTools:
                     for e in exc.errors(include_input=False, include_url=False)],
                     "next_action": "Read draft_schema and revise this draft. Other drafts are retained."}
             except LightGraphError as exc:
+                if exc.code in TERMINAL_QUERY_CODES:
+                    return self._stop_queries(exc.code)
                 return {"status": "error", "code": exc.code,
                         "next_action": "Correct the affected request. Record only unmet user requirements as unresolved; optional suggestions are not blockers. Other drafts remain available."}
             except (TypeError, ValueError, KeyError):
@@ -139,10 +160,24 @@ class ConstructionTools:
                 return {"status": "error", "code": "construction_tool_failed",
                         "next_action": "The operation failed. Retain the draft and retry after checking the source or workspace."}
 
+    def _stop_queries(self, code):
+        """Tell Harness to finish using saved work, never retry exhausted queries."""
+        if not self.terminal_reason:
+            self.terminal_reason = code
+            from lightgraph.runtime.retention import atomic_text
+            atomic_text(self.workspace.root / 'query-stop.json', json.dumps({'code': code}))
+        return {'status': 'error', 'code': self.terminal_reason, 'retryable': False,
+                'queries_stopped': True, 'finalization_model_calls': 2,
+                'next_action': 'Source queries cannot continue in this run. Read saved work, publish an already '
+                    'successful validation if appropriate, and finish. Do not repeat queries or revise the '
+                    'mapping solely because resources were exhausted. Two model calls remain for this closeout, '
+                    'subject to the existing model/time limits.'}
+
     def describe_sources(self):
         """Return the authorized physical catalog without inferred business roles."""
         titles = {d.document_id: d.title for d in self.documents.documents}
         return {"status": "ok", "goal": goal_descriptor(self.config),
+                "construction_target": self.config.construction_target,
                 "output_constraints": {"entity_kinds": self.config.goal.entity_kinds,
                                        "relation_kinds": self.config.goal.relation_kinds},
                 "result_visibility": {"scopes": self.config.scopes,
@@ -171,8 +206,8 @@ class ConstructionTools:
             raise LightGraphError('source_fact_data_forbidden')
 
     def _require_draft_sources(self, draft):
-        self._require_fact_sources(mapping.source_id
-            for definition in draft.entities + draft.relations for mapping in definition.mappings)
+        from .models import iter_source_mappings
+        self._require_fact_sources(mapping.source_id for mapping in iter_source_mappings(draft))
 
     def inspect_source(self, table: str, operation: str, arguments: dict | None = None):
         """Run a named read-only probe using physical names, not guessed IDs."""
@@ -324,7 +359,20 @@ class ConstructionTools:
                 "revision": record.revision, "state": record.status,
                 "next_action": "Validate this draft, or revise it as new evidence arrives."}
 
-    def validate_graph_draft(self, draft_id: str):
+    def validate_graph_draft(self, draft_id: str, mode: str | None = None):
+        mode = mode or self.config.construction_target
+        if mode not in {'instances', 'structure'}:
+            raise LightGraphError('invalid_construction_mode')
+        if mode == 'structure':
+            self._check_current_inputs()
+            record = self.workspace.get_draft(draft_id)
+            for ref in draft_evidence_refs(record.draft):
+                self.workspace.read_evidence(ref)
+            from .structure import save_structure_check
+            return save_structure_check(self.workspace, draft_id, list(self.tables.values()),
+                access=access_fingerprint(self.config), goal=self.config.goal,
+                dialects={key: value.compiler.dialect for key, value in self.executors.items()},
+                scope_bindings=self.config.scope_bindings)
         if self.config.resolved_model.mode not in {"in_environment", "approved_external"}:
             raise LightGraphError("metadata_only_query_forbidden")
         self._check_current_inputs()
@@ -334,58 +382,65 @@ class ConstructionTools:
             raise LightGraphError("stale_graph_draft")
         for ref in draft_evidence_refs(record.draft):
             self.workspace.read_evidence(ref)
+        started = datetime.now(timezone.utc).isoformat()
         result = execute_draft(record.draft, self.adapters, list(self.tables.values()),
             goal=self.config.goal, max_working_bytes=self.config.max_working_bytes,
             max_rows=self.config.limits.max_result_rows, max_seconds=self.budget.remaining_seconds(),
             scope_bindings=self.config.scope_bindings)
         self._check_current_inputs()
+        from .models import iter_source_mappings
+        sources = sorted({m.source_id for m in iter_source_mappings(record.draft)})
+        read_window = {'started_at': started, 'finished_at': datetime.now(timezone.utc).isoformat(),
+                       'source_ids': sources, 'consistency': 'independent_source_snapshots',
+                       'source_read_windows': result.pop('source_read_windows', []),
+                       'publication_semantics': 'validated_snapshot'}
         evidence = self.workspace.issue_evidence("data_validation", details={
             "draft_id": draft_id, "draft_revision": record.revision,
             "passed": result["passed"], "metrics": result["metrics"],
             "diagnostics": result["diagnostics"]})
         graph = {**result.pop('graph'), 'draft_id': draft_id, 'draft_revision': record.revision,
                  'access_fingerprint': access_fingerprint(self.config),
+                 'read_window': read_window,
                  'evidence_refs': list(dict.fromkeys(record.draft.evidence_refs + [evidence.ref]))}
-        relative = f"previews/{digest(draft_id)[:16]}-{record.revision}.yaml"
-        path = self.workspace.root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_yaml(path, graph)
         current = self.workspace.record_validation(draft_id, revision=record.revision,
             passed=result["passed"], diagnostics=result["diagnostics"], metrics=result["metrics"],
-            evidence_refs=[evidence.ref], graph=graph)
+            evidence_refs=[evidence.ref], graph=graph, read_window=read_window)
+        stop = next((d['code'] for d in result['diagnostics'] if d.get('code') in TERMINAL_QUERY_CODES), None)
+        budget_state = self._stop_queries(stop) if stop else None
         from .statistics import graph_statistics
+        from .quality import name_mapping_advice
         statistics = graph_statistics(filter_graph_scopes(graph, self.config.scopes))
         return {"status": "ok", "state": current.status, **result, "statistics": statistics,
-                "evidence_ref": evidence.ref, "candidate_graph": relative,
+                "evidence_ref": evidence.ref, "candidate_graph": current.validation.graph_path,
+                "validation_id": current.validation.validation_id, 'read_window': read_window,
+                'quality_advice': name_mapping_advice(record.draft, graph),
+                **({'resource_state': budget_state} if budget_state else {}),
                 "semantic_assessment": "agent_authored", "published": False}
 
-    def publish_graph_draft(self, draft_id: str):
+    def publish_graph_draft(self, draft_id: str, validation_id: str | None = None, mode: str | None = None):
         """Publish an Agent-selected revision only while its checks are current."""
         if not self.allow_publication:
             raise LightGraphError("construction_publication_disabled")
+        mode = mode or self.config.construction_target
+        if mode not in {'instances', 'structure'}:
+            raise LightGraphError('invalid_construction_mode')
+        if mode == 'structure':
+            if validation_id is not None:
+                raise LightGraphError('structure_validation_selection_unsupported')
+            self._check_current_inputs()
+            from .structure import publish_structure
+            return publish_structure(self.workspace, draft_id, access=access_fingerprint(self.config))
         if self.config.resolved_model.mode not in {"in_environment", "approved_external"}:
             raise LightGraphError("metadata_only_query_forbidden")
         self._check_current_inputs()
         record = self.workspace.get_draft(draft_id)
         self._require_draft_sources(record.draft)
-        preview = self.workspace.root / f"previews/{digest(draft_id)[:16]}-{record.revision}.yaml"
-        if not preview.exists():
-            raise LightGraphError("graph_validation_required")
-        from .workspace import safe_load_yaml
-        graph = safe_load_yaml(preview.read_text(encoding="utf-8"), max_bytes=128 * 1024 * 1024)
-        if any(not s.path for s in self.config.sources):
-            # A per-run schema token cannot prove unchanged database rows.
-            # Recheck the materialized facts immediately before publication.
-            fresh = execute_draft(record.draft, self.adapters, list(self.tables.values()),
-                goal=self.config.goal, max_working_bytes=self.config.max_working_bytes,
-                max_rows=self.config.limits.max_result_rows, max_seconds=self.budget.remaining_seconds(),
-                scope_bindings=self.config.scope_bindings)
-            compared = {key: value for key, value in graph.items()
-                        if key not in {'draft_id', 'draft_revision', 'evidence_refs', 'access_fingerprint'}}
-            new_graph = {key: value for key, value in fresh['graph'].items() if key != 'evidence_refs'}
-            if not fresh['passed'] or digest(compared) != digest(new_graph):
-                raise LightGraphError('construction_source_changed')
-        publication = self.workspace.publish(draft_id, revision=record.revision, graph=graph)
+        selected = self.workspace.select_validation(draft_id, validation_id)
+        graph = self.workspace.read_validation_graph(draft_id, selected)
+        if graph.get('access_fingerprint') != access_fingerprint(self.config):
+            raise LightGraphError('validated_graph_access_mismatch')
+        publication = self.workspace.publish(draft_id, revision=record.revision, graph=graph,
+                                             validation_id=selected.validation_id)
         manifest = self.workspace.read_summary()
         merged = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes)
         from .statistics import graph_statistics

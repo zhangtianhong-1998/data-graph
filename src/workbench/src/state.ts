@@ -14,7 +14,11 @@ export function assertNoCredentials(value: unknown): void {
 export const runLabels: Record<Run['status'], string> = { queued: '等待启动', running: '运行中', completed: '已完成', completed_with_gaps: '已完成，有未决项', partial: '执行未完成', failed: '失败', cancelled: '已取消', interrupted: '运行中断' }
 export function graphOutcome(report: unknown): string {
   if (!report || typeof report !== 'object') return ''
-  const data = report as { validation?: { business_graph?: string }; counts?: Record<string, number> }
+  const data = report as { validation?: { business_graph?: string; construction_target?: string }; counts?: Record<string, number> }
+  if (data.validation?.construction_target === 'structure') {
+    const count = data.counts?.structures_published ?? 0
+    return count > 0 ? `已发布 ${count} 份结构与映射方案；本次未生成或验证具体实例。` : '本次目标是结构与映射，尚无已发布方案；请查看结构检查结果。'
+  }
   switch (data.validation?.business_graph) {
     case 'empty': return '当前没有已发布的业务实体或关系，请查看发现与校验问题。'
     case 'candidates_only': return '当前只有候选对象，尚未形成已确认的业务图谱。'

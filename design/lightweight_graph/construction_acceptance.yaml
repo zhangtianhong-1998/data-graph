@@ -1,5 +1,5 @@
 schema_version: 1
-updated: '2026-11-03'
+updated: '2026-11-04'
 purpose: 按用户目的从事实数据自主发现图谱；本轮尚未登记真实模型或客户语义验收。
 design: GENERIC_GRAPH_CONSTRUCTION.md
 scope:
@@ -30,6 +30,29 @@ engineering_snapshot:
   scope: 测试集合可能重叠，数量不可相加；工程接线与脚本生成映射不证明真实模型自主发现。
   status_document: ../../IMPLEMENTATION_STATUS.md
   migration_gaps: CONSTRUCTION_MIGRATION_GAPS.md
+latest_engineering_snapshot:
+  date: '2026-11-04'
+  design: RELATION_MAPPING_AND_PUBLICATION_20261104.md
+  python_passed: 2829
+  python_failed: 0
+  python_skipped: 0
+  native_kernel_enabled: true
+  model_endpoint: loopback_scripted_fixture
+  frontend_passed: 306
+  frontend_build: passed
+  browser_config_and_name_checks: passed
+  browser_evidence: ../../runs/architecture-20261104/ui-verification.json
+  real_database_called: false
+  external_model_called: false
+  autonomous_discovery_acceptance: not_run
+  covered_contracts:
+    - optional_query_count_and_bounded_finalization
+    - immutable_validation_and_asof_publication
+    - structure_without_fact_queries_and_yaml_export
+    - actual_cross_source_and_self_row_matching
+    - lookup_permissions_missing_ambiguity_and_explicit_omit
+    - primary_name_roles_and_wrapped_labels
+  boundary: 工程测试及模拟浏览器数据不证明客户库性能或真实模型发现质量；旧 engineering_snapshot 保留为历史记录。
 execution_record_fields:
   - code_revision
   - input_revision

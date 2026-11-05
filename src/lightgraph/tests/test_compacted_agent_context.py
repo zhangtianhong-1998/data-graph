@@ -1,5 +1,6 @@
 """Exercise the actual AgentScope formatter/request/trace boundary offline."""
 import json
+from lightgraph.discovery.budget import BudgetAllocator, Cost
 from lightgraph.runtime.trace import bind_trace, RunTrace
 from lightgraph.tests.test_discovery_agent import Toolbox, final, input_packet, response
 from lightgraph.tests.test_model_streaming import model
@@ -30,7 +31,11 @@ def test_proactive_compaction_keeps_drafts_and_full_trace_below_a_large_hard_cap
         assert calls==replies
         return response(tool='finish_discovery',args={'pending':False})
     trace_path=tmp_path/'trace.jsonl'
-    client=model(handle,stream=False,max_prompt_tokens=1048576,max_discovery_steps=8)
+    # The retained trace is intentionally large. A slow runner can spend the
+    # default minute serializing it and then hide source tools for submission.
+    # This test checks compaction, so the clock must not change the tool list.
+    client=model(handle,stream=False,max_prompt_tokens=1048576,max_discovery_steps=8,
+        budget=BudgetAllocator(Cost(llm_calls=20,llm_tokens=1_000_000,memory_bytes=1_000_000,seconds=600)))
     source=Source()
     with bind_trace(RunTrace(trace_path)):
         batch=client.explore(input_packet(),source)

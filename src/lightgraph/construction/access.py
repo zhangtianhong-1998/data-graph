@@ -77,7 +77,8 @@ def filter_graph_scopes(graph, scopes):
 
     def supports_for(item):
         return [deepcopy(support) for support in item.get('supports', [])
-                if support.get('scope_ref') in allowed]
+                if support.get('scope_ref') in allowed
+                and all(scope in allowed for scope in support.get('required_scope_refs', []))]
 
     def attributes(supports):
         properties = {}

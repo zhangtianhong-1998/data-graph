@@ -50,6 +50,55 @@ beforeEach(() => {
 })
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); clearSessions(); sessionStorage.clear() })
 describe('visible model limits', () => {
+  it.each([false, true])('persists query limit and construction target independently of model source (%s)', async separate => {
+    if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }
+    config.max_db_queries = 240
+    await mount()
+    const check = root.querySelector<HTMLInputElement>('#query-count-unlimited')!
+    expect(check.checked).toBe(false)
+    check.checked = true; check.dispatchEvent(new Event('change', { bubbles: true })); await nextTick()
+    const target = root.querySelector<HTMLSelectElement>('#construction-target')!
+    target.value = 'structure'; target.dispatchEvent(new Event('change', { bubbles: true })); await nextTick()
+    button('保存配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存'))
+    expect(config.max_db_queries).toBeNull(); expect(config.construction_target).toBe('structure')
+    app.unmount(); root.remove(); await mount()
+    expect(root.querySelector<HTMLInputElement>('#query-count-unlimited')!.checked).toBe(true)
+    expect(root.querySelector<HTMLInputElement>('#max-db-queries')!.disabled).toBe(true)
+    expect(root.querySelector<HTMLSelectElement>('#construction-target')!.value).toBe('structure')
+    const restored = root.querySelector<HTMLInputElement>('#query-count-unlimited')!
+    restored.checked = false; restored.dispatchEvent(new Event('change', { bubbles: true })); await nextTick()
+    await edit('max-db-queries', '500'); button('保存完整配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('完整配置已保存'))
+    expect(config.max_db_queries).toBe(500)
+    app.unmount(); root.remove(); await mount()
+    expect(root.querySelector<HTMLInputElement>('#query-count-unlimited')!.checked).toBe(false)
+    expect(root.querySelector<HTMLInputElement>('#max-db-queries')!.value).toBe('500')
+  })
+  it('merges query controls with unrelated JSON edits and detects same-field conflicts', async () => {
+    config.max_db_queries = 240
+    await mount()
+    await edit('advanced-config', JSON.stringify({ ...config, max_run_seconds: 9000 }))
+    await edit('max-db-queries', '500'); button('保存完整配置').click()
+    await vi.waitFor(() => expect(config.max_db_queries).toBe(500))
+    expect(config.max_run_seconds).toBe(9000)
+    await vi.waitFor(() => expect(button('保存完整配置').disabled).toBe(false))
+    await edit('advanced-config', JSON.stringify({ ...config, max_db_queries: 800 }))
+    await edit('max-db-queries', '1000'); button('保存完整配置').click()
+    await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('max_db_queries'))
+    expect(config.max_db_queries).toBe(500)
+  })
+  it.each(['', '0', '-1', '1.5'])('rejects an invalid enabled query limit: %s', async invalid => {
+    await mount()
+    const check = root.querySelector<HTMLInputElement>('#query-count-unlimited')!
+    check.checked = false; check.dispatchEvent(new Event('change', { bubbles: true })); await nextTick()
+    await edit('max-db-queries', invalid)
+    expect(root.textContent).toContain('查询次数上限须为正整数')
+    expect(button('保存配置').disabled).toBe(true)
+    expect(button('保存并开始抽取').disabled).toBe(true)
+    expect(calls.some(call => call.method === 'PUT')).toBe(false)
+  })
+
   it('explicitly discards form changes even when JSON changed the same previewed field', async () => {
     await mount(); await edit('model-max-calls', '80')
     const draft = JSON.parse(root.querySelector<HTMLTextAreaElement>('#advanced-config')!.value)

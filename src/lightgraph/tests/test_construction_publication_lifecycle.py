@@ -66,7 +66,10 @@ def test_driver_exception_is_value_free_and_preserves_published_graph(tmp_path, 
             assert result['diagnostics'] == [{'code': 'construction_source_execution_failed'}]
             assert tools.workspace.get_draft('items').status == 'needs_revision'
             assert tools.workspace.read_published_graph() == before
-            assert tools.call('publish_graph_draft', draft_id='items')['code'] == 'graph_validation_required'
+            # A transport failure does not refute the previously checked
+            # snapshot, which can be published without another source read.
+            assert tools.call('publish_graph_draft', draft_id='items')['status'] == 'ok'
+            assert tools.workspace.read_published_graph() == before
             assert marker not in str(result)
             assert all(marker.encode() not in path.read_bytes() for path in tools.workspace.root.rglob('*') if path.is_file())
             captured = capsys.readouterr()

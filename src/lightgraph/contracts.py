@@ -483,7 +483,7 @@ class ConstructionSummary(StrictModel):
     """Recorded work and deterministic results, separate from formal acceptance."""
     drafts: list[ConstructionDraftSummary] = Field(default_factory=list)
     summary: dict[str, int] = Field(default_factory=dict)
-    execution: dict[str, str] = Field(default_factory=dict)
+    execution: dict[str, Any] = Field(default_factory=dict)
     acceptance: dict[str, str] = Field(default_factory=lambda: {
         'independent_gold': 'not_run', 'customer_database': 'not_run'})
     statistics: dict[str, Any] = Field(default_factory=dict)

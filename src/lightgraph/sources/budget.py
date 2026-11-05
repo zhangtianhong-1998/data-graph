@@ -6,8 +6,9 @@ from contextlib import contextmanager
 from lightgraph.errors import BudgetExceeded, LightGraphError
 
 class QueryBudget:
-    def __init__(self, *, max_queries: int = 240, max_run_seconds: float = 1800, max_returned_rows: int = 400000, max_returned_bytes: int = 64 * 1024 * 1024, deadline: float | None = None):
-        if min(max_queries, max_run_seconds, max_returned_rows, max_returned_bytes) <= 0:
+    def __init__(self, *, max_queries: int | None = None, max_run_seconds: float = 1800, max_returned_rows: int = 400000, max_returned_bytes: int = 64 * 1024 * 1024, deadline: float | None = None):
+        if (max_queries is not None and (type(max_queries) is not int or max_queries <= 0)
+                or min(max_run_seconds, max_returned_rows, max_returned_bytes) <= 0):
             raise LightGraphError("invalid_query_budget")
         self.max_queries=max_queries;self.max_returned_rows=max_returned_rows;self.max_returned_bytes=max_returned_bytes
         self.deadline=min(deadline, time.monotonic()+max_run_seconds) if deadline else time.monotonic()+max_run_seconds
@@ -40,7 +41,7 @@ class QueryBudget:
         finally:
             self.deadline = previous_deadline
     @contextmanager
-    def exploration(self, *, deadline: float, query_limit: int):
+    def exploration(self, *, deadline: float, query_limit: int | None):
         """Apply a smaller phase ceiling without resetting consumed resources.
 
         The run orchestrator is sequential. All source adapters share this
@@ -49,10 +50,11 @@ class QueryBudget:
         """
         previous_deadline, previous_limit = self.deadline, self.max_queries
         self.deadline = min(previous_deadline, deadline)
-        self.max_queries = min(previous_limit, query_limit)
+        limits = [limit for limit in (previous_limit, query_limit) if limit is not None]
+        self.max_queries = min(limits) if limits else None
         try:
             self.check_time()
-            if self.queries >= self.max_queries:
+            if self.max_queries is not None and self.queries >= self.max_queries:
                 raise BudgetExceeded('discovery_query_budget_exhausted')
             yield
         except BudgetExceeded as exc:
@@ -66,7 +68,7 @@ class QueryBudget:
     def charge_query(self):
         with self._lock:
             self.check_time()
-            if self.queries >= self.max_queries: raise BudgetExceeded("query_budget_exhausted")
+            if self.max_queries is not None and self.queries >= self.max_queries: raise BudgetExceeded("query_budget_exhausted")
             self.queries += 1
     def charge_return(self, rows: int, byte_count: int):
         with self._lock:
@@ -83,12 +85,12 @@ class QueryBudget:
                 self._absorbed_budgets[id(previous)]=previous
                 self.queries+=prior["queries"];self.returned_rows+=prior["returned_rows"];self.returned_bytes+=prior["returned_bytes"]
             self.check_time()
-            if self.queries > self.max_queries: raise BudgetExceeded("query_budget_exhausted")
+            if self.max_queries is not None and self.queries > self.max_queries: raise BudgetExceeded("query_budget_exhausted")
             if self.returned_rows > self.max_returned_rows: raise BudgetExceeded("returned_rows_budget_exhausted")
             if self.returned_bytes > self.max_returned_bytes: raise BudgetExceeded("returned_bytes_budget_exhausted")
     def snapshot(self):
         with self._lock:
-            return {"queries":self.queries,"returned_rows":self.returned_rows,"returned_bytes":self.returned_bytes,"remaining_queries":max(0,self.max_queries-self.queries),"remaining_seconds":max(0,self.deadline-time.monotonic())}
+            return {"queries":self.queries,"returned_rows":self.returned_rows,"returned_bytes":self.returned_bytes,"max_queries":self.max_queries,"remaining_queries":None if self.max_queries is None else max(0,self.max_queries-self.queries),"remaining_seconds":max(0,self.deadline-time.monotonic())}
 
 class BudgetedCursor:
     """Metadata/control cursor wrapper; no SQL or parameter values are retained."""

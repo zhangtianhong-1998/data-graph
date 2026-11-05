@@ -1,4 +1,157 @@
 {
+  "$defs": {
+    "ConstructionCheckSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "passed": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Passed"
+        },
+        "metrics": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ]
+          },
+          "title": "Metrics",
+          "type": "object"
+        },
+        "diagnostics": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Diagnostics",
+          "type": "array"
+        }
+      },
+      "title": "ConstructionCheckSummary",
+      "type": "object"
+    },
+    "ConstructionDraftSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "draft_id": {
+          "title": "Draft Id",
+          "type": "string"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "integer"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "entity_types": {
+          "default": 0,
+          "title": "Entity Types",
+          "type": "integer"
+        },
+        "relation_types": {
+          "default": 0,
+          "title": "Relation Types",
+          "type": "integer"
+        },
+        "mappings": {
+          "default": 0,
+          "title": "Mappings",
+          "type": "integer"
+        },
+        "unresolved": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Unresolved",
+          "type": "array"
+        },
+        "decisions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Decisions",
+          "type": "array"
+        },
+        "suggestions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Suggestions",
+          "type": "array"
+        },
+        "validation": {
+          "$ref": "#/$defs/ConstructionCheckSummary"
+        }
+      },
+      "required": [
+        "draft_id",
+        "revision",
+        "status"
+      ],
+      "title": "ConstructionDraftSummary",
+      "type": "object"
+    },
+    "ConstructionSummary": {
+      "additionalProperties": false,
+      "description": "Recorded work and deterministic results, separate from formal acceptance.",
+      "properties": {
+        "drafts": {
+          "items": {
+            "$ref": "#/$defs/ConstructionDraftSummary"
+          },
+          "title": "Drafts",
+          "type": "array"
+        },
+        "summary": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Summary",
+          "type": "object"
+        },
+        "execution": {
+          "additionalProperties": true,
+          "title": "Execution",
+          "type": "object"
+        },
+        "acceptance": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Acceptance",
+          "type": "object"
+        },
+        "statistics": {
+          "additionalProperties": true,
+          "title": "Statistics",
+          "type": "object"
+        },
+        "usage": {
+          "additionalProperties": true,
+          "title": "Usage",
+          "type": "object"
+        }
+      },
+      "title": "ConstructionSummary",
+      "type": "object"
+    }
+  },
   "additionalProperties": false,
   "properties": {
     "run_id": {
@@ -67,6 +220,17 @@
       },
       "title": "Validation",
       "type": "object"
+    },
+    "construction": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ConstructionSummary"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [

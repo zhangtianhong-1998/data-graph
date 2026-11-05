@@ -235,7 +235,8 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
         if 'supports' not in item:
             return item.get('provenance', [])
         return [{**support.get('provenance', {}), 'scope_ref': support['scope_ref'],
-                 **({'row_context': support['row_context']} if support.get('row_context') is not None else {})}
+                 **{key: support[key] for key in ('row_context', 'lookup_matches', 'required_scope_refs')
+                    if support.get(key) is not None}}
                 for support in item['supports']]
 
     if entity_id or fact_id:
@@ -273,6 +274,7 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             "source": source.get("source", {}), "mapping_index": source.get("mapping"),
             "identity_columns": source.get("key_columns", []),
             "reference_columns": {name: source[name] for name in ("source_key_columns", "target_key_columns") if name in source},
+            "endpoint_lookups": {name: source[name] for name in ('source_lookup', 'target_lookup') if name in source},
             "source_columns": source.get("columns", []), "scope_columns": source.get("scope_columns", []),
             "label_column": source.get("label_column"), "scope_ref": support["scope_ref"],
             "constant_properties": source.get('constant_properties', {}),

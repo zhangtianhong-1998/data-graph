@@ -1,0 +1,521 @@
+{
+  "$defs": {
+    "EndpointLookup": {
+      "additionalProperties": false,
+      "description": "Resolve one endpoint through actual equal-key matches in an authorized table.",
+      "properties": {
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "table": {
+          "minLength": 1,
+          "title": "Table",
+          "type": "string"
+        },
+        "schema": {
+          "default": "public",
+          "title": "Schema",
+          "type": "string"
+        },
+        "predicate": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Predicate"
+        },
+        "match_columns": {
+          "description": "Columns matched to the corresponding relation key_columns, in order. Include tenant or other required matching scope explicitly.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Match Columns",
+          "type": "array"
+        },
+        "key_columns": {
+          "description": "Columns from the matched row that form the resolved entity identity.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Key Columns",
+          "type": "array"
+        },
+        "cardinality": {
+          "default": "one",
+          "description": "one rejects matches to multiple distinct endpoint identities; many explicitly permits all observed matches for this input row.",
+          "enum": [
+            "one",
+            "many"
+          ],
+          "title": "Cardinality",
+          "type": "string"
+        },
+        "on_missing": {
+          "default": "error",
+          "description": "error diagnoses unmatched references; omit explicitly omits unmatched input rows and reports their count.",
+          "enum": [
+            "error",
+            "omit"
+          ],
+          "title": "On Missing",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "table",
+        "match_columns",
+        "key_columns"
+      ],
+      "title": "EndpointLookup",
+      "type": "object"
+    },
+    "EntityDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "maxLength": 4000,
+          "title": "Description",
+          "type": "string"
+        },
+        "key_names": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Key Names",
+          "type": "array"
+        },
+        "mappings": {
+          "items": {
+            "$ref": "#/$defs/EntityMapping"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Mappings",
+          "type": "array"
+        },
+        "display_mode": {
+          "default": "auto",
+          "description": "For objects without a source label: derive from visible relations or the complete identity. Explicit source labels always take precedence.",
+          "enum": [
+            "auto",
+            "identity",
+            "relations"
+          ],
+          "title": "Display Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "key_names",
+        "mappings"
+      ],
+      "title": "EntityDefinition",
+      "type": "object"
+    },
+    "EntityMapping": {
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "table": {
+          "minLength": 1,
+          "title": "Table",
+          "type": "string"
+        },
+        "schema": {
+          "default": "public",
+          "title": "Schema",
+          "type": "string"
+        },
+        "predicate": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Predicate"
+        },
+        "properties": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "maxProperties": 128,
+          "title": "Properties"
+        },
+        "constant_properties": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ]
+          },
+          "description": "Agent-declared mapping annotations, such as the observed slot or endpoint positions. Not identity keys or source-verified values.",
+          "maxProperties": 32,
+          "title": "Constant Properties",
+          "type": "object"
+        },
+        "context_columns": {
+          "description": "Authorized columns that identify a source-row context shared across mappings. Retained on each support, never added to entity identity. Use the same column set for related mappings.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Context Columns",
+          "type": "array"
+        },
+        "key_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Key Columns",
+          "type": "array"
+        },
+        "label_column": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Physical column containing the primary source name. Choose a confirmed name column when available; omission generates a display/identity fallback and does not check name consistency. Never omit a known name to bypass a conflict.",
+          "title": "Label Column"
+        },
+        "alias_columns": {
+          "description": "Confirmed alternate names, translations or abbreviations for the same object. Display columns alone do not become aliases.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Alias Columns",
+          "type": "array"
+        },
+        "display_columns": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Supplementary display components, or a composite display for objects without an independent name. Does not replace label_column or alias_columns and never changes identity.",
+          "maxProperties": 32,
+          "title": "Display Columns",
+          "type": "object"
+        }
+      },
+      "required": [
+        "source_id",
+        "table",
+        "key_columns"
+      ],
+      "title": "EntityMapping",
+      "type": "object"
+    },
+    "RelationDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "maxLength": 4000,
+          "title": "Description",
+          "type": "string"
+        },
+        "source_type": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Source Type",
+          "type": "string"
+        },
+        "target_type": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Target Type",
+          "type": "string"
+        },
+        "allow_self_links": {
+          "default": false,
+          "title": "Allow Self Links",
+          "type": "boolean"
+        },
+        "acyclic": {
+          "default": false,
+          "title": "Acyclic",
+          "type": "boolean"
+        },
+        "mappings": {
+          "items": {
+            "$ref": "#/$defs/RelationMapping"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Mappings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "source_type",
+        "target_type",
+        "mappings"
+      ],
+      "title": "RelationDefinition",
+      "type": "object"
+    },
+    "RelationMapping": {
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "table": {
+          "minLength": 1,
+          "title": "Table",
+          "type": "string"
+        },
+        "schema": {
+          "default": "public",
+          "title": "Schema",
+          "type": "string"
+        },
+        "predicate": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Predicate"
+        },
+        "properties": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "maxProperties": 128,
+          "title": "Properties"
+        },
+        "constant_properties": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ]
+          },
+          "description": "Agent-declared mapping annotations, such as the observed slot or endpoint positions. Not identity keys or source-verified values.",
+          "maxProperties": 32,
+          "title": "Constant Properties",
+          "type": "object"
+        },
+        "context_columns": {
+          "description": "Authorized columns that identify a source-row context shared across mappings. Retained on each support, never added to entity identity. Use the same column set for related mappings.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Context Columns",
+          "type": "array"
+        },
+        "source_key_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Source Key Columns",
+          "type": "array"
+        },
+        "target_key_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Target Key Columns",
+          "type": "array"
+        },
+        "source_lookup": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointLookup"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "target_lookup": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointLookup"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "equal_endpoints": {
+          "default": "error",
+          "enum": [
+            "error",
+            "omit",
+            "include"
+          ],
+          "title": "Equal Endpoints",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "table",
+        "source_key_columns",
+        "target_key_columns"
+      ],
+      "title": "RelationMapping",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "draft_id": {
+      "maxLength": 80,
+      "minLength": 1,
+      "title": "Draft Id",
+      "type": "string"
+    },
+    "purpose": {
+      "default": "",
+      "maxLength": 4000,
+      "title": "Purpose",
+      "type": "string"
+    },
+    "entities": {
+      "items": {
+        "$ref": "#/$defs/EntityDefinition"
+      },
+      "maxItems": 128,
+      "title": "Entities",
+      "type": "array"
+    },
+    "relations": {
+      "items": {
+        "$ref": "#/$defs/RelationDefinition"
+      },
+      "maxItems": 128,
+      "title": "Relations",
+      "type": "array"
+    },
+    "evidence_refs": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 512,
+      "title": "Evidence Refs",
+      "type": "array"
+    },
+    "rationale": {
+      "default": "",
+      "maxLength": 8000,
+      "title": "Rationale",
+      "type": "string"
+    },
+    "unresolved": {
+      "description": "Only unmet requirements of the current user goal. Empty when covered; never invent missing work.",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 128,
+      "title": "Unresolved",
+      "type": "array"
+    },
+    "decisions": {
+      "description": "Evidence-backed choices already applied; these do not prevent completion.",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 128,
+      "title": "Decisions",
+      "type": "array"
+    },
+    "suggestions": {
+      "description": "Optional future improvements outside the current goal; these do not prevent completion.",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 128,
+      "title": "Suggestions",
+      "type": "array"
+    }
+  },
+  "required": [
+    "draft_id"
+  ],
+  "title": "GraphDraft",
+  "type": "object"
+}

@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Literal
 import yaml
-from pydantic import ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, field_validator, model_serializer, model_validator
+from pydantic import ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, StrictInt, field_validator, model_serializer, model_validator
 from ..contracts import StrictModel, QueryLimits, ExtractionGoal
 from ..errors import LightGraphError
 
@@ -155,7 +155,10 @@ class RunConfig(StrictModel):
     scope_bindings: list[GraphScopeBinding] = Field(default_factory=list, max_length=1024,
         description='Operator-owned source/table columns determining each result support scope. No binding means public; never inferred from identity keys.')
     max_working_bytes: int = Field(default=32*1024*1024, gt=0)
-    max_db_queries: int = Field(default=240, gt=0)
+    max_db_queries: StrictInt | None = Field(default=None, gt=0,
+        description="Total source-query admissions, including metadata and transaction controls. Null removes only the query-count ceiling.")
+    construction_target: Literal["instances", "structure"] = Field(default="instances",
+        description="Build concrete instance nodes and edges, or publish only structure and source mappings with no claim of instance validation.")
     max_partitions: int = Field(default=256, ge=1, le=4096)
     max_discovery_rounds: int = Field(default=3, ge=1, le=8)
     # Accepted only to read old project configurations. Harness does not split

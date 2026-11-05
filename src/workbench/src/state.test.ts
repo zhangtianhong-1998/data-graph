@@ -13,6 +13,10 @@ describe('运行和配置边界', () => {
     expect(graphOutcome({ status: 'completed' })).toBe('')
     expect(graphOutcome({ status: 'COMPLETED_WITH_GAPS', counts: { business_nodes: 462, business_edges: 930 } })).toContain('462 个业务实体、930 条业务关系')
   })
+  it('结构产出不被空实例图误报为失败', () => {
+    expect(graphOutcome({ validation: { construction_target: 'structure', business_graph: 'empty' }, counts: { structures_published: 1 } })).toBe('已发布 1 份结构与映射方案；本次未生成或验证具体实例。')
+    expect(graphOutcome({ validation: { construction_target: 'structure' } })).toContain('尚无已发布方案')
+  })
   it('只有后端 queued/running 状态触发轮询', () => {
     for (const status of ['completed', 'completed_with_gaps', 'partial', 'failed', 'cancelled', 'interrupted']) expect(isActive({ status } as Run)).toBe(false)
     expect(isActive({ status: 'running' } as Run)).toBe(true)

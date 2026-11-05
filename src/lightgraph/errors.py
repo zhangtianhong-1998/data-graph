@@ -7,4 +7,4 @@ class LightGraphError(Exception):
 
 class BudgetExceeded(LightGraphError):
     def __init__(self, code: str = "query_budget_exhausted"):
-        super().__init__(code, retryable=True)
+        super().__init__(code, retryable=False)

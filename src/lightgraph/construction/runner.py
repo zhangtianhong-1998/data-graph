@@ -16,7 +16,7 @@ from lightgraph.runtime.trace import emit_trace, current_trace
 
 from .harness import HarnessOptions, run_goal
 from .mcp_server import serve_local_tools
-from .tools import ConstructionTools
+from .tools import ConstructionTools, TERMINAL_QUERY_CODES
 from .workspace import write_yaml
 
 
@@ -181,7 +181,7 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
         if reason not in {"completed", "stop", "end_turn"}:
             report.status = "PARTIAL"
             cause = budget.get("stop_reason", "")
-            code = cause if cause in {"construction_input_limit_exceeded", "construction_call_budget_exhausted",
+            code = cause if cause in TERMINAL_QUERY_CODES | {"construction_input_limit_exceeded", "construction_call_budget_exhausted",
                                      "construction_time_budget_exhausted"} else "harness_run_interrupted"
             report.issues.append({"code": code, "status": "partial"})
     except LightGraphError as exc:
@@ -200,10 +200,26 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
                 summary = tools.workspace.read_summary()
                 records = tools.workspace.list_drafts()
                 publications = {p["draft_id"]: p for p in summary["publications"]}
+                structures = {key: value for key, value in summary.get('structure_publications', {}).items()
+                    if value.get('context_fingerprint') == tools.workspace.context_fingerprint}
+                structure_target = getattr(config, 'construction_target', 'instances') == 'structure'
+                from .structure import structure_ready
+                checked_structures = [r for r in records if structure_ready(
+                    tools.workspace, r, discover_only=True)]
+                published_structures = [r for r in checked_structures if structure_ready(
+                    tools.workspace, r, discover_only=False)]
+                structures = {r.draft.draft_id: structures[r.draft.draft_id]
+                              for r in published_structures}
                 # A new candidate revision does not remove its previous valid
                 # publication. Count the published versions, not current drafts.
                 report.rules_published = list(publications)
                 report.counts.update(discovered_drafts=len(records), rules_published=len(publications))
+                report.counts['structures_published'] = len(structures)
+                report.validation['construction_target'] = 'structure' if structure_target else 'instances'
+                if tools.terminal_reason:
+                    report.status = 'PARTIAL'
+                    if not any(i.get('code') == tools.terminal_reason for i in report.issues):
+                        report.issues.append({'code': tools.terminal_reason, 'status': 'partial'})
                 try:
                     graph = tools.workspace.read_published_graph()
                 except LightGraphError as exc:
@@ -228,14 +244,39 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
                     execution_kind = 'interrupted'
                 report.construction = construction_summary(records, publications, graph, execution_kind=execution_kind)
                 report.construction.usage = usage
-                report.issues.extend(draft_issues(records, publications, discover_only=discover_only))
-                report.validation.update(business_graph='nonempty' if graph.get('nodes') else 'empty',
+                report.construction.execution['structure_publications'] = [
+                    {key: value[key] for key in ('draft_id', 'revision', 'validation_id', 'path',
+                                                'data_validation', 'instance_enumeration')}
+                    | {'validation_level': 'structure'}
+                    for value in structures.values()]
+                report.construction.summary['published_structures'] = len(structures)
+                if structure_target:
+                    # Count checked definitions, never infer instances from a
+                    # bound schema or from the current empty materialized graph.
+                    plans = checked_structures if discover_only else published_structures
+                    report.construction.summary.update(
+                        entity_type_count=len({d.type for r in plans for d in r.draft.entities}),
+                        relation_type_count=len({d.type for r in plans for d in r.draft.relations}),
+                        mapping_count=sum(len(d.mappings) for r in plans
+                                          for d in r.draft.entities + r.draft.relations))
+                    report.construction.execution['data_validation'] = 'not_run'
+                if not structure_target:
+                    report.issues.extend(draft_issues(records, publications, discover_only=discover_only))
+                report.validation.update(business_graph='not_requested' if structure_target else 'nonempty' if graph.get('nodes') else 'empty',
                     data_checks=report.construction.execution['data_validation'], model_execution=execution_kind)
                 report.counts.update(published_drafts=len(publications),
                     entity_types=report.construction.summary['entity_type_count'],
                     relation_types=report.construction.summary['relation_type_count'],
                     mappings=report.construction.summary['mapping_count'],
                     db_queries=sum(getattr(getattr(a, 'stats', None), 'queries', 0) for a in tools.adapters))
+                # The admission limit also counts catalog and transaction SQL.
+                # Keep the old data-query metric and expose the actual shared
+                # budget once, rather than summing it once per source.
+                source_budgets = {id(b): b for a in tools.adapters
+                                  if (b := getattr(a, 'query_budget', None)) is not None}
+                actual_queries = sum(b.snapshot()['queries'] for b in source_budgets.values())
+                report.counts['db_query_admissions'] = actual_queries
+                report.construction.execution['query_counter_basis'] = 'db_queries=data_operation_attempts; db_query_admissions=shared_all_sql_admissions'
                 emit_progress(None, 'stage_completed', counters={
                     **{target: report.counts[source] for source, target in
                        [('llm_calls', 'model_calls'), ('input_tokens', 'input_tokens'), ('output_tokens', 'output_tokens')]
@@ -244,6 +285,15 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
                     'business_nodes': report.counts['business_nodes'], 'business_edges': report.counts['business_edges']})
                 remaining_work = not records or any(r.draft.unresolved or not draft_is_ready(
                     r, publications, discover_only=discover_only) for r in records)
+                if structure_target:
+                    remaining_work = not records or any(r.draft.unresolved or not structure_ready(
+                        tools.workspace, r, discover_only=discover_only) for r in records)
+                    report.construction.execution['structure_validation'] = 'incomplete' if remaining_work else 'passed'
+                    report.construction.execution['instance_enumeration'] = 'not_requested'
+                    for r in records:
+                        if r.draft.unresolved:
+                            report.issues.extend({'code': 'construction_goal_gap', 'status': 'unresolved',
+                                'draft_id': r.draft.draft_id, 'message': item} for item in r.draft.unresolved)
                 if (report.status == "COMPLETED" and remaining_work
                         and config.resolved_model.mode != "disabled"):
                     report.status = "COMPLETED_WITH_GAPS"

@@ -1,7 +1,7 @@
 /** Bound every Harness model dispatch, including retry and compaction calls.
  * No transport parsing or business inference is performed by this plugin.
  */
-import { writeFileSync, renameSync, appendFileSync } from 'node:fs'
+import { writeFileSync, renameSync, appendFileSync, readFileSync, existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 
 export const name = 'graph-run-budget'
@@ -16,6 +16,15 @@ export function apply(ctx, config) {
   let stopped = ''
   let diagnostic = null
   let peakInputTokens = 0
+  let finalizationCalls = 0
+  const queryStopCodes = new Set(['query_budget_exhausted', 'db_cu_budget_exhausted',
+    'run_time_budget_exhausted', 'wall_time_budget_exhausted', 'construction_time_exhausted',
+    'returned_rows_budget_exhausted', 'returned_bytes_budget_exhausted'])
+  function queryStop() {
+    if (!config.queryStopFile || !existsSync(config.queryStopFile)) return ''
+    const code = JSON.parse(readFileSync(config.queryStopFile, 'utf8')).code
+    return queryStopCodes.has(code) ? code : ''
+  }
   const executionId = randomUUID()
   const permitted = name => name.startsWith('mcp__graph__') || [
     'skill', 'session_search', 'session_event_search', 'session_trace',
@@ -43,9 +52,14 @@ export function apply(ctx, config) {
   }
   save()
   ctx.on('llm/stream', async function* (options, next) {
+    // Source tools write this trusted control file after a hard query limit.
+    // At most two further dispatches can publish saved work and summarize it.
+    // Retry and compaction dispatches consume the same closeout allowance.
+    const queryStopReason = queryStop()
     const elapsed = (performance.now() - start) / 1000
     const code = elapsed >= config.maxRunSeconds ? 'construction_time_budget_exhausted'
-      : calls >= config.maxCalls ? 'construction_call_budget_exhausted' : null
+      : calls >= config.maxCalls ? 'construction_call_budget_exhausted'
+      : queryStopReason && finalizationCalls >= 2 ? queryStopReason : null
     if (code) {
       save(code)
       const error = new Error(code)
@@ -79,6 +93,7 @@ export function apply(ctx, config) {
       throw error
     }
     calls += 1
+    if (queryStopReason) finalizationCalls += 1
     const dispatchIndex = calls
     save()
     if (config.requestLog) {

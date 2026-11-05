@@ -50,6 +50,7 @@ def parser():
     c=sub.add_parser('import-graph');c.add_argument('snapshot');c.add_argument('store')
     c=sub.add_parser('validate',help='校验新图谱 YAML 草稿格式，不查询数据');c.add_argument('drafts',nargs='+')
     c=sub.add_parser('export-graph',help='导出当前授权范围内已发布的图谱 YAML');c.add_argument('config');c.add_argument('output')
+    c=sub.add_parser('export-structure',help='导出已发布的结构与映射 YAML，不连接数据源');c.add_argument('config');c.add_argument('output')
     c=sub.add_parser('schema');c.add_argument('output')
     c=sub.add_parser('retain-check');c.add_argument('paths',nargs='+');c.add_argument('--marker',action='append',required=True)
     return p
@@ -125,6 +126,14 @@ def run(args):
         graph=load_graph(config)
         write_yaml(Path(args.output), graph)
         emit({'status':'exported','nodes':len(graph['nodes']),'edges':len(graph['edges']),
+              'output':str(Path(args.output).resolve()),'format':'yaml'});return 0
+    if args.command=='export-structure':
+        from .construction.structure_export import load_published_structures
+        from .construction.workspace import write_yaml
+        structure=load_published_structures(load_config(args.config))
+        write_yaml(Path(args.output), structure)
+        emit({'status':'exported','target':'graph_structure','plans':len(structure['plans']),
+              'data_validation':'not_run','instance_enumeration':'not_run',
               'output':str(Path(args.output).resolve()),'format':'yaml'});return 0
     if args.command=='schema':
         out=Path(args.output);out.mkdir(parents=True,exist_ok=True)

@@ -1,0 +1,45 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "ref": {
+      "title": "Ref",
+      "type": "string"
+    },
+    "kind": {
+      "title": "Kind",
+      "type": "string"
+    },
+    "context_fingerprint": {
+      "title": "Context Fingerprint",
+      "type": "string"
+    },
+    "source_ref": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Ref"
+    },
+    "details": {
+      "additionalProperties": true,
+      "title": "Details",
+      "type": "object"
+    }
+  },
+  "required": [
+    "ref",
+    "kind",
+    "context_fingerprint"
+  ],
+  "title": "EvidenceRecord",
+  "type": "object"
+}

@@ -3,6 +3,7 @@ import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { request, projectPath } from './api'
 import type { Graph, GraphNode, GraphEdge } from './types'
 import { fitCamera, zoomCamera } from './graphViewport'
+import { wrapGraphLabel } from './graphLabelLayout'
 import { SCENE_LIMIT, SCENE_EDGE_LIMIT, edgeKey, mergeScene, placeNodes, sceneBounds, hitNode } from './graphScene'
 import type { Point } from './graphScene'
 import { twoHopNeighborhood } from './graphNeighborhood'
@@ -83,7 +84,7 @@ async function expandNode() {
 }
 const selected = ref<GraphNode | null>(null)
 const selectedEdge = ref<GraphEdge | null>(null)
-type Provenance = { facts: Array<{ id: string; fact_kind: string; status: string; payload: Record<string, unknown> }>; supports: Array<{ id: string; fact_id: string; status: string; origin: string; source_binding: string; rule_id: string; rule_revision?: number; publication_id?: string; document_ref?: string; scope_ref: string; binding?: { constant_properties?: Record<string, unknown>; row_context?: { values?: Record<string, unknown> } } }>; rules: Array<Record<string, unknown>>; nodes?: GraphNode[]; display_schema?: DisplaySchema; next_offset: number | null; supports_truncated: boolean; total_incident_edges?: number | null }
+type Provenance = { facts: Array<{ id: string; fact_kind: string; status: string; payload: Record<string, unknown> }>; supports: Array<{ id: string; fact_id: string; status: string; origin: string; source_binding: string; rule_id: string; rule_revision?: number; publication_id?: string; document_ref?: string; scope_ref: string; binding?: { constant_properties?: Record<string, unknown>; row_context?: { values?: Record<string, unknown> }; lookup_matches?: Array<Record<string, unknown>> } }>; rules: Array<Record<string, unknown>>; nodes?: GraphNode[]; display_schema?: DisplaySchema; next_offset: number | null; supports_truncated: boolean; total_incident_edges?: number | null }
 const details = ref<Provenance | null>(null), detailsLoading = ref(false), detailsError = ref('')
 const detailNodes = ref<Record<string, GraphNode>>({})
 const detailSchema = ref<DisplaySchema>({})
@@ -102,7 +103,8 @@ const factTitle = (fact: Provenance['facts'][number]) => fact.fact_kind === 'Pro
 const visibleQualifiers = (value: unknown) => Object.fromEntries(Object.entries((value || {}) as Record<string, unknown>).filter(([key]) => !['semantic_basis', 'document_ref', 'source_group'].includes(key)))
 const factValues = (fact: Provenance['facts'][number]) => fact.fact_kind === 'PropertyValue' ? { [String(fact.payload.name)]: fact.payload.value } : fact.fact_kind === 'Edge' ? visibleQualifiers(fact.payload.qualifiers) : { kind: kindName(fact.payload.kind) }
 const sourceSummary = (rule: Record<string, unknown>) => Object.fromEntries(Object.entries((rule.source || {}) as Record<string, unknown>).filter(([, value]) => value != null && value !== ''))
-const mappingValues = (rule: Record<string, unknown>) => Object.fromEntries(['identity_columns', 'namespace_columns', 'attribute_columns', 'hierarchy_columns', 'reference_columns', 'concept_columns', 'source_columns', 'scope_columns', 'label_column', 'constant_properties', 'context_columns'].filter(key => rule[key] && (typeof rule[key] === 'string' || Object.keys(rule[key] as object).length)).map(key => [key, rule[key]]))
+const lookupValues = (match: Record<string, unknown>) => ({ '关联端点': match.endpoint === 'source' ? '关系起点' : '关系终点', '匹配来源': match.source, '本行字段': match.input_columns, '本行取值': match.input_values, '目标匹配字段': match.match_columns, '目标身份字段': match.key_columns, '匹配后的身份': match.resolved_key, '可见范围': match.scope_ref })
+const mappingValues = (rule: Record<string, unknown>) => Object.fromEntries(['identity_columns', 'namespace_columns', 'attribute_columns', 'hierarchy_columns', 'reference_columns', 'concept_columns', 'source_columns', 'scope_columns', 'label_column', 'constant_properties', 'context_columns', 'endpoint_lookups'].filter(key => rule[key] && (typeof rule[key] === 'string' || Object.keys(rule[key] as object).length)).map(key => [key, rule[key]]))
 let detailGeneration = 0
 const statusName = (value?: unknown) => ({ accepted: '已接受', candidate: '候选', unresolved: '未决', conflict: '冲突' }[String(value)] || '状态未提供')
 async function loadDetails(more = false) {
@@ -226,7 +228,17 @@ const scopeLabel = (node: GraphNode) => {
   return identity.length ? identity.map(([key, value]) => `${key}：${String(value)}`).join(' · ') : accessLabel(node)
 }
 const shortScope = (node: GraphNode) => { const text = scopeLabel(node); return text.length > 18 ? text.slice(0, 17) + '…' : text }
-const shortLabel = (node: GraphNode) => { const text = display(node); return text.length > 15 ? text.slice(0, 14) + '…' : text }
+// Use the same layout for SVG, Canvas and Canvas hit testing. Full names remain
+// in the accessible label, tooltip, search and detail heading.
+const captionContext = document.createElement('canvas').getContext('2d')
+const measureCaption = captionContext?.measureText ? (text: string) => {
+  captionContext.font = '13px sans-serif'
+  return captionContext.measureText(text).width
+} : undefined
+const layoutCaption = (node: GraphNode) => wrapGraphLabel(display(node), 158, 2, measureCaption)
+const captionLines = computed(() => new Map(visible.value.map(node => [node.id, layoutCaption(node)])))
+const labelLines = (node: GraphNode) => captionLines.value.get(node.id) || layoutCaption(node)
+const metadataY = (node: GraphNode) => 43 + labelLines(node).length * 16
 const kindColor = (node: GraphNode) => ['#407ff2', '#20a27e', '#9a6add', '#da9b37', '#54a6bc'][Math.max(0, kinds.value.indexOf(String(node.kind || node.layer || '节点'))) % 5]
 function reset() { zoom.value = 1; offset.value = { x: 0, y: 0 } }
 function setZoom(value: number) {
@@ -271,8 +283,9 @@ function bitmapNode(event: MouseEvent) {
   return [...visible.value].reverse().find(node => {
     if (zoom.value < .4 && selected.value?.id !== node.id) return false
     const p = points.value.get(node.id)!
-    const labels: Array<[string, number, number]> = [[shortLabel(node), 43, 13], [`${kindName(node.kind || node.layer)} · ${statusName(node.status)}`, 59, 11]]
-    if (scopeLabel(node)) labels.push([shortScope(node), 75, 11])
+    const labels: Array<[string, number, number]> = labelLines(node).map((line, index) => [line, 43 + index * 16, 13])
+    labels.push([`${kindName(node.kind || node.layer)} · ${statusName(node.status)}`, metadataY(node), 11])
+    if (scopeLabel(node)) labels.push([shortScope(node), metadataY(node) + 16, 11])
     return labels.some(([text, baseline, size]) => {
       if (ctx) ctx.font = `${size}px sans-serif`
       const width = ctx?.measureText(text).width ?? text.length * size
@@ -325,9 +338,10 @@ function paint() {
     ctx.setLineDash(node.status === 'candidate' ? [6,4] : node.status === 'unresolved' ? [2,4] : [])
     ctx.beginPath(); ctx.arc(p.x,p.y,zoom.value < .3 ? 12 : 22,0,Math.PI*2); ctx.fill(); ctx.stroke()
     if (zoom.value >= .4 || selected.value?.id === node.id) {
-      ctx.fillStyle = '#26364f'; ctx.textAlign = 'center'; ctx.font = '13px sans-serif'; ctx.fillText(shortLabel(node),p.x,p.y+43)
-      ctx.font = '11px sans-serif'; ctx.fillText(`${kindName(node.kind || node.layer)} · ${statusName(node.status)}`,p.x,p.y+59)
-      if (scopeLabel(node)) ctx.fillText(shortScope(node),p.x,p.y+75)
+      ctx.fillStyle = '#26364f'; ctx.textAlign = 'center'; ctx.font = '13px sans-serif'
+      labelLines(node).forEach((line, index) => ctx.fillText(line, p.x, p.y + 43 + index * 16))
+      ctx.fillStyle = '#7888a2'; ctx.font = '11px sans-serif'; ctx.fillText(`${kindName(node.kind || node.layer)} · ${statusName(node.status)}`,p.x,p.y+metadataY(node))
+      if (scopeLabel(node)) ctx.fillText(shortScope(node),p.x,p.y+metadataY(node)+16)
     }
   }
   ctx.globalAlpha = 1
@@ -392,7 +406,7 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
             </g>
             <g v-for="node in visible" :key="node.id" class="graph-node" :class="{ dimmed: (search || selectedKind) && !filtered.includes(node), selected: selected?.id === node.id, candidate: node.status === 'candidate', unresolved: node.status === 'unresolved' }" :transform="`translate(${points.get(node.id)!.x} ${points.get(node.id)!.y})`" tabindex="0" role="button" :aria-label="display(node)" @click="nodeClick(node, $event)" @dblclick.stop="nodeDoubleClick(node)" @keydown.enter="selectNode(node)" @keydown.space.prevent="selectNode(node)">
               <circle r="22" :fill="kindColor(node) + '18'" :stroke="kindColor(node)"/><circle r="5" :fill="kindColor(node)"/>
-              <text class="node-label" y="43">{{ shortLabel(node) }}</text><text class="node-kind" y="59">{{ kindName(node.kind || node.layer) }} · {{ statusName(node.status) }}</text><text v-if="scopeLabel(node)" class="node-kind node-scope" y="75">{{ shortScope(node) }}</text><title>{{ display(node) }} · {{ statusName(node.status) }} · {{ scopeLabel(node) }}</title>
+              <text class="node-label" y="43"><tspan v-for="(line, index) in labelLines(node)" :key="index" x="0" :dy="index ? 16 : 0">{{ line }}</tspan></text><text class="node-kind" :y="metadataY(node)">{{ kindName(node.kind || node.layer) }} · {{ statusName(node.status) }}</text><text v-if="scopeLabel(node)" class="node-kind node-scope" :y="metadataY(node) + 16">{{ shortScope(node) }}</text><title>{{ display(node) }} · {{ statusName(node.status) }} · {{ scopeLabel(node) }}</title>
             </g>
           </g>
         </svg>
@@ -439,7 +453,7 @@ onUnmounted(() => { pageGeneration++; sceneController?.abort(); clearTimeout(sea
               <PropertyTable :values="factValues(fact)" :label="propertyName" />
               <div v-for="support in details.supports.filter(item => item.fact_id === fact.id)" :key="support.id" class="support-detail">
                 <PropertyTable :values="{ '支持状态': statusName(support.status), '来源类型': originName(support.origin), '可见范围': support.scope_ref, '数据位置': support.source_binding, ...(support.rule_revision != null ? { '映射修订': support.rule_revision } : {}) }" />
-                <div v-if="support.binding?.constant_properties && Object.keys(support.binding.constant_properties).length"><h5>来源位置与固定属性</h5><PropertyTable :values="support.binding.constant_properties" :label="propertyName" /></div><div v-if="support.binding?.row_context?.values"><h5>同一行路径上下文</h5><PropertyTable :values="support.binding.row_context.values" /></div><TechnicalDetails :value="support" title="来源标识与引用" />
+                <div v-if="support.binding?.constant_properties && Object.keys(support.binding.constant_properties).length"><h5>来源位置与固定属性</h5><PropertyTable :values="support.binding.constant_properties" :label="propertyName" /></div><div v-if="support.binding?.row_context?.values"><h5>同一行路径上下文</h5><PropertyTable :values="support.binding.row_context.values" /></div><div v-for="(match, index) in support.binding?.lookup_matches || []" :key="index"><h5>记录匹配依据</h5><PropertyTable :values="lookupValues(match)" /></div><TechnicalDetails :value="support" title="来源标识与引用" />
               </div>
               <TechnicalDetails :value="fact" title="事实标识与原始结构" />
             </article>

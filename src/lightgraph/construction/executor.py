@@ -3,18 +3,21 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict, deque
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from datetime import datetime, timezone
 
 from lightgraph.contracts import canonical, digest
-from lightgraph.errors import LightGraphError
+from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.query import QueryCompiler
 from lightgraph.sources.base import aggregate_count
-from .models import GraphDraft
+from .models import GraphDraft, iter_source_mappings
 from .access import scope_binding_map, support_scope
 from .display import derive_display_graph
 
 
 def _projection_columns(mapping):
+    if hasattr(mapping, 'match_columns'):
+        return list(dict.fromkeys(mapping.match_columns + mapping.key_columns))
     keys = (mapping.key_columns if hasattr(mapping, 'key_columns') else
             mapping.source_key_columns + mapping.target_key_columns)
     columns = list(keys) + list(mapping.properties.values()) + mapping.context_columns
@@ -24,6 +27,9 @@ def _projection_columns(mapping):
         if mapping.label_column:
             columns.append(mapping.label_column)
     return list(dict.fromkeys(columns))
+
+
+projection_columns = _projection_columns
 
 
 def _has_cycle(pairs):
@@ -62,6 +68,12 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     checked, projected_rows, omitted = 0, 0, 0
     deadline = time.monotonic() + max_seconds
     graph_bytes = 0
+    cache_bytes = 0
+    lookup_bytes = 0
+    projection_cache, lookup_indexes = {}, {}
+    cache_hits = 0
+    lookup_matches, lookup_omitted = 0, 0
+    source_read_windows = []
     visibility = scope_binding_map(scope_bindings)
 
     def scope_columns(mapping):
@@ -71,6 +83,24 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         if time.monotonic() > deadline:
             raise LightGraphError('construction_time_exhausted')
 
+    @contextmanager
+    def source_snapshot(source_id, adapter):
+        # These are client-observed transaction windows, not server snapshot IDs
+        # or a distributed point-in-time guarantee across different sources.
+        window = {'source_id': source_id, 'requested_at': datetime.now(timezone.utc).isoformat(),
+                  'basis': 'client_observed_snapshot_context', 'state': 'opening'}
+        source_read_windows.append(window)
+        try:
+            with adapter.snapshot():
+                window.update(opened_at=datetime.now(timezone.utc).isoformat(), state='open')
+                yield adapter
+            window['state'] = 'closed'
+        except Exception:
+            window['state'] = 'failed'
+            raise
+        finally:
+            window['closed_at'] = datetime.now(timezone.utc).isoformat()
+
     def diagnostic(code, **location):
         entry = {'code': code, **location}
         if entry not in diagnostics:
@@ -79,10 +109,11 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     def update_size(previous, current):
         nonlocal graph_bytes
         graph_bytes += len(canonical(current).encode()) - previous
-        if graph_bytes > max_working_bytes:
+        if graph_bytes + cache_bytes + lookup_bytes > max_working_bytes:
             raise LightGraphError('memory_budget_exhausted')
 
     def rows_for(mapping):
+        nonlocal cache_bytes, cache_hits
         clock()
         table = allowed.get((mapping.source_id, mapping.schema_name, mapping.table))
         adapter = by_source.get(mapping.source_id)
@@ -107,6 +138,11 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         # Compile against the filtered catalog before the adapter uses its own
         # catalog, including columns mentioned only in a predicate.
         compiler.projection(table, columns, predicate=mapping.predicate, limit=cap)
+        cache_key = canonical([mapping.source_id, mapping.schema_name, mapping.table,
+                               sorted(columns), mapping.predicate, cap])
+        if cache_key in projection_cache:
+            cache_hits += 1
+            return projection_cache[cache_key]
         query = compiler.profile_column_group(table, columns, predicate=mapping.predicate)
         expected = None
         for batch in adapter.execute(query, row_limit=1):
@@ -130,7 +166,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                         clock()
                         item = dict(zip(batch.columns, row))
                         retained_bytes += len(canonical(item).encode())
-                        if retained_bytes + graph_bytes > max_working_bytes:
+                        if retained_bytes + graph_bytes + cache_bytes + lookup_bytes > max_working_bytes:
                             raise LightGraphError('memory_budget_exhausted')
                         if len(rows) >= cap:
                             raise LightGraphError('projection_truncated')
@@ -140,6 +176,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                 stream.close()
         if len(rows) != expected:
             raise LightGraphError('projection_incomplete')
+        # The cache belongs to this execute_draft's open source snapshots only.
+        # Retain complete authorized projections, never failed partial streams.
+        cache_bytes += retained_bytes
+        projection_cache[cache_key] = rows
         return rows
 
     def identity(kind, key):
@@ -150,6 +190,50 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         if any(v is None or v == '' for v in key):
             raise LightGraphError('null_identity_key')
         return key
+
+    def resolve_endpoint(mapping, row, end):
+        """Resolve only matches for this input row; unrelated sets never combine."""
+        nonlocal lookup_bytes, lookup_matches, lookup_omitted
+        columns = getattr(mapping, end + '_key_columns')
+        lookup = getattr(mapping, end + '_lookup')
+        if lookup is None:
+            return [(key_for(row, columns), None)]
+        cache_key = canonical(lookup.model_dump(mode='json', by_alias=True))
+        if cache_key not in lookup_indexes:
+            index = defaultdict(list)
+            for candidate in rows_for(lookup):
+                clock()
+                match = [candidate[c] for c in lookup.match_columns]
+                if any(v is None or v == '' for v in match):
+                    continue
+                token = canonical(match)
+                lookup_bytes += len(token.encode()) + 16
+                if graph_bytes + cache_bytes + lookup_bytes > max_working_bytes:
+                    raise LightGraphError('memory_budget_exhausted')
+                index[token].append(candidate)
+            lookup_indexes[cache_key] = index
+        values = [row[c] for c in columns]
+        matched = lookup_indexes[cache_key].get(canonical(values), [])
+        if not matched:
+            if lookup.on_missing == 'omit':
+                lookup_omitted += 1
+                return []
+            raise LightGraphError('lookup_reference_unmatched')
+        resolved = [(key_for(candidate, lookup.key_columns), candidate) for candidate in matched]
+        if lookup.cardinality == 'one' and len({canonical(key) for key, _ in resolved}) > 1:
+            raise LightGraphError('lookup_reference_ambiguous')
+        answers = []
+        for key, candidate in resolved:
+            origin = {'source_id': lookup.source_id, 'schema': lookup.schema_name, 'table': lookup.table}
+            details = {'endpoint': end, 'source': origin, 'match_columns': lookup.match_columns,
+                       'key_columns': lookup.key_columns, 'input_columns': columns,
+                       'input_values': values, 'resolved_key': key,
+                       'scope_ref': support_scope(candidate, scope_columns(lookup))}
+            content = {c: candidate[c] for c in sorted(set(_projection_columns(lookup) + scope_columns(lookup)))}
+            details['row_context'] = {'id': 'ctx_' + digest(origin, content), 'values': content}
+            answers.append((key, details))
+            lookup_matches += 1
+        return answers
 
     def provenance(kind, index, mapping):
         return {'definition': kind, 'mapping': index,
@@ -196,7 +280,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     if not draft.entities:
         diagnostic('graph_draft_has_no_entities')
     try:
-        used_sources = {m.source_id for d in draft.entities + draft.relations for m in d.mappings}
+        used_sources = {mapping.source_id for mapping in iter_source_mappings(draft)}
         with ExitStack() as stack:
             for source_id in sorted(used_sources):
                 adapter = by_source.get(source_id)
@@ -206,7 +290,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                 if any(capability.capabilities.get(c) != 'verified' for c in
                        ('metadata_reading', 'read_only_transaction', 'parameter_binding', 'distinct_projection')):
                     raise LightGraphError('snapshot_or_projection_unavailable')
-                stack.enter_context(adapter.snapshot())
+                stack.enter_context(source_snapshot(source_id, adapter))
                 # Database adapters attest snapshot consistency only while the
                 # read-only transaction is open; files can attest it at rest.
                 if not adapter.capabilities().consistent_snapshot:
@@ -260,7 +344,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                 node['supports'].append(current_support)
                             update_size(previous, node)
                     except LightGraphError as exc:
-                        if exc.code in {'memory_budget_exhausted', 'construction_time_exhausted',
+                        if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted',
                                        'run_time_budget_exhausted', 'query_budget_exhausted'}:
                             raise
                         diagnostic(exc.code, **location)
@@ -278,36 +362,59 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                         support = provenance(relation.type, index, mapping)
                         support.update(source_key_columns=mapping.source_key_columns,
                                        target_key_columns=mapping.target_key_columns)
+                        for end in ('source', 'target'):
+                            lookup = getattr(mapping, end + '_lookup')
+                            if lookup is not None:
+                                support[end + '_lookup'] = lookup.model_dump(mode='json', by_alias=True)
                         for row in rows:
                             clock()
-                            source = identity(relation.source_type, key_for(row, mapping.source_key_columns))
-                            target = identity(relation.target_type, key_for(row, mapping.target_key_columns))
-                            if source not in nodes or target not in nodes:
-                                diagnostic('unresolved_relation_endpoint', **location)
+                            sources = resolve_endpoint(mapping, row, 'source')
+                            if not sources:
+                                # Explicitly omitted input rows cannot produce
+                                # a pair and must not fail on an unused target.
                                 continue
-                            if source == target:
-                                if mapping.equal_endpoints == 'omit':
-                                    omitted += 1
-                                    continue
-                                if mapping.equal_endpoints == 'error' or not relation.allow_self_links:
-                                    diagnostic('self_link_forbidden', **location)
-                                    continue
-                            pairs.add((source, target))
-                            edge_id = 'r_' + digest(relation.type, source, target)
-                            edge = edges.get(edge_id)
-                            previous = len(canonical(edge).encode()) if edge is not None else 0
-                            if edge is None:
-                                edge = edges[edge_id] = {'id': edge_id, 'type': relation.type,
-                                    'source': source, 'target': target, 'properties': {}, 'provenance': [], 'supports': []}
-                            properties(edge, mapping, row)
-                            if support not in edge['provenance']:
-                                edge['provenance'].append(support)
-                            current_support = contribution(mapping, row, support)
-                            if current_support not in edge['supports']:
-                                edge['supports'].append(current_support)
-                            update_size(previous, edge)
+                            targets = resolve_endpoint(mapping, row, 'target')
+                            # Multiple matches are allowed only when the lookup
+                            # explicitly declares many, and only for this row.
+                            for source_key, source_match in sources:
+                                for target_key, target_match in targets:
+                                    clock()
+                                    source = identity(relation.source_type, source_key)
+                                    target = identity(relation.target_type, target_key)
+                                    if source not in nodes or target not in nodes:
+                                        diagnostic('unresolved_relation_endpoint', **location)
+                                        continue
+                                    if source == target:
+                                        if mapping.equal_endpoints == 'omit':
+                                            omitted += 1
+                                            continue
+                                        if mapping.equal_endpoints == 'error' or not relation.allow_self_links:
+                                            diagnostic('self_link_forbidden', **location)
+                                            continue
+                                    pairs.add((source, target))
+                                    edge_id = 'r_' + digest(relation.type, source, target)
+                                    edge = edges.get(edge_id)
+                                    previous = len(canonical(edge).encode()) if edge is not None else 0
+                                    if edge is None:
+                                        edge = edges[edge_id] = {'id': edge_id, 'type': relation.type,
+                                            'source': source, 'target': target, 'properties': {}, 'provenance': [], 'supports': []}
+                                    properties(edge, mapping, row)
+                                    if support not in edge['provenance']:
+                                        edge['provenance'].append(support)
+                                    current_support = contribution(mapping, row, support)
+                                    matches = [match for match in (source_match, target_match) if match is not None]
+                                    if matches:
+                                        current_support['lookup_matches'] = matches
+                                        current_support['required_scope_refs'] = sorted({match['scope_ref'] for match in matches})
+                                        if 'row_context' not in current_support:
+                                            values = {c: row[c] for c in sorted(set(_projection_columns(mapping) + scope_columns(mapping)))}
+                                            current_support['row_context'] = {
+                                                'id': 'ctx_' + digest(support['source'], values), 'values': values}
+                                    if current_support not in edge['supports']:
+                                        edge['supports'].append(current_support)
+                                    update_size(previous, edge)
                     except LightGraphError as exc:
-                        if exc.code in {'memory_budget_exhausted', 'construction_time_exhausted',
+                        if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted',
                                        'run_time_budget_exhausted', 'query_budget_exhausted'}:
                             raise
                         diagnostic(exc.code, **location)
@@ -343,6 +450,9 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         item['provenance'].sort(key=canonical)
         item['supports'].sort(key=canonical)
     return {'passed': passed, 'diagnostics': diagnostics,
+            'source_read_windows': source_read_windows,
             'metrics': {'mappings_checked': checked, 'projected_distinct_rows': projected_rows,
-                        'nodes': len(nodes), 'edges': len(edges), 'equal_endpoints_omitted': omitted},
+                        'nodes': len(nodes), 'edges': len(edges), 'equal_endpoints_omitted': omitted,
+                        'projection_cache_hits': cache_hits, 'unique_projections': len(projection_cache),
+                        'lookup_matches': lookup_matches, 'lookup_inputs_omitted': lookup_omitted},
             'graph': derive_display_graph(graph)}
