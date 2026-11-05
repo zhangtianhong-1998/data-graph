@@ -88,7 +88,7 @@ class MySQLSource(SourceAdapter):
                  allowed_columns: dict[str, list[str]] | None = None, limits: QueryLimits | None = None,
                  verified_capabilities: dict | CapabilityManifest | None = None,
                  connect_factory: Callable | None = None, probe_runtime_limits=False,
-                 query_budget: QueryBudget | None = None):
+                 query_budget: QueryBudget | None = None, metadata_only: bool = False):
         if not allowed_tables or any(len(t.split(".")) != 2 or any(not p for p in t.split(".")) for t in allowed_tables):
             raise LightGraphError("authorized_catalog_required")
         if len(set(allowed_tables)) != len(allowed_tables):
@@ -98,6 +98,7 @@ class MySQLSource(SourceAdapter):
         if any(t.split(".")[0].casefold() in {"mysql", "sys", "information_schema", "performance_schema"} for t in allowed_tables):
             raise LightGraphError("system_catalog_forbidden")
         self.source_id = source_id
+        self.metadata_only = metadata_only
         self.allowed_tables = tuple(allowed_tables)
         self.allowed_columns = allowed_columns or {}
         self.limits = limits or QueryLimits()
@@ -149,6 +150,9 @@ class MySQLSource(SourceAdapter):
                 control_options.clear()
             self.query_budget.check_time()
             self.preflight(probe_runtime_limits=probe_runtime_limits)
+            if probe_runtime_limits and (not self._manifest.actual_database_verified or
+                    any(self._manifest.capabilities.get(k) != 'verified' for k in REQUIRED_RUNTIME)):
+                raise LightGraphError('runtime_capability_unverified')
         except BaseException as exc:
             self._close_connections()
             if isinstance(exc, (LightGraphError, KeyboardInterrupt, SystemExit)):
@@ -438,6 +442,8 @@ class MySQLSource(SourceAdapter):
         with self._lock:
             if self._closed or self._broken:
                 raise LightGraphError("source_closed")
+            if self.metadata_only:
+                raise LightGraphError("metadata_only_query_forbidden")
             if any(self._manifest.capabilities[k] != "verified" for k in REQUIRED_RUNTIME):
                 raise LightGraphError("runtime_capability_unverified")
             outer = self._depth == 0

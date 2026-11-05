@@ -13,6 +13,8 @@ description: 根据用户目的，从授权事实数据、元数据和补充文�
 
 按当前问题调用 `inspect_source(table, operation, arguments)`。元数据、样例、统计、FD、引用检查和只读 SQL 各自解决不同问题；操作参数可通过 `read_material(name="source_operations")` 查看。样例足以提出候选，不能单独证明全量身份或关系。
 
+目录中每张表的 `fact_data_allowed` 表示本次是否允许读取事实数据。为 `false` 时只读元数据和知识文档，不对该来源发起样例、统计、SQL、跨源值比较或实例映射验证；其他已授权来源仍可继续构建。权限不足时保留候选并说明缺口，不反复尝试，也不能借用其他来源绕过限制。
+
 需要详细材料时按需读取：
 
 - 普通对象、属性、身份与关系发现：`read_material(name="reference:discovery-method.md")`。

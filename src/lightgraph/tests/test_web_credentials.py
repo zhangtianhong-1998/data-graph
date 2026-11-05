@@ -149,6 +149,64 @@ def fake_open(calls):
     return opened
 
 
+@pytest.mark.parametrize('kind', ['mysql_database', 'gauss_database'])
+def test_fact_data_choice_persists_without_yaml_and_metadata_onboarding_does_not_read_rows(client, monkeypatch, kind):
+    calls = []
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', fake_open(calls))
+    body = {**db_body(), 'allow_fact_data': True, 'remember_connection': True}
+    body['connection'].update(kind=kind, schema='business')
+    response = client.post('/api/projects/alpha/database/connect', headers=session(client), json=body)
+    assert response.status_code == 200, response.text
+    value = response.json()['config']
+    assert value['sources'][0]['allow_fact_data'] is True
+    assert value['sources'][0]['capability_manifest'] is None
+    assert value['deployment_retention_verified'] is False  # Not an invented deployment attestation.
+    assert calls[-1][1] is True and response.json()['metadata']['instance_queries'] == 0
+    assert client.get('/api/projects/alpha/config', headers=session(client)).json()['sources'][0]['allow_fact_data'] is True
+    # A subsequent edit from an older client must retain the explicit permission.
+    body.pop('allow_fact_data')
+    assert client.post('/api/projects/alpha/database/connect', headers=session(client), json=body).json()['config']['sources'][0]['allow_fact_data'] is True
+    body['allow_fact_data'] = False
+    response = client.post('/api/projects/alpha/database/connect', headers=session(client), json=body)
+    assert response.status_code == 200 and response.json()['config']['sources'][0]['allow_fact_data'] is False
+    assert client.get('/api/projects/alpha/config').json()['sources'][0]['allow_fact_data'] is False
+    assert all(metadata_only for _, metadata_only, _ in calls)
+
+
+def test_fact_data_permission_edit_rolls_back_if_connection_fails(client, monkeypatch):
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', fake_open([]))
+    headers = session(client)
+    body = {**db_body(), 'allow_fact_data': True, 'remember_connection': True}
+    assert client.post('/api/projects/alpha/database/connect', headers=headers, json=body).status_code == 200
+    def unavailable(*args, **kwargs):
+        raise LightGraphError('database_connection_failed')
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', unavailable)
+    body['allow_fact_data'] = False
+    assert client.post('/api/projects/alpha/database/connect', headers=headers, json=body).status_code != 200
+    assert client.get('/api/projects/alpha/config').json()['sources'][0]['allow_fact_data'] is True
+
+
+def test_environment_source_fact_permission_roundtrips_via_config(client):
+    config = client.get('/api/projects/alpha/config').json()
+    config['sources'] = [{'id': 'gauss', 'kind': 'gauss_database', 'dsn_env': 'GAUSS_DSN',
+                          'allowed_tables': ['public.items'], 'allow_fact_data': True}]
+    assert client.put('/api/projects/alpha/config', json=config).status_code == 200
+    saved = client.get('/api/projects/alpha/config').json()
+    assert saved['sources'][0]['allow_fact_data'] is True
+    saved['sources'][0]['allow_fact_data'] = False
+    assert client.put('/api/projects/alpha/config', json=saved).status_code == 200
+    assert client.app.state.workspace.resolved_config('alpha').sources[0].allow_fact_data is False
+
+
+@pytest.mark.parametrize('value', [1, 0, 'true', 'false', [], {}])
+def test_connect_rejects_coerced_fact_data_permission(client, monkeypatch, value):
+    monkeypatch.setattr('lightgraph.web.app.build_dsn', lambda *a: pytest.fail('invalid permission reached connection'))
+    result = client.post('/api/projects/alpha/database/connect', headers=session(client),
+                        json={**db_body(), 'allow_fact_data': value})
+    assert result.status_code in {400, 422}
+    assert client.get('/api/projects/alpha/config').json()['sources'] == []
+
+
 def test_connect_uses_only_selected_source_and_keeps_credentials_out_of_files(client,monkeypatch):
     headers=session(client)
     calls=[]

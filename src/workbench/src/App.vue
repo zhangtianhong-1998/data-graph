@@ -541,7 +541,7 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
           </template>
           <template v-if="tab === 'inputs'">
             <input ref="uploadInput" type="file" hidden multiple accept=".xlsx,.csv" @change="upload"/>
-            <DataInputs :key="project.project_id" :project-id="project.project_id" :sources="config.sources || []" :files="project.files" :metadata="metadata" :locked="locked" @connect="openDatabaseSource" @upload="uploadInput?.click()" @refresh="refreshMetadata" @delete-file="file => askDeletion({ kind: 'file', file })" @delete-source="source => askDeletion({ kind: 'source', source })" @delete-table="(source, table) => askDeletion({ kind: 'table', source, table })"/>
+            <DataInputs :key="project.project_id" :project-id="project.project_id" :sources="config.sources || []" :files="project.files" :metadata="metadata" :locked="locked" :retention-verified="config.deployment_retention_verified === true" @connect="openDatabaseSource" @upload="uploadInput?.click()" @refresh="refreshMetadata" @delete-file="file => askDeletion({ kind: 'file', file })" @delete-source="source => askDeletion({ kind: 'source', source })" @delete-table="(source, table) => askDeletion({ kind: 'table', source, table })"/>
           </template>
           <template v-if="tab === 'documents'">
             <div class="intro"><div><h2>知识文档</h2></div><button class="btn primary" :disabled="locked" @click="documentInput?.click()">＋ 上传 Markdown</button><input ref="documentInput" type="file" hidden multiple accept=".md,.markdown" @change="upload"/></div>

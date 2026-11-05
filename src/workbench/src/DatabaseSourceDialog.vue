@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { updateDatabaseSources } from './database'
+import { databaseFactDataAllowed, updateDatabaseSources } from './database'
 import { ConnectionDraftWriter } from './connectionDraft'
 import type { ConnectionDraft, DraftResult, DraftStatus } from './connectionDraft'
 import type { DatabaseForm } from './database'
@@ -11,9 +11,9 @@ import type { Metadata, ProjectFile, RunConfig, SourceConfig } from './types'
 
 const props = defineProps<{ projectId: string; source: SourceConfig | null; sources: SourceConfig[]; files: ProjectFile[]; retentionVerified: boolean; busy: boolean; error: string; configRevision?: string }>()
 const emit = defineEmits<{ close: []; save: [sources: SourceConfig[], retentionVerified: boolean]; connected: [config: RunConfig, metadata: Metadata, revision?: string]; capabilityUploaded: [file: ProjectFile, revision?: string] }>()
-const form = ref<DatabaseForm>({ id: props.source?.id || '', kind: props.source?.kind === 'mysql_database' ? 'mysql_database' : 'gauss_database', dsnEnv: typeof props.source?.dsn_env === 'string' ? props.source.dsn_env : '', tables: Array.isArray(props.source?.allowed_tables) ? props.source.allowed_tables.join('\n') : '', capabilityManifest: typeof props.source?.capability_manifest === 'string' ? props.source.capability_manifest : '' })
+const form = ref<DatabaseForm>({ id: props.source?.id || '', kind: props.source?.kind === 'mysql_database' ? 'mysql_database' : 'gauss_database', dsnEnv: typeof props.source?.dsn_env === 'string' ? props.source.dsn_env : '', tables: Array.isArray(props.source?.allowed_tables) ? props.source.allowed_tables.join('\n') : '', capabilityManifest: typeof props.source?.capability_manifest === 'string' ? props.source.capability_manifest : '', allowFactData: databaseFactDataAllowed(props.source, props.retentionVerified) })
 const connection = ref<ConnectionForm>({ kind: form.value.kind, format: 'fields', dsn: '', host: '', port: form.value.kind === 'mysql_database' ? '3306' : '5432', database: '', username: '', password: '', schema: '', sslmode: 'auto' })
-const mode = ref<'direct' | 'environment'>('direct')
+const mode = ref<'direct' | 'environment'>(props.source?.credential_mode === 'environment' || (!props.source?.credential_mode && props.source?.dsn_env) ? 'environment' : 'direct')
 const progress = ref(''), notice = ref(''), rememberConnection = ref(true), savedConnection = ref(false), skippedCount = ref(0)
 const controller = new AbortController()
 const retention = ref(props.retentionVerified), localError = ref(''), pending = ref(false), tested = ref(false), tableLoaded = ref(false), truncated = ref(false)
@@ -25,6 +25,9 @@ function revisionHeaders(): Record<string, string> { return configRevision.value
 watch(() => props.configRevision, value => { configRevision.value = value })
 const manifests = computed(() => [...props.files.filter(file => file.kind === 'yaml'), ...uploadedManifests.value.filter(file => !props.files.some(existing => existing.file_id === file.file_id))])
 const missingManifest = computed(() => form.value.capabilityManifest && !manifests.value.some(file => file.relative_path === form.value.capabilityManifest))
+// The checkbox uses live verification. A removed legacy file must not block
+// saving that choice; the visible notice explains the reference removal.
+const savedManifest = computed(() => missingManifest.value ? '' : form.value.capabilityManifest)
 const locked = computed(() => props.busy || pending.value)
 const jdbcConnection = computed(() => connection.value.kind === 'gauss_database' && isGaussJdbcDsn(connection.value.dsn))
 const sslHint = computed(() => {
@@ -90,7 +93,10 @@ onMounted(async () => {
       if (result.saved && result.draft) {
         const draft = result.draft
         if (props.source && (draft.form.id !== props.source.id || draft.form.kind !== props.source.kind)) throw new Error('草稿与当前数据源不一致，请清除后重新填写。')
-        form.value = draft.form; connection.value = draft.connection; mode.value = draft.mode
+        // Old drafts never granted this permission. Preserve an existing source's
+        // effective setting, but leave new sources metadata-only until selected.
+        form.value = { ...draft.form, allowFactData: draft.form.allowFactData ?? databaseFactDataAllowed(props.source, props.retentionVerified) }
+        connection.value = draft.connection; mode.value = draft.mode
         retention.value = draft.retention; checked.value = draft.checked
         draftStatus.value = 'saved'; restoredDraft = true; savedConnection.value = !!props.source
       }
@@ -100,7 +106,7 @@ onMounted(async () => {
       draftRecoverable.value = code === 'saved_connection_corrupt' || code === 'saved_connection_key_missing' || code === 'connection_draft_corrupt'
       draftStatus.value = 'failed'; draftError.value = error instanceof Error ? error.message : '草稿加载失败，请重试。'
     }
-    if (!props.source || restoredDraft) return
+    if (!props.source || restoredDraft || mode.value === 'environment') return
     try {
       const result = await request<{ saved: boolean; connection?: ConnectionPayload }>(`${path.value}/database/connections/${encodeURIComponent(props.source.id)}`, { signal: controller.signal })
       if (controller.signal.aborted) return
@@ -207,18 +213,17 @@ defineExpose({ completeDraft: finalizeDraft })
 async function submit() {
   if (mode.value === 'environment') {
     localError.value = ''
-    try { emit('save', updateDatabaseSources(props.sources, props.source?.id || null, form.value, manifests.value.map(file => file.relative_path)), retention.value) }
+    try { emit('save', updateDatabaseSources(props.sources, props.source?.id || null, { ...form.value, capabilityManifest: savedManifest.value }, manifests.value.map(file => file.relative_path)), retention.value) }
     catch (error) { localError.value = error instanceof Error ? error.message : '请检查数据库来源配置。' }
     return
   }
   await perform(async () => {
     validateSourceId(form.value.id.trim(), props.source, props.sources)
     const allowedTables = selectedTables(form.value.tables, checked.value)
-    if (form.value.capabilityManifest && !manifests.value.some(file => file.relative_path === form.value.capabilityManifest)) throw new Error('请重新选择能力验证文件。')
     connectionPayload(connection.value)
     await ensureSession(props.projectId)
     if (controller.signal.aborted) return
-    const result = await request<{ config: RunConfig; metadata: Metadata }>(`${path.value}/database/connect`, { method: 'POST', headers: revisionHeaders(), body: json({ source_id: form.value.id.trim(), remember_connection: rememberConnection.value, connection: connectionPayload(connection.value), allowed_tables: allowedTables, deployment_retention_verified: retention.value, capability_manifest: form.value.capabilityManifest || null }), signal: controller.signal, timeoutMs: 120000 })
+    const result = await request<{ config: RunConfig; metadata: Metadata }>(`${path.value}/database/connect`, { method: 'POST', headers: revisionHeaders(), body: json({ source_id: form.value.id.trim(), remember_connection: rememberConnection.value, connection: connectionPayload(connection.value), allowed_tables: allowedTables, allow_fact_data: form.value.allowFactData === true, deployment_retention_verified: retention.value, capability_manifest: savedManifest.value || null }), signal: controller.signal, timeoutMs: 120000 })
     if (controller.signal.aborted) return
     await finalizeDraft()
     clearSecrets(); emit('connected', result.config, result.metadata, responseRevision(result))
@@ -259,7 +264,21 @@ async function submit() {
             </section>
           </template>
           <template v-else><div class="field"><label for="database-env">数据库连接环境变量名</label><input id="database-env" v-model="form.dsnEnv" :disabled="locked" required placeholder="LIGHTGRAPH_MYSQL_DSN" autocomplete="off"/></div><div class="field"><label for="environment-tables">允许查询的表</label><textarea id="environment-tables" v-model="form.tables" :disabled="locked" required placeholder="每行一张表，包含 Schema；不使用通配符。"/></div></template>
-          <details class="connection-advanced"><summary>运行权限与高级选项</summary><div class="field"><label for="database-manifest">实例抽取能力清单</label><select id="database-manifest" v-model="form.capabilityManifest" :disabled="locked"><option value="">仅读取元数据，暂不指定</option><option v-if="missingManifest" :value="form.capabilityManifest" disabled>原文件不在上传列表，请重新选择</option><option v-for="file in manifests" :key="file.file_id" :value="file.relative_path">{{ file.name }}</option></select><div class="actions"><button type="button" class="btn small" :disabled="locked || !form.id.trim()" @click="manifestInput?.click()">上传能力清单</button><input ref="manifestInput" type="file" accept=".yaml,.yml" hidden aria-label="上传数据库能力清单" @change="uploadManifest"/></div><p class="field-hint">读取元数据可暂缺；正式实例抽取前需绑定当前数据库产品、版本和驱动的验证结果。</p><details><summary>如何生成能力清单</summary><p class="field-hint">在运行服务所在环境准备对应来源编号的运行配置和只读连接，执行以下命令，再上传输出文件。探针会执行有界超时与取消检查，请使用获准的测试环境。</p><pre class="code">lightgraph connect-check &lt;运行配置.yaml&gt; --verify-runtime --output capabilities.yaml</pre><p class="field-hint">此页面校验文件格式，实际运行仍由后端检查数据库版本与能力；上传文件不会绕过验证。</p></details></div><div class="retention-box"><label class="checkbox-line"><input v-model="retention" type="checkbox" :disabled="locked"/>此项目的部署环境已完成数据留存检查</label><p class="field-hint">此项影响真实实例数据的抽取。未确认时仍可连接并读取元数据。</p></div><p v-if="source?.allowed_columns" class="field-hint">已有列级访问限制会保留。</p></details>
+          <section class="connection-step database-read-access" aria-labelledby="database-access-title">
+            <h3 id="database-access-title">数据读取范围</h3>
+            <label class="checkbox-line"><input id="database-allow-fact-data" v-model="form.allowFactData" type="checkbox" :disabled="locked" aria-describedby="database-access-hint"/>允许读取事实数据</label>
+            <p id="database-access-hint" class="field-hint">表结构等元数据默认可读。勾选后，Agent 可只读查询所选表的数据，用于抽取；不允许新增、修改或删除数据。</p>
+            <p v-if="form.allowFactData" class="field-hint">开始抽取时自动检查只读、超时和取消能力，无需编写或上传 YAML。查询结果按项目的运行轨迹设置保存在本机。</p>
+            <p v-if="missingManifest" class="field-hint" aria-label="历史能力文件提示">原能力文件已不在项目文件列表中。保存时会解除该文件引用，不影响运行时自动检查。</p>
+            <span class="badge" :class="form.allowFactData ? 'green' : ''">{{ form.allowFactData ? '元数据和事实数据可读' : '仅读取元数据' }}</span>
+            <p v-if="source?.allowed_columns" class="field-hint">已有列级访问限制会保留。</p>
+          </section>
+          <details class="connection-advanced"><summary>历史能力文件（可选）</summary>
+            <div class="field"><label for="database-manifest">已上传的能力清单</label><select id="database-manifest" v-model="form.capabilityManifest" :disabled="locked"><option value="">不使用历史能力清单</option><option v-if="missingManifest" :value="form.capabilityManifest" disabled>原文件不在上传列表，请重新选择或清除</option><option v-for="file in manifests" :key="file.file_id" :value="file.relative_path">{{ file.name }}</option></select>
+              <div class="actions"><button type="button" class="btn small" :disabled="locked || !form.id.trim()" @click="manifestInput?.click()">上传能力清单</button><input ref="manifestInput" type="file" accept=".yaml,.yml" hidden aria-label="上传数据库能力清单" @change="uploadManifest"/></div>
+              <p class="field-hint">此处仅保留历史文件配置。数据读取范围以上方勾选项为准；运行时会自动检查当前连接，上传文件不会绕过验证。</p>
+            </div>
+          </details>
         </div>
         <div v-if="draftStatus !== 'idle'" class="draft-feedback panel-footer" aria-live="polite">
           <span v-if="draftStatus === 'saving'" role="status">连接草稿保存中…</span>

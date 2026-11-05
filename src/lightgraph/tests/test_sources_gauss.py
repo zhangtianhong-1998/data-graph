@@ -339,12 +339,16 @@ def test_cancel_probe_cannot_be_satisfied_by_short_statement_timeout(monkeypatch
         def cancel(self):
             self.stopped = True
 
-        def join(self):
+        def join(self, timeout=None):
+            assert timeout is not None and 0 < timeout <= 2
             # A callback already running cannot be stopped by Timer.cancel().
             # Model it returning only after the query has finished normally.
             if cancel_outcome == "late":
                 self.fire()
             self.joined = True
+
+        def is_alive(self):
+            return False
 
     # Replace only this adapter's timer; QueryBudget has independent deadlines.
     monkeypatch.setattr("lightgraph.sources.gauss.threading", SimpleNamespace(
@@ -482,3 +486,49 @@ def test_lock_timeout_non_capability_failures_are_not_swallowed(state, caplog):
     assert "PRIVATE_DRIVER_PASSWORD" not in "".join(traceback.format_exception(error.value))
     assert not any("ROLLBACK TO SAVEPOINT" in sql for sql, _ in db.executed)
     assert db.closed
+
+
+def test_automatic_probe_does_not_wait_forever_for_stuck_cancel(monkeypatch):
+    """Model a blocked driver callback without sleeping or starting a thread."""
+    import threading
+    from types import SimpleNamespace
+
+    timers = []
+    class StuckTimer:
+        def __init__(self, interval, callback):
+            self.daemon = False
+            self.join_timeout = None
+            timers.append(self)
+        def start(self):
+            assert self.daemon is True
+        def cancel(self):
+            pass
+        def join(self, timeout=None):
+            self.join_timeout = timeout
+            assert timeout is not None and 0 < timeout <= 2
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr('lightgraph.sources.gauss.threading', SimpleNamespace(
+        Timer=StuckTimer, Event=threading.Event, RLock=threading.RLock))
+    class Cancelled(Exception):
+        sqlstate = '57014'
+    class ProbeCursor(Cursor):
+        def execute(self, sql, parameters=None):
+            if 'pg_sleep' in sql:
+                raise Cancelled()
+            return super().execute(sql, parameters)
+    class ProbeConnection(Connection):
+        def cursor(self, name=None):
+            return ProbeCursor(self, name)
+        def rollback(self):
+            assert not self.closed, 'do not mask the probe failure by rolling back a discarded connection'
+        def close(self):
+            assert not self.closed, 'close the discarded connection once'
+            super().close()
+    db = ProbeConnection()
+    with pytest.raises(LightGraphError, match='^query_cancel_unverified$'):
+        GaussSource('fixture-only-dsn', allowed_tables=['public.items'],
+                    connect_factory=lambda _: db, probe_runtime_limits=True)
+    assert db.closed
+    assert len(timers) == 1 and 0 < timers[0].join_timeout <= 2

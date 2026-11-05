@@ -54,6 +54,20 @@ def test_incomplete_unicode_form_restarts_exactly_without_source_or_plaintext(tm
     assert "秘密" not in original.model_dump_json()
 
 
+@pytest.mark.parametrize('allowed', [False, True])
+def test_fact_data_choice_survives_encrypted_draft_reload(tmp_path, allowed):
+    value = draft().to_payload()
+    value['form']['allowFactData'] = allowed
+    record = DatabaseDraft.model_validate(value)
+    SavedConnections(tmp_path).save_draft('alpha', 'new', record, 1)
+    restored = SavedConnections(tmp_path).load_draft('alpha', 'new')['draft']
+    assert restored['form']['allowFactData'] is allowed
+
+
+def test_legacy_connection_draft_does_not_invent_fact_access():
+    assert draft().form.allowFactData is None
+
+
 @pytest.mark.parametrize("revision", [-1, 2**53, True, "12", 1.5])
 def test_revisions_are_strict_and_bounded(tmp_path, revision):
     with pytest.raises(ValidationError):

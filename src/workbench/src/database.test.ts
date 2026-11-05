@@ -1,9 +1,23 @@
 import { describe, expect, it } from 'vitest'
-import { updateDatabaseSources } from './database'
+import { databaseFactDataAllowed, updateDatabaseSources } from './database'
 import type { DatabaseForm } from './database'
 
 const form: DatabaseForm = { id: 'business_mysql', kind: 'mysql_database', dsnEnv: 'MYSQL_DSN', tables: 'analytics.metrics\nanalytics.metrics\nanalytics.org', capabilityManifest: 'files/capabilities.yaml' }
 describe('数据库来源编辑', () => {
+  it('明确保存事实读取开关，不用能力清单推翻关闭选择', () => {
+    const source = { id: form.id, kind: 'mysql_database', allow_fact_data: true, capability_manifest: form.capabilityManifest }
+    expect(updateDatabaseSources([source], source.id, { ...form, allowFactData: false }, [form.capabilityManifest])[0]).toMatchObject({ allow_fact_data: false, capability_manifest: form.capabilityManifest })
+    expect(updateDatabaseSources([], null, { ...form, capabilityManifest: '', allowFactData: true }, [])[0]).toMatchObject({ allow_fact_data: true, capability_manifest: null })
+    expect(updateDatabaseSources([], null, { ...form, capabilityManifest: '' }, [])[0]?.allow_fact_data).toBe(false)
+  })
+  it('旧来源仅在清单和原部署确认均存在时显示为事实可读', () => {
+    const legacy = { id: 'db', kind: 'gauss_database', capability_manifest: 'files/old.yaml' }
+    expect(databaseFactDataAllowed(null, true)).toBe(false)
+    expect(databaseFactDataAllowed(legacy, false)).toBe(false)
+    expect(databaseFactDataAllowed(legacy, true)).toBe(true)
+    expect(databaseFactDataAllowed({ ...legacy, allow_fact_data: false }, true)).toBe(false)
+    expect(databaseFactDataAllowed({ ...legacy, capability_manifest: null, allow_fact_data: true }, false)).toBe(true)
+  })
   it('MySQL 与 Gauss、文件来源并存，去重授权表', () => {
     const original = [{ id: 'gauss', kind: 'gauss_database', dsn_env: 'GAUSS_DSN' }, { id: 'excel', kind: 'excel_workbook', path: 'files/data.xlsx' }]
     const sources = updateDatabaseSources(original, null, form, ['files/capabilities.yaml'])

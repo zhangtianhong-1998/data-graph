@@ -39,7 +39,7 @@ def product_version(banner: str) -> tuple[str, str]:
     return "unknown", "unknown"
 
 class GaussSource(SourceAdapter):
-    def __init__(self, dsn: str, *, source_id: str = "gauss", allowed_tables: list[str], allowed_columns: dict[str, list[str]] | None = None, limits: QueryLimits | None = None, verified_capabilities: dict | CapabilityManifest | None = None, connect_factory: Callable | None = None, probe_runtime_limits: bool = False, query_budget: QueryBudget | None = None):
+    def __init__(self, dsn: str, *, source_id: str = "gauss", allowed_tables: list[str], allowed_columns: dict[str, list[str]] | None = None, limits: QueryLimits | None = None, verified_capabilities: dict | CapabilityManifest | None = None, connect_factory: Callable | None = None, probe_runtime_limits: bool = False, query_budget: QueryBudget | None = None, metadata_only: bool = False):
         if not allowed_tables or any(len(t.split(".")) != 2 or any(not p for p in t.split(".")) for t in allowed_tables):
             raise LightGraphError("authorized_catalog_required")
         if len(allowed_tables) != len(set(allowed_tables)):
@@ -47,6 +47,7 @@ class GaussSource(SourceAdapter):
         if allowed_columns is not None and set(allowed_columns) - set(allowed_tables):
             raise LightGraphError("unauthorized_column_scope")
         self.source_id = source_id; self.allowed_tables = tuple(allowed_tables)
+        self.metadata_only = metadata_only
         self.allowed_columns = allowed_columns or {}; self.limits = limits or QueryLimits()
         self.stats = QueryStats(); self._lock = threading.RLock(); self._depth = 0
         self.query_budget = query_budget or QueryBudget()
@@ -70,11 +71,14 @@ class GaussSource(SourceAdapter):
             else:
                 self._connection = connect_factory(dsn)
             self.preflight(probe_runtime_limits=probe_runtime_limits)
+            if probe_runtime_limits and (not self._manifest.actual_database_verified or
+                    any(self._manifest.capabilities.get(k) != 'verified' for k in REQUIRED_RUNTIME)):
+                raise LightGraphError('runtime_capability_unverified')
         except LightGraphError:
-            if hasattr(self, "_connection"): self._connection.close()
+            if hasattr(self, "_connection") and not self._closed: self._connection.close()
             raise
         except Exception as exc:
-            if hasattr(self, "_connection"): self._connection.close()
+            if hasattr(self, "_connection") and not self._closed: self._connection.close()
             raise LightGraphError("database_connection_failed") from safe_database_cause(exc, logging.getLogger(__name__))
         self.compiler = QueryCompiler(self._tables, dialect="postgres",
             physical_columns=self._physical_column_names)
@@ -152,7 +156,7 @@ class GaussSource(SourceAdapter):
             except Exception as exc:
                 raise LightGraphError("database_preflight_failed") from safe_database_cause(exc, logging.getLogger(__name__))
             finally:
-                self._connection.rollback()
+                if not self._closed: self._connection.rollback()
                 self._manifest.consistent_snapshot = False
             return self.capabilities()
 
@@ -176,8 +180,9 @@ class GaussSource(SourceAdapter):
                 raise LightGraphError("database_runtime_preflight_failed") from safe_database_cause(exc, logging.getLogger(__name__))
             finally:
                 self._manifest.consistent_snapshot = False
-                try: self._connection.rollback()
-                except Exception: raise LightGraphError("snapshot_close_failed") from None
+                if not self._closed:
+                    try: self._connection.rollback()
+                    except Exception: raise LightGraphError("snapshot_close_failed") from None
             return self.capabilities()
 
     def _read_catalog(self, cursor) -> list[TableSpec]:
@@ -254,13 +259,25 @@ class GaussSource(SourceAdapter):
                         # Driver details may contain secrets; the probe below
                         # reports only query_cancel_unverified.
                         pass
-                timer = threading.Timer(0.05, send_cancel); timer.start()
+                timer = threading.Timer(0.05, send_cancel); timer.daemon = True; timer.start()
             else: cursor.execute("SET LOCAL statement_timeout = '50ms'")
             try: cursor.execute("SELECT pg_catalog.pg_sleep(0.25)")
             except Exception as exc:
                 interrupted = getattr(exc, "sqlstate", None) == "57014" or getattr(exc, "pgcode", None) == "57014"
         finally:
-            if timer: timer.cancel(); timer.join()
+            if timer:
+                timer.cancel()
+                timer.join(timeout=min(2, max(.001, self.query_budget.deadline - time.monotonic())))
+                if timer.is_alive():
+                    # Driver cancellation can block on a separate network
+                    # connection. Never reuse this session after a late cancel,
+                    # or let its background thread hold the worker open.
+                    self._closed = True
+                    try: cursor.close()
+                    except Exception: pass
+                    try: self._connection.close()
+                    except Exception: pass
+                    raise LightGraphError('query_cancel_unverified')
             cursor.close(); self._connection.rollback()
         if cancel and not cancel_sent.is_set(): interrupted = False
         if not interrupted: raise LightGraphError("query_cancel_unverified" if cancel else "statement_timeout_unverified")
@@ -279,6 +296,7 @@ class GaussSource(SourceAdapter):
     def snapshot(self):
         with self._lock:
             if self._closed: raise LightGraphError("source_closed")
+            if self.metadata_only: raise LightGraphError("metadata_only_query_forbidden")
             if any(self._manifest.capabilities.get(k) != "verified" for k in REQUIRED_RUNTIME):
                 raise LightGraphError("runtime_capability_unverified")
             outer = self._depth == 0

@@ -20,6 +20,8 @@ class DraftSourceForm(_DraftModel):
     dsnEnv: str = Field(max_length=256)
     tables: str = Field(max_length=16000)
     capabilityManifest: str = Field(max_length=1024)
+    # None preserves old unfinished drafts; a checked value is never inferred.
+    allowFactData: bool | None = None
 
 
 class DraftConnectionForm(_DraftModel):
@@ -53,6 +55,10 @@ class DatabaseDraft(_DraftModel):
     def to_payload(self) -> dict:
         """Unwrap only for encryption or the authenticated no-store edit response."""
         payload = self.model_dump(by_alias=True)
+        if self.form.allowFactData is None:
+            # Keep old drafts byte-for-field compatible on edit/reload; absence
+            # means inherit the saved source choice, never a grant of access.
+            payload['form'].pop('allowFactData', None)
         for field in ("dsn", "password"):
             payload["connection"][field] = getattr(self.connection, field).get_secret_value()
         return payload

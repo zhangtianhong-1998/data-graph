@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue'
 import MetadataPreview from './MetadataPreview.vue'
-import { isDatabaseSource, sourceKindLabel } from './database'
+import { databaseFactDataAllowed, isDatabaseSource, sourceKindLabel } from './database'
 import { projectPath, request } from './api'
 import type { Metadata, ProjectFile, SourceConfig } from './types'
 
-const props = defineProps<{ projectId: string; sources: SourceConfig[]; files: ProjectFile[]; metadata: Metadata; locked: boolean }>()
+const props = defineProps<{ projectId: string; sources: SourceConfig[]; files: ProjectFile[]; metadata: Metadata; locked: boolean; retentionVerified?: boolean }>()
 const emit = defineEmits<{ connect: [source?: SourceConfig]; upload: []; refresh: []; deleteFile: [file: ProjectFile]; deleteSource: [source: SourceConfig]; deleteTable: [source: SourceConfig, table: string] }>()
 const databases = computed(() => props.sources.filter(isDatabaseSource))
 const localFiles = computed(() => props.files.filter(file => file.kind === 'excel' || file.kind === 'csv'))
@@ -57,7 +57,7 @@ onUnmounted(() => { revision++ })
       <div class="input-items" tabindex="0" role="region" aria-label="已接入数据列表">
         <template v-if="kind === 'database'">
           <section v-for="source in databases" :key="source.id" class="database-group">
-            <div class="source-heading"><div><strong>{{ source.id }}</strong><small>{{ sourceKindLabel(source.kind) }}</small></div><div class="actions"><button class="text-button" :disabled="locked" :aria-label="`配置 ${source.id}`" @click="emit('connect', source)">配置</button><button class="text-button danger-text" :disabled="locked" :aria-label="`删除数据库来源 ${source.id}`" @click="emit('deleteSource', source)">删除</button></div></div>
+            <div class="source-heading"><div><strong>{{ source.id }}</strong><small>{{ sourceKindLabel(source.kind) }}</small><small>{{ databaseFactDataAllowed(source, retentionVerified) ? '允许读取事实数据' : '仅读取元数据' }}</small></div><div class="actions"><button class="text-button" :disabled="locked" :aria-label="`配置 ${source.id}`" @click="emit('connect', source)">配置</button><button class="text-button danger-text" :disabled="locked" :aria-label="`删除数据库来源 ${source.id}`" @click="emit('deleteSource', source)">删除</button></div></div>
             <div v-for="item in entries.filter(entry => entry.sourceId === source.id)" :key="item.key" class="input-item-row" :class="{ active: current?.key === item.key }"><button class="input-item" :class="{ active: current?.key === item.key }" :aria-pressed="current?.key === item.key" @click="selected = item.key"><span>{{ item.label }}</span><small>表</small></button><button class="text-button danger-text input-delete" :disabled="locked" :aria-label="`移除数据表 ${source.id}.${item.label}`" @click="emit('deleteTable', source, item.label)">移除</button></div>
           </section>
           <div v-if="!databases.length" class="empty-state">尚未连接数据库</div>

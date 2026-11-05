@@ -18,14 +18,15 @@ let app: App | undefined
 let root: HTMLDivElement
 let onClose: ReturnType<typeof vi.fn>
 let onConnected: ReturnType<typeof vi.fn>
+let onSave: ReturnType<typeof vi.fn>
 
-function mount(source: SourceConfig | null = null) {
+function mount(source: SourceConfig | null = null, extra: Record<string, unknown> = {}) {
   root = document.createElement('div')
   document.body.append(root)
-  onClose = vi.fn(); onConnected = vi.fn()
+  onClose = vi.fn(); onConnected = vi.fn(); onSave = vi.fn()
   app = createApp(DatabaseSourceDialog, {
     projectId: 'dialog-test', source, sources: source ? [source] : [], files: [],
-    retentionVerified: false, busy: false, error: '', configRevision: '"4"', onClose, onConnected,
+    retentionVerified: false, busy: false, error: '', configRevision: '"4"', onClose, onConnected, onSave, ...extra,
   })
   app.mount(root)
 }
@@ -96,6 +97,90 @@ beforeEach(async () => {
 afterEach(() => { app?.unmount(); app = undefined; root.remove() })
 
 describe('数据库连接弹窗', () => {
+  it('普通配置直接提供事实数据开关，默认只读元数据', () => {
+    const checkbox = element<HTMLInputElement>('#database-allow-fact-data')
+    expect(checkbox.checked).toBe(false)
+    expect(checkbox.closest('details')).toBeNull()
+    expect(element('.database-read-access').textContent).toContain('仅读取元数据')
+    expect(root.textContent).not.toContain('connect-check')
+  })
+
+  it.each(['gauss_database', 'mysql_database'])('%s 勾选事实读取直接保存，不上传 YAML、不修改部署确认', async kind => {
+    await fillConnection(kind)
+    await inputValue('#database-tables', 'public.metrics')
+    element<HTMLInputElement>('#database-allow-fact-data').click(); await nextTick()
+    expect(element('.database-read-access').textContent).toContain('无需编写或上传 YAML')
+    api.request.mockResolvedValueOnce({ config: {}, metadata: {} })
+    element('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await vi.waitFor(() => expect(onConnected).toHaveBeenCalledOnce())
+    const connect = api.request.mock.calls.find(call => call[0].endsWith('/database/connect'))!
+    expect(JSON.parse(connect[1].body)).toMatchObject({ allow_fact_data: true, capability_manifest: null, deployment_retention_verified: false })
+    expect(api.request.mock.calls.every(call => !call[0].includes('/capabilities'))).toBe(true)
+  })
+
+  it('未勾选时保存明确的元数据权限', async () => {
+    await fillConnection()
+    await inputValue('#database-tables', 'public.metrics')
+    api.request.mockResolvedValueOnce({ config: {}, metadata: {} })
+    element('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await vi.waitFor(() => expect(onConnected).toHaveBeenCalledOnce())
+    const connect = api.request.mock.calls.find(call => call[0].endsWith('/database/connect'))!
+    expect(JSON.parse(connect[1].body).allow_fact_data).toBe(false)
+  })
+
+  it('环境变量连接也保存事实读取选择', async () => {
+    element<HTMLInputElement>('.connection-mode input[value="environment"]').click(); await nextTick()
+    await inputValue('#database-id', 'env-db')
+    await inputValue('#database-env', 'GAUSS_DSN')
+    await inputValue('#environment-tables', 'public.metrics')
+    element<HTMLInputElement>('#database-allow-fact-data').click(); await nextTick()
+    element('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await vi.waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+    expect(onSave.mock.calls[0]![0]).toEqual([expect.objectContaining({ allow_fact_data: true, capability_manifest: null, dsn_env: 'GAUSS_DSN' })])
+    expect(onSave.mock.calls[0]![1]).toBe(false)
+    expect(api.request).not.toHaveBeenCalled()
+  })
+
+  it.each(['environment', undefined])('已保存的环境变量来源（%s）直接编辑读取开关，不要求填写连接信息', async credentialMode => {
+    app?.unmount(); root.remove()
+    const source: SourceConfig = { id: 'env-db', kind: 'gauss_database', credential_mode: credentialMode, dsn_env: 'GAUSS_DSN', allowed_tables: ['public.metrics'], allow_fact_data: false, allowed_columns: { 'public.metrics': ['code'] }, capability_manifest: 'files/removed.yaml' }
+    mount(source)
+    await nextTick()
+    await vi.waitFor(() => expect(button('保存数据库来源').disabled).toBe(false))
+    expect(element<HTMLInputElement>('.connection-mode input[value="environment"]').checked).toBe(true)
+    expect(element<HTMLInputElement>('#database-env').value).toBe('GAUSS_DSN')
+    expect(root.querySelector('#database-host')).toBeNull()
+    expect(root.querySelector('[aria-label="历史能力文件提示"]')?.textContent).toContain('保存时会解除该文件引用')
+    element<HTMLInputElement>('#database-allow-fact-data').click(); await nextTick()
+    element('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await vi.waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+    expect(onSave.mock.calls[0]![0]).toEqual([expect.objectContaining({ allow_fact_data: true, capability_manifest: null, credential_mode: 'environment', dsn_env: 'GAUSS_DSN', allowed_columns: source.allowed_columns })])
+    expect(api.request).not.toHaveBeenCalled()
+  })
+
+  it('直接连接的旧文件缺失时也能保存读取范围，并明确告知解除历史引用', async () => {
+    app?.unmount(); root.remove()
+    api.request.mockResolvedValueOnce({ saved: true, connection: { kind: 'gauss_database', host: 'example.invalid', database: 'fixture_db', username: 'reader', password: 'fake', port: 5432 } })
+    mount({ id: 'saved-db', kind: 'gauss_database', credential_mode: 'session', allowed_tables: ['public.metrics'], allow_fact_data: false, capability_manifest: 'files/removed.yaml' })
+    await nextTick()
+    await vi.waitFor(() => expect(button('测试连接').disabled).toBe(false))
+    expect(root.querySelector('[aria-label="历史能力文件提示"]')).not.toBeNull()
+    element<HTMLInputElement>('#database-allow-fact-data').click(); await nextTick()
+    api.request.mockResolvedValueOnce({ config: {}, metadata: {} })
+    element('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await vi.waitFor(() => expect(onConnected).toHaveBeenCalledOnce())
+    const connect = api.request.mock.calls.find(call => call[0].endsWith('/database/connect'))!
+    expect(JSON.parse(connect[1].body)).toMatchObject({ allow_fact_data: true, capability_manifest: null })
+  })
+
+  it.each([true, false])('重新打开来源后恢复事实读取=%s，旧清单不能覆盖明确选择', async allowed => {
+    app?.unmount(); root.remove()
+    api.request.mockResolvedValueOnce({ saved: false })
+    mount({ id: 'saved-db', kind: 'gauss_database', allowed_tables: ['public.metrics'], allow_fact_data: allowed, capability_manifest: 'files/old.yaml' }, { retentionVerified: true })
+    await vi.waitFor(() => expect(button('测试连接').disabled).toBe(false))
+    expect(element<HTMLInputElement>('#database-allow-fact-data').checked).toBe(allowed)
+  })
+
   it('移出弹窗、释放鼠标或点击遮罩不会关闭或清空填写内容', async () => {
     await fillConnection()
     const dialog = element('[role="dialog"]')
@@ -286,7 +371,7 @@ describe('数据库连接弹窗', () => {
 })
 
 
-const savedSource: SourceConfig = { id: 'saved-source', kind: 'gauss_database', allowed_tables: ['analytics.metrics'], dsn_env: 'PROJECT_DSN' }
+const savedSource: SourceConfig = { id: 'saved-source', kind: 'gauss_database', allowed_tables: ['analytics.metrics'], credential_mode: 'session', dsn_env: 'PROJECT_DSN' }
 const savedFields = { kind: 'gauss_database', host: 'saved.example.invalid', port: 8000, database: 'saved_db', username: 'saved_reader', password: ' test @:/password ', schema: 'analytics', sslmode: 'prefer' }
 function reopenSource(source = savedSource) { app?.unmount(); root.remove(); mount(source) }
 
@@ -462,6 +547,7 @@ describe('未连接成功的数据库草稿', () => {
     await inputValue('#database-username', 'draft-reader')
     await inputValue('#database-password', ' secret :@+= ')
     await inputValue('#database-tables', 'public.metrics\npublic.organizations')
+    element<HTMLInputElement>('#database-allow-fact-data').click(); await nextTick()
     await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('已保存到本机'))
     const saved = JSON.parse(api.draftRequest.mock.calls.filter(call => call[1]?.method === 'PUT').at(-1)![1].body)
     app?.unmount(); root.remove()
@@ -473,6 +559,48 @@ describe('未连接成功的数据库草稿', () => {
     expect(element<HTMLInputElement>('#database-username').value).toBe('draft-reader')
     expect(element<HTMLInputElement>('#database-password').value).toBe(' secret :@+= ')
     expect(element<HTMLTextAreaElement>('#database-tables').value).toContain('public.organizations')
+    expect(element<HTMLInputElement>('#database-allow-fact-data').checked).toBe(true)
+    expect(api.request).not.toHaveBeenCalled()
+  })
+
+  it.each([undefined, null])('旧草稿事实读取字段为 %s 时不自动授权新来源', async legacyValue => {
+    await fillConnection()
+    element<HTMLInputElement>('#database-allow-fact-data').click(); await nextTick()
+    await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('已保存到本机'))
+    const saved = JSON.parse(api.draftRequest.mock.calls.filter(call => call[1]?.method === 'PUT').at(-1)![1].body)
+    saved.draft.form.allowFactData = legacyValue
+    saved.draft.form.capabilityManifest = 'files/legacy.yaml'
+    saved.draft.retention = true
+    app?.unmount(); root.remove()
+    api.draftRequest.mockResolvedValueOnce({ saved: true, ...saved })
+    mount()
+    await vi.waitFor(() => expect(button('测试连接').disabled).toBe(false))
+    expect(element<HTMLInputElement>('#database-allow-fact-data').checked).toBe(false)
+  })
+
+  it('旧来源草稿缺少事实读取字段时保留已保存来源的选择', async () => {
+    await fillConnection()
+    await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('已保存到本机'))
+    const saved = JSON.parse(api.draftRequest.mock.calls.filter(call => call[1]?.method === 'PUT').at(-1)![1].body)
+    delete saved.draft.form.allowFactData
+    app?.unmount(); root.remove()
+    api.draftRequest.mockResolvedValueOnce({ saved: true, ...saved })
+    mount({ id: 'fake-source', kind: 'gauss_database', allowed_tables: ['public.metrics'], allow_fact_data: true })
+    await vi.waitFor(() => expect(button('测试连接').disabled).toBe(false))
+    expect(element<HTMLInputElement>('#database-allow-fact-data').checked).toBe(true)
+  })
+
+  it('恢复草稿中的连接方式优先于来源原有的环境变量方式', async () => {
+    await fillConnection()
+    await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('已保存到本机'))
+    const saved = JSON.parse(api.draftRequest.mock.calls.filter(call => call[1]?.method === 'PUT').at(-1)![1].body)
+    expect(saved.draft.mode).toBe('direct')
+    app?.unmount(); root.remove()
+    api.draftRequest.mockResolvedValueOnce({ saved: true, ...saved })
+    mount({ id: 'fake-source', kind: 'gauss_database', credential_mode: 'environment', dsn_env: 'GAUSS_DSN', allowed_tables: ['public.metrics'], allow_fact_data: true })
+    await vi.waitFor(() => expect(button('测试连接').disabled).toBe(false))
+    expect(element<HTMLInputElement>('.connection-mode input[value="direct"]').checked).toBe(true)
+    expect(element<HTMLInputElement>('#database-host').value).toBe('example.invalid')
     expect(api.request).not.toHaveBeenCalled()
   })
 

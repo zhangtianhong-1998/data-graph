@@ -16,7 +16,7 @@ import yaml
 from fastapi import FastAPI, File, Header, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 from starlette.middleware.cors import CORSMiddleware
@@ -158,6 +158,7 @@ class ConnectDatabase(DatabaseRequest):
     allowed_tables: list[str] = Field(min_length=1,max_length=1000)
     deployment_retention_verified: bool | None = None
     capability_manifest: str | None = None
+    allow_fact_data: StrictBool | None = None
     remember_connection: bool = False
 
 
@@ -401,6 +402,8 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
                 'allowed_tables':selected})
             if 'capability_manifest' in data.model_fields_set:
                 source_config['capability_manifest']=data.capability_manifest
+            if 'allow_fact_data' in data.model_fields_set:
+                source_config['allow_fact_data']=data.allow_fact_data
             config['sources'].append(source_config)
             if data.deployment_retention_verified is not None:
                 config['deployment_retention_verified']=data.deployment_retention_verified

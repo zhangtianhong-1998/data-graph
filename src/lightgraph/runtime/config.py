@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Literal
 import yaml
-from pydantic import ConfigDict, Field, PrivateAttr, SecretStr, field_validator, model_serializer, model_validator
+from pydantic import ConfigDict, Field, PrivateAttr, SecretStr, StrictBool, field_validator, model_serializer, model_validator
 from ..contracts import StrictModel, QueryLimits, ExtractionGoal
 from ..errors import LightGraphError
 
@@ -20,6 +20,9 @@ class SourceConfig(StrictModel):
     allowed_tables: list[str] = Field(default_factory=list)
     allowed_columns: dict[str,list[str]] | None = None
     capability_manifest: str | None = None
+    # Explicit UI permission is per source. None retains legacy manifest-based
+    # configuration; False permits catalog reads only, even with a manifest.
+    allow_fact_data: StrictBool | None = None
     include_hidden: bool = False
     header_row: int = Field(default=1, ge=1)
     encoding: str | None = None
@@ -259,7 +262,9 @@ def open_sources(config, *, metadata_only=False, source_credentials=None):
                     header_row=s.header_row,max_memory_bytes=config.max_working_bytes,
                     query_budget=budget,metadata_only=metadata_only))
             else:
-                if not metadata_only and not config.deployment_retention_verified:
+                source_metadata_only = metadata_only or s.allow_fact_data is False
+                auto_verify = s.allow_fact_data is True and not source_metadata_only
+                if not source_metadata_only and not auto_verify and not config.deployment_retention_verified:
                     raise LightGraphError("deployment_retention_unverified")
                 dsn=(source_credentials or {}).get(s.id)
                 if not dsn and s.credential_mode == "environment":
@@ -267,7 +272,7 @@ def open_sources(config, *, metadata_only=False, source_credentials=None):
                 if not dsn:raise LightGraphError("source_credential_missing")
                 if not s.allowed_tables:raise LightGraphError("source_scope_missing")
                 verified=None
-                if s.capability_manifest and not metadata_only:
+                if s.capability_manifest and not source_metadata_only and not auto_verify:
                     from ..contracts import CapabilityManifest
                     try:
                         path=Path(s.capability_manifest)
@@ -281,8 +286,15 @@ def open_sources(config, *, metadata_only=False, source_credentials=None):
                         verified=CapabilityManifest.model_validate(records[s.id])
                     except Exception:raise LightGraphError("capability_manifest_invalid") from None
                 adapter=MySQLSource if s.kind=='mysql_database' else GaussSource
+                options = {}
+                if source_metadata_only:
+                    options['metadata_only'] = True
+                if auto_verify:
+                    # Verify the current connection, rather than treating the
+                    # checkbox or a previously uploaded file as capability proof.
+                    options['probe_runtime_limits'] = True
                 sources.append(adapter(dsn,source_id=s.id,allowed_tables=s.allowed_tables,
-                    allowed_columns=s.allowed_columns,limits=config.limits,verified_capabilities=verified,query_budget=budget))
+                    allowed_columns=s.allowed_columns,limits=config.limits,verified_capabilities=verified,query_budget=budget,**options))
         return sources
     except Exception:
         for s in sources:s.close()

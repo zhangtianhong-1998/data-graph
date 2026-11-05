@@ -7,9 +7,17 @@ export interface DatabaseForm {
   dsnEnv: string
   tables: string
   capabilityManifest: string
+  // Missing in older encrypted drafts; the dialog resolves it before editing.
+  allowFactData?: boolean | null
 }
 export const isDatabaseSource = (source: SourceConfig): boolean => ['gauss_database', 'mysql_database'].includes(source.kind)
 export const sourceKindLabel = (kind: string): string => ({ gauss_database: 'Gauss 数据库', mysql_database: 'MySQL 数据库', excel_workbook: 'Excel 工作簿', csv_file: 'CSV 文件' } as Record<string, string>)[kind] || kind
+
+/** An explicit per-source choice takes priority over old project-wide settings. */
+export function databaseFactDataAllowed(source: SourceConfig | null, retentionVerified = false): boolean {
+  if (typeof source?.allow_fact_data === 'boolean') return source.allow_fact_data
+  return !!source?.capability_manifest && retentionVerified
+}
 
 /** Update only the form-owned fields; column permissions and other advanced restrictions survive edits. */
 export function updateDatabaseSources(sources: SourceConfig[], originalId: string | null, form: DatabaseForm, uploadedManifests: string[]): SourceConfig[] {
@@ -26,6 +34,6 @@ export function updateDatabaseSources(sources: SourceConfig[], originalId: strin
   if (!tables.length) throw new Error('请至少填写一张允许查询的表。')
   if (tables.some(table => table.includes('*'))) throw new Error('允许查询的表必须逐一列出，不能使用通配符。')
   if (form.capabilityManifest && !uploadedManifests.includes(form.capabilityManifest)) throw new Error('能力验证文件必须从此项目已上传的 YAML 文件中选择。')
-  const source: SourceConfig = { ...original, id, kind: form.kind, dsn_env: dsnEnv, credential_mode: 'environment', credential_revision: null, allowed_tables: tables, capability_manifest: form.capabilityManifest || null }
+  const source: SourceConfig = { ...original, id, kind: form.kind, dsn_env: dsnEnv, credential_mode: 'environment', credential_revision: null, allowed_tables: tables, capability_manifest: form.capabilityManifest || null, allow_fact_data: form.allowFactData ?? databaseFactDataAllowed(original || null) }
   return original ? sources.map(item => item.id === originalId ? source : item) : [...sources, source]
 }

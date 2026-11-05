@@ -683,6 +683,18 @@
           "default": null,
           "title": "Capability Manifest"
         },
+        "allow_fact_data": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allow Fact Data"
+        },
         "include_hidden": {
           "default": false,
           "title": "Include Hidden",

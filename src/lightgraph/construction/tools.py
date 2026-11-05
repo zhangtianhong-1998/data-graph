@@ -53,12 +53,18 @@ class ConstructionTools:
             self.documents = DocumentCorpus([document for document in load_documents(config.documents)
                 if document.document_id not in config.removed_document_ids])
             mapping = {t.source_id: adapter for adapter in self.adapters for t in adapter.describe()}
+            self._fact_data_denied = {source.id for source in config.sources
+                if source.allow_fact_data is False}
+            self._fact_data_denied.update(source_id for source_id, adapter in mapping.items()
+                if getattr(adapter, 'metadata_only', False))
             budget = BudgetAllocator(Cost(db_cu=config.max_db_queries, llm_calls=None,
                 llm_tokens=None, memory_bytes=config.max_working_bytes, seconds=config.max_run_seconds))
             self.budget = budget
             for adapter in self.adapters:
                 executor = ToolExecutor(adapter, config.goal, budget, documents=self.documents,
-                    allow_source_samples=config.resolved_model.mode in {"in_environment", "approved_external"},
+                    allow_source_samples=config.resolved_model.mode in {"in_environment", "approved_external"}
+                        and not any(source_id in self._fact_data_denied
+                                    for source_id, current in mapping.items() if current is adapter),
                     source_adapters=mapping, include_document_context=False)
                 for source_id in executor._local_source_ids:
                     self.executors[source_id] = executor
@@ -144,6 +150,7 @@ class ConstructionTools:
                     "unbound_scope": "public", "managed_by": "operator"},
                 "tables": [{"table": key, "source": t.source_id, "schema": t.schema_name,
                             "sql_dialect": self.executors[t.source_id].compiler.dialect,
+                            "fact_data_allowed": self._fact_data_allowed(t.source_id),
                             "name": t.name, "columns": [c.model_dump(mode="json") for c in t.columns],
                             "declared_unique_keys": t.unique_keys,
                             "declared_foreign_keys": [fk.model_dump(mode="json") for fk in t.foreign_keys]}
@@ -152,11 +159,34 @@ class ConstructionTools:
                                    for s in self._sections}.values()),
                 "workspace": self.workspace.read_summary()}
 
+    def _fact_data_allowed(self, source_id):
+        return (self.config.resolved_model.mode in {"in_environment", "approved_external"}
+                and source_id not in self._fact_data_denied)
+
+    def _require_fact_sources(self, source_ids):
+        """Check each participating source before any query, including cross-source probes."""
+        if self.config.resolved_model.mode not in {"in_environment", "approved_external"}:
+            raise LightGraphError('metadata_only_query_forbidden')
+        if any(source_id in self._fact_data_denied for source_id in source_ids):
+            raise LightGraphError('source_fact_data_forbidden')
+
+    def _require_draft_sources(self, draft):
+        self._require_fact_sources(mapping.source_id
+            for definition in draft.entities + draft.relations for mapping in definition.mappings)
+
     def inspect_source(self, table: str, operation: str, arguments: dict | None = None):
         """Run a named read-only probe using physical names, not guessed IDs."""
         self._check_current_inputs()
         executor, key, physical = self._executor(table)
         arguments = dict(arguments or {})
+        if operation not in {'get_metadata', 'search_knowledge'}:
+            self._require_fact_sources([physical.source_id])
+            if operation == 'check_reference':
+                # The selected source may be allowed while the other endpoint
+                # is metadata-only. Reject before either side reads rows.
+                for field in ('source_table', 'target_table'):
+                    if isinstance(arguments.get(field), str):
+                        self._require_fact_sources([self._executor(arguments[field])[2].source_id])
         if operation in {"get_metadata", "search_knowledge", "profile_columns", "check_fd"}:
             if "table" in arguments and arguments["table"] not in {key, table}:
                 raise LightGraphError("probe_table_mismatch")
@@ -168,6 +198,7 @@ class ConstructionTools:
         if operation == 'get_metadata' and result.get('status') == 'ok':
             data = result.get('data', {})
             for entry in data.get('tables', []):
+                entry['fact_data_allowed'] = self._fact_data_allowed(entry.get('source_id', physical.source_id))
                 for column in entry.get('columns', []):
                     column.pop('id', None)
             data['identifier_usage'] = {
@@ -298,6 +329,7 @@ class ConstructionTools:
             raise LightGraphError("metadata_only_query_forbidden")
         self._check_current_inputs()
         record = self.workspace.get_draft(draft_id)
+        self._require_draft_sources(record.draft)
         if record.status == "stale":
             raise LightGraphError("stale_graph_draft")
         for ref in draft_evidence_refs(record.draft):
@@ -335,6 +367,7 @@ class ConstructionTools:
             raise LightGraphError("metadata_only_query_forbidden")
         self._check_current_inputs()
         record = self.workspace.get_draft(draft_id)
+        self._require_draft_sources(record.draft)
         preview = self.workspace.root / f"previews/{digest(draft_id)[:16]}-{record.revision}.yaml"
         if not preview.exists():
             raise LightGraphError("graph_validation_required")
