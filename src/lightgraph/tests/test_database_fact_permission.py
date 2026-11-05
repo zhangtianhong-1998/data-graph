@@ -53,17 +53,23 @@ def setup_database(monkeypatch, kind, allow):
     import lightgraph.sources as sources
     if kind == 'gauss':
         db = GaussConnection()
-        factory = lambda dsn, **kw: GaussSource(dsn, connect_factory=lambda _: db, **kw)
+        driver = gauss_fixture.Driver(db)
+        original_factory = driver.__call__
+        def connection_factory(dsn):
+            connection = original_factory(dsn)
+            connection.timeout_works = db.timeout_works
+            return connection
+        factory = lambda dsn, **kw: GaussSource(dsn, connect_factory=connection_factory, **kw)
         monkeypatch.setattr(sources, 'GaussSource', factory)
         dsn, table = 'fixture-only-dsn', 'public.items'
-        connections = [db]
+        connections = driver.connections
     else:
         driver = mysql_fixture.Driver()
         db = driver.main
         factory = lambda dsn, **kw: MySQLSource(dsn, connect_factory=driver, **kw)
         monkeypatch.setattr(sources, 'MySQLSource', factory)
         dsn, table = mysql_fixture.DSN, 'analytics.items'
-        connections = [driver.main, driver.control]
+        connections = driver.connections
     monkeypatch.setenv('FACT_PERMISSION_TEST_DSN', dsn)
     config = RunConfig(sources=[SourceConfig(id='db', kind=kind + '_database',
         dsn_env='FACT_PERMISSION_TEST_DSN', allowed_tables=[table], allow_fact_data=allow)])

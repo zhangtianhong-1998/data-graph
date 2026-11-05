@@ -39,6 +39,7 @@ _ERRORS = frozenset({'worker_execution_failed', 'worker_start_failed', 'worker_r
     'query_timeout', 'query_cancelled', 'runtime_capability_unverified', 'legacy_rule_input_removed',
     'read_only_transaction_failed', 'snapshot_close_failed', 'source_catalog_changed',
     'database_reconnect_failed', 'source_closed', 'source_close_failed', 'query_cancel_failed',
+    'source_circuit_open', 'source_retry_limit_exhausted',
     'database_preflight_failed', 'database_runtime_preflight_failed', 'read_only_transaction_unverified',
     'capability_manifest_binding_mismatch', 'qualified_capability_manifest_required',
     'authorized_table_unavailable_or_view', 'authorized_column_unavailable', 'invalid_capability_manifest'})

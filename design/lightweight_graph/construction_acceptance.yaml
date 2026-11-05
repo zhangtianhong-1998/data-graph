@@ -32,6 +32,29 @@ engineering_snapshot:
   migration_gaps: CONSTRUCTION_MIGRATION_GAPS.md
 latest_engineering_snapshot:
   date: '2026-11-05'
+  design: SNAPSHOT_CONNECTION_LIFECYCLE_20261105.md
+  python_passed: 2993
+  python_failed: 0
+  python_skipped: 0
+  final_counter_adjustment_regressions: 42
+  native_kernel_enabled: true
+  model_endpoint: loopback_scripted_fixture
+  frontend_passed: 331
+  frontend_build: passed
+  evidence: ../../runs/snapshot-lifecycle-20261105/verification-summary.json
+  real_database_called: false
+  external_model_called: false
+  autonomous_discovery_acceptance: not_run
+  covered_contracts:
+    - one_connection_lease_per_outer_readonly_snapshot
+    - half_open_begin_recovery_before_rows_only
+    - terminal_source_failure_latched_across_tool_calls
+    - source_failure_isolation_and_retained_candidates
+    - cross_source_failure_attribution_without_success_counter_reset
+    - native_harness_two_dispatch_closeout_including_compaction
+  boundary: 完整回归后对计数去重进行了42项定向回归；测试集合重叠不相加。驱动替身及本地模型接口不证明客户断链根因或真实构图质量。
+prior_discovery_recovery_snapshot:
+  date: '2026-11-05'
   design: DISCOVERY_RECOVERY_AND_FULL_GRAPH_20261105.md
   python_passed: 2946
   python_failed: 0

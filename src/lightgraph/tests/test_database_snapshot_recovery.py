@@ -18,7 +18,7 @@ GAUSS_QUALIFIED = {'product': 'openGauss', 'version': '6.0.0', 'driver': 'psycop
 
 def gauss_source(db, **kwargs):
     return GaussSource('fixture-only', allowed_tables=['public.items'],
-        connect_factory=lambda _: db, verified_capabilities=GAUSS_QUALIFIED, **kwargs)
+        connect_factory=lambda _: db, verified_capabilities=GAUSS_QUALIFIED, _keep_connection=True, **kwargs)
 
 
 class GaussFailure(Exception):
@@ -163,7 +163,7 @@ def test_gauss_failure_inside_existing_snapshot_never_restarts_it():
     (1205, 'lock_timeout', True), (1213, 'deadlock', True)])
 def test_mysql_start_failure_cleanup_and_classification(number, category, retryable):
     driver = mysql.Driver()
-    with mysql.source(driver, verified_capabilities=mysql.QUALIFIED) as source:
+    with mysql.source(driver, verified_capabilities=mysql.QUALIFIED, _keep_connection=True) as source:
         original = driver.main.cursor
         failed = []
         def cursor():
@@ -194,7 +194,7 @@ def test_mysql_start_failure_cleanup_and_classification(number, category, retrya
 
 def test_mysql_failed_start_rollback_preserves_permission_failure():
     driver = mysql.Driver()
-    with mysql.source(driver, verified_capabilities=mysql.QUALIFIED) as source:
+    with mysql.source(driver, verified_capabilities=mysql.QUALIFIED, _keep_connection=True) as source:
         def fail():
             raise mysql.DBError(1142, 'PRIVATE_DRIVER_PASSWORD')
         source._start_readonly = fail
@@ -236,5 +236,5 @@ def test_gauss_query_cancellation_join_is_bounded_and_connection_discarded(monke
         with pytest.raises(LightGraphError, match='^query_cancel_failed$'):
             list(source.project(source.describe()[0], ['code']))
         assert len(timers) == 1 and db.closed
-        with pytest.raises(LightGraphError, match='source_closed'):
+        with pytest.raises(LightGraphError, match='query_cancel_failed'):
             list(source.project(source.describe()[0], ['code']))

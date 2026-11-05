@@ -22,7 +22,8 @@ def failure_guidance(diagnostics):
         source_errors = [d for d in diagnostics if d.get('code') in SOURCE_FAILURES]
         retryable = any(d.get('retryable') is True for d in source_errors)
         reconnect = any(d.get('database', {}).get('recovery') == 'reconnect_required' for d in source_errors)
-        if codes & {'database_reconnect_failed', 'source_catalog_changed'}:
+        if codes & {'database_reconnect_failed', 'source_catalog_changed'} or any(
+                d.get('source_blocked') is True for d in source_errors):
             return {'failure_class': 'source_execution', 'retryable': False,
                     'recovery': 'operator_requalification_required',
                     'next_action': 'Automatic reconnection or catalog requalification did not succeed. '

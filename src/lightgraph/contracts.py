@@ -497,5 +497,5 @@ class RunReport(StrictModel):
     rules_skipped: list[str] = Field(default_factory=list)
     issues: list[dict[str, str | int]] = Field(default_factory=list)
     counts: dict[str, int | float] = Field(default_factory=dict)
-    validation: dict[str, str] = Field(default_factory=lambda: {"E": "not_run", "D": "not_run", "I": "not_run"})
+    validation: dict[str, Any] = Field(default_factory=lambda: {"E": "not_run", "D": "not_run", "I": "not_run"})
     construction: ConstructionSummary | None = None

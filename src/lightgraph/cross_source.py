@@ -6,7 +6,7 @@ is provided. Successful coverage is an instance observation, not semantic proof.
 """
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import hashlib
 import math
 import sys
@@ -132,6 +132,42 @@ def check_cross_source_reference(
     target_bindings = {}
     held_bytes = 0
 
+    def attribute_failure(error, source_id, phase):
+        # Attach only program-known endpoint identity; never driver messages,
+        # SQL or data values. Outer snapshot cleanup preserves this attribution.
+        error.cross_source_failure_source_id = source_id
+        error.cross_source_failure_phase = phase
+
+    @contextmanager
+    def source_operation(source_id, phase):
+        try:
+            yield
+        except LightGraphError as error:
+            attribute_failure(error, source_id, phase)
+            raise
+
+    @contextmanager
+    def source_snapshot(adapter):
+        source_ids = {table.source_id for current, table in (
+            (source_adapter, source_table), (target_adapter, target_table)) if current is adapter}
+        body_error = None
+        opened = False
+        try:
+            with adapter.snapshot():
+                opened = True
+                try:
+                    yield
+                except BaseException as error:
+                    body_error = error
+                    raise
+        except LightGraphError as error:
+            # ExitStack may throw the other endpoint's failure through this
+            # context. A shared adapter with two source IDs is also ambiguous.
+            if error is not body_error and len(source_ids) == 1:
+                attribute_failure(error, next(iter(source_ids)),
+                                  'snapshot_close' if opened else 'snapshot_open')
+            raise
+
     def reserve(size):
         nonlocal held_bytes
         held_bytes += size
@@ -139,6 +175,10 @@ def check_cross_source_reference(
             raise LightGraphError("memory_budget_exhausted")
 
     def read_projection(adapter, table, columns, scope, coverage, consume):
+        with source_operation(table.source_id, 'projection'):
+            return _read_projection(adapter, table, columns, scope, coverage, consume)
+
+    def _read_projection(adapter, table, columns, scope, coverage, consume):
         nonlocal held_bytes
         cap = min(max_distinct_rows or adapter.limits.max_result_rows,
                   adapter.limits.max_result_rows)
@@ -215,12 +255,13 @@ def check_cross_source_reference(
             # A deterministic order avoids opposing lock acquisition by callers.
             for adapter in sorted({id(source_adapter): source_adapter,
                                    id(target_adapter): target_adapter}.values(), key=id):
-                snapshots.enter_context(adapter.snapshot())
+                snapshots.enter_context(source_snapshot(adapter))
             for adapter, coverage in ((source_adapter, source_coverage),
                                       (target_adapter, target_coverage)):
-                coverage["consistent"] = bool(adapter.capabilities().consistent_snapshot)
-            if not all(side["consistent"] for side in result["coverage"].values()):
-                raise LightGraphError("cross_source_snapshot_unverified")
+                with source_operation(coverage['source_id'], 'catalog'):
+                    coverage["consistent"] = bool(adapter.capabilities().consistent_snapshot)
+                    if not coverage['consistent']:
+                        raise LightGraphError("cross_source_snapshot_unverified")
             read_projection(source_adapter, source_table, source_columns, predicate,
                             source_coverage, collect_source)
             read_projection(target_adapter, target_table, target_projection, target_predicate,
@@ -229,11 +270,12 @@ def check_cross_source_reference(
                 (source_adapter, source_table, source_coverage),
                 (target_adapter, target_table, target_coverage),
             ):
-                if (not adapter.capabilities().consistent_snapshot or
-                        digest(_registered_table(adapter, table).model_dump(
-                            mode="json", by_alias=True)) != coverage["schema_version"]):
-                    coverage["consistent"] = False
-                    raise LightGraphError("cross_source_source_changed")
+                with source_operation(table.source_id, 'catalog'):
+                    if (not adapter.capabilities().consistent_snapshot or
+                            digest(_registered_table(adapter, table).model_dump(
+                                mode="json", by_alias=True)) != coverage["schema_version"]):
+                        coverage["consistent"] = False
+                        raise LightGraphError("cross_source_source_changed")
             counts = dict.fromkeys(_COUNT_FIELDS, 0)
             counts["source_ref_tuples"] = len(source_keys)
             for encoded, (missing, entirely_null) in source_keys.items():
@@ -255,6 +297,14 @@ def check_cross_source_reference(
         if error.code not in _RECOVERABLE:
             raise
         result["reasons"].append(error.code)
+        source_id = getattr(error, 'cross_source_failure_source_id', None)
+        if source_id in {source_table.source_id, target_table.source_id}:
+            from .sources.database_errors import safe_database_diagnostic
+            database = safe_database_diagnostic(error)
+            result['failure'] = {'source_id': source_id, 'code': error.code,
+                'retryable': error.retryable,
+                'phase': getattr(error, 'cross_source_failure_phase', 'unknown'),
+                **({'database': database} if database else {})}
         if error.code == "snapshot_close_failed":
             for coverage in result["coverage"].values():
                 coverage["consistent"] = False

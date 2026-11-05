@@ -16,7 +16,7 @@ from lightgraph.runtime.trace import emit_trace, current_trace
 
 from .harness import HarnessOptions, run_goal
 from .mcp_server import serve_local_tools
-from .tools import ConstructionTools, TERMINAL_QUERY_CODES
+from .tools import ConstructionTools, STOP_QUERY_CODES
 from .workspace import write_yaml
 
 
@@ -181,7 +181,7 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
         if reason not in {"completed", "stop", "end_turn"}:
             report.status = "PARTIAL"
             cause = budget.get("stop_reason", "")
-            code = cause if cause in TERMINAL_QUERY_CODES | {"construction_input_limit_exceeded", "construction_call_budget_exhausted",
+            code = cause if cause in STOP_QUERY_CODES | {"construction_input_limit_exceeded", "construction_call_budget_exhausted",
                                      "construction_time_budget_exhausted"} else "harness_run_interrupted"
             report.issues.append({"code": code, "status": "partial"})
     except LightGraphError as exc:
@@ -197,6 +197,13 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
             report.validation.setdefault('model_usage', 'incomplete')
         try:
             if tools is not None:
+                source_circuits = tools.source_circuits.summary()
+                if source_circuits['sources']:
+                    report.validation['source_circuits'] = source_circuits
+                    report.counts['sources_blocked'] = sum(
+                        bool(source['blocked']) for source in source_circuits['sources'])
+                    report.counts['source_blocked_requests'] = sum(
+                        source['blocked_requests'] for source in source_circuits['sources'])
                 summary = tools.workspace.read_summary()
                 records = tools.workspace.list_drafts()
                 publications = {p["draft_id"]: p for p in summary["publications"]}

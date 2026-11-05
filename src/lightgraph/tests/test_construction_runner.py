@@ -101,6 +101,42 @@ def test_no_automatic_validation_or_publication(tmp_path, scripted_bridge):
     assert result['execution_kind'] == 'test_double'
 
 
+def test_report_retains_source_circuit_cause_and_already_published_graph(tmp_path, scripted_bridge):
+    config = configuration(tmp_path)
+
+    def runtime(intent, **options):
+        tools = scripted_bridge['tools']
+        save_object(tools)
+        assert tools.call('validate_graph_draft', draft_id='资料对象')['passed']
+        assert tools.call('publish_graph_draft', draft_id='资料对象')['status'] == 'ok'
+
+        @contextmanager
+        def failed_snapshot():
+            raise LightGraphError('database_reconnect_failed')
+            yield
+        tools.adapters[0].snapshot = failed_snapshot
+        assert not tools.call('validate_graph_draft', draft_id='资料对象')['passed']
+        for _ in range(3):
+            stopped = tools.call('validate_graph_draft', draft_id='资料对象')
+        assert stopped['code'] == 'source_retry_limit_exhausted'
+        return {'finish_reason': 'error', 'budget': {
+            'calls': 6, 'stop_reason': 'source_retry_limit_exhausted'}}
+
+    report = runner.run_construction(config, runtime=runtime)
+    assert report.status == 'PARTIAL'
+    assert report.counts['business_nodes'] == 2 and report.counts['rules_published'] == 1
+    assert report.counts['sources_blocked'] == 1
+    assert report.counts['source_blocked_requests'] == 3
+    source = report.validation['source_circuits']['sources'][0]
+    assert source['source_id'] == 'local' and source['blocked'] is True
+    assert source['cause_code'] == 'database_reconnect_failed'
+    codes = [issue['code'] for issue in report.issues]
+    assert codes.count('source_retry_limit_exhausted') == 1
+    assert 'harness_run_interrupted' not in codes
+    restored = type(report).model_validate_json(report.model_dump_json())
+    assert restored.validation['source_circuits'] == report.validation['source_circuits']
+
+
 def test_discover_only_enforced_below_prompt_and_validation_can_complete(tmp_path, scripted_bridge):
     config = configuration(tmp_path)
 

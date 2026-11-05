@@ -196,7 +196,8 @@ def test_legacy_validation_remains_readable_after_schema_upgrade(tmp_path):
     assert workspace.publish('items', revision=1, graph=graph())['revision'] == 1
 
 
-def test_query_stop_allows_only_two_finalization_model_dispatches(tmp_path):
+@pytest.mark.parametrize('stop_code', ['query_budget_exhausted', 'source_retry_limit_exhausted'])
+def test_query_stop_allows_only_two_finalization_model_dispatches(tmp_path, stop_code):
     node = shutil.which('node')
     if not node:
         pytest.skip('Node required to execute native Harness plugin')
@@ -212,15 +213,15 @@ apply(ctx,{maxCalls:1000,maxRunSeconds:60,output:OUTPUT,queryStopFile:STOP})
 let network=0
 async function* next(){network++;yield {type:'text',text:'ok'}}
 for await (const c of hooks.get('llm/stream')({},next)) {}
-writeFileSync(STOP,JSON.stringify({code:'query_budget_exhausted'}))
+writeFileSync(STOP,JSON.stringify({code:STOP_CODE}))
 for(const purpose of ['agent','summary']) for await(const c of hooks.get('llm/stream')({purpose},next)){}
 let code
 try {for await(const c of hooks.get('llm/stream')({purpose:'retry'},next)){}}catch(e){code=e.code}
 console.log(JSON.stringify({network,code}))
 '''.replace('MODULE', json.dumps(module.as_uri())).replace('OUTPUT', json.dumps(str(tmp_path / 'budget.yaml')))
-       .replace('STOP', json.dumps(str(stop_path))), encoding='utf-8')
+       .replace('STOP_CODE', json.dumps(stop_code)).replace('STOP', json.dumps(str(stop_path))), encoding='utf-8')
     result = subprocess.run([node, str(script)], capture_output=True, text=True, check=True, timeout=20)
-    assert json.loads(result.stdout) == {'network': 3, 'code': 'query_budget_exhausted'}
+    assert json.loads(result.stdout) == {'network': 3, 'code': stop_code}
 
 
 def test_report_keeps_budget_cause_and_successful_publication(tmp_path, scripted_bridge):

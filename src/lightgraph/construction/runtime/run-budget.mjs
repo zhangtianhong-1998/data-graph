@@ -19,7 +19,8 @@ export function apply(ctx, config) {
   let finalizationCalls = 0
   const queryStopCodes = new Set(['query_budget_exhausted', 'db_cu_budget_exhausted',
     'run_time_budget_exhausted', 'wall_time_budget_exhausted', 'construction_time_exhausted',
-    'returned_rows_budget_exhausted', 'returned_bytes_budget_exhausted'])
+    'returned_rows_budget_exhausted', 'returned_bytes_budget_exhausted',
+    'source_retry_limit_exhausted'])
   function queryStop() {
     if (!config.queryStopFile || !existsSync(config.queryStopFile)) return ''
     const code = JSON.parse(readFileSync(config.queryStopFile, 'utf8')).code
@@ -52,7 +53,8 @@ export function apply(ctx, config) {
   }
   save()
   ctx.on('llm/stream', async function* (options, next) {
-    // Source tools write this trusted control file after a hard query limit.
+    // Source tools write this trusted file after a hard query limit or bounded
+    // repeated requests to sources already blocked for this run.
     // At most two further dispatches can publish saved work and summarize it.
     // Retry and compaction dispatches consume the same closeout allowance.
     const queryStopReason = queryStop()

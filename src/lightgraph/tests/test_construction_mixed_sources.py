@@ -35,6 +35,8 @@ def database_transport(kind):
 
     class Cursor(fixture.Cursor):
         def execute(self, sql, parameters=None):
+            if self.connection.closed:
+                raise RuntimeError('fixture connection is closed')
             if quoted_table in sql:
                 # Execute the adapter's generated query, not a canned row set;
                 # this exercises count reconciliation, DISTINCT and projections.
@@ -49,15 +51,31 @@ def database_transport(kind):
 
     class Connection(fixture.Connection):
         def cursor(self, name=None):
+            if self.closed:
+                raise RuntimeError('fixture connection is closed')
             cursor = Cursor(self) if kind == 'mysql' else Cursor(self, name)
             if kind == 'mysql':
                 self.cursors.append(cursor)
             return cursor
 
     main = Connection()
-    control = Connection(main) if kind == 'mysql' else None
-    connections = iter([main, control]) if control else iter([main])
-    factory = lambda *args, **kwargs: next(connections)
+    physical_connections = []
+    main_commands = main.executed
+    current_main = main
+    def factory(*args, **kwargs):
+        nonlocal current_main
+        is_main = kind != 'mysql' or len(physical_connections) % 2 == 0
+        if is_main:
+            current_main = main if not physical_connections else Connection()
+            current_main.executed = main_commands
+            connection = current_main
+        else:
+            connection = Connection(current_main)
+        physical_connections.append(connection)
+        return connection
+    # Existing SQL assertions inspect this shared backend history; physical
+    # connection state remains distinct and every closed connection rejects I/O.
+    main.physical_connections = physical_connections
     qualification = (mysql_fixture.QUALIFIED if kind == 'mysql' else {
         'product': 'openGauss', 'version': '6.0.0', 'driver': 'psycopg_dbapi',
         'capabilities': {'statement_timeout': 'verified', 'query_cancel': 'verified'}})
@@ -183,6 +201,8 @@ def test_mixed_adapters_inspect_join_validate_and_publish(tmp_path, monkeypatch,
         tools.close()
         data.close()
     assert opened[0]._closed
+    assert all(connection.closed for connection in connection.physical_connections)
+    assert len({id(item) for item in connection.physical_connections}) == len(connection.physical_connections)
 
 
 def test_snapshot_entry_without_consistency_still_blocks_projection(tmp_path):

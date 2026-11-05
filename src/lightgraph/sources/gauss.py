@@ -22,7 +22,7 @@ from .base import SourceAdapter, QueryStats, cursor_batches
 from .budget import QueryBudget, BudgetedCursor
 from .gauss_compat import catalog_value, catalog_bool, safe_database_cause, set_optional_lock_timeout
 from .database_errors import connection_is_closed, database_diagnostic, database_error
-from .reconnect import configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary
+from .reconnect import configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary, terminal_failure, latch_terminal_failure, prepare_snapshot
 
 REQUIRED_RUNTIME = {"read_only_transaction", "parameter_binding", "metadata_reading", "distinct_projection", "statement_timeout", "query_cancel"}
 
@@ -44,7 +44,7 @@ def product_version(banner: str) -> tuple[str, str]:
     return "unknown", "unknown"
 
 class GaussSource(SourceAdapter):
-    def __init__(self, dsn: str, *, source_id: str = "gauss", allowed_tables: list[str], allowed_columns: dict[str, list[str]] | None = None, limits: QueryLimits | None = None, verified_capabilities: dict | CapabilityManifest | None = None, connect_factory: Callable | None = None, probe_runtime_limits: bool = False, query_budget: QueryBudget | None = None, metadata_only: bool = False):
+    def __init__(self, dsn: str, *, source_id: str = "gauss", allowed_tables: list[str], allowed_columns: dict[str, list[str]] | None = None, limits: QueryLimits | None = None, verified_capabilities: dict | CapabilityManifest | None = None, connect_factory: Callable | None = None, probe_runtime_limits: bool = False, query_budget: QueryBudget | None = None, metadata_only: bool = False, _keep_connection: bool = False):
         if not allowed_tables or any(len(t.split(".")) != 2 or any(not p for p in t.split(".")) for t in allowed_tables):
             raise LightGraphError("authorized_catalog_required")
         if len(allowed_tables) != len(set(allowed_tables)):
@@ -85,12 +85,14 @@ class GaussSource(SourceAdapter):
             if probe_runtime_limits and (not self._manifest.actual_database_verified or
                     any(self._manifest.capabilities.get(k) != 'verified' for k in REQUIRED_RUNTIME)):
                 raise LightGraphError('runtime_capability_unverified')
-        except LightGraphError:
-            if hasattr(self, "_connection") and not self._closed: self._connection.close()
-            raise
-        except Exception as exc:
-            if hasattr(self, "_connection") and not self._closed: self._connection.close()
-            raise LightGraphError("database_connection_failed") from safe_database_cause(exc, logging.getLogger(__name__))
+        except BaseException as exc:
+            if hasattr(self, '_connection'):
+                try: self._connection.close()
+                except Exception: pass
+            if isinstance(exc, LightGraphError) or not isinstance(exc, Exception):
+                raise
+            raise database_error('database_connection_failed', exc, engine='gauss',
+                stage='connection_preflight') from None
         self.compiler = QueryCompiler(self._tables, dialect="postgres",
             physical_columns=self._physical_column_names)
         reopen_options = {'source_id': source_id, 'allowed_tables': list(self.allowed_tables),
@@ -98,7 +100,9 @@ class GaussSource(SourceAdapter):
             'verified_capabilities': deepcopy(self._qualification), 'connect_factory': connect_factory,
             'metadata_only': metadata_only}
         configure_reconnection(self, lambda probe, budget: GaussSource(dsn, **reopen_options,
-            probe_runtime_limits=probe, query_budget=budget))
+            probe_runtime_limits=probe, query_budget=budget, _keep_connection=True))
+        if not _keep_connection:
+            self._release_snapshot_connection()
 
     def __repr__(self): return f"GaussSource(source_id={self.source_id!r}, product={self._manifest.product!r})"
 
@@ -171,13 +175,44 @@ class GaussSource(SourceAdapter):
                     self._manifest.actual_database_verified = False
             except LightGraphError: raise
             except Exception as exc:
-                raise LightGraphError("database_preflight_failed") from safe_database_cause(exc, logging.getLogger(__name__))
+                raise database_error('database_preflight_failed', exc, engine='gauss',
+                    stage='connection_preflight', connection_closed=connection_is_closed(self._connection)) from None
             finally:
-                if not self._closed: self._connection.rollback()
-                self._manifest.consistent_snapshot = False
+                active_error = sys.exc_info()[1]
+                try:
+                    if not self._closed: self._connection.rollback()
+                except Exception as exc:
+                    if active_error is None:
+                        raise database_error('snapshot_close_failed', exc, engine='gauss',
+                            stage='connection_preflight', rollback_succeeded=False) from None
+                    if isinstance(active_error, LightGraphError):
+                        active_error.database_diagnostic = {**getattr(active_error, 'database_diagnostic', {}),
+                            'rollback_succeeded': False}
+                finally:
+                    self._manifest.consistent_snapshot = False
             return self.capabilities()
 
-    def verify_runtime_controls(self) -> CapabilityManifest:
+    def verify_runtime_controls(self):
+        """Qualify a physical connection, releasing an explicitly acquired lease."""
+        with self._lock:
+            acquired = getattr(self, '_idle_released', False)
+            if acquired:
+                stopped = terminal_failure(self)
+                if stopped is not None: raise stopped
+                if self._disposed: raise LightGraphError('source_closed')
+                if self._cancelled: raise LightGraphError('query_cancelled')
+                self._boundary_recovery_used = False
+                self._reconnect()
+            try:
+                # A previously runtime-qualified source repeats these probes
+                # inside replacement construction, once per physical session.
+                if acquired and self._manifest.actual_database_verified:
+                    return self.capabilities()
+                return self._verify_runtime_controls_current()
+            finally:
+                if acquired: self._release_snapshot_connection()
+
+    def _verify_runtime_controls_current(self) -> CapabilityManifest:
         """Verify timeout/cancel on this connection without re-reading metadata."""
         with self._lock:
             if self._closed: raise LightGraphError("source_closed")
@@ -268,9 +303,10 @@ class GaussSource(SourceAdapter):
                 # A short configured statement timeout must not masquerade as
                 # successful client cancellation (both report SQLSTATE 57014).
                 cursor.execute("SET LOCAL statement_timeout = '1000ms'")
+                query_connection = self._connection
                 def send_cancel():
                     try:
-                        self._connection.cancel()
+                        query_connection.cancel()
                         cancel_sent.set()
                     except Exception:
                         # Driver details may contain secrets; the probe below
@@ -309,6 +345,22 @@ class GaussSource(SourceAdapter):
 
     def describe(self): return [t.model_copy(deep=True) for t in self._tables]
     def capabilities(self): return self._manifest.model_copy(deep=True)
+
+    @property
+    def terminal_failure_code(self):
+        return self._terminal_failure_code
+
+    @property
+    def terminal_failure_diagnostic(self):
+        return deepcopy(self._terminal_failure_diagnostic)
+
+    def _release_snapshot_connection(self):
+        """Release only the physical lease; authorized metadata stays available."""
+        eligible = self._reconnect_allowed
+        self._discard_connection()
+        self._idle_released = True
+        self._reconnect_allowed = eligible
+        self._manifest.consistent_snapshot = False
 
     @property
     def new_snapshot_recovery_allowed(self):
@@ -362,7 +414,7 @@ class GaussSource(SourceAdapter):
                     # a retry of an interrupted or partially consumed query.
                     continue
                 reconnect = (diagnostic['category'] in {'connection', 'idle_transaction_timeout', 'shutdown', 'unavailable'}
-                             or was_closed and diagnostic['category'] == 'unknown')
+                             or diagnostic['category'] == 'unknown' and (was_closed or not rolled_back))
                 self._reconnect_allowed = reconnect
                 if reconnect:
                     self._discard_connection(reconnect_allowed=True)
@@ -378,55 +430,45 @@ class GaussSource(SourceAdapter):
     @contextmanager
     def snapshot(self):
         with self._lock:
-            if self._disposed or self._reconnect_blocked: raise LightGraphError('source_closed')
-            if self.metadata_only: raise LightGraphError("metadata_only_query_forbidden")
-            if any(self._manifest.capabilities.get(k) != "verified" for k in REQUIRED_RUNTIME):
-                raise LightGraphError("runtime_capability_unverified")
+            stopped = terminal_failure(self)
+            if stopped is not None: raise stopped
+            if self._disposed: raise LightGraphError('source_closed')
+            if self._cancelled: raise LightGraphError('query_cancelled')
+            if self.metadata_only: raise LightGraphError('metadata_only_query_forbidden')
+            if any(self._manifest.capabilities.get(k) != 'verified' for k in REQUIRED_RUNTIME):
+                raise LightGraphError('runtime_capability_unverified')
             outer = self._depth == 0
             if outer:
-                reconnected = False
-                if self._reconnect_allowed or not self._closed and connection_is_closed(self._connection):
-                    self._reconnect()
-                    reconnected = True
-                if self._closed: raise LightGraphError('source_closed')
-                try:
-                    self._begin_snapshot()
-                except LightGraphError:
-                    if reconnected or not self._reconnect_allowed:
-                        if reconnected: self._reconnect_blocked = True
-                        raise
-                    self._reconnect()
-                    try:
-                        self._begin_snapshot()
-                    except BaseException:
-                        self._reconnect_blocked = True
-                        raise
+                prepare_snapshot(self, engine='gauss', begin=self._begin_snapshot,
+                    disconnected=connection_is_closed(self._connection))
                 self._manifest.consistent_snapshot = True
             elif self._closed:
                 raise LightGraphError('source_closed')
             self._depth += 1
-            try: yield self
+            try:
+                yield self
             finally:
                 self._depth -= 1
                 if outer:
                     self._manifest.consistent_snapshot = False
                     active_error = sys.exc_info()[1]
-                    if not self._closed:
-                        try: self._connection.rollback()
-                        except Exception as exc:
-                            category = getattr(active_error, 'database_diagnostic', {}).get('category')
-                            self._discard_connection(reconnect_allowed=connection_is_closed(self._connection)
-                                and category not in {'permission', 'authentication', 'configuration_or_catalog', 'unsupported'})
-                            if active_error is None:
-                                raise database_error('snapshot_close_failed', exc, engine='gauss',
-                                    stage='snapshot_close', rollback_succeeded=False,
-                                    recovery='reconnect_required') from None
-                            # Preserve timeout/budget/driver cause rather than
-                            # replacing it with the subsequent cleanup failure.
-                            if isinstance(active_error, LightGraphError):
-                                diagnostic = getattr(active_error, 'database_diagnostic', {})
-                                active_error.database_diagnostic = {**diagnostic,
-                                    'rollback_succeeded': False, 'recovery': 'reconnect_required'}
+                    try:
+                        if not self._closed:
+                            try: self._connection.rollback()
+                            except Exception as exc:
+                                self._discard_connection(reconnect_allowed=not self._cancelled)
+                                if active_error is None:
+                                    raise database_error('snapshot_close_failed', exc, engine='gauss',
+                                        stage='snapshot_close', rollback_succeeded=False,
+                                        recovery='reconnect_required') from None
+                                if isinstance(active_error, LightGraphError):
+                                    active_error.database_diagnostic = {**getattr(active_error, 'database_diagnostic', {}),
+                                        'rollback_succeeded': False, 'recovery': 'reconnect_required'}
+                    finally:
+                        # No transaction or network connection survives Agent
+                        # think-time. Nested queries share this lease only.
+                        self._release_snapshot_connection()
+
     def execute(self, query, *, row_limit=None):
         # Reject unauthorized SQL before reconnecting or touching a transaction.
         self.compiler.guard.validate(query.sql, query.parameters)
@@ -474,6 +516,7 @@ class GaussSource(SourceAdapter):
                 stuck_cancel = timer.is_alive()
                 if stuck_cancel:
                     self._discard_connection()
+                    latch_terminal_failure(self, LightGraphError('query_cancel_failed'), engine='gauss')
                 if cursor is not None:
                     try: cursor.close()
                     except Exception: pass
@@ -484,6 +527,8 @@ class GaussSource(SourceAdapter):
         self._cancelled = True
         self._reconnect_allowed = False
         self._reconnect_blocked = True
+        if self._closed:
+            return
         try: self._connection.cancel()
         except Exception: raise LightGraphError("query_cancel_failed") from None
     def close(self):

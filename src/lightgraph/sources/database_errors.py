@@ -70,11 +70,12 @@ def safe_database_diagnostic(error):
         return selected if isinstance(selected, str) and selected in allowed else default
     return {
         'engine': choice('engine', {'gauss', 'mysql'}),
-        'stage': choice('stage', {'snapshot_start', 'snapshot_close', 'query', 'reconnect'}),
+        'stage': choice('stage', {'snapshot_start', 'snapshot_close', 'connection_preflight', 'query', 'reconnect'}),
         'category': choice('category', categories),
         'sqlstate': state if isinstance(state, str) and re.fullmatch(r'[0-9A-Z]{5}', state) else 'unknown',
         'errno': number if type(number) is int and 0 <= number <= 65535 else None,
         'rollback_succeeded': value.get('rollback_succeeded') if type(value.get('rollback_succeeded')) is bool else None,
+        'terminal': value.get('terminal') is True,
         'connection_closed': value.get('connection_closed') if type(value.get('connection_closed')) is bool else None,
         'recovery': choice('recovery', {
             'none', 'rolled_back', 'rollback_rebegin_failed', 'reconnect_required', 'reconnect_failed', 'reconnected'}, 'none'),

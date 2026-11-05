@@ -26,6 +26,9 @@ class Factory:
 
 
 def environment(engine, *, qualified=True, **options):
+    # Start at the same qualified-lease boundary used by replacement adapters.
+    # Public constructor release / reacquisition is covered in lifecycle tests.
+    options['_keep_connection'] = True
     if engine == 'gauss':
         old, new = gauss.Connection(), gauss.Connection()
         factory = Factory([old, new])
@@ -85,9 +88,9 @@ def test_reconnects_once_before_rows_with_same_budget_and_full_readonly_setup(en
         assert budget.queries > before and source.stats.queries == 1
         assert source.connection_generation == source._reconnect_attempts == 1
         assert factory.calls == (2 if engine == 'gauss' else 4)
-        assert old.closed and not new.closed
+        assert old.closed and new.closed
         if controls:
-            assert controls[0].closed and not controls[1].closed
+            assert controls[0].closed and controls[1].closed
             assert any('@@server_uuid' in sql for sql, _ in controls[1].executed)
         commands = [sql for sql, _ in new.executed]
         assert any('READ ONLY' in sql for sql in commands)
@@ -115,7 +118,7 @@ def test_unknown_open_connection_and_permission_errors_do_not_reconnect(engine, 
         assert factory.calls == (1 if engine == 'gauss' else 2)
         assert not new.executed
         if fault == 'permission_closed':
-            with pytest.raises(LightGraphError, match='source_closed'):
+            with pytest.raises(LightGraphError, match='read_only_transaction_failed'):
                 read(source)
             assert source._reconnect_attempts == 0
     finally:
@@ -137,7 +140,7 @@ def test_failed_requalification_closes_new_connections_and_latches_retry_budget(
         assert new.closed and (not controls or controls[1].closed)
         calls = factory.calls
         for _ in range(3):
-            with pytest.raises(LightGraphError, match='source_closed'):
+            with pytest.raises(LightGraphError, match='database_reconnect_failed'):
                 read(source)
         assert factory.calls == calls and source._reconnect_attempts == 1
         assert source.stats.queries == 0
@@ -317,6 +320,8 @@ def test_late_cancel_callback_stays_bound_to_retired_connection(engine, monkeypa
         if engine == 'gauss':
             assert old.cancelled and not new.cancelled
         else:
-            assert old.cancelled.is_set() and not new.cancelled.is_set()
+            # The retired control connection is closed, so a late callback
+            # cannot issue KILL there or target the new physical connection.
+            assert not new.cancelled.is_set()
     finally:
         source.close()

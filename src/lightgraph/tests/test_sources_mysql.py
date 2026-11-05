@@ -32,6 +32,8 @@ class Cursor:
 
     def execute(self, sql, parameters=None):
         db = self.connection
+        if db.closed:
+            raise DBError(2006, 'fixture connection is closed')
         self._executed = sql
         db.executed.append((sql, parameters))
         self.result = []
@@ -146,6 +148,8 @@ class Connection:
         self.fail_close = self.fail_rollback = False
 
     def cursor(self):
+        if self.closed:
+            raise DBError(2006, 'fixture connection is closed')
         cursor = Cursor(self)
         self.cursors.append(cursor)
         return cursor
@@ -168,10 +172,31 @@ class Driver:
         self.main = Connection()
         self.control = Connection(self.main)
         self.options = []
+        self.connections = [self.main, self.control]
+
+    @staticmethod
+    def _fresh(previous, owner=None):
+        result = Connection(owner)
+        # Backend data/settings and the audit log survive a physical connection.
+        # Transaction state, cancellation events, cursors and closed do not.
+        for name in ('executed', 'rows', 'ignore_sql_mode', 'version', 'version_comment',
+                     'server_uuid', 'current_user', 'engine', 'table_type', 'readonly',
+                     'isolation', 'timeout_works', 'cancel_works', 'false_timeout_on_cancel',
+                     'fail_errno', 'on_query', 'fail_close', 'fail_rollback'):
+            setattr(result, name, getattr(previous, name))
+        return result
 
     def __call__(self, **kwargs):
         self.options.append(dict(kwargs))
-        return self.main if len(self.options) == 1 else self.control
+        main_call = len(self.options) % 2 == 1
+        if len(self.options) > 2:
+            if main_call:
+                self.main = self._fresh(self.main)
+                self.connections.append(self.main)
+            else:
+                self.control = self._fresh(self.control, self.main)
+                self.connections.append(self.control)
+        return self.main if main_call else self.control
 
 
 def source(driver, **kwargs):
@@ -237,7 +262,10 @@ def test_parameter_binding_snapshot_and_ephemeral_cleanup():
         table = adapter.describe()[0]
         before = len(driver.main.executed)
         with adapter.snapshot():
+            assert len(driver.connections)==4 and all(c.closed for c in driver.connections[:2])
+            snapshot_start = len(driver.main.executed)
             assert adapter.capabilities().consistent_snapshot
+            assert not any(s.startswith('START TRANSACTION') for s, _ in driver.main.executed[snapshot_start:])
             rows = []
             for batch in adapter.project(table, ['code', 'name'], predicate={'code': 'PRIVATE_QUERY_VALUE'}):
                 rows.extend(batch.rows())
@@ -248,7 +276,9 @@ def test_parameter_binding_snapshot_and_ephemeral_cleanup():
         assert 'PRIVATE_QUERY_VALUE' not in generated[0]
         assert generated[1]['p0'] == 'PRIVATE_QUERY_VALUE'
         assert '%(p0)s' in generated[0] and '%(cap)s' in generated[0]
-        assert sum(s.startswith('START TRANSACTION') for s, _ in driver.main.executed[before:]) == 1
+        # The new physical pair is qualified, then opens the requested snapshot.
+        assert sum(s.startswith('START TRANSACTION') for s, _ in driver.main.executed[before:]) == 2
+        assert all(c.closed for c in driver.connections)
         assert all(c.closed and c._executed is None for c in driver.main.cursors)
         assert adapter.stats.queries == 1
         assert adapter.capabilities().capabilities['cursor_paging'] == 'verified'
@@ -279,7 +309,7 @@ def test_manifest_exact_binding(field, value):
         source(Driver(), verified_capabilities=manifest)
 
 
-def test_runtime_probes_verify_actual_interruptions_without_repeating_catalog():
+def test_runtime_probes_requalify_new_connection_and_verify_actual_interruptions():
     driver = Driver()
     with source(driver) as adapter:
         catalog_before = sum('information_schema' in sql for sql, _ in driver.main.executed)
@@ -287,8 +317,10 @@ def test_runtime_probes_verify_actual_interruptions_without_repeating_catalog():
         assert manifest.actual_database_verified
         assert manifest.capabilities['statement_timeout'] == manifest.capabilities['query_cancel'] == 'verified'
         assert not manifest.consistent_snapshot
-        assert sum('information_schema' in sql for sql, _ in driver.main.executed) == catalog_before
-        assert driver.control.executed == [('SELECT @@server_uuid, CURRENT_USER()', None), ('KILL QUERY 42', None)]
+        assert sum('information_schema' in sql for sql, _ in driver.main.executed) == 2 * catalog_before
+        assert driver.control.executed == [('SELECT @@server_uuid, CURRENT_USER()', None),
+            ('SELECT @@server_uuid, CURRENT_USER()', None), ('KILL QUERY 42', None)]
+        assert len(driver.connections)==4 and all(c.closed for c in driver.connections)
         assert 'SELECT SLEEP(0.25), 1' in [s for s, _ in driver.main.executed]
         assert driver.main.cancel_probe_started.is_set() and driver.main.cancel_attempt_finished.is_set()
 
@@ -334,9 +366,12 @@ def test_query_failure_is_redacted_and_does_not_drain_remaining_rows():
         assert 'PRIVATE_DRIVER_VALUE' not in str(error.value)
         assert driver.main.closed
         assert not adapter.capabilities().consistent_snapshot
-        with pytest.raises(LightGraphError, match='source_closed'):
-            with adapter.snapshot():
-                pass
+        failed_connection = driver.main
+        with adapter.snapshot():
+            assert driver.main is not failed_connection
+            assert failed_connection.closed and not driver.main.closed
+            assert adapter.capabilities().consistent_snapshot
+        assert adapter.stats.queries == 1  # The failed SELECT was never replayed.
 
 
 def test_early_generator_close_drops_unbuffered_connection_without_drain():
@@ -353,15 +388,16 @@ def test_early_generator_close_drops_unbuffered_connection_without_drain():
 
 def test_cancel_is_bound_to_own_connection_and_error_is_safe():
     driver = Driver()
-    with source(driver) as adapter:
+    with source(driver, verified_capabilities=QUALIFIED) as adapter:
         with pytest.raises(LightGraphError, match='query_cancel_target_forbidden'):
             adapter.cancel('43')
         assert not any(s.startswith('KILL') for s, _ in driver.control.executed)
-        adapter.cancel()
-        assert driver.control.executed[-1][0] == 'KILL QUERY 42'
-        driver.main.cancel_works = False
-        with pytest.raises(LightGraphError, match='query_cancel_failed') as error:
+        with adapter.snapshot():
             adapter.cancel()
+            assert driver.control.executed[-1][0] == 'KILL QUERY 42'
+            driver.main.cancel_works = False
+            with pytest.raises(LightGraphError, match='query_cancel_failed') as error:
+                adapter.cancel()
         assert 'PRIVATE_CANCEL_DETAIL' not in str(error.value)
 
 
@@ -419,10 +455,11 @@ def test_default_driver_uses_unbuffered_cursor_and_real_distribution_version(mon
 
 def test_failed_close_is_fixed_code_and_not_claimed_clean():
     driver = Driver()
-    adapter = source(driver)
-    driver.control.fail_close = True
-    with pytest.raises(LightGraphError, match='source_close_failed') as error:
-        adapter.close()
+    adapter = source(driver, verified_capabilities=QUALIFIED)
+    with adapter.snapshot():
+        driver.control.fail_close = True
+        with pytest.raises(LightGraphError, match='source_close_failed') as error:
+            adapter.close()
     assert 'PRIVATE_CLOSE_VALUE' not in str(error.value)
     assert driver.main.closed
 
@@ -494,11 +531,13 @@ def test_control_connection_must_match_server_and_account(attribute, value):
 def test_late_timer_cannot_leave_connection_reusable(monkeypatch):
     # Model a timer still blocked inside control I/O after join's bound. It may
     # complete later, so the original connection must never serve another query.
+    timers = []
     class LateTimer:
         ident = 123
         daemon = True
         def __init__(self, _delay, callback):
             self.callback = callback
+            timers.append(self)
         def start(self):
             pass
         def cancel(self):
@@ -511,9 +550,15 @@ def test_late_timer_cannot_leave_connection_reusable(monkeypatch):
     with source(driver, verified_capabilities=QUALIFIED) as adapter:
         monkeypatch.setattr('lightgraph.sources.mysql.threading.Timer', LateTimer)
         assert list(adapter.project(adapter.describe()[0], ['code']))
-        assert driver.main.closed
-        with pytest.raises(LightGraphError, match='source_closed'):
-            list(adapter.project(adapter.describe()[0], ['code']))
+        previous_main, previous_control = driver.main, driver.control
+        assert previous_main.closed and previous_control.closed
+        with adapter.snapshot():
+            assert driver.main is not previous_main and driver.control is not previous_control
+            before = list(driver.control.executed)
+            timers[0].callback()
+            assert driver.control.executed == before  # Old callback cannot KILL the fresh lease.
+            assert not driver.main.closed and adapter.capabilities().consistent_snapshot
+        assert adapter.stats.queries == 1
 
 
 def test_external_cancel_revokes_connection_before_control_io():
@@ -522,13 +567,14 @@ def test_external_cancel_revokes_connection_before_control_io():
         original = adapter._interrupt
         def delayed_cancel(**kwargs):
             # The KILL has not yet been sent. A competing next query must fail.
-            with pytest.raises(LightGraphError, match='source_closed'):
+            with pytest.raises(LightGraphError, match='query_cancelled'):
                 with adapter.snapshot():
                     pass
             original(**kwargs)
         adapter._interrupt = delayed_cancel
-        adapter.cancel()
-        assert driver.control.executed[-1][0] == 'KILL QUERY 42'
+        with adapter.snapshot():
+            adapter.cancel()
+            assert driver.control.executed[-1][0] == 'KILL QUERY 42'
 
 
 def test_cancel_after_last_batch_does_not_report_query_success():

@@ -33,6 +33,7 @@ SKILL_ROOT = Path(__file__).parent / "skills" / "build-graph"
 TERMINAL_QUERY_CODES = frozenset({'query_budget_exhausted', 'db_cu_budget_exhausted',
     'run_time_budget_exhausted', 'wall_time_budget_exhausted', 'construction_time_exhausted',
     'returned_rows_budget_exhausted', 'returned_bytes_budget_exhausted'})
+STOP_QUERY_CODES = TERMINAL_QUERY_CODES | {'source_retry_limit_exhausted'}
 
 
 def _file_hash(path):
@@ -93,9 +94,12 @@ class ConstructionTools:
                 [(d.document_id, d.revision, d.content_hash) for d in self.documents.documents])
             self.workspace = GraphWorkspace(workspace, fingerprint)
             self.terminal_reason = None
+            from .source_circuit import SourceCircuits
+            self.source_circuits = SourceCircuits()
             # Live control state is reset for this worker; durable attempts remain.
             from lightgraph.runtime.retention import atomic_text
             atomic_text(self.workspace.root / 'query-stop.json', json.dumps({'code': None}))
+            self._save_source_circuits()
             # Changes in source content or goals invalidate old evidence, even
             # when the source path and the visible schema remain unchanged.
             self._document_refs = {}
@@ -172,12 +176,52 @@ class ConstructionTools:
             self.terminal_reason = code
             from lightgraph.runtime.retention import atomic_text
             atomic_text(self.workspace.root / 'query-stop.json', json.dumps({'code': code}))
+        action = ('Repeated requests targeted a source already stopped in this run. '
+                  'Do not retry it or remove its mappings to claim the full goal is complete. '
+                  if self.terminal_reason == 'source_retry_limit_exhausted' else '')
         return {'status': 'error', 'code': self.terminal_reason, 'retryable': False,
                 'queries_stopped': True, 'finalization_model_calls': 2,
-                'next_action': 'Source queries cannot continue in this run. Read saved work, publish an already '
+                'next_action': action + 'Source queries cannot continue in this run. Read saved work, publish an already '
                     'successful validation if appropriate, and finish. Do not repeat queries or revise the '
                     'mapping solely because resources were exhausted. Two model calls remain for this closeout, '
                     'subject to the existing model/time limits.'}
+
+    def _save_source_circuits(self):
+        from lightgraph.runtime.retention import atomic_text
+        atomic_text(self.workspace.root / 'source-circuits.json',
+                    json.dumps(self.source_circuits.summary(), ensure_ascii=False))
+
+    def _sync_source_circuits(self, source_ids):
+        """Consult adapter state without SQL, before any new instance operation."""
+        for source_id in set(source_ids):
+            executor = self.executors.get(source_id)
+            if executor is None:
+                continue
+            adapter = executor.adapter
+            code = getattr(adapter, 'terminal_failure_code', None)
+            if isinstance(code, str):
+                self.source_circuits.fail(source_id, {'code': code,
+                    'database': getattr(adapter, 'terminal_failure_diagnostic', None)}, terminal=True, observed=False)
+
+    def _source_gate(self, source_ids):
+        source_ids = set(source_ids)
+        self._sync_source_circuits(source_ids)
+        blocked = self.source_circuits.reject(source_ids)
+        if not blocked:
+            return None
+        self._save_source_circuits()
+        common = {'blocked_sources': blocked, 'retryable': False,
+                  'new_snapshot_recovery_available': False,
+                  'source_circuits': self.source_circuits.summary()}
+        if any(s['blocked_requests'] >= self.source_circuits.blocked_request_limit for s in blocked):
+            return {**self._stop_queries('source_retry_limit_exhausted'), **common}
+        return {'status': 'error', 'code': 'source_circuit_open', **common,
+                'failure_class': 'source_execution', 'recovery': 'operator_requalification_required',
+                'next_action': 'This source is stopped for this run. No queries or new validation were executed. '
+                    'Preserve the original draft and its earlier candidate/validation. Continue metadata, '
+                    'structure or independent healthy-source work; do not repeatedly validate this source, '
+                    'rename a draft or remove source mappings to claim the full goal is complete. '
+                    'Three blocked requests end data exploration and leave two model dispatches for closeout.'}
 
     def describe_sources(self):
         """Return the authorized physical catalog without inferred business roles."""
@@ -198,6 +242,7 @@ class ConstructionTools:
                            for key, t in self.tables.items()],
                 "documents": list({s["doc_id"]: {"id": s["doc_id"], "title": titles.get(s["doc_id"], s["doc_id"]), "revision": s["revision"]}
                                    for s in self._sections}.values()),
+                "source_circuits": self.source_circuits.summary(),
                 "workspace": self.workspace.read_summary()}
 
     def _fact_data_allowed(self, source_id):
@@ -218,7 +263,8 @@ class ConstructionTools:
     def _snapshot_recovery_sources(self, source_ids):
         """Observe recovery eligibility only after the failed snapshot closes."""
         return sorted({source_id for source_id in source_ids
-            if source_id in self.executors and getattr(self.executors[source_id].adapter,
+            if not self.source_circuits.blocked([source_id])
+            and source_id in self.executors and getattr(self.executors[source_id].adapter,
                 'new_snapshot_recovery_allowed', False) is True})
 
     def inspect_source(self, table: str, operation: str, arguments: dict | None = None):
@@ -226,30 +272,64 @@ class ConstructionTools:
         self._check_current_inputs()
         executor, key, physical = self._executor(table)
         arguments = dict(arguments or {})
-        if operation not in {'get_metadata', 'search_knowledge'}:
+        is_data_operation = operation not in {'get_metadata', 'search_knowledge'}
+        involved = {physical.source_id}
+        if is_data_operation:
             self._require_fact_sources([physical.source_id])
             if operation == 'check_reference':
                 # The selected source may be allowed while the other endpoint
                 # is metadata-only. Reject before either side reads rows.
                 for field in ('source_table', 'target_table'):
                     if isinstance(arguments.get(field), str):
-                        self._require_fact_sources([self._executor(arguments[field])[2].source_id])
+                        source_id = self._executor(arguments[field])[2].source_id
+                        self._require_fact_sources([source_id])
+                        involved.add(source_id)
+            stopped = self._source_gate(involved)
+            if stopped:
+                return stopped
         if operation in {"get_metadata", "search_knowledge", "profile_columns", "check_fd"}:
             if "table" in arguments and arguments["table"] not in {key, table}:
                 raise LightGraphError("probe_table_mismatch")
             arguments["table"] = key
         result = executor.execute(operation, arguments)
+        if is_data_operation:
+            reference_failure = result.get('coverage', {}).get('failure') if operation == 'check_reference' else None
+            data_completed = result.get('status') == 'ok' and (
+                operation != 'check_reference' or len(involved) == 1
+                or result.get('coverage', {}).get('complete') is True)
+            if data_completed:
+                for source_id in involved:
+                    self.source_circuits.succeeded(source_id)
+            elif len(involved) == 1:
+                self.source_circuits.fail(physical.source_id, result)
+            elif isinstance(reference_failure, dict) and reference_failure.get('source_id') in involved:
+                self.source_circuits.fail(reference_failure['source_id'], reference_failure)
+            # Never guess the failed endpoint when a cross-source check cannot
+            # attribute it. Adapter terminal state remains an independent signal.
+            self._sync_source_circuits(involved)
+            self._save_source_circuits()
+            if isinstance(reference_failure, dict) and reference_failure.get('source_id') in involved:
+                from .failures import failure_guidance
+                failed_source = reference_failure['source_id']
+                reference_failure.update(
+                    source_blocked=bool(self.source_circuits.blocked([failed_source])),
+                    new_snapshot_recovery_available=failed_source in self._snapshot_recovery_sources([failed_source]))
+                result.update(**failure_guidance([reference_failure]))
+            blocked = self.source_circuits.blocked(involved)
+            if blocked:
+                from .failures import failure_guidance
+                result.update(source_circuits=self.source_circuits.summary(),
+                    **failure_guidance([{'code': s['cause_code'], 'source_blocked': True}
+                                       for s in blocked]))
         if result.get('status') == 'error':
             from .failures import SOURCE_FAILURES, failure_guidance
             if result.get('code') in SOURCE_FAILURES:
-                involved = [physical.source_id]
-                if operation == 'check_reference':
-                    involved.extend(self._executor(arguments[name])[2].source_id
-                                    for name in ('source_table', 'target_table')
-                                    if isinstance(arguments.get(name), str))
                 recovery = self._snapshot_recovery_sources(involved)
                 result.update(new_snapshot_recovery_available=bool(recovery), recovery_source_ids=recovery)
+                result['source_blocked'] = bool(self.source_circuits.blocked(involved))
             result.update(source_id=physical.source_id, **failure_guidance([result]))
+            if is_data_operation:
+                result['source_circuits'] = self.source_circuits.summary()
         # The generic draft protocol uses physical column names. Legacy probe
         # aliases are implementation details, not references the Agent must copy.
         result.pop('probe_id', None)
@@ -448,19 +528,40 @@ class ConstructionTools:
             raise LightGraphError("stale_graph_draft")
         for ref in draft_evidence_refs(record.draft):
             self.workspace.read_evidence(ref)
+        from .models import iter_source_mappings
+        sources = sorted({m.source_id for m in iter_source_mappings(record.draft)})
+        stopped = self._source_gate(sources)
+        if stopped:
+            return stopped
         started = datetime.now(timezone.utc).isoformat()
         result = execute_draft(record.draft, self.adapters, list(self.tables.values()),
             goal=self.config.goal, max_working_bytes=self.config.max_working_bytes,
             max_rows=self.config.limits.max_result_rows, max_seconds=self.budget.remaining_seconds(),
             scope_bindings=self.config.scope_bindings)
         self._check_current_inputs()
-        from .models import iter_source_mappings
-        sources = sorted({m.source_id for m in iter_source_mappings(record.draft)})
         recovery = self._snapshot_recovery_sources(sources)
         from .failures import SOURCE_FAILURES
         for diagnostic in result['diagnostics']:
             if diagnostic.get('code') in SOURCE_FAILURES:
                 diagnostic['new_snapshot_recovery_available'] = diagnostic.get('source_id') in recovery
+        # Count a source only once per operation, not once per failed mapping.
+        # Unsuccessful mappings on healthy sources are not connection failures.
+        for source_id in sources:
+            failures = [d for d in result['diagnostics']
+                        if d.get('source_id') == source_id and d.get('code') in SOURCE_FAILURES]
+            if failures:
+                primary = next((d for d in failures if d.get('phase') == 'snapshot_open'), failures[0])
+                self.source_circuits.fail(source_id, primary)
+            elif any(w['source_id'] == source_id and w['state'] == 'closed'
+                     and w.get('completed_projections', 0) > 0
+                     for w in result.get('source_read_windows', [])):
+                self.source_circuits.succeeded(source_id)
+        self._sync_source_circuits(sources)
+        self._save_source_circuits()
+        blocked_ids = {s['source_id'] for s in self.source_circuits.blocked(sources)}
+        for diagnostic in result['diagnostics']:
+            if diagnostic.get('source_id') in blocked_ids and diagnostic.get('code') in SOURCE_FAILURES:
+                diagnostic.update(source_blocked=True, new_snapshot_recovery_available=False)
         read_window = {'started_at': started, 'finished_at': datetime.now(timezone.utc).isoformat(),
                        'source_ids': sources, 'consistency': 'independent_source_snapshots',
                        'source_read_windows': result.pop('source_read_windows', []),
@@ -487,6 +588,7 @@ class ConstructionTools:
                 "evidence_ref": evidence.ref, "candidate_graph": current.validation.graph_path,
                 "validation_id": current.validation.validation_id, 'read_window': read_window,
                 'quality_advice': name_mapping_advice(record.draft, visible_graph),
+                'source_circuits': self.source_circuits.summary(),
                 **failure_guidance(result['diagnostics']),
                 **({'resource_state': budget_state} if budget_state else {}),
                 "semantic_assessment": "agent_authored", "published": False}
@@ -536,6 +638,7 @@ class ConstructionTools:
         value = self.workspace.get_draft(draft_id).model_dump(mode="json", by_alias=True) if draft_id else self.workspace.read_summary()
         if draft_id is None:
             value['retained_failed_work'] = self._retained_failed_work()
+            value['source_circuits'] = self.source_circuits.summary()
             from .statistics import graph_statistics
             try:
                 graph = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes)

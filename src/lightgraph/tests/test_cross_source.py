@@ -212,3 +212,68 @@ def test_snapshot_close_failure_cannot_leave_confirmed_result():
     assert result["reasons"] == ["snapshot_close_failed"]
     assert not result["complete"] and not result["consistent"] and not result["confirmed"]
     assert result["source_ref_tuples"] is None
+
+
+@pytest.mark.parametrize('side', ['source', 'target'])
+@pytest.mark.parametrize('phase', ['snapshot_open', 'snapshot_close', 'projection'])
+def test_recoverable_failure_identifies_only_the_actual_endpoint_without_raw_driver_text(side, phase):
+    class FaultSource(MemorySource):
+        def failure(self):
+            code = {'snapshot_open': 'read_only_transaction_failed',
+                    'snapshot_close': 'snapshot_close_failed', 'projection': 'query_execution_failed'}[phase]
+            error = LightGraphError(code, retryable=False)
+            error.database_diagnostic = {
+                'engine': 'gauss', 'stage': {'snapshot_open': 'snapshot_start', 'snapshot_close': 'snapshot_close',
+                                           'projection': 'query'}[phase],
+                'category': 'unknown', 'sqlstate': 'unknown', 'errno': None,
+                'rollback_succeeded': True, 'connection_closed': False, 'recovery': 'rolled_back',
+                'message': 'PRIVATE_PASSWORD SELECT private_column', 'sql': 'SELECT PRIVATE_VALUE'}
+            return error
+
+        @contextmanager
+        def snapshot(self):
+            if phase == 'snapshot_open':
+                raise self.failure()
+            with super().snapshot():
+                yield self
+            if phase == 'snapshot_close':
+                raise self.failure()
+
+        def project(self, *args, **kwargs):
+            if phase == 'projection':
+                raise self.failure()
+            yield from super().project(*args, **kwargs)
+
+    classes = {f'{side}_class': FaultSource}
+    with pair([('A', '001', None)], [('A', '001', None)], **classes) as inputs:
+        result = check(inputs)
+    failure = result['failure']
+    assert failure['source_id'] == ('left' if side == 'source' else 'right')
+    assert failure['phase'] == phase and not failure['retryable']
+    assert result['reasons'] == [failure['code']]
+    assert result['status'] == 'unresolved' and not result['complete'] and not result['confirmed']
+    assert result['unique_matches'] is None and result['source_ref_tuples'] is None
+    assert failure['database']['category'] == 'unknown'
+    assert 'PRIVATE' not in json.dumps(result)
+    assert 'message' not in failure['database'] and 'sql' not in failure['database']
+
+
+def test_shared_adapter_snapshot_failure_does_not_invent_an_endpoint_owner():
+    class SharedFailure(MemorySource):
+        @contextmanager
+        def snapshot(self):
+            raise LightGraphError('read_only_transaction_failed')
+            yield self
+    left = table('left')
+    right = table('right').model_copy(update={'name': 'other_table'})
+    with SharedFailure([left, right], {left.qualified_name: [('A', '001', None)],
+                                      right.qualified_name: [('A', '001', None)]}) as source:
+        result = check_cross_source_reference(source, left, ['code'], source, right, ['code'])
+    assert result['reasons'] == ['read_only_transaction_failed']
+    assert result['complete'] is False and 'failure' not in result
+
+
+def test_successful_cross_source_result_has_no_failure_object():
+    with pair([('A', '001', None)], [('A', '001', None)]) as inputs:
+        result = check(inputs)
+    assert result['confirmed'] and 'failure' not in result

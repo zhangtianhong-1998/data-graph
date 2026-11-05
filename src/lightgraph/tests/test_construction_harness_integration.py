@@ -328,3 +328,105 @@ def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatc
         server.shutdown(); server.server_close(); thread.join(timeout=5)
         if tools is not None:
             tools.close()
+
+
+@pytest.mark.parametrize('large_closeout_result', [False, True])
+def test_real_kernel_stops_repeated_blocked_source_requests(tmp_path, large_closeout_result):
+    """A real kernel cannot spend its call budget repeating a dead source.
+
+    The model deliberately ignores recovery advice. SQL execution and retained
+    validation artifacts are real; only the database snapshot failure is fake.
+    Large tool feedback also exercises native compaction during closeout.
+    """
+    from contextlib import contextmanager
+    from lightgraph.construction.mcp_server import serve_local_tools
+    from lightgraph.construction.tools import ConstructionTools
+    from lightgraph.construction.workspace import dump_yaml
+    from lightgraph.contracts import ColumnSpec, TableSpec
+    from lightgraph.errors import LightGraphError
+    from lightgraph.runtime.config import RunConfig
+    from lightgraph.sources import MemorySource
+
+    class FailedSource(MemorySource):
+        snapshot_attempts = 0
+        @contextmanager
+        def snapshot(self):
+            self.snapshot_attempts += 1
+            raise LightGraphError('database_reconnect_failed')
+            yield  # Keep this a context manager without opening a database.
+
+    tables = [TableSpec(source_id=source, name='items',
+        columns=[ColumnSpec(name='code'), ColumnSpec(name='name')])
+        for source in ('local', 'remote')]
+    good = MemorySource([tables[0]], {tables[0].qualified_name: [('A', 'Local A')]})
+    bad = FailedSource([tables[1]], {tables[1].qualified_name: [('B', 'Remote B')]})
+    config = RunConfig(sources=[], model={'mode': 'in_environment'},
+        goal={'purpose': 'Keep the complete mixed-source draft and healthy local evidence'},
+        max_run_seconds=60)
+    config_path = tmp_path / 'config.yaml'
+    config_path.write_text(dump_yaml(config.model_dump(mode='json')), encoding='utf-8')
+    workspace = tmp_path / 'work'
+    host = ConstructionTools(config, workspace, adapters=[good, bad])
+    authored = {'draft_id': 'mixed', 'entities': [
+        {'type': source, 'key_names': ['id'], 'mappings': [{
+            'source_id': source, 'table': 'items', 'key_columns': ['code'], 'label_column': 'name'}]}
+        for source in ('local', 'remote')]}
+    assert host.call('save_graph_draft', yaml_text=dump_yaml(authored))['status'] == 'ok'
+    original = host.workspace.get_draft('mixed').draft
+    requests, events, tool_results = [], [], []
+    stopped_at = []
+    original_call = host.call
+
+    def observed_call(tool_name, **arguments):
+        result = original_call(tool_name, **arguments)
+        tool_results.append(result)
+        if result.get('code') == 'source_retry_limit_exhausted' and not stopped_at:
+            stopped_at.append(len(requests))
+            if large_closeout_result:
+                result = {**result, 'test_material': 'x' * 100000}
+        return result
+    host.call = observed_call
+
+    class Model(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            requests.append(request)
+            if 'Graph checkpoint rules:' in json.dumps(request['messages'][-1]):
+                respond(self, {'role': 'assistant', 'content':
+                    'The original mixed draft is retained. The remote source requires operator recovery.'}, 'stop')
+            else:
+                respond(self, {'role': 'assistant', 'tool_calls': [{
+                    'index': 0, 'id': f'call{len(requests)}', 'type': 'function', 'function': {
+                        'name': 'mcp__graph__validate_graph_draft',
+                        'arguments': json.dumps({'draft_id': 'mixed'})}}]}, 'tool_calls')
+
+    model = ThreadingHTTPServer(('127.0.0.1', 0), Model)
+    thread = threading.Thread(target=model.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with serve_local_tools(host) as (url, token):
+            result = run_goal(config.goal.purpose, config_path, workspace,
+                HarnessOptions(model='loopback-model', base_url=f'http://127.0.0.1:{model.server_port}/v1',
+                    max_calls=32, max_run_seconds=60,
+                    working_context_tokens=2048 if large_closeout_result else 32768),
+                mcp_url=url, mcp_token_env='GRAPH_TEST_TOKEN',
+                environment={'GRAPH_TEST_TOKEN': token, 'OPENAI_API_KEY': 'local-test-only'},
+                on_event=events.append)
+        assert stopped_at, tool_results
+        assert result['finish_reason'] == 'error'
+        assert result['budget']['stop_reason'] == 'source_retry_limit_exhausted'
+        assert result['budget']['calls'] == len(requests) == stopped_at[0] + 2
+        assert bad.snapshot_attempts == 1
+        assert host.workspace.get_draft('mixed').draft == original
+        retained = host.workspace.get_draft('mixed').validation
+        assert not retained.passed
+        candidate = host.workspace.read_validation_graph('mixed', retained)
+        assert len(candidate['nodes']) == 1 and candidate['nodes'][0]['label'] == 'Local A'
+        assert host.workspace.read_published_graph()['nodes'] == []
+        if large_closeout_result:
+            assert any('Graph checkpoint rules:' in json.dumps(request['messages'][-1])
+                       for request in requests[stopped_at[0]:])
+    finally:
+        model.shutdown(); model.server_close(); thread.join(timeout=5)
+        host.close(); good.close(); bad.close()

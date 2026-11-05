@@ -122,20 +122,23 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         window = {'source_id': source_id, 'requested_at': datetime.now(timezone.utc).isoformat(),
                   'basis': 'client_observed_snapshot_context', 'state': 'opening'}
         source_read_windows.append(window)
-        body_failed = False
+        body_error = None
         try:
             with adapter.snapshot():
                 window.update(opened_at=datetime.now(timezone.utc).isoformat(), state='open')
                 try:
                     yield adapter
-                except BaseException:
-                    body_failed = True
+                except BaseException as exc:
+                    body_error = exc
                     raise
             window['state'] = 'closed'
-        except Exception:
+        except Exception as exc:
             # An exception from another mapping is not evidence that this
             # source failed to open its own transaction.
-            window['state'] = 'closed_after_interruption' if body_failed else 'failed'
+            interrupted = exc is body_error
+            window['state'] = 'closed_after_interruption' if interrupted else 'failed'
+            if not interrupted and isinstance(exc, LightGraphError):
+                exc.construction_source_id = source_id
             raise
         finally:
             window['closed_at'] = datetime.now(timezone.utc).isoformat()
@@ -244,6 +247,9 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         projection_sizes[cache_key] = retained_bytes
         unique_projections.add(cache_key)
         projection_cache[cache_key] = rows
+        for window in source_read_windows:
+            if window['source_id'] == mapping.source_id:
+                window['completed_projections'] = window.get('completed_projections', 0) + 1
         return rows
 
     def identity(kind, key):

@@ -7,6 +7,8 @@ from lightgraph.errors import LightGraphError
 class Cursor:
     def __init__(self, connection, name=None): self.connection=connection; self.name=name; self.result=[]; self.description=[]
     def execute(self, sql, parameters=None):
+        if self.connection.closed:
+            raise RuntimeError('fixture connection is closed')
         self.connection.executed.append((sql, parameters))
         if "current_setting" in sql: self.result=[("on","repeatable read")]
         elif "SELECT pg_catalog.version" in sql: self.result=[("openGauss 6.0.0 test fixture",)]
@@ -25,10 +27,31 @@ class Cursor:
     def close(self): pass
 class Connection:
     def __init__(self): self.executed=[];self.closed=False;self.cancelled=False
-    def cursor(self,name=None): return Cursor(self,name)
+    def cursor(self,name=None):
+        if self.closed: raise RuntimeError('fixture connection is closed')
+        return Cursor(self,name)
     def rollback(self): pass
     def close(self): self.closed=True
     def cancel(self): self.cancelled=True
+
+
+class Driver:
+    """One physical connection per call, shared backend commands for assertions."""
+    def __init__(self, connection_type=Connection):
+        self.initial = connection_type if isinstance(connection_type, Connection) else None
+        self.connection_type = type(self.initial) if self.initial is not None else connection_type
+        self.connections = []
+        self.executed = self.initial.executed if self.initial is not None else []
+
+    def __call__(self, _dsn):
+        connection = self.initial if not self.connections and self.initial is not None else self.connection_type()
+        connection.executed = self.executed
+        self.connections.append(connection)
+        return connection
+
+    @property
+    def current(self):
+        return self.connections[-1]
 
 
 @pytest.mark.parametrize("mode", ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"])
@@ -85,26 +108,29 @@ def test_group_alias_cannot_shadow_column_removed_by_source_allowlist():
         tools.close()
 
 def test_driver_parameters_server_cursor_and_snapshot_lifetime():
-    db=Connection()
-    with GaussSource("SECRET_DSN",source_id="s",allowed_tables=["public.items"],connect_factory=lambda _:db, verified_capabilities={"product":"openGauss", "version":"6.0.0", "driver":"psycopg_dbapi", "capabilities":{"statement_timeout":"verified","query_cancel":"verified"}}) as source:
+    driver=Driver()
+    with GaussSource("SECRET_DSN",source_id="s",allowed_tables=["public.items"],connect_factory=driver, verified_capabilities={"product":"openGauss", "version":"6.0.0", "driver":"psycopg_dbapi", "capabilities":{"statement_timeout":"verified","query_cancel":"verified"}}) as source:
         table=source.describe()[0]
         assert table.columns[0].primary_key
         assert table.comment=="Business registry"
         assert table.unique_keys == [["code"]]
         assert table.foreign_keys[0].target_columns == ["code"]
         assert not source.capabilities().consistent_snapshot
+        assert driver.current.closed
         with source.snapshot():
+            db=driver.current
+            assert not db.closed and len(driver.connections)==2
             assert source.capabilities().consistent_snapshot
             rows=[]
             for batch in source.project(table,["code","name"],predicate={"code":"001"}): rows.extend(batch.rows())
             assert rows==[("001","Expenses")]
             assert source.capabilities().consistent_snapshot
+            source.cancel();assert db.cancelled
         assert not source.capabilities().consistent_snapshot
         generated=[(sql,p) for sql,p in db.executed if 'FROM "public"."items"' in sql][-1]
         assert "001" not in generated[0] and "001" in generated[1].values()
         assert source.stats.queries==1
-        source.cancel();assert db.cancelled
-    assert db.closed
+    assert all(connection.closed for connection in driver.connections)
 
 
 def test_gauss_decimal_aggregate_counts_preserve_zero_and_generic_rows_stay_text():
@@ -175,12 +201,13 @@ def test_nested_snapshot_uses_one_transaction_and_outer_failure_rolls_back():
     class TrackedConnection(Connection):
         rollbacks=0
         def rollback(self): self.rollbacks+=1
-    db=TrackedConnection()
-    with GaussSource("secret",allowed_tables=["public.items"],connect_factory=lambda _:db,
+    driver=Driver(TrackedConnection)
+    with GaussSource("secret",allowed_tables=["public.items"],connect_factory=driver,
         verified_capabilities={"product":"openGauss","version":"6.0.0","driver":"psycopg_dbapi","capabilities":{"statement_timeout":"verified","query_cancel":"verified"}}) as source:
-        initial_rollbacks=db.rollbacks;initial_commands=len(db.executed)
         with pytest.raises(RuntimeError,match="outer failed"):
             with source.snapshot():
+                db=driver.current
+                initial_rollbacks=db.rollbacks;initial_commands=len(db.executed)
                 with source.snapshot():
                     assert source.capabilities().consistent_snapshot
                 assert source.capabilities().consistent_snapshot
@@ -188,15 +215,17 @@ def test_nested_snapshot_uses_one_transaction_and_outer_failure_rolls_back():
                 raise RuntimeError("outer failed")
         assert not source.capabilities().consistent_snapshot
         assert db.rollbacks==initial_rollbacks+1
-        assert sum(sql.startswith("BEGIN ") for sql,_ in db.executed[initial_commands:])==1
+        assert not any(sql.startswith("BEGIN ") for sql,_ in db.executed[initial_commands:])
+        assert len(driver.connections)==2 and all(connection.closed for connection in driver.connections)
 
 
 def test_prefix_uses_bound_like_operator_and_qualified_catalog_controls():
-    db=Connection()
-    with GaussSource("secret",allowed_tables=["public.items"],connect_factory=lambda _:db,
+    driver=Driver()
+    with GaussSource("secret",allowed_tables=["public.items"],connect_factory=driver,
         verified_capabilities={"product":"openGauss","version":"6.0.0","driver":"psycopg_dbapi","capabilities":{"statement_timeout":"verified","query_cancel":"verified"}}) as source:
         table=source.describe()[0]
         list(source.project(table,["code"],predicate={"column":"code","op":"prefix","value":"A_%!"}))
+        db=driver.current
         sql,parameters=[(sql,p) for sql,p in db.executed if 'FROM "public"."items"' in sql][-1]
         assert "LIKE %(p0)s ESCAPE '!'" in sql
         assert parameters["p0"]=="A!_!%!!%"
@@ -209,12 +238,12 @@ def test_snapshot_close_failure_is_safe_and_never_confirms_consistency():
         fail_rollback=False
         def rollback(self):
             if self.fail_rollback:raise RuntimeError("PRIVATE_DRIVER_PAYLOAD")
-    db=FailingCloseConnection()
-    with GaussSource("secret",allowed_tables=["public.items"],connect_factory=lambda _:db,
+    driver=Driver(FailingCloseConnection)
+    with GaussSource("secret",allowed_tables=["public.items"],connect_factory=driver,
         verified_capabilities={"product":"openGauss","version":"6.0.0","driver":"psycopg_dbapi","capabilities":{"statement_timeout":"verified","query_cancel":"verified"}}) as source:
         with pytest.raises(LightGraphError,match="snapshot_close_failed") as caught:
-            with source.snapshot():db.fail_rollback=True
-        db.fail_rollback=False
+            with source.snapshot():driver.current.fail_rollback=True
+        driver.current.fail_rollback=False
         assert not source.capabilities().consistent_snapshot
         assert "PRIVATE_DRIVER_PAYLOAD" not in str(caught.value)
 
@@ -268,10 +297,10 @@ def test_unknown_product_version_cannot_claim_runtime_verification():
         assert not source.capabilities().actual_database_verified
 
 
-def test_runtime_controls_do_not_repeat_catalog_and_partial_failure_is_unverified(monkeypatch):
-    db=Connection();probes=[]
-    with GaussSource("secret",allowed_tables=["public.items"],connect_factory=lambda _:db) as source:
-        before=list(db.executed)
+def test_runtime_controls_requalify_connection_and_partial_failure_is_unverified(monkeypatch):
+    driver=Driver();probes=[]
+    with GaussSource("secret",allowed_tables=["public.items"],connect_factory=driver) as source:
+        assert driver.current.closed
         def probe(*,cancel):
             probes.append(cancel)
             if cancel:raise LightGraphError("query_cancel_unverified")
@@ -279,22 +308,23 @@ def test_runtime_controls_do_not_repeat_catalog_and_partial_failure_is_unverifie
         monkeypatch.setattr(source,"_probe_runtime_control",probe)
         with pytest.raises(LightGraphError,match="query_cancel_unverified"):source.verify_runtime_controls()
         assert probes==[False,True]
-        assert db.executed==before
+        assert len(driver.connections)==2 and all(db.closed for db in driver.connections)
+        assert sum('information_schema.columns' in sql for sql, _ in driver.executed)==2
         assert not source.capabilities().actual_database_verified
         assert source.capabilities().capabilities["query_cancel"]=="unknown"
 
 
 @pytest.mark.parametrize("verify_runtime",[False,True])
-def test_cli_connect_check_uses_single_catalog_preflight(tmp_path,monkeypatch,capsys,verify_runtime):
+def test_cli_connect_check_requalifies_each_physical_connection(tmp_path,monkeypatch,capsys,verify_runtime):
     import json
     import lightgraph.cli as cli
     import lightgraph.sources as sources
     from lightgraph.sources import QueryBudget
     config=tmp_path/"gauss.yaml"
-    config.write_text("sources:\n  - id: gauss\n    kind: gauss_database\n    dsn_env: AUDIT_TEST_DSN\n    allowed_tables: [public.items]\nmax_db_queries: 20\n")
+    config.write_text("sources:\n  - id: gauss\n    kind: gauss_database\n    dsn_env: AUDIT_TEST_DSN\n    allowed_tables: [public.items]\nmax_db_queries: 40\n")
     monkeypatch.setenv("AUDIT_TEST_DSN","TEST_ONLY_DSN")
-    db=Connection();probes=[]
-    def factory(dsn,**kwargs):return GaussSource(dsn,connect_factory=lambda _:db,**kwargs)
+    driver=Driver();probes=[]
+    def factory(dsn,**kwargs):return GaussSource(dsn,connect_factory=driver,**kwargs)
     def probe(self,*,cancel):
         probes.append(cancel)
         self._manifest.capabilities["query_cancel" if cancel else "statement_timeout"]="verified"
@@ -306,10 +336,12 @@ def test_cli_connect_check_uses_single_catalog_preflight(tmp_path,monkeypatch,ca
     manifest=json.loads(output)["gauss"]
     assert "TEST_ONLY_DSN" not in output
     assert manifest["actual_database_verified"] is verify_runtime
-    assert sum("SELECT pg_catalog.version" in sql for sql,_ in db.executed)==1
-    assert sum("information_schema.columns" in sql for sql,_ in db.executed)==1
+    expected_connections=2 if verify_runtime else 1
+    assert len(driver.connections)==expected_connections
+    assert sum("SELECT pg_catalog.version" in sql for sql,_ in driver.executed)==expected_connections
+    assert sum("information_schema.columns" in sql for sql,_ in driver.executed)==expected_connections
     assert probes==([False,True] if verify_runtime else [])
-    assert db.closed
+    assert all(db.closed for db in driver.connections)
 
 
 @pytest.mark.parametrize("cancel_outcome", ["cancelled", "driver_error", "ignored", "late", "never"])
@@ -372,17 +404,17 @@ def test_cancel_probe_cannot_be_satisfied_by_short_statement_timeout(monkeypatch
         def cancel(self):
             if cancel_outcome in {"cancelled", "late"}:self.cancelled=True
             elif cancel_outcome == "driver_error":raise RuntimeError("PRIVATE_DRIVER_DETAIL")
-    db=RuntimeConnection()
-    with GaussSource("secret",allowed_tables=["public.items"],limits=QueryLimits(timeout_ms=1),connect_factory=lambda _:db) as source:
+    driver=Driver(RuntimeConnection)
+    with GaussSource("secret",allowed_tables=["public.items"],limits=QueryLimits(timeout_ms=1),connect_factory=driver) as source:
         if cancel_outcome == "cancelled":
-            source._probe_runtime_control(cancel=True)
+            source.verify_runtime_controls()
             assert source.capabilities().capabilities["query_cancel"]=="verified"
         else:
             with pytest.raises(LightGraphError,match="^query_cancel_unverified$"):
-                source._probe_runtime_control(cancel=True)
+                source.verify_runtime_controls()
             assert source.capabilities().capabilities["query_cancel"]=="unknown"
     assert len(timers) == 1 and timers[0].stopped and timers[0].joined
-    assert db.closed
+    assert all(db.closed for db in driver.connections)
 
 
 class ByteCatalogCursor(Cursor):
@@ -450,20 +482,23 @@ def test_unsupported_lock_timeout_recovers_savepoint_without_replacing_snapshot(
         rollbacks = 0
         def cursor(self, name=None): return TransactionCursor(self, name)
         def rollback(self): self.failed = False; self.rollbacks += 1
-    db = TransactionConnection()
-    with GaussSource("secret", allowed_tables=["public.items"], connect_factory=lambda _: db,
+    driver = Driver(TransactionConnection)
+    with GaussSource("secret", allowed_tables=["public.items"], connect_factory=driver,
                      verified_capabilities={"product":"openGauss", "version":"6.0.0", "driver":"psycopg_dbapi",
                                             "capabilities":{"statement_timeout":"verified", "query_cancel":"verified"}}) as source:
-        commands = [sql for sql, _ in db.executed]
+        db=driver.current
+        commands = [sql for sql, _ in driver.executed]
         assert commands.count("ROLLBACK TO SAVEPOINT lightgraph_lock_timeout") == 1
         assert commands.count("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY") == 1
         assert not db.failed
-        before = db.rollbacks
         with source.snapshot():
+            db=driver.current
+            before = db.rollbacks
             with source.snapshot():
                 assert source.capabilities().consistent_snapshot and db.rollbacks == before
         # Unsupported setting is remembered for this connection, not re-probed.
-        assert sum("SET LOCAL lock_timeout" in sql for sql, _ in db.executed) == 1
+        assert len(driver.connections)==2
+        assert sum("SET LOCAL lock_timeout" in sql for sql, _ in driver.executed) == 2
         assert db.rollbacks == before + 1
 
 
@@ -479,9 +514,14 @@ def test_lock_timeout_non_capability_failures_are_not_swallowed(state, caplog):
     db = FailingConnection()
     with pytest.raises(LightGraphError, match="^database_preflight_failed$") as error:
         GaussSource("secret", allowed_tables=["public.items"], connect_factory=lambda _: db)
-    assert error.value.__cause__.sqlstate == state
+    from lightgraph.sources.database_errors import safe_database_diagnostic
+    detail=safe_database_diagnostic(error.value)
+    assert detail['sqlstate'] == (state or 'unknown')
+    assert detail['stage'] == 'connection_preflight'
+    assert detail['category'] == ({'57014':'interrupted', '28P01':'authentication',
+        '08006':'connection', '42501':'permission'}.get(state, 'unknown'))
     assert "PRIVATE_DRIVER_PASSWORD" not in caplog.text
-    assert "PRIVATE_DRIVER_PASSWORD" not in str(error.value.__cause__)
+    assert "PRIVATE_DRIVER_PASSWORD" not in str(detail)
     import traceback
     assert "PRIVATE_DRIVER_PASSWORD" not in "".join(traceback.format_exception(error.value))
     assert not any("ROLLBACK TO SAVEPOINT" in sql for sql, _ in db.executed)
