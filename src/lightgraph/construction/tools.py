@@ -257,8 +257,52 @@ class ConstructionTools:
             raise LightGraphError('source_fact_data_forbidden')
 
     def _require_draft_sources(self, draft):
-        from .models import iter_source_mappings
-        self._require_fact_sources(mapping.source_id for mapping in iter_source_mappings(draft))
+        from .models import iter_fact_mappings
+        sources = {mapping.source_id for mapping in iter_fact_mappings(draft)}
+        if sources:
+            self._require_fact_sources(sources)
+
+    def _metadata_evidence_issues(self, draft):
+        """Validate issued evidence applicability, not the Agent's semantic claim."""
+        from .models import ColumnReference
+        issues = []
+        catalog = {(t.source_id, t.schema_name, t.name): t for t in self.tables.values()}
+        for category in ('entities', 'relations'):
+            for index, definition in enumerate(getattr(draft, category)):
+                for number, mapping in enumerate(definition.mappings):
+                    references = [(mapping, [])] if isinstance(mapping, ColumnReference) else [
+                        (value, [name]) for name in ('source_metadata', 'target_metadata')
+                        if (value := getattr(mapping, name, None)) is not None]
+                    for column, suffix in references:
+                        key = (column.source_id, column.schema_name, column.table)
+                        table = catalog.get(key)
+                        applicable = set()
+                        if table is not None and column.column in table.column_names:
+                            applicable = {f"{s['doc_id']}@{s['revision']}:{s['section_id']}"
+                                for s in self.documents.context_for(table, [column.column])}
+                        for position, ref in enumerate(column.evidence_refs):
+                            evidence = self.workspace.read_evidence(ref)
+                            source = evidence.source_ref if isinstance(evidence.source_ref, dict) else {}
+                            metadata_probe = (evidence.kind == 'source_probe'
+                                and evidence.details.get('operation') == 'get_metadata'
+                                and evidence.details.get('complete') is True
+                                and (source.get('source_id'), source.get('schema', 'public'), source.get('table')) == key)
+                            document = evidence.kind == 'document_section' and ref in applicable
+                            if not (metadata_probe or document):
+                                issues.append({'code': 'metadata_evidence_not_applicable',
+                                    'path': [category, index, 'mappings', number] + suffix + ['evidence_refs', position],
+                                    'source_id': column.source_id, 'table': column.table, 'column': column.column})
+        return issues
+
+    def _metadata_evidence_error(self, draft):
+        issues = self._metadata_evidence_issues(draft)
+        if issues:
+            return {'status': 'error', 'code': 'metadata_evidence_not_applicable', 'diagnostics': issues,
+                    'next_action': 'Read get_metadata for this authorized table, or read the complete applicable '
+                        'document section. Reference its issued evidence for this column. Query results, '
+                        'validation records and references for other tables cannot establish column definitions. '
+                        'Existing drafts remain available; do not use fact values as column identity.'}
+        return None
 
     def _snapshot_recovery_sources(self, source_ids):
         """Observe recovery eligibility only after the failed snapshot closes."""
@@ -428,6 +472,8 @@ class ConstructionTools:
                         'Use physical table and column names, with the supplied SQL quoting.')
             return {"status": "ok", "operations": operations,
                     "query_planning": {
+                        "mapping_predicates": "Mappings support typed is_not_null/is_null, comparisons and all/any/not. Read reference:predicate-guide.md; never change code identity to a name merely to avoid NULL.",
+                        "column_definitions": "Use metadata_column mappings for evidence-backed catalog column definitions, without reading their fact values. Read reference:metadata-objects.md for row-to-column relations and evidence boundaries.",
                         "profile_columns": "One exact aggregate query per selected column; each may scan the table.",
                         "check_fd": "One key-null aggregate plus one dependency query per selected value column; each may scan the table.",
                         "check_reference": "Actual paired-key coverage; cross-source checks use bounded projections and may be incomplete.",
@@ -464,8 +510,13 @@ class ConstructionTools:
         raise LightGraphError("unknown_construction_material")
 
     def save_graph_draft(self, yaml_text: str):
+        from .workspace import parse_graph_draft
+        draft = parse_graph_draft(yaml_text)
+        error = self._metadata_evidence_error(draft)
+        if error:
+            return error
         previous_entries = self.workspace._manifest()['drafts']
-        record = self.workspace.save_draft(yaml_text)
+        record = self.workspace.save_draft(draft)
         entry = previous_entries.get(record.draft.draft_id)
         previous = DraftRecord.model_validate(self.workspace._read_record(entry['current'])) if entry else None
         from .revision_advice import revision_loss_advice
@@ -512,6 +563,9 @@ class ConstructionTools:
         if mode == 'structure':
             self._check_current_inputs()
             record = self.workspace.get_draft(draft_id)
+            error = self._metadata_evidence_error(record.draft)
+            if error:
+                return error
             for ref in draft_evidence_refs(record.draft):
                 self.workspace.read_evidence(ref)
             from .structure import save_structure_check
@@ -523,13 +577,16 @@ class ConstructionTools:
             raise LightGraphError("metadata_only_query_forbidden")
         self._check_current_inputs()
         record = self.workspace.get_draft(draft_id)
+        error = self._metadata_evidence_error(record.draft)
+        if error:
+            return error
         self._require_draft_sources(record.draft)
         if record.status == "stale":
             raise LightGraphError("stale_graph_draft")
         for ref in draft_evidence_refs(record.draft):
             self.workspace.read_evidence(ref)
-        from .models import iter_source_mappings
-        sources = sorted({m.source_id for m in iter_source_mappings(record.draft)})
+        from .models import iter_fact_mappings
+        sources = sorted({m.source_id for m in iter_fact_mappings(record.draft)})
         stopped = self._source_gate(sources)
         if stopped:
             return stopped
@@ -573,7 +630,7 @@ class ConstructionTools:
         graph = {**result.pop('graph'), 'draft_id': draft_id, 'draft_revision': record.revision,
                  'access_fingerprint': access_fingerprint(self.config),
                  'read_window': read_window,
-                 'evidence_refs': list(dict.fromkeys(record.draft.evidence_refs + [evidence.ref]))}
+                 'evidence_refs': sorted(draft_evidence_refs(record.draft) | {evidence.ref})}
         current = self.workspace.record_validation(draft_id, revision=record.revision,
             passed=result["passed"], diagnostics=result["diagnostics"], metrics=result["metrics"],
             evidence_refs=[evidence.ref], graph=graph, read_window=read_window)

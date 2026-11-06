@@ -78,6 +78,9 @@ class ToolExecutor:
         self._reserved_probe_ids = set()
         self._max_rows = min(128, adapter.limits.max_result_rows)
         self._max_bytes = min(65536, adapter.limits.max_result_bytes, budget.limits.memory_bytes)
+        # A compact model response is independent of the in-process key index.
+        # Source result limits still bound each authorized DISTINCT projection.
+        self._max_working_bytes = budget.limits.memory_bytes
         self.source_adapters=dict(source_adapters or {})
         local_catalog=list(adapter.describe())
         self._local_source_ids={t.source_id for t in local_catalog}
@@ -433,14 +436,17 @@ class ToolExecutor:
                 for t,names in ((source,source_columns),(target,target_columns))])
             adapters=[self.source_adapters[source.source_id],self.source_adapters[target.source_id]]
             # Each endpoint uses count, bounded DISTINCT and version recheck.
-            self.budget.admit(Cost(db_cu=6,memory_bytes=self._max_bytes))
+            self.budget.admit(Cost(db_cu=6,memory_bytes=self._max_working_bytes))
             with self._query_deadlines(adapters):
                 before=[a.stats.queries for a in adapters]
+                result = None
                 try:
                     result=check_cross_source_reference(adapters[0],source,source_columns,adapters[1],target,target_columns,
-                        max_working_bytes=self._max_bytes,metadata_only=not self.allow_source_samples)
+                        max_working_bytes=self._max_working_bytes,metadata_only=not self.allow_source_samples)
                 finally:
-                    self.budget.charge(Cost(db_cu=sum(max(0,a.stats.queries-n) for a,n in zip(adapters,before))))
+                    peak = (result or {}).get('working_memory', {}).get('estimated_peak_bytes', 0)
+                    self.budget.charge(Cost(db_cu=sum(max(0,a.stats.queries-n) for a,n in zip(adapters,before)),
+                                           memory_bytes=peak))
             counts={'source_ref_tuples','null_refs','partial_null_refs','unmatched','ambiguous','unique_matches'}
             return {'aggregates':{k:v for k,v in result.items() if k in counts},
                     'coverage':{k:v for k,v in result.items() if k not in counts|{'sample','rows'}}}

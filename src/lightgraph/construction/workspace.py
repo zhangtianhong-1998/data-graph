@@ -465,6 +465,7 @@ def _merge_graphs(graphs):
                 definition = deepcopy(definition)
                 if category == 'entities':
                     definition.setdefault('display_mode', 'auto')
+                    definition.setdefault('identity_origin', 'row')
                 previous = definitions[category].get(definition['type'])
                 if previous is not None and previous != definition:
                     raise LightGraphError('published_definition_conflict')
@@ -479,6 +480,12 @@ def _merge_graphs(graphs):
                 if any(previous.get(key) != item.get(key) for key in fixed):
                     raise LightGraphError('published_graph_identity_conflict')
                 if category == 'nodes':
+                    if previous.get('identity_origin', 'row') != item.get('identity_origin', 'row'):
+                        raise LightGraphError('published_graph_identity_conflict')
+                    if previous.get('identity_origin') == 'physical_column':
+                        from .metadata_columns import merge_column_supports
+                        merge_column_supports(previous, deepcopy(item))
+                        continue
                     if 'supports' not in previous or 'supports' not in item:
                         if previous.get('label') != item.get('label'):
                             raise LightGraphError('published_graph_identity_conflict')

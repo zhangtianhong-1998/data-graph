@@ -82,6 +82,26 @@ def test_failed_structure_check_is_visible_with_its_diagnostics(checked):
     assert selected['data_validation'] == 'not_run'
 
 
+def test_old_draft_without_new_mapping_defaults_keeps_signed_structure_shape(checked):
+    from lightgraph.contracts import digest
+    config, workspace, table, _, _ = checked
+    path = workspace.root / workspace._manifest()['drafts']['full']['current']
+    payload = safe_load_yaml(path.read_text(encoding='utf-8'))
+    for entity in payload['draft']['entities']:
+        for mapping in entity['mappings']:
+            mapping.pop('kind', None)
+    for relation in payload['draft']['relations']:
+        for mapping in relation['mappings']:
+            for key in ('source_metadata', 'target_metadata', 'metadata_basis'):
+                mapping.pop(key, None)
+    payload['fingerprint'] = digest(payload['draft'])
+    write_yaml(path, payload)
+    result = save_structure_check(workspace, 'full', [table], access=access_fingerprint(config))
+    assert result['passed']
+    selected = load_structure_preview(config)['selected']
+    assert selected['passed'] and selected['draft'] == payload['draft']
+
+
 def test_empty_preview_does_not_create_a_workspace(tmp_path):
     config = RunConfig(sources=[], output_dir=str(tmp_path / 'empty'))
     assert load_structure_preview(config)['selected'] is None

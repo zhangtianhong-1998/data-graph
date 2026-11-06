@@ -277,3 +277,101 @@ def test_successful_cross_source_result_has_no_failure_object():
     with pair([('A', '001', None)], [('A', '001', None)]) as inputs:
         result = check(inputs)
     assert result['confirmed'] and 'failure' not in result
+
+
+@pytest.mark.parametrize('working_limit, complete', [(32 * 1024 * 1024, True), (65536, False)])
+def test_tool_reference_working_set_is_independent_of_model_response_size(working_limit, complete):
+    from lightgraph.discovery.budget import BudgetAllocator, Cost
+    from lightgraph.discovery.tools import ToolExecutor
+
+    class KeysOnly(MemorySource):
+        def project(self, table, columns, **options):
+            assert columns == ['code']  # Never transfer labels or row context for a key comparison.
+            yield from super().project(table, columns, **options)
+
+    rows = [('A', f'PRIVATE_CODE_{index:05d}_' + 'x' * 30, 'PRIVATE_LABEL_' + 'y' * 256)
+            for index in range(4000)]
+    with pair(rows, rows, source_class=KeysOnly, target_class=KeysOnly) as (left, a, right, b):
+        budget = BudgetAllocator(Cost(db_cu=20, memory_bytes=working_limit, seconds=60))
+        tools = ToolExecutor(left, ExtractionGoal(), budget, allow_source_samples=True,
+            source_adapters={'left': left, 'right': right})
+        try:
+            response = tools.execute('check_reference', {
+                'source_table': 'left:public.same_name', 'source_columns': ['code'],
+                'target_table': 'right:public.same_name', 'target_columns': ['code']})
+            assert response['status'] == 'ok', response
+            encoded = json.dumps(response)
+            assert len(encoded.encode()) < 65536
+            assert 'PRIVATE_CODE_' not in encoded and 'PRIVATE_LABEL_' not in encoded
+            coverage = response['coverage']
+            assert coverage['complete'] is complete and coverage['confirmed'] is complete
+            memory = coverage['working_memory']
+            assert memory['limit_bytes'] == working_limit and memory['exact'] is False
+            assert memory['estimated_peak_bytes'] <= working_limit
+            assert budget.used.memory_bytes >= memory['estimated_peak_bytes']
+            if complete:
+                assert response['aggregates']['unique_matches'] == 4000
+                assert memory['estimated_peak_bytes'] > 65536
+                assert left.stats.queries == right.stats.queries == 3
+            else:
+                assert coverage['status'] == 'unresolved'
+                assert coverage['reasons'] == ['memory_budget_exhausted']
+                assert all(value is None for value in response['aggregates'].values())
+                diagnostic = coverage['memory_diagnostic']
+                assert diagnostic['phase'] == 'source_key_index'
+                assert diagnostic['limit_bytes'] == working_limit
+                assert diagnostic['estimated_required_bytes'] > working_limit
+                assert coverage['failure']['source_id'] == 'left'
+                partial = coverage['coverage']['source']
+                assert 0 < partial['observed_distinct_tuples'] < partial['expected_distinct_tuples'] == 4000
+                assert partial['complete'] is False
+                assert coverage['coverage']['target']['observed_distinct_tuples'] == 0
+        finally:
+            tools.close()
+
+
+@pytest.mark.parametrize('discriminators', [[], ['code'], ['code', 'label']])
+def test_distinct_index_reuse_preserves_nulls_and_discriminator_ambiguity(discriminators):
+    refs = [('A', '001', None), ('A', None, None), (None, None, None)]
+    targets = [('A', '001', 'one'), ('A', '001', 'two'), ('A', '001', 'one'),
+               ('A', None, 'ignored'), (None, None, 'ignored')]
+    with pair(refs, targets) as inputs:
+        result = check(inputs, discriminator_columns=discriminators)
+    assert result['complete'] and result['source_ref_tuples'] == 3
+    assert result['null_refs'] == 2 and result['partial_null_refs'] == 1
+    assert result['ambiguous'] == (1 if 'label' in discriminators else 0)
+    assert result['unique_matches'] == (0 if 'label' in discriminators else 1)
+    assert result['unmatched'] == 0
+
+
+def test_target_index_exhaustion_keeps_partial_observations_separate_from_final_counts():
+    source_rows = [('A', 'PRIVATE_0000', None)]
+    target_rows = [('A', f'PRIVATE_{index:04d}', None) for index in range(1000)]
+    with pair(source_rows, target_rows) as inputs:
+        result = check(inputs, max_working_bytes=65536)
+    assert result['status'] == 'unresolved' and result['confirmed'] is False
+    assert result['coverage']['source']['complete'] is True
+    target = result['coverage']['target']
+    assert target['complete'] is False
+    assert 0 < target['observed_distinct_tuples'] < target['expected_distinct_tuples'] == 1000
+    assert result['source_ref_tuples'] is None and result['unique_matches'] is None
+    assert result['memory_diagnostic']['phase'] == 'target_key_index'
+    assert result['failure']['source_id'] == 'right'
+    assert 'PRIVATE_' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('side', ['source', 'target'])
+def test_index_reuse_still_rejects_non_distinct_adapter_output(side):
+    class DuplicateRows(MemorySource):
+        def project(self, table, columns, **options):
+            batch = EphemeralBatch(columns, [('A', '001'), ('A', '001')])
+            try:
+                yield batch
+            finally:
+                batch.release()
+
+    rows = [('A', '001', None), ('A', '002', None)]
+    with pair(rows, rows, **{f'{side}_class': DuplicateRows}) as inputs:
+        result = check(inputs)
+    assert result['reasons'] == ['cross_source_incomplete']
+    assert result['confirmed'] is False and result['source_ref_tuples'] is None

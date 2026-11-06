@@ -10,7 +10,7 @@ def _primary_name_coverage(entity, index, nodes):
     The caller must supply the graph visible to its audience. Mapping numbers
     and counts make the feedback actionable without retaining source values.
     """
-    if not nodes or not any(mapping.label_column or mapping.alias_columns or mapping.display_columns
+    if not nodes or not any(getattr(mapping, 'label_column', None) or getattr(mapping, 'alias_columns', []) or getattr(mapping, 'display_columns', {})
                             for mapping in entity.mappings):
         return None
     missing, alias_only, display_only = 0, 0, 0
@@ -65,6 +65,8 @@ def name_mapping_advice(draft, graph=None):
     for node in (graph or {}).get('nodes', []):
         nodes_by_type.setdefault(node.get('type'), []).append(node)
     for index, entity in enumerate(draft.entities):
+        if any(getattr(mapping, 'kind', None) == 'metadata_column' for mapping in entity.mappings):
+            continue
         has_primary_mapping = any(mapping.label_column for mapping in entity.mappings)
         for number, mapping in enumerate(entity.mappings):
             if has_primary_mapping or not mapping.display_columns:

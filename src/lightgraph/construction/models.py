@@ -10,7 +10,8 @@ class SourceMapping(StrictModel):
     source_id: str = Field(min_length=1)
     table: str = Field(min_length=1)
     schema_name: str = Field(default="public", alias="schema")
-    predicate: dict[str, Any] | None = None
+    predicate: dict[str, Any] | None = Field(default=None,
+        description='Typed Predicate/1.0 filter: is_not_null/is_null have no value, ne uses value; logical all/any/not (and alias). Read reference:predicate-guide.md. No raw SQL.')
     properties: dict[str, str] = Field(default_factory=dict, max_length=128)
     constant_properties: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=32,
         description='Agent-declared mapping annotations, such as the observed slot or endpoint positions. Not identity keys or source-verified values.')
@@ -27,6 +28,7 @@ class SourceMapping(StrictModel):
 
 
 class EntityMapping(SourceMapping):
+    kind: Literal['row'] = 'row'
     key_columns: list[str] = Field(min_length=1, max_length=32)
     label_column: str | None = Field(default=None,
         description='Physical column containing the primary source name. Choose a confirmed name column when available; omission generates a display/identity fallback and does not check name consistency. Never omit a known name to bypass a conflict.')
@@ -43,11 +45,37 @@ class EntityMapping(SourceMapping):
         return value
 
 
+COLUMN_IDENTITY_NAMES = ['source_id', 'schema', 'table', 'column']
+
+
+class ColumnReference(StrictModel):
+    source_id: str = Field(min_length=1)
+    table: str = Field(min_length=1)
+    schema_name: str = Field(default='public', alias='schema')
+    column: str = Field(min_length=1)
+    evidence_refs: list[str] = Field(min_length=1, max_length=128,
+        description='Issued metadata or applicable document references supporting this column meaning; never raw values or invented evidence IDs.')
+
+
+class MetadataColumnMapping(ColumnReference):
+    """One authorized catalog column as a physical semantic object, not its values."""
+    kind: Literal['metadata_column']
+    label: str | None = Field(default=None, min_length=1, max_length=4000,
+        description='Agent-declared primary meaning supported by evidence. If omitted, catalog comment then physical column name is used; no fact values are read.')
+    aliases: list[str] = Field(default_factory=list, max_length=32)
+    semantic_annotations: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=32,
+        description='Evidence-backed Agent interpretations; recorded as declared annotations, separately from observed catalog metadata.')
+
+
+class ColumnEndpoint(ColumnReference):
+    """A fixed column object attached only to observed rows of its own table."""
+
+
 class EntityDefinition(StrictModel):
     type: str = Field(min_length=1, max_length=100)
     description: str = Field(default="", max_length=4000)
     key_names: list[str] = Field(min_length=1, max_length=32)
-    mappings: list[EntityMapping] = Field(min_length=1, max_length=128)
+    mappings: list[EntityMapping | MetadataColumnMapping] = Field(min_length=1, max_length=128)
     display_mode: Literal['auto', 'identity', 'relations'] = Field(default='auto',
         description='For objects without a source label: derive from visible relations or the complete identity. Explicit source labels always take precedence.')
 
@@ -55,6 +83,13 @@ class EntityDefinition(StrictModel):
     def consistent_key_arity(self):
         if len(set(self.key_names)) != len(self.key_names):
             raise ValueError("duplicate_identity_key_name")
+        metadata = [isinstance(m, MetadataColumnMapping) for m in self.mappings]
+        if any(metadata):
+            if not all(metadata):
+                raise ValueError('mixed_entity_identity_origins')
+            if self.key_names != COLUMN_IDENTITY_NAMES:
+                raise ValueError('metadata_column_identity_required')
+            return self
         if any(len(m.key_columns) != len(self.key_names) for m in self.mappings):
             raise ValueError("entity_key_arity_mismatch")
         return self
@@ -65,7 +100,8 @@ class EndpointLookup(StrictModel):
     source_id: str = Field(min_length=1)
     table: str = Field(min_length=1)
     schema_name: str = Field(default='public', alias='schema')
-    predicate: dict[str, Any] | None = None
+    predicate: dict[str, Any] | None = Field(default=None,
+        description='Typed Predicate/1.0 filter: is_not_null/is_null have no value, ne uses value; logical all/any/not (and alias). Read reference:predicate-guide.md. No raw SQL.')
     match_columns: list[str] = Field(min_length=1, max_length=32,
         description='Columns matched to the corresponding relation key_columns, in order. Include tenant or other required matching scope explicitly.')
     key_columns: list[str] = Field(min_length=1, max_length=32,
@@ -83,16 +119,34 @@ class EndpointLookup(StrictModel):
 
 
 class RelationMapping(SourceMapping):
-    source_key_columns: list[str] = Field(min_length=1, max_length=32)
-    target_key_columns: list[str] = Field(min_length=1, max_length=32)
+    source_key_columns: list[str] = Field(default_factory=list, max_length=32)
+    target_key_columns: list[str] = Field(default_factory=list, max_length=32)
+    source_metadata: ColumnEndpoint | None = None
+    target_metadata: ColumnEndpoint | None = None
+    metadata_basis: Literal['schema_applies_to_rows', 'observed_non_null'] | None = Field(default=None,
+        description='Required for a column endpoint. schema_applies_to_rows declares applicability to actual selected rows using evidence; observed_non_null restricts rows by that physical column IS NOT NULL without retaining its values. NULL absence never proves non-applicability.')
     source_lookup: EndpointLookup | None = None
     target_lookup: EndpointLookup | None = None
     equal_endpoints: Literal["error", "omit", "include"] = "error"
 
     @model_validator(mode='after')
     def matching_arity(self):
+        endpoints = [getattr(self, end + '_metadata') for end in ('source', 'target')]
+        if sum(value is not None for value in endpoints) > 1:
+            raise ValueError('metadata_relation_requires_row_endpoint')
+        if any(endpoints) != (self.metadata_basis is not None):
+            raise ValueError('metadata_relation_basis_required')
         for end in ('source', 'target'):
+            metadata = getattr(self, end + '_metadata')
             lookup = getattr(self, end + '_lookup')
+            keys = getattr(self, end + '_key_columns')
+            if metadata is not None:
+                if lookup is not None or keys:
+                    raise ValueError('ambiguous_relation_endpoint')
+                if (metadata.source_id, metadata.schema_name, metadata.table) != (self.source_id, self.schema_name, self.table):
+                    raise ValueError('metadata_relation_input_table_mismatch')
+            elif not keys:
+                raise ValueError('row_endpoint_key_required')
             if lookup and len(getattr(self, end + '_key_columns')) != len(lookup.match_columns):
                 raise ValueError('lookup_match_arity_mismatch')
         return self
@@ -139,9 +193,23 @@ class GraphDraft(StrictModel):
             if relation.source_type not in kinds or relation.target_type not in kinds:
                 raise ValueError("unknown_relation_entity_type")
             for mapping in relation.mappings:
-                if (len(mapping.source_lookup.key_columns if mapping.source_lookup else mapping.source_key_columns) != kinds[relation.source_type]
-                        or len(mapping.target_lookup.key_columns if mapping.target_lookup else mapping.target_key_columns) != kinds[relation.target_type]):
-                    raise ValueError("relation_key_arity_mismatch")
+                for end in ('source', 'target'):
+                    kind = getattr(relation, end + '_type')
+                    metadata = getattr(mapping, end + '_metadata')
+                    entity = next(item for item in self.entities if item.type == kind)
+                    metadata_entity = isinstance(entity.mappings[0], MetadataColumnMapping)
+                    if (metadata is not None) != metadata_entity:
+                        raise ValueError('relation_endpoint_origin_mismatch')
+                    if metadata is not None:
+                        if not any((m.source_id, m.schema_name, m.table, m.column) ==
+                                   (metadata.source_id, metadata.schema_name, metadata.table, metadata.column)
+                                   for m in entity.mappings):
+                            raise ValueError('metadata_endpoint_mapping_missing')
+                    else:
+                        lookup = getattr(mapping, end + '_lookup')
+                        keys = lookup.key_columns if lookup else getattr(mapping, end + '_key_columns')
+                        if len(keys) != kinds[kind]:
+                            raise ValueError('relation_key_arity_mismatch')
                 if mapping.equal_endpoints == "include" and not relation.allow_self_links:
                     raise ValueError("self_link_permission_required")
         try:
@@ -155,6 +223,19 @@ def iter_source_mappings(draft):
     """Enumerate every physical dependency, including relation lookup tables."""
     for definition in draft.entities + draft.relations:
         for mapping in definition.mappings:
+            yield mapping
+            for name in ('source_lookup', 'target_lookup', 'source_metadata', 'target_metadata'):
+                lookup = getattr(mapping, name, None)
+                if lookup is not None:
+                    yield lookup
+
+
+def iter_fact_mappings(draft):
+    """Dependencies needing fact access; column objects need only the catalog."""
+    for definition in draft.entities + draft.relations:
+        for mapping in definition.mappings:
+            if isinstance(mapping, MetadataColumnMapping):
+                continue
             yield mapping
             for name in ('source_lookup', 'target_lookup'):
                 lookup = getattr(mapping, name, None)
@@ -195,4 +276,5 @@ class DraftRecord(StrictModel):
 
 
 def draft_evidence_refs(draft: GraphDraft) -> set[str]:
-    return set(draft.evidence_refs)
+    return set(draft.evidence_refs).union(*(set(getattr(mapping, 'evidence_refs', []))
+        for mapping in iter_source_mappings(draft)))

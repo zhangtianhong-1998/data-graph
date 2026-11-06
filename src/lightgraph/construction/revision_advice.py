@@ -20,13 +20,20 @@ def _source_ref(source):
 
 
 def _mapping_key(mapping):
+    if getattr(mapping, 'kind', None) == 'metadata_column':
+        return _source(mapping) + ('metadata_column', mapping.column)
     keys = ((tuple(mapping.key_columns),) if hasattr(mapping, 'label_column') else
             (tuple(mapping.source_key_columns), tuple(mapping.target_key_columns)))
+    if hasattr(mapping, 'source_metadata'):
+        keys += tuple((name, ref.source_id, ref.schema_name, ref.table, ref.column)
+            for name in ('source_metadata', 'target_metadata') if (ref := getattr(mapping, name)) is not None)
     return _source(mapping) + keys
 
 
 def _mapping_ref(mapping):
     result = {'source': _source_ref(_source(mapping))}
+    if getattr(mapping, 'kind', None) == 'metadata_column':
+        return {**result, 'column': mapping.column, 'source_kind': 'metadata_column'}
     names = ('key_columns',) if hasattr(mapping, 'label_column') else ('source_key_columns', 'target_key_columns')
     result.update({name: list(getattr(mapping, name)) for name in names})
     return result
@@ -83,6 +90,8 @@ def revision_loss_advice(previous_draft, new_draft):
                     continue
                 location['matching_paths'] = [[collection, current_index, 'mappings', index]
                                               for index, _ in matches]
+                if getattr(mapping, 'kind', None) == 'metadata_column':
+                    continue
                 if kind == 'entity' and mapping.label_column and not any(
                         candidate.label_column == mapping.label_column for _, candidate in matches):
                     new_roles = []

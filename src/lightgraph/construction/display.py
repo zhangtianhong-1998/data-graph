@@ -49,6 +49,9 @@ def derive_display_graph(graph, *, copy=True):
                     declared[name].append(value)
         if labels:
             text, origin = labels[0], 'source'
+            label_supports = [s for s in supports or [] if s.get('label') == text]
+            if label_supports and all(s.get('source_kind') in {'catalog', 'declared'} for s in label_supports):
+                origin = 'metadata_declared' if any(s.get('source_kind') == 'declared' for s in label_supports) else 'metadata'
         elif declared:
             fields = {name: ' / '.join(_value(v) for v in sorted(values, key=canonical))
                       for name, values in sorted(declared.items())}

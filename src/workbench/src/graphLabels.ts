@@ -44,6 +44,32 @@ const properties: Record<string, string> = {
   code: '编码字段', key_column: '身份编码字段',
   constant_properties: '来源位置与固定属性', context_columns: '路径上下文字段', identity: '业务身份', source_key_columns: '来源端身份字段', target_key_columns: '目标端身份字段',
   scope_columns: '可见范围字段', label_column: '名称字段',
+  physical_column: '物理字段', catalog_comment: '字段注释', evidence_refs: '证据引用',
+}
+export const supportOriginName = (origin: string) => ({
+  source_query: '事实数据查询', user_input: '用户确认', document: '文档依据',
+  metadata: '授权字段元数据', agent_declared: 'Agent 依据材料声明',
+}[origin] || '规则计算')
+
+export type MetadataEndpoint = {
+  endpoint?: string
+  basis: string
+  column: { source_id: string; schema?: string; table: string; column: string; evidence_refs?: string[] }
+  meaning_origin?: string
+  row_membership?: string
+  non_null_observed?: boolean
+}
+export function metadataRelationValues(endpoint: MetadataEndpoint): Record<string, unknown> {
+  const { column } = endpoint
+  const basis = endpoint.basis === 'schema_applies_to_rows' ? '声明适用于实际行对象' :
+    endpoint.basis === 'observed_non_null' ? '实际行中该字段非空' : '依据未识别'
+  return { '列定义所在端': endpoint.endpoint === 'source' ? '关系起点' : '关系终点',
+    '关系依据': basis, '数据来源': column.source_id, '模式': column.schema || 'public',
+    '表': column.table, '字段': column.column,
+    ...(endpoint.meaning_origin === 'agent_declared' ? { '关系含义': 'Agent 依据材料声明' } : {}),
+    ...(endpoint.row_membership === 'observed_projection' ? { '行对象依据': '来自实际投影行' } : {}),
+    '非空观测': endpoint.non_null_observed === true ? '已观察到非空值；未保留经营数值' : '未声明已观察到非空值',
+    '证据引用': column.evidence_refs || [] }
 }
 const chinese = (value: string) => /[\u3400-\u9fff]/.test(value)
 export function vocabularyLabel(category: keyof DisplaySchema, raw: unknown, schema: DisplaySchema = {}): string {
@@ -84,7 +110,7 @@ export function nodeSearchText(node: GraphNode): string {
 }
 export function nodeProperties(node: GraphNode): Record<string, unknown> {
   const fields = Object.fromEntries(Object.entries(node).filter(([key, value]) =>
-    !['id', 'type', 'kind', 'layer', 'status', 'display_label', 'display_label_basis', 'label_origin', 'identity', 'scopes',
+    !['id', 'type', 'kind', 'layer', 'status', 'display_label', 'display_label_basis', 'label_origin', 'identity_origin', 'identity', 'scopes',
       'provenance', 'supports', 'entity_members', 'members', 'support_ids', 'fact_ids', 'properties'].includes(key) &&
     !(key === 'label' && value === node.id) && !(key === 'conflicts' && Array.isArray(value) && !value.length)))
   return { ...fields, ...(node.properties && typeof node.properties === 'object' ? node.properties : {}) }

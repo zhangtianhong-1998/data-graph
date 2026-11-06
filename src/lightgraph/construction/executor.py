@@ -10,12 +10,16 @@ from lightgraph.contracts import canonical, digest
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.query import QueryCompiler
 from lightgraph.sources.base import aggregate_count
-from .models import GraphDraft, iter_source_mappings
+from .models import GraphDraft, iter_fact_mappings, draft_evidence_refs
 from .access import scope_binding_map, support_scope
 from .display import derive_display_graph
+from .metadata_columns import (is_metadata_mapping, physical_column_key, metadata_endpoint,
+                               mapping_predicate, checked_column, column_node, merge_column_supports)
 
 
 def _projection_columns(mapping):
+    if is_metadata_mapping(mapping):
+        return [mapping.column]
     if hasattr(mapping, 'match_columns'):
         return list(dict.fromkeys(mapping.match_columns + mapping.key_columns))
     keys = (mapping.key_columns if hasattr(mapping, 'key_columns') else
@@ -89,11 +93,14 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         adapter = by_source.get(mapping.source_id)
         cap = min(max_rows, adapter.limits.max_result_rows) if adapter else max_rows
         return canonical([mapping.source_id, mapping.schema_name, mapping.table,
-            sorted(set(_projection_columns(mapping) + scope_columns(mapping))), mapping.predicate, cap])
+            sorted(set(_projection_columns(mapping) + scope_columns(mapping))), mapping.predicate,
+            getattr(mapping, 'metadata_basis', None),
+            physical_column_key(metadata_endpoint(mapping)[1]) if metadata_endpoint(mapping)[1] else None, cap])
 
     # Keep a projection only until its last consumer. Lookup indexes retain
     # their backing rows for this snapshot and therefore remain pinned.
-    remaining_uses = Counter(projection_key(m) for d in draft.entities + draft.relations for m in d.mappings)
+    remaining_uses = Counter(projection_key(m) for d in draft.entities + draft.relations for m in d.mappings
+                             if not is_metadata_mapping(m))
     pinned_projections = {projection_key(lookup) for d in draft.relations for m in d.mappings
                           for lookup in (m.source_lookup, m.target_lookup) if lookup is not None}
     projection_sizes = {}
@@ -101,6 +108,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
 
     def release_projection(mapping):
         nonlocal cache_bytes
+        if is_metadata_mapping(mapping):
+            return
         key = projection_key(mapping)
         remaining_uses[key] -= 1
         if remaining_uses[key] <= 0 and key not in pinned_projections:
@@ -185,6 +194,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         adapter = by_source.get(mapping.source_id)
         if table is None or adapter is None:
             raise LightGraphError('unauthorized_object')
+        _, column_endpoint = metadata_endpoint(mapping)
+        if column_endpoint is not None:
+            checked_column(column_endpoint, allowed, goal)
+        predicate = mapping_predicate(mapping)
         columns = list(dict.fromkeys(_projection_columns(mapping) + scope_columns(mapping)))
         if not columns or set(columns) - set(table.column_names):
             raise LightGraphError('unauthorized_column')
@@ -203,12 +216,12 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                  physical_columns=adapter.compiler.guard.physical_columns)
         # Compile against the filtered catalog before the adapter uses its own
         # catalog, including columns mentioned only in a predicate.
-        compiler.projection(table, columns, predicate=mapping.predicate, limit=cap)
+        compiler.projection(table, columns, predicate=predicate, limit=cap)
         cache_key = projection_key(mapping)
         if cache_key in projection_cache:
             cache_hits += 1
             return projection_cache[cache_key]
-        query = compiler.profile_column_group(table, columns, predicate=mapping.predicate)
+        query = compiler.profile_column_group(table, columns, predicate=predicate)
         expected = None
         for batch in adapter.execute(query, row_limit=1):
             with batch:
@@ -221,7 +234,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         if expected > cap:
             raise LightGraphError('projection_truncated')
         rows, retained_bytes = [], 0
-        stream = adapter.project(table, columns, predicate=mapping.predicate, distinct=True, limit=cap)
+        stream = adapter.project(table, columns, predicate=predicate, distinct=True, limit=cap)
         try:
             for batch in stream:
                 with batch:
@@ -264,6 +277,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     def resolve_endpoint(mapping, row, end):
         """Resolve only matches for this input row; unrelated sets never combine."""
         nonlocal lookup_bytes, lookup_matches, lookup_omitted
+        column = getattr(mapping, end + '_metadata')
+        if column is not None:
+            checked_column(column, allowed, goal)
+            return [(physical_column_key(column), None)]
         columns = getattr(mapping, end + '_key_columns')
         lookup = getattr(mapping, end + '_lookup')
         if lookup is None:
@@ -345,12 +362,14 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             if canonical(value) not in {canonical(v) for v in values}:
                 values.append(value)
 
-    definitions = {'entities': [e.model_dump(mode='json', exclude={'mappings'}) for e in draft.entities],
+    definitions = {'entities': [{**e.model_dump(mode='json', exclude={'mappings'}),
+                    'identity_origin': 'physical_column' if is_metadata_mapping(e.mappings[0]) else 'row'}
+                    for e in draft.entities],
                    'relations': [r.model_dump(mode='json', exclude={'mappings'}) for r in draft.relations]}
     if not draft.entities:
         diagnostic('graph_draft_has_no_entities')
     try:
-        used_sources = {mapping.source_id for mapping in iter_source_mappings(draft)}
+        used_sources = {mapping.source_id for mapping in iter_fact_mappings(draft)}
         with ExitStack() as stack:
             for source_id in sorted(used_sources):
                 clock()
@@ -381,6 +400,18 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                 for index, mapping in enumerate(entity.mappings):
                     location = {'entity_type': entity.type, 'mapping': index, 'source_id': mapping.source_id}
                     try:
+                        if is_metadata_mapping(mapping):
+                            node = column_node(entity, index, mapping, allowed, goal)
+                            previous_node = nodes.get(node['id'])
+                            if previous_node is not None:
+                                previous_size = len(canonical(previous_node).encode())
+                                merge_column_supports(previous_node, node)
+                                update_size(previous_size, previous_node)
+                            else:
+                                nodes[node['id']] = node
+                                update_size(0, node)
+                            checked += 1
+                            continue
                         if blocked_sources(mapping):
                             incomplete_entity_types.add(entity.type)
                             diagnostic('mapping_source_unavailable', **location,
@@ -461,6 +492,15 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                             lookup = getattr(mapping, end + '_lookup')
                             if lookup is not None:
                                 support[end + '_lookup'] = lookup.model_dump(mode='json', by_alias=True)
+                        metadata_end, column_endpoint = metadata_endpoint(mapping)
+                        if column_endpoint is not None:
+                            support['metadata_endpoint'] = {
+                                'endpoint': metadata_end,
+                                'column': column_endpoint.model_dump(mode='json', by_alias=True),
+                                'basis': mapping.metadata_basis,
+                                'meaning_origin': 'agent_declared',
+                                'row_membership': 'observed_projection',
+                                'non_null_observed': mapping.metadata_basis == 'observed_non_null'}
                         for row in rows:
                             clock()
                             sources = resolve_endpoint(mapping, row, 'source')
@@ -539,7 +579,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
              'support_visibility_version': 1,
              'semantic_origin': 'agent_authored', 'purpose': draft.purpose or (goal.purpose if goal else ''),
              'definitions': definitions, 'nodes': sorted(nodes.values(), key=lambda n: n['id']),
-             'edges': sorted(edges.values(), key=lambda e: e['id']), 'evidence_refs': draft.evidence_refs}
+             'edges': sorted(edges.values(), key=lambda e: e['id']), 'evidence_refs': sorted(draft_evidence_refs(draft))}
     for item in graph['nodes']:
         item.pop('label_observed', None)
         observed = sorted({support['label'] for support in item['supports'] if support.get('label') is not None})

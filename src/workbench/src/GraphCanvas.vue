@@ -12,8 +12,8 @@ import { twoHopNeighborhood } from './graphNeighborhood'
 import type { NeighborhoodTraversal } from './graphNeighborhood'
 import PropertyTable from './PropertyTable.vue'
 import TechnicalDetails from './TechnicalDetails.vue'
-import { mergeDisplaySchema, nodeCaption, nodeIdentity, nodeProperties, nodeSearchText, vocabularyDescription, vocabularyLabel } from './graphLabels'
-import type { DisplaySchema } from './graphLabels'
+import { mergeDisplaySchema, metadataRelationValues, nodeCaption, nodeIdentity, nodeProperties, nodeSearchText, supportOriginName, vocabularyDescription, vocabularyLabel } from './graphLabels'
+import type { DisplaySchema, MetadataEndpoint } from './graphLabels'
 
 const props = defineProps<{ graph: Graph; layer: string; loading?: boolean; projectId?: string; includeCandidates?: boolean; configRevision?: string | number }>()
 const search = ref('')
@@ -108,7 +108,7 @@ async function expandNode() {
 }
 const selected = ref<GraphNode | null>(null)
 const selectedEdge = ref<GraphEdge | null>(null)
-type Provenance = { facts: Array<{ id: string; fact_kind: string; status: string; payload: Record<string, unknown> }>; supports: Array<{ id: string; fact_id: string; status: string; origin: string; source_binding: string; rule_id: string; rule_revision?: number; publication_id?: string; document_ref?: string; scope_ref: string; binding?: { constant_properties?: Record<string, unknown>; row_context?: { values?: Record<string, unknown> }; lookup_matches?: Array<Record<string, unknown>> } }>; rules: Array<Record<string, unknown>>; nodes?: GraphNode[]; display_schema?: DisplaySchema; next_offset: number | null; supports_truncated: boolean; total_incident_edges?: number | null }
+type Provenance = { facts: Array<{ id: string; fact_kind: string; status: string; payload: Record<string, unknown> }>; supports: Array<{ id: string; fact_id: string; status: string; origin: string; source_binding: string; rule_id: string; rule_revision?: number; publication_id?: string; document_ref?: string; scope_ref: string; binding?: { source_kind?: string; evidence_refs?: string[]; metadata_endpoint?: MetadataEndpoint; constant_properties?: Record<string, unknown>; row_context?: { values?: Record<string, unknown> }; lookup_matches?: Array<Record<string, unknown>> } }>; rules: Array<Record<string, unknown>>; nodes?: GraphNode[]; display_schema?: DisplaySchema; next_offset: number | null; supports_truncated: boolean; total_incident_edges?: number | null }
 const details = ref<Provenance | null>(null), detailsLoading = ref(false), detailsError = ref('')
 const detailNodes = ref<Record<string, GraphNode>>({})
 const detailSchema = ref<DisplaySchema>({})
@@ -122,7 +122,6 @@ const endpointName = (id: unknown) => {
   const node = graph.value.nodes.find(item => item.id === key) || detailNodes.value[key]
   return node ? nodeCaption(node) : '节点名称尚未加载'
 }
-const originName = (origin: string) => ({ source_query: '数据查询', user_input: '用户确认', document: '文档依据', metadata: '元数据' }[origin] || '规则计算')
 const factTitle = (fact: Provenance['facts'][number]) => fact.fact_kind === 'PropertyValue' ? propertyName(String(fact.payload.name || '')) : fact.fact_kind === 'Edge' ? relationName(fact.payload.relation) : '对象存在'
 const visibleQualifiers = (value: unknown) => Object.fromEntries(Object.entries((value || {}) as Record<string, unknown>).filter(([key]) => !['semantic_basis', 'document_ref', 'source_group'].includes(key)))
 const factValues = (fact: Provenance['facts'][number]) => fact.fact_kind === 'PropertyValue' ? { [String(fact.payload.name)]: fact.payload.value } : fact.fact_kind === 'Edge' ? visibleQualifiers(fact.payload.qualifiers) : { kind: kindName(fact.payload.kind) }
@@ -257,7 +256,7 @@ const adjacent = computed(() => {
 const drawnIncidentEdges = computed(() => selected.value ? edges.value.filter(edge => selected.value!.id === edge.source || selected.value!.id === edge.target).length : 0)
 const knownIncidentEdges = computed(() => details.value?.total_incident_edges ?? (selected.value?.id === graph.value.focus_node_id ? graph.value.focus_total_edges as number | undefined : undefined))
 const display = nodeCaption
-const labelOrigin = (node: GraphNode) => ({ declared: '名称由已声明的展示字段生成', relations: '名称由关联对象和业务身份生成', identity: '名称由业务身份生成' }[String(node.label_origin)] || '')
+const labelOrigin = (node: GraphNode) => ({ declared: '名称由已声明的展示字段生成', relations: '名称由关联对象和业务身份生成', identity: '名称由业务身份生成', metadata: '名称来自字段元数据；此节点代表列定义', metadata_declared: '名称由 Agent 依据元数据或文档声明；此节点代表列定义' }[String(node.label_origin)] || '')
 const accessLabel = (node: GraphNode) => Array.isArray(node.scopes) ? node.scopes.join('、') : ''
 const scopeLabel = (node: GraphNode) => {
   const identity = Object.entries(nodeIdentity(node))
@@ -516,7 +515,10 @@ onUnmounted(() => { fullEpoch++; fullController?.abort(); pageGeneration++; scen
               <p v-else class="muted small-text">{{ endpointName(fact.payload.entity_id) }}</p>
               <PropertyTable :values="factValues(fact)" :label="propertyName" />
               <div v-for="support in details.supports.filter(item => item.fact_id === fact.id)" :key="support.id" class="support-detail">
-                <PropertyTable :values="{ '支持状态': statusName(support.status), '来源类型': originName(support.origin), '可见范围': support.scope_ref, '数据位置': support.source_binding, ...(support.rule_revision != null ? { '映射修订': support.rule_revision } : {}) }" />
+                <PropertyTable :values="{ '支持状态': statusName(support.status), '来源类型': supportOriginName(support.origin), '可见范围': support.scope_ref, '数据位置': support.source_binding, ...(support.rule_revision != null ? { '映射修订': support.rule_revision } : {}) }" />
+                <p v-if="support.binding?.source_kind === 'metadata_column'" class="muted small-text">{{ support.origin === 'agent_declared' ? '名称和含义是 Agent 依据材料作出的声明，引用可追溯不代表已独立确认业务解释。' : '此支持来自授权目录中的列定义，不是经营数值的查询结果。' }}</p>
+                <PropertyTable v-if="support.binding?.evidence_refs?.length" :values="{ '证据引用': support.binding.evidence_refs }" />
+                <div v-if="support.binding?.metadata_endpoint" class="metadata-relation-basis"><h5>行对象与列定义的关系依据</h5><PropertyTable :values="metadataRelationValues(support.binding.metadata_endpoint)" /><p class="muted small-text">{{ support.binding.metadata_endpoint.basis === 'schema_applies_to_rows' ? '适用性来自元数据或文档声明；行对象实际存在，但这份支持不证明经营数值非空。' : support.binding.metadata_endpoint.basis === 'observed_non_null' ? '仅连接实际非空行中的对象；空值不代表该定义不适用。' : '请查看原始映射，当前无法解释此关系依据。' }}</p></div>
                 <div v-if="support.binding?.constant_properties && Object.keys(support.binding.constant_properties).length"><h5>来源位置与固定属性</h5><PropertyTable :values="support.binding.constant_properties" :label="propertyName" /></div><div v-if="support.binding?.row_context?.values"><h5>同一行路径上下文</h5><PropertyTable :values="support.binding.row_context.values" /></div><div v-for="(match, index) in support.binding?.lookup_matches || []" :key="index"><h5>记录匹配依据</h5><PropertyTable :values="lookupValues(match)" /></div><TechnicalDetails :value="support" title="来源标识与引用" />
               </div>
               <TechnicalDetails :value="fact" title="事实标识与原始结构" />

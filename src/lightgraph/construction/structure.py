@@ -12,6 +12,7 @@ from lightgraph.query import QueryCompiler
 from .access import scope_binding_map
 from .executor import _projection_columns
 from .models import GraphDraft
+from .metadata_columns import is_metadata_mapping, metadata_endpoint, mapping_predicate, checked_column
 from .quality import name_mapping_advice
 
 
@@ -43,7 +44,7 @@ def validate_structure(draft, tables, *, goal=None, dialects=None, scope_binding
                 if not column_is_excluded(goal, table, column.name)]})
         compiler = QueryCompiler([table], dialect=(dialects or {}).get(table.source_id, 'postgres'))
         # Compiling a guarded query checks predicates too; it never executes it.
-        compiler.projection(table, selected, predicate=mapping.predicate, limit=1)
+        compiler.projection(table, selected, predicate=mapping_predicate(mapping), limit=1)
         bindings.append({'source_id': table.source_id, 'schema': table.schema_name,
                          'table': table.name, 'columns': selected, 'path': location,
                          'predicate': mapping.predicate})
@@ -60,7 +61,17 @@ def validate_structure(draft, tables, *, goal=None, dialects=None, scope_binding
             for number, mapping in enumerate(definition.mappings):
                 path = [category, index, 'mappings', number]
                 try:
-                    check(mapping, _projection_columns(mapping), path)
+                    if is_metadata_mapping(mapping):
+                        checked_column(mapping, catalog, goal)
+                        bindings.append({'source_id': mapping.source_id, 'schema': mapping.schema_name,
+                            'table': mapping.table, 'columns': [mapping.column], 'path': path,
+                            'source_kind': 'metadata_column', 'evidence_refs': mapping.evidence_refs,
+                            'fact_queries': 0})
+                    else:
+                        check(mapping, _projection_columns(mapping), path)
+                        _, endpoint = metadata_endpoint(mapping)
+                        if endpoint is not None:
+                            checked_column(endpoint, catalog, goal)
                 except LightGraphError as exc:
                     diagnostics.append({'code': exc.code, 'path': path})
                 for name in ('source_lookup', 'target_lookup'):
@@ -90,7 +101,7 @@ def save_structure_check(workspace, draft_id, tables, *, access, **options):
                 'access_fingerprint': access,
                 'checked_at': datetime.now(timezone.utc).isoformat(),
                 'semantic_origin': 'agent_authored',
-                'draft': record.draft.model_dump(mode='json', by_alias=True), **result}
+                'draft': workspace._draft_record_payload(record)['draft'], **result}
     relative = workspace._append_record('structure-checks', artifact)
     manifest = workspace._manifest()
     entry = manifest.setdefault('structure_checks', {}).setdefault(draft_id, {'history': []})

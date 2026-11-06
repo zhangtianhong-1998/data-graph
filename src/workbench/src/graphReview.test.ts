@@ -6,6 +6,7 @@ import GraphCanvas from './GraphCanvas.vue'
 import IdentityCandidates from './IdentityCandidates.vue'
 import RunIssues from './RunIssues.vue'
 import type { Graph } from './types'
+import { nodeProperties } from './graphLabels'
 const api = vi.hoisted(() => ({ request: vi.fn() }))
 vi.mock('./api', async original => ({ ...await original<typeof import('./api')>(), request: api.request }))
 let app: App, root: HTMLDivElement
@@ -16,6 +17,52 @@ beforeEach(() => { api.request.mockReset(); vi.stubGlobal('ResizeObserver', clas
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('业务图来源与归并裁决', () => {
+  it('列定义展示元数据与声明来源，证据引用无需展开JSON', async () => {
+    const definition = { id: 'measure', label: '去年同期季度完成', label_origin: 'metadata_declared',
+      identity_origin: 'physical_column', kind: '度量定义', status: 'accepted',
+      identity: { source_id: 'facts', schema: 'public', table: 'observations', column: 'comparison_total' },
+      properties: { physical_column: ['comparison_total'], catalog_comment: ['去年同期季度完成'] } }
+    api.request.mockResolvedValue({ facts: [{ id: 'measure', fact_kind: 'NodeExistence', status: 'accepted', payload: { entity_id: 'measure', kind: '度量定义' } }],
+      supports: [
+        { id: 'catalog', fact_id: 'measure', status: 'accepted', origin: 'metadata', source_binding: 'facts.public.observations', scope_ref: 'public',
+          binding: { source_kind: 'metadata_column', evidence_refs: ['e-metadata'] } },
+        { id: 'meaning', fact_id: 'measure', status: 'accepted', origin: 'agent_declared', source_binding: 'facts.public.observations', scope_ref: 'public',
+          binding: { source_kind: 'metadata_column', evidence_refs: ['doc@revision:measure-definition'] } },
+      ], rules: [], next_offset: null, supports_truncated: false })
+    mount(GraphCanvas, { graph: { nodes: [definition], edges: [] }, layer: 'business', projectId: 'p' })
+    root.querySelector('.graph-node')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await vi.waitFor(() => expect(root.querySelectorAll('.support-detail')).toHaveLength(2))
+    const tables = [...root.querySelectorAll('.support-detail .property-table')].map(n => n.textContent).join(' ')
+    expect(tables).toContain('授权字段元数据'); expect(tables).toContain('Agent 依据材料声明')
+    expect(tables).toContain('e-metadata'); expect(tables).toContain('doc@revision:measure-definition')
+    expect(tables).not.toContain('事实数据查询')
+    expect(root.querySelector('.graph-detail')?.textContent).toContain('此节点代表列定义')
+    expect(nodeProperties(definition)).not.toHaveProperty('identity_origin')
+    const propertyTables = [...root.querySelectorAll('.graph-detail .property-table')].map(n => n.textContent).join(' ')
+    expect(propertyTables).toContain('物理字段'); expect(propertyTables).toContain('字段注释')
+    expect(propertyTables).not.toContain('physical_column（未提供中文名）')
+    expect(root.querySelector('.support-detail')?.textContent).toContain('不是经营数值的查询结果')
+    expect(root.querySelectorAll('.support-detail')[1]?.textContent).toContain('不代表已独立确认业务解释')
+  })
+  it.each([
+    ['schema_applies_to_rows', '声明适用于实际行对象', '未声明已观察到非空值', '不证明经营数值非空'],
+    ['observed_non_null', '实际行中该字段非空', '已观察到非空值；未保留经营数值', '空值不代表该定义不适用'],
+  ])('行到列定义关系单独展示依据 %s', async (basis, title, observation, note) => {
+    const column = { source_id: 'facts', schema: 'public', table: 'observations', column: 'comparison_total', evidence_refs: ['e-column'] }
+    api.request.mockResolvedValue({ facts: [{ id: 'edge1', fact_kind: 'Edge', status: 'accepted', payload: { source: 'a', target: 'b', relation: 'uses_measure' } }],
+      supports: [{ id: 'pair', fact_id: 'edge1', status: 'accepted', origin: 'source_query', source_binding: 'facts.public.observations', scope_ref: 'public',
+        binding: { metadata_endpoint: { endpoint: 'target', basis, column, meaning_origin: 'agent_declared', row_membership: 'observed_projection', non_null_observed: basis === 'observed_non_null' } } }],
+      rules: [], next_offset: null, supports_truncated: false })
+    mount(GraphCanvas, { graph, layer: 'business', projectId: 'p' })
+    root.querySelector('.graph-node')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await vi.waitFor(() => expect(root.querySelector('.metadata-relation-basis')).not.toBeNull())
+    const values = root.querySelector('.metadata-relation-basis .property-table')?.textContent
+    expect(values).toContain(title); expect(values).toContain(observation)
+    expect(values).toContain('comparison_total'); expect(values).toContain('e-column')
+    expect(values).toContain('来自实际投影行'); expect(values).toContain('Agent 依据材料声明')
+    expect(root.querySelector('.metadata-relation-basis')?.textContent).toContain(note)
+    expect(root.querySelector('.support-detail .property-table')?.textContent).toContain('事实数据查询')
+  })
   it('来源详情展示位置与同一行路径上下文，不要求展开原始JSON', async () => {
     api.request.mockResolvedValue({ facts: [{ id: 'a', fact_kind: 'NodeExistence', status: 'accepted', payload: { entity_id: 'a', kind: '报表项' } }],
       supports: [{ id: 's1', fact_id: 'a', status: 'accepted', origin: 'source_query', source_binding: 's.public.paths', scope_ref: 'public',

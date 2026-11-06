@@ -118,7 +118,6 @@ def check_cross_source_reference(
         target_adapter.compiler.columns(target_table, discriminator_columns)
     target_projection = list(dict.fromkeys(target_columns + discriminator_columns))
     target_key_indexes = [target_projection.index(column) for column in target_columns]
-    target_discriminator_indexes = [target_projection.index(column) for column in discriminator_columns]
     source_coverage = _coverage(source_table, source_columns, predicate)
     target_coverage = _coverage(target_table, target_projection, target_predicate)
     result = {
@@ -127,6 +126,10 @@ def check_cross_source_reference(
         "status": "unresolved", "reasons": [],
         "consistency_scope": "independent_source_snapshots",
         "coverage": {"source": source_coverage, "target": target_coverage},
+        "working_memory": {"limit_bytes": max_working_bytes, "estimated_peak_bytes": 0,
+            "measurement": "conservative_python_key_storage", "exact": False,
+            "scope": "retained_reference_keys_and_distinct_tracking",
+            "excludes": ["adapter_batches", "database_scan_memory", "model_response"]},
     }
     source_keys = {}
     target_bindings = {}
@@ -168,17 +171,26 @@ def check_cross_source_reference(
                                   'snapshot_close' if opened else 'snapshot_open')
             raise
 
-    def reserve(size):
+    def reserve(size, phase):
         nonlocal held_bytes
-        held_bytes += size
-        if held_bytes > max_working_bytes:
-            raise LightGraphError("memory_budget_exhausted")
+        attempted = held_bytes + size
+        if attempted > max_working_bytes:
+            error = LightGraphError("memory_budget_exhausted")
+            error.cross_source_memory_diagnostic = {
+                'code': error.code, 'phase': phase, 'limit_bytes': max_working_bytes,
+                'estimated_retained_bytes': held_bytes, 'requested_bytes': size,
+                'estimated_required_bytes': attempted,
+                'measurement': 'conservative_python_key_storage', 'exact': False}
+            raise error
+        held_bytes = attempted
+        result['working_memory']['estimated_peak_bytes'] = max(
+            result['working_memory']['estimated_peak_bytes'], held_bytes)
 
-    def read_projection(adapter, table, columns, scope, coverage, consume):
+    def read_projection(adapter, table, columns, scope, coverage, consume, seen_keys=None):
         with source_operation(table.source_id, 'projection'):
-            return _read_projection(adapter, table, columns, scope, coverage, consume)
+            return _read_projection(adapter, table, columns, scope, coverage, consume, seen_keys)
 
-    def _read_projection(adapter, table, columns, scope, coverage, consume):
+    def _read_projection(adapter, table, columns, scope, coverage, consume, seen_keys):
         nonlocal held_bytes
         cap = min(max_distinct_rows or adapter.limits.max_result_rows,
                   adapter.limits.max_result_rows)
@@ -189,7 +201,11 @@ def check_cross_source_reference(
         coverage["expected_distinct_tuples"] = expected
         if expected > cap:
             raise LightGraphError("result_truncated")
-        seen = set()
+        # Source keys (and target keys without discriminators) are already the
+        # exact DISTINCT tuple index. Reuse it for duplicate detection instead
+        # of retaining a second copy of every key.
+        owns_seen = seen_keys is None
+        seen = set() if owns_seen else seen_keys
         set_bytes = 0
         hash_sum = 0
         stream = adapter.project(table, columns, predicate=scope, distinct=True, limit=cap)
@@ -208,14 +224,15 @@ def check_cross_source_reference(
                         encoded = _key(row)
                         if encoded in seen:
                             raise LightGraphError("cross_source_incomplete")
-                        size = sys.getsizeof(encoded) + 256
-                        reserve(size)
-                        set_bytes += size
-                        seen.add(encoded)
+                        if owns_seen:
+                            size = sys.getsizeof(encoded) + 256
+                            reserve(size, 'projection_distinct_tracking')
+                            set_bytes += size
+                            seen.add(encoded)
+                        consume(row, encoded)
                         coverage["observed_distinct_tuples"] += 1
                         hash_sum = (hash_sum + int.from_bytes(
                             hashlib.sha256(encoded.encode()).digest(), "big")) % (1 << 256)
-                        consume(row)
             if len(seen) != expected:
                 raise LightGraphError("cross_source_incomplete")
             after = adapter.probe("profile_column_group", table, {"columns": columns}, scope)
@@ -226,29 +243,29 @@ def check_cross_source_reference(
                 "typed_distinct_set_v1", len(seen), f"{hash_sum:064x}")
             coverage["complete"] = True
         finally:
-            seen.clear()
+            if owns_seen:
+                seen.clear()
             held_bytes -= set_bytes
             close = getattr(stream, "close", None)
             if close is not None:
                 close()
 
-    def collect_source(row):
-        encoded = _key(row)
-        reserve(sys.getsizeof(encoded) + 256)
+    def collect_source(row, encoded):
+        reserve(sys.getsizeof(encoded) + 256, 'source_key_index')
         source_keys[encoded] = (any(value is None for value in row), all(value is None for value in row))
 
-    def collect_target(row):
+    def collect_target(row, projected_key):
         key_values = tuple(row[index] for index in target_key_indexes)
+        encoded = _key(key_values) if discriminator_columns else projected_key
+        if encoded not in target_bindings:
+            reserve(sys.getsizeof(encoded) + 256, 'target_key_index')
+            target_bindings[encoded] = 0
         if any(value is None for value in key_values):
             return
-        encoded = _key(key_values)
-        discriminator = _key(tuple(row[index] for index in target_discriminator_indexes))
-        if encoded not in target_bindings:
-            reserve(sys.getsizeof(encoded) + 512)
-            target_bindings[encoded] = set()
-        if discriminator not in target_bindings[encoded]:
-            reserve(sys.getsizeof(discriminator) + 256)
-            target_bindings[encoded].add(discriminator)
+        # The full key+discriminator projection is checked for DISTINCT above;
+        # each such tuple contributes exactly one binding. Only 0/1/many matters
+        # for coverage, so per-key discriminator sets would duplicate the index.
+        target_bindings[encoded] = min(2, target_bindings[encoded] + 1)
 
     try:
         with ExitStack() as snapshots:
@@ -263,9 +280,10 @@ def check_cross_source_reference(
                     if not coverage['consistent']:
                         raise LightGraphError("cross_source_snapshot_unverified")
             read_projection(source_adapter, source_table, source_columns, predicate,
-                            source_coverage, collect_source)
+                            source_coverage, collect_source, source_keys)
             read_projection(target_adapter, target_table, target_projection, target_predicate,
-                            target_coverage, collect_target)
+                            target_coverage, collect_target,
+                            None if discriminator_columns else target_bindings)
             for adapter, table, coverage in (
                 (source_adapter, source_table, source_coverage),
                 (target_adapter, target_table, target_coverage),
@@ -283,7 +301,7 @@ def check_cross_source_reference(
                     counts["null_refs"] += 1
                     counts["partial_null_refs"] += not entirely_null
                     continue
-                matches = len(target_bindings.get(encoded, ()))
+                matches = target_bindings.get(encoded, 0)
                 counts["unmatched" if not matches else "ambiguous" if matches > 1 else "unique_matches"] += 1
         # Snapshot-close failures cannot leave a successful publication signal.
         result.update(counts)
@@ -297,6 +315,9 @@ def check_cross_source_reference(
         if error.code not in _RECOVERABLE:
             raise
         result["reasons"].append(error.code)
+        memory_diagnostic = getattr(error, 'cross_source_memory_diagnostic', None)
+        if memory_diagnostic is not None:
+            result['memory_diagnostic'] = memory_diagnostic
         source_id = getattr(error, 'cross_source_failure_source_id', None)
         if source_id in {source_table.source_id, target_table.source_id}:
             from .sources.database_errors import safe_database_diagnostic
@@ -313,7 +334,5 @@ def check_cross_source_reference(
             all(side["consistent"] for side in result["coverage"].values()))
     finally:
         source_keys.clear()
-        for values in target_bindings.values():
-            values.clear()
         target_bindings.clear()
     return result

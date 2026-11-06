@@ -207,8 +207,10 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             binding = source.get("source", {})
             location = ".".join(str(binding.get(key, "")) for key in ("source_id", "schema", "table") if binding.get(key))
             support_id = digest(identifier, index)
+            origin = {'authorized_catalog': 'metadata', 'agent_declared_semantics': 'agent_declared'}.get(
+                source.get('origin'), 'source_query')
             supports.append({"id": support_id, "support_id": support_id, "fact_id": identifier,
-                             "status": "accepted", "origin": "source_query",
+                             "status": "accepted", "origin": origin,
                              "rule_id": source.get("definition", ""),
                              "source_binding": location, "binding": source,
                              "scope_ref": source.get('scope_ref', 'public')})
@@ -278,7 +280,10 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             "source_columns": source.get("columns", []), "scope_columns": source.get("scope_columns", []),
             "label_column": source.get("label_column"), "scope_ref": support["scope_ref"],
             "constant_properties": source.get('constant_properties', {}),
-            "context_columns": source.get('context_columns', [])}
+            "context_columns": source.get('context_columns', []),
+            **({"metadata_endpoint": source['metadata_endpoint']} if 'metadata_endpoint' in source else {}),
+            **({"source_kind": source['source_kind'], "evidence_refs": source.get('evidence_refs', [])}
+               if source.get('source_kind') == 'metadata_column' else {})}
     return {"facts": facts, "supports": retained[:500], "rules": list(mappings.values()),
             "nodes": [n for n in graph["nodes"] if n["id"] in endpoints], "display_schema": vocabulary(graph),
             "total_facts": len(selected), "total_supports": len(retained), "supports_truncated": len(retained) > 500,

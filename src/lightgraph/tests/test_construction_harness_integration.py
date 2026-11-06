@@ -214,18 +214,23 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
 
 
 @pytest.mark.parametrize("through_runner", [False, True])
-def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatch, through_runner):
+@pytest.mark.parametrize("column_definition", [False, True], ids=['row-objects', 'row-and-column-objects'])
+def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatch, through_runner, column_definition):
     """Only the model's tool calls may create, validate or publish this graph."""
     from lightgraph.construction.mcp_server import serve_local_tools
     from lightgraph.construction.tools import ConstructionTools
     from lightgraph.construction.workspace import dump_yaml
     from lightgraph.runtime.config import RunConfig
     data = tmp_path / "input.csv"
-    data.write_text("甲,乙,丙,丁\n001,设备甲,G1,制造组\n002,设备乙,G1,制造组\n", encoding="utf-8")
+    contents = ("甲,乙,丙,丁,戊\n001,指标甲,O1,办事处甲,987654321\n002,指标乙,,,\n" if column_definition else
+                "甲,乙,丙,丁\n001,设备甲,G1,制造组\n002,设备乙,G1,制造组\n")
+    data.write_text(contents, encoding="utf-8")
+    expected_nodes = 4 if column_definition else 3
     config = RunConfig.model_validate({"sources": [{"id": "input", "kind": "csv_file",
         "path": str(data), "table_name": "无命名模板", "encoding": "utf-8", "delimiter": ",",
         "header": True, "null_values": [""], "type_inference": "text"}],
-        "model": {"mode": "in_environment"}, "goal": {"purpose": "发现设备及其所属组织"},
+        "model": {"mode": "in_environment"}, "goal": {"purpose":
+            "建立指标、办事处及列定义，并仅连接实际非空配对" if column_definition else "发现设备及其所属组织"},
         "output_dir": str(tmp_path / "output"), "max_run_seconds": 60})
     config_path = tmp_path / "config.yaml"
     config_path.write_text(dump_yaml(config.model_dump(mode="json")))
@@ -266,6 +271,27 @@ def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatc
                                 {**source, "key_columns": ["丙"], "label_column": "丁"}]}],
                         "relations": [{"type": "隶属", "source_type": "设备", "target_type": "组织",
                             "mappings": [{**source, "source_key_columns": ["甲"], "target_key_columns": ["丙"]}]}]}
+                    if column_definition:
+                        # Only the scripted model authors these definitions. The
+                        # actual kernel must use MCP to validate and publish them.
+                        # Nested refs deliberately test publication evidence closure.
+                        nonnull = {"column": "丙", "op": "is_not_null"}
+                        draft.update(evidence_refs=[], entities=[
+                            {"type": "Indicator", "key_names": ["code"], "mappings": [
+                                {**source, "key_columns": ["甲"], "label_column": "乙"}]},
+                            {"type": "Office", "key_names": ["code"], "mappings": [
+                                {**source, "key_columns": ["丙"], "label_column": "丁", "predicate": nonnull}]},
+                            {"type": "MeasureDefinition", "key_names": ["source_id", "schema", "table", "column"],
+                             "mappings": [{**source, "kind": "metadata_column", "column": "戊",
+                                "label": "同期季度完成", "aliases": ["Prior quarter completion"],
+                                "evidence_refs": [evidence]}]}], relations=[
+                            {"type": "measured_in", "source_type": "Indicator", "target_type": "Office",
+                             "mappings": [{**source, "source_key_columns": ["甲"], "target_key_columns": ["丙"],
+                                "predicate": nonnull}]},
+                            {"type": "uses_measure", "source_type": "Indicator", "target_type": "MeasureDefinition",
+                             "mappings": [{**source, "source_key_columns": ["甲"], "target_metadata": {
+                                **source, "column": "戊", "evidence_refs": [evidence]},
+                                "metadata_basis": "observed_non_null"}]}])
                     name, arguments = "save_graph_draft", {"yaml_text": dump_yaml(draft)}
                 elif index == 3:
                     decode_result(request)
@@ -274,7 +300,7 @@ def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatc
                     assert decode_result(request)["passed"]
                     name, arguments = "publish_graph_draft", {"draft_id": "设备组织"}
                 else:
-                    assert decode_result(request)["nodes"] == 3
+                    assert decode_result(request)["nodes"] == expected_nodes
                     calls.append("final")
                     respond(self, {"role": "assistant", "content": "已保存图谱。"}, "stop")
                     return
@@ -298,7 +324,7 @@ def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatc
             monkeypatch.setattr(runner, "_trace_event", events.append)
             report = runner.run_construction(config)
             assert report.status == "COMPLETED", report
-            assert report.counts["business_nodes"] == 3 and report.counts["business_edges"] == 2
+            assert report.counts["business_nodes"] == expected_nodes and report.counts["business_edges"] == 2
             result = yaml.safe_load((Path(config.output_dir) / "construction/runtime-result.yaml").read_text())
             assert result["execution_kind"] == "model_runtime"
             tools = ConstructionTools(config, Path(config.output_dir) / "construction")
@@ -314,8 +340,28 @@ def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatc
                          "publish_graph_draft", "final"]
         assert result["finish_reason"] == "completed"
         graph = tools.workspace.read_published_graph()
-        assert len(graph["nodes"]) == 3 and len(graph["edges"]) == 2
-        assert {n["label"] for n in graph["nodes"]} == {"设备甲", "设备乙", "制造组"}
+        assert len(graph["nodes"]) == expected_nodes and len(graph["edges"]) == 2
+        if column_definition:
+            assert {n["label"] for n in graph["nodes"]} == {"指标甲", "指标乙", "办事处甲", "同期季度完成"}
+            nodes = {n['id']: n for n in graph['nodes']}
+            definition, = [n for n in nodes.values() if n['type'] == 'MeasureDefinition']
+            assert definition['identity'] == {'source_id': 'input', 'schema': 'public',
+                                               'table': '无命名模板', 'column': '戊'}
+            assert definition['label_origin'] == 'metadata_declared'
+            assert definition['aliases'] == ['Prior quarter completion']
+            assert {edge['type'] for edge in graph['edges']} == {'uses_measure', 'measured_in'}
+            assert {nodes[edge['source']]['identity']['code'] for edge in graph['edges']} == {'001'}
+            measure_edge, = [e for e in graph['edges'] if e['type'] == 'uses_measure']
+            assert measure_edge['target'] == definition['id']
+            for support in measure_edge['supports']:
+                assert support['provenance']['metadata_endpoint']['non_null_observed'] is True
+                assert '戊' not in support['provenance']['columns']
+            assert '987654321' not in dump_yaml(graph)
+            evidence = next(item['evidence_ref'] for item in observed if 'evidence_ref' in item)
+            assert evidence in graph['evidence_refs']
+            assert tools.workspace.read_evidence(evidence).kind == 'source_probe'
+        else:
+            assert {n["label"] for n in graph["nodes"]} == {"设备甲", "设备乙", "制造组"}
         assert all(io_path(path).is_file() for path in result["trace_files"])
         assert list(tmp_path.rglob("*.yaml"))
         (tmp_path / "notifications.json").write_text(json.dumps(events, ensure_ascii=False), encoding="utf-8")
