@@ -175,7 +175,7 @@ const time = (value?: string) => value ? new Intl.DateTimeFormat('zh-CN', { date
 const size = (value: number) => value < 1024 ? `${value} B` : value < 1024 * 1024 ? `${(value / 1024).toFixed(1)} KB` : `${(value / 1024 / 1024).toFixed(1)} MB`
 const tableKey = (table: Metadata['tables'][number]) => `${table.source_id}.${table.schema}.${table.name}`
 function notify(message: string) { toast.value = message; clearTimeout(toastTimer); toastTimer = setTimeout(() => { toast.value = '' }, 4500) }
-function report(exception: unknown) { if (exception instanceof ApiError && exception.code === 'config_revision_conflict') configurationConflict.value = true; error.value = exception instanceof Error ? exception.message : '操作未完成，请重试。' }
+function report(exception: unknown) { if (exception instanceof ApiError && ['config_revision_conflict', 'model_credential_binding_conflict'].includes(exception.code)) configurationConflict.value = true; error.value = exception instanceof Error ? exception.message : '操作未完成，请重试。' }
 function fillForms(value: RunConfig) {
   configRevision.value = responseRevision(value) || configRevision.value
   configurationConflict.value = false
@@ -321,21 +321,29 @@ function advancedConfig(): RunConfig {
   if ((value as RunConfig).record_trace === false) throw new Error('运行需要保存轨迹，请将 record_trace 设为 true。')
   return value as RunConfig
 }
-async function persistConfiguration(value: RunConfig) {
-  fillForms(await request<RunConfig>(`${path.value}/config`, { method: 'PUT', headers: revisionHeaders(), body: json(value) }))
+type SavedModelBinding = { path: string; revision?: string; expectedModel: { base_url: string; model: string } }
+async function persistConfiguration(value: RunConfig): Promise<SavedModelBinding> {
+  const projectPath = path.value
+  const saved = await request<RunConfig>(`${projectPath}/config`, { method: 'PUT', headers: revisionHeaders(), body: json(value) })
+  // Capture the write response before applying reactive state. A later refresh
+  // must not retarget the key that belongs to this configuration write.
+  const binding = { path: projectPath, revision: responseRevision(saved), expectedModel: { base_url: saved.model?.base_url || '', model: saved.model?.model || '' } }
+  fillForms(saved)
+  return binding
 }
 async function saveForms() {
   const value = advancedDirty.value ? mergeConfigDraft(JSON.parse(advancedBaseline.value), previewConfig(), advancedConfig()) : formConfig()
-  await persistConfiguration(value)
-  await saveModelCredential()
+  const saved = await persistConfiguration(value)
+  await saveModelCredential(saved)
 }
-async function saveModelCredential() {
+async function saveModelCredential(saved: SavedModelBinding) {
   if (modelKey.value) {
     const key = modelKey.value
     try {
-      credentials.value = await request<CredentialStatus>(`${path.value}/credentials/model`, { method: 'PUT', body: json({ api_key: key }) })
+      credentials.value = await request<CredentialStatus>(`${saved.path}/credentials/model`, { method: 'PUT', headers: saved.revision ? { 'If-Match': saved.revision } : {}, body: json({ api_key: key, expected_model: saved.expectedModel }) })
       modelKey.value = ''
     } catch (exception) {
+      if (exception instanceof ApiError && ['config_revision_conflict', 'model_credential_binding_conflict'].includes(exception.code)) configurationConflict.value = true
       throw new Error(`项目配置已保存，但 API key 保存失败，输入已保留。${exception instanceof Error ? exception.message : '请重试。'}`)
     }
   } else {
@@ -355,10 +363,10 @@ async function saveDraft() {
 }
 async function reloadConfiguration() {
   if ((dirty.value || advancedDirty.value) && !window.confirm('重新加载会放弃当前未保存的配置修改，继续吗？')) return
-  await action(async () => { closeDatabaseSource(); await refreshProjectConfig(); notify('已读取服务器配置') })
+  await action(async () => { closeDatabaseSource(); await refreshProjectConfig(); modelKey.value = ''; notify('已读取服务器配置') })
 }
 async function clearModelCredential() {
-  await action(async () => { credentials.value = await request<CredentialStatus>(`${path.value}/credentials/model`, { method: 'DELETE' }); modelKey.value = ''; notify('已清除本机保存的模型密钥') })
+  await action(async () => { credentials.value = await request<CredentialStatus>(`${path.value}/credentials/model`, { method: 'DELETE', headers: revisionHeaders() }); modelKey.value = ''; notify('已清除本机保存的模型密钥') })
 }
 async function previewFileMetadata(file: ProjectFile) {
   await request(`${path.value}/files/${encodeURIComponent(file.file_id)}/metadata`)

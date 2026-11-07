@@ -508,7 +508,8 @@ def test_worker_opens_sources_with_pipe_credentials_and_clears_payload(client,mo
         raise LightGraphError('source_scope_missing')
     monkeypatch.setattr('lightgraph.runtime.config.open_sources',opened)
     execute(payload,path)
-    assert observed==[{'metadata_only': True, 'source_credentials':{'db':'SECRET_PIPE_SOURCE'}}]
+    assert observed==[{'metadata_only': True, 'isolate_database_failures': True,
+                      'source_credentials':{'db':'SECRET_PIPE_SOURCE'}}]
     assert not payload
     assert 'SECRET_PIPE_SOURCE' not in path.read_text()
 

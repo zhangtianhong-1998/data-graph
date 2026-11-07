@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 
 from lightgraph.contracts import canonical
+from lightgraph.source_values import identity_cell
 
 
 def _value(value):
@@ -81,7 +82,7 @@ def derive_display_graph(graph, *, copy=True):
                 if piece not in pieces:
                     pieces.append(piece)
                 for name, value in target.get('identity', {}).items():
-                    if name in node.get('identity', {}) and canonical(node['identity'][name]) == canonical(value):
+                    if name in node.get('identity', {}) and identity_cell(node, name) == identity_cell(target, name):
                         covered.add(name)
             remaining = {name: value for name, value in node.get('identity', {}).items() if name not in covered}
             if remaining:

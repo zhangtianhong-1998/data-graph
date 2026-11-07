@@ -9,6 +9,7 @@ from typing import Any, Iterable, Iterator
 from lightgraph.contracts import QueryLimits, TableSpec
 from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler, ValidatedQuery
+from lightgraph.source_values import source_scalar
 
 
 COUNT_AGGREGATE_OPERATORS = frozenset({"profile_column", "profile_column_group", "check_fd",
@@ -202,21 +203,7 @@ def cursor_batches(cursor, *, limits: QueryLimits, columns: tuple[str, ...], row
         # fetchone avoids a driver-side fetchmany allocation exceeding byte cap.
         raw = cursor.fetchone()
         if raw is None: break
-        from decimal import Decimal
-        from datetime import date, datetime, time as daytime
-        def scalar(v):
-            if isinstance(v, Decimal):
-                if not v.is_finite(): raise LightGraphError("non_finite_source_value")
-                return str(v)
-            if isinstance(v, float) and not math.isfinite(v):
-                raise LightGraphError("non_finite_source_value")
-            if isinstance(v, (date, datetime, daytime)): return v.isoformat()
-            if isinstance(v, (bytes, bytearray, memoryview)):
-                raise LightGraphError("source_value_type_unsupported")
-            if not isinstance(v, (str, int, float, bool, type(None))):
-                raise LightGraphError("source_value_type_unsupported")
-            return v
-        row = tuple(scalar(v) for v in raw); size = row_bytes(row)
+        row = tuple(source_scalar(v) for v in raw); size = row_bytes(row)
         total_rows += 1; total_bytes += size
         if budget is not None: budget.charge_return(1, size)
         stats.returned_rows += 1; stats.returned_bytes += size

@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 import hashlib
-import math
 import sys
 
 from .contracts import canonical, digest
 from .errors import LightGraphError
 from .sources.base import aggregate_count, row_bytes
+from .source_values import scalar_cell, typed_key, SOURCE_KEY_SEMANTICS_VERSION
 
 
 _RECOVERABLE = frozenset({
@@ -41,23 +41,17 @@ def _registered_table(adapter, requested):
 def _cell(value):
     # Never coerce codes, booleans or numbers across sources. A caller must
     # establish and implement any domain conversion outside this checker.
-    if value is None:
-        return ("null", None)
-    if isinstance(value, bool):
-        return ("boolean", value)
-    if isinstance(value, int):
-        return ("integer", value)
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise LightGraphError("cross_source_value_unsupported")
-        return ("real", value)
-    if isinstance(value, str):
-        return ("text", value)
-    raise LightGraphError("cross_source_value_unsupported")
+    try:
+        return scalar_cell(value)
+    except LightGraphError:
+        raise LightGraphError("cross_source_value_unsupported") from None
 
 
 def _key(values):
-    return canonical([_cell(value) for value in values])
+    try:
+        return typed_key(values)
+    except LightGraphError:
+        raise LightGraphError("cross_source_value_unsupported") from None
 
 
 def _coverage(table, columns, predicate):
@@ -124,6 +118,7 @@ def check_cross_source_reference(
         **dict.fromkeys(_COUNT_FIELDS), "complete": False, "consistent": False,
         "confirmed": False, "semantic_identity_confirmed": False,
         "status": "unresolved", "reasons": [],
+        "source_key_semantics": SOURCE_KEY_SEMANTICS_VERSION,
         "consistency_scope": "independent_source_snapshots",
         "coverage": {"source": source_coverage, "target": target_coverage},
         "working_memory": {"limit_bytes": max_working_bytes, "estimated_peak_bytes": 0,
@@ -240,7 +235,7 @@ def check_cross_source_reference(
                 coverage["consistent"] = False
                 raise LightGraphError("cross_source_source_changed")
             coverage["projection_version"] = digest(
-                "typed_distinct_set_v1", len(seen), f"{hash_sum:064x}")
+                "typed_distinct_set_v2", SOURCE_KEY_SEMANTICS_VERSION, len(seen), f"{hash_sum:064x}")
             coverage["complete"] = True
         finally:
             if owns_seen:

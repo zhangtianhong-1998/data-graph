@@ -128,7 +128,8 @@ def test_custom_scopes_preserve_source_connection_behavior(tmp_path, monkeypatch
     config = RunConfig(sources=[], **permissions)
     tools = ConstructionTools(config, tmp_path / 'work')
     tools.close()
-    assert opened == [(config.scopes, config.document_scopes, {'metadata_only': True})]
+    assert opened == [(config.scopes, config.document_scopes,
+                       {'metadata_only': True, 'isolate_database_failures': True})]
     assert (tmp_path / 'work').exists()
 
 

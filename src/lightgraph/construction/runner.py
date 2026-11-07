@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -103,7 +104,8 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
             if budget is not None:
                 budget.deadline = min(budget.deadline, deadline)
         metadata = tools.describe_sources()
-        write_yaml(output / "physical_catalog.yaml", {"tables": metadata["tables"], "documents": metadata["documents"]})
+        write_yaml(output / "physical_catalog.yaml", {"tables": metadata["tables"],
+            "documents": metadata["documents"], "unavailable_sources": metadata['unavailable_sources']})
         if config.resolved_model.mode == "disabled":
             report.issues.append({"code": "model_disabled", "status": "diagnostic"})
             report.counts["metadata_tables"] = len(tools.tables)
@@ -197,6 +199,13 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
             report.validation.setdefault('model_usage', 'incomplete')
         try:
             if tools is not None:
+                if tools.initialization_failures:
+                    report.status = 'PARTIAL'
+                    report.validation['source_initialization_failures'] = deepcopy(tools.initialization_failures)
+                    report.counts['sources_failed_initialization'] = len(tools.initialization_failures)
+                    report.issues.extend({'code': 'source_initialization_failed', 'status': 'partial',
+                        'source_id': failure['source_id'], 'cause_code': failure['code']}
+                        for failure in tools.initialization_failures)
                 source_circuits = tools.source_circuits.summary()
                 if source_circuits['sources']:
                     report.validation['source_circuits'] = source_circuits

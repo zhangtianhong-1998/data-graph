@@ -1,5 +1,5 @@
 schema_version: 1
-updated: '2026-11-05'
+updated: '2026-11-06'
 purpose: 按用户目的从事实数据自主发现图谱；本轮尚未登记真实模型或客户语义验收。
 design: GENERIC_GRAPH_CONSTRUCTION.md
 scope:
@@ -31,6 +31,29 @@ engineering_snapshot:
   status_document: ../../IMPLEMENTATION_STATUS.md
   migration_gaps: CONSTRUCTION_MIGRATION_GAPS.md
 latest_engineering_snapshot:
+  date: '2026-11-06'
+  design: P1_CORRECTNESS_REPAIRS_20261106.md
+  code_base_revision: d96e9110e6bc7a2a3e8ab44f53fed077369399f1
+  code_state: uncommitted_working_tree
+  python_passed: 3128
+  python_failed: 0
+  python_skipped: 0
+  native_kernel_enabled: true
+  model_endpoint: loopback_scripted_fixture
+  frontend_passed: 338
+  frontend_build: passed
+  evidence: ../../runs/p1-repairs-20261106/verification-summary.json
+  real_database_called: false
+  external_model_called: false
+  autonomous_discovery_acceptance: not_run
+  covered_contracts:
+    - credential_config_revision_and_target_binding_preconditions
+    - driver_scalar_types_preserved_in_reference_lookup_and_persistence
+    - prior_validation_requires_new_key_semantics_revalidation
+    - initial_database_failure_isolated_with_partial_report
+    - unavailable_source_dependencies_blocked_without_weakening_authorization_or_budget
+  boundary: 全量回归使用合成数据、驱动替身和本地脚本模型；未验收客户数据库、真实模型发现或现场性能。历史图不自动迁移或修正，旧验证需重做；P2不属于本轮修复范围。
+prior_snapshot_lifecycle_snapshot:
   date: '2026-11-05'
   design: SNAPSHOT_CONNECTION_LIFECYCLE_20261105.md
   python_passed: 2993

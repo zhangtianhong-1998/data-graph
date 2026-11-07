@@ -161,6 +161,72 @@ describe('visible model limits', () => {
     expect(root.textContent).toContain('已在本机保存密钥')
     expect(root.querySelector<HTMLInputElement>('#model-key')!.value).toBe('')
   })
+  it('saves a model key against the revision and normalized binding returned by the config write', async () => {
+    config.model = { ...config.model, base_url: 'https://a.example/v1', model: 'model-a' }
+    const original = vi.mocked(fetch).getMockImplementation()!
+    const credentialWrites: RequestInit[] = []
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/credentials/model')) {
+        credentialWrites.push(init!)
+        return response({ model: true, database_sources: [] })
+      }
+      if (String(input).endsWith('/config') && init?.method === 'PUT') {
+        const result = await original(input, init)
+        config.model!.base_url = 'https://normalized.example/v1'
+        config.model!.model = 'normalized-model'
+        return response(config, result.headers.get('ETag')!)
+      }
+      return original(input, init)
+    })
+    await mount(); await edit('model-key', 'synthetic-key'); button('保存配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存'))
+    expect(credentialWrites).toHaveLength(1)
+    expect(new Headers(credentialWrites[0]!.headers).get('If-Match')).toBe('"2"')
+    expect(JSON.parse(String(credentialWrites[0]!.body))).toEqual({ api_key: 'synthetic-key', expected_model: { base_url: 'https://normalized.example/v1', model: 'normalized-model' } })
+  })
+  it.each(['config_revision_conflict', 'model_credential_binding_conflict'])('retains the key and offers reload after %s without retrying', async code => {
+    const original = vi.mocked(fetch).getMockImplementation()!
+    const credentialWrites: RequestInit[] = []
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/credentials/model')) {
+        credentialWrites.push(init!)
+        return new Response(JSON.stringify({ error: { code } }), { status: 409 })
+      }
+      return original(input, init)
+    })
+    await mount(); await edit('model-key', 'synthetic-key'); button('保存配置').click()
+    await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('API key 保存失败，输入已保留'))
+    expect(root.querySelector<HTMLInputElement>('#model-key')!.value).toBe('synthetic-key')
+    expect(button('重新加载配置')).toBeDefined()
+    expect(credentialWrites).toHaveLength(1)
+    expect(root.querySelector<HTMLTextAreaElement>('#advanced-config')!.value).not.toContain('synthetic-key')
+    // Reload explicitly discards this draft. Do not carry A's retained key into B's form.
+    config.model = { ...config.model, base_url: 'https://b.example/v1', model: 'model-b' }; revision++
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+    button('重新加载配置').click()
+    await vi.waitFor(() => expect(root.querySelector<HTMLInputElement>('#model-url')!.value).toBe('https://b.example/v1'))
+    expect(root.querySelector<HTMLInputElement>('#model-key')!.value).toBe('')
+    expect(credentialWrites).toHaveLength(1)
+  })
+  it('clears a model key with the viewed revision and keeps saved status after a stale clear', async () => {
+    const original = vi.mocked(fetch).getMockImplementation()!
+    const credentialWrites: RequestInit[] = []
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/credentials')) return response({ model: true, database_sources: [] })
+      if (String(input).endsWith('/credentials/model')) {
+        credentialWrites.push(init!)
+        return new Response(JSON.stringify({ error: { code: 'config_revision_conflict' } }), { status: 409 })
+      }
+      return original(input, init)
+    })
+    await mount(); button('清除密钥').click()
+    await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('配置已被其他页面修改'))
+    expect(credentialWrites).toHaveLength(1)
+    expect(credentialWrites[0]!.method).toBe('DELETE')
+    expect(new Headers(credentialWrites[0]!.headers).get('If-Match')).toBe('"1"')
+    expect(root.textContent).toContain('已在本机保存密钥')
+    expect(button('重新加载配置')).toBeDefined()
+  })
   it('shows a safe field diagnostic and retains invalid JSON values for correction', async () => {
     await mount()
     await edit('advanced-config', JSON.stringify({ ...config, model: { ...config.model, max_output_tokens: 'wrong' } }))

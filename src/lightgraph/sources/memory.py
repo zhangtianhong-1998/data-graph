@@ -12,6 +12,7 @@ from lightgraph.query import QueryCompiler
 from lightgraph.query.compiler import ident
 from .base import SourceAdapter, QueryStats, cursor_batches, row_bytes
 from .budget import QueryBudget
+from lightgraph.source_values import SourceText
 
 class MemorySource(SourceAdapter):
     def __init__(self, tables: list[TableSpec], rows: Mapping[str, Iterable[dict | tuple]], *, limits: QueryLimits | None = None, max_memory_bytes: int = 128 * 1024 * 1024, query_budget: QueryBudget | None = None):
@@ -40,6 +41,9 @@ class MemorySource(SourceAdapter):
                     self.query_budget.check_time()
                     row = tuple(raw.get(c) for c in table.column_names) if isinstance(raw, dict) else tuple(raw)
                     if len(row) != len(table.column_names): raise LightGraphError("source_shape_invalid")
+                    # SQLite bindings erase str-subclass driver tags. Never
+                    # silently reinterpret a typed DB key as text in a replay.
+                    if any(isinstance(v, SourceText) for v in row): raise LightGraphError("source_value_type_unsupported")
                     if any(not isinstance(v, (str, int, float, bool, bytes, type(None))) for v in row): raise LightGraphError("source_value_type_unsupported")
                     if any(isinstance(v,float) and not math.isfinite(v) for v in row): raise LightGraphError("non_finite_source_value")
                     self._input_bytes += row_bytes(row) + 64

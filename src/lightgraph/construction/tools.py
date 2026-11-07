@@ -20,6 +20,7 @@ from lightgraph.discovery.budget import BudgetAllocator, Cost
 from lightgraph.discovery.tools import ToolExecutor
 from lightgraph.documents import DocumentCorpus, load_documents
 from lightgraph.errors import LightGraphError
+from lightgraph.source_values import SOURCE_KEY_SEMANTICS_VERSION
 from lightgraph.runtime.config import open_sources
 
 from .models import DraftRecord, GraphDraft, draft_evidence_refs
@@ -52,13 +53,20 @@ class ConstructionTools:
         self._lock = RLock()
         self._own_adapters = adapters is None
         self.adapters = list(adapters if adapters is not None else open_sources(config,
-            metadata_only=config.resolved_model.mode in {"disabled", "metadata_only"}))
+            metadata_only=config.resolved_model.mode in {"disabled", "metadata_only"},
+            isolate_database_failures=True))
+        from lightgraph.sources.unavailable import UnavailableSource
+        self.unavailable_sources = {adapter.source_id: adapter for adapter in self.adapters
+                                    if isinstance(adapter, UnavailableSource)}
+        self.initialization_failures = [adapter.initialization_failure
+                                        for adapter in self.unavailable_sources.values()]
         self.executors = {}
         self._read_chunks = {}
         try:
             self.documents = DocumentCorpus([document for document in load_documents(config.documents)
                 if document.document_id not in config.removed_document_ids])
             mapping = {t.source_id: adapter for adapter in self.adapters for t in adapter.describe()}
+            self._adapters_by_source = {**mapping, **self.unavailable_sources}
             self._fact_data_denied = {source.id for source in config.sources
                 if source.allow_fact_data is False}
             self._fact_data_denied.update(source_id for source_id, adapter in mapping.items()
@@ -67,6 +75,8 @@ class ConstructionTools:
                 llm_tokens=None, memory_bytes=config.max_working_bytes, seconds=config.max_run_seconds))
             self.budget = budget
             for adapter in self.adapters:
+                if isinstance(adapter, UnavailableSource):
+                    continue
                 executor = ToolExecutor(adapter, config.goal, budget, documents=self.documents,
                     allow_source_samples=config.resolved_model.mode in {"in_environment", "approved_external"}
                         and not any(source_id in self._fact_data_denied
@@ -91,11 +101,13 @@ class ConstructionTools:
                  'connection_bindings': [(s.id, digest(value)) for s in config.sources
                     if not s.path and s.dsn_env and (value := os.getenv(s.dsn_env)) is not None]}
                     if any(not s.path for s in config.sources) else None,
-                [(d.document_id, d.revision, d.content_hash) for d in self.documents.documents])
+                [(d.document_id, d.revision, d.content_hash) for d in self.documents.documents],
+                {'source_key_semantics': SOURCE_KEY_SEMANTICS_VERSION})
             self.workspace = GraphWorkspace(workspace, fingerprint)
             self.terminal_reason = None
             from .source_circuit import SourceCircuits
             self.source_circuits = SourceCircuits()
+            self._sync_source_circuits(self.unavailable_sources)
             # Live control state is reset for this worker; durable attempts remain.
             from lightgraph.runtime.retention import atomic_text
             atomic_text(self.workspace.root / 'query-stop.json', json.dumps({'code': None}))
@@ -194,10 +206,9 @@ class ConstructionTools:
     def _sync_source_circuits(self, source_ids):
         """Consult adapter state without SQL, before any new instance operation."""
         for source_id in set(source_ids):
-            executor = self.executors.get(source_id)
-            if executor is None:
+            adapter = self._adapters_by_source.get(source_id)
+            if adapter is None:
                 continue
-            adapter = executor.adapter
             code = getattr(adapter, 'terminal_failure_code', None)
             if isinstance(code, str):
                 self.source_circuits.fail(source_id, {'code': code,
@@ -242,6 +253,7 @@ class ConstructionTools:
                            for key, t in self.tables.items()],
                 "documents": list({s["doc_id"]: {"id": s["doc_id"], "title": titles.get(s["doc_id"], s["doc_id"]), "revision": s["revision"]}
                                    for s in self._sections}.values()),
+                "unavailable_sources": deepcopy(self.initialization_failures),
                 "source_circuits": self.source_circuits.summary(),
                 "workspace": self.workspace.read_summary()}
 
@@ -314,6 +326,13 @@ class ConstructionTools:
     def inspect_source(self, table: str, operation: str, arguments: dict | None = None):
         """Run a named read-only probe using physical names, not guessed IDs."""
         self._check_current_inputs()
+        unavailable = self._unavailable_table_source(table)
+        if unavailable:
+            if operation in {'get_metadata', 'search_knowledge'}:
+                failure = self.unavailable_sources[unavailable].initialization_failure
+                return {**failure, 'status': 'error', 'code': 'source_initialization_failed',
+                        'cause_code': failure['code']}
+            return self._source_gate([unavailable])
         executor, key, physical = self._executor(table)
         arguments = dict(arguments or {})
         is_data_operation = operation not in {'get_metadata', 'search_knowledge'}
@@ -325,6 +344,9 @@ class ConstructionTools:
                 # is metadata-only. Reject before either side reads rows.
                 for field in ('source_table', 'target_table'):
                     if isinstance(arguments.get(field), str):
+                        unavailable = self._unavailable_table_source(arguments[field])
+                        if unavailable:
+                            return self._source_gate([unavailable])
                         source_id = self._executor(arguments[field])[2].source_id
                         self._require_fact_sources([source_id])
                         involved.add(source_id)
@@ -657,6 +679,14 @@ class ConstructionTools:
         mode = mode or self.config.construction_target
         if mode not in {'instances', 'structure'}:
             raise LightGraphError('invalid_construction_mode')
+        from .models import iter_source_mappings
+        record = self.workspace.get_draft(draft_id)
+        failed = sorted({m.source_id for m in iter_source_mappings(record.draft)}
+                        & self.unavailable_sources.keys())
+        if failed:
+            return {'status': 'error', 'code': 'source_initialization_failed',
+                    'retryable': False, 'blocked_sources': [
+                        self.unavailable_sources[source].initialization_failure for source in failed]}
         if mode == 'structure':
             if validation_id is not None:
                 raise LightGraphError('structure_validation_selection_unsupported')
@@ -696,6 +726,7 @@ class ConstructionTools:
         if draft_id is None:
             value['retained_failed_work'] = self._retained_failed_work()
             value['source_circuits'] = self.source_circuits.summary()
+            value['unavailable_sources'] = deepcopy(self.initialization_failures)
             from .statistics import graph_statistics
             try:
                 graph = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes)
@@ -705,3 +736,15 @@ class ConstructionTools:
                     raise
                 value['statistics_status'] = 'stale_published_graph'
         return {"status": "ok", "format": "yaml", "content": dump_yaml(value)}
+
+    def _unavailable_table_source(self, table):
+        # Configured identifiers identify an unavailable source, never create a
+        # readable table or columns. Ambiguous short names remain unauthorized.
+        if any(table in {key, value.name, value.qualified_name,
+                         f'{value.source_id}.{value.qualified_name}'}
+               for key, value in self.tables.items()):
+            return None
+        matches = {source_id for source_id, adapter in self.unavailable_sources.items()
+                   for name in adapter.allowed_tables
+                   if table in {name, name.split('.')[-1], f'{source_id}:{name}', f'{source_id}.{name}'}}
+        return next(iter(matches)) if len(matches) == 1 else None

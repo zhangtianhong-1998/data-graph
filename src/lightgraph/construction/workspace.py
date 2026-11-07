@@ -437,11 +437,17 @@ class GraphWorkspace:
 def _merge_graphs(graphs):
     """Combine independently checked subgraphs without silently replacing facts."""
     from copy import deepcopy
+    from lightgraph.source_values import persisted_identity_key
     result = {'format_version': 1, 'target': 'graph', 'status': 'published',
               'semantic_origin': 'agent_authored', 'definitions': {'entities': [], 'relations': []},
               'nodes': [], 'edges': [], 'evidence_refs': []}
     definitions = {category: {} for category in ('entities', 'relations')}
     items = {category: {} for category in ('nodes', 'edges')}
+    key_versions = {graph.get('source_key_semantics', 'legacy_scalar_v1') for graph in graphs}
+    if len(key_versions) > 1:
+        raise LightGraphError('published_graph_key_semantics_conflict')
+    if key_versions:
+        result['source_key_semantics'] = next(iter(key_versions))
     access = {graph.get('access_fingerprint') for graph in graphs}
     if len(access) > 1:
         raise LightGraphError('published_graph_access_conflict')
@@ -476,8 +482,9 @@ def _merge_graphs(graphs):
                 if previous is None:
                     items[category][item['id']] = deepcopy(item)
                     continue
-                fixed = ('type', 'identity') if category == 'nodes' else ('type', 'source', 'target')
-                if any(previous.get(key) != item.get(key) for key in fixed):
+                fixed = ('type',) if category == 'nodes' else ('type', 'source', 'target')
+                if (any(previous.get(key) != item.get(key) for key in fixed)
+                        or category == 'nodes' and persisted_identity_key(previous) != persisted_identity_key(item)):
                     raise LightGraphError('published_graph_identity_conflict')
                 if category == 'nodes':
                     if previous.get('identity_origin', 'row') != item.get('identity_origin', 'row'):

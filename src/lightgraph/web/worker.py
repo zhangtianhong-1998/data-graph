@@ -103,7 +103,8 @@ def execute(payload, result_path):
         # They never enter the persisted RunConfig or process environment.
         options = {"source_credentials": payload["source_credentials"]} if payload.get("source_credentials") else {}
         sources = open_sources(config,
-            metadata_only=config.resolved_model.mode in {"disabled", "metadata_only"}, **options)
+            metadata_only=config.resolved_model.mode in {"disabled", "metadata_only"},
+            isolate_database_failures=True, **options)
         opening_sources = False
         stage = 'construction'
         emit_progress("initializing", "source_open_completed")

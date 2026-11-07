@@ -245,7 +245,7 @@ def load_config(path):
         raise LightGraphError("config_invalid") from None
 
 
-def open_sources(config, *, metadata_only=False, source_credentials=None):
+def open_sources(config, *, metadata_only=False, source_credentials=None, isolate_database_failures=False):
     from ..sources import ExcelSource, CSVSource, GaussSource, MySQLSource
     sources=[]
     from ..sources.budget import QueryBudget
@@ -296,8 +296,20 @@ def open_sources(config, *, metadata_only=False, source_credentials=None):
                     # Verify the current connection, rather than treating the
                     # checkbox or a previously uploaded file as capability proof.
                     options['probe_runtime_limits'] = True
-                sources.append(adapter(dsn,source_id=s.id,allowed_tables=s.allowed_tables,
-                    allowed_columns=s.allowed_columns,limits=config.limits,verified_capabilities=verified,query_budget=budget,**options))
+                try:
+                    sources.append(adapter(dsn,source_id=s.id,allowed_tables=s.allowed_tables,
+                        allowed_columns=s.allowed_columns,limits=config.limits,verified_capabilities=verified,query_budget=budget,**options))
+                except LightGraphError as exc:
+                    from ..sources.unavailable import UnavailableSource, isolatable_initialization_failure
+                    if not isolate_database_failures or not isolatable_initialization_failure(exc):
+                        raise
+                    # Do not turn an exhausted shared run into a per-source
+                    # outage or grant a fresh budget to the remaining sources.
+                    budget.check_time()
+                    if budget.snapshot()['remaining_queries'] == 0:
+                        from ..errors import BudgetExceeded
+                        raise BudgetExceeded('query_budget_exhausted') from None
+                    sources.append(UnavailableSource(s, exc, limits=config.limits, query_budget=budget))
         return sources
     except Exception:
         for s in sources:s.close()

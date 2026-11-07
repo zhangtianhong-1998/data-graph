@@ -2,6 +2,7 @@
 from collections import Counter, defaultdict
 
 from lightgraph.contracts import canonical
+from lightgraph.source_values import persisted_identity_key
 
 
 def directed_topology(node_ids, edges):
@@ -112,7 +113,7 @@ def graph_statistics(graph):
         'integrity': {
             'duplicate_node_ids': len(nodes) - len(ids),
             'duplicate_edge_ids': len(edges) - len({e['id'] for e in edges}),
-            'duplicate_node_identities': len(nodes) - len({canonical([n['type'], n.get('identity', {})]) for n in nodes}),
+            'duplicate_node_identities': len(nodes) - len({(n['type'], persisted_identity_key(n)) for n in nodes}),
             'duplicate_edge_endpoints': len(edges) - len({(e['type'], e['source'], e['target']) for e in edges}),
             'dangling_edges': sum(e['source'] not in ids or e['target'] not in ids for e in edges),
         },

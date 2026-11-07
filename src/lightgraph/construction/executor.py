@@ -10,6 +10,8 @@ from lightgraph.contracts import canonical, digest
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.query import QueryCompiler
 from lightgraph.sources.base import aggregate_count
+from lightgraph.source_values import (source_scalar, scalar_kind, typed_key, identity_values,
+    typed_value, plain_value, SOURCE_KEY_SEMANTICS_VERSION)
 from .models import GraphDraft, iter_fact_mappings, draft_evidence_refs
 from .access import scope_binding_map, support_scope
 from .display import derive_display_graph
@@ -242,7 +244,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                         raise LightGraphError('projection_columns_mismatch')
                     for row in batch:
                         clock()
-                        item = dict(zip(batch.columns, row))
+                        item = dict(zip(batch.columns, (source_scalar(value) for value in row)))
                         retained_bytes += len(canonical(item).encode())
                         if retained_bytes + graph_bytes + cache_bytes + lookup_bytes > max_working_bytes:
                             raise LightGraphError('memory_budget_exhausted')
@@ -266,7 +268,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         return rows
 
     def identity(kind, key):
-        return 'n_' + digest(kind, key)
+        return 'n_' + digest(kind, identity_values(key))
 
     def key_for(row, columns):
         key = [row[c] for c in columns]
@@ -293,21 +295,21 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                 match = [candidate[c] for c in lookup.match_columns]
                 if any(v is None or v == '' for v in match):
                     continue
-                token = canonical(match)
+                token = typed_key(match)
                 lookup_bytes += len(token.encode()) + 16
                 if graph_bytes + cache_bytes + lookup_bytes > max_working_bytes:
                     raise LightGraphError('memory_budget_exhausted')
                 index[token].append(candidate)
             lookup_indexes[cache_key] = index
         values = [row[c] for c in columns]
-        matched = lookup_indexes[cache_key].get(canonical(values), [])
+        matched = lookup_indexes[cache_key].get(typed_key(values), [])
         if not matched:
             if lookup.on_missing == 'omit':
                 lookup_omitted += 1
                 return []
             raise LightGraphError('lookup_reference_unmatched')
         resolved = [(key_for(candidate, lookup.key_columns), candidate) for candidate in matched]
-        if lookup.cardinality == 'one' and len({canonical(key) for key, _ in resolved}) > 1:
+        if lookup.cardinality == 'one' and len({typed_key(key) for key, _ in resolved}) > 1:
             raise LightGraphError('lookup_reference_ambiguous')
         answers = []
         for key, candidate in resolved:
@@ -315,9 +317,12 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             details = {'endpoint': end, 'source': origin, 'match_columns': lookup.match_columns,
                        'key_columns': lookup.key_columns, 'input_columns': columns,
                        'input_values': values, 'resolved_key': key,
+                       'input_value_types': [scalar_kind(value) for value in values],
+                       'resolved_key_types': [scalar_kind(value) for value in key],
                        'scope_ref': support_scope(candidate, scope_columns(lookup))}
             content = {c: candidate[c] for c in sorted(set(_projection_columns(lookup) + scope_columns(lookup)))}
-            details['row_context'] = {'id': 'ctx_' + digest(origin, content), 'values': content}
+            details['row_context'] = {'id': 'ctx_' + digest(origin, typed_value(content)), 'values': content,
+                                     'value_types': {name: scalar_kind(value) for name, value in content.items()}}
             answers.append((key, details))
             lookup_matches += 1
         return answers
@@ -338,7 +343,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             # A stable content key links projections of the same authorized row
             # context. Equal rows share evidence; this is not a physical row ID.
             values = {name: row[name] for name in sorted(mapping.context_columns)}
-            support['row_context'] = {'id': 'ctx_' + digest(origin['source'], values), 'values': values}
+            support['row_context'] = {'id': 'ctx_' + digest(origin['source'], typed_value(values)), 'values': values,
+                                     'value_types': {name: scalar_kind(value) for name, value in values.items()}}
         if hasattr(mapping, 'alias_columns'):
             value = row[mapping.label_column] if mapping.label_column else None
             support['label'] = str(value) if value not in (None, '') else None
@@ -440,7 +446,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                 node = nodes[node_id] = {'id': node_id, 'type': entity.type,
                                     'label': str(label) if label is not None else '',
                                     'label_observed': label is not None,
-                                    'identity': dict(zip(entity.key_names, key)), 'aliases': [],
+                                    'identity': dict(zip(entity.key_names, key)),
+                                    'identity_types': dict(zip(entity.key_names, map(scalar_kind, key))), 'aliases': [],
                                     'properties': {}, 'provenance': [], 'supports': []}
                             elif label is not None:
                                 if any(previous_support['scope_ref'] == current_support['scope_ref']
@@ -547,7 +554,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                         if 'row_context' not in current_support:
                                             values = {c: row[c] for c in sorted(set(_projection_columns(mapping) + scope_columns(mapping)))}
                                             current_support['row_context'] = {
-                                                'id': 'ctx_' + digest(support['source'], values), 'values': values}
+                                                'id': 'ctx_' + digest(support['source'], typed_value(values)), 'values': values,
+                                                'value_types': {name: scalar_kind(value) for name, value in values.items()}}
                                     if current_support not in edge['supports']:
                                         edge['supports'].append(current_support)
                                     update_size(previous, edge)
@@ -576,6 +584,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         diagnostic('construction_source_execution_failed')
     passed = not diagnostics
     graph = {'format_version': 1, 'target': 'graph', 'status': 'validated' if passed else 'candidate',
+             'source_key_semantics': SOURCE_KEY_SEMANTICS_VERSION,
              'support_visibility_version': 1,
              'semantic_origin': 'agent_authored', 'purpose': draft.purpose or (goal.purpose if goal else ''),
              'definitions': definitions, 'nodes': sorted(nodes.values(), key=lambda n: n['id']),
@@ -610,4 +619,4 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                         'nodes': len(nodes), 'edges': len(edges), 'equal_endpoints_omitted': omitted,
                         'projection_cache_hits': cache_hits, 'unique_projections': len(unique_projections),
                         'lookup_matches': lookup_matches, 'lookup_inputs_omitted': lookup_omitted},
-            'graph': rendered}
+            'graph': plain_value(rendered)}

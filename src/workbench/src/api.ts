@@ -46,6 +46,7 @@ const messages: Record<string, string> = {
   session_required: '页面会话已失效，请刷新后继续，已保存的密钥和连接信息会自动恢复。', session_invalid: '页面会话已失效，请刷新后继续，已保存的密钥和连接信息会自动恢复。',
   credential_session_invalid: '页面会话已失效，请刷新后继续，已保存的密钥和连接信息会自动恢复。', credential_session_capacity_reached: '服务当前会话已满，请稍后重试。',
   model_endpoint_required: '请先填写并保存模型服务地址和模型名称。',
+  model_credential_binding_conflict: '模型服务地址或名称已变化，密钥未保存。请重新加载配置并核对密钥对应的服务。',
   database_tls_required: '远程数据库要求 TLS 证书校验，请使用包含 TLS 配置的连接串。',
   database_sslmode_invalid: '连接串中的 sslmode 无效，请修正该参数，或删除该参数后在表单中选择。',
   database_sslmode_not_supported: '此 SSL 模式配置仅用于 Gauss 数据库。',

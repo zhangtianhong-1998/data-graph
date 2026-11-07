@@ -123,8 +123,14 @@ class ImportConfig(InputModel):
     file_id: str
 
 
+class ExpectedModel(InputModel):
+    base_url: str
+    model: str
+
+
 class ModelCredential(InputModel):
     api_key: SecretStr = Field(min_length=1,max_length=16384)
+    expected_model: ExpectedModel
 
 
 class DeleteConnectionDraft(InputModel):
@@ -328,19 +334,27 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return credential_status(pid,x_workbench_session)
 
     @app.put('/api/projects/{pid}/credentials/model')
-    def model_credential(pid:str,data:ModelCredential,x_workbench_session:str|None=Header(default=None)):
+    def model_credential(pid:str,data:ModelCredential,x_workbench_session:str|None=Header(default=None),if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             credentials.require(pid,x_workbench_session)
-            saved_connections.save_model(pid,workspace.resolved_config(pid),data.api_key.get_secret_value())
+            workspace.require_config_revision(pid,if_match)
+            config=workspace.resolved_config(pid)
+            model=config.resolved_model
+            # The key belongs to the configuration the page saved, not whichever
+            # endpoint another tab (or an edited Agent file) selected afterward.
+            if (data.expected_model.base_url,data.expected_model.model)!=(model.base_url,model.model):
+                raise LightGraphError('model_credential_binding_conflict')
+            saved_connections.save_model(pid,config,data.api_key.get_secret_value())
             credentials.clear_model_sessions(pid)
             return credential_status(pid,x_workbench_session)
 
     @app.delete('/api/projects/{pid}/credentials/model')
-    def clear_model_credential(pid:str,x_workbench_session:str|None=Header(default=None)):
+    def clear_model_credential(pid:str,x_workbench_session:str|None=Header(default=None),if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             credentials.require(pid,x_workbench_session)
+            workspace.require_config_revision(pid,if_match)
             saved_connections.delete_model(pid)
             credentials.clear_model_sessions(pid)
             return credential_status(pid,x_workbench_session)
