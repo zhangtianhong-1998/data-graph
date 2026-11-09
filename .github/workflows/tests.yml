@@ -78,7 +78,7 @@ jobs:
       - name: Install locked kernel and persistence support
         run: python scripts/bootstrap_harness.py
       - name: Exercise actual kernel with loopback model only
-        run: python -m pytest -q src/lightgraph/tests/test_construction_harness.py src/lightgraph/tests/test_construction_harness_integration.py src/lightgraph/tests/test_web_model_settings_runtime.py
+        run: python -m pytest -q src/lightgraph/tests/test_construction_harness.py src/lightgraph/tests/test_construction_harness_integration.py src/lightgraph/tests/test_construction_mcp_native_deadline.py src/lightgraph/tests/test_web_model_settings_runtime.py
 
   frontend:
     runs-on: ubuntu-latest

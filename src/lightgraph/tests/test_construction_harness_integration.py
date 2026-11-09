@@ -24,6 +24,60 @@ pytestmark = pytest.mark.skipif(os.environ.get("LIGHTGRAPH_TEST_HARNESS") != "1"
                                 reason="real kernel smoke requires scripts/bootstrap_harness.py")
 
 
+@pytest.mark.skipif(os.environ.get('LIGHTGRAPH_TEST_LONG_MCP') != '1',
+                   reason='real 310-second transport regression is explicitly opt-in')
+def test_native_kernel_validation_survives_default_fetch_300_second_limit(tmp_path):
+    """Keep native fetch defaults and the production SSE heartbeat unchanged."""
+    from lightgraph.construction.mcp_server import serve_local_tools
+    calls, requests, durations = [], [], []
+    stop = threading.Event()
+    marker = 'long-validation-completed-once'
+    class Host:
+        def request_shutdown(self): stop.set()
+        def call(self, name, **arguments):
+            calls.append(name)
+            assert name == 'validate_graph_draft'
+            start = time.monotonic()
+            assert not stop.wait(310), 'validation was cancelled before its result'
+            durations.append(time.monotonic()-start)
+            return {'status':'ok', 'validation_id':marker, 'passed':True}
+    class Model(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            requests.append(request)
+            if len(requests) == 1:
+                respond(self, {'role':'assistant','tool_calls':[{'index':0,
+                    'id':'long-validation','type':'function','function':{
+                        'name':'mcp__graph__validate_graph_draft',
+                        'arguments':json.dumps({'draft_id':'long-draft','mode':'instances'})}}]}, 'tool_calls')
+            else:
+                respond(self, {'role':'assistant','content':'Validation completed.'}, 'stop')
+    model = ThreadingHTTPServer(('127.0.0.1',0),Model)
+    thread = threading.Thread(target=model.serve_forever,daemon=True)
+    thread.start()
+    try:
+        config = tmp_path/'config.yaml'
+        config.write_text('goal: long validation\n')
+        with serve_local_tools(Host()) as (url,token):
+            result = run_goal('Validate the saved graph draft once.',config,tmp_path,
+                HarnessOptions(model='loopback-model',base_url=f'http://127.0.0.1:{model.server_port}/v1',
+                    timeout_seconds=5,max_calls=4,max_run_seconds=380),
+                mcp_url=url,mcp_token_env='GRAPH_TEST_TOKEN',
+                environment={'GRAPH_TEST_TOKEN':token,'OPENAI_API_KEY':'local-test-only'})
+        assert calls == ['validate_graph_draft']
+        assert len(durations) == 1 and durations[0] >= 310
+        assert len(requests) == 2
+        assert marker in json.dumps(requests[1]['messages'])
+        assert result['finish_reason'] == 'completed'
+        assert result['budget']['stop_reason'] == ''
+    finally:
+        stop.set()
+        model.shutdown()
+        model.server_close()
+        thread.join(timeout=5)
+
+
 @pytest.mark.parametrize('broken_channel', [False, True])
 def test_native_kernel_separates_model_timeout_and_stops_dead_graph_channel(tmp_path, broken_channel):
     """Real MCP/native hooks: slow tools survive, broken tools never replay."""

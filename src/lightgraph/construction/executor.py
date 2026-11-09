@@ -94,10 +94,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         return visibility.get((mapping.source_id, mapping.schema_name, mapping.table), [])
 
     def clock():
-        if cancelled is not None and cancelled():
-            raise LightGraphError('construction_cancelled')
         if time.monotonic() > deadline:
             raise LightGraphError('construction_time_exhausted')
+        if cancelled is not None and cancelled():
+            raise LightGraphError('construction_cancelled')
 
     def projection_key(mapping):
         adapter = by_source.get(mapping.source_id)
@@ -233,8 +233,13 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         try:
             return _rows_for(mapping)
         except LightGraphError as exc:
+            if exc.code == 'query_cancelled' and cancelled is not None and cancelled():
+                # Teardown cancelled the operation, not this source's health.
+                # Abort the whole validation and discard its partial graph,
+                # including when cancellation hits its final projection.
+                exc = LightGraphError('construction_cancelled')
             exc.construction_source_id = mapping.source_id
-            raise
+            raise exc
 
     def _rows_for(mapping):
         nonlocal cache_bytes, cache_hits

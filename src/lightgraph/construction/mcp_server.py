@@ -19,7 +19,11 @@ def create_server(tools):
     from functools import partial
     # The workspace is the durable session. HTTP requests must not depend on an
     # in-memory MCP session ID surviving a network reconnect.
-    server = FastMCP("lightgraph-construction", stateless_http=True, json_response=True)
+    # Send response headers immediately and let MCP's native SSE heartbeat keep
+    # long validations alive. A deferred JSON response leaves Node fetch waiting
+    # for headers and can hit its 300-second limit before our tool deadline.
+    # Heartbeats carry no tool data and do not extend the absolute run budget.
+    server = FastMCP("lightgraph-construction", stateless_http=True, json_response=False)
     writer = anyio.Lock()
     closing = threading.Event()
     state_lock = threading.Lock()

@@ -4,7 +4,7 @@ from dataclasses import dataclass, asdict
 import math
 import threading
 import time
-from lightgraph.errors import BudgetExceeded
+from lightgraph.errors import BudgetExceeded, LightGraphError
 
 @dataclass(frozen=True)
 class Cost:
@@ -30,6 +30,11 @@ class BudgetAllocator:
         self._started = time.monotonic()
         self._deadline = self._started + self.limits.seconds
         self._ceiling = self._deadline
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        """Cancel further work without turning teardown into a time overrun."""
+        self._cancelled.set()
 
     @property
     def deadline_monotonic(self) -> float:
@@ -72,6 +77,8 @@ class BudgetAllocator:
             remaining = self._deadline - time.monotonic()
             if remaining <= 0:
                 raise BudgetExceeded('wall_time_budget_exhausted')
+            if self._cancelled.is_set():
+                raise LightGraphError('query_cancelled')
             return remaining
 
     def check_deadline(self) -> None:
@@ -128,7 +135,7 @@ class BudgetAllocator:
                     limit = getattr(self.limits, name)
                     if limit is not None and getattr(self.used, name) > limit:
                         raise BudgetExceeded(f"{name}_budget_exhausted")
-            except BudgetExceeded:
+            except LightGraphError:
                 # A failed charge must not pin an unusable reservation. The
                 # actual counters above remain visible even when work was late.
                 if reservation_id:

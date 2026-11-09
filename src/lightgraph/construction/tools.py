@@ -132,14 +132,14 @@ class ConstructionTools:
         observable from another thread, including between CPU-only graph rows.
         The MCP owner waits for that writer to settle before calling ``close``.
         """
-        import time
         self._shutdown_requested.set()
-        now = time.monotonic()
-        self.budget.tighten_deadline(now)
+        # Closing a failed MCP session is cancellation, not evidence that the
+        # run's wall clock expired. Keep the deadline intact for reporting.
+        self.budget.cancel()
         for adapter in self.adapters:
             budget = getattr(adapter, 'query_budget', None)
             if budget is not None:
-                budget.deadline = min(budget.deadline, now)
+                budget.cancel()
             try:
                 adapter.cancel()
             except Exception:

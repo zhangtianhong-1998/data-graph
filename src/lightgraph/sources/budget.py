@@ -13,10 +13,19 @@ class QueryBudget:
         self.max_queries=max_queries;self.max_returned_rows=max_returned_rows;self.max_returned_bytes=max_returned_bytes
         self.deadline=min(deadline, time.monotonic()+max_run_seconds) if deadline else time.monotonic()+max_run_seconds
         self.queries=0;self.returned_rows=0;self.returned_bytes=0;self._lock=threading.RLock()
+        self._cancelled = threading.Event()
         # Hold references so Python cannot reuse an absorbed object's id.
         self._absorbed_budgets: dict[int, QueryBudget] = {}
     def check_time(self):
         if time.monotonic() > self.deadline: raise BudgetExceeded("run_time_budget_exhausted")
+        if self._cancelled.is_set(): raise LightGraphError('query_cancelled')
+    def cancel(self):
+        """Stop this run's source work without changing its real deadline.
+
+        Adapter cancellation interrupts a current statement; this persistent
+        flag also prevents a multi-query operation from starting another one.
+        """
+        self._cancelled.set()
     @contextmanager
     def deadline_scope(self, deadline: float):
         """Borrow a shorter deadline until the query iterator closes.
