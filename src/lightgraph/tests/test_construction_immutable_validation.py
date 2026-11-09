@@ -41,7 +41,7 @@ def test_budget_failure_retains_snapshot_and_publishes_without_reading_database(
         published = tools.call('publish_graph_draft', draft_id=draft['draft_id'])
         assert published['status'] == 'ok' and published['nodes'] == 4
         assert published['publication']['validation_id'] == checked['validation_id']
-        assert published['publication']['read_window']['consistency'] == 'independent_source_snapshots'
+        assert published['publication']['read_window']['consistency'] == 'independent_projection_snapshots'
         assert len(connection.executed) == before
         # Repeated attempts never ask the adapter to run another SQL statement.
         for _ in range(3):

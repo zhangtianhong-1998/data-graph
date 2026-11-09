@@ -32,7 +32,7 @@ def test_profile_is_domain_only_and_uses_working_target(tmp_path):
     assert compaction["retainTokens"] < 32768
     provider = plugins["graph-provider"]["config"]["providers"]["graph-model"]
     assert provider["api"] == "openai-completions"
-    assert provider["timeoutMs"] == 600000
+    assert provider["timeoutMs"] == 800000
     assert provider["retryPolicy"]["maxRetries"] == 1
 
 

@@ -50,6 +50,22 @@ beforeEach(() => {
 })
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); clearSessions(); sessionStorage.clear() })
 describe('visible model limits', () => {
+  it.each([false, true])('保存默认额度后刷新仍生效，无需展开 JSON (%s)', async separate => {
+    config.max_run_seconds = 1800
+    if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }
+    await mount()
+    expect(root.querySelector<HTMLDetailsElement>('.advanced-panel')!.open).toBe(false)
+    button('使用默认额度').click(); await nextTick()
+    button('保存配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存'))
+    expect(separate ? limits : config.model).toMatchObject({ max_calls: 2000, max_prompt_tokens: 1048576,
+      max_output_tokens: 65536, timeout_seconds: 800, context_window_tokens: null })
+    expect(config.max_run_seconds).toBe(60000)
+    app.unmount(); root.remove(); await mount()
+    expect(root.textContent).toContain('1048576 tokens')
+    expect(root.querySelector<HTMLInputElement>('#model-output-tokens')!.value).toBe('65536')
+  })
+
   it.each([false, true])('persists query limit and construction target independently of model source (%s)', async separate => {
     if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }
     config.max_db_queries = 240
@@ -339,7 +355,7 @@ describe('visible model limits', () => {
   it('reports the default Harness capacity and rejects disabling persistence in JSON', async () => {
     delete config.model!.max_prompt_tokens; delete config.model!.context_window_tokens
     await mount()
-    expect(root.querySelector('[data-testid="effective-input-tokens"]')?.textContent).toContain('未额外设置')
+    expect(root.querySelector('[data-testid="effective-input-tokens"]')?.textContent).toContain('1048576 tokens')
     await edit('advanced-config', JSON.stringify({ ...config, record_trace: false }))
     button('保存完整配置').click()
     await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('record_trace 设为 true'))
@@ -443,7 +459,7 @@ describe('visible model limits', () => {
   it('shows the current default for configurations without an explicit call budget', async () => {
     delete config.model!.max_calls
     await mount()
-    expect(root.querySelector<HTMLInputElement>('#model-max-calls')!.value).toBe('40')
+    expect(root.querySelector<HTMLInputElement>('#model-max-calls')!.value).toBe('2000')
     expect(button('保存配置').disabled).toBe(false)
   })
   it('keeps the latest Agent load locked when a previous file request returns late', async () => {

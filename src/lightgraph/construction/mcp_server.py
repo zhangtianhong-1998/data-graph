@@ -69,7 +69,8 @@ def create_server(tools):
     @server.tool()
     async def read_material(name: str, page: int = 0) -> dict:
         """Read Markdown goal, skill, reference:<name.md>, draft_schema, source_operations,
-        document:<id>, evidence:<ref>, draft:<id> or validation:<id>.
+        document:<id>, evidence:<ref>, draft:<id>, validation:<id>, conflicts:<id>
+        or publication_conflicts. Conflict materials include retained names/keys without a new query.
         Follow next_page for complete documents and saved artifacts.
         """
         return await dispatch("read_material", name=name, page=page)

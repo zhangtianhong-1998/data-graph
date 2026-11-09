@@ -11,6 +11,18 @@ function mount(component: typeof ConstructionReport | typeof RunIssues, report: 
 }
 afterEach(() => { app?.unmount(); root?.remove() })
 describe('构建报告与程序统计', () => {
+  it('明确显示冲突隔离和可用成果，不将部分发布描述为完整通过', () => {
+    mount(ConstructionReport, { construction: { summary: { published_drafts: 1 },
+      execution: { data_validation: 'failed', conflict_isolation: { nodes: 39, edges: 50, coverage: 'incomplete' },
+        instance_publications: [{ draft_id: 'plan', revision: 3, coverage: 'conflict_isolated',
+          published_nodes: 200, published_edges: 180, isolated_nodes: 39 }] },
+      drafts: [{ draft_id: 'plan', revision: 3, status: 'needs_revision', entity_types: 2, relation_types: 1,
+        mappings: 5, validation: { passed: false } }] } })
+    expect(root.querySelector('[aria-label="冲突隔离结果"]')?.textContent).toContain('39 个节点及 50 条关联边已隔离')
+    expect(root.textContent).toContain('本修订的无冲突部分已发布：200 个节点、180 条边')
+    expect(root.textContent).toContain('完整草稿的数据检查仍未通过')
+  })
+
   it('结构目标展示已发布方案及定义，不将零实例误报为零成果或数据失败', () => {
     mount(ConstructionReport, { validation: { construction_target: 'structure' }, counts: { structures_published: 1 },
       construction: { summary: { published_drafts: 0, entity_type_count: 2, relation_type_count: 1, mapping_count: 3 },

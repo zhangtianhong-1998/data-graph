@@ -471,6 +471,7 @@ class MySQLSource(SourceAdapter):
                 if self._disposed: raise LightGraphError('source_closed')
                 if self._cancelled: raise LightGraphError('query_cancelled')
                 self._boundary_recovery_used = False
+                self._boundary_recoveries = 0
                 self._reconnect()
             try:
                 # A previously runtime-qualified source repeats these probes

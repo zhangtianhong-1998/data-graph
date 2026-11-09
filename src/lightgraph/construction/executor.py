@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter, defaultdict, deque
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from lightgraph.contracts import canonical, digest
@@ -12,7 +12,7 @@ from lightgraph.query import QueryCompiler
 from lightgraph.sources.base import aggregate_count
 from lightgraph.source_values import (source_scalar, scalar_kind, typed_key, identity_values,
     typed_value, plain_value, SOURCE_KEY_SEMANTICS_VERSION)
-from .models import GraphDraft, iter_fact_mappings, draft_evidence_refs
+from .models import GraphDraft, draft_evidence_refs
 from .access import scope_binding_map, support_scope
 from .display import derive_display_graph
 from .accumulation import GraphAccumulator
@@ -65,7 +65,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
 
     Callers provide an authorized physical catalog. Keys include only explicitly
     mapped values; source names and physical positions never enter identity.
-    All mapping results remain unpublishable when any data check fails.
+    Full validation fails on counterexamples; node-local label conflicts may
+    subsequently be quarantined for publication of the verified remainder.
     ``cancelled`` lets a caller stop CPU-side materialization cooperatively;
     source adapters remain responsible for interrupting a blocking query.
     """
@@ -134,18 +135,25 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         return sorted(ids.intersection(unavailable_sources))
 
     @contextmanager
-    def source_snapshot(source_id, adapter):
+    def source_snapshot(source_id, adapter, projection):
         # These are client-observed transaction windows, not server snapshot IDs
         # or a distributed point-in-time guarantee across different sources.
         window = {'source_id': source_id, 'requested_at': datetime.now(timezone.utc).isoformat(),
-                  'basis': 'client_observed_snapshot_context', 'state': 'opening'}
+                  'basis': 'client_observed_snapshot_context', 'state': 'opening',
+                  'projection_fingerprint': digest(projection), 'completed_projections': 0}
         source_read_windows.append(window)
         body_error = None
         try:
+            capability = adapter.capabilities()
+            if any(capability.capabilities.get(c) != 'verified' for c in
+                   ('metadata_reading', 'read_only_transaction', 'parameter_binding', 'distinct_projection')):
+                raise LightGraphError('snapshot_or_projection_unavailable')
             with adapter.snapshot():
+                if not adapter.capabilities().consistent_snapshot:
+                    raise LightGraphError('snapshot_or_projection_unavailable')
                 window.update(opened_at=datetime.now(timezone.utc).isoformat(), state='open')
                 try:
-                    yield adapter
+                    yield window
                 except BaseException as exc:
                     body_error = exc
                     raise
@@ -157,6 +165,15 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             window['state'] = 'closed_after_interruption' if interrupted else 'failed'
             if not interrupted and isinstance(exc, LightGraphError):
                 exc.construction_source_id = source_id
+                exc.construction_mapping_location = {'phase': 'snapshot_open' if 'opened_at' not in window else 'snapshot_close'}
+            if not isinstance(exc, LightGraphError):
+                # Preserve source isolation for unexpected adapter failures,
+                # without exposing a driver's SQL/credentials in its message.
+                failure = LightGraphError('construction_source_execution_failed')
+                failure.construction_source_id = source_id
+                failure.construction_mapping_location = {'phase': 'projection' if interrupted else
+                    'snapshot_open' if 'opened_at' not in window else 'snapshot_close'}
+                raise failure from None
             raise
         finally:
             window['closed_at'] = datetime.now(timezone.utc).isoformat()
@@ -253,47 +270,48 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         if cache_key in projection_cache:
             cache_hits += 1
             return projection_cache[cache_key]
-        query = compiler.profile_column_group(table, columns, predicate=predicate)
-        expected = None
-        for batch in adapter.execute(query, row_limit=1):
-            with batch:
-                for row in batch:
-                    if expected is not None:
-                        raise LightGraphError('invalid_aggregate_shape')
-                    expected = aggregate_count(dict(zip(batch.columns, row)).get('distinct_tuples'))
-        if expected is None:
-            raise LightGraphError('invalid_aggregate_shape')
-        if expected > cap:
-            raise LightGraphError('projection_truncated')
-        rows, retained_bytes = [], 0
-        stream = adapter.project(table, columns, predicate=predicate, distinct=True, limit=cap)
-        try:
-            for batch in stream:
+        # A count and its projection need one snapshot. Release it before
+        # materializing or reading another projection, including another source.
+        with source_snapshot(mapping.source_id, adapter, cache_key) as window:
+            query = compiler.profile_column_group(table, columns, predicate=predicate)
+            expected = None
+            for batch in adapter.execute(query, row_limit=1):
                 with batch:
-                    if tuple(batch.columns) != tuple(columns):
-                        raise LightGraphError('projection_columns_mismatch')
                     for row in batch:
-                        clock()
-                        item = dict(zip(batch.columns, (source_scalar(value) for value in row)))
-                        retained_bytes += len(canonical(item).encode())
-                        check_memory('projection', retained_bytes)
-                        if len(rows) >= cap:
-                            raise LightGraphError('projection_truncated')
-                        rows.append(item)
-        finally:
-            if hasattr(stream, 'close'):
-                stream.close()
-        if len(rows) != expected:
-            raise LightGraphError('projection_incomplete')
-        # The cache belongs to this execute_draft's open source snapshots only.
-        # Retain complete authorized projections, never failed partial streams.
+                        if expected is not None:
+                            raise LightGraphError('invalid_aggregate_shape')
+                        expected = aggregate_count(dict(zip(batch.columns, row)).get('distinct_tuples'))
+            if expected is None:
+                raise LightGraphError('invalid_aggregate_shape')
+            if expected > cap:
+                raise LightGraphError('projection_truncated')
+            rows, retained_bytes = [], 0
+            stream = adapter.project(table, columns, predicate=predicate, distinct=True, limit=cap)
+            try:
+                for batch in stream:
+                    with batch:
+                        if tuple(batch.columns) != tuple(columns):
+                            raise LightGraphError('projection_columns_mismatch')
+                        for row in batch:
+                            clock()
+                            item = dict(zip(batch.columns, (source_scalar(value) for value in row)))
+                            retained_bytes += len(canonical(item).encode())
+                            check_memory('projection', retained_bytes)
+                            if len(rows) >= cap:
+                                raise LightGraphError('projection_truncated')
+                            rows.append(item)
+            finally:
+                if hasattr(stream, 'close'):
+                    stream.close()
+            if len(rows) != expected:
+                raise LightGraphError('projection_incomplete')
+            window['completed_projections'] = 1
+        # Reuse only complete observations from this validation; the window above
+        # records when each projection was read, without a whole-run snapshot claim.
         cache_bytes += retained_bytes
         projection_sizes[cache_key] = retained_bytes
         unique_projections.add(cache_key)
         projection_cache[cache_key] = rows
-        for window in source_read_windows:
-            if window['source_id'] == mapping.source_id:
-                window['completed_projections'] = window.get('completed_projections', 0) + 1
         return rows
 
     def identity(kind, key):
@@ -411,197 +429,174 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     if not draft.entities:
         diagnostic('graph_draft_has_no_entities')
     try:
-        used_sources = {mapping.source_id for mapping in iter_fact_mappings(draft)}
-        with ExitStack() as stack:
-            for source_id in sorted(used_sources):
-                clock()
-                adapter = by_source.get(source_id)
-                if adapter is None:
-                    continue
+        clock()
+        for entity in draft.entities:
+            if goal is not None and goal.entity_kinds and entity.type not in goal.entity_kinds:
+                diagnostic('outside_extraction_goal', entity_type=entity.type)
+                continue
+            for index, mapping in enumerate(entity.mappings):
+                location = {'entity_type': entity.type, 'mapping': index, 'source_id': mapping.source_id}
                 try:
-                    capability = adapter.capabilities()
-                    if any(capability.capabilities.get(c) != 'verified' for c in
-                           ('metadata_reading', 'read_only_transaction', 'parameter_binding', 'distinct_projection')):
-                        raise LightGraphError('snapshot_or_projection_unavailable')
-                    stack.enter_context(source_snapshot(source_id, adapter))
-                    if not adapter.capabilities().consistent_snapshot:
-                        raise LightGraphError('snapshot_or_projection_unavailable')
-                except LightGraphError as exc:
-                    if isinstance(exc, BudgetExceeded):
-                        raise
-                    unavailable_sources[source_id] = exc.code
-                    error_diagnostic(exc, source_id=source_id, phase='snapshot_open')
-                except Exception:
-                    unavailable_sources[source_id] = 'construction_source_execution_failed'
-                    diagnostic('construction_source_execution_failed', source_id=source_id,
-                               phase='snapshot_open', retryable=False)
-            for entity in draft.entities:
-                if goal is not None and goal.entity_kinds and entity.type not in goal.entity_kinds:
-                    diagnostic('outside_extraction_goal', entity_type=entity.type)
-                    continue
-                for index, mapping in enumerate(entity.mappings):
-                    location = {'entity_type': entity.type, 'mapping': index, 'source_id': mapping.source_id}
-                    try:
-                        clock()
-                        if is_metadata_mapping(mapping):
-                            node = column_node(entity, index, mapping, allowed, goal)
-                            previous_node = nodes.get(node['id'])
-                            if previous_node is not None:
-                                previous_size = len(canonical(previous_node).encode())
-                                merge_column_supports(previous_node, node)
-                                update_size(previous_size, previous_node)
-                            else:
-                                nodes[node['id']] = node
-                                update_size(0, node)
-                            checked += 1
-                            continue
-                        if blocked_sources(mapping):
-                            incomplete_entity_types.add(entity.type)
-                            diagnostic('mapping_source_unavailable', **location,
-                                       blocked_sources=blocked_sources(mapping))
-                            continue
-                        rows = rows_for(mapping)
+                    clock()
+                    if is_metadata_mapping(mapping):
+                        node = column_node(entity, index, mapping, allowed, goal)
+                        previous_node = nodes.get(node['id'])
+                        if previous_node is not None:
+                            previous_size = len(canonical(previous_node).encode())
+                            merge_column_supports(previous_node, node)
+                            update_size(previous_size, previous_node)
+                        else:
+                            nodes[node['id']] = node
+                            update_size(0, node)
                         checked += 1
-                        projected_rows += len(rows)
-                        support = provenance(entity.type, index, mapping)
-                        support['key_columns'] = mapping.key_columns
-                        if mapping.label_column:
-                            support['label_column'] = mapping.label_column
-                        if mapping.display_columns:
-                            support['display_columns'] = mapping.display_columns
-                        for row in rows:
-                            clock()
-                            key = key_for(row, mapping.key_columns)
-                            node_id = identity(entity.type, key)
-                            label = row[mapping.label_column] if mapping.label_column else None
-                            if label == '':
-                                label = None
-                            current_support = contribution(mapping, row, support)
-                            node = nodes.get(node_id)
-                            if node is None:
-                                node = nodes[node_id] = {'id': node_id, 'type': entity.type,
-                                    'label': str(label) if label is not None else '',
-                                    'label_observed': label is not None,
-                                    'identity': dict(zip(entity.key_names, key)),
-                                    'identity_types': dict(zip(entity.key_names, map(scalar_kind, key))), 'aliases': [],
-                                    'properties': {}, 'provenance': [], 'supports': []}
-                                accumulation.register(node)
-                            if label is not None:
-                                if accumulation.label_conflicts(node_id, current_support['scope_ref'], str(label)):
-                                    diagnostic('same_identity_conflicting_label', node_id=node_id, **location)
-                                elif not node['label_observed']:
-                                    accumulation.replace(node, 'label', str(label))
-                                    accumulation.replace(node, 'label_observed', True)
-                            for column in mapping.alias_columns:
-                                alias = row[column]
-                                if alias is not None:
-                                    accumulation.append(node, 'aliases', str(alias))
-                            graph_properties(node, mapping, row)
-                            accumulation.append(node, 'provenance', support)
-                            accumulation.append(node, 'supports', current_support)
-                    except LightGraphError as exc:
+                        continue
+                    if blocked_sources(mapping):
                         incomplete_entity_types.add(entity.type)
-                        failed_operation(exc)
-                        if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted', 'construction_cancelled',
-                                       'run_time_budget_exhausted', 'query_budget_exhausted'}:
-                            exc.construction_mapping_location = location
-                            raise
-                        error_diagnostic(exc, **location)
-                    finally:
-                        rows = None
-                        release_projection(mapping)
-            for relation in draft.relations:
-                if goal is not None and goal.relation_kinds and relation.type not in goal.relation_kinds:
-                    diagnostic('outside_relation_goal', relation_type=relation.type)
-                    continue
-                pairs = set()
-                for index, mapping in enumerate(relation.mappings):
-                    location = {'relation_type': relation.type, 'mapping': index, 'source_id': mapping.source_id}
-                    try:
+                        diagnostic('mapping_source_unavailable', **location,
+                                   blocked_sources=blocked_sources(mapping))
+                        continue
+                    rows = rows_for(mapping)
+                    checked += 1
+                    projected_rows += len(rows)
+                    support = provenance(entity.type, index, mapping)
+                    support['key_columns'] = mapping.key_columns
+                    if mapping.label_column:
+                        support['label_column'] = mapping.label_column
+                    if mapping.display_columns:
+                        support['display_columns'] = mapping.display_columns
+                    for row in rows:
                         clock()
-                        if blocked_sources(mapping):
-                            diagnostic('mapping_source_unavailable', **location,
-                                       blocked_sources=blocked_sources(mapping))
+                        key = key_for(row, mapping.key_columns)
+                        node_id = identity(entity.type, key)
+                        label = row[mapping.label_column] if mapping.label_column else None
+                        if label == '':
+                            label = None
+                        current_support = contribution(mapping, row, support)
+                        node = nodes.get(node_id)
+                        if node is None:
+                            node = nodes[node_id] = {'id': node_id, 'type': entity.type,
+                                'label': str(label) if label is not None else '',
+                                'label_observed': label is not None,
+                                'identity': dict(zip(entity.key_names, key)),
+                                'identity_types': dict(zip(entity.key_names, map(scalar_kind, key))), 'aliases': [],
+                                'properties': {}, 'provenance': [], 'supports': []}
+                            accumulation.register(node)
+                        if label is not None:
+                            if accumulation.label_conflicts(node_id, current_support['scope_ref'], str(label)):
+                                diagnostic('same_identity_conflicting_label', node_id=node_id, **location)
+                            elif not node['label_observed']:
+                                accumulation.replace(node, 'label', str(label))
+                                accumulation.replace(node, 'label_observed', True)
+                        for column in mapping.alias_columns:
+                            alias = row[column]
+                            if alias is not None:
+                                accumulation.append(node, 'aliases', str(alias))
+                        graph_properties(node, mapping, row)
+                        accumulation.append(node, 'provenance', support)
+                        accumulation.append(node, 'supports', current_support)
+                except LightGraphError as exc:
+                    incomplete_entity_types.add(entity.type)
+                    failed_operation(exc)
+                    if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted', 'construction_cancelled',
+                                   'run_time_budget_exhausted', 'query_budget_exhausted'}:
+                        exc.construction_mapping_location = location
+                        raise
+                    error_diagnostic(exc, **location)
+                finally:
+                    rows = None
+                    release_projection(mapping)
+        for relation in draft.relations:
+            if goal is not None and goal.relation_kinds and relation.type not in goal.relation_kinds:
+                diagnostic('outside_relation_goal', relation_type=relation.type)
+                continue
+            pairs = set()
+            for index, mapping in enumerate(relation.mappings):
+                location = {'relation_type': relation.type, 'mapping': index, 'source_id': mapping.source_id}
+                try:
+                    clock()
+                    if blocked_sources(mapping):
+                        diagnostic('mapping_source_unavailable', **location,
+                                   blocked_sources=blocked_sources(mapping))
+                        continue
+                    rows = rows_for(mapping)
+                    checked += 1
+                    projected_rows += len(rows)
+                    support = provenance(relation.type, index, mapping)
+                    support.update(source_key_columns=mapping.source_key_columns,
+                                   target_key_columns=mapping.target_key_columns)
+                    for end in ('source', 'target'):
+                        lookup = getattr(mapping, end + '_lookup')
+                        if lookup is not None:
+                            support[end + '_lookup'] = lookup.model_dump(mode='json', by_alias=True)
+                    metadata_end, column_endpoint = metadata_endpoint(mapping)
+                    if column_endpoint is not None:
+                        support['metadata_endpoint'] = {
+                            'endpoint': metadata_end,
+                            'column': column_endpoint.model_dump(mode='json', by_alias=True),
+                            'basis': mapping.metadata_basis,
+                            'meaning_origin': 'agent_declared',
+                            'row_membership': 'observed_projection',
+                            'non_null_observed': mapping.metadata_basis == 'observed_non_null'}
+                    for row in rows:
+                        clock()
+                        sources = resolve_endpoint(mapping, row, 'source')
+                        if not sources:
+                            # Explicitly omitted input rows cannot produce
+                            # a pair and must not fail on an unused target.
                             continue
-                        rows = rows_for(mapping)
-                        checked += 1
-                        projected_rows += len(rows)
-                        support = provenance(relation.type, index, mapping)
-                        support.update(source_key_columns=mapping.source_key_columns,
-                                       target_key_columns=mapping.target_key_columns)
-                        for end in ('source', 'target'):
-                            lookup = getattr(mapping, end + '_lookup')
-                            if lookup is not None:
-                                support[end + '_lookup'] = lookup.model_dump(mode='json', by_alias=True)
-                        metadata_end, column_endpoint = metadata_endpoint(mapping)
-                        if column_endpoint is not None:
-                            support['metadata_endpoint'] = {
-                                'endpoint': metadata_end,
-                                'column': column_endpoint.model_dump(mode='json', by_alias=True),
-                                'basis': mapping.metadata_basis,
-                                'meaning_origin': 'agent_declared',
-                                'row_membership': 'observed_projection',
-                                'non_null_observed': mapping.metadata_basis == 'observed_non_null'}
-                        for row in rows:
-                            clock()
-                            sources = resolve_endpoint(mapping, row, 'source')
-                            if not sources:
-                                # Explicitly omitted input rows cannot produce
-                                # a pair and must not fail on an unused target.
-                                continue
-                            targets = resolve_endpoint(mapping, row, 'target')
-                            # Multiple matches are allowed only when the lookup
-                            # explicitly declares many, and only for this row.
-                            for source_key, source_match in sources:
-                                for target_key, target_match in targets:
-                                    clock()
-                                    source = identity(relation.source_type, source_key)
-                                    target = identity(relation.target_type, target_key)
-                                    if source not in nodes or target not in nodes:
-                                        dependency_failed = ((source not in nodes and relation.source_type in incomplete_entity_types)
-                                            or (target not in nodes and relation.target_type in incomplete_entity_types))
-                                        diagnostic('relation_dependency_unavailable' if dependency_failed else
-                                                   'unresolved_relation_endpoint', **location)
+                        targets = resolve_endpoint(mapping, row, 'target')
+                        # Multiple matches are allowed only when the lookup
+                        # explicitly declares many, and only for this row.
+                        for source_key, source_match in sources:
+                            for target_key, target_match in targets:
+                                clock()
+                                source = identity(relation.source_type, source_key)
+                                target = identity(relation.target_type, target_key)
+                                if source not in nodes or target not in nodes:
+                                    dependency_failed = ((source not in nodes and relation.source_type in incomplete_entity_types)
+                                        or (target not in nodes and relation.target_type in incomplete_entity_types))
+                                    diagnostic('relation_dependency_unavailable' if dependency_failed else
+                                               'unresolved_relation_endpoint', **location)
+                                    continue
+                                if source == target:
+                                    if mapping.equal_endpoints == 'omit':
+                                        omitted += 1
                                         continue
-                                    if source == target:
-                                        if mapping.equal_endpoints == 'omit':
-                                            omitted += 1
-                                            continue
-                                        if mapping.equal_endpoints == 'error' or not relation.allow_self_links:
-                                            diagnostic('self_link_forbidden', **location)
-                                            continue
-                                    pairs.add((source, target))
-                                    edge_id = 'r_' + digest(relation.type, source, target)
-                                    edge = edges.get(edge_id)
-                                    if edge is None:
-                                        edge = edges[edge_id] = {'id': edge_id, 'type': relation.type,
-                                            'source': source, 'target': target, 'properties': {}, 'provenance': [], 'supports': []}
-                                        accumulation.register(edge)
-                                    graph_properties(edge, mapping, row)
-                                    accumulation.append(edge, 'provenance', support)
-                                    current_support = contribution(mapping, row, support)
-                                    matches = [match for match in (source_match, target_match) if match is not None]
-                                    if matches:
-                                        current_support['lookup_matches'] = matches
-                                        current_support['required_scope_refs'] = sorted({match['scope_ref'] for match in matches})
-                                        if 'row_context' not in current_support:
-                                            values = {c: row[c] for c in sorted(set(_projection_columns(mapping) + scope_columns(mapping)))}
-                                            current_support['row_context'] = {
-                                                'id': 'ctx_' + digest(support['source'], typed_value(values)), 'values': values,
-                                                'value_types': {name: scalar_kind(value) for name, value in values.items()}}
-                                    accumulation.append(edge, 'supports', current_support)
-                    except LightGraphError as exc:
-                        failed_operation(exc)
-                        if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted', 'construction_cancelled',
-                                       'run_time_budget_exhausted', 'query_budget_exhausted'}:
-                            exc.construction_mapping_location = location
-                            raise
-                        error_diagnostic(exc, **location)
-                    finally:
-                        rows = None
-                        release_projection(mapping)
-                if relation.acyclic and _has_cycle(pairs):
-                    diagnostic('relation_cycle', relation_type=relation.type)
+                                    if mapping.equal_endpoints == 'error' or not relation.allow_self_links:
+                                        diagnostic('self_link_forbidden', **location)
+                                        continue
+                                pairs.add((source, target))
+                                edge_id = 'r_' + digest(relation.type, source, target)
+                                edge = edges.get(edge_id)
+                                if edge is None:
+                                    edge = edges[edge_id] = {'id': edge_id, 'type': relation.type,
+                                        'source': source, 'target': target, 'properties': {}, 'provenance': [], 'supports': []}
+                                    accumulation.register(edge)
+                                graph_properties(edge, mapping, row)
+                                accumulation.append(edge, 'provenance', support)
+                                current_support = contribution(mapping, row, support)
+                                matches = [match for match in (source_match, target_match) if match is not None]
+                                if matches:
+                                    current_support['lookup_matches'] = matches
+                                    current_support['required_scope_refs'] = sorted({match['scope_ref'] for match in matches})
+                                    if 'row_context' not in current_support:
+                                        values = {c: row[c] for c in sorted(set(_projection_columns(mapping) + scope_columns(mapping)))}
+                                        current_support['row_context'] = {
+                                            'id': 'ctx_' + digest(support['source'], typed_value(values)), 'values': values,
+                                            'value_types': {name: scalar_kind(value) for name, value in values.items()}}
+                                accumulation.append(edge, 'supports', current_support)
+                except LightGraphError as exc:
+                    failed_operation(exc)
+                    if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted', 'construction_cancelled',
+                                   'run_time_budget_exhausted', 'query_budget_exhausted'}:
+                        exc.construction_mapping_location = location
+                        raise
+                    error_diagnostic(exc, **location)
+                finally:
+                    rows = None
+                    release_projection(mapping)
+            if relation.acyclic and _has_cycle(pairs):
+                diagnostic('relation_cycle', relation_type=relation.type)
     except LightGraphError as exc:
         error_diagnostic(exc)
         if exc.code in {'memory_budget_exhausted', 'construction_cancelled'}:

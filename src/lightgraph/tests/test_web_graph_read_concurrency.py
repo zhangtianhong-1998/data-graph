@@ -49,7 +49,8 @@ def test_slow_graph_does_not_block_configuration_or_credentials(client, monkeypa
             credentials = pool.submit(client.get, '/api/projects/p/credentials').result(timeout=5)
             assert credentials.status_code == 200
             updated = config.json()
-            updated['model']['max_output_tokens'] = 65536
+            original_output_limit = updated['model']['max_output_tokens']
+            updated['model']['max_output_tokens'] = original_output_limit + 1
             saved = pool.submit(client.put, '/api/projects/p/config', json=updated,
                                 headers={'If-Match': config.headers['etag']}).result(timeout=5)
             assert saved.status_code == 200, saved.text
@@ -57,7 +58,7 @@ def test_slow_graph_does_not_block_configuration_or_credentials(client, monkeypa
         finally:
             release.set()
         response = graph.result(timeout=5)
-    assert observed[0].resolved_model.max_output_tokens != 65536
+    assert observed[0].resolved_model.max_output_tokens == original_output_limit
     assert response.status_code == 409
     assert response.json()['error']['code'] == 'graph_read_conflict'
     assert 'OLD_AUTHORIZED_VALUE' not in response.text

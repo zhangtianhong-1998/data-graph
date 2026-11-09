@@ -7,7 +7,7 @@ import ConstructionReport from './ConstructionReport.vue'
 import TechnicalDetails from './TechnicalDetails.vue'
 import RunProgress from './RunProgress.vue'
 import RunTrace from './RunTrace.vue'
-import { effectiveInputTokenLimit, modelLimitError, modelLimitKeys } from './modelLimits'
+import { effectiveInputTokenLimit, modelLimitError, modelLimitKeys, modelLimitDefaults, runSecondsDefault } from './modelLimits'
 import { configTextChanged, mergeConfigDraft } from './configDraft'
 import type { ModelLimitKey } from './modelLimits'
 import IdentityCandidates from './IdentityCandidates.vue'
@@ -47,7 +47,7 @@ const busy = ref(false)
 const error = ref('')
 const toast = ref('')
 const purpose = ref('')
-const runSeconds = ref<number | null>(1800)
+const runSeconds = ref<number | null>(runSecondsDefault)
 const maxDbQueries = ref<number | null>(null)
 const queryCountUnlimited = ref(true)
 const constructionTarget = ref<'instances' | 'structure'>('instances')
@@ -66,6 +66,12 @@ const agentLimitsDirty = computed(() => !!config.value.agent_config && JSON.stri
 const limitModel = computed(() => config.value.agent_config ? agentLimits.value : model.value)
 const limitsError = computed(() => !traceRecording.value ? '运行需要保存轨迹，请先启用后保存。' : runSeconds.value === null || !Number.isFinite(runSeconds.value) || runSeconds.value <= 0 ? '整次运行时限须大于 0。' : queryLimitError.value || modelLimitError(limitModel.value))
 const effectiveInputTokens = computed(() => effectiveInputTokenLimit(limitModel.value))
+function useDefaultLimits() {
+  const defaults = { ...modelLimitDefaults, context_window_tokens: null }
+  if (config.value.agent_config) agentLimits.value = { ...agentLimits.value, ...defaults }
+  else model.value = { ...model.value, ...defaults }
+  runSeconds.value = runSecondsDefault
+}
 function setModelLimit(key: ModelLimitKey, event: Event) {
   const text = (event.target as HTMLInputElement).value
   const value = text === '' ? null : Number(text)
@@ -143,13 +149,13 @@ const activeRun = computed(() => runs.value.find(isActive))
 const locked = computed(() => busy.value || loading.value || !!activeRun.value)
 const path = computed(() => projectPath(project.value?.project_id || ''))
 const queryLimitDirty = computed(() => effectiveQueryLimit.value !== (config.value.max_db_queries ?? null) || queryCountUnlimited.value !== (config.value.max_db_queries == null))
-const formDirty = computed(() => traceRecording.value !== (config.value.record_trace !== false) || runSeconds.value !== (config.value.max_run_seconds ?? 1800) || queryLimitDirty.value || constructionTarget.value !== (config.value.construction_target ?? 'instances') || purpose.value !== goalMarkdown(config.value) || JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}))
+const formDirty = computed(() => traceRecording.value !== (config.value.record_trace !== false) || runSeconds.value !== (config.value.max_run_seconds ?? runSecondsDefault) || queryLimitDirty.value || constructionTarget.value !== (config.value.construction_target ?? 'instances') || purpose.value !== goalMarkdown(config.value) || JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}))
 const dirty = computed(() => !!modelKey.value || formDirty.value || agentLimitsDirty.value)
 const advancedDirty = computed(() => configTextChanged(advanced.value, advancedBaseline.value))
 function previewConfig(): RunConfig {
   const value = { ...config.value }
   if (purpose.value !== goalMarkdown(config.value)) value.goal_markdown = purpose.value
-  if (runSeconds.value !== (config.value.max_run_seconds ?? 1800)) value.max_run_seconds = runSeconds.value!
+  if (runSeconds.value !== (config.value.max_run_seconds ?? runSecondsDefault)) value.max_run_seconds = runSeconds.value!
   if (effectiveQueryLimit.value !== (config.value.max_db_queries ?? null)) value.max_db_queries = effectiveQueryLimit.value
   if (constructionTarget.value !== (config.value.construction_target ?? 'instances')) value.construction_target = constructionTarget.value
   if (traceRecording.value !== (config.value.record_trace !== false)) value.record_trace = traceRecording.value
@@ -182,7 +188,7 @@ function fillForms(value: RunConfig) {
   configurationConflict.value = false
   config.value = value
   purpose.value = goalMarkdown(value)
-  runSeconds.value = value.max_run_seconds ?? 1800
+  runSeconds.value = value.max_run_seconds ?? runSecondsDefault
   queryCountUnlimited.value = value.max_db_queries == null
   maxDbQueries.value = value.max_db_queries ?? null
   constructionTarget.value = value.construction_target ?? 'instances'
@@ -246,7 +252,7 @@ function applyProjectConfig(nextProject: Project, nextConfig: RunConfig, preserv
   // Preserve only edited fields; unchanged controls must follow server-side dependency cleanup.
   const edits = preserveEdits ? {
     traceRecording: traceRecording.value !== (config.value.record_trace !== false) ? traceRecording.value : undefined,
-    runSeconds: runSeconds.value !== (config.value.max_run_seconds ?? 1800) ? runSeconds.value : undefined,
+    runSeconds: runSeconds.value !== (config.value.max_run_seconds ?? runSecondsDefault) ? runSeconds.value : undefined,
     maxDbQueries: queryLimitDirty.value ? { value: effectiveQueryLimit.value, unlimited: queryCountUnlimited.value } : undefined,
     constructionTarget: constructionTarget.value !== (config.value.construction_target ?? 'instances') ? constructionTarget.value : undefined,
     purpose: purpose.value !== goalMarkdown(config.value) ? purpose.value : undefined,
@@ -584,16 +590,18 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
 <div class="field"><label for="construction-target">构建结果</label><select id="construction-target" v-model="constructionTarget" :disabled="locked"><option value="instances">生成实例图谱</option><option value="structure">仅生成结构与映射</option></select><p class="field-hint">结构与映射可以单独保存和发布；这不代表具体节点、关系或全部数据已经验证。</p></div>
 <div class="field"><label for="max-db-queries">数据查询次数上限</label><label class="checkbox-line"><input id="query-count-unlimited" v-model="queryCountUnlimited" type="checkbox" :disabled="locked"/>不限次数</label><input id="max-db-queries" type="number" min="1" step="1" :value="maxDbQueries ?? ''" :disabled="locked || queryCountUnlimited" placeholder="填写正整数" @input="maxDbQueries = ($event.target as HTMLInputElement).value === '' ? null : Number(($event.target as HTMLInputElement).value)"/><p class="field-hint">所有数据来源共用，包括元数据与事务控制查询。不限次数仍受单次查询超时、整次运行时限和数据量限制。</p></div>
 <p v-if="agentLimitsLoading" role="status">正在读取模型额度…</p>
-<div class="two-fields"><div class="field"><label for="model-max-calls">模型调用总额度</label><input id="model-max-calls" type="number" min="0" step="1" :value="limitModel.max_calls === undefined ? 40 : limitModel.max_calls ?? ''" :disabled="locked || agentLimitsLoading" placeholder="留空不额外限制" @input="setModelLimit('max_calls', $event)"/><p class="field-hint">整次运行的模型请求次数，包含重试和压缩调用。0 表示不允许调用模型。</p></div><div class="field"><label for="run-seconds">整次运行时限（秒）</label><input id="run-seconds" type="number" min="0.1" step="any" :value="runSeconds ?? ''" :disabled="locked || agentLimitsLoading" @input="runSeconds = ($event.target as HTMLInputElement).value === '' ? null : Number(($event.target as HTMLInputElement).value)"/><p class="field-hint">由同一时限覆盖发现、验证与构建，</p></div></div>
-<div class="two-fields"><div class="field"><label for="model-input-tokens">最大输入 tokens</label><input id="model-input-tokens" type="number" min="1" step="1" :value="limitModel.max_prompt_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="留空不另设输入限制" @input="setModelLimit('max_prompt_tokens', $event)"/><p class="field-hint">请求派发前按估算值检查输入，包括系统提示、历史消息和工具定义。额度估算会结合接口实际用量校准，不代表精确分词结果。</p></div><div class="field"><label for="model-output-tokens">最大输出 tokens</label><input id="model-output-tokens" type="number" min="1" step="1" :value="limitModel.max_output_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="默认 4096" @input="setModelLimit('max_output_tokens', $event)"/><p class="field-hint">单次请求的输出上限，不是整轮抽取的 token 预算。</p></div></div>
-<div class="field"><label for="model-timeout-seconds">接口超时时间（秒）</label><input id="model-timeout-seconds" type="number" min="0.1" step="any" :value="limitModel.timeout_seconds ?? ''" :disabled="locked || agentLimitsLoading" placeholder="默认 60" @input="setModelLimit('timeout_seconds', $event)"/></div>
+<div class="two-fields"><div class="field"><label for="model-max-calls">模型调用总额度</label><input id="model-max-calls" type="number" min="0" step="1" :value="limitModel.max_calls === undefined ? modelLimitDefaults.max_calls : limitModel.max_calls ?? ''" :disabled="locked || agentLimitsLoading" placeholder="留空不额外限制" @input="setModelLimit('max_calls', $event)"/><p class="field-hint">整次运行的模型请求次数，包含重试和压缩调用。0 表示不允许调用模型。</p></div><div class="field"><label for="run-seconds">整次运行时限（秒）</label><input id="run-seconds" type="number" min="0.1" step="any" :value="runSeconds ?? ''" :disabled="locked || agentLimitsLoading" @input="runSeconds = ($event.target as HTMLInputElement).value === '' ? null : Number(($event.target as HTMLInputElement).value)"/><p class="field-hint">同一时限覆盖发现、验证与构建。</p></div></div>
+<div class="two-fields"><div class="field"><label for="model-input-tokens">最大输入 tokens</label><input id="model-input-tokens" type="number" min="1" step="1" :value="limitModel.max_prompt_tokens === undefined ? modelLimitDefaults.max_prompt_tokens : limitModel.max_prompt_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="留空不另设输入限制" @input="setModelLimit('max_prompt_tokens', $event)"/><p class="field-hint">请求派发前按估算值检查输入，包括系统提示、历史消息和工具定义。额度估算会结合接口实际用量校准，不代表精确分词结果。</p></div><div class="field"><label for="model-output-tokens">最大输出 tokens</label><input id="model-output-tokens" type="number" min="1" step="1" :value="limitModel.max_output_tokens === undefined ? modelLimitDefaults.max_output_tokens : limitModel.max_output_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="默认 65536" @input="setModelLimit('max_output_tokens', $event)"/><p class="field-hint">单次请求的输出上限，不是整轮抽取的 token 预算。</p></div></div>
+<div class="field"><label for="model-timeout-seconds">接口超时时间（秒）</label><input id="model-timeout-seconds" type="number" min="0.1" step="any" :value="limitModel.timeout_seconds === undefined ? modelLimitDefaults.timeout_seconds : limitModel.timeout_seconds ?? ''" :disabled="locked || agentLimitsLoading" placeholder="默认 800" @input="setModelLimit('timeout_seconds', $event)"/></div>
+<div class="actions"><button class="btn" :disabled="locked || agentLimitsLoading" @click="useDefaultLimits">使用默认额度</button><span class="field-hint">填入默认值后点击保存。已有配置不会自动覆盖。</span></div>
 <p class="field-hint">配置保存成功后，下一次启动立即使用新值，无需重启服务。运行中的任务使用启动时的配置。</p>
-<div class="field"><label for="model-context-tokens">模型总上下文窗口（tokens，可选）</label><input id="model-context-tokens" type="number" min="1" step="1" :value="limitModel.context_window_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="留空不额外限制" @input="setModelLimit('context_window_tokens', $event)"/><p class="field-hint">同时设置时，输入上限取“最大输入”与“总窗口减最大输出”中的较小值。</p></div>
+<details class="optional-model-settings"><summary>更多上下文选项</summary><div class="field"><label for="model-context-tokens">模型总上下文窗口（tokens，可选）</label><input id="model-context-tokens" type="number" min="1" step="1" :value="limitModel.context_window_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="留空不额外限制" @input="setModelLimit('context_window_tokens', $event)"/><p class="field-hint">同时设置时，输入上限取“最大输入”与“总窗口减最大输出”中的较小值。</p></div>
+<p class="field-hint">工作上下文默认在约 32768 tokens 时自动压缩，完整会话仍保留。此阈值与最大输入额度分别生效。</p></details>
 <p class="field-hint" data-testid="effective-input-tokens">当前有效输入限制：{{ effectiveInputTokens === null ? '未额外设置' : `${effectiveInputTokens} tokens` }}。</p>
 <p class="field-hint">模型输入、返回及工具结果保留在本地，供排查与恢复使用；运行后需手动清理。</p>
 <button v-if="!traceRecording" class="btn" :disabled="locked" @click="traceRecording = true">启用运行轨迹</button>
 <p v-if="limitsError" class="note amber" role="alert">{{ limitsError }}</p>
-</div><div class="panel-footer"><span>API key 加密保存在服务端本机，刷新后无需重填</span><button class="btn primary" :disabled="locked || agentLimitsLoading || !!limitsError" @click="action(saveModelLimits)">保存配置</button></div></section><aside class="panel"><div class="panel-head"><h2>运行前检查</h2></div><div class="panel-body"><div class="setup-check"><strong>{{ config.sources?.length || 0 }} 个数据来源</strong><button class="text-button" @click="tab = 'inputs'">配置数据接入</button></div><div class="setup-check"><strong>{{ documentFiles.length }} 个知识文档</strong><button class="text-button" @click="tab = 'documents'">配置知识文档</button></div><div class="setup-check"><strong>{{ purpose.trim() ? '已填写抽取目标' : '尚未填写抽取目标' }}</strong><button class="text-button" @click="tab = 'goal'">配置抽取目标</button></div></div></aside></div><section class="panel advanced-panel"><div class="panel-head"><h2>完整项目配置</h2><span class="badge">JSON 编辑 · 服务端保存 YAML</span></div><div class="panel-body"><p class="field-hint editor-hint">此处与上方表单同步；两处修改不同字段时一并保存，同一字段有冲突时会提示。</p><label class="sr-only" for="advanced-config">完整项目 JSON 配置</label><textarea id="advanced-config" v-model="advanced" class="code-editor" :disabled="locked" spellcheck="false"/></div><div class="panel-footer"><span>完整配置不接受明文密码或 API key，请使用上方连接表单</span><div class="actions"><button v-if="advancedDirty && (formDirty || agentLimitsDirty)" class="btn" :disabled="locked" @click="discardFormEdits">放弃表单修改</button><button v-if="advancedDirty" class="btn" :disabled="locked" @click="resetAdvanced">放弃修改</button><button class="btn" :disabled="locked" @click="action(async () => { advanced = JSON.stringify(advancedConfig(), null, 2) })">格式化 JSON</button><button class="btn primary" :disabled="locked" @click="saveAdvanced">保存完整配置</button></div></div></section></template>
+</div><div class="panel-footer"><span>API key 加密保存在服务端本机，刷新后无需重填</span><button class="btn primary" :disabled="locked || agentLimitsLoading || !!limitsError" @click="action(saveModelLimits)">保存配置</button></div></section><aside class="panel"><div class="panel-head"><h2>运行前检查</h2></div><div class="panel-body"><div class="setup-check"><strong>{{ config.sources?.length || 0 }} 个数据来源</strong><button class="text-button" @click="tab = 'inputs'">配置数据接入</button></div><div class="setup-check"><strong>{{ documentFiles.length }} 个知识文档</strong><button class="text-button" @click="tab = 'documents'">配置知识文档</button></div><div class="setup-check"><strong>{{ purpose.trim() ? '已填写抽取目标' : '尚未填写抽取目标' }}</strong><button class="text-button" @click="tab = 'goal'">配置抽取目标</button></div></div></aside></div><details class="panel advanced-panel"><summary class="panel-head">高级配置（可选）</summary><div class="panel-head"><h2>完整项目配置</h2><span class="badge">JSON 编辑 · 服务端保存 YAML</span></div><div class="panel-body"><p class="field-hint editor-hint">此处与上方表单同步；两处修改不同字段时一并保存，同一字段有冲突时会提示。</p><label class="sr-only" for="advanced-config">完整项目 JSON 配置</label><textarea id="advanced-config" v-model="advanced" class="code-editor" :disabled="locked" spellcheck="false"/></div><div class="panel-footer"><span>完整配置不接受明文密码或 API key，请使用上方连接表单</span><div class="actions"><button v-if="advancedDirty && (formDirty || agentLimitsDirty)" class="btn" :disabled="locked" @click="discardFormEdits">放弃表单修改</button><button v-if="advancedDirty" class="btn" :disabled="locked" @click="resetAdvanced">放弃修改</button><button class="btn" :disabled="locked" @click="action(async () => { advanced = JSON.stringify(advancedConfig(), null, 2) })">格式化 JSON</button><button class="btn primary" :disabled="locked" @click="saveAdvanced">保存完整配置</button></div></div></details></template>
         </div>
       </template>
     </main>

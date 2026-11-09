@@ -496,11 +496,40 @@ class ConstructionTools:
             raise LightGraphError("invalid_material_page")
         if name == "goal":
             return read_goal_material(self.config, page)
-        if name.startswith(('draft:', 'validation:')):
+        if name == 'publication_conflicts' or name.startswith(('draft:', 'validation:', 'conflicts:')):
             kind, _, draft_id = name.partition(':')
-            record = self.workspace.get_draft(draft_id)
-            if kind == 'draft':
+            record = self.workspace.get_draft(draft_id) if draft_id else None
+            if name == 'publication_conflicts':
+                from .conflicts import conflict_details
+                self._check_current_inputs()
+                merged = self.workspace.read_published_graph()
+                if merged.get('access_fingerprint') != access_fingerprint(self.config):
+                    raise LightGraphError('validated_graph_access_mismatch')
+                diagnostics = [{'code': 'same_identity_conflicting_label', 'node_id': node_id}
+                    for node_id in merged.get('conflict_isolation', {}).get('node_ids', [])]
+                contributors = []
+                for graph in self.workspace.read_publication_contributors():
+                    detail = conflict_details(graph, diagnostics, self.config.scopes)
+                    if detail['nodes']:
+                        contributors.append({'draft_id': graph.get('draft_id'),
+                            'revision': graph.get('draft_revision'), **detail})
+                value = {'basis': 'retained_publication_snapshots', 'contributors': contributors,
+                         'requires_database': False,
+                         'local_conflicts': 'Read conflicts:<draft_id> for identities already isolated within a draft.'}
+            elif kind == 'draft':
                 value = self.workspace._draft_record_payload(record)['draft']
+            elif kind == 'conflicts':
+                from .conflicts import conflict_details
+                self._check_current_inputs()
+                if record.status == 'stale':
+                    raise LightGraphError('stale_graph_draft')
+                validation = self.workspace.latest_conflict_validation(draft_id)
+                graph = self.workspace.read_validation_graph(draft_id, validation)
+                if graph.get('access_fingerprint') != access_fingerprint(self.config):
+                    raise LightGraphError('validated_graph_access_mismatch')
+                value = conflict_details(graph, validation.diagnostics, self.config.scopes)
+                value.update(validation_id=validation.validation_id, observed_revision=validation.revision,
+                             current_revision=record.revision, authorizes_current_publication=False)
             elif record.validation is not None:
                 value = record.validation.model_dump(mode='json')
             else:
@@ -511,8 +540,8 @@ class ConstructionTools:
             if page >= pages:
                 raise LightGraphError('invalid_material_page')
             return {'status': 'ok', 'format': 'yaml', 'material': name,
-                    'draft_id': draft_id, 'revision': record.revision,
-                    'material_revision': digest(content), 'draft_state': record.status,
+                    **({'draft_id': draft_id, 'revision': record.revision, 'draft_state': record.status} if record else {}),
+                    'material_revision': digest(content),
                     'page': page, 'pages': pages, 'characters': len(content),
                     'content': content[page * page_size:(page + 1) * page_size],
                     'content_is_fragment': pages > 1,
@@ -670,14 +699,17 @@ class ConstructionTools:
         self._check_current_inputs()
         recovery = self._snapshot_recovery_sources(sources)
         from .failures import SOURCE_FAILURES
+        # A healthy mapping can depend on an unavailable endpoint. That is a
+        # skipped dependency, not another failed connection to its own source.
+        operation_failures = SOURCE_FAILURES - {'mapping_source_unavailable', 'relation_dependency_unavailable'}
         for diagnostic in result['diagnostics']:
-            if diagnostic.get('code') in SOURCE_FAILURES:
+            if diagnostic.get('code') in operation_failures:
                 diagnostic['new_snapshot_recovery_available'] = diagnostic.get('source_id') in recovery
         # Count a source only once per operation, not once per failed mapping.
         # Unsuccessful mappings on healthy sources are not connection failures.
         for source_id in sources:
             failures = [d for d in result['diagnostics']
-                        if d.get('source_id') == source_id and d.get('code') in SOURCE_FAILURES]
+                        if d.get('source_id') == source_id and d.get('code') in operation_failures]
             if failures:
                 primary = next((d for d in failures if d.get('phase') == 'snapshot_open'), failures[0])
                 self.source_circuits.fail(source_id, primary)
@@ -692,7 +724,7 @@ class ConstructionTools:
             if diagnostic.get('source_id') in blocked_ids and diagnostic.get('code') in SOURCE_FAILURES:
                 diagnostic.update(source_blocked=True, new_snapshot_recovery_available=False)
         read_window = {'started_at': started, 'finished_at': datetime.now(timezone.utc).isoformat(),
-                       'source_ids': sources, 'consistency': 'independent_source_snapshots',
+                       'source_ids': sources, 'consistency': 'independent_projection_snapshots',
                        'source_read_windows': result.pop('source_read_windows', []),
                        'publication_semantics': 'validated_snapshot'}
         evidence = self.workspace.issue_evidence("data_validation", details={
@@ -714,6 +746,16 @@ class ConstructionTools:
         statistics = graph_statistics(visible_graph)
         from .failures import failure_guidance
         diagnostics = result['diagnostics']
+        from .conflicts import subset_available, isolate_validation
+        subset = None
+        if subset_available(current.validation):
+            try:
+                clean = isolate_validation(graph, diagnostics)
+                subset = {'nodes': len(clean['nodes']), 'edges': len(clean['edges']),
+                    'isolated_nodes': clean['conflict_isolation']['nodes'],
+                    'isolated_edges': clean['conflict_isolation']['edges']}
+            except LightGraphError:
+                pass
         # Keep every counterexample in the validation artifact; a model reply
         # need not replay hundreds of identical error shapes on every attempt.
         return {"status": "ok", "state": current.status, **result,
@@ -722,6 +764,8 @@ class ConstructionTools:
                 'diagnostic_codes': dict(Counter(d['code'] for d in diagnostics)),
                 'diagnostics_truncated': len(diagnostics) > 32,
                 'validation_material': 'validation:' + draft_id,
+                'conflicts_material': 'conflicts:' + draft_id,
+                'publishable_subset': subset,
                 'draft_material': 'draft:' + draft_id, "statistics": statistics,
                 'effective_limits': {'max_working_bytes': self.config.max_working_bytes,
                     'max_result_rows': self.config.limits.max_result_rows,
@@ -761,18 +805,20 @@ class ConstructionTools:
         self._check_current_inputs()
         record = self.workspace.get_draft(draft_id)
         self._require_draft_sources(record.draft)
-        selected = self.workspace.select_validation(draft_id, validation_id)
+        selected = self.workspace.select_validation(draft_id, validation_id, isolate_conflicts=True)
         graph = self.workspace.read_validation_graph(draft_id, selected)
         if graph.get('access_fingerprint') != access_fingerprint(self.config):
             raise LightGraphError('validated_graph_access_mismatch')
         publication = self.workspace.publish(draft_id, revision=record.revision, graph=graph,
-                                             validation_id=selected.validation_id)
+                                             validation_id=selected.validation_id, isolate_conflicts=True)
         manifest = self.workspace.read_summary()
         merged = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes)
         from .statistics import graph_statistics
         return {"status": "ok", "draft_id": draft_id, "publication": publication,
                 "graph": "manifest.yaml:current_graph", "publications": len(manifest['publications']),
                 "nodes": len(merged['nodes']), "edges": len(merged['edges']),
+                'conflict_isolation': merged.get('conflict_isolation'),
+                'conflicts_material': 'publication_conflicts',
                 "statistics": graph_statistics(merged), "semantic_assessment": "agent_authored"}
 
     def _check_current_inputs(self):

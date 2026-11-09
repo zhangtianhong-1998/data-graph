@@ -68,7 +68,7 @@ def safe_database_diagnostic(error):
     def choice(name, allowed, default='unknown'):
         selected = value.get(name)
         return selected if isinstance(selected, str) and selected in allowed else default
-    return {
+    result = {
         'engine': choice('engine', {'gauss', 'mysql'}),
         'stage': choice('stage', {'snapshot_start', 'snapshot_close', 'connection_preflight', 'query', 'reconnect'}),
         'category': choice('category', categories),
@@ -80,3 +80,7 @@ def safe_database_diagnostic(error):
         'recovery': choice('recovery', {
             'none', 'rolled_back', 'rollback_rebegin_failed', 'reconnect_required', 'reconnect_failed', 'reconnected'}, 'none'),
     }
+    for name in ('boundary_recovery_attempts', 'recovery_attempt_limit'):
+        if type(value.get(name)) is int and 0 <= value[name] <= 100:
+            result[name] = value[name]
+    return result

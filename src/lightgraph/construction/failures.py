@@ -58,7 +58,12 @@ def failure_guidance(diagnostics):
                     'publish independent drafts only after their own validation. Preserve the original unmet goal.'}
     if 'same_identity_conflicting_label' in codes:
         return {'failure_class': 'data_conflict', 'retryable': False,
-                'next_action': 'Check names for the same entity type, full identity key and access scope. '
+                'next_action': 'If publishable_subset is present, publish_graph_draft can publish the '
+                    'verified remainder while quarantining conflicting identities and their incident edges. '
+                    'This preserves every original counterexample and leaves goal gaps unresolved. '
+                    'Read conflicts:<draft_id> for retained keys, names and source mappings even when the database is unavailable; '
+                    'the material identifies the observed revision and cannot validate a new revision. '
+                    'Check names for the same entity type, full identity key and access scope. '
                     'Different codes sharing a name and one identity occurring in multiple positions are allowed. '
                     'Do not move conflicting names to aliases/display fields or filter away records solely to pass. '
                     'Read the saved draft and validation:<draft_id> material, then inspect only the affected '

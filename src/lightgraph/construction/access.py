@@ -124,6 +124,10 @@ def filter_graph_scopes(graph, scopes):
     # The published document is not reused. Copy only the small header; nodes and
     # edges above already own their supports. A second full copy dominated large reads.
     view = _view_shell(graph)
+    if 'conflict_isolation' in view:
+        # Quarantine IDs are internal merge state, not authorized visible nodes.
+        view['conflict_isolation'].pop('node_ids', None)
+        view['conflict_isolation'].pop('edge_ids', None)
     view['nodes'] = nodes
     view['edges'] = edges
     view['definitions'] = {'entities': [deepcopy(item) for item in definitions.get('entities', []) if item['type'] in entity_types],

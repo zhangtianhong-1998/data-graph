@@ -1,8 +1,14 @@
 """Snapshot-scoped database sessions and bounded, non-replaying recovery."""
 from copy import deepcopy
 import logging
+import time
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from .database_errors import database_error, safe_database_diagnostic
+
+
+# Applies to one snapshot boundary, including connection qualification and
+# BEGIN. Never resets inside a nested query or replays a partially read result.
+MAX_BOUNDARY_RECOVERIES = 3
 
 
 def configure_reconnection(source, factory):
@@ -14,6 +20,7 @@ def configure_reconnection(source, factory):
     source._reconnect_allowed = False
     source._reconnect_blocked = False
     source._boundary_recovery_used = False
+    source._boundary_recoveries = 0
     source._reconnect_attempts = 0
     source._connection_acquisitions = 1
     source.connection_generation = 0
@@ -40,6 +47,8 @@ def latch_terminal_failure(source, error, *, engine, code=None):
             engine=engine, stage='reconnect').database_diagnostic
     source._terminal_failure_code = code or getattr(error, 'code', 'database_reconnect_failed')
     source._terminal_failure_diagnostic = {**diagnostic, 'terminal': True,
+        'boundary_recovery_attempts': source._boundary_recoveries,
+        'recovery_attempt_limit': MAX_BOUNDARY_RECOVERIES,
         'recovery': 'reconnect_failed' if source._terminal_failure_code == 'database_reconnect_failed'
                     else diagnostic.get('recovery', 'none')}
     source._reconnect_blocked = True
@@ -73,11 +82,48 @@ def _preflight_can_recover(error):
         return False
     category = diagnostic.get('category', 'unknown')
     return (category in {'connection', 'idle_transaction_timeout', 'shutdown', 'unavailable'}
-            or category == 'unknown' and diagnostic.get('rollback_succeeded') is False)
+            or category == 'unknown' and (diagnostic.get('rollback_succeeded') is False
+                or diagnostic.get('connection_closed') is True
+                # Failure to obtain a new session is safe to retry before any
+                # rows exist. Unknown remains unknown; this is not a claim that
+                # the network, rather than the driver/server, caused it.
+                or getattr(error, 'code', None) == 'database_connection_failed'))
+
+
+def _check_recovery_budget(source):
+    if source._cancelled:
+        raise LightGraphError('query_cancelled')
+    if source._disposed:
+        raise LightGraphError('source_closed')
+    source.query_budget.check_time()
+    if source.query_budget.snapshot()['remaining_queries'] == 0:
+        raise BudgetExceeded('query_budget_exhausted')
+
+
+def _recovery_pause(source):
+    """Short backoff remains interruptible and consumes the existing deadline."""
+    end = time.monotonic() + min(2 ** (source._boundary_recoveries - 1), 4)
+    while True:
+        _check_recovery_budget(source)
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(.05, remaining))
+
+
+def _reserve_recovery(source, *, engine, error=None):
+    _check_recovery_budget(source)
+    if source._boundary_recoveries >= MAX_BOUNDARY_RECOVERIES:
+        raise latch_terminal_failure(source, error or LightGraphError('database_reconnect_failed'),
+                                     engine=engine, code='database_reconnect_failed') from None
+    source._boundary_recoveries += 1
+    source._boundary_recovery_used = True
+    source._reconnect_attempts += 1
+    _recovery_pause(source)
 
 
 def reconnect_at_boundary(source, *, engine, discard, adopt):
-    """Acquire one qualified session, with at most one pre-data recovery.
+    """Acquire one qualified session, with bounded pre-data recovery.
 
     Idle release is normal lifecycle, not a recovery attempt. Every new physical
     session repeats catalog/readonly/qualification checks under the same budget.
@@ -88,26 +134,22 @@ def reconnect_at_boundary(source, *, engine, discard, adopt):
         raise stopped
     if source._depth or source._disposed or source._reconnect_blocked or source._reopen is None:
         raise LightGraphError('source_closed')
-    source.query_budget.check_time()
-    if source.query_budget.snapshot()['remaining_queries'] == 0:
-        raise BudgetExceeded('query_budget_exhausted')
+    _check_recovery_budget(source)
     if not source._idle_released or source._reconnect_allowed:
-        if source._boundary_recovery_used:
-            raise latch_terminal_failure(source, LightGraphError('database_reconnect_failed'), engine=engine)
-        source._boundary_recovery_used = True
-        source._reconnect_attempts += 1
+        _reserve_recovery(source, engine=engine)
     original_manifest = source.capabilities()
     original_tables = source.describe()
     physical_columns = source._physical_column_names
     while True:
-        source.query_budget.check_time()
-        if source.query_budget.snapshot()['remaining_queries'] == 0:
-            raise BudgetExceeded('query_budget_exhausted')
+        _check_recovery_budget(source)
         replacement = None
         try:
             discard()
             source._connection_acquisitions += 1
             replacement = source._reopen(original_manifest.actual_database_verified, source.query_budget)
+            # A cancellation/deadline during connect or qualification must not
+            # be cleared by adopt(), which transfers a healthy session's state.
+            _check_recovery_budget(source)
             current = replacement.capabilities()
             if any(getattr(current, field) != getattr(original_manifest, field)
                    for field in ('product', 'version', 'driver')):
@@ -137,12 +179,11 @@ def reconnect_at_boundary(source, *, engine, discard, adopt):
                 except Exception: pass
             if not isinstance(exc, Exception):
                 raise
-            if not source._boundary_recovery_used and _preflight_can_recover(exc):
-                source._boundary_recovery_used = True
-                source._reconnect_attempts += 1
-                continue
-            if isinstance(exc, BudgetExceeded):
+            if isinstance(exc, BudgetExceeded) or getattr(exc, 'code', None) in {'query_cancelled', 'source_closed'}:
                 raise
+            if _preflight_can_recover(exc):
+                _reserve_recovery(source, engine=engine, error=exc)
+                continue
             preserved = {'source_catalog_changed', 'capability_manifest_binding_mismatch',
                 'runtime_capability_unverified', 'read_only_transaction_unverified',
                 'authorized_table_unavailable_or_view', 'authorized_column_unavailable',
@@ -152,27 +193,35 @@ def reconnect_at_boundary(source, *, engine, discard, adopt):
 
 
 def prepare_snapshot(source, *, engine, begin, disconnected):
-    """Start a fresh operation; one pre-read recovery is the absolute bound."""
+    """Start a fresh operation; all acquisition/BEGIN retries share one bound."""
     stopped = terminal_failure(source)
     if stopped is not None: raise stopped
     if source._disposed: raise LightGraphError('source_closed')
     if source._cancelled: raise LightGraphError('query_cancelled')
     source._boundary_recovery_used = False
+    source._boundary_recoveries = 0
     try:
         if source._idle_released or source._reconnect_allowed or disconnected:
             source._reconnect()
-        try:
-            begin()
-        except Exception as exc:
-            if isinstance(exc, BudgetExceeded): raise
-            if source._reconnect_allowed and not source._boundary_recovery_used:
-                source._reconnect()
+        while True:
+            try:
+                _check_recovery_budget(source)
                 begin()
-            else:
-                raise
+                return
+            except Exception as exc:
+                if isinstance(exc, BudgetExceeded) or source._cancelled: raise
+                if not source._reconnect_allowed or not _preflight_can_recover(exc): raise
+                if source._boundary_recoveries >= MAX_BOUNDARY_RECOVERIES:
+                    raise latch_terminal_failure(source, exc, engine=engine,
+                                                 code='database_reconnect_failed') from None
+                source._reconnect()
     except BaseException as exc:
         source._release_snapshot_connection()
         if not isinstance(exc, Exception) or isinstance(exc, BudgetExceeded): raise
+        if source._cancelled:
+            raise LightGraphError('query_cancelled') from None
+        if source._disposed:
+            raise LightGraphError('source_closed') from None
         stopped = terminal_failure(source)
         if stopped is not None: raise stopped from None
         if getattr(exc, 'retryable', False) or getattr(exc, 'code', None) == 'query_cancelled': raise

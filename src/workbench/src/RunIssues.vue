@@ -36,6 +36,7 @@ const hints: Record<string, string> = {
   construction_compaction_failed: '上下文摘要连续截断，运行已停止反复压缩。原历史与已保存草稿保留；请检查模型输出限制，调整后继续运行。',
   construction_draft_validation_failed: '该草稿当前的数据检查未通过。此前已发布成果保留；查看具体诊断，修订或重新验证后再确认完成。',
   construction_unpublished_draft: '该草稿尚未发布。查看草稿的数据检查结果与本次实际轨迹，已发布的其他成果保留。',
+  construction_conflicts_isolated: '无冲突部分已发布；冲突节点及相连边暂时隔离，完整候选与名称证据保留。修订后重新验证，不必删除其余成果。',
   construction_unresolved_work: '仍有目标未覆盖或草稿尚未发布，已发布结果保留。请查看下方构建结果中的具体事项。',
   source_retry_limit_exhausted: '反复请求已停止的数据库来源，运行已结束探索并保留草稿。请先恢复数据库，再重新运行；已有发布结果保留。',
   source_circuit_open: '该来源已达到本次运行的失败上限，暂不再查询。可继续查看结构方案及其他来源的结果，修复数据库后重新运行。',

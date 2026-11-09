@@ -98,8 +98,8 @@ def test_unknown_half_open_begin_with_failed_rollback_rebuilds_once_before_rows(
 @pytest.mark.parametrize('engine', ['gauss', 'mysql'])
 @pytest.mark.parametrize('begin_number', [1, 2])
 def test_repeated_half_open_failure_latches_original_safe_terminal_state(engine, begin_number):
-    source, data, controls, factory = sessions(engine)
-    for connection in data[1:3]:
+    source, data, controls, factory = sessions(engine, count=6)
+    for connection in data[1:5]:
         fail_begin(connection, engine, begin_number=begin_number, rollback_fails=True)
     try:
         with pytest.raises(LightGraphError, match='^database_reconnect_failed$') as caught:
@@ -107,6 +107,7 @@ def test_repeated_half_open_failure_latches_original_safe_terminal_state(engine,
         diagnostic = safe_database_diagnostic(caught.value)
         assert diagnostic['category'] == 'unknown' and diagnostic['rollback_succeeded'] is False
         assert diagnostic['terminal'] and diagnostic['recovery'] == 'reconnect_failed'
+        assert diagnostic['boundary_recovery_attempts'] == diagnostic['recovery_attempt_limit'] == 3
         assert source.terminal_failure_code == 'database_reconnect_failed'
         assert not source.new_snapshot_recovery_allowed
         saved = source.terminal_failure_diagnostic
@@ -118,8 +119,8 @@ def test_repeated_half_open_failure_latches_original_safe_terminal_state(engine,
             assert repeated.value is not caught.value
             assert safe_database_diagnostic(repeated.value) == diagnostic
         assert factory.calls == calls and source.query_budget.queries == queries
-        assert source._reconnect_attempts == 1 and source.stats.queries == 0
-        assert not data[3].executed and all(item.closed for item in data[:3])
+        assert source._reconnect_attempts == 3 and source.stats.queries == 0
+        assert not data[5].executed and all(item.closed for item in data[:5])
         assert 'PRIVATE' not in str(source.terminal_failure_diagnostic)
     finally: source.close()
 

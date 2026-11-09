@@ -61,19 +61,19 @@ class ModelConfig(StrictModel):
     stream_options_include_usage: bool = True
     allow_insecure_http: bool = False
     # Explicit null disables only this API total; counters and other limits remain.
-    max_calls: int | None = Field(default=40, ge=0)
+    max_calls: int | None = Field(default=2000, ge=0)
     max_tokens: int | None = Field(default=None, ge=0,
         description="Legacy cumulative-token setting retained for configuration migration; Harness budgets physical calls and wall time.")
     max_discovery_steps: int = Field(default=16, ge=1, le=32,
         description="Legacy per-table setting, accepted when reading old configurations; not used by Harness.")
     max_tool_calls: int = Field(default=16, ge=1, le=64,
         description="Legacy source-tool allowance; not used by Harness.")
-    timeout_seconds: float = Field(default=60, gt=0)
-    max_output_tokens: int = Field(default=4096, gt=0)
+    timeout_seconds: float = Field(default=800, gt=0)
+    max_output_tokens: int = Field(default=65536, gt=0)
     # Read legacy byte settings without presenting them as Harness controls.
     max_prompt_bytes: int | None = Field(default=None, gt=0,
         description="Legacy request-byte guard retained for configuration migration; not applied by Harness.")
-    max_prompt_tokens: int | None = Field(default=None, gt=0,
+    max_prompt_tokens: int | None = Field(default=1048576, gt=0,
         description="Optional estimated input token cap, including tool schemas; independent of byte limits.")
     context_window_tokens: int | None = Field(default=None, gt=0,
         description="Optional combined input/output token window; max_output_tokens is reserved from it.")
@@ -169,7 +169,7 @@ class RunConfig(StrictModel):
     max_reconciliation_entities: int = Field(default=5000, ge=1, le=100000)
     max_reconciliation_candidates: int = Field(default=256, ge=1, le=4096)
     max_identity_reviews: int = Field(default=8, ge=0, le=64)
-    max_run_seconds: float = Field(default=1800, gt=0)
+    max_run_seconds: float = Field(default=60000, gt=0)
     # Customer deployment must attest all external retention paths before live instance access.
     deployment_retention_verified: bool = False
     rediscover: bool = False

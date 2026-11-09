@@ -304,7 +304,7 @@ class GraphWorkspace:
         self._save_manifest(manifest)
         return record
 
-    def select_validation(self, draft_id: str, validation_id: str | None = None) -> DataValidation:
+    def select_validation(self, draft_id: str, validation_id: str | None = None, *, isolate_conflicts=False) -> DataValidation:
         """Resolve a successful snapshot without erasing the latest attempt.
 
         Explicit historical selection is required after a data counterexample.
@@ -323,9 +323,13 @@ class GraphWorkspace:
                     break
         elif selected and not selected.passed:
             codes = {d.get('code') for d in selected.diagnostics}
-            if codes and codes <= SNAPSHOT_RETRY_FAILURES:
+            # Skipped dependent mappings are consequences of the failed read,
+            # not additional semantic counterexamples to the old snapshot.
+            causes = codes - {'mapping_source_unavailable', 'relation_dependency_unavailable'}
+            if causes and causes <= SNAPSHOT_RETRY_FAILURES:
                 selected = record.last_successful_validation
-        if (selected is None or not selected.passed
+        from .conflicts import subset_available
+        if (selected is None or not (selected.passed or isolate_conflicts and subset_available(selected))
                 or selected.revision != record.revision
                 or selected.draft_fingerprint != record.fingerprint
                 or selected.context_fingerprint != self.context_fingerprint):
@@ -339,30 +343,55 @@ class GraphWorkspace:
             raise LightGraphError('validated_graph_mismatch')
         return graph
 
+    def latest_conflict_validation(self, draft_id: str) -> DataValidation:
+        """Retain counterexamples across revisions, without rereading a failed source.
+
+        Historical observations may explain a repair, but cannot authorize
+        publication of a newer draft. Access/context changes invalidate them.
+        """
+        self.get_draft(draft_id)
+        for path in reversed(self._manifest()['drafts'][draft_id]['history']):
+            validation = DraftRecord.model_validate(self._read_record(path)).validation
+            if (validation and validation.context_fingerprint == self.context_fingerprint
+                    and any(d.get('code') == 'same_identity_conflicting_label'
+                            for d in validation.diagnostics)):
+                return validation
+        raise LightGraphError('graph_conflict_evidence_missing')
+
     def publish(self, draft_id: str, *, revision: int, graph: dict,
-                validation_id: str | None = None) -> dict:
+                validation_id: str | None = None, isolate_conflicts=False) -> dict:
         """Publish the exact validated graph, retaining independent draft outputs.
 
         Semantic definitions remain Agent-authored. Publication attests only to
         the recorded deterministic checks and does not claim independent review.
         """
         record = self.get_draft(draft_id)
-        validation = self.select_validation(draft_id, validation_id)
+        validation = self.select_validation(draft_id, validation_id, isolate_conflicts=isolate_conflicts)
         if record.status == 'stale':
             raise LightGraphError('stale_graph_draft')
         if revision != record.revision:
             raise LightGraphError('graph_draft_revision_conflict')
         if validation.graph_digest is None or digest(graph) != validation.graph_digest:
             raise LightGraphError('validated_graph_mismatch')
+        from .conflicts import isolate_validation, isolate_publications
+        isolated = not validation.passed
+        if isolated:
+            graph = isolate_validation(graph, validation.diagnostics)
+        publication_status = 'needs_revision' if isolated else 'published'
         manifest = self._manifest()
         publications = manifest.setdefault('publications', {})
         existing = publications.get(draft_id)
+        # Once quarantine is in use, a strict low-level caller must not silently
+        # reintroduce an identity blocked by another active publication.
+        isolate_conflicts = isolate_conflicts or any(
+            value.get('conflict_policy') == 'isolate' for value in publications.values())
         if (existing and existing['revision'] == revision
                 and existing['context_fingerprint'] == self.context_fingerprint
                 and existing.get('validation_id') == validation.validation_id
-                and existing.get('graph_digest') == validation.graph_digest):
-            if record.status != 'published':
-                restored = record.model_copy(update={'status': 'published'})
+                and existing.get('graph_digest') == validation.graph_digest
+                and existing.get('conflict_policy', 'reject') == ('isolate' if isolate_conflicts else 'reject')):
+            if record.status != publication_status:
+                restored = record.model_copy(update={'status': publication_status})
                 relative = self._append_record('drafts', self._draft_record_payload(restored))
                 manifest['drafts'][draft_id]['history'].append(relative)
                 manifest['drafts'][draft_id]['current'] = relative
@@ -371,20 +400,31 @@ class GraphWorkspace:
         entry = {'draft_id': draft_id, 'revision': revision, 'context_fingerprint': self.context_fingerprint,
                  'draft_fingerprint': record.fingerprint, 'graph_digest': validation.graph_digest,
                  'validation_id': validation.validation_id, 'read_window': validation.read_window,
-                 'semantic_origin': 'agent_authored'}
+                 'semantic_origin': 'agent_authored', 'conflict_policy': 'isolate' if isolate_conflicts else 'reject',
+                 'coverage': 'conflict_isolated' if isolated else 'complete',
+                 'published_nodes': len(graph.get('nodes', [])), 'published_edges': len(graph.get('edges', [])),
+                 'isolated_nodes': graph.get('conflict_isolation', {}).get('nodes', 0),
+                 'isolated_edges': graph.get('conflict_isolation', {}).get('edges', 0)}
         published = {**graph, 'status': 'published', 'semantic_origin': 'agent_authored'}
+        entry['published_graph_digest'] = digest(published)
         # Check conflicts against every still-current independent publication
         # before advancing either the publication set or the merged graph head.
         graphs = [self._read_record(value['graph']) for key, value in publications.items()
                   if key != draft_id and value['context_fingerprint'] == self.context_fingerprint]
-        merged = _merge_graphs(graphs + [published])
+        contributors = graphs + [published]
+        if isolate_conflicts:
+            contributors, isolation = isolate_publications(contributors)
+            merged = _merge_graphs(contributors)
+            merged['conflict_isolation'] = isolation
+        else:
+            merged = _merge_graphs(contributors)
         entry['graph'] = self._append_record('published', published)
         manifest.setdefault('publication_history', []).append(entry)
         publications[draft_id] = entry
         manifest['current_graph'] = {'context_fingerprint': self.context_fingerprint,
                                      'access_fingerprint': merged.get('access_fingerprint'),
                                      'path': self._append_record('published', merged)}
-        published_record = record.model_copy(update={'status': 'published'})
+        published_record = record.model_copy(update={'status': publication_status})
         relative = self._append_record('drafts', self._draft_record_payload(published_record))
         manifest['drafts'][draft_id]['history'].append(relative)
         manifest['drafts'][draft_id]['current'] = relative
@@ -398,6 +438,11 @@ class GraphWorkspace:
         if head['context_fingerprint'] != self.context_fingerprint:
             raise LightGraphError('stale_published_graph')
         return self._read_record(head['path'])
+
+    def read_publication_contributors(self) -> list[dict]:
+        """Unmerged snapshots retain cross-draft counterexamples for diagnosis."""
+        return [self._read_record(entry['graph']) for entry in self._manifest().get('publications', {}).values()
+                if entry['context_fingerprint'] == self.context_fingerprint]
 
     def list_drafts(self) -> list[DraftRecord]:
         return [self.get_draft(key) for key in self._manifest()["drafts"]]

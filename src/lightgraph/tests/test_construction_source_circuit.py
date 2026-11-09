@@ -300,13 +300,14 @@ def test_mixed_snapshot_close_failure_is_attributed_only_to_its_source(fixture):
     bad.snapshot = fail_on_close
     for _ in range(3):
         result = validate(tools)
-        assert not result['passed'] and result['metrics']['mappings_checked'] == 3
+        assert not result['passed'] and result['metrics']['mappings_checked'] == 2
         failures = [item for item in result['diagnostics'] if item['code'] == 'snapshot_close_failed']
         assert len(failures) == 1 and failures[0]['source_id'] == 'z_database'
-        assert not any(item.get('source_id') == 'a_local' for item in result['diagnostics'])
+        assert all(item['code'] == 'relation_dependency_unavailable'
+                   for item in result['diagnostics'] if item.get('source_id') == 'a_local')
         windows = {item['source_id']: item['state'] for item in result['read_window']['source_read_windows']}
         assert windows['z_database'] == 'failed'
-        assert windows['a_local'] == 'closed_after_interruption'
+        assert windows['a_local'] == 'closed'
     summary = tools.call('describe_sources')['source_circuits']
     assert len(summary['sources']) == 1 and summary['sources'][0]['source_id'] == 'z_database'
     assert summary['sources'][0]['consecutive_failures'] == 3

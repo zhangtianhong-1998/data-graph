@@ -63,8 +63,10 @@ def test_driver_exception_is_value_free_and_preserves_published_graph(tmp_path, 
             adapter.project = broken
             result = tools.call('validate_graph_draft', draft_id='items')
             assert result['status'] == 'ok' and not result['passed']
-            assert result['diagnostics'] == [{'code': 'construction_source_execution_failed',
-                                              'new_snapshot_recovery_available': False}]
+            assert result['diagnostics'][0] == {'code': 'construction_source_execution_failed',
+                'phase': 'projection', 'entity_type': '对象', 'mapping': 0, 'source_id': 's',
+                'retryable': False, 'new_snapshot_recovery_available': False}
+            assert {d['code'] for d in result['diagnostics'][1:]} == {'mapping_source_unavailable'}
             assert tools.workspace.get_draft('items').status == 'needs_revision'
             assert tools.workspace.read_published_graph() == before
             # A transport failure does not refute the previously checked

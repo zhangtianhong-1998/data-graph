@@ -5,10 +5,12 @@ type Check = { passed?: boolean | null; diagnostics?: Array<{ code?: string }>; 
 type Draft = { draft_id: string; revision: number; status: string; entity_types: number; relation_types: number; mappings: number; unresolved?: string[]; decisions?: string[]; suggestions?: string[]; validation?: Check }
 type Usage = { input_tokens?: number; output_tokens?: number; total_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; max_input_tokens?: number; measured_calls?: number; dispatched_calls?: number | null; missing_usage_calls?: number; complete?: boolean; by_purpose?: { compaction?: { total_tokens?: number } } }
 type StructurePublication = { draft_id: string; revision: number; path?: string; validation_id?: string }
+type ConflictIsolation = { nodes?: number; edges?: number; coverage?: string }
+type InstancePublication = { draft_id: string; revision: number; coverage?: string; published_nodes?: number; published_edges?: number; isolated_nodes?: number }
 type Construction = {
   drafts?: Draft[]
   summary?: { draft_count?: number; published_drafts?: number; published_structures?: number; entity_type_count?: number; relation_type_count?: number; mapping_count?: number }
-  execution?: { model_runtime?: string; data_validation?: string; structure_validation?: string; instance_enumeration?: string; structure_publications?: StructurePublication[] }
+  execution?: { model_runtime?: string; data_validation?: string; structure_validation?: string; instance_enumeration?: string; structure_publications?: StructurePublication[]; conflict_isolation?: ConflictIsolation; instance_publications?: InstancePublication[] }
   acceptance?: { independent_gold?: string; customer_database?: string }
   usage?: Usage
   statistics?: { complete?: boolean; nodes?: number; edges?: number; entity_types?: Record<string, { nodes: number; unique_labels: number; unique_source_labels?: number; aliases: number }>; relation_types?: Record<string, { edges: number; multiple_parent_nodes: number; acyclic: boolean; cycle_nodes: number; acyclic_declared: boolean }> }
@@ -17,9 +19,11 @@ const report = computed(() => props.report as { construction?: Construction; val
 const data = computed(() => report.value?.construction)
 const structureOnly = computed(() => report.value?.validation?.construction_target === 'structure')
 const structurePublications = computed(() => data.value?.execution?.structure_publications || [])
+const isolated = computed(() => data.value?.execution?.conflict_isolation)
+const subsetPublication = (draft: Draft) => data.value?.execution?.instance_publications?.find(item => item.draft_id === draft.draft_id && item.revision === draft.revision && item.coverage === 'conflict_isolated')
 const publishedStructures = computed(() => data.value?.summary?.published_structures ?? report.value?.counts?.structures_published ?? (data.value?.execution?.structure_publications ? structurePublications.value.length : undefined))
 const modelLabels: Record<string, string> = { executed: '已执行真实模型调用', test_double: '仅模拟调用', not_run: '未执行', interrupted: '调用过程被中断' }
-const checkLabels: Record<string, string> = { passed: '已通过', failed: '未通过', not_run: '未执行', incomplete: '尚未完成' }
+const checkLabels: Record<string, string> = { passed: '已通过', failed: '未通过', conflict_isolated: '冲突已隔离，仍需修订', not_run: '未执行', incomplete: '尚未完成' }
 const acceptanceLabels: Record<string, string> = { passed: '已验收', failed: '未通过', not_run: '尚未验收', partial: '尚未完成' }
 const draftLabels: Record<string, string> = { candidate: '草稿已保存', validated: '数据检查已通过', published: '已发布', needs_revision: '需要修订', stale: '来源已变化，需重验' }
 const draftCheck = (draft: Draft) => draft.validation?.passed === true ? '已通过' : draft.validation?.passed === false ? '未通过' : '未执行'
@@ -48,6 +52,7 @@ const compactionTokens = computed(() => data.value?.usage?.by_purpose?.compactio
     </dl>
     <p v-if="structureOnly" class="field-hint" aria-label="结构产物范围">本次检查对象、关系定义和字段映射，未枚举或验证实例数据。结构方案发布不代表实例图谱完整；业务解释来自 Agent，独立评测与客户验收分别记录。</p>
     <p v-else class="field-hint">发布表示已通过所记录的数据检查。业务解释来自 Agent，独立评测与客户验收分别记录。</p>
+    <p v-if="!structureOnly && isolated?.nodes" class="note amber" aria-label="冲突隔离结果">已发布无冲突部分；{{ isolated.nodes }} 个节点及 {{ isolated.edges ?? 0 }} 条关联边已隔离，原始候选与冲突证据保留。目标仍有缺口，修订并重验后可恢复相关节点。</p>
     <section v-if="structurePublications.length" aria-label="已发布结构方案">
       <h4>已发布结构方案</h4>
       <ul><li v-for="item in structurePublications" :key="`${item.draft_id}:${item.revision}`"><strong>{{ item.draft_id }} · 修订 {{ item.revision }}</strong><p v-if="item.path" class="structure-path">产物路径：<code>{{ item.path }}</code></p></li></ul>
@@ -73,6 +78,7 @@ const compactionTokens = computed(() => data.value?.usage?.by_purpose?.compactio
       <h4>{{ draft.draft_id }} · 修订 {{ draft.revision }} <span class="badge">{{ structureOnly ? (structurePublished(draft) ? '结构方案已发布' : '结构映射草稿') : (draftLabels[draft.status] || draft.status) }}</span></h4>
       <p v-if="structureOnly">{{ draft.entity_types }} 类对象定义 · {{ draft.relation_types }} 类关系定义 · {{ draft.mappings }} 个映射 · 结构检查：{{ structureDraftCheck(draft) }}</p>
       <p v-else>{{ draft.entity_types }} 类实体 · {{ draft.relation_types }} 类关系 · {{ draft.mappings }} 个映射 · 数据检查：{{ draftCheck(draft) }}</p>
+      <p v-if="!structureOnly && subsetPublication(draft)" class="note amber">本修订的无冲突部分已发布：{{ subsetPublication(draft)?.published_nodes }} 个节点、{{ subsetPublication(draft)?.published_edges }} 条边；隔离 {{ subsetPublication(draft)?.isolated_nodes }} 个冲突节点。完整草稿的数据检查仍未通过。</p>
       <p v-if="!structureOnly && draft.validation?.diagnostics?.length" class="note amber">检查诊断：{{ draft.validation.diagnostics.map(item => item.code || '未提供代码').join('、') }}</p>
       <section v-if="draft.unresolved?.length" aria-label="目标缺口"><h5>目标缺口</h5><ul><li v-for="(item, i) in draft.unresolved" :key="i">{{ item }}</li></ul></section>
       <section v-if="draft.decisions?.length" aria-label="已采用的解释"><h5>已采用的解释</h5><ul><li v-for="(item, i) in draft.decisions" :key="i">{{ item }}</li></ul></section>

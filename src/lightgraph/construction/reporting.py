@@ -8,6 +8,8 @@ from .statistics import graph_statistics
 def draft_is_ready(record, publications, *, discover_only=False):
     """A selected snapshot can be published after an unrelated failed attempt."""
     published = publications.get(record.draft.draft_id, {})
+    if not discover_only and published.get('coverage') == 'conflict_isolated':
+        return False
     if (not discover_only and record.status == 'published'
             and published.get('revision') == record.revision
             and published.get('draft_fingerprint') == record.fingerprint
@@ -35,12 +37,19 @@ def construction_summary(records, publications, graph, *, execution_kind='not_ru
     checks = [record.validation for record in records]
     data_validation = ('not_run' if not any(checks) else
                       'passed' if checks and all(check and check.passed for check in checks) else 'failed')
+    if graph.get('conflict_isolation', {}).get('nodes', 0):
+        data_validation = 'conflict_isolated'
     stats = graph_statistics(graph)
     return ConstructionSummary(drafts=drafts,
         summary={'draft_count': len(drafts), 'published_drafts': len(publications),
                  'entity_type_count': stats['entity_type_count'], 'relation_type_count': stats['relation_type_count'],
                  'mapping_count': sum(stats['observed_mappings'].values())},
-        execution={'model_runtime': execution_kind, 'data_validation': data_validation}, statistics=stats)
+        execution={'model_runtime': execution_kind, 'data_validation': data_validation,
+                   'conflict_isolation': {k: v for k, v in graph.get('conflict_isolation', {}).items()
+                                          if k not in {'node_ids', 'edge_ids'}},
+                   'instance_publications': [{k: v for k, v in p.items() if k in {
+                       'draft_id', 'revision', 'coverage', 'published_nodes', 'published_edges',
+                       'isolated_nodes', 'isolated_edges'}} for p in publications.values()]}, statistics=stats)
 
 
 def draft_issues(records, publications, *, discover_only=False):

@@ -35,9 +35,9 @@ class HarnessOptions:
     max_input_tokens: int | None = 1048576
     max_output_tokens: int = 65536
     working_context_tokens: int | None = 32768
-    timeout_seconds: float = 600
-    max_calls: int = 240
-    max_run_seconds: float = 7200
+    timeout_seconds: float = 800
+    max_calls: int = 2000
+    max_run_seconds: float = 60000
     retries: int = 1
     include_stream_usage: bool = True
     dsh_bin: str | None = None

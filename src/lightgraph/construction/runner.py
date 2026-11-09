@@ -305,6 +305,9 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
                     'business_nodes': report.counts['business_nodes'], 'business_edges': report.counts['business_edges']})
                 remaining_work = not records or any(r.draft.unresolved or not draft_is_ready(
                     r, publications, discover_only=discover_only) for r in records)
+                if not structure_target and graph.get('conflict_isolation', {}).get('nodes', 0):
+                    remaining_work = True
+                    report.issues.append({'code': 'construction_conflicts_isolated', 'status': 'unresolved'})
                 if structure_target:
                     remaining_work = not records or any(r.draft.unresolved or not structure_ready(
                         tools.workspace, r, discover_only=discover_only) for r in records)

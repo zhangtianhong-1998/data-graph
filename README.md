@@ -22,6 +22,8 @@ Windows 使用 `.venv\Scripts\python.exe` 和 `.venv\Scripts\lightgraph.exe`。�
 
 打开 [http://127.0.0.1:8001](http://127.0.0.1:8001)，配置来源、知识文档、构建目标和模型后保存并启动。配置保存后，下一次运行立即使用新值；运行中的任务保持启动时快照。
 
+新建项目默认最大输入 1048576 tokens、最大输出 65536 tokens、模型调用 2000 次、运行时限 60000 秒、接口超时 800 秒。已有明确配置保留，可在页面点击“使用默认额度”后保存。常用设置直接填写，完整 JSON 编辑器默认折叠。
+
 启动时可选“继续上次工作”或“从零开始（保留历史）”。继续运行复用当前草稿、证据和验证；从零运行使用独立成果目录与会话索引，仍沿用保存的输入和授权，旧成果不会删除。之后的当前画布与继续运行跟随新目录，运行详情记录各自模式及成果路径。
 
 页面填写的模型 API key 加密保存在本机，刷新页面或重启服务后无需重填；密钥绑定项目、服务地址与模型名，可主动清除，服务器环境变量方式仍可使用。
@@ -75,11 +77,11 @@ model:
   base_url: http://127.0.0.1:9000/v1
   model: your-model
   api_key_env: LIGHTGRAPH_API_KEY
-  max_calls: 80
+  max_calls: 2000
   max_prompt_tokens: 1048576
   max_output_tokens: 65536
-  timeout_seconds: 600
-max_run_seconds: 3600
+  timeout_seconds: 800
+max_run_seconds: 60000
 record_trace: true
 output_dir: ./runs/graph
 ```
@@ -140,3 +142,5 @@ Harness 原生会话与调用轨迹使用原生 JSONL，单独保留，不冒充
 - [迁移前实施记录](design/lightweight_graph/history/implementation-before-harness.md)
 
 历史实验、输入文件和已生成结果均保留。历史文档中的 AgentScope、RuleSpec、固定阶段和旧测试数字只描述当时版本。
+
+本轮连接与发布行为见[短连接和冲突隔离设计](design/lightweight_graph/CONNECTIONS_AND_CONFLICTS_20261109.md)：每组完整投影后释放连接；连接恢复最多三次；仅有名称冲突时可发布无冲突部分，保留冲突证据和目标缺口。
