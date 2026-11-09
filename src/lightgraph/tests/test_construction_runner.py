@@ -101,6 +101,26 @@ def test_no_automatic_validation_or_publication(tmp_path, scripted_bridge):
     assert result['execution_kind'] == 'test_double'
 
 
+@pytest.mark.parametrize('stop_code', ['construction_tool_transport_failed', 'construction_compaction_failed'])
+@pytest.mark.parametrize('finish_reason', ['error', 'completed'])
+def test_native_terminal_cause_kept_without_losing_saved_publication(tmp_path, scripted_bridge, stop_code, finish_reason):
+    def runtime(intent, **options):
+        tools = scripted_bridge['tools']
+        save_object(tools)
+        assert tools.call('validate_graph_draft', draft_id='资料对象')['passed']
+        assert tools.call('publish_graph_draft', draft_id='资料对象')['status'] == 'ok'
+        return {'finish_reason': finish_reason, 'budget': {'calls': 4, 'stop_reason': stop_code}}
+
+    report = runner.run_construction(configuration(tmp_path), runtime=runtime)
+    assert report.status == 'PARTIAL'
+    assert report.counts['business_nodes'] == 2
+    assert report.counts['rules_published'] == 1
+    codes = {issue['code'] for issue in report.issues}
+    assert stop_code in codes and 'harness_run_interrupted' not in codes
+    restored = type(report).model_validate_json(report.model_dump_json())
+    assert restored.construction.drafts[0].validation.passed
+
+
 def test_report_retains_source_circuit_cause_and_already_published_graph(tmp_path, scripted_bridge):
     config = configuration(tmp_path)
 

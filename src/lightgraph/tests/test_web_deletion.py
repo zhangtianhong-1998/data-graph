@@ -461,3 +461,49 @@ def test_imported_source_ids_remain_removable_without_profile_paths(client, sid)
     result = client.delete('/api/projects/alpha/sources/' + sid)
     assert result.status_code == 200, result.text
     assert result.json()['removed_source_ids'] == [sid]
+
+
+
+def test_delete_after_fresh_updates_only_active_metadata_and_preserves_history(client, monkeypatch):
+    from pathlib import Path
+    first = upload(client, 'first.csv', b'code\nA\n')
+    second = upload(client, 'second.csv', b'code\nB\n')
+    ws = client.app.state.workspace
+    assert len(read_metadata(ws, 'alpha', refresh=True)['tables']) == 2
+    old_output = Path(ws.resolved_config('alpha').output_dir)
+    historical = {path: path.read_bytes() for path in old_output.rglob('*') if path.is_file()}
+    ws.select_output_generation('alpha', 'run_' + '3' * 24, create=True)
+    assert len(read_metadata(ws, 'alpha', refresh=True)['tables']) == 2
+    active = Path(ws.resolved_config('alpha').output_dir)
+    current_catalogs = list((active / 'metadata').rglob('*.yaml'))
+    assert current_catalogs
+    import lightgraph.runtime.config as runtime
+    monkeypatch.setattr(runtime, 'open_sources', lambda *_a, **_k: pytest.fail('deletion must not query sources'))
+    response = client.delete(f"/api/projects/alpha/files/{first['file_id']}")
+    assert response.status_code == 200, response.text
+    metadata = read_metadata(ws, 'alpha')
+    assert [table['name'] for table in metadata['tables']] == ['second']
+    assert not metadata['requires_refresh']
+    assert all(not path.exists() for path in current_catalogs)
+    assert all(path.read_bytes() == content for path, content in historical.items())
+    assert (ws.project_path('alpha') / second['relative_path']).is_file()
+
+
+def test_rebind_inactive_document_uses_fresh_metadata_not_historical_catalog(client):
+    from pathlib import Path
+    first = upload(client, 'items.csv', b'code\nA\n')
+    doc = upload(client, 'bound.md', b'---\npurpose: data_description\nscope: {tables: [items]}\n---\n# schema')
+    ws = client.app.state.workspace
+    preview_file_metadata(ws, 'alpha', first['file_id'])
+    assert client.delete(f"/api/projects/alpha/files/{first['file_id']}").status_code == 200
+    old_output = Path(ws.resolved_config('alpha').output_dir)
+    historical = {path: path.read_bytes() for path in old_output.rglob('*') if path.is_file()}
+    ws.select_output_generation('alpha', 'run_' + '4' * 24, create=True)
+    other = upload(client, 'other.csv', b'code\nB\n')
+    preview_file_metadata(ws, 'alpha', other['file_id'])
+    response = client.patch(f"/api/projects/alpha/files/{doc['file_id']}/binding", json={
+        'purpose': 'data_description', 'scope': {'tables': ['other']}})
+    assert response.status_code == 200, response.text
+    assert response.json()['inactive_reason'] is None
+    assert doc['relative_path'] in ws.get_config('alpha')['documents']
+    assert all(path.read_bytes() == content for path, content in historical.items())

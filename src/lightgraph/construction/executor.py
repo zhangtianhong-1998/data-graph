@@ -15,6 +15,7 @@ from lightgraph.source_values import (source_scalar, scalar_kind, typed_key, ide
 from .models import GraphDraft, iter_fact_mappings, draft_evidence_refs
 from .access import scope_binding_map, support_scope
 from .display import derive_display_graph
+from .accumulation import GraphAccumulator
 from .metadata_columns import (is_metadata_mapping, physical_column_key, metadata_endpoint,
                                mapping_predicate, checked_column, column_node, merge_column_supports)
 
@@ -59,12 +60,14 @@ def _has_cycle(pairs):
 
 
 def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 1024 * 1024,
-                  max_rows=20000, max_seconds=1800, scope_bindings=()):
+                  max_rows=20000, max_seconds=1800, scope_bindings=(), cancelled=None):
     """Check complete source projections and build an evidence-labelled graph.
 
     Callers provide an authorized physical catalog. Keys include only explicitly
     mapped values; source names and physical positions never enter identity.
     All mapping results remain unpublishable when any data check fails.
+    ``cancelled`` lets a caller stop CPU-side materialization cooperatively;
+    source adapters remain responsible for interrupting a blocking query.
     """
     draft = GraphDraft.model_validate(draft.model_dump(mode='python', by_alias=True)
                                      if isinstance(draft, GraphDraft) else draft)
@@ -76,6 +79,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     graph_bytes = 0
     cache_bytes = 0
     lookup_bytes = 0
+    accumulation_index_bytes = 0
+    peak_working_bytes = 0
     projection_cache, lookup_indexes = {}, {}
     cache_hits = 0
     lookup_matches, lookup_omitted = 0, 0
@@ -88,6 +93,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         return visibility.get((mapping.source_id, mapping.schema_name, mapping.table), [])
 
     def clock():
+        if cancelled is not None and cancelled():
+            raise LightGraphError('construction_cancelled')
         if time.monotonic() > deadline:
             raise LightGraphError('construction_time_exhausted')
 
@@ -162,11 +169,13 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     def error_diagnostic(error, **location):
         from lightgraph.sources.database_errors import safe_database_diagnostic
         detail = safe_database_diagnostic(error)
+        location = {**getattr(error, 'construction_mapping_location', {}), **location}
         source_id = getattr(error, 'construction_source_id', None)
         if source_id in by_source:
             location['source_id'] = source_id
         diagnostic(error.code, **location, retryable=error.retryable,
-                   **({'database': detail} if detail else {}))
+                   **({'database': detail} if detail else {}),
+                   **getattr(error, 'construction_memory_diagnostic', {}))
 
     def failed_operation(error):
         from .failures import SOURCE_FAILURES
@@ -176,11 +185,32 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             # Never retry later mappings against that same snapshot.
             unavailable_sources[source_id] = error.code
 
+    def check_memory(phase, pending_projection_bytes=0):
+        nonlocal peak_working_bytes
+        required = (graph_bytes + cache_bytes + lookup_bytes + accumulation_index_bytes
+                    + pending_projection_bytes)
+        peak_working_bytes = max(peak_working_bytes, required)
+        if required > max_working_bytes:
+            error = LightGraphError('memory_budget_exhausted')
+            error.construction_memory_diagnostic = {
+                'phase': phase, 'limit_bytes': max_working_bytes, 'estimated_required_bytes': required,
+                'graph_payload_bytes': graph_bytes, 'projection_cache_bytes': cache_bytes,
+                'pending_projection_bytes': pending_projection_bytes, 'lookup_index_bytes': lookup_bytes,
+                'accumulation_index_bytes': accumulation_index_bytes,
+                'measurement': 'serialized_payload_and_estimated_indexes', 'exact_rss': False}
+            raise error
+
+    def account_graph(delta, index_delta=0):
+        nonlocal graph_bytes, accumulation_index_bytes
+        graph_bytes += delta
+        accumulation_index_bytes += index_delta
+        check_memory('graph_accumulation')
+
+    accumulation = GraphAccumulator(account_graph)
+
     def update_size(previous, current):
-        nonlocal graph_bytes
-        graph_bytes += len(canonical(current).encode()) - previous
-        if graph_bytes + cache_bytes + lookup_bytes > max_working_bytes:
-            raise LightGraphError('memory_budget_exhausted')
+        # Catalog objects are small and updated only once per mapping.
+        account_graph(len(canonical(current).encode()) - previous)
 
     def rows_for(mapping):
         try:
@@ -246,8 +276,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                         clock()
                         item = dict(zip(batch.columns, (source_scalar(value) for value in row)))
                         retained_bytes += len(canonical(item).encode())
-                        if retained_bytes + graph_bytes + cache_bytes + lookup_bytes > max_working_bytes:
-                            raise LightGraphError('memory_budget_exhausted')
+                        check_memory('projection', retained_bytes)
                         if len(rows) >= cap:
                             raise LightGraphError('projection_truncated')
                         rows.append(item)
@@ -297,8 +326,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                     continue
                 token = typed_key(match)
                 lookup_bytes += len(token.encode()) + 16
-                if graph_bytes + cache_bytes + lookup_bytes > max_working_bytes:
-                    raise LightGraphError('memory_budget_exhausted')
+                check_memory('lookup_index')
                 index[token].append(candidate)
             lookup_indexes[cache_key] = index
         values = [row[c] for c in columns]
@@ -368,6 +396,14 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             if canonical(value) not in {canonical(v) for v in values}:
                 values.append(value)
 
+    def graph_properties(item, mapping, row):
+        for name, value in mapping.constant_properties.items():
+            accumulation.append(item, 'properties', value, property_name=name)
+        for name, column in mapping.properties.items():
+            value = row[column]
+            if value is not None:
+                accumulation.append(item, 'properties', value, property_name=name)
+
     definitions = {'entities': [{**e.model_dump(mode='json', exclude={'mappings'}),
                     'identity_origin': 'physical_column' if is_metadata_mapping(e.mappings[0]) else 'row'}
                     for e in draft.entities],
@@ -406,6 +442,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                 for index, mapping in enumerate(entity.mappings):
                     location = {'entity_type': entity.type, 'mapping': index, 'source_id': mapping.source_id}
                     try:
+                        clock()
                         if is_metadata_mapping(mapping):
                             node = column_node(entity, index, mapping, allowed, goal)
                             previous_node = nodes.get(node['id'])
@@ -441,7 +478,6 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                 label = None
                             current_support = contribution(mapping, row, support)
                             node = nodes.get(node_id)
-                            previous = len(canonical(node).encode()) if node is not None else 0
                             if node is None:
                                 node = nodes[node_id] = {'id': node_id, 'type': entity.type,
                                     'label': str(label) if label is not None else '',
@@ -449,29 +485,26 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                     'identity': dict(zip(entity.key_names, key)),
                                     'identity_types': dict(zip(entity.key_names, map(scalar_kind, key))), 'aliases': [],
                                     'properties': {}, 'provenance': [], 'supports': []}
-                            elif label is not None:
-                                if any(previous_support['scope_ref'] == current_support['scope_ref']
-                                       and previous_support.get('label') is not None
-                                       and previous_support['label'] != str(label)
-                                       for previous_support in node['supports']):
+                                accumulation.register(node)
+                            if label is not None:
+                                if accumulation.label_conflicts(node_id, current_support['scope_ref'], str(label)):
                                     diagnostic('same_identity_conflicting_label', node_id=node_id, **location)
                                 elif not node['label_observed']:
-                                    node['label'], node['label_observed'] = str(label), True
+                                    accumulation.replace(node, 'label', str(label))
+                                    accumulation.replace(node, 'label_observed', True)
                             for column in mapping.alias_columns:
                                 alias = row[column]
-                                if alias is not None and str(alias) not in node['aliases']:
-                                    node['aliases'].append(str(alias))
-                            properties(node, mapping, row)
-                            if support not in node['provenance']:
-                                node['provenance'].append(support)
-                            if current_support not in node['supports']:
-                                node['supports'].append(current_support)
-                            update_size(previous, node)
+                                if alias is not None:
+                                    accumulation.append(node, 'aliases', str(alias))
+                            graph_properties(node, mapping, row)
+                            accumulation.append(node, 'provenance', support)
+                            accumulation.append(node, 'supports', current_support)
                     except LightGraphError as exc:
                         incomplete_entity_types.add(entity.type)
                         failed_operation(exc)
-                        if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted',
+                        if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted', 'construction_cancelled',
                                        'run_time_budget_exhausted', 'query_budget_exhausted'}:
+                            exc.construction_mapping_location = location
                             raise
                         error_diagnostic(exc, **location)
                     finally:
@@ -485,6 +518,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                 for index, mapping in enumerate(relation.mappings):
                     location = {'relation_type': relation.type, 'mapping': index, 'source_id': mapping.source_id}
                     try:
+                        clock()
                         if blocked_sources(mapping):
                             diagnostic('mapping_source_unavailable', **location,
                                        blocked_sources=blocked_sources(mapping))
@@ -539,13 +573,12 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                     pairs.add((source, target))
                                     edge_id = 'r_' + digest(relation.type, source, target)
                                     edge = edges.get(edge_id)
-                                    previous = len(canonical(edge).encode()) if edge is not None else 0
                                     if edge is None:
                                         edge = edges[edge_id] = {'id': edge_id, 'type': relation.type,
                                             'source': source, 'target': target, 'properties': {}, 'provenance': [], 'supports': []}
-                                    properties(edge, mapping, row)
-                                    if support not in edge['provenance']:
-                                        edge['provenance'].append(support)
+                                        accumulation.register(edge)
+                                    graph_properties(edge, mapping, row)
+                                    accumulation.append(edge, 'provenance', support)
                                     current_support = contribution(mapping, row, support)
                                     matches = [match for match in (source_match, target_match) if match is not None]
                                     if matches:
@@ -556,13 +589,12 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                             current_support['row_context'] = {
                                                 'id': 'ctx_' + digest(support['source'], typed_value(values)), 'values': values,
                                                 'value_types': {name: scalar_kind(value) for name, value in values.items()}}
-                                    if current_support not in edge['supports']:
-                                        edge['supports'].append(current_support)
-                                    update_size(previous, edge)
+                                    accumulation.append(edge, 'supports', current_support)
                     except LightGraphError as exc:
                         failed_operation(exc)
-                        if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted',
+                        if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted', 'construction_cancelled',
                                        'run_time_budget_exhausted', 'query_budget_exhausted'}:
+                            exc.construction_mapping_location = location
                             raise
                         error_diagnostic(exc, **location)
                     finally:
@@ -572,8 +604,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                     diagnostic('relation_cycle', relation_type=relation.type)
     except LightGraphError as exc:
         error_diagnostic(exc)
-        if exc.code == 'memory_budget_exhausted':
-            # Do not return an over-limit graph after stopping its enumeration.
+        if exc.code in {'memory_budget_exhausted', 'construction_cancelled'}:
+            # Do not render an over-limit or explicitly cancelled partial graph.
             # The source mappings remain durable and can be retried unchanged.
             nodes.clear()
             edges.clear()
@@ -604,6 +636,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     # in memory or omit those fields from the serialized working-set boundary.
     projection_cache.clear()
     lookup_indexes.clear()
+    accumulation.clear()
     rendered = derive_display_graph(graph, copy=False)
     rendered_bytes = len(canonical(rendered).encode())
     if rendered_bytes > max_working_bytes:
@@ -618,5 +651,11 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             'metrics': {'mappings_checked': checked, 'projected_distinct_rows': projected_rows,
                         'nodes': len(nodes), 'edges': len(edges), 'equal_endpoints_omitted': omitted,
                         'projection_cache_hits': cache_hits, 'unique_projections': len(unique_projections),
-                        'lookup_matches': lookup_matches, 'lookup_inputs_omitted': lookup_omitted},
+                        'lookup_matches': lookup_matches, 'lookup_inputs_omitted': lookup_omitted,
+                        # Serialized payload plus estimated index allowances;
+                        # numeric metrics deliberately do not claim actual RSS.
+                        'working_memory_limit_bytes': max_working_bytes,
+                        'working_memory_estimated_peak_bytes': max(peak_working_bytes, rendered_bytes),
+                        'working_memory_exact_rss': False,
+                        'accumulation_serialized_bytes': accumulation.serialized_bytes},
             'graph': plain_value(rendered)}

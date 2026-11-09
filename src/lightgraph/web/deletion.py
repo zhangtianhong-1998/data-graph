@@ -98,10 +98,17 @@ def _rule_targets(value, targets):
     return any(_rule_targets(item, targets) for item in value.values())
 
 
+def _output_path(workspace, pid, relative):
+    """Resolve mutable metadata only inside the active construction workspace."""
+    output = Path(workspace.resolved_config(pid).output_dir)
+    path = output / relative
+    return workspace._path(pid, path.relative_to(workspace.project_path(pid)).as_posix())
+
+
 def _cached(workspace, pid):
     from .execution import _metadata_context
-    path = workspace._path(pid, 'output/metadata.yaml')
-    context_path = workspace._path(pid, 'output/metadata-context.json')
+    path = _output_path(workspace, pid, 'metadata.yaml')
+    context_path = _output_path(workspace, pid, 'metadata-context.json')
     if not path.exists() or not context_path.exists():
         return None, set()
     try:
@@ -133,10 +140,10 @@ def _metadata_update(workspace, pid, config, declared, trusted, targets):
         revision=digest(CATALOG_VERSION, [t.model_dump(by_alias=True) for t in tables], [s.model_dump() for s in sources]))
     semantic = semantic_catalog(fresh, resolved.goal, documents=[])
     return {
-        workspace._path(pid, 'output/metadata.yaml'): yaml.safe_dump({
+        _output_path(workspace, pid, 'metadata.yaml'): yaml.safe_dump({
             'declared': fresh.model_dump(mode='json', by_alias=True),
             'semantic_annotations': semantic.model_dump(mode='json', by_alias=True)}, allow_unicode=True, sort_keys=False).encode(),
-        workspace._path(pid, 'output/metadata-context.json'): json.dumps(
+        _output_path(workspace, pid, 'metadata-context.json'): json.dumps(
             _metadata_context(resolved, workspace.project_path(pid)), ensure_ascii=False).encode(),
     }
 
@@ -145,7 +152,8 @@ def _obsolete_catalogs(workspace, pid, targets):
     """Remove owned snapshots containing deleted inputs, without rewriting hashes.
 
     Mixed snapshots are removed as a unit; the current catalog is rebuilt above.
-    Uploads, per-run results and unrelated catalog revisions remain untouched.
+    Only the active generation is edited. Historical generation catalogs,
+    uploads, per-run results and unrelated catalog revisions remain untouched.
     """
     if not targets:
         return []
@@ -156,7 +164,7 @@ def _obsolete_catalogs(workspace, pid, targets):
 
     deletions, removed_revisions = [], set()
     for folder, model in [('declarations', DeclaredCatalog), ('interpretations', SemanticCatalog)]:
-        directory = workspace._path(pid, 'output/metadata/' + folder)
+        directory = _output_path(workspace, pid, 'metadata/' + folder)
         for path in sorted(directory.glob('*.yaml')):
             if not re.fullmatch(r'[0-9a-f]{64}', path.stem):
                 continue

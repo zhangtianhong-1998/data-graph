@@ -267,12 +267,14 @@ class RunManager:
                 except (LightGraphError, OSError):
                     continue
 
-    def start(self, pid, *, source_credentials=None, model_api_key=None):
+    def start(self, pid, *, source_credentials=None, model_api_key=None, run_mode="continue"):
         with self.workspace.lock(pid), self._guard:
             if self._closed:
                 raise LightGraphError("run_service_stopped")
             if self.active(pid):
                 raise LightGraphError("project_run_active")
+            if run_mode not in {"continue", "fresh"}:
+                raise LightGraphError("invalid_run_mode")
             project, runs = self._paths(pid)
             config = self.workspace.resolved_config(pid).model_copy(deep=True)
             from ..construction.intent import effective_goal_markdown
@@ -283,14 +285,20 @@ class RunManager:
             for source in config.sources:
                 if source.credential_mode == "session" and not (source_credentials or {}).get(source.id):
                     raise LightGraphError("source_credential_missing")
+            rid = "run_" + uuid.uuid4().hex[:24]
+            previous_generation = None
+            if run_mode == "fresh":
+                previous_generation = self.workspace.output_generation(pid)
+                config.output_dir = str(self.workspace.generation_path(pid, rid))
             payload = _resolved_payload(config, project, source_credentials=source_credentials,
                                         model_api_key=model_api_key)
-            rid = "run_" + uuid.uuid4().hex[:24]
             result_path = runs / (rid + ".result.json")
             record = {"run_id": rid, "project_id": pid, "status": "queued", "stage": "starting",
                       "created_at": _now(), "finished_at": None, "report": None,
                       "error_code": None, "cleanup_status": "pending",
                       "dependencies": payload["dependencies"],
+                      "run_mode": run_mode,
+                      "output_path": Path(config.output_dir).relative_to(project).as_posix(),
                       "config_revision": self.workspace.config_revision(pid)}
             _save(runs / (rid + ".json"), record)
             env = os.environ.copy()
@@ -299,7 +307,11 @@ class RunManager:
             diagnostics = WorkerDiagnostics(result_path)
             diagnostics.emit('worker_starting', stage='launch')
             collector = None
+            generation_selected = False
             try:
+                if run_mode == "fresh":
+                    self.workspace.select_output_generation(pid, rid, create=True)
+                    generation_selected = True
                 # The inherited lock stays held if this service crashes while
                 # its worker is still publishing. Handle inheritance differs
                 # between POSIX and Windows and is owned by FileLock.
@@ -324,6 +336,8 @@ class RunManager:
                 if collector is not None:
                     diagnostics.emit('worker_stderr_summary', stage='launch', **collector.finish())
                 diagnostics.emit('worker_start_failed', stage='launch', error=exc, error_code='worker_start_failed')
+                if generation_selected:
+                    self.workspace.select_output_generation(pid, previous_generation)
                 record.update(status="failed", stage="finished", finished_at=_now(),
                               cleanup_status="unknown", error_code="worker_start_failed")
                 _save(runs / (rid + ".json"), record)

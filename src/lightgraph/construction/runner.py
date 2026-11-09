@@ -180,11 +180,14 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
         if runtime is not None:
             report.counts["simulated_model_calls"] = calls
             report.validation["D"] = "test_double"
-        if reason not in {"completed", "stop", "end_turn"}:
+        cause = budget.get("stop_reason", "")
+        terminal_codes = STOP_QUERY_CODES | {"construction_input_limit_exceeded", "construction_call_budget_exhausted",
+            "construction_time_budget_exhausted", "construction_tool_transport_failed", "construction_compaction_failed"}
+        # The Agent may use its closeout allowance to return a normal final
+        # message. That cannot erase a trusted runtime failure already recorded.
+        if reason not in {"completed", "stop", "end_turn"} or cause in terminal_codes:
             report.status = "PARTIAL"
-            cause = budget.get("stop_reason", "")
-            code = cause if cause in STOP_QUERY_CODES | {"construction_input_limit_exceeded", "construction_call_budget_exhausted",
-                                     "construction_time_budget_exhausted"} else "harness_run_interrupted"
+            code = cause if cause in terminal_codes else "harness_run_interrupted"
             report.issues.append({"code": code, "status": "partial"})
     except LightGraphError as exc:
         report.status = "PARTIAL"
@@ -256,7 +259,8 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
                 from .reporting import construction_summary, draft_is_ready, draft_issues
                 execution_kind = ('test_double' if runtime and outcome else
                                   'executed' if outcome else 'interrupted' if observed_calls else 'not_run')
-                if outcome and outcome.get('finish_reason') not in {'completed', 'stop', 'end_turn'}:
+                if outcome and (outcome.get('finish_reason') not in {'completed', 'stop', 'end_turn'}
+                        or (outcome.get('budget') or {}).get('stop_reason')):
                     execution_kind = 'interrupted'
                 report.construction = construction_summary(records, publications, graph, execution_kind=execution_kind)
                 report.construction.usage = usage

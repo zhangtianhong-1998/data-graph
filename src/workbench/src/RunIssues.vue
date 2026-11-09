@@ -32,6 +32,8 @@ const constructionMessageCodes = new Set(['construction_goal_gap', 'construction
 const issueMessage = (issue: RunIssue) => constructionMessageCodes.has(issue.code || '') && issue.category === ({ construction_goal_gap: 'goal_gap', construction_decision: 'decision', construction_suggestion: 'suggestion' } as Record<string, string>)[issue.code!] && typeof issue.message === 'string' ? issue.message : ''
 const issueKey = (issue: RunIssue) => JSON.stringify([issue.code, issue.table, issue.draft_id, issueMessage(issue), enumLabel(issue.status, states), columnNames(issue), ...(isDiagnostic(issue) ? [diagnosticCode(issue.reason_code), fieldPath(issue.field_path), diagnosticConstraint(issue.constraint), enumLabel(issue.stage, protocolStages)] : [])])
 const hints: Record<string, string> = {
+  construction_tool_transport_failed: '图谱工具通信失败，运行已停止反复调用并保留草稿。请检查进程诊断；恢复服务后可继续上次成果，或选择从零运行。',
+  construction_compaction_failed: '上下文摘要连续截断，运行已停止反复压缩。原历史与已保存草稿保留；请检查模型输出限制，调整后继续运行。',
   construction_draft_validation_failed: '该草稿当前的数据检查未通过。此前已发布成果保留；查看具体诊断，修订或重新验证后再确认完成。',
   construction_unpublished_draft: '该草稿尚未发布。查看草稿的数据检查结果与本次实际轨迹，已发布的其他成果保留。',
   construction_unresolved_work: '仍有目标未覆盖或草稿尚未发布，已发布结果保留。请查看下方构建结果中的具体事项。',

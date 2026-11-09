@@ -132,6 +132,8 @@ def test_http_mcp_keeps_authorization_out_of_yaml(tmp_path, monkeypatch):
                             mcp_url="http://127.0.0.1:8123/mcp", mcp_token_env="GRAPH_AUTH")
     bridge = next(row for row in profile[-1]["insert"] if row["id"] == "graph-domain-tools")["config"]
     assert bridge["transport"] == "streamable-http" and "command" not in bridge
+    assert bridge['toolCallTimeoutMs'] == (options().max_run_seconds + 30) * 1000
+    assert bridge['toolCallTimeoutMs'] > options().timeout_seconds * 1000
     with pytest.raises(ValueError):
         profile_patch(config, tmp_path, options(), mcp_url="http://example.org/mcp", mcp_token_env="GRAPH_AUTH")
 
@@ -169,6 +171,87 @@ console.log(JSON.stringify({network, code, allowed, denied:guard({name:'bash'})}
                       "allowed": ["mcp__graph__describe_sources", "skill"],
                       "denied": "construction_tool_not_allowed"}
     assert yaml.safe_load((tmp_path / "budget.yaml").read_text())["calls"] == 2
+
+
+@pytest.mark.parametrize('detail', ['MCP error -32001: Request timed out',
+    'Session not found', 'fetch failed: ECONNRESET'])
+def test_graph_transport_failure_bounds_history_search_and_never_replays(tmp_path, detail):
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node required')
+    module = Path(__file__).parents[1] / 'construction/runtime/run-budget.mjs'
+    script = tmp_path / 'test.mjs'
+    script.write_text("""
+import { apply } from MODULE
+const hooks = new Map(); let guard
+const ctx = {on:(name, fn)=>hooks.set(name,fn), tools:{guard:fn=>{guard=fn}},
+  tokenMeter:{estimateMessage:()=>0}}
+apply(ctx,{maxCalls:1000,maxRunSeconds:600,output:OUTPUT})
+const exec = {name:'mcp__graph__validate_graph_draft'}
+hooks.get('tools/result')(exec, {isError:false,content:[{text:'same_identity_conflicting_label'}]})
+const businessGuard = guard(exec)
+hooks.get('tools/result')(exec, {isError:true,content:[{type:'text',text:DETAIL}]})
+let network = 0, code
+async function* next(){network++;yield {type:'finish',reason:{kind:'stop'}}}
+for(let i=0;i<20;i++){
+  // Even if the Agent keeps searching historical records, its next model
+  // request consumes the same two-dispatch closeout allowance.
+  if(guard({name:'session_event_search'}))throw new Error('history tool lost')
+  try {for await(const _ of hooks.get('llm/stream')({purpose:'agent'},next)){}}
+  catch(error){code=error.code;break}
+}
+console.log(JSON.stringify({network,code,businessGuard:businessGuard??null,graphGuard:guard(exec)}))
+""".replace('MODULE', json.dumps(module.as_uri())).replace('OUTPUT', json.dumps(str(tmp_path/'budget.yaml')))
+        .replace('DETAIL', json.dumps(detail)))
+    result = subprocess.run([node, str(script)], capture_output=True, text=True, check=True, timeout=20)
+    assert json.loads(result.stdout) == {'network': 2, 'code': 'construction_tool_transport_failed',
+        'businessGuard': None, 'graphGuard': 'construction_tool_transport_failed'}
+    assert yaml.safe_load((tmp_path/'budget.yaml').read_text())['stop_reason'] == 'construction_tool_transport_failed'
+
+
+def test_native_summary_truncations_expand_once_then_stop_boundedly(tmp_path):
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node required')
+    runtime = Path(__file__).parents[1] / 'construction/runtime'
+    skill = tmp_path/'SKILL.md'
+    skill.write_text('Build from authorized evidence.')
+    script = tmp_path/'test.mjs'
+    script.write_text("""
+import {apply as contract} from CONTRACT
+import {apply as budget} from BUDGET
+const hooks = new Map()
+const ctx = {on:(name,fn)=>{hooks.set(name,[...(hooks.get(name)??[]),fn])},
+  systemPrompt:{section:()=>{}},tools:{guard:()=>{}},tokenMeter:{estimateMessage:()=>0}}
+contract(ctx,{skillPath:SKILL,summaryMaxTokens:16384})
+budget(ctx,{maxCalls:1000,maxRunSeconds:60,output:OUTPUT})
+let network=0,code;const caps=[]
+async function* dispatch(options) {
+  const steps=hooks.get('llm/stream')
+  const next=i=>i===steps.length?(async function*(){
+    network++;caps.push(options.maxTokens)
+    yield {type:'finish',reason:{kind:'max-tokens'}}
+  })():steps[i](options,()=>next(i+1))
+  yield* next(0)
+}
+for(let i=0;i<20;i++) {
+  try {for await(const _ of dispatch({purpose:'compaction',maxTokens:8192,messages:[]})){}}
+  catch(error){code=error.code;break}
+}
+const summaryCalls=network
+// No fourth attempt at the same incomplete checkpoint. Ordinary Agent work
+// still gets two dispatches to explain the gap using the retained history.
+for(let i=0;i<3;i++) {
+  try {for await(const _ of dispatch({purpose:'agent',maxTokens:65536,messages:[]})){}}
+  catch(error){code=error.code;break}
+}
+console.log(JSON.stringify({network,summaryCalls,code,caps}))
+""".replace('CONTRACT', json.dumps((runtime/'context-contract.mjs').as_uri()))
+        .replace('BUDGET', json.dumps((runtime/'run-budget.mjs').as_uri()))
+        .replace('SKILL', json.dumps(str(skill))).replace('OUTPUT',json.dumps(str(tmp_path/'budget.yaml'))))
+    result = subprocess.run([node, str(script)], capture_output=True, text=True, check=True, timeout=20)
+    assert json.loads(result.stdout) == {'network': 5, 'summaryCalls': 3,
+        'code': 'construction_compaction_failed', 'caps': [8192, 16384, 16384, 65536, 65536]}
 
 
 @pytest.mark.parametrize("change", [dict(max_calls=0), dict(max_calls=1.5), dict(retries=True),

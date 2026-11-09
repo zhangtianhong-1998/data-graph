@@ -24,6 +24,102 @@ pytestmark = pytest.mark.skipif(os.environ.get("LIGHTGRAPH_TEST_HARNESS") != "1"
                                 reason="real kernel smoke requires scripts/bootstrap_harness.py")
 
 
+@pytest.mark.parametrize('broken_channel', [False, True])
+def test_native_kernel_separates_model_timeout_and_stops_dead_graph_channel(tmp_path, broken_channel):
+    """Real MCP/native hooks: slow tools survive, broken tools never replay."""
+    from lightgraph.construction.mcp_server import serve_local_tools
+    calls, requests = [], []
+    class Host:
+        def call(self, name, **arguments):
+            calls.append(name)
+            if broken_channel:
+                raise RuntimeError('Session not found')
+            time.sleep(.4)
+            return {'status': 'ok', 'sources': []}
+    class Model(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            requests.append(request)
+            if len(requests) == 1 or broken_channel:
+                respond(self, {'role':'assistant','tool_calls':[{'index':0,
+                    'id':f'call{len(requests)}','type':'function','function':{
+                        'name':'mcp__graph__describe_sources','arguments':'{}'}}]}, 'tool_calls')
+            else:
+                respond(self, {'role':'assistant','content':'Sources read.'}, 'stop')
+    model = ThreadingHTTPServer(('127.0.0.1',0),Model)
+    thread = threading.Thread(target=model.serve_forever,daemon=True)
+    thread.start()
+    try:
+        config = tmp_path/'config.yaml'
+        config.write_text('goal: lifecycle\n')
+        with serve_local_tools(Host()) as (url,token):
+            result = run_goal('Read authorized sources.',config,tmp_path,
+                HarnessOptions(model='loopback-model',base_url=f'http://127.0.0.1:{model.server_port}/v1',
+                    timeout_seconds=.2,max_calls=12,max_run_seconds=40),
+                mcp_url=url,mcp_token_env='GRAPH_TEST_TOKEN',
+                environment={'GRAPH_TEST_TOKEN':token,'OPENAI_API_KEY':'local-test-only'})
+        assert calls == ['describe_sources']
+        assert len(requests) == (3 if broken_channel else 2)
+        assert result['budget']['stop_reason'] == ('construction_tool_transport_failed' if broken_channel else '')
+        assert result['finish_reason'] == ('error' if broken_channel else 'completed')
+    finally:
+        model.shutdown()
+        model.server_close()
+        thread.join(timeout=5)
+
+
+def test_native_truncated_summaries_never_replace_history_and_stop_retrying(tmp_path):
+    from lightgraph.construction.mcp_server import serve_local_tools
+    requests, events = [], []
+    marker = 'TRUNCATED_CHECKPOINT_MUST_NOT_BECOME_MEMORY'
+    class Host:
+        def call(self, tool_name, **arguments):
+            return {'status':'ok','material':'x'*100000}
+    class Model(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            requests.append(request)
+            if 'Graph checkpoint rules:' in json.dumps(request['messages'][-1]):
+                respond(self, {'role':'assistant','content':marker}, 'length')
+            else:
+                respond(self, {'role':'assistant','tool_calls':[{'index':0,
+                    'id':f'call{len(requests)}','type':'function','function':{
+                        'name':'mcp__graph__describe_sources','arguments':'{}'}}]}, 'tool_calls')
+    model = ThreadingHTTPServer(('127.0.0.1',0),Model)
+    thread = threading.Thread(target=model.serve_forever,daemon=True)
+    thread.start()
+    try:
+        config = tmp_path/'config.yaml'
+        config.write_text('goal: checkpoint\n')
+        with serve_local_tools(Host()) as (url,token):
+            result = run_goal('Keep the original graph goal.',config,tmp_path,
+                HarnessOptions(model='loopback-model',base_url=f'http://127.0.0.1:{model.server_port}/v1',
+                    max_calls=20,max_run_seconds=40,working_context_tokens=2048),
+                mcp_url=url,mcp_token_env='GRAPH_TEST_TOKEN',
+                environment={'GRAPH_TEST_TOKEN':token,'OPENAI_API_KEY':'local-test-only'},
+                on_event=events.append)
+        summaries = [request for request in requests
+            if 'Graph checkpoint rules:' in json.dumps(request['messages'][-1])]
+        assert len(summaries) == 3
+        assert result['budget']['stop_reason'] == 'construction_compaction_failed'
+        assert result['finish_reason'] == 'error'
+        # Native compaction rejects truncated model output before installing a
+        # checkpoint. Its original event log remains available for retrieval.
+        assert not any(event.get('payload',{}).get('event',{}).get('type') == 'compaction/summary'
+                       for event in events)
+        ordinary = [request for request in requests if request not in summaries]
+        assert len(ordinary) >= 3
+        assert all(marker not in json.dumps(request) for request in ordinary)
+        assert all('Keep the original graph goal.' in json.dumps(request) for request in ordinary)
+        assert all('Pinned build-graph skill' in json.dumps(request) for request in ordinary)
+    finally:
+        model.shutdown()
+        model.server_close()
+        thread.join(timeout=5)
+
+
 def respond(handler, delta, reason):
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream")
@@ -50,8 +146,9 @@ def respond(handler, delta, reason):
     pytest.param(3, 2, False, 1048576, False, True, id="deep-unicode-workspace")])
 def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_calls, large_result, input_limit, fail_first, long_workspace):
     narrow_window = large_result and input_limit < 1048576
-    # With the complete pinned skill, 4096 tokens can fit the first request but
-    # cannot fit its reply plus the native pruner's retained head/tail. A lossy
+    # With the complete pinned skill, 4096 tokens cannot fit a tool result plus
+    # the native pruner's retained head/tail; depending on the skill's current
+    # length even the first request can exceed it. A lossy
     # summary is not permission to remove the original contract. Verify that
     # boundary separately from recovery with enough room for the fixed context.
     input_exhausted = input_limit in {100, 4096}
@@ -128,11 +225,13 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
                            working_context_tokens=(500000 if narrow_window else 2048) if large_result else 32768),
             mcp_url=f"http://127.0.0.1:{mcp_port}/mcp", mcp_token_env="GRAPH_TEST_TOKEN",
             environment={"GRAPH_TEST_TOKEN": token, "OPENAI_API_KEY": "local-test-only"}, on_event=events.append)
-        if expected_calls is not None:
+        if input_limit == 4096:
+            assert len(requests) <= 1
+        elif expected_calls is not None:
             assert len(requests) == expected_calls
         else:
             assert 2 <= len(requests) <= max_calls
-        assert tool_calls == (["describe_sources"] if input_limit > 100 and not fail_first else [])
+        assert tool_calls == (["describe_sources"] if requests and input_limit > 100 and not fail_first else [])
         assert result["budget"]["calls"] == len(requests)
         assert result["finish_reason"] == ("completed" if max_calls > 1 and not input_exhausted else "error")
         if max_calls == 1:
@@ -179,7 +278,7 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
             assert native_usage["measured_calls"] == len(requests)
             assert native_usage["input_tokens"] == 100 * len(requests)
         assert "vendor/deepseek-harness" in result["sdk_source"].replace("\\", "/")
-        if large_result:
+        if large_result and requests:
             kinds = [e.get("payload", {}).get("event", {}).get("type") for e in events]
             assert "compaction/prune" in kinds
             if not narrow_window:

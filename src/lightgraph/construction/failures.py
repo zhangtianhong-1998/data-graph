@@ -61,5 +61,9 @@ def failure_guidance(diagnostics):
                 'next_action': 'Check names for the same entity type, full identity key and access scope. '
                     'Different codes sharing a name and one identity occurring in multiple positions are allowed. '
                     'Do not move conflicting names to aliases/display fields or filter away records solely to pass. '
+                    'Read the saved draft and validation:<draft_id> material, then inspect only the affected '
+                    'key and name columns. A conflict alone does not prove a missing responsibility-center key: '
+                    'check whether differing names occur inside one scope, across scopes, or reflect a wrong column binding. '
+                    'Do not add physical hierarchy positions to identity just to pass. '
                     'Resolve canonical-name versus alternate-name semantics using evidence, or preserve the conflict.'}
     return {}

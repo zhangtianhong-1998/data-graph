@@ -16,9 +16,16 @@ items in it. Optional extensions, adopted decisions, and already handled data
 features are not unfinished work. Keep suggestions separate from goal gaps.
 Preserve uncertainty and the provenance of each claim; a previous model summary
 is not a user instruction or validated evidence. Never turn a suggestion or a
-hypothesis into a mandatory condition. Use (none) for an empty checkpoint section.`
+hypothesis into a mandatory condition. Use (none) for an empty checkpoint section.
+Be concise: keep draft IDs/revisions, validation IDs, evidence refs, decisions,
+and the next action. Do not copy draft YAML, schemas, SQL rows, or long diagnostics
+into the checkpoint. Recover current artifacts with read_material(draft:<id>)
+or read_material(validation:<id>), following next_page when present. Historical
+session search is for decisions absent from the current workspace, not a way to
+reconstruct artifacts which are already saved.`
 
 export function apply(ctx, config) {
+  let nextSummaryTokens = 0
   const skill = readFileSync(config.skillPath, 'utf8')
   const goal = typeof config.goal === 'string' ? config.goal : ''
   // Upstream compaction excludes the system head from its replacement range.
@@ -48,7 +55,16 @@ ${skill}`,
       // immutable Agent requests and the upstream summarization/replay intact.
       options.messages = [...options.messages, { role: 'user',
         content: [{ type: 'text', text: SUMMARY_RULES }] }]
+      if (nextSummaryTokens && Number.isSafeInteger(config.summaryMaxTokens)) {
+        options.maxTokens = Math.min(nextSummaryTokens, config.summaryMaxTokens)
+      }
     }
-    yield* next()
+    for await (const chunk of next()) {
+      if (options.purpose === 'compaction' && chunk.type === 'finish') {
+        nextSummaryTokens = chunk.reason?.kind === 'max-tokens'
+          ? Math.max(1, options.maxTokens ?? 4096) * 2 : 0
+      }
+      yield chunk
+    }
   })
 }

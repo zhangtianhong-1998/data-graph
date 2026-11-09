@@ -11,7 +11,8 @@ import os
 from datetime import datetime, timezone
 from copy import deepcopy
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock
+from collections import Counter
 
 from pydantic import ValidationError
 
@@ -51,6 +52,7 @@ class ConstructionTools:
         # This is a host capability, never an Agent-supplied tool argument.
         self.allow_publication = bool(allow_publication)
         self._lock = RLock()
+        self._shutdown_requested = Event()
         self._own_adapters = adapters is None
         self.adapters = list(adapters if adapters is not None else open_sources(config,
             metadata_only=config.resolved_model.mode in {"disabled", "metadata_only"},
@@ -123,6 +125,28 @@ class ConstructionTools:
             self.close()
             raise
 
+    def request_shutdown(self):
+        """Stop active work before its owner closes adapters; never take the writer lock.
+
+        The writer may be blocked in a database operation. Cancellation must be
+        observable from another thread, including between CPU-only graph rows.
+        The MCP owner waits for that writer to settle before calling ``close``.
+        """
+        import time
+        self._shutdown_requested.set()
+        now = time.monotonic()
+        self.budget.tighten_deadline(now)
+        for adapter in self.adapters:
+            budget = getattr(adapter, 'query_budget', None)
+            if budget is not None:
+                budget.deadline = min(budget.deadline, now)
+            try:
+                adapter.cancel()
+            except Exception:
+                # Cancellation is best effort. The service still waits for
+                # active operations; this never authorizes premature close.
+                pass
+
     def close(self):
         for executor in set(self.executors.values()):
             executor.close()
@@ -150,6 +174,8 @@ class ConstructionTools:
                    "publish_graph_draft")}
         with self._lock:
             try:
+                if self._shutdown_requested.is_set():
+                    raise LightGraphError('construction_cancelled')
                 if tool_name not in methods:
                     raise LightGraphError("unknown_construction_tool")
                 if self.terminal_reason and (tool_name == 'validate_graph_draft'
@@ -470,6 +496,29 @@ class ConstructionTools:
             raise LightGraphError("invalid_material_page")
         if name == "goal":
             return read_goal_material(self.config, page)
+        if name.startswith(('draft:', 'validation:')):
+            kind, _, draft_id = name.partition(':')
+            record = self.workspace.get_draft(draft_id)
+            if kind == 'draft':
+                value = self.workspace._draft_record_payload(record)['draft']
+            elif record.validation is not None:
+                value = record.validation.model_dump(mode='json')
+            else:
+                raise LightGraphError('graph_validation_missing')
+            content = dump_yaml(value)
+            page_size = 12000
+            pages = max(1, (len(content) + page_size - 1) // page_size)
+            if page >= pages:
+                raise LightGraphError('invalid_material_page')
+            return {'status': 'ok', 'format': 'yaml', 'material': name,
+                    'draft_id': draft_id, 'revision': record.revision,
+                    'material_revision': digest(content), 'draft_state': record.status,
+                    'page': page, 'pages': pages, 'characters': len(content),
+                    'content': content[page * page_size:(page + 1) * page_size],
+                    'content_is_fragment': pages > 1,
+                    'next_page': page + 1 if page + 1 < pages else None,
+                    'next_action': 'Concatenate content pages only when material_revision matches. '
+                        'Read the saved draft and validation directly; session history is not their canonical copy.'}
         if name == "skill":
             return {"status": "ok", "text": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")}
         if name == "draft_schema":
@@ -616,7 +665,8 @@ class ConstructionTools:
         result = execute_draft(record.draft, self.adapters, list(self.tables.values()),
             goal=self.config.goal, max_working_bytes=self.config.max_working_bytes,
             max_rows=self.config.limits.max_result_rows, max_seconds=self.budget.remaining_seconds(),
-            scope_bindings=self.config.scope_bindings)
+            scope_bindings=self.config.scope_bindings,
+            cancelled=self._shutdown_requested.is_set)
         self._check_current_inputs()
         recovery = self._snapshot_recovery_sources(sources)
         from .failures import SOURCE_FAILURES
@@ -663,12 +713,25 @@ class ConstructionTools:
         visible_graph = filter_graph_scopes(graph, self.config.scopes)
         statistics = graph_statistics(visible_graph)
         from .failures import failure_guidance
-        return {"status": "ok", "state": current.status, **result, "statistics": statistics,
+        diagnostics = result['diagnostics']
+        # Keep every counterexample in the validation artifact; a model reply
+        # need not replay hundreds of identical error shapes on every attempt.
+        return {"status": "ok", "state": current.status, **result,
+                'diagnostics': diagnostics[:32],
+                'diagnostic_count': len(diagnostics),
+                'diagnostic_codes': dict(Counter(d['code'] for d in diagnostics)),
+                'diagnostics_truncated': len(diagnostics) > 32,
+                'validation_material': 'validation:' + draft_id,
+                'draft_material': 'draft:' + draft_id, "statistics": statistics,
+                'effective_limits': {'max_working_bytes': self.config.max_working_bytes,
+                    'max_result_rows': self.config.limits.max_result_rows,
+                    'query_timeout_ms': self.config.limits.timeout_ms,
+                    'run_max_seconds': self.config.max_run_seconds},
                 "evidence_ref": evidence.ref, "candidate_graph": current.validation.graph_path,
                 "validation_id": current.validation.validation_id, 'read_window': read_window,
                 'quality_advice': name_mapping_advice(record.draft, visible_graph),
                 'source_circuits': self.source_circuits.summary(),
-                **failure_guidance(result['diagnostics']),
+                **failure_guidance(diagnostics),
                 **({'resource_state': budget_state} if budget_state else {}),
                 "semantic_assessment": "agent_authored", "published": False}
 
@@ -735,7 +798,21 @@ class ConstructionTools:
                 if exc.code != 'stale_published_graph':
                     raise
                 value['statistics_status'] = 'stale_published_graph'
-        return {"status": "ok", "format": "yaml", "content": dump_yaml(value)}
+        content = dump_yaml(value)
+        if draft_id and len(content) > 16000:
+            record = self.workspace.get_draft(draft_id)
+            validation = record.validation
+            return {'status': 'ok', 'format': 'yaml', 'content': dump_yaml({
+                'draft_id': draft_id, 'revision': record.revision, 'status': record.status,
+                'entities': len(record.draft.entities), 'relations': len(record.draft.relations),
+                'validation': None if validation is None else {
+                    'passed': validation.passed, 'validation_id': validation.validation_id,
+                    'diagnostic_codes': dict(Counter(d['code'] for d in validation.diagnostics))}}),
+                'summary_only': True, 'draft_material': 'draft:' + draft_id,
+                'validation_material': 'validation:' + draft_id if validation else None,
+                'next_action': 'Read read_material(name="draft:' + draft_id + '", page=0) and follow next_page '
+                    'for the complete saved YAML. Read validation material for all diagnostics. Do not reconstruct it from session searches.'}
+        return {"status": "ok", "format": "yaml", "content": content}
 
     def _unavailable_table_source(self, table):
         # Configured identifiers identify an unavailable source, never create a

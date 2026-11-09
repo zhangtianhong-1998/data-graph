@@ -544,13 +544,57 @@ class Workspace:
             self._save(project)
             return clean
 
+    def output_generation(self, project_id: str) -> str | None:
+        """Read the active construction lineage, independently of user settings."""
+        with self.lock(project_id):
+            pointer = self._path(project_id, "output-head.yaml")
+            if not pointer.exists():
+                return None
+            value = self._read(pointer)
+            if (not isinstance(value, dict) or set(value) != {"run_id"} or
+                    not isinstance(value["run_id"], str) or
+                    not re.fullmatch(r"run_[0-9a-f]{24}", value["run_id"])):
+                raise LightGraphError("invalid_output_generation")
+            path = self.generation_path(project_id, value["run_id"])
+            if not path.is_dir():
+                raise LightGraphError("invalid_output_generation")
+            return value["run_id"]
+
+    def generation_path(self, project_id: str, run_id: str) -> Path:
+        if not isinstance(run_id, str) or not re.fullmatch(r"run_[0-9a-f]{24}", run_id):
+            raise LightGraphError("invalid_output_generation")
+        return self._path(project_id, f"output/generations/{run_id}")
+
+    def select_output_generation(self, project_id: str, run_id: str | None, *, create=False) -> None:
+        """Switch only the active pointer; old graphs, drafts and sessions remain intact.
+
+        Callers hold the run-manager lock and must reject changes while a worker
+        is active. A new lineage starts with an empty, exclusively created folder.
+        """
+        with self.lock(project_id):
+            pointer = self._path(project_id, "output-head.yaml")
+            if run_id is None:
+                pointer.unlink(missing_ok=True)
+                return
+            path = self.generation_path(project_id, run_id)
+            if create:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.mkdir(exist_ok=False)
+            elif not path.is_dir():
+                raise LightGraphError("invalid_output_generation")
+            self._write_yaml(pointer, {"run_id": run_id})
+
     def resolved_config(self, project_id: str) -> RunConfig:
         with self.lock(project_id):
             data = self.get_config(project_id)
             try:
-                return RunConfig.model_validate(data).resolve_paths(self.project_path(project_id))
+                config = RunConfig.model_validate(data).resolve_paths(self.project_path(project_id))
             except Exception:
                 raise LightGraphError("invalid_project_config") from None
+            generation = self.output_generation(project_id)
+            if generation is not None:
+                config.output_dir = str(self.generation_path(project_id, generation))
+            return config
 
     def import_config(self, project_id: str, file_id: str) -> dict:
         with self.lock(project_id):

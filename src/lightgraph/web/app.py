@@ -105,6 +105,10 @@ class InputModel(BaseModel):
     model_config=ConfigDict(extra='forbid',hide_input_in_errors=True)
 
 
+class StartRun(InputModel):
+    run_mode: Literal["continue", "fresh"] = "continue"
+
+
 class NewProject(InputModel):
     name: str=Field(min_length=1,max_length=120)
     project_id: str|None=None
@@ -720,7 +724,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return {'runs':manager.list(pid)}
 
     @app.post('/api/projects/{pid}/runs',status_code=202)
-    def start_run(pid:str,x_workbench_session:str|None=Header(default=None),if_match:str|None=Header(default=None)):
+    def start_run(pid:str,data:StartRun|None=None,x_workbench_session:str|None=Header(default=None),if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             sources,model=resolved_credentials(pid,x_workbench_session)
@@ -728,6 +732,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             options={}
             if sources:options['source_credentials']=sources
             if model is not None:options['model_api_key']=model
+            if data is not None:options['run_mode']=data.run_mode
             return manager.start(pid,**options)
 
     @app.get('/api/projects/{pid}/runs/{rid}')

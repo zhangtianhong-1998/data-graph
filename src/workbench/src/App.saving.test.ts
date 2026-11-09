@@ -43,6 +43,20 @@ beforeEach(() => {
 afterEach(() => { app?.unmount(); root?.remove(); vi.unstubAllGlobals(); vi.restoreAllMocks(); clearSessions(); sessionStorage.clear() })
 
 describe('完整配置与修订', () => {
+  it.each(['continue', 'fresh'])('启动时传递所选运行方式 %s，不改写项目配置', async mode => {
+    await ready()
+    const selector = root.querySelector<HTMLSelectElement>('#run-mode')!
+    expect(selector.value).toBe('continue')
+    selector.value = mode
+    selector.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+    button('开始抽取').click()
+    await vi.waitFor(() => expect(writes().some(item => item.url.endsWith('/runs'))).toBe(true))
+    const started = writes().find(item => item.url.endsWith('/runs'))!
+    expect(JSON.parse(started.body!)).toEqual({ run_mode: mode })
+    expect(config).not.toHaveProperty('run_mode')
+  })
+
   it('目标使用 Markdown，保存并刷新后保留原文', async () => {
     await ready(); button('抽取目标').click(); await nextTick()
     const markdown = '# 本次目标\n\n发现设备归属。\n\n## 验收要求\n保留来源和未决。'

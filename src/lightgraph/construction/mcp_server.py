@@ -1,4 +1,4 @@
-"""Stdio MCP bridge exposing only graph construction's six domain tools."""
+"""HTTP/stdio MCP bridge exposing only graph construction's seven domain tools."""
 from __future__ import annotations
 
 import argparse
@@ -14,52 +14,93 @@ from .tools import ConstructionTools
 
 def create_server(tools):
     """Register compact schemas; source operation details are read on demand."""
-    server = FastMCP("lightgraph-construction")
+    import anyio
+    import threading
+    from functools import partial
+    # The workspace is the durable session. HTTP requests must not depend on an
+    # in-memory MCP session ID surviving a network reconnect.
+    server = FastMCP("lightgraph-construction", stateless_http=True, json_response=True)
+    writer = anyio.Lock()
+    closing = threading.Event()
+    state_lock = threading.Lock()
+    pending = 0
+
+    def shutdown():
+        with state_lock:
+            closing.set()
+            needs_cancel = pending > 0
+        # Cooperatively stop SQL and CPU projection work. The owner must wait
+        # for this server before closing adapters or releasing its writer lock.
+        if needs_cancel and hasattr(tools, 'request_shutdown'):
+            tools.request_shutdown()
+
+    server.construction_shutdown = shutdown
+
+    async def dispatch(tool_name, **arguments):
+        nonlocal pending
+        # Validation is synchronous and can take minutes. Keep the HTTP event
+        # loop responsive, but retain one writer and wait for work to settle
+        # even if the caller disconnects. Cancellation never starts a replay.
+        with state_lock:
+            if closing.is_set():
+                return {'status': 'error', 'code': 'construction_cancelled', 'retryable': False}
+            pending += 1
+        try:
+            async with writer:
+                if closing.is_set():
+                    return {'status': 'error', 'code': 'construction_cancelled', 'retryable': False}
+                with anyio.CancelScope(shield=True):
+                    return await anyio.to_thread.run_sync(partial(tools.call, tool_name, **arguments),
+                                                         abandon_on_cancel=False)
+        finally:
+            with state_lock:
+                pending -= 1
 
     @server.tool()
-    def describe_sources() -> dict:
+    async def describe_sources() -> dict:
         """Read the authorized physical catalog, user goal, document index and saved work."""
-        return tools.call("describe_sources")
+        return await dispatch("describe_sources")
 
     @server.tool()
-    def inspect_source(table: str, operation: str, arguments: dict | None = None) -> dict:
+    async def inspect_source(table: str, operation: str, arguments: dict | None = None) -> dict:
         """Probe data read-only. Get operation arguments from read_material(source_operations)."""
-        return tools.call("inspect_source", table=table, operation=operation, arguments=arguments)
+        return await dispatch("inspect_source", table=table, operation=operation, arguments=arguments)
 
     @server.tool()
-    def read_material(name: str, page: int = 0) -> dict:
+    async def read_material(name: str, page: int = 0) -> dict:
         """Read Markdown goal, skill, reference:<name.md>, draft_schema, source_operations,
-        document:<id>, or evidence:<ref>. Follow next_page for long documents.
+        document:<id>, evidence:<ref>, draft:<id> or validation:<id>.
+        Follow next_page for complete documents and saved artifacts.
         """
-        return tools.call("read_material", name=name, page=page)
+        return await dispatch("read_material", name=name, page=page)
 
     @server.tool()
-    def save_graph_draft(yaml_text: str) -> dict:
+    async def save_graph_draft(yaml_text: str) -> dict:
         """Save or revise a YAML candidate with discovered mappings and issued evidence refs."""
-        return tools.call("save_graph_draft", yaml_text=yaml_text)
+        return await dispatch("save_graph_draft", yaml_text=yaml_text)
 
     @server.tool()
-    def validate_graph_draft(draft_id: str, mode: Literal['instances', 'structure'] | None = None) -> dict:
+    async def validate_graph_draft(draft_id: str, mode: Literal['instances', 'structure'] | None = None) -> dict:
         """Check structure without querying facts, or validate complete mapped instances.
         Omitted mode uses the project's construction_target. Every attempt retains
         its own YAML artifact. Name quality advice is non-blocking.
         """
-        return tools.call("validate_graph_draft", draft_id=draft_id, mode=mode)
+        return await dispatch("validate_graph_draft", draft_id=draft_id, mode=mode)
 
     @server.tool()
-    def read_workspace(draft_id: str | None = None) -> dict:
+    async def read_workspace(draft_id: str | None = None) -> dict:
         """Recover saved drafts, revisions, checks and unresolved items without replaying raw rows."""
-        return tools.call("read_workspace", draft_id=draft_id)
+        return await dispatch("read_workspace", draft_id=draft_id)
 
     @server.tool()
-    def publish_graph_draft(draft_id: str, validation_id: str | None = None,
+    async def publish_graph_draft(draft_id: str, validation_id: str | None = None,
                             mode: Literal['instances', 'structure'] | None = None) -> dict:
         """Publish a checked immutable artifact without rereading database facts.
         Omitted mode follows construction_target. Structure publication contains
         definitions and bindings, not verified instances. validation_id selects
         an applicable successful instance check explicitly when needed.
         """
-        return tools.call("publish_graph_draft", draft_id=draft_id, validation_id=validation_id, mode=mode)
+        return await dispatch("publish_graph_draft", draft_id=draft_id, validation_id=validation_id, mode=mode)
 
     return server
 
@@ -81,7 +122,8 @@ def serve_local_tools(tools):
     from starlette.responses import JSONResponse
 
     token = secrets.token_urlsafe(32)
-    app = create_server(tools).streamable_http_app()
+    domain = create_server(tools)
+    app = domain.streamable_http_app()
 
     class LocalAuthorization(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
@@ -106,8 +148,11 @@ def serve_local_tools(tools):
             time.sleep(.02)
         yield f"http://{address[0]}:{address[1]}/mcp", token
     finally:
+        domain.construction_shutdown()
         server.should_exit = True
-        thread.join(timeout=5)
+        # Do not return while a shielded validation still holds the workspace
+        # or adapters. Their caller closes those resources immediately next.
+        thread.join()
         listener.close()
 
 

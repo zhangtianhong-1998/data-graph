@@ -17,6 +17,9 @@ export function apply(ctx, config) {
   let diagnostic = null
   let peakInputTokens = 0
   let finalizationCalls = 0
+  let channelFailure = ''
+  let compactionFailures = 0
+  let compactionFailure = ''
   const queryStopCodes = new Set(['query_budget_exhausted', 'db_cu_budget_exhausted',
     'run_time_budget_exhausted', 'wall_time_budget_exhausted', 'construction_time_exhausted',
     'returned_rows_budget_exhausted', 'returned_bytes_budget_exhausted',
@@ -32,7 +35,19 @@ export function apply(ctx, config) {
     'session_event_trace', 'session_event_read',
   ].includes(name)
   // Denial survives accidental profile additions and subsequent plugins.
-  ctx.tools.guard(exec => permitted(exec.name) ? undefined : 'construction_tool_not_allowed')
+  ctx.tools.guard(exec => channelFailure && exec.name.startsWith('mcp__graph__')
+    ? channelFailure : permitted(exec.name) ? undefined : 'construction_tool_not_allowed')
+  ctx.on('tools/result', (exec, result) => {
+    // Domain validation errors are normal successful MCP envelopes. Only an
+    // actual channel/lifecycle failure stops graph calls; never replay a timed
+    // out save, validation or publish whose server outcome is still unknown.
+    if (!exec.name.startsWith('mcp__graph__') || !result.isError || channelFailure) return
+    const detail = JSON.stringify({ error: result.error, content: result.content })
+    if (/session (?:not found|expired)|request timed out|connection (?:closed|reset|refused)|not connected|fetch failed|econnreset|econnrefused|streamable http error|transport.*(?:closed|error)/i.test(detail)) {
+      channelFailure = 'construction_tool_transport_failed'
+      save(channelFailure)
+    }
+  })
   const restricted = new WeakSet()
   ctx.on('agent/pre-step', async ({ agent }, next) => {
     if (!restricted.has(agent)) {
@@ -57,10 +72,11 @@ export function apply(ctx, config) {
     // repeated requests to sources already blocked for this run.
     // At most two further dispatches can publish saved work and summarize it.
     // Retry and compaction dispatches consume the same closeout allowance.
-    const queryStopReason = queryStop()
+    const queryStopReason = channelFailure || compactionFailure || queryStop()
     const elapsed = (performance.now() - start) / 1000
     const code = elapsed >= config.maxRunSeconds ? 'construction_time_budget_exhausted'
       : calls >= config.maxCalls ? 'construction_call_budget_exhausted'
+      : compactionFailure && options.purpose === 'compaction' ? compactionFailure
       : queryStopReason && finalizationCalls >= 2 ? queryStopReason : null
     if (code) {
       save(code)
@@ -118,6 +134,17 @@ export function apply(ctx, config) {
         yield chunk
       }
     } finally {
+      if (options.purpose === 'compaction') {
+        compactionFailures = finish === 'max-tokens' ? compactionFailures + 1
+          : finish ? 0 : compactionFailures
+        // Native compaction rejects incomplete checkpoints, preserving the
+        // old history. Bound repeated truncation rather than retrying it on
+        // every subsequent Agent step and spending the whole run on summaries.
+        if (compactionFailures >= 3) {
+          compactionFailure = 'construction_compaction_failed'
+          save(compactionFailure)
+        }
+      }
       if (config.usageLog) appendFileSync(config.usageLog, JSON.stringify({
         type: 'model/usage', seq: dispatchIndex, time: Date.now(),
         execution_id: executionId,

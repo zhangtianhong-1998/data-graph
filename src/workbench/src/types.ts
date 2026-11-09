@@ -36,6 +36,8 @@ export interface Run {
   run_id: string; project_id: string; status: 'queued' | 'running' | 'completed' | 'completed_with_gaps' | 'partial' | 'failed' | 'cancelled' | 'interrupted'
   stage: string; created_at: string; finished_at?: string; report?: unknown; error_code?: string
   config_revision?: number
+  run_mode?: 'continue' | 'fresh'
+  output_path?: string
   progress?: RunProgressSnapshot | null
   cleanup_status: 'pending' | 'completed' | 'unknown'
 }

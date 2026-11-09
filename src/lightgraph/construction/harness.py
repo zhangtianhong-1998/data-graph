@@ -139,7 +139,10 @@ def profile_patch(config_path: Path, workspace: Path, options: HarnessOptions,
             raise ValueError("domain MCP requires loopback HTTP and a token environment reference")
         mcp_config = {"transport": "streamable-http", "serverName": "graph", "url": mcp_url,
             "headers": {"Authorization": _Expression("'Bearer ' + process.env[" + repr(mcp_token_env) + "]")},
-            "toolCallTimeoutMs": int(options.timeout_seconds * 1000),
+            # An instance check may span many individually bounded SQL calls.
+            # The run watchdog, not the model-request or SQL timeout, owns its
+            # total lifetime. Allow cleanup beyond that watchdog's deadline.
+            "toolCallTimeoutMs": min(2147483647, int((options.max_run_seconds + 30) * 1000)),
             "failOnStartupError": True, "reconnect": {"enabled": False}}
     plugins = [
         row("graph-provider", "llm-pi-ai", {"providers": {"graph-model": {
@@ -166,7 +169,7 @@ def profile_patch(config_path: Path, workspace: Path, options: HarnessOptions,
             "auto": options.working_context_tokens is not None,
             "thresholdRatio": target / capacity, "headroomTokens": 0,
             "retainTokens": min(8192, max(1, target // 4)),
-            "maxTokens": min(4096, options.max_output_tokens),
+            "maxTokens": min(max(1024, target // 4), 8192, options.max_output_tokens),
             "compactionRetries": options.retries, "maxOverflowRetries": 1}),
         row("graph-session-query", "session-query-sqlite", {
             "path": str(home / "session-index.sqlite"), "openAt": "first-search"}),
@@ -174,6 +177,7 @@ def profile_patch(config_path: Path, workspace: Path, options: HarnessOptions,
         *([row("graph-domain-tools", "mcp-client", mcp_config)] if mcp_config is not None else []),
         {"id": "graph-context-contract", "name": str(assets / "context-contract.mjs"),
          "config": {"goal": goal,
+                    "summaryMaxTokens": min(max(1024, target // 2), 16384, options.max_output_tokens),
                     "skillPath": str(Path(__file__).parent / "skills/build-graph/SKILL.md")}},
         {"id": "graph-run-budget", "name": str(assets / "run-budget.mjs"),
          "config": {"maxCalls": options.max_calls,
