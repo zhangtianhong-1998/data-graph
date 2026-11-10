@@ -32,7 +32,7 @@ export function apply(ctx, config) {
   const executionId = randomUUID()
   const permitted = name => name.startsWith('mcp__graph__') || [
     'skill', 'session_search', 'session_event_search', 'session_trace',
-    'session_event_trace', 'session_event_read',
+    'session_event_trace', 'session_event_read', 'session_event_read_page',
   ].includes(name)
   // Denial survives accidental profile additions and subsequent plugins.
   ctx.tools.guard(exec => channelFailure && exec.name.startsWith('mcp__graph__')

@@ -129,6 +129,7 @@ def profile_patch(config_path: Path, workspace: Path, options: HarnessOptions,
     input_capacity = options.max_input_tokens or 1048576
     capacity = input_capacity + options.max_output_tokens
     target = min(options.working_context_tokens or input_capacity, input_capacity)
+    payload_tokens = min(4096, max(512, target // 4))
     mcp_config = None
     if mcp_url is not None:
         from urllib.parse import urlsplit
@@ -164,7 +165,11 @@ def profile_patch(config_path: Path, workspace: Path, options: HarnessOptions,
             "customSkillDirs": [str(Path(__file__).parent / "skills")]}),
         row("graph-skill-tool", "tool-skill"),
         row("graph-token-meter", "token-meter"),
-        row("graph-tool-pruner", "compaction-tool-result-pruner"),
+        # The native fallback must not slice JSON already admitted by the
+        # token-based retention hook. Its fixed meter prices text at 4 UTF-16
+        # units/token; this character fence is only a secondary safety net.
+        row("graph-tool-pruner", "compaction-tool-result-pruner", {
+            "thresholdChars": max(8192, payload_tokens * 4 + 64)}),
         row("graph-compaction", "compaction-basic", {
             "auto": options.working_context_tokens is not None,
             "thresholdRatio": target / capacity, "headroomTokens": 0,
@@ -174,6 +179,8 @@ def profile_patch(config_path: Path, workspace: Path, options: HarnessOptions,
         row("graph-session-query", "session-query-sqlite", {
             "path": str(home / "session-index.sqlite"), "openAt": "first-search"}),
         row("graph-session-query-tool", "tool-session-query"),
+        {"id": "graph-context-retention", "name": str(assets / "context-retention.mjs"),
+         "config": {"maxPayloadTokens": payload_tokens}},
         *([row("graph-domain-tools", "mcp-client", mcp_config)] if mcp_config is not None else []),
         {"id": "graph-context-contract", "name": str(assets / "context-contract.mjs"),
          "config": {"goal": goal,

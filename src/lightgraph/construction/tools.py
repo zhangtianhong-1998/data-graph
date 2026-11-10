@@ -107,6 +107,9 @@ class ConstructionTools:
                 [(d.document_id, d.revision, d.content_hash) for d in self.documents.documents],
                 {'source_key_semantics': SOURCE_KEY_SEMANTICS_VERSION})
             self.workspace = GraphWorkspace(workspace, fingerprint)
+            from .result_materials import ResultMaterialStore, result_token_limit
+            self.result_materials = ResultMaterialStore(self.workspace.root, fingerprint,
+                self._result_access(), result_token_limit(config.resolved_model))
             self.terminal_reason = None
             from .source_circuit import SourceCircuits
             self.source_circuits = SourceCircuits()
@@ -149,6 +152,8 @@ class ConstructionTools:
                 pass
 
     def close(self):
+        if hasattr(self, 'result_materials'):
+            self.result_materials.close()
         for executor in set(self.executors.values()):
             executor.close()
         if self._own_adapters:
@@ -211,6 +216,23 @@ class ConstructionTools:
                 # backend's SQL or source values. Durable drafts stay available.
                 return {"status": "error", "code": "construction_tool_failed",
                         "next_action": "The operation failed. Retain the draft and retry after checking the source or workspace."}
+
+    def _result_access(self):
+        """Bind cached values to every value-output permission, without secrets."""
+        return digest(access_fingerprint(self.config), self.config.scopes,
+            self.config.resolved_model.mode,
+            [(source.id, source.allow_fact_data) for source in self.config.sources])
+
+    def bounded_call(self, tool_name, **arguments):
+        """Present a recoverable model view; internal callers keep full call()."""
+        with self._lock:
+            result = self.call(tool_name, **arguments)
+            if (tool_name == 'read_material' and isinstance(arguments.get('name'), str)
+                    and arguments['name'].startswith('result:')):
+                # A material page already has a token-sized wrapper. Offloading
+                # that page again would create an unreadable reference chain.
+                return result
+            return self.result_materials.bound(result, tool_name)
 
     def _stop_queries(self, code):
         """Tell Harness to finish using saved work, never retry exhausted queries."""
@@ -498,10 +520,16 @@ class ConstructionTools:
             "content_digest": digest(section["text"]), "complete": True}, ref=ref)
         return [ref]
 
-    def read_material(self, name: str, page: int = 0):
+    def read_material(self, name: str, page: int = 0, section: str = ""):
         """Read Markdown goal, skill, reference, schema or document on demand."""
         if type(page) is not int or page < 0:
             raise LightGraphError("invalid_material_page")
+        if name.startswith('result:'):
+            self._check_current_inputs()
+            return self.result_materials.read(name, page, section, access=self._result_access(),
+                                              query_budget=self.query_budget.snapshot())
+        if section:
+            raise LightGraphError("result_section_requires_result_material")
         if name == "goal":
             return read_goal_material(self.config, page)
         if name == 'publication_conflicts' or name.startswith(('draft:', 'validation:', 'conflicts:')):

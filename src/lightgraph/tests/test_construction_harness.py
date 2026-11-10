@@ -30,6 +30,9 @@ def test_profile_is_domain_only_and_uses_working_target(tmp_path):
     compaction = plugins["graph-compaction"]["config"]
     assert compaction["thresholdRatio"] * (1048576 + 65536) == 32768
     assert compaction["retainTokens"] < 32768
+    retention = plugins['graph-context-retention']['config']
+    assert retention['maxPayloadTokens'] == 4096
+    assert plugins['graph-tool-pruner']['config']['thresholdChars'] > 4096 * 4
     provider = plugins["graph-provider"]["config"]["providers"]["graph-model"]
     assert provider["api"] == "openai-completions"
     assert provider["timeoutMs"] == 800000

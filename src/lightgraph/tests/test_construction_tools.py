@@ -289,6 +289,22 @@ def test_mcp_registered_material_arguments_execute_without_dispatch_collision(tm
         # FastMCP validates and serializes the real wrapper; this exercises the
         # parameter named `name` that previously collided with dispatch itself.
         encoded = str(result)
-        assert 'EntityMapping' in encoded and 'invalid_construction_arguments' not in encoded
+        assert 'invalid_construction_arguments' not in encoded
+        body = json.loads(result[0].text)
+        if 'result_ref' in body:
+            fragments = []
+            page = 0
+            while True:
+                material = asyncio.run(server.call_tool('read_material', {
+                    'name': body['result_ref'], 'page': page, 'section': '/content'}))
+                chunk = json.loads(material[0].text)
+                assert chunk['result_ref'] == body['result_ref']
+                fragments.append(chunk['content'])
+                if chunk['next_page'] is None:
+                    break
+                page = chunk['next_page']
+            assert 'EntityMapping' in json.loads(''.join(fragments))
+        else:
+            assert 'EntityMapping' in encoded
     finally:
         tools.close()

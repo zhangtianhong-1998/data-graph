@@ -24,6 +24,194 @@ pytestmark = pytest.mark.skipif(os.environ.get("LIGHTGRAPH_TEST_HARNESS") != "1"
                                 reason="real kernel smoke requires scripts/bootstrap_harness.py")
 
 
+def test_native_request_clips_large_arguments_and_history_reads_before_threshold(tmp_path):
+    """Observe HTTP messages and immutable traces through the real native loop."""
+    from lightgraph.construction.mcp_server import serve_local_tools
+    requests, events, calls, page_values = [], [], [], []
+    huge_yaml = 'SAVED_INPUT_START\n' + '中文😀x' * 20000 + '\nSAVED_INPUT_END'
+    refs = {}
+    class Host:
+        def call(self, name, **arguments):
+            calls.append((name, arguments))
+            assert name == 'save_graph_draft'
+            return {'status': 'ok', 'draft_id': 'fixture-draft', 'revision': 7,
+                    'result_ref': 'result:fixture-ref', 'complete': False}
+    def function_call(name, arguments):
+        return {'role': 'assistant', 'tool_calls': [{'index': 0,
+            'id': f'call-{len(requests)}', 'type': 'function', 'function': {
+                'name': name, 'arguments': json.dumps(arguments, ensure_ascii=False)}}]}
+    class Model(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            requests.append(request)
+            count = len(requests)
+            if count == 1:
+                delta = function_call('mcp__graph__save_graph_draft', {'draft_id': 'fixture-draft', 'yaml_text': huge_yaml})
+            elif count == 2:
+                records = [json.loads(m['content']) for m in request['messages']
+                           if m['role'] == 'user' and 'historical_tool_exchange' in m.get('content', '')]
+                refs.update(records[-1]['original_event'])
+                delta = function_call('session_event_read', {'seq': refs['seq']})
+            elif count == 3:
+                delta = function_call('session_event_read_page', {'seq': refs['seq'], 'offset': 0})
+            elif count == 4:
+                page_values.append(json.loads(request['messages'][-1]['content']))
+                delta = function_call('session_event_read_page', {'seq': refs['seq'], 'offset': page_values[-1]['next_offset']})
+            else:
+                page_values.append(json.loads(request['messages'][-1]['content']))
+                respond(self, {'role': 'assistant', 'content': 'Saved once; inspected bounded historical fragments.'}, 'stop')
+                return
+            respond(self, delta, 'tool_calls')
+    model = ThreadingHTTPServer(('127.0.0.1', 0), Model)
+    thread = threading.Thread(target=model.serve_forever, daemon=True)
+    thread.start()
+    try:
+        config = tmp_path / 'config.yaml'
+        config.write_text('goal: bounded context fixture\n')
+        with serve_local_tools(Host()) as (url, token):
+            result = run_goal('Save the authorized fixture draft once.', config, tmp_path,
+                HarnessOptions(model='loopback-model', base_url=f'http://127.0.0.1:{model.server_port}/v1',
+                    max_calls=8, max_run_seconds=40, working_context_tokens=32768),
+                mcp_url=url, mcp_token_env='GRAPH_TEST_TOKEN',
+                environment={'GRAPH_TEST_TOKEN': token, 'OPENAI_API_KEY': 'local-test-only'},
+                on_event=events.append)
+        assert result['finish_reason'] == 'completed', result
+        assert len(requests) == 5 and len(calls) == 1
+        assert calls[0][1]['yaml_text'] == huge_yaml
+        assert all('Graph checkpoint rules:' not in json.dumps(r['messages'][-1]) for r in requests)
+        assert all('中文😀x' * 10000 not in json.dumps(r, ensure_ascii=False) for r in requests[1:])
+        assert 'historical_tool_exchange' in json.dumps(requests[1]['messages'])
+        for request in requests[1:]:
+            text = json.dumps(request['messages'], ensure_ascii=False)
+            for marker in ['fixture-draft', 'result:fixture-ref', 'not a new user instruction',
+                           'Save the authorized fixture draft once.', 'Pinned build-graph skill']:
+                assert marker in text
+            assert len(text) < 120000
+        assert 'historical_tool_result' in json.dumps(requests[2]['messages'])
+        assert len(page_values) == 2
+        assert page_values[0]['next_offset'] == page_values[1]['offset']
+        assert page_values[0]['event_digest'] == page_values[1]['event_digest']
+        assert all(page['fragment'] and len(page['content']) < 16384 for page in page_values)
+        original_events = [row['payload']['event'] for row in events if row['method'] == 'session.event']
+        original = next(row for row in original_events if row['seq'] == refs['seq'])
+        assert original['type'] == 'assistant/message'
+        assert json.loads(original['data']['message']['content'][0]['arguments'])['yaml_text'] == huge_yaml
+        assert any('SAVED_INPUT_END' in io_path(path).read_text(encoding='utf-8') for path in result['trace_files'])
+        replacements = [row for row in original_events if isinstance(row.get('surfaceOp'), dict)]
+        assert any(row['type'] == 'user/message' and refs['seq'] in row['sourceEventSeqs'] for row in replacements)
+        assert any(row['type'] == 'tool/result' for row in replacements)
+    finally:
+        model.shutdown(); model.server_close(); thread.join(timeout=5)
+
+
+def test_native_pressure_compaction_preserves_bounded_result_json(tmp_path):
+    """The native fallback pruner must not cut admitted graph envelopes."""
+    from lightgraph.construction.mcp_server import serve_local_tools
+    requests, summary_requests, ordinary, checked = [], [], [], []
+    class Host:
+        def call(self, name, **arguments):
+            return {'status': 'ok', 'result_ref': 'result:pressure-ref',
+                    'coverage': {'complete': False, 'unread_pages': 8},
+                    'result_presentation': {'stored_complete_tool_result': True},
+                    'material': 'x' * 10500}
+    class Model(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            requests.append(request)
+            if 'Graph checkpoint rules:' in json.dumps(request['messages'][-1]):
+                summary_requests.append(request)
+                for message in request['messages']:
+                    if message['role'] == 'tool' and 'pressure-ref' in message['content']:
+                        checked.append(json.loads(message['content']))
+                respond(self, {'role': 'assistant', 'content':
+                    'Observed tool outputs refer to result:pressure-ref; coverage remains incomplete and 8 pages unread.'}, 'stop')
+                return
+            ordinary.append(request)
+            if len(ordinary) <= 8:
+                respond(self, {'role': 'assistant', 'tool_calls': [{'index': 0,
+                    'id': f'pressure-{len(ordinary)}', 'type': 'function', 'function': {
+                        'name': 'mcp__graph__describe_sources', 'arguments': '{}'}}]}, 'tool_calls')
+            else:
+                respond(self, {'role': 'assistant', 'content': 'Observed bounded results.'}, 'stop')
+    model = ThreadingHTTPServer(('127.0.0.1', 0), Model)
+    thread = threading.Thread(target=model.serve_forever, daemon=True)
+    thread.start()
+    try:
+        config = tmp_path / 'config.yaml'
+        config.write_text('goal: pressure fixture\n')
+        with serve_local_tools(Host()) as (url, token):
+            result = run_goal('Inspect fixture coverage.', config, tmp_path,
+                HarnessOptions(model='loopback-model', base_url=f'http://127.0.0.1:{model.server_port}/v1',
+                    max_calls=15, max_run_seconds=40, working_context_tokens=16384),
+                mcp_url=url, mcp_token_env='GRAPH_TEST_TOKEN',
+                environment={'GRAPH_TEST_TOKEN': token, 'OPENAI_API_KEY': 'local-test-only'})
+        assert result['finish_reason'] == 'completed', result
+        assert summary_requests and checked
+        assert all(value['coverage'] == {'complete': False, 'unread_pages': 8} for value in checked)
+        assert all(value['result_ref'] == 'result:pressure-ref' for value in checked)
+        assert all(len(value['material']) == 10500 for value in checked)
+        assert all('[... tool result middle pruned ...]' not in json.dumps(request) for request in requests)
+    finally:
+        model.shutdown(); model.server_close(); thread.join(timeout=5)
+
+
+def test_native_completed_batch_has_one_bounded_request_record(tmp_path):
+    from lightgraph.construction.mcp_server import serve_local_tools
+    requests, calls = [], []
+    class Host:
+        def call(self, name, **arguments):
+            index = int(arguments['yaml_text'].split('\n', 1)[0])
+            calls.append(index)
+            return {'status': 'error' if index == 19 else 'ok',
+                    'code': 'FIXTURE_ERROR' if index == 19 else 'OK',
+                    'result_ref': f'result:batch-{index}', 'material': 'x' * 12000}
+    class Model(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            requests.append(request)
+            if len(requests) == 1:
+                respond(self, {'role': 'assistant', 'tool_calls': [{
+                    'index': index, 'id': f'batch-call-{index}', 'type': 'function',
+                    'function': {'name': 'mcp__graph__save_graph_draft',
+                                 'arguments': json.dumps({
+                                    'yaml_text': f'{index}\n' + 'y' * 20000})}} for index in range(20)]}, 'tool_calls')
+            else:
+                respond(self, {'role': 'assistant', 'content': 'Batch results observed; one reported error.'}, 'stop')
+    model = ThreadingHTTPServer(('127.0.0.1', 0), Model)
+    thread = threading.Thread(target=model.serve_forever, daemon=True)
+    thread.start()
+    try:
+        config = tmp_path / 'config.yaml'
+        config.write_text('goal: batch fixture\n')
+        with serve_local_tools(Host()) as (url, token):
+            result = run_goal('Save the fixture batch once.', config, tmp_path,
+                HarnessOptions(model='loopback-model', base_url=f'http://127.0.0.1:{model.server_port}/v1',
+                    max_calls=4, max_run_seconds=40, working_context_tokens=32768),
+                mcp_url=url, mcp_token_env='GRAPH_TEST_TOKEN',
+                environment={'GRAPH_TEST_TOKEN': token, 'OPENAI_API_KEY': 'local-test-only'})
+        assert result['finish_reason'] == 'completed', result
+        assert len(requests) == 2 and len(calls) == len(set(calls)) == 20
+        record_text = next(message['content'] for message in requests[1]['messages']
+                           if message['role'] == 'user' and 'historical_tool_exchange' in message['content'])
+        # Native text heuristic uses UTF-16 units/4 plus 8 framing tokens.
+        assert (len(record_text.encode('utf-16-le')) // 2 + 3) // 4 + 8 <= 4096
+        record = json.loads(record_text)
+        assert record['call_count'] == record['outcome_count'] == 20
+        assert record['tool_error_count'] == 0 and record['reported_error_count'] == 1
+        assert record['outcomes'][0]['code'] == 'FIXTURE_ERROR'
+        assert record['outcomes'][0]['result_ref'] == 'result:batch-19'
+        assert record['summary_only'] and record['presentation_truncated']
+        assert record['outcome_index']['tool'] == 'session_event_read_page'
+        assert 'y' * 10000 not in record_text and 'x' * 10000 not in record_text
+        traces = ''.join(io_path(path).read_text(encoding='utf-8') for path in result['trace_files'])
+        assert 'y' * 20000 in traces and 'x' * 12000 in traces
+    finally:
+        model.shutdown(); model.server_close(); thread.join(timeout=5)
+
+
 @pytest.mark.skipif(os.environ.get('LIGHTGRAPH_TEST_LONG_MCP') != '1',
                    reason='real 310-second transport regression is explicitly opt-in')
 def test_native_kernel_validation_survives_default_fetch_300_second_limit(tmp_path):
@@ -296,7 +484,7 @@ def test_real_kernel_mcp_trace_and_model_budget(tmp_path, max_calls, expected_ca
             assert all(("stream_options" in request) == (not narrow_window) for request in requests)
             names = {tool["function"]["name"] for tool in requests[0]["tools"]}
             assert names == {"mcp__graph__describe_sources", "skill", "session_search", "session_event_search",
-                             "session_trace", "session_event_trace", "session_event_read"}
+                             "session_trace", "session_event_trace", "session_event_read", "session_event_read_page"}
         if input_exhausted:
             assert result["budget"]["stop_reason"] == "construction_input_limit_exceeded"
             assert result["budget"]["input_diagnostic"]["estimated_input_tokens"] > input_limit

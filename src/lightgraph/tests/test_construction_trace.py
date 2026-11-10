@@ -130,3 +130,18 @@ def test_dispatch_usage_missing_provider_counters_and_resumed_session_are_explic
     assert usage["input_tokens"] == 10 and usage["total_tokens"] == 11
     assert usage["measured_calls"] == 1 and usage["missing_usage_calls"] == 1
     assert usage["dispatched_calls"] == 2 and not usage["complete"]
+
+
+def test_retained_exchange_is_a_history_edit_not_a_new_user_or_tool_event():
+    native = {'method': 'session.event', 'payload': {'sessionId': 's', 'event': {
+        'type': 'user/message', 'seq': 30,
+        'data': {'id': 'working-note', 'role': 'user',
+                 'source': {'kind': 'graph-context-retention'},
+                 'content': [{'type': 'text', 'text': 'Historical execution record.'}]},
+        'surfaceOp': {'op': 'replace', 'startSeq': 10, 'endSeq': 12},
+        'sourceEventSeqs': [10, 12]}}}
+    kind, data = project_harness_event(native)
+    assert kind == 'context_history_edit' and kind not in AGENT_EVENTS
+    assert data['operation'] == 'tool_exchange_replacement'
+    assert data['source_event_seqs'] == [10, 12]
+    assert data['native'] == native

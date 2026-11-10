@@ -72,6 +72,15 @@ def project_harness_event(event: dict) -> tuple[str, dict]:
     if kind == "assistant/attempt":
         result["diagnostic"] = data
         return "model_error", result
+    if (kind == "user/message"
+            and _mapping(data.get("source")).get("kind") == "graph-context-retention"
+            and _mapping(native.get("surfaceOp")).get("op") == "replace"):
+        # Native surface history uses a user-role note for a settled tool
+        # exchange. This is not a new human message or another execution.
+        result.update(operation="tool_exchange_replacement", content=data.get("content", []),
+                      surface_operation=native["surfaceOp"],
+                      source_event_seqs=native.get("sourceEventSeqs", []))
+        return "context_history_edit", result
     if kind == "turn/start":
         result["turn_record"] = data
         return "agent_start", result

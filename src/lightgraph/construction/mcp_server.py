@@ -54,7 +54,11 @@ def create_server(tools):
                 if closing.is_set():
                     return {'status': 'error', 'code': 'construction_cancelled', 'retryable': False}
                 with anyio.CancelScope(shield=True):
-                    return await anyio.to_thread.run_sync(partial(tools.call, tool_name, **arguments),
+                    # Domain execution keeps its complete result. The model
+                    # receives a bounded view with an immutable material ref;
+                    # reading that material never reruns a source query.
+                    call = getattr(tools, 'bounded_call', tools.call)
+                    return await anyio.to_thread.run_sync(partial(call, tool_name, **arguments),
                                                          abandon_on_cancel=False)
         finally:
             with state_lock:
@@ -71,13 +75,17 @@ def create_server(tools):
         return await dispatch("inspect_source", table=table, operation=operation, arguments=arguments)
 
     @server.tool()
-    async def read_material(name: str, page: int = 0) -> dict:
+    async def read_material(name: str, page: int = 0, section: str = "") -> dict:
         """Read Markdown goal, skill, reference:<name.md>, draft_schema, source_operations,
         document:<id>, evidence:<ref>, draft:<id>, validation:<id>, conflicts:<id>
-        or publication_conflicts. Conflict materials include retained names/keys without a new query.
-        Follow next_page for complete documents and saved artifacts.
+        or publication_conflicts. For a retained tool result use result:<id>,
+        optionally selecting a section with a JSON pointer, such as /data/rows.
+        Read only needed sections/pages; follow next_page if more is necessary.
+        Result materials and conflicts require no new database query. A page is
+        a fragment, not proof that all rows or all material have been read.
         """
-        return await dispatch("read_material", name=name, page=page)
+        return await dispatch("read_material", name=name, page=page,
+                              **({'section': section} if section else {}))
 
     @server.tool()
     async def save_graph_draft(yaml_text: str) -> dict:
