@@ -88,9 +88,16 @@ def create_server(tools):
                               **({'section': section} if section else {}))
 
     @server.tool()
-    async def save_graph_draft(yaml_text: str) -> dict:
-        """Save or revise a YAML candidate with discovered mappings and issued evidence refs."""
-        return await dispatch("save_graph_draft", yaml_text=yaml_text)
+    async def save_graph_draft(yaml_text: str | None = None, metadata_from_draft: str | None = None) -> dict:
+        """Provide exactly one input: YAML, or metadata_from_draft naming a saved draft.
+        The latter derives a separate catalog-column-only candidate, preserves
+        its parent and gaps, and requires normal validation/publication. It
+        performs no SQL and does not include fact members or their relations.
+        """
+        return await dispatch("save_graph_draft", **({'metadata_from_draft': metadata_from_draft}
+            if yaml_text is None and metadata_from_draft is not None else
+            {'yaml_text': yaml_text, **({'metadata_from_draft': metadata_from_draft}
+                                      if metadata_from_draft is not None else {})}))
 
     @server.tool()
     async def validate_graph_draft(draft_id: str, mode: Literal['instances', 'structure'] | None = None) -> dict:

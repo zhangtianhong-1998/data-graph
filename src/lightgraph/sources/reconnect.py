@@ -207,6 +207,7 @@ def prepare_snapshot(source, *, engine, begin, disconnected):
     if source._cancelled: raise LightGraphError('query_cancelled')
     source._boundary_recovery_used = False
     source._boundary_recoveries = 0
+    initial_generation = source.connection_generation
     try:
         if source._idle_released or source._reconnect_allowed or disconnected:
             source._reconnect()
@@ -217,10 +218,25 @@ def prepare_snapshot(source, *, engine, begin, disconnected):
                 return
             except Exception as exc:
                 if isinstance(exc, BudgetExceeded) or source._cancelled: raise
-                if not source._reconnect_allowed or not _preflight_can_recover(exc): raise
+                diagnostic = safe_database_diagnostic(exc) or {}
+                # A new session can pass qualification then fail the fixed
+                # BEGIN/readonly setup with no classified driver state. A
+                # successful rollback does not make that setup succeed. No
+                # fact row has been emitted, so it can consume the same bounded
+                # recovery allowance as qualification. Keep semantic capability
+                # failures and classified permission/auth errors non-retryable.
+                qualified_begin_failure = (
+                    source.connection_generation > initial_generation
+                    and getattr(exc, 'code', None) == 'read_only_transaction_failed'
+                    and diagnostic.get('stage') == 'snapshot_start'
+                    and diagnostic.get('category') == 'unknown')
+                if not (_preflight_can_recover(exc) or qualified_begin_failure): raise
                 if source._boundary_recoveries >= MAX_BOUNDARY_RECOVERIES:
                     raise latch_terminal_failure(source, exc, engine=engine,
                                                  code='database_reconnect_failed') from None
+                # Eligibility is determined once here from the setup failure,
+                # not independently by a flag a driver cleanup may have reset.
+                source._reconnect_allowed = True
                 source._reconnect()
     except BaseException as exc:
         source._release_snapshot_connection()

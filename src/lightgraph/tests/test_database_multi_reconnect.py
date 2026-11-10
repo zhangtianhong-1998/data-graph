@@ -126,16 +126,60 @@ def test_unknown_new_session_preflight_failure_retries_before_any_fact_rows(engi
 
 
 @pytest.mark.parametrize('engine', ['gauss', 'mysql'])
+@pytest.mark.parametrize('failures', [2, 4], ids=['recovers', 'bounded_stop'])
+def test_qualified_session_unknown_begin_failure_uses_boundary_recovery(engine, failures, monkeypatch):
+    pauses = []
+    monkeypatch.setattr(reconnect, '_recovery_pause', lambda source: pauses.append(source._boundary_recoveries))
+    source, data, controls, factory = sessions(engine, count=failures + 2)
+    # Initial qualification succeeds. The subsequent fixed BEGIN fails while
+    # the driver still reports open and rollback returns normally. Neither
+    # condition proves that retrying this newly qualified session will work.
+    for connection in data[1:failures + 1]:
+        fail_begin(connection, engine, begin_number=2, rollback_fails=False)
+    try:
+        budget = source.query_budget
+        if failures < 4:
+            assert read(source) == [('001', 'Expenses')]
+            assert source.connection_generation == failures + 1
+            assert source._reconnect_attempts == source._boundary_recoveries == failures
+            assert pauses == [1, 2] and source.terminal_failure_code is None
+            assert source.stats.queries == 1
+        else:
+            with pytest.raises(LightGraphError, match='^database_reconnect_failed$') as caught:
+                read(source)
+            diagnostic = safe_database_diagnostic(caught.value)
+            assert diagnostic['stage'] == 'snapshot_start'
+            assert diagnostic['category'] == 'unknown'
+            assert diagnostic['connection_closed'] is False
+            assert diagnostic['rollback_succeeded'] is True
+            assert diagnostic['terminal'] and diagnostic['boundary_recovery_attempts'] == 3
+            assert source.connection_generation == 4 and source.stats.queries == 0
+            assert pauses == [1, 2, 3] and not data[-1].executed
+            calls = factory.calls
+            with pytest.raises(LightGraphError, match='^database_reconnect_failed$'):
+                read(source)
+            assert factory.calls == calls
+        assert source.query_budget is budget
+        assert all(connection.closed for connection in data[:failures + 1])
+        assert all(connection.closed for connection in controls[:failures + 1])
+        assert all(not any('FROM "public"."items"' in sql or 'FROM `analytics`.`items`' in sql
+                           for sql, _ in connection.executed) for connection in data[1:failures + 1])
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize('engine', ['gauss', 'mysql'])
+@pytest.mark.parametrize('begin_number', [1, 2], ids=['qualification', 'qualified_begin'])
 @pytest.mark.parametrize('category,state,number', [
     ('authentication', '28P01', 1045), ('permission', '42501', 1142),
     ('configuration_or_catalog', '42601', 1064), ('unsupported', '0A000', 1235),
 ])
-def test_classified_new_session_preflight_failure_never_uses_unknown_recovery(engine, category, state, number, monkeypatch):
+def test_classified_new_session_preflight_failure_never_uses_unknown_recovery(engine, begin_number, category, state, number, monkeypatch):
     pauses = []
     monkeypatch.setattr(reconnect, '_recovery_pause', lambda source: pauses.append(True))
     source, data, controls, factory = sessions(engine, count=3)
     failure = GaussFailure(state) if engine == 'gauss' else mysql.DBError(number, 'PRIVATE')
-    fail_begin(data[1], engine, begin_number=1, failure=failure)
+    fail_begin(data[1], engine, begin_number=begin_number, failure=failure)
     try:
         with pytest.raises(LightGraphError) as caught:
             read(source)
@@ -150,10 +194,29 @@ def test_classified_new_session_preflight_failure_never_uses_unknown_recovery(en
 
 
 @pytest.mark.parametrize('engine', ['gauss', 'mysql'])
-@pytest.mark.parametrize('stop', ['cancel', 'time', 'queries'])
-def test_unknown_preflight_retry_respects_cancel_and_budget(engine, stop, monkeypatch):
+def test_qualified_begin_cannot_retry_failed_readonly_attestation(engine, monkeypatch):
+    pauses = []
+    monkeypatch.setattr(reconnect, '_recovery_pause', lambda source: pauses.append(True))
     source, data, _, factory = sessions(engine, count=3)
-    fail_begin(data[1], engine, begin_number=1)
+    fail_begin(data[1], engine, begin_number=2,
+               failure=LightGraphError('read_only_transaction_unverified'))
+    try:
+        with pytest.raises(LightGraphError, match='^read_only_transaction_unverified$'):
+            read(source)
+        assert source._reconnect_attempts == 0 and not pauses
+        assert source.capabilities().capabilities['read_only_transaction'] == 'unknown'
+        assert source.terminal_failure_code == 'read_only_transaction_unverified'
+        assert not data[2].executed and source.stats.queries == 0
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize('engine', ['gauss', 'mysql'])
+@pytest.mark.parametrize('begin_number', [1, 2], ids=['qualification', 'qualified_begin'])
+@pytest.mark.parametrize('stop', ['cancel', 'time', 'queries'])
+def test_unknown_preflight_retry_respects_cancel_and_budget(engine, begin_number, stop, monkeypatch):
+    source, data, _, factory = sessions(engine, count=3)
+    fail_begin(data[1], engine, begin_number=begin_number)
     original_pause = reconnect._recovery_pause
     def pause(current):
         if stop == 'cancel': current.cancel()
@@ -195,7 +258,7 @@ def test_qualification_and_begin_share_one_recovery_limit(engine, monkeypatch):
     # First replacement fails in qualification, second at final BEGIN. Both
     # failures precede fact rows; the third session can safely start from zero.
     fail_begin(data[1], engine, begin_number=1, rollback_fails=True)
-    fail_begin(data[2], engine, begin_number=2, rollback_fails=True)
+    fail_begin(data[2], engine, begin_number=2, rollback_fails=False)
     try:
         assert read(source) == [('001', 'Expenses')]
         assert source._reconnect_attempts == source._boundary_recoveries == 2

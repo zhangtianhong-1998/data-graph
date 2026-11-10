@@ -184,9 +184,7 @@ class ConstructionTools:
                     raise LightGraphError('construction_cancelled')
                 if tool_name not in methods:
                     raise LightGraphError("unknown_construction_tool")
-                if self.terminal_reason and (tool_name == 'validate_graph_draft'
-                        and (arguments.get('mode') or self.config.construction_target) != 'structure'
-                        or tool_name == 'inspect_source' and arguments.get('operation')
+                if self.terminal_reason and (tool_name == 'inspect_source' and arguments.get('operation')
                         not in {'get_metadata', 'search_knowledge'}):
                     return self._stop_queries(self.terminal_reason)
                 result = methods[tool_name](**arguments)
@@ -645,9 +643,32 @@ class ConstructionTools:
                     "next_page": page + 1 if page + 1 < len(windows) else None}
         raise LightGraphError("unknown_construction_material")
 
-    def save_graph_draft(self, yaml_text: str):
+    def _check_metadata_catalog(self, draft):
+        """A lost fact connection does not revoke its observed catalog; a changed
+        catalog or rejected access does. Never recover definitions from those.
+        """
+        from .metadata_columns import is_metadata_mapping
+        sources = {m.source_id for e in draft.entities for m in e.mappings if is_metadata_mapping(m)}
+        self._sync_source_circuits(sources)
+        for state in self.source_circuits.blocked(sources):
+            if (state.get('cause_code') not in {'database_reconnect_failed', 'database_connection_failed',
+                    'read_only_transaction_failed', 'snapshot_close_failed'}
+                    or state.get('database', {}).get('category') in {
+                        'authentication', 'permission', 'configuration_or_catalog', 'unsupported'}):
+                raise LightGraphError('metadata_catalog_requalification_required')
+
+    def save_graph_draft(self, yaml_text: str | None = None, metadata_from_draft: str | None = None):
         from .workspace import parse_graph_draft
-        draft = parse_graph_draft(yaml_text)
+        if (yaml_text is None) == (metadata_from_draft is None):
+            raise LightGraphError('graph_draft_input_selection_required')
+        if metadata_from_draft is not None:
+            from .definitions import metadata_definition_draft
+            self._check_current_inputs()
+            parent = self.workspace.get_draft(metadata_from_draft)
+            draft = metadata_definition_draft(parent)
+            self._check_metadata_catalog(draft)
+        else:
+            draft = parse_graph_draft(yaml_text)
         error = self._metadata_evidence_error(draft)
         if error:
             return error
@@ -662,6 +683,10 @@ class ConstructionTools:
                 "revision": record.revision, "state": record.status,
                 "previous_revision": previous.revision if previous else None,
                 "revision_advice": advice,
+                **({'derived_from': {'draft_id': parent.draft.draft_id, 'revision': parent.revision,
+                                     'fingerprint': parent.fingerprint},
+                    'scope': 'metadata_definitions_only', 'fact_data_validation': 'not_run'}
+                   if metadata_from_draft is not None else {}),
                 "retained_failed_work": self._retained_failed_work(excluding=record.draft.draft_id),
                 "next_action": "Validate this draft, or revise it as new evidence arrives."}
 
@@ -713,6 +738,7 @@ class ConstructionTools:
             raise LightGraphError("metadata_only_query_forbidden")
         self._check_current_inputs()
         record = self.workspace.get_draft(draft_id)
+        self._check_metadata_catalog(record.draft)
         error = self._metadata_evidence_error(record.draft)
         if error:
             return error
@@ -723,8 +749,12 @@ class ConstructionTools:
             self.workspace.read_evidence(ref)
         from .models import iter_fact_mappings
         sources = sorted({m.source_id for m in iter_fact_mappings(record.draft)})
+        if self.terminal_reason and sources:
+            return {**self._stop_queries(self.terminal_reason),
+                    'metadata_definitions': self._definition_options(record)}
         stopped = self._source_gate(sources)
         if stopped:
+            stopped['metadata_definitions'] = self._definition_options(record)
             return stopped
         started = datetime.now(timezone.utc).isoformat()
         result = execute_draft(record.draft, self.adapters, list(self.tables.values()),
@@ -795,6 +825,7 @@ class ConstructionTools:
         # Keep every counterexample in the validation artifact; a model reply
         # need not replay hundreds of identical error shapes on every attempt.
         return {"status": "ok", "state": current.status, **result,
+                'metadata_definitions': self._definition_options(current),
                 'diagnostics': diagnostics[:32],
                 'diagnostic_count': len(diagnostics),
                 'diagnostic_codes': dict(Counter(d['code'] for d in diagnostics)),
@@ -842,6 +873,7 @@ class ConstructionTools:
             raise LightGraphError("metadata_only_query_forbidden")
         self._check_current_inputs()
         record = self.workspace.get_draft(draft_id)
+        self._check_metadata_catalog(record.draft)
         self._require_draft_sources(record.draft)
         selected = self.workspace.select_validation(draft_id, validation_id, isolate_conflicts=True)
         graph = self.workspace.read_validation_graph(draft_id, selected)
@@ -874,6 +906,10 @@ class ConstructionTools:
             value['retained_failed_work'] = self._retained_failed_work()
             value['source_circuits'] = self.source_circuits.summary()
             value['unavailable_sources'] = deepcopy(self.initialization_failures)
+            value['metadata_definition_options'] = [option
+                for record in self.workspace.list_drafts()
+                if record.context_fingerprint == self.workspace.context_fingerprint
+                and (option := self._definition_options(record)).get('available')]
             from .statistics import graph_statistics
             try:
                 graph = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes)
@@ -897,6 +933,11 @@ class ConstructionTools:
                 'next_action': 'Read read_material(name="draft:' + draft_id + '", page=0) and follow next_page '
                     'for the complete saved YAML. Read validation material for all diagnostics. Do not reconstruct it from session searches.'}
         return {"status": "ok", "format": "yaml", "content": content}
+
+    @staticmethod
+    def _definition_options(record):
+        from .definitions import definition_options
+        return definition_options(record)
 
     def _unavailable_table_source(self, table):
         # Configured identifiers identify an unavailable source, never create a
