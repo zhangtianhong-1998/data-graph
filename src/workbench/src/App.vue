@@ -10,6 +10,8 @@ import RunTrace from './RunTrace.vue'
 import { effectiveInputTokenLimit, modelLimitError, modelLimitKeys, modelLimitDefaults, runSecondsDefault } from './modelLimits'
 import { configTextChanged, mergeConfigDraft } from './configDraft'
 import type { ModelLimitKey } from './modelLimits'
+import { resourceFields, resourceInputs, resourceInputsError, resourceValues } from './resourceLimits'
+import type { ResourceKey } from './resourceLimits'
 import IdentityCandidates from './IdentityCandidates.vue'
 import DiscoveryCandidates from './DiscoveryCandidates.vue'
 import DatabaseSourceDialog from './DatabaseSourceDialog.vue'
@@ -53,6 +55,17 @@ const queryCountUnlimited = ref(true)
 const constructionTarget = ref<'instances' | 'structure'>('instances')
 const effectiveQueryLimit = computed(() => queryCountUnlimited.value ? null : maxDbQueries.value)
 const queryLimitError = computed(() => !queryCountUnlimited.value && (maxDbQueries.value === null || !Number.isSafeInteger(maxDbQueries.value) || maxDbQueries.value <= 0) ? '查询次数上限须为正整数，或勾选不限次数。' : '')
+const resources = ref(resourceInputs({}))
+const resourceError = computed(() => resourceInputsError(resources.value))
+const resourceChanges = computed(() => {
+  const current = resourceValues(resources.value), saved = resourceValues(resourceInputs(config.value))
+  return Object.fromEntries(resourceFields.filter(field => current[field.key] !== saved[field.key])
+    .map(field => [field.key, current[field.key]])) as Partial<RunConfig>
+})
+function setResourceLimit(key: ResourceKey, unit: number, event: Event) {
+  const text = (event.target as HTMLInputElement).value
+  resources.value[key].value = text === '' ? null : Number(text) * unit
+}
 const traceRecording = ref(true)
 const model = ref<NonNullable<RunConfig['model']>>({})
 const internalHttpEndpoint = computed(() => {
@@ -64,7 +77,7 @@ const internalHttpEndpoint = computed(() => {
 const agentLimits = ref<Record<string, unknown>>({}), agentLimitsSaved = ref('{}'), agentLimitsLoading = ref(false)
 const agentLimitsDirty = computed(() => !!config.value.agent_config && JSON.stringify(agentLimits.value) !== agentLimitsSaved.value)
 const limitModel = computed(() => config.value.agent_config ? agentLimits.value : model.value)
-const limitsError = computed(() => !traceRecording.value ? '运行需要保存轨迹，请先启用后保存。' : runSeconds.value === null || !Number.isFinite(runSeconds.value) || runSeconds.value <= 0 ? '整次运行时限须大于 0。' : queryLimitError.value || modelLimitError(limitModel.value))
+const limitsError = computed(() => !traceRecording.value ? '运行需要保存轨迹，请先启用后保存。' : runSeconds.value === null || !Number.isFinite(runSeconds.value) || runSeconds.value <= 0 ? '整次运行时限须大于 0。' : queryLimitError.value || resourceError.value || modelLimitError(limitModel.value))
 const effectiveInputTokens = computed(() => effectiveInputTokenLimit(limitModel.value))
 function useDefaultLimits() {
   const defaults = { ...modelLimitDefaults, context_window_tokens: null }
@@ -149,11 +162,11 @@ const activeRun = computed(() => runs.value.find(isActive))
 const locked = computed(() => busy.value || loading.value || !!activeRun.value)
 const path = computed(() => projectPath(project.value?.project_id || ''))
 const queryLimitDirty = computed(() => effectiveQueryLimit.value !== (config.value.max_db_queries ?? null) || queryCountUnlimited.value !== (config.value.max_db_queries == null))
-const formDirty = computed(() => traceRecording.value !== (config.value.record_trace !== false) || runSeconds.value !== (config.value.max_run_seconds ?? runSecondsDefault) || queryLimitDirty.value || constructionTarget.value !== (config.value.construction_target ?? 'instances') || purpose.value !== goalMarkdown(config.value) || JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}))
+const formDirty = computed(() => traceRecording.value !== (config.value.record_trace !== false) || runSeconds.value !== (config.value.max_run_seconds ?? runSecondsDefault) || queryLimitDirty.value || Object.keys(resourceChanges.value).length > 0 || constructionTarget.value !== (config.value.construction_target ?? 'instances') || purpose.value !== goalMarkdown(config.value) || JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}))
 const dirty = computed(() => !!modelKey.value || formDirty.value || agentLimitsDirty.value)
 const advancedDirty = computed(() => configTextChanged(advanced.value, advancedBaseline.value))
 function previewConfig(): RunConfig {
-  const value = { ...config.value }
+  const value = { ...config.value, ...resourceChanges.value }
   if (purpose.value !== goalMarkdown(config.value)) value.goal_markdown = purpose.value
   if (runSeconds.value !== (config.value.max_run_seconds ?? runSecondsDefault)) value.max_run_seconds = runSeconds.value!
   if (effectiveQueryLimit.value !== (config.value.max_db_queries ?? null)) value.max_db_queries = effectiveQueryLimit.value
@@ -163,7 +176,7 @@ function previewConfig(): RunConfig {
   return value
 }
 function resetAdvanced() { advanced.value = advancedBaseline.value = JSON.stringify(previewConfig(), null, 2) }
-watch([purpose, runSeconds, effectiveQueryLimit, constructionTarget, traceRecording, model], () => {
+watch([purpose, runSeconds, effectiveQueryLimit, resources, constructionTarget, traceRecording, model], () => {
   // The JSON view follows the form until the user edits the JSON itself.
   if (!advancedDirty.value) resetAdvanced()
 }, { deep: true })
@@ -191,6 +204,7 @@ function fillForms(value: RunConfig) {
   runSeconds.value = value.max_run_seconds ?? runSecondsDefault
   queryCountUnlimited.value = value.max_db_queries == null
   maxDbQueries.value = value.max_db_queries ?? null
+  resources.value = resourceInputs(value)
   constructionTarget.value = value.construction_target ?? 'instances'
   traceRecording.value = value.record_trace !== false
   model.value = JSON.parse(JSON.stringify(value.model || {})); advanced.value = advancedBaseline.value = JSON.stringify(value, null, 2)
@@ -198,7 +212,7 @@ function fillForms(value: RunConfig) {
 function formConfig(): RunConfig {
   const problem = limitsError.value
   if (problem) throw new Error(problem)
-  const value: RunConfig = { ...config.value, record_trace: traceRecording.value, max_run_seconds: runSeconds.value!, max_db_queries: effectiveQueryLimit.value, construction_target: constructionTarget.value, goal_markdown: purpose.value }
+  const value: RunConfig = { ...config.value, ...resourceChanges.value, record_trace: traceRecording.value, max_run_seconds: runSeconds.value!, max_db_queries: effectiveQueryLimit.value, construction_target: constructionTarget.value, goal_markdown: purpose.value }
   if (!value.agent_config) value.model = { ...model.value }
   assertNoCredentials(value)
   return value
@@ -254,6 +268,8 @@ function applyProjectConfig(nextProject: Project, nextConfig: RunConfig, preserv
     traceRecording: traceRecording.value !== (config.value.record_trace !== false) ? traceRecording.value : undefined,
     runSeconds: runSeconds.value !== (config.value.max_run_seconds ?? runSecondsDefault) ? runSeconds.value : undefined,
     maxDbQueries: queryLimitDirty.value ? { value: effectiveQueryLimit.value, unlimited: queryCountUnlimited.value } : undefined,
+    resources: Object.fromEntries(resourceFields.filter(field => field.key in resourceChanges.value)
+      .map(field => [field.key, { ...resources.value[field.key] }])),
     constructionTarget: constructionTarget.value !== (config.value.construction_target ?? 'instances') ? constructionTarget.value : undefined,
     purpose: purpose.value !== goalMarkdown(config.value) ? purpose.value : undefined,
     model: JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}) ? JSON.parse(JSON.stringify(model.value)) as typeof model.value : undefined,
@@ -269,6 +285,7 @@ function applyProjectConfig(nextProject: Project, nextConfig: RunConfig, preserv
     if (edits.traceRecording !== undefined) traceRecording.value = edits.traceRecording
     if (edits.runSeconds !== undefined) runSeconds.value = edits.runSeconds
     if (edits.maxDbQueries !== undefined) { maxDbQueries.value = edits.maxDbQueries.value; queryCountUnlimited.value = edits.maxDbQueries.unlimited }
+    Object.assign(resources.value, edits.resources)
     if (edits.constructionTarget !== undefined) constructionTarget.value = edits.constructionTarget
     if (edits.purpose !== undefined) purpose.value = edits.purpose
     if (edits.model !== undefined && !agentConfigRemoved) model.value = edits.model
@@ -589,6 +606,11 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
           <template v-if="tab === 'settings'"><div class="intro"><div><h2>模型配置</h2></div></div><div class="layout-two"><section class="panel"><div class="panel-head"><h2>模型连接</h2><span class="badge blue">运行设置</span></div><div class="panel-body"><p v-if="config.agent_config" class="note amber">当前配置引用独立模型文件 {{ config.agent_config }}。连接信息在该文件中配置，下方可调整额度和超时；保存时会生成新配置，保留原文件。</p><template v-else><div class="field"><label for="model-mode">模型模式</label><select id="model-mode" v-model="model.mode" :disabled="locked"><option value="disabled">关闭模型，暂不启动自主构建</option><option value="metadata_only">仅元数据，不向模型发送样本</option><option value="in_environment">环境内模型，可使用受限样本</option><option value="approved_external">已批准的外部模型</option></select></div><div class="field"><label for="model-url">服务 Base URL</label><input id="model-url" v-model="model.base_url" :disabled="locked" placeholder="https://model.example.com/v1" autocomplete="off"/><p class="field-hint">使用兼容 Chat Completions 的地址；不要在 URL 中包含密钥。</p></div><div class="two-fields"><div class="field"><label for="model-name">模型名称</label><input id="model-name" v-model="model.model" :disabled="locked" placeholder="模型服务提供的名称"/></div><div class="field"><label for="model-key">API key</label><input id="model-key" v-model="modelKey" :disabled="locked" type="password" autocomplete="new-password" :placeholder="credentials.model ? '已在本机保存，留空保留' : credentials.model_environment ? '服务器已配置，可留空' : '填写模型服务的 API key'"/></div></div><p class="credential-status field-hint"><span class="badge" :class="credentials.model || credentials.model_environment ? 'green' : ''">{{ credentials.model ? '已在本机保存密钥' : credentials.model_environment ? '已配置服务器环境变量' : '尚未配置密钥' }}</span><button v-if="credentials.model || credentials.model_error" class="text-button" :disabled="locked" @click="clearModelCredential">清除密钥</button></p><p v-if="credentials.model_error" class="note amber" role="alert">{{ new ApiError(credentials.model_error).message }}</p><details class="model-advanced"><summary>使用服务器环境变量（可选）</summary><div class="field"><label for="model-key-env">API key 环境变量名</label><input id="model-key-env" v-model="model.api_key_env" :disabled="locked" placeholder="LIGHTGRAPH_API_KEY" autocomplete="off"/></div></details><p class="field-hint">连接和接口参数由后台自动适配。</p><label v-if="internalHttpEndpoint" class="checkbox-line"><input id="model-allow-http" v-model="model.allow_insecure_http" type="checkbox" :disabled="locked"/>允许使用此内部 HTTP 服务</label></template>
 <div class="field"><label for="construction-target">构建结果</label><select id="construction-target" v-model="constructionTarget" :disabled="locked"><option value="instances">生成实例图谱</option><option value="structure">仅生成结构与映射</option></select><p class="field-hint">结构与映射可以单独保存和发布；这不代表具体节点、关系或全部数据已经验证。</p></div>
 <div class="field"><label for="max-db-queries">数据查询次数上限</label><label class="checkbox-line"><input id="query-count-unlimited" v-model="queryCountUnlimited" type="checkbox" :disabled="locked"/>不限次数</label><input id="max-db-queries" type="number" min="1" step="1" :value="maxDbQueries ?? ''" :disabled="locked || queryCountUnlimited" placeholder="填写正整数" @input="maxDbQueries = ($event.target as HTMLInputElement).value === '' ? null : Number(($event.target as HTMLInputElement).value)"/><p class="field-hint">所有数据来源共用，包括元数据与事务控制查询。不限次数仍受单次查询超时、整次运行时限和数据量限制。</p></div>
+<fieldset class="resource-settings"><legend>数据读取与构图额度</legend>
+<p class="field-hint">累计返回量是本轮所有来源查询合计读取的数据量，包含探查与实例验证；处理后释放内存也不会扣回，不是磁盘存储或模型 token。</p>
+<div v-for="field in resourceFields" :key="field.key" class="field"><label :for="field.id">{{ field.label }}</label><label v-if="field.unlimited" class="checkbox-line"><input :id="`${field.id}-unlimited`" v-model="resources[field.key].unlimited" type="checkbox" :disabled="locked"/>不限</label><input :id="field.id" type="number" :min="field.unit === 1 ? 1 : 1 / field.unit" :step="field.unit === 1 ? 1 : 'any'" :value="resources[field.key].value === null ? '' : resources[field.key].value! / field.unit" :disabled="locked || (field.unlimited && resources[field.key].unlimited)" @input="setResourceLimit(field.key, field.unit, $event)"/></div>
+<p class="field-hint">1 MiB = 1,048,576 字节；填写 1024 即 1 GiB。工作内存限制构图时保留的结果与索引，和累计返回量分别生效。不限累计返回量仍保留只读权限、单次查询限制、工作内存与运行时限。</p>
+</fieldset>
 <p v-if="agentLimitsLoading" role="status">正在读取模型额度…</p>
 <div class="two-fields"><div class="field"><label for="model-max-calls">模型调用总额度</label><input id="model-max-calls" type="number" min="0" step="1" :value="limitModel.max_calls === undefined ? modelLimitDefaults.max_calls : limitModel.max_calls ?? ''" :disabled="locked || agentLimitsLoading" placeholder="留空不额外限制" @input="setModelLimit('max_calls', $event)"/><p class="field-hint">整次运行的模型请求次数，包含重试和压缩调用。0 表示不允许调用模型。</p></div><div class="field"><label for="run-seconds">整次运行时限（秒）</label><input id="run-seconds" type="number" min="0.1" step="any" :value="runSeconds ?? ''" :disabled="locked || agentLimitsLoading" @input="runSeconds = ($event.target as HTMLInputElement).value === '' ? null : Number(($event.target as HTMLInputElement).value)"/><p class="field-hint">同一时限覆盖发现、验证与构建。</p></div></div>
 <div class="two-fields"><div class="field"><label for="model-input-tokens">最大输入 tokens</label><input id="model-input-tokens" type="number" min="1" step="1" :value="limitModel.max_prompt_tokens === undefined ? modelLimitDefaults.max_prompt_tokens : limitModel.max_prompt_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="留空不另设输入限制" @input="setModelLimit('max_prompt_tokens', $event)"/><p class="field-hint">请求派发前按估算值检查输入，包括系统提示、历史消息和工具定义。额度估算会结合接口实际用量校准，不代表精确分词结果。</p></div><div class="field"><label for="model-output-tokens">最大输出 tokens</label><input id="model-output-tokens" type="number" min="1" step="1" :value="limitModel.max_output_tokens === undefined ? modelLimitDefaults.max_output_tokens : limitModel.max_output_tokens ?? ''" :disabled="locked || agentLimitsLoading" placeholder="默认 65536" @input="setModelLimit('max_output_tokens', $event)"/><p class="field-hint">单次请求的输出上限，不是整轮抽取的 token 预算。</p></div></div>
@@ -613,3 +635,10 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
     <div v-if="toast" class="toast" role="status">{{ toast }}</div>
   </div>
 </template>
+
+<style scoped>
+.resource-settings { min-width: 0; margin: 0 0 24px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; }
+.resource-settings legend { padding: 0 6px; font-weight: 600; }
+.resource-settings > .field-hint { margin-bottom: 16px; }
+.resource-settings > .field-hint:last-child { margin-bottom: 0; }
+</style>

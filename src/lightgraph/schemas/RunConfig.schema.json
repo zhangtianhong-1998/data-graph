@@ -922,6 +922,34 @@
       "description": "Total source-query admissions, including metadata and transaction controls. Null removes only the query-count ceiling.",
       "title": "Max Db Queries"
     },
+    "max_returned_rows": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": 400000,
+      "description": "Cumulative rows returned by all source queries across the run, including exploration and validation. Null removes only this cumulative row ceiling.",
+      "title": "Max Returned Rows"
+    },
+    "max_returned_bytes": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": 67108864,
+      "description": "Cumulative estimated row bytes returned by all source queries across the run, not resident memory, disk space, model tokens or MCP traffic. Null removes only this cumulative byte ceiling.",
+      "title": "Max Returned Bytes"
+    },
     "construction_target": {
       "default": "instances",
       "description": "Build concrete instance nodes and edges, or publish only structure and source mappings with no claim of instance validation.",

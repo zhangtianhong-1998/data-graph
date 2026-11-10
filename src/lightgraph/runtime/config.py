@@ -157,6 +157,10 @@ class RunConfig(StrictModel):
     max_working_bytes: int = Field(default=32*1024*1024, gt=0)
     max_db_queries: StrictInt | None = Field(default=None, gt=0,
         description="Total source-query admissions, including metadata and transaction controls. Null removes only the query-count ceiling.")
+    max_returned_rows: StrictInt | None = Field(default=400000, gt=0,
+        description="Cumulative rows returned by all source queries across the run, including exploration and validation. Null removes only this cumulative row ceiling.")
+    max_returned_bytes: StrictInt | None = Field(default=64*1024*1024, gt=0,
+        description="Cumulative estimated row bytes returned by all source queries across the run, not resident memory, disk space, model tokens or MCP traffic. Null removes only this cumulative byte ceiling.")
     construction_target: Literal["instances", "structure"] = Field(default="instances",
         description="Build concrete instance nodes and edges, or publish only structure and source mappings with no claim of instance validation.")
     max_partitions: int = Field(default=256, ge=1, le=4096)
@@ -245,11 +249,29 @@ def load_config(path):
         raise LightGraphError("config_invalid") from None
 
 
+def run_query_budget(config):
+    """Create the configured whole-run source budget; phase changes never reset it."""
+    from ..sources.budget import QueryBudget
+    return QueryBudget(max_queries=config.max_db_queries, max_run_seconds=config.max_run_seconds,
+        max_returned_rows=config.max_returned_rows, max_returned_bytes=config.max_returned_bytes)
+
+
+def install_run_query_budget(config, adapters):
+    """Share limits across borrowed adapters while importing prior usage exactly once.
+
+    Preparing sources may already have consumed metadata queries. Retain that
+    consumption and the earliest deadline, including an existing cancellation.
+    """
+    budget = run_query_budget(config)
+    for adapter in adapters:
+        adapter.install_budget(budget)
+    return budget
+
+
 def open_sources(config, *, metadata_only=False, source_credentials=None, isolate_database_failures=False):
     from ..sources import ExcelSource, CSVSource, GaussSource, MySQLSource
     sources=[]
-    from ..sources.budget import QueryBudget
-    budget=QueryBudget(max_queries=config.max_db_queries,max_run_seconds=config.max_run_seconds)
+    budget=run_query_budget(config)
     try:
         for s in config.sources:
             if s.kind=="excel_workbook":

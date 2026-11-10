@@ -22,7 +22,7 @@ from lightgraph.discovery.tools import ToolExecutor
 from lightgraph.documents import DocumentCorpus, load_documents
 from lightgraph.errors import LightGraphError
 from lightgraph.source_values import SOURCE_KEY_SEMANTICS_VERSION
-from lightgraph.runtime.config import open_sources
+from lightgraph.runtime.config import install_run_query_budget, open_sources
 
 from .models import DraftRecord, GraphDraft, draft_evidence_refs
 from .access import access_fingerprint, ensure_supported_access, filter_graph_scopes
@@ -65,6 +65,7 @@ class ConstructionTools:
         self.executors = {}
         self._read_chunks = {}
         try:
+            self.query_budget = install_run_query_budget(config, self.adapters)
             self.documents = DocumentCorpus([document for document in load_documents(config.documents)
                 if document.document_id not in config.removed_document_ids])
             mapping = {t.source_id: adapter for adapter in self.adapters for t in adapter.describe()}
@@ -183,7 +184,10 @@ class ConstructionTools:
                         or tool_name == 'inspect_source' and arguments.get('operation')
                         not in {'get_metadata', 'search_knowledge'}):
                     return self._stop_queries(self.terminal_reason)
-                return methods[tool_name](**arguments)
+                result = methods[tool_name](**arguments)
+                if isinstance(result, dict):
+                    result['query_budget'] = self.query_budget.snapshot()
+                return result
             except ValidationError as exc:
                 return {"status": "error", "code": "invalid_graph_draft", "diagnostics": [
                     {"path": list(e["loc"]), "constraint": e["type"]}
@@ -217,12 +221,15 @@ class ConstructionTools:
         action = ('Repeated requests targeted a source already stopped in this run. '
                   'Do not retry it or remove its mappings to claim the full goal is complete. '
                   if self.terminal_reason == 'source_retry_limit_exhausted' else '')
+        from .failures import failure_guidance
         return {'status': 'error', 'code': self.terminal_reason, 'retryable': False,
+                'query_budget': self.query_budget.snapshot(),
                 'queries_stopped': True, 'finalization_model_calls': 2,
                 'next_action': action + 'Source queries cannot continue in this run. Read saved work, publish an already '
                     'successful validation if appropriate, and finish. Do not repeat queries or revise the '
                     'mapping solely because resources were exhausted. Two model calls remain for this closeout, '
-                    'subject to the existing model/time limits.'}
+                    'subject to the existing model/time limits.',
+                **failure_guidance([{'code': self.terminal_reason}])}
 
     def _save_source_circuits(self):
         from lightgraph.runtime.retention import atomic_text
@@ -264,6 +271,7 @@ class ConstructionTools:
         """Return the authorized physical catalog without inferred business roles."""
         titles = {d.document_id: d.title for d in self.documents.documents}
         return {"status": "ok", "goal": goal_descriptor(self.config),
+                "query_budget": self.query_budget.snapshot(),
                 "construction_target": self.config.construction_target,
                 "output_constraints": {"entity_kinds": self.config.goal.entity_kinds,
                                        "relation_kinds": self.config.goal.relation_kinds},
@@ -768,6 +776,8 @@ class ConstructionTools:
                 'publishable_subset': subset,
                 'draft_material': 'draft:' + draft_id, "statistics": statistics,
                 'effective_limits': {'max_working_bytes': self.config.max_working_bytes,
+                    'max_returned_rows': self.config.max_returned_rows,
+                    'max_returned_bytes': self.config.max_returned_bytes,
                     'max_result_rows': self.config.limits.max_result_rows,
                     'query_timeout_ms': self.config.limits.timeout_ms,
                     'run_max_seconds': self.config.max_run_seconds},

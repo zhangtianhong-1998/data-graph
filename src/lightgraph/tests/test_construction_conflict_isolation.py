@@ -71,7 +71,8 @@ def test_local_conflict_publishes_clean_remainder_without_losing_counterexamples
         tools.close()
 
 
-@pytest.mark.parametrize('failure', ['memory_budget_exhausted', 'projection_truncated', 'database_reconnect_failed', 'relation_cycle'])
+@pytest.mark.parametrize('failure', ['memory_budget_exhausted', 'returned_bytes_budget_exhausted',
+    'returned_rows_budget_exhausted', 'projection_truncated', 'database_reconnect_failed', 'relation_cycle'])
 def test_other_failures_cannot_authorize_subset(tmp_path, failure):
     work = GraphWorkspace(tmp_path, 'context')
     work.save_draft(payload('objects'))

@@ -6,9 +6,10 @@ from contextlib import contextmanager
 from lightgraph.errors import BudgetExceeded, LightGraphError
 
 class QueryBudget:
-    def __init__(self, *, max_queries: int | None = None, max_run_seconds: float = 1800, max_returned_rows: int = 400000, max_returned_bytes: int = 64 * 1024 * 1024, deadline: float | None = None):
-        if (max_queries is not None and (type(max_queries) is not int or max_queries <= 0)
-                or min(max_run_seconds, max_returned_rows, max_returned_bytes) <= 0):
+    def __init__(self, *, max_queries: int | None = None, max_run_seconds: float = 1800, max_returned_rows: int | None = 400000, max_returned_bytes: int | None = 64 * 1024 * 1024, deadline: float | None = None):
+        if (any(value is not None and (type(value) is not int or value <= 0)
+                for value in (max_queries, max_returned_rows, max_returned_bytes))
+                or max_run_seconds <= 0):
             raise LightGraphError("invalid_query_budget")
         self.max_queries=max_queries;self.max_returned_rows=max_returned_rows;self.max_returned_bytes=max_returned_bytes
         self.deadline=min(deadline, time.monotonic()+max_run_seconds) if deadline else time.monotonic()+max_run_seconds
@@ -77,14 +78,30 @@ class QueryBudget:
     def charge_query(self):
         with self._lock:
             self.check_time()
-            if self.max_queries is not None and self.queries >= self.max_queries: raise BudgetExceeded("query_budget_exhausted")
+            self._check_return_limits()
+            if self.max_queries is not None and self.queries >= self.max_queries: self._raise_exhausted("query_budget_exhausted")
             self.queries += 1
     def charge_return(self, rows: int, byte_count: int):
+        if any(type(value) is not int or value < 0 for value in (rows, byte_count)):
+            raise LightGraphError('invalid_query_return_cost')
         with self._lock:
             self.check_time()
             self.returned_rows += rows; self.returned_bytes += byte_count
-            if self.returned_rows > self.max_returned_rows: raise BudgetExceeded("returned_rows_budget_exhausted")
-            if self.returned_bytes > self.max_returned_bytes: raise BudgetExceeded("returned_bytes_budget_exhausted")
+            self._check_return_limits()
+    def _check_return_limits(self):
+        if self.max_returned_rows is not None and self.returned_rows > self.max_returned_rows:
+            self._raise_exhausted("returned_rows_budget_exhausted")
+        if self.max_returned_bytes is not None and self.returned_bytes > self.max_returned_bytes:
+            self._raise_exhausted("returned_bytes_budget_exhausted")
+    def _raise_exhausted(self, code):
+        # Only numeric counters and public configuration names; never row values.
+        field = {'query_budget_exhausted': 'max_db_queries',
+                 'returned_rows_budget_exhausted': 'max_returned_rows',
+                 'returned_bytes_budget_exhausted': 'max_returned_bytes'}[code]
+        error = BudgetExceeded(code)
+        error.query_budget_diagnostic = {**self.snapshot(), 'config_field': field,
+            'scope': 'whole_run_all_sources', 'byte_measurement': 'estimated_returned_row_bytes'}
+        raise error
     def absorb(self, previous: "QueryBudget"):
         if previous is self: return
         with self._lock:
@@ -93,13 +110,20 @@ class QueryBudget:
                 prior=previous.snapshot()
                 self._absorbed_budgets[id(previous)]=previous
                 self.queries+=prior["queries"];self.returned_rows+=prior["returned_rows"];self.returned_bytes+=prior["returned_bytes"]
+            if previous._cancelled.is_set():
+                self._cancelled.set()
             self.check_time()
-            if self.max_queries is not None and self.queries > self.max_queries: raise BudgetExceeded("query_budget_exhausted")
-            if self.returned_rows > self.max_returned_rows: raise BudgetExceeded("returned_rows_budget_exhausted")
-            if self.returned_bytes > self.max_returned_bytes: raise BudgetExceeded("returned_bytes_budget_exhausted")
+            if self.max_queries is not None and self.queries > self.max_queries: self._raise_exhausted("query_budget_exhausted")
+            self._check_return_limits()
     def snapshot(self):
         with self._lock:
-            return {"queries":self.queries,"returned_rows":self.returned_rows,"returned_bytes":self.returned_bytes,"max_queries":self.max_queries,"remaining_queries":None if self.max_queries is None else max(0,self.max_queries-self.queries),"remaining_seconds":max(0,self.deadline-time.monotonic())}
+            return {"queries":self.queries,"returned_rows":self.returned_rows,"returned_bytes":self.returned_bytes,
+                "max_queries":self.max_queries,"remaining_queries":None if self.max_queries is None else max(0,self.max_queries-self.queries),
+                "max_returned_rows":self.max_returned_rows,
+                "remaining_returned_rows":None if self.max_returned_rows is None else max(0,self.max_returned_rows-self.returned_rows),
+                "max_returned_bytes":self.max_returned_bytes,
+                "remaining_returned_bytes":None if self.max_returned_bytes is None else max(0,self.max_returned_bytes-self.returned_bytes),
+                "remaining_seconds":max(0,self.deadline-time.monotonic())}
 
 class BudgetedCursor:
     """Metadata/control cursor wrapper; no SQL or parameter values are retained."""

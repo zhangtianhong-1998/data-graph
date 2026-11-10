@@ -87,7 +87,14 @@ def _preflight_can_recover(error):
                 # Failure to obtain a new session is safe to retry before any
                 # rows exist. Unknown remains unknown; this is not a claim that
                 # the network, rather than the driver/server, caused it.
-                or getattr(error, 'code', None) == 'database_connection_failed'))
+                or getattr(error, 'code', None) == 'database_connection_failed'
+                # Qualification belongs to this newly acquired session. No
+                # fact rows exist yet, so an unclassified driver failure can
+                # consume the same bounded recovery allowance as connect.
+                # Keep unknown as unknown; explicit capability/catalog and
+                # authentication failures remain non-recoverable above.
+                or getattr(error, 'code', None) == 'database_preflight_failed'
+                and diagnostic.get('stage') == 'connection_preflight'))
 
 
 def _check_recovery_budget(source):

@@ -72,10 +72,19 @@ class GaussSource(SourceAdapter):
             self.query_budget.check_time()
             if connect_factory is None:
                 import psycopg
+                from psycopg.conninfo import conninfo_to_dict
                 self._manifest.driver = f"psycopg/{psycopg.__version__}"
                 remaining = max(1, math.ceil(self.query_budget.deadline - time.monotonic()))
+                # Keep short-lived leases detectable during a silent query.
+                # Explicit DSN choices win. OS/libpq support controls actual
+                # detection time; these probes do not reconnect or replay SQL.
+                explicit_options = conninfo_to_dict(dsn)
+                socket_options = {key: value for key, value in {
+                    'keepalives': 1, 'keepalives_idle': 30,
+                    'keepalives_interval': 10, 'keepalives_count': 3,
+                }.items() if key not in explicit_options}
                 self._connection = psycopg.connect(dsn, connect_timeout=max(1,
-                    min(30, self.limits.timeout_ms // 1000, remaining)))
+                    min(30, self.limits.timeout_ms // 1000, remaining)), **socket_options)
             else:
                 self._connection = connect_factory(dsn)
             if connection_is_closed(self._connection):

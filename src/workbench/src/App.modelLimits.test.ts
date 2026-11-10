@@ -50,6 +50,65 @@ beforeEach(() => {
 })
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); clearSessions(); sessionStorage.clear() })
 describe('visible model limits', () => {
+  it.each([false, true])('saves cumulative data budgets and working memory, then restores after reload (%s)', async separate => {
+    if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }
+    await mount()
+    expect(root.querySelector<HTMLInputElement>('#max-returned-rows')!.value).toBe('400000')
+    expect(root.querySelector<HTMLInputElement>('#max-returned-mib')!.value).toBe('64')
+    expect(root.querySelector<HTMLInputElement>('#max-working-mib')!.value).toBe('32')
+    await edit('max-returned-rows', '1200000')
+    await edit('max-returned-mib', '512')
+    await edit('max-working-mib', '1024')
+    await edit('model-max-calls', '400')
+    button('保存配置').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存'))
+    expect(config).toMatchObject({ max_returned_rows: 1200000, max_returned_bytes: 536870912, max_working_bytes: 1073741824 })
+    expect(separate ? limits.max_calls : config.model!.max_calls).toBe(400)
+    app.unmount(); root.remove(); await mount()
+    expect(root.querySelector<HTMLInputElement>('#max-returned-rows')!.value).toBe('1200000')
+    expect(root.querySelector<HTMLInputElement>('#max-returned-mib')!.value).toBe('512')
+    expect(root.querySelector<HTMLInputElement>('#max-working-mib')!.value).toBe('1024')
+    // Saving only model settings must not restore old resource defaults.
+    await edit('model-max-calls', '600'); button('保存配置').click()
+    await vi.waitFor(() => expect(separate ? limits.max_calls : config.model!.max_calls).toBe(600))
+    expect(config).toMatchObject({ max_returned_rows: 1200000, max_returned_bytes: 536870912, max_working_bytes: 1073741824 })
+  })
+  it('persists explicit unlimited return budgets and keeps byte-precise existing memory values', async () => {
+    config.max_working_bytes = 1073741825
+    await mount()
+    for (const id of ['max-returned-rows-unlimited', 'max-returned-mib-unlimited']) {
+      const input = root.querySelector<HTMLInputElement>(`#${id}`)!
+      input.checked = true; input.dispatchEvent(new Event('change', { bubbles: true })); await nextTick()
+    }
+    button('保存配置').click()
+    await vi.waitFor(() => expect(config.max_returned_bytes).toBeNull())
+    expect(config.max_returned_rows).toBeNull(); expect(config.max_working_bytes).toBe(1073741825)
+    app.unmount(); root.remove(); await mount()
+    expect(root.querySelector<HTMLInputElement>('#max-returned-mib-unlimited')!.checked).toBe(true)
+    expect(root.querySelector<HTMLInputElement>('#max-returned-rows-unlimited')!.checked).toBe(true)
+    expect(root.querySelector<HTMLInputElement>('#max-returned-mib')!.disabled).toBe(true)
+    expect(Number(root.querySelector<HTMLInputElement>('#max-working-mib')!.value) * 1048576).toBe(1073741825)
+  })
+  it('merges resource controls with unrelated JSON fields and rejects conflicting resource changes', async () => {
+    await mount()
+    await edit('advanced-config', JSON.stringify({ ...config, max_run_seconds: 9000 }))
+    await edit('max-returned-mib', '1024'); button('保存完整配置').click()
+    await vi.waitFor(() => expect(config.max_returned_bytes).toBe(1073741824))
+    expect(config.max_run_seconds).toBe(9000)
+    await vi.waitFor(() => expect(button('保存完整配置').disabled).toBe(false))
+    await edit('advanced-config', JSON.stringify({ ...config, max_returned_bytes: 268435456 }))
+    await edit('max-returned-mib', '512'); button('保存完整配置').click()
+    await vi.waitFor(() => expect(root.querySelector('.error-strip')?.textContent).toContain('max_returned_bytes'))
+    expect(config.max_returned_bytes).toBe(1073741824)
+  })
+  it.each([['max-returned-rows', ''], ['max-returned-rows', '1.5'], ['max-returned-mib', '0'],
+    ['max-returned-mib', '0.0000001'], ['max-working-mib', '-1'], ['max-working-mib', '']])('rejects invalid resource control %s=%s', async (id, value) => {
+    await mount(); await edit(id, value)
+    expect(button('保存配置').disabled).toBe(true)
+    expect(button('保存并开始抽取').disabled).toBe(true)
+    expect(calls.some(call => call.method === 'PUT')).toBe(false)
+  })
+
   it.each([false, true])('保存默认额度后刷新仍生效，无需展开 JSON (%s)', async separate => {
     config.max_run_seconds = 1800
     if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }

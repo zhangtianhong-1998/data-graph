@@ -192,6 +192,8 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
     except LightGraphError as exc:
         report.status = "PARTIAL"
         report.issues.append({"code": exc.code, "status": "partial"})
+        if hasattr(exc, 'query_budget_diagnostic'):
+            report.validation['query_budget'] = exc.query_budget_diagnostic
     except Exception as exc:
         report.status = "PARTIAL"
         report.issues.append({"code": "harness_runtime_failed", "status": "partial"})
@@ -294,6 +296,9 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
                 # budget once, rather than summing it once per source.
                 source_budgets = {id(b): b for a in tools.adapters
                                   if (b := getattr(a, 'query_budget', None)) is not None}
+                report.validation['query_budget'] = tools.query_budget.snapshot()
+                report.counts['source_returned_rows'] = tools.query_budget.returned_rows
+                report.counts['source_returned_bytes'] = tools.query_budget.returned_bytes
                 actual_queries = sum(b.snapshot()['queries'] for b in source_budgets.values())
                 report.counts['db_query_admissions'] = actual_queries
                 report.construction.execution['query_counter_basis'] = 'db_queries=data_operation_attempts; db_query_admissions=shared_all_sql_admissions'

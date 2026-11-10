@@ -12,6 +12,19 @@ SOURCE_FAILURES = frozenset({
 
 def failure_guidance(diagnostics):
     codes = {d.get('code') for d in diagnostics}
+    if codes & {'returned_rows_budget_exhausted', 'returned_bytes_budget_exhausted'}:
+        return {'failure_class': 'resource', 'retryable': False,
+                'recovery': 'run_capacity_change_required',
+                'next_action': 'The cumulative source-return allowance for this run is exhausted. '
+                    'Read query_budget for used, configured and remaining rows/bytes; this is not '
+                    'resident memory, disk storage or model tokens. Splitting or retrying drafts '
+                    'inside this run does not reset these counters. This instance validation is '
+                    'incomplete: do not publish it as a conflict-isolated subset, even if it also '
+                    'contains label conflicts. Keep the full draft and saved evidence. Finish '
+                    'after publishing only an independently completed validation if available; '
+                    'continue in a new run after the operator changes the return allowance or '
+                    'confirms an appropriate scope. Do not drop required dimensions, measures, '
+                    'names or row contexts to conceal the resource gap.'}
     if 'memory_budget_exhausted' in codes:
         return {'failure_class': 'resource', 'retryable': False,
                 'next_action': 'Keep the full mapping and its requested names and row contexts. '

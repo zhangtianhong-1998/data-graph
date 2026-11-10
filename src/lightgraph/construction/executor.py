@@ -192,6 +192,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             location['source_id'] = source_id
         diagnostic(error.code, **location, retryable=error.retryable,
                    **({'database': detail} if detail else {}),
+                   **({'query_budget': error.query_budget_diagnostic}
+                      if hasattr(error, 'query_budget_diagnostic') else {}),
                    **getattr(error, 'construction_memory_diagnostic', {}))
 
     def failed_operation(error):

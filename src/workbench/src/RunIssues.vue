@@ -32,6 +32,9 @@ const constructionMessageCodes = new Set(['construction_goal_gap', 'construction
 const issueMessage = (issue: RunIssue) => constructionMessageCodes.has(issue.code || '') && issue.category === ({ construction_goal_gap: 'goal_gap', construction_decision: 'decision', construction_suggestion: 'suggestion' } as Record<string, string>)[issue.code!] && typeof issue.message === 'string' ? issue.message : ''
 const issueKey = (issue: RunIssue) => JSON.stringify([issue.code, issue.table, issue.draft_id, issueMessage(issue), enumLabel(issue.status, states), columnNames(issue), ...(isDiagnostic(issue) ? [diagnosticCode(issue.reason_code), fieldPath(issue.field_path), diagnosticConstraint(issue.constraint), enumLabel(issue.stage, protocolStages)] : [])])
 const hints: Record<string, string> = {
+  returned_rows_budget_exhausted: '本轮所有来源累计返回的行数已超过上限，后续数据检查未完成。请在模型配置的“数据读取与构图额度”中调整累计返回行数，再继续运行；分批验证不会重置本轮计数。',
+  returned_bytes_budget_exhausted: '本轮所有来源累计返回的数据量已超过上限，后续数据检查未完成。请在模型配置的“数据读取与构图额度”中调整累计返回数据量，再继续运行。这是累计读取额度，不是内存、磁盘容量或 MCP 通信超时。',
+  memory_budget_exhausted: '构图或数据校验保留的工作集超过内存额度。请检查投影和索引规模，或在模型配置中调整“构图工作内存上限”；增加累计返回量额度不能解除这个限制。',
   construction_tool_transport_failed: '图谱工具通信失败，运行已停止反复调用并保留草稿。请检查进程诊断；恢复服务后可继续上次成果，或选择从零运行。',
   construction_compaction_failed: '上下文摘要连续截断，运行已停止反复压缩。原历史与已保存草稿保留；请检查模型输出限制，调整后继续运行。',
   construction_draft_validation_failed: '该草稿当前的数据检查未通过。此前已发布成果保留；查看具体诊断，修订或重新验证后再确认完成。',
@@ -96,9 +99,36 @@ const requestRetries = computed(() => {
   const count = (key: string) => typeof counts?.[key] === 'number' && Number.isSafeInteger(counts[key]) && counts[key] >= 0 ? counts[key] as number : 0
   return { attempts: count('request_retry_attempts'), succeeded: count('request_retry_succeeded'), exhausted: count('request_retry_exhausted') }
 })
+const record = (value: unknown): Record<string, unknown> | null => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+const nonnegativeInteger = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+const quantity = (value: number, bytes: boolean) => bytes
+  ? value >= 1048576 ? `${(value / 1048576).toLocaleString('zh-CN', { maximumFractionDigits: 2 })} MiB` : `${value.toLocaleString('zh-CN')} B`
+  : value.toLocaleString('zh-CN')
+const sourceBudgetRows = computed(() => {
+  const budget = record(record(record(props.report)?.validation)?.query_budget)
+  if (!budget) return []
+  return [
+    { label: '查询次数', used: 'queries', limit: 'max_queries', remaining: 'remaining_queries', bytes: false },
+    { label: '累计返回行数', used: 'returned_rows', limit: 'max_returned_rows', remaining: 'remaining_returned_rows', bytes: false },
+    { label: '累计返回数据量', used: 'returned_bytes', limit: 'max_returned_bytes', remaining: 'remaining_returned_bytes', bytes: true },
+  ].filter(row => nonnegativeInteger(budget[row.used]) || nonnegativeInteger(budget[row.limit]) || budget[row.limit] === null)
+    .map(row => ({
+      label: row.label,
+      used: nonnegativeInteger(budget[row.used]) ? quantity(budget[row.used] as number, row.bytes) : '未记录',
+      limit: budget[row.limit] === null ? '不限' : nonnegativeInteger(budget[row.limit]) ? quantity(budget[row.limit] as number, row.bytes) : '未记录',
+      remaining: budget[row.limit] === null ? '不限' : nonnegativeInteger(budget[row.remaining]) ? quantity(budget[row.remaining] as number, row.bytes) : '未记录',
+    }))
+})
 const issues = computed(() => {
   const report = props.report as { issues?: RunIssue[] } | null
   return (report?.issues || []).filter((item, index, items) => diagnosticCode(item.code) && items.findIndex(other => issueKey(other) === issueKey(item)) === index)
 })
 </script>
-<template><section v-if="issues.length || requestRetries.attempts || requestRetries.exhausted" aria-label="问题与处理建议"><h3>问题与处理建议</h3><p v-if="requestRetries.attempts || requestRetries.exhausted" class="note" aria-label="请求重试">追加请求 {{ requestRetries.attempts }} 次，{{ requestRetries.succeeded }} 个请求恢复成功，{{ requestRetries.exhausted }} 个请求用尽重试额度。已恢复的请求错误仅作过程记录，任务状态按最终结果判断。</p><p v-for="issue in issues" :key="issueKey(issue)" class="note" :class="{ amber: !['rejected', 'resolved', 'diagnostic'].includes(String(issue.status)) }"><strong>{{ issue.table || issue.code }}</strong><span v-if="enumLabel(issue.status, states)"> · {{ enumLabel(issue.status, states) }}</span><br/>{{ hints[issue.code!] || '此问题暂未提供专门说明。请保留错误码，结合本次运行轨迹排查。' }}<template v-if="issueMessage(issue)"><br/>{{ issueMessage(issue) }}</template><template v-if="issue.draft_id"><br/>图谱草稿：{{ issue.draft_id }}</template><template v-if="columnNames(issue).length"><br/>相关列：{{ columnNames(issue).join('、') }}<span v-if="diagnosticCount(issue) && diagnosticCount(issue)! > columnNames(issue).length">（共 {{ diagnosticCount(issue) }} 列，仅展示前 {{ columnNames(issue).length }} 列）</span></template><template v-if="enumLabel(issue.category, categories) || enumLabel(issue.next_action, actions)"><br/><span v-if="enumLabel(issue.category, categories)">问题类型：{{ enumLabel(issue.category, categories) }}；</span><span v-if="enumLabel(issue.next_action, actions)">处理：{{ enumLabel(issue.next_action, actions) }}</span></template><template v-if="isDiagnostic(issue)"><br/><span v-if="issue.code === 'model_protocol_diagnostic' && enumLabel(issue.stage, protocolStages)">阶段：{{ enumLabel(issue.stage, protocolStages) }}；</span><span v-if="diagnosticCode(issue.reason_code)">拒绝原因：<code>{{ diagnosticCode(issue.reason_code) }}</code>；</span><span v-if="fieldPath(issue.field_path)">字段：<code>{{ fieldPath(issue.field_path) }}</code>；</span><span v-if="diagnosticConstraint(issue.constraint)">约束：<code>{{ diagnosticConstraint(issue.constraint) }}</code>；</span><span v-if="diagnosticCount(issue)">发生 {{ diagnosticCount(issue) }} 次</span></template></p></section></template>
+<template><section v-if="issues.length || requestRetries.attempts || requestRetries.exhausted || sourceBudgetRows.length" aria-label="问题与处理建议"><h3>问题与处理建议</h3><div v-if="sourceBudgetRows.length" class="source-budget" aria-label="本轮数据读取额度"><h4>本轮数据读取额度</h4><p class="field-hint">按本轮报告记录的配置与用量展示，所有来源和阶段累计；累计数据量不是当前内存占用，也不是模型 token。</p><div class="table-scroll"><table><thead><tr><th>项目</th><th>已用</th><th>上限</th><th>剩余</th></tr></thead><tbody><tr v-for="row in sourceBudgetRows" :key="row.label"><th scope="row">{{ row.label }}</th><td>{{ row.used }}</td><td>{{ row.limit }}</td><td>{{ row.remaining }}</td></tr></tbody></table></div></div><p v-if="requestRetries.attempts || requestRetries.exhausted" class="note" aria-label="请求重试">追加请求 {{ requestRetries.attempts }} 次，{{ requestRetries.succeeded }} 个请求恢复成功，{{ requestRetries.exhausted }} 个请求用尽重试额度。已恢复的请求错误仅作过程记录，任务状态按最终结果判断。</p><p v-for="issue in issues" :key="issueKey(issue)" class="note" :class="{ amber: !['rejected', 'resolved', 'diagnostic'].includes(String(issue.status)) }"><strong>{{ issue.table || issue.code }}</strong><span v-if="enumLabel(issue.status, states)"> · {{ enumLabel(issue.status, states) }}</span><br/>{{ hints[issue.code!] || '此问题暂未提供专门说明。请保留错误码，结合本次运行轨迹排查。' }}<template v-if="issueMessage(issue)"><br/>{{ issueMessage(issue) }}</template><template v-if="issue.draft_id"><br/>图谱草稿：{{ issue.draft_id }}</template><template v-if="columnNames(issue).length"><br/>相关列：{{ columnNames(issue).join('、') }}<span v-if="diagnosticCount(issue) && diagnosticCount(issue)! > columnNames(issue).length">（共 {{ diagnosticCount(issue) }} 列，仅展示前 {{ columnNames(issue).length }} 列）</span></template><template v-if="enumLabel(issue.category, categories) || enumLabel(issue.next_action, actions)"><br/><span v-if="enumLabel(issue.category, categories)">问题类型：{{ enumLabel(issue.category, categories) }}；</span><span v-if="enumLabel(issue.next_action, actions)">处理：{{ enumLabel(issue.next_action, actions) }}</span></template><template v-if="isDiagnostic(issue)"><br/><span v-if="issue.code === 'model_protocol_diagnostic' && enumLabel(issue.stage, protocolStages)">阶段：{{ enumLabel(issue.stage, protocolStages) }}；</span><span v-if="diagnosticCode(issue.reason_code)">拒绝原因：<code>{{ diagnosticCode(issue.reason_code) }}</code>；</span><span v-if="fieldPath(issue.field_path)">字段：<code>{{ fieldPath(issue.field_path) }}</code>；</span><span v-if="diagnosticConstraint(issue.constraint)">约束：<code>{{ diagnosticConstraint(issue.constraint) }}</code>；</span><span v-if="diagnosticCount(issue)">发生 {{ diagnosticCount(issue) }} 次</span></template></p></section></template>
+
+<style scoped>
+.source-budget { margin: 12px 0 20px; }
+.source-budget h4 { margin: 0 0 6px; }
+.source-budget .field-hint { margin-bottom: 10px; }
+.source-budget th[scope=row] { font-weight: 500; text-align: left; }
+</style>

@@ -84,6 +84,95 @@ def test_unknown_connect_failure_exhausts_bounded_recovery_and_retains_unknown(e
 
 
 @pytest.mark.parametrize('engine', ['gauss', 'mysql'])
+@pytest.mark.parametrize('failures', [2, 4], ids=['recovers', 'bounded_stop'])
+def test_unknown_new_session_preflight_failure_retries_before_any_fact_rows(engine, failures, monkeypatch):
+    pauses = []
+    monkeypatch.setattr(reconnect, '_recovery_pause', lambda source: pauses.append(source._boundary_recoveries))
+    source, data, controls, factory = sessions(engine, count=failures + 2)
+    # A driver may leave closed=False and rollback may succeed even though a
+    # newly opened session failed a fixed qualification statement. No business
+    # projection has started, so try another complete qualified connection.
+    for connection in data[1:failures + 1]:
+        fail_begin(connection, engine, begin_number=1, rollback_fails=False)
+    try:
+        budget = source.query_budget
+        if failures < 4:
+            assert read(source) == [('001', 'Expenses')]
+            assert source.connection_generation == 1 and source.stats.queries == 1
+            assert source.terminal_failure_code is None
+            assert source._reconnect_attempts == failures and pauses == [1, 2]
+        else:
+            with pytest.raises(LightGraphError, match='^database_reconnect_failed$') as caught:
+                read(source)
+            diagnostic = safe_database_diagnostic(caught.value)
+            assert diagnostic['stage'] == 'connection_preflight'
+            assert diagnostic['category'] == 'unknown'
+            assert diagnostic['connection_closed'] is False
+            assert diagnostic['terminal'] and diagnostic['boundary_recovery_attempts'] == 3
+            assert source.stats.queries == 0 and pauses == [1, 2, 3]
+            assert not data[-1].executed
+            calls = factory.calls
+            with pytest.raises(LightGraphError, match='^database_reconnect_failed$'):
+                read(source)
+            assert factory.calls == calls
+        assert source.query_budget is budget
+        assert all(connection.closed for connection in data[:failures + 1])
+        if controls:
+            assert all(connection.closed for connection in controls[:failures + 1])
+        assert all(not any('FROM "public"."items"' in sql or 'FROM `analytics`.`items`' in sql
+                           for sql, _ in connection.executed) for connection in data[1:failures + 1])
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize('engine', ['gauss', 'mysql'])
+@pytest.mark.parametrize('category,state,number', [
+    ('authentication', '28P01', 1045), ('permission', '42501', 1142),
+    ('configuration_or_catalog', '42601', 1064), ('unsupported', '0A000', 1235),
+])
+def test_classified_new_session_preflight_failure_never_uses_unknown_recovery(engine, category, state, number, monkeypatch):
+    pauses = []
+    monkeypatch.setattr(reconnect, '_recovery_pause', lambda source: pauses.append(True))
+    source, data, controls, factory = sessions(engine, count=3)
+    failure = GaussFailure(state) if engine == 'gauss' else mysql.DBError(number, 'PRIVATE')
+    fail_begin(data[1], engine, begin_number=1, failure=failure)
+    try:
+        with pytest.raises(LightGraphError) as caught:
+            read(source)
+        diagnostic = safe_database_diagnostic(caught.value)
+        assert diagnostic['category'] == category and diagnostic['terminal']
+        assert source._reconnect_attempts == 0 and pauses == []
+        assert not data[2].executed and source.stats.queries == 0
+        assert data[1].closed
+        if controls: assert controls[1].closed
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize('engine', ['gauss', 'mysql'])
+@pytest.mark.parametrize('stop', ['cancel', 'time', 'queries'])
+def test_unknown_preflight_retry_respects_cancel_and_budget(engine, stop, monkeypatch):
+    source, data, _, factory = sessions(engine, count=3)
+    fail_begin(data[1], engine, begin_number=1)
+    original_pause = reconnect._recovery_pause
+    def pause(current):
+        if stop == 'cancel': current.cancel()
+        elif stop == 'time': current.query_budget.deadline = 0
+        else: current.query_budget.max_queries = current.query_budget.queries
+        original_pause(current)
+    monkeypatch.setattr(reconnect, '_recovery_pause', pause)
+    try:
+        expected = {'cancel': 'query_cancelled', 'time': 'run_time_budget_exhausted',
+                    'queries': 'query_budget_exhausted'}[stop]
+        with pytest.raises(LightGraphError, match=expected):
+            read(source)
+        assert source.terminal_failure_code is None and source.stats.queries == 0
+        assert not data[2].executed
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize('engine', ['gauss', 'mysql'])
 def test_authentication_failure_never_consumes_recovery_attempts(engine, monkeypatch):
     pauses = []
     monkeypatch.setattr(reconnect, '_recovery_pause', lambda source: pauses.append(True))

@@ -10,6 +10,9 @@ export interface SourceConfig { id: string; kind: string; [key: string]: unknown
 export interface RunConfig {
   max_run_seconds?: number
   max_db_queries?: number | null
+  max_returned_rows?: number | null
+  max_returned_bytes?: number | null
+  max_working_bytes?: number
   construction_target?: 'instances' | 'structure'
   goal_markdown?: string | null
   goal?: { runtime_guidance?: RuntimeGuidance[]; purpose?: string; entity_kinds?: string[]; relation_kinds?: string[]; include?: string[]; exclude?: string[]; discovery_guidance?: string[]; [key: string]: unknown }
