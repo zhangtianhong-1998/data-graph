@@ -41,6 +41,7 @@ _ERRORS = frozenset({'worker_execution_failed', 'worker_start_failed', 'worker_r
     'database_reconnect_failed', 'source_closed', 'source_close_failed', 'query_cancel_failed',
     'source_circuit_open', 'source_retry_limit_exhausted',
     'database_preflight_failed', 'database_runtime_preflight_failed', 'read_only_transaction_unverified',
+    'parameter_binding_unverified', 'distinct_projection_unverified',
     'capability_manifest_binding_mismatch', 'qualified_capability_manifest_required',
     'authorized_table_unavailable_or_view', 'authorized_column_unavailable', 'invalid_capability_manifest'})
 _EXCEPTION_LINE = re.compile(rb'^(?:[a-zA-Z_][a-zA-Z0-9_.]*\.)?([A-Za-z]+Error|KeyboardInterrupt|SystemExit):')

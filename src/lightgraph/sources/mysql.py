@@ -23,7 +23,7 @@ from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler
 from .base import SourceAdapter, QueryStats, cursor_batches
 from .budget import BudgetedCursor, QueryBudget
-from .database_errors import connection_is_closed, database_diagnostic, database_error
+from .database_errors import connection_is_closed, database_diagnostic, database_error, qualification_error, readback_shape_failure
 from .reconnect import configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary, terminal_failure, latch_terminal_failure, prepare_snapshot
 
 MYSQL_SQL_MODES = frozenset({"ONLY_FULL_GROUP_BY", "STRICT_TRANS_TABLES", "ERROR_FOR_DIVISION_BY_ZERO", "NO_ENGINE_SUBSTITUTION"})
@@ -220,7 +220,7 @@ class MySQLSource(SourceAdapter):
             if hasattr(raw, "_rows"):
                 raw._rows = None
 
-    def _start_readonly(self):
+    def _start_readonly(self, *, stage='snapshot_start'):
         cursor = self._cursor()
         try:
             # Guard and driver renderer use ordinary MySQL quoting. Fixed
@@ -235,11 +235,13 @@ class MySQLSource(SourceAdapter):
             cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
             cursor.execute("SELECT @@session.transaction_read_only, @@session.transaction_isolation, @@session.max_execution_time, @@session.sql_mode")
             row = cursor.fetchone()
-            if (not row or str(row[0]).lower() not in {"1", "on", "true"}
+            failure = readback_shape_failure(row, 4)
+            if (failure or str(row[0]).lower() not in {"1", "on", "true"}
                     or str(row[1]).upper().replace("-", " ") != "REPEATABLE READ"
-                    or int(row[2]) != min(4294967295, int(self.limits.timeout_ms))
+                    or str(row[2]) != str(min(4294967295, int(self.limits.timeout_ms)))
                     or set(str(row[3]).split(",")) != MYSQL_SQL_MODES):
-                raise LightGraphError("read_only_transaction_unverified")
+                raise qualification_error('read_only_transaction_unverified', engine='mysql', stage=stage,
+                    failure=failure or 'readback_mismatch', connection_closed=connection_is_closed(self._connection))
         finally:
             self._close_cursor(cursor)
 
@@ -260,7 +262,7 @@ class MySQLSource(SourceAdapter):
             cursor = None
             try:
                 self._rollback()
-                self._start_readonly()
+                self._start_readonly(stage='connection_preflight')
                 cursor = self._cursor()
                 cursor.execute("SELECT VERSION(), @@version_comment, CONNECTION_ID(), @@server_uuid, CURRENT_USER()")
                 row = cursor.fetchone()
@@ -284,12 +286,20 @@ class MySQLSource(SourceAdapter):
                 self._connection_id = row[2]
                 self._manifest.capabilities["read_only_transaction"] = "verified"
                 cursor.execute("SELECT %s", (71,))
-                if cursor.fetchone() != (71,):
-                    raise LightGraphError("parameter_binding_unverified")
+                row = cursor.fetchone()
+                failure = readback_shape_failure(row, 1)
+                if failure or row[0] != 71:
+                    raise qualification_error('parameter_binding_unverified', engine='mysql',
+                        stage='connection_preflight', failure=failure or 'readback_mismatch',
+                        connection_closed=connection_is_closed(self._connection))
                 self._manifest.capabilities["parameter_binding"] = "verified"
                 cursor.execute("SELECT DISTINCT 1 AS n")
-                if cursor.fetchone() != (1,):
-                    raise LightGraphError("distinct_projection_unverified")
+                row = cursor.fetchone()
+                failure = readback_shape_failure(row, 1)
+                if failure or row[0] != 1 or isinstance(row[0], bool):
+                    raise qualification_error('distinct_projection_unverified', engine='mysql',
+                        stage='connection_preflight', failure=failure or 'readback_mismatch',
+                        connection_closed=connection_is_closed(self._connection))
                 self._manifest.capabilities["distinct_projection"] = "verified"
                 self._tables = self._read_catalog(cursor)
                 self._manifest.capabilities["metadata_reading"] = "verified"

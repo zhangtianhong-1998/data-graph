@@ -52,6 +52,8 @@ Windows 使用 `.venv\Scripts\python.exe` 和 `.venv\Scripts\lightgraph.exe`。�
 
 事实来源断连时，Agent 可从已保存的混合草稿另存度量、维度等列定义草稿，单独验证并发布。已有列定义使用本次授权目录，无需读取经营数值；事实成员及其关联仍留在主草稿中等待验证。目录变化或权限失效不会被当作可离线复用的网络故障，见[快照恢复与独立列定义发布](design/lightweight_graph/RECOVERY_AND_DEFINITIONS_20261110.md)。
 
+新会话的参数绑定或 DISTINCT 固定探查读回不符时，可丢弃会话并在三次恢复额度内重新检查；只读资格、权限和目录错误仍停止访问。进程诊断显示具体检查项目、失败类型和恢复次数。同次验证中读取列与筛选条件相同的度量关系复用完整投影，逐条保留关系依据；恢复后仍需验证并发布原主草稿才能补上关联边。详见[预检恢复与关联取数复用](design/lightweight_graph/PREFLIGHT_AND_RELATION_REUSE_20261110.md)。
+
 字段本身也可按目标建为定义对象，例如从元数据或文档中的字段说明建立度量定义。`metadata_column` 使用来源、Schema、表、列作为身份，不查询金额值；Agent 必须引用已读取且适用的材料。它可与实际行中的指标关联，分别记录“声明适用”或“观察到非空值”的依据，不自动连接全图指标。空维度编码可用显式 `is_not_null` 筛选；列定义、谓词和跨源内存边界见[本轮设计](design/lightweight_graph/METADATA_OBJECTS_AND_RELATIONS_20261105.md)。
 
 圆形画布分批加载全部已授权节点和关系，显示加载进度并支持暂停、继续；分批传输不再把跨页边丢掉。数据库确认断链后可在新只读快照前有界重建并重新检查目录和能力，不重放已读取的部分结果。运行轨迹下的“查看进程诊断”提供安全的驱动状态与退出记录，可独立导出。探查顺序、恢复及性能边界见[后续设计修订](design/lightweight_graph/DISCOVERY_RECOVERY_AND_FULL_GRAPH_20261105.md)。

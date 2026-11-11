@@ -5,6 +5,40 @@ from lightgraph.errors import LightGraphError
 from .gauss_compat import sqlstate
 
 
+PROBE_CODES = frozenset({'parameter_binding_unverified', 'distinct_projection_unverified',
+                         'read_only_transaction_unverified'})
+PROBE_FAILURES = frozenset({'no_row', 'malformed_row', 'readback_mismatch'})
+
+
+def readback_shape_failure(row, width):
+    """Describe fixed control-probe shape failures, never retain returned values."""
+    if row is None:
+        return 'no_row'
+    if not isinstance(row, (tuple, list)) or len(row) != width:
+        return 'malformed_row'
+    return None
+
+
+def qualification_error(probe_code, *, engine, stage, failure, connection_closed=None):
+    """A probe result did not qualify this session; it proves no network cause.
+
+    Constant readback checks may retry a whole newly acquired session. Readonly
+    attestation remains fail-closed and is never reclassified as a transient IO
+    failure. The caller must still discard every unqualified connection.
+    """
+    if probe_code not in PROBE_CODES or failure not in PROBE_FAILURES:
+        raise ValueError('invalid_qualification_diagnostic')
+    code = probe_code if probe_code == 'read_only_transaction_unverified' else 'database_preflight_failed'
+    error = LightGraphError(code)
+    error.database_diagnostic = {'engine': engine, 'stage': stage, 'category': 'qualification',
+        'sqlstate': 'unknown', 'errno': None, 'rollback_succeeded': None,
+        'recovery': 'none', 'connection_closed': connection_closed,
+        'probe_code': probe_code, 'probe_failure': failure}
+    logging.getLogger(__name__).error('database qualification failed: %s', probe_code,
+        extra={'error_code': code, 'database_diagnostic': safe_database_diagnostic(error)})
+    return error
+
+
 def database_diagnostic(exc, *, engine, stage, rollback_succeeded=None, recovery='none', connection_closed=None):
     state = sqlstate(exc)
     args = getattr(exc, 'args', ())
@@ -63,7 +97,7 @@ def safe_database_diagnostic(error):
     categories = {'unknown', 'connection', 'authentication', 'configuration_or_catalog',
                   'resource', 'unsupported', 'failed_transaction', 'idle_transaction_timeout',
                   'permission', 'interrupted', 'shutdown', 'unavailable', 'serialization',
-                  'deadlock', 'lock_unavailable', 'lock_timeout', 'statement_timeout'}
+                  'deadlock', 'lock_unavailable', 'lock_timeout', 'statement_timeout', 'qualification'}
     state, number = value.get('sqlstate'), value.get('errno')
     def choice(name, allowed, default='unknown'):
         selected = value.get(name)
@@ -82,5 +116,8 @@ def safe_database_diagnostic(error):
     }
     for name in ('boundary_recovery_attempts', 'recovery_attempt_limit'):
         if type(value.get(name)) is int and 0 <= value[name] <= 100:
+            result[name] = value[name]
+    for name, allowed in (('probe_code', PROBE_CODES), ('probe_failure', PROBE_FAILURES)):
+        if isinstance(value.get(name), str) and value[name] in allowed:
             result[name] = value[name]
     return result

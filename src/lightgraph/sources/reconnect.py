@@ -81,6 +81,14 @@ def _preflight_can_recover(error):
                                           'snapshot_close_failed', 'read_only_transaction_failed'}:
         return False
     category = diagnostic.get('category', 'unknown')
+    if category == 'qualification':
+        # A replacement has not emitted facts. Require all capabilities on a
+        # new session; a failed constant probe never authorizes using this one.
+        # Read-only attestation is deliberately absent from this allowlist.
+        return (getattr(error, 'code', None) == 'database_preflight_failed'
+            and diagnostic.get('stage') == 'connection_preflight'
+            and diagnostic.get('probe_code') in {'parameter_binding_unverified', 'distinct_projection_unverified'}
+            and diagnostic.get('probe_failure') in {'no_row', 'malformed_row', 'readback_mismatch'})
     return (category in {'connection', 'idle_transaction_timeout', 'shutdown', 'unavailable'}
             or category == 'unknown' and (diagnostic.get('rollback_succeeded') is False
                 or diagnostic.get('connection_closed') is True

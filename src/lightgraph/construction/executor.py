@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.query import QueryCompiler
+from lightgraph.query.predicate import ScopeConjunction
 from lightgraph.sources.base import aggregate_count
 from lightgraph.source_values import (source_scalar, scalar_kind, typed_key, identity_values,
     typed_value, plain_value, SOURCE_KEY_SEMANTICS_VERSION)
@@ -102,10 +103,19 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     def projection_key(mapping):
         adapter = by_source.get(mapping.source_id)
         cap = min(max_rows, adapter.limits.max_result_rows) if adapter else max_rows
+        predicate = mapping_predicate(mapping)
+        # Internal generated predicates are deliberately not JSON-serializable;
+        # identify both parts locally without turning them into a user DSL tree.
+        predicate_parts = ([predicate.user_predicate, predicate.partition_filter]
+                           if isinstance(predicate, ScopeConjunction) else [predicate, None])
+        # Cache the authorized observation, not the semantic use of its rows.
+        # Several schema-based column relations can share the exact same row
+        # projection; non-null evidence remains separate through its effective
+        # column-specific predicate. Each mapping still checks its endpoint and
+        # permissions before reuse and builds its own provenance afterward.
         return canonical([mapping.source_id, mapping.schema_name, mapping.table,
-            sorted(set(_projection_columns(mapping) + scope_columns(mapping))), mapping.predicate,
-            getattr(mapping, 'metadata_basis', None),
-            physical_column_key(metadata_endpoint(mapping)[1]) if metadata_endpoint(mapping)[1] else None, cap])
+            sorted(set(_projection_columns(mapping) + scope_columns(mapping))),
+            predicate_parts, cap])
 
     # Keep a projection only until its last consumer. Lookup indexes retain
     # their backing rows for this snapshot and therefore remain pinned.

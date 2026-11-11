@@ -49,3 +49,16 @@ it('does not poll a closed panel while a run remains active', async () => {
   await vi.advanceTimersByTimeAsync(10000)
   expect(api.request).toHaveBeenCalledTimes(count)
 })
+it('shows the failed capability probe and used recovery allowance without asserting a disconnect', async () => {
+  api.request.mockResolvedValue({ ...response(), events: [{ code: 'worker_database_diagnostic',
+    error_code: 'database_reconnect_failed', database: { category: 'qualification', stage: 'connection_preflight',
+      probe_code: 'parameter_binding_unverified', probe_failure: 'readback_mismatch',
+      boundary_recovery_attempts: 3, recovery_attempt_limit: 3, terminal: true } }] })
+  await mount(); await open()
+  await vi.waitFor(() => expect(root.textContent).toContain('连接能力检查未通过'))
+  expect(root.textContent).toContain('检查项目：参数绑定')
+  expect(root.textContent).toContain('检查结果：检查结果与要求不符')
+  expect(root.textContent).toContain('本次快照恢复次数：3 / 3')
+  expect(root.textContent).toContain('该来源已停止事实查询')
+  expect(root.textContent).toContain('检查未通过不等于网络断连')
+})

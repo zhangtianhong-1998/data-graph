@@ -136,6 +136,35 @@ def test_primary_database_error_codes_are_preserved(tmp_path, code):
     assert read_worker_log(record)['events'][0]['error_code'] == code
 
 
+def test_probe_diagnostics_preserve_reason_and_bounds_without_raw_readback(tmp_path):
+    record = tmp_path / 'run.json'
+    sink = WorkerDiagnostics(record)
+    trace = RunTrace(trace_path(record))
+    handler = DatabaseDiagnosticHandler(sink, lambda: 'construction')
+    logger = logging.getLogger('lightgraph.sources.database_errors')
+    detail = {'engine': 'gauss', 'stage': 'connection_preflight', 'category': 'qualification',
+              'probe_code': 'parameter_binding_unverified', 'probe_failure': 'readback_mismatch',
+              'boundary_recovery_attempts': 3, 'recovery_attempt_limit': 3, 'terminal': True,
+              'received': SECRET, 'sql': SECRET}
+    event = logger.makeRecord(logger.name, logging.ERROR, __file__, 1, SECRET, (), None,
+        extra={'error_code': 'database_reconnect_failed', 'database_diagnostic': detail})
+    with bind_trace(trace):
+        handler.handle(event)
+    diagnostic = read_worker_log(record)['events'][0]['database']
+    assert diagnostic['probe_code'] == 'parameter_binding_unverified'
+    assert diagnostic['probe_failure'] == 'readback_mismatch'
+    assert diagnostic['category'] == 'qualification'
+    assert diagnostic['boundary_recovery_attempts'] == diagnostic['recovery_attempt_limit'] == 3
+    assert SECRET not in worker_log_path(record).read_text()
+    assert SECRET not in trace.path.read_text()
+    detail.update(probe_code=SECRET, probe_failure=SECRET)
+    with bind_trace(trace):
+        handler.handle(event)
+    diagnostic = read_worker_log(record)['events'][-1]['database']
+    assert diagnostic.get('probe_code') != SECRET and diagnostic.get('probe_failure') != SECRET
+    assert SECRET not in worker_log_path(record).read_text()
+
+
 def test_windows_long_path_and_symlink_destinations(tmp_path):
     record = tmp_path.joinpath(*(['long_project_' + 'x' * 40] * 5)) / 'run.json'
     sink = WorkerDiagnostics(record)

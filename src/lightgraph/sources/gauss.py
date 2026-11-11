@@ -21,7 +21,7 @@ from lightgraph.query import QueryCompiler
 from .base import SourceAdapter, QueryStats, cursor_batches
 from .budget import QueryBudget, BudgetedCursor
 from .gauss_compat import catalog_value, catalog_bool, safe_database_cause, set_optional_lock_timeout
-from .database_errors import connection_is_closed, database_diagnostic, database_error
+from .database_errors import connection_is_closed, database_diagnostic, database_error, qualification_error, readback_shape_failure
 from .reconnect import configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary, terminal_failure, latch_terminal_failure, prepare_snapshot
 
 REQUIRED_RUNTIME = {"read_only_transaction", "parameter_binding", "metadata_reading", "distinct_projection", "statement_timeout", "query_cancel"}
@@ -130,7 +130,7 @@ class GaussSource(SourceAdapter):
             if key in ("statement_timeout", "query_cancel"):
                 self._manifest.capabilities[key] = state
 
-    def _start_readonly(self):
+    def _start_readonly(self, *, stage='snapshot_start'):
         cursor = self._cursor()
         try:
             cursor.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -140,8 +140,10 @@ class GaussSource(SourceAdapter):
                 self._lock_timeout_supported = set_optional_lock_timeout(cursor, 5000)
             cursor.execute("SELECT pg_catalog.current_setting('transaction_read_only'), pg_catalog.current_setting('transaction_isolation')")
             values = cursor.fetchone()
-            if not values or str(catalog_value(values[0])).lower() not in ("on", "true") or str(catalog_value(values[1])).lower() != "repeatable read":
-                raise LightGraphError("read_only_transaction_unverified")
+            failure = readback_shape_failure(values, 2)
+            if failure or str(catalog_value(values[0])).lower() not in ("on", "true") or str(catalog_value(values[1])).lower() != "repeatable read":
+                raise qualification_error('read_only_transaction_unverified', engine='gauss', stage=stage,
+                    failure=failure or 'readback_mismatch', connection_closed=connection_is_closed(self._connection))
         finally: cursor.close()
 
     def preflight(self, *, probe_runtime_limits: bool = False) -> CapabilityManifest:
@@ -152,7 +154,7 @@ class GaussSource(SourceAdapter):
         """
         with self._lock:
             try:
-                self._connection.rollback(); self._start_readonly()
+                self._connection.rollback(); self._start_readonly(stage='connection_preflight')
                 cursor = self._cursor()
                 try:
                     cursor.execute("SELECT pg_catalog.version()")
@@ -160,10 +162,20 @@ class GaussSource(SourceAdapter):
                     self._manifest.product, self._manifest.version = product_version(version)
                     self._manifest.capabilities["read_only_transaction"] = "verified"
                     cursor.execute("SELECT %s", (71,))
-                    if cursor.fetchone()[0] != 71: raise LightGraphError("parameter_binding_unverified")
+                    row = cursor.fetchone()
+                    failure = readback_shape_failure(row, 1)
+                    if failure or row[0] != 71:
+                        raise qualification_error('parameter_binding_unverified', engine='gauss',
+                            stage='connection_preflight', failure=failure or 'readback_mismatch',
+                            connection_closed=connection_is_closed(self._connection))
                     self._manifest.capabilities["parameter_binding"] = "verified"
                     cursor.execute("SELECT DISTINCT 1 AS n")
-                    if cursor.fetchone()[0] != 1: raise LightGraphError("distinct_projection_unverified")
+                    row = cursor.fetchone()
+                    failure = readback_shape_failure(row, 1)
+                    if failure or row[0] != 1 or isinstance(row[0], bool):
+                        raise qualification_error('distinct_projection_unverified', engine='gauss',
+                            stage='connection_preflight', failure=failure or 'readback_mismatch',
+                            connection_closed=connection_is_closed(self._connection))
                     self._manifest.capabilities["distinct_projection"] = "verified"
                     self._tables = self._read_catalog(cursor)
                     self._manifest.capabilities["metadata_reading"] = "verified"

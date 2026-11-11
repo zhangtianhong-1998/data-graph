@@ -1,7 +1,8 @@
 """Separate source execution failures from counterexamples to a mapping."""
 
 SOURCE_FAILURES = frozenset({
-    'read_only_transaction_failed', 'snapshot_close_failed', 'source_closed',
+    'read_only_transaction_failed', 'read_only_transaction_unverified', 'snapshot_close_failed', 'source_closed',
+    'database_preflight_failed',
     'database_connection_failed', 'database_reconnect_failed', 'source_catalog_changed',
     'query_execution_failed', 'query_timeout', 'query_cancel_failed',
     'query_cancelled', 'construction_source_execution_failed',
@@ -37,9 +38,13 @@ def failure_guidance(diagnostics):
         reconnect = any(d.get('database', {}).get('recovery') == 'reconnect_required' for d in source_errors)
         if codes & {'database_reconnect_failed', 'source_catalog_changed'} or any(
                 d.get('source_blocked') is True for d in source_errors):
+            qualification = any(d.get('database', {}).get('category') == 'qualification' for d in source_errors)
             return {'failure_class': 'source_execution', 'retryable': False,
                     'recovery': 'operator_requalification_required',
-                    'next_action': 'Automatic reconnection or catalog requalification did not succeed. '
+                    'next_action': ('A fixed capability probe did not return its required result. '
+                        'Inspect database.probe_code and probe_failure; a readback mismatch is not proof '
+                        'of a network disconnection or server load. ' if qualification else '') +
+                        'Automatic reconnection or catalog requalification did not succeed. '
                         'Do not retry unchanged or discard the original mappings. Preserve the failed-source '
                         'requirements, continue independent work, and report that the operator must restore '
                         'and requalify this source before a new complete validation.'}

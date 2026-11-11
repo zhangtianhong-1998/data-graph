@@ -6,7 +6,8 @@ import type { Run } from './types'
 
 const props = defineProps<{ run: Run }>()
 type Entry = { time?: string; code: string; stage?: string; error_code?: string; exception_type?: string;
-  database?: { stage?: string; category?: string; sqlstate?: string; errno?: number; recovery?: string; connection_closed?: boolean; connection_broken?: boolean };
+  database?: { stage?: string; category?: string; sqlstate?: string; errno?: number; recovery?: string; connection_closed?: boolean; connection_broken?: boolean;
+    probe_code?: string; probe_failure?: string; boundary_recovery_attempts?: number; recovery_attempt_limit?: number; terminal?: boolean };
   exit_code?: number; stderr_bytes?: number; connection_generation?: number; reconnect_attempts?: number; frames?: { file: string; line: number }[] }
 type Page = { status: 'available' | 'not_recorded' | 'unavailable' | 'cleared'; events: Entry[]; incomplete: boolean; active: boolean }
 const opened = ref(false), loading = ref(false), error = ref(''), page = ref<Page | null>(null)
@@ -24,6 +25,14 @@ const categories: Record<string, string> = {
   shutdown: '服务端关闭', unavailable: '服务暂不可用', configuration_or_catalog: '配置或目录问题',
   resource: '数据库资源限制', serialization: '事务并发冲突', deadlock: '死锁', lock_timeout: '等待锁超时',
   statement_timeout: '语句超时', unsupported: '功能不支持', lock_unavailable: '锁不可用',
+  qualification: '连接能力检查未通过',
+}
+const probeLabels: Record<string, string> = {
+  parameter_binding_unverified: '参数绑定', distinct_projection_unverified: '去重查询',
+  read_only_transaction_unverified: '只读事务',
+}
+const probeFailureLabels: Record<string, string> = {
+  no_row: '没有返回检查结果', malformed_row: '检查结果格式不符', readback_mismatch: '检查结果与要求不符',
 }
 let epoch = 0, controller: AbortController | undefined, timer: ReturnType<typeof setTimeout> | undefined
 async function load() {
@@ -76,6 +85,11 @@ onUnmounted(() => { epoch++; controller?.abort(); clearTimeout(timer) })
           <div v-if="entry.database.recovery">恢复结果：{{ entry.database.recovery }}</div>
           <div v-if="entry.database.connection_closed != null">连接已关闭：{{ entry.database.connection_closed ? '是' : '否' }}</div>
           <div v-if="entry.database.connection_broken != null">驱动标记连接损坏：{{ entry.database.connection_broken ? '是' : '否' }}</div>
+          <div v-if="entry.database.probe_code">检查项目：{{ probeLabels[entry.database.probe_code] || entry.database.probe_code }}</div>
+          <div v-if="entry.database.probe_failure">检查结果：{{ probeFailureLabels[entry.database.probe_failure] || entry.database.probe_failure }}</div>
+          <div v-if="entry.database.boundary_recovery_attempts != null">本次快照恢复次数：{{ entry.database.boundary_recovery_attempts }}<span v-if="entry.database.recovery_attempt_limit != null"> / {{ entry.database.recovery_attempt_limit }}</span></div>
+          <div v-if="entry.database.terminal">该来源已停止事实查询，请检查原因后新开运行。</div>
+          <p v-if="entry.database.category === 'qualification'" class="field-hint">检查未通过不等于网络断连。只读事务检查失败时不会继续取数；参数绑定或去重检查失败可在新会话上有界重试。</p>
         </template>
         <div v-if="entry.exit_code != null">退出码：{{ entry.exit_code }}</div>
         <div v-if="entry.connection_generation != null">连接版本：{{ entry.connection_generation }}</div>
