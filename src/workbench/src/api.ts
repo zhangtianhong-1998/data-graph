@@ -75,6 +75,7 @@ const messages: Record<string, string> = {
   database_connection_credentials_conflict: '连接串中的账号或密码与单独填写的内容不同，请只保留一处或填写一致。',
   database_connection_option_forbidden: '连接串包含不支持的参数，请使用主机、端口、数据库和账号信息。',
   database_metadata_failed: '连接已处理，但元数据读取失败，请检查授权表与只读账号权限。',
+  metadata_preview_persistence_failed: '项目元数据副本保存失败，操作未完成。请检查工作目录的写入权限后重试。',
   deployment_retention_unverified: '连接真实数据库前，需要完成部署环境的数据留存检查。',
   run_already_active: '此项目正在运行，请等待完成或先取消。', project_busy: '项目正在运行，暂时无法修改。',
   project_run_active: '此项目正在运行，请等待完成或先取消。', extraction_purpose_required: '请先填写抽取目的。',

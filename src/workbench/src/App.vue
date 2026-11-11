@@ -129,7 +129,7 @@ async function saveModelLimits() {
 const advanced = ref('')
 const advancedBaseline = ref('')
 const modelKey = ref('')
-type CredentialStatus = { database_sources: string[]; model: boolean; model_error?: string; model_environment?: boolean }
+type CredentialStatus = { database_sources: string[]; database_errors?: Record<string, string>; model: boolean; model_error?: string; model_environment?: boolean }
 const credentials = ref<CredentialStatus>({ database_sources: [], model: false })
 const metadata = ref<Metadata>({ tables: [], nodes: [], edges: [] })
 const business = ref<Graph>({ nodes: [], edges: [] })
@@ -241,12 +241,13 @@ async function loadProject(id: string) {
   try {
     const values = await Promise.all([request<Project>(p), request<RunConfig>(`${p}/config`)])
     if (epoch !== generation) return
-    configRevision.value = undefined; project.value = values[0]; fillForms(values[1]); await ensureSession(id); metadata.value = { tables: [], nodes: [], edges: [] }; business.value = { nodes: [], edges: [] }; runs.value = []
+    configRevision.value = undefined; project.value = values[0]; fillForms(values[1]); metadata.value = { tables: [], nodes: [], edges: [] }; business.value = { nodes: [], edges: [] }; runs.value = []
     // An unavailable database must not prevent opening and repairing its project configuration.
     // Graph loading can take longer than opening configuration. A graph read
     // must not lock model fields or report a successful config load as failed.
     void loadBusinessGraph(p, epoch)
-    const details = await Promise.allSettled([request<Metadata>(`${p}/metadata`), request<{ runs: Run[] }>(`${p}/runs`), request<CredentialStatus>(`${p}/credentials`)])
+    const details = await Promise.allSettled([request<Metadata>(`${p}/metadata`), request<{ runs: Run[] }>(`${p}/runs`),
+      ensureSession(id).then(() => request<CredentialStatus>(`${p}/credentials`))])
     if (epoch !== generation) return
     if (details[0].status === 'fulfilled') { metadata.value = details[0].value }
     if (details[1].status === 'fulfilled') runs.value = details[1].value.runs
@@ -595,7 +596,7 @@ onUnmounted(() => { generation++; clearTimeout(pollTimer); clearTimeout(toastTim
           </template>
           <template v-if="tab === 'inputs'">
             <input ref="uploadInput" type="file" hidden multiple accept=".xlsx,.csv" @change="upload"/>
-            <DataInputs :key="project.project_id" :project-id="project.project_id" :sources="config.sources || []" :files="project.files" :metadata="metadata" :locked="locked" :retention-verified="config.deployment_retention_verified === true" @connect="openDatabaseSource" @upload="uploadInput?.click()" @refresh="refreshMetadata" @delete-file="file => askDeletion({ kind: 'file', file })" @delete-source="source => askDeletion({ kind: 'source', source })" @delete-table="(source, table) => askDeletion({ kind: 'table', source, table })"/>
+            <DataInputs :key="project.project_id" :project-id="project.project_id" :sources="config.sources || []" :files="project.files" :metadata="metadata" :credential-sources="credentials.database_sources" :credential-errors="credentials.database_errors" :locked="locked" :retention-verified="config.deployment_retention_verified === true" @connect="openDatabaseSource" @upload="uploadInput?.click()" @refresh="refreshMetadata" @delete-file="file => askDeletion({ kind: 'file', file })" @delete-source="source => askDeletion({ kind: 'source', source })" @delete-table="(source, table) => askDeletion({ kind: 'table', source, table })"/>
           </template>
           <template v-if="tab === 'documents'">
             <div class="intro"><div><h2>知识文档</h2></div><button class="btn primary" :disabled="locked" @click="documentInput?.click()">＋ 上传 Markdown</button><input ref="documentInput" type="file" hidden multiple accept=".md,.markdown" @change="upload"/></div>

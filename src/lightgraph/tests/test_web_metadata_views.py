@@ -30,7 +30,7 @@ def test_csv_preview_ignores_unavailable_database_and_never_exports_cells(tmp_pa
     catalog = yaml.safe_load(result["yaml"])
     assert catalog["artifact"] == "declared_metadata"
     assert {f["name"] for f in result["files"]} == {"tables.yaml", "constraints.yaml", "foreign_keys.yaml"}
-    saved = list((workspace.project_path("alpha") / "metadata").glob("*.yaml"))
+    saved = list((workspace.project_path("alpha") / "metadata").glob("f_*.yaml"))
     assert len(saved) == 1
     assert "SAMPLE_CELL_SENTINEL" not in saved[0].read_text(encoding="utf-8")
     # A single input preview cannot pretend to be the complete project's catalog.
@@ -87,6 +87,119 @@ def test_export_uses_only_current_cache_without_opening_sources(tmp_path, monkey
     config["sources"][0]["table_name"] = "changed"
     workspace.save_config("alpha", config)
     assert metadata_yaml(workspace, "alpha")["requires_refresh"]
+
+
+def test_saved_catalog_survives_fresh_generation_and_server_reload(tmp_path, monkeypatch):
+    from lightgraph.web.execution import read_metadata
+    workspace = project(tmp_path)
+    workspace.add_file('alpha', 'items.csv', b'code,label\nA,PRIVATE_CELL\n')
+    initial = read_metadata(workspace, 'alpha', refresh=True)
+    workspace.select_output_generation('alpha', 'run_' + '1' * 24, create=True)
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources',
+                        lambda *a, **kw: pytest.fail('GET must not reopen a source'))
+    restored = Workspace(workspace.root)
+    view = read_metadata(restored, 'alpha')
+    assert view['tables'] == initial['tables'] and view['using_saved_metadata']
+    assert not view['requires_refresh'] and not view['refresh_failed']
+    files = metadata_yaml(restored, 'alpha')['files']
+    assert len(files) == 3 and 'PRIVATE_CELL' not in str(files)
+    # A saved preview is not an alternative authorization source.
+    config = restored.get_config('alpha')
+    config['sources'][0]['table_name'] = 'changed'
+    restored.save_config('alpha', config)
+    assert read_metadata(restored, 'alpha')['tables'] == []
+    assert metadata_yaml(restored, 'alpha')['files'] == []
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_failed_refresh_keeps_last_successful_preview_and_reports_staleness(tmp_path, monkeypatch, legacy):
+    from lightgraph.web.execution import read_metadata
+    workspace = project(tmp_path)
+    workspace.add_file('alpha', 'items.csv', b'code,label\nA,PRIVATE_CELL\n')
+    initial = read_metadata(workspace, 'alpha', refresh=True)
+    if legacy:
+        (workspace.project_path('alpha') / 'metadata/catalog-preview.yaml').unlink()
+    def failed(*args, **kwargs):
+        raise LightGraphError('database_connection_failed')
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', failed)
+    with pytest.raises(LightGraphError, match='database_connection_failed'):
+        read_metadata(workspace, 'alpha', refresh=True)
+    view = read_metadata(Workspace(workspace.root), 'alpha')
+    assert view['tables'] == initial['tables']
+    assert view['requires_refresh'] and view['using_saved_metadata'] and view['refresh_failed']
+    files = metadata_yaml(workspace, 'alpha')
+    assert files['refresh_failed'] and len(files['files']) == 3
+    assert 'PRIVATE_CELL' not in (workspace.project_path('alpha') / 'metadata/catalog-preview.yaml').read_text()
+
+
+def test_partial_refresh_after_fresh_retains_only_unchanged_saved_sources(tmp_path, monkeypatch):
+    from lightgraph.runtime.config import open_sources
+    from lightgraph.web.execution import read_metadata
+    workspace = project(tmp_path)
+    workspace.add_file('alpha', 'first.csv', b'code,label\nA,FIRST_PRIVATE\n')
+    workspace.add_file('alpha', 'second.csv', b'code,label\nB,SECOND_PRIVATE\n')
+    original = read_metadata(workspace, 'alpha', refresh=True)
+    original_ids = {table['source_id'] for table in original['tables']}
+    workspace.select_output_generation('alpha', 'run_' + '2' * 24, create=True)
+    workspace.add_file('alpha', 'new.csv', b'code,label\nC,NEW_PRIVATE\n')
+    added_id = next(source['id'] for source in workspace.get_config('alpha')['sources'] if source['id'] not in original_ids)
+    opened = []
+    def selected_only(config, *args, **kwargs):
+        opened.append([source.id for source in config.sources])
+        return open_sources(config, *args, **kwargs)
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', selected_only)
+    refreshed = read_metadata(workspace, 'alpha', refresh=True, source_ids=[added_id])
+    assert opened == [[added_id]]
+    assert {table['source_id'] for table in refreshed['tables']} == original_ids | {added_id}
+    assert not refreshed['requires_refresh']
+    assert read_metadata(Workspace(workspace.root), 'alpha')['tables'] == refreshed['tables']
+    # A credential or permission revision must not reuse the old declaration,
+    # even while a different source is being refreshed successfully.
+    config = workspace.get_config('alpha')
+    changed_id = config['sources'][0]['id']
+    config['sources'][0]['credential_revision'] = 'changed-revision'
+    workspace.save_config('alpha', config)
+    refreshed = read_metadata(workspace, 'alpha', refresh=True, source_ids=[added_id])
+    assert refreshed['requires_refresh'] and refreshed['missing_sources'] == [changed_id]
+    assert changed_id not in {table['source_id'] for table in refreshed['tables']}
+    assert 'PRIVATE' not in str(metadata_yaml(Workspace(workspace.root), 'alpha'))
+
+
+def test_cache_copy_write_failure_keeps_valid_get_and_yaml_readable(tmp_path, monkeypatch):
+    from lightgraph.web.execution import read_metadata
+    workspace = project(tmp_path)
+    workspace.add_file('alpha', 'items.csv', b'code,label\nA,PRIVATE_CELL\n')
+    initial = read_metadata(workspace, 'alpha', refresh=True)
+    (workspace.project_path('alpha') / 'metadata/catalog-preview.yaml').unlink()
+    def failed(*args, **kwargs):
+        raise PermissionError('DO_NOT_EXPOSE_PRIVATE_PATH')
+    monkeypatch.setattr('lightgraph.web.execution._save_metadata_preview', failed)
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda *a, **kw: pytest.fail('cached read must not connect'))
+    view = read_metadata(workspace, 'alpha')
+    assert view['tables'] == initial['tables'] and not view['requires_refresh']
+    assert view['metadata_cache_warning'] == 'metadata_preview_persistence_failed'
+    exported = metadata_yaml(workspace, 'alpha')
+    assert len(exported['files']) == 3 and exported['metadata_cache_warning'] == view['metadata_cache_warning']
+    assert 'DO_NOT_EXPOSE_PRIVATE_PATH' not in str(view) + str(exported)
+    with pytest.raises(LightGraphError, match='metadata_preview_persistence_failed'):
+        read_metadata(workspace, 'alpha', refresh=True)
+    # A failed cache copy does not bypass changed source authorization.
+    config = workspace.get_config('alpha')
+    config['sources'][0]['credential_revision'] = 'new-authorization'
+    workspace.save_config('alpha', config)
+    assert read_metadata(workspace, 'alpha')['tables'] == []
+
+
+def test_cache_copy_path_policy_failure_is_not_downgraded_to_warning(tmp_path, monkeypatch):
+    from lightgraph.web.execution import read_metadata
+    workspace = project(tmp_path)
+    workspace.add_file('alpha', 'items.csv', b'code,label\nA,PRIVATE_CELL\n')
+    read_metadata(workspace, 'alpha', refresh=True)
+    def forbidden(*args, **kwargs):
+        raise LightGraphError('workspace_path_invalid')
+    monkeypatch.setattr('lightgraph.web.execution._save_metadata_preview', forbidden)
+    with pytest.raises(LightGraphError, match='workspace_path_invalid'):
+        read_metadata(workspace, 'alpha')
 
 
 def test_adapter_closes_if_catalog_preview_fails(tmp_path, monkeypatch):

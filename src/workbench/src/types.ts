@@ -24,7 +24,7 @@ export interface Table { source_id: string; schema: string; name: string; column
 export interface GraphNode { id: string; label?: string; name?: string; kind?: string; layer?: string; status?: string; [key: string]: unknown }
 export interface GraphEdge { id?: string; status?: string; source: string; target: string; relation?: string; [key: string]: unknown }
 export interface Graph { nodes: GraphNode[]; edges: GraphEdge[]; claims?: unknown[]; display_schema?: import('./graphLabels').DisplaySchema; [key: string]: unknown }
-export interface Metadata extends Graph { tables: Table[]; files?: Array<{ name: string; content: string }> }
+export interface Metadata extends Graph { tables: Table[]; files?: Array<{ name: string; content: string }>; using_saved_metadata?: boolean; refresh_failed?: boolean; requires_refresh?: boolean; metadata_cache_warning?: string | null }
 export interface RunEvent {
   seq: number; time: string; stage: string; code: string; level: 'info' | 'warning' | 'error'
   table?: string; rule_id?: string; completed?: number; total?: number; unit?: string

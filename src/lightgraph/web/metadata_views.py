@@ -84,4 +84,7 @@ def metadata_yaml(workspace, pid: str, *, source_id: str | None = None,
     sources = [item for item in view.get("sources", []) if item["source_id"] in source_ids]
     return {"files": _yaml_files(tables, sources) if tables else [],
             "requires_refresh": bool(view.get("requires_refresh")),
+            "using_saved_metadata": bool(view.get("using_saved_metadata")),
+            "refresh_failed": bool(view.get("refresh_failed")),
+            "metadata_cache_warning": view.get("metadata_cache_warning"),
             "missing_sources": view.get("missing_sources", [])}

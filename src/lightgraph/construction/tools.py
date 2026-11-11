@@ -654,7 +654,11 @@ class ConstructionTools:
             if (state.get('cause_code') not in {'database_reconnect_failed', 'database_connection_failed',
                     'read_only_transaction_failed', 'snapshot_close_failed'}
                     or state.get('database', {}).get('category') in {
-                        'authentication', 'permission', 'configuration_or_catalog', 'unsupported'}):
+                        'authentication', 'permission', 'configuration_or_catalog', 'unsupported'}
+                    # Recovery exhaustion changes the outer code, not the
+                    # reason this source failed qualification. Preserve the
+                    # existing offline-publication restriction for readonly.
+                    or state.get('database', {}).get('probe_code') == 'read_only_transaction_unverified'):
                 raise LightGraphError('metadata_catalog_requalification_required')
 
     def save_graph_draft(self, yaml_text: str | None = None, metadata_from_draft: str | None = None):

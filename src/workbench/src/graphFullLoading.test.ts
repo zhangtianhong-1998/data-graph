@@ -20,6 +20,21 @@ function button(text: string) { return [...root.querySelectorAll('button')].find
 beforeEach(() => { api.request.mockReset(); vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} }); vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null) })
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 describe('full graph canvas', () => {
+  it('loads full node properties on selection when the canvas batch contains an explicit summary', async () => {
+    api.request.mockImplementation(async path => {
+      if (path.includes('/details')) return { nodes: [{ id: 'n0', label: '节点0', properties: { note: ['完整属性按需加载'] } }], facts: [], supports: [], rules: [], next_offset: null }
+      const result = page(path)
+      return { ...result, nodes: result.nodes.map(node => node.id === 'n0' ? { ...node, overview_only: true } : node) }
+    })
+    mount()
+    await vi.waitFor(() => expect(root.textContent).toContain('已加载完整图谱'))
+    const input = root.querySelector<HTMLInputElement>('[aria-label="搜索图节点"]')!
+    input.value = '节点0'; input.dispatchEvent(new Event('input', { bubbles: true })); await nextTick()
+    button('节点0 · 状态未提供 ·').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('完整属性按需加载'))
+    expect(root.textContent).not.toContain('此节点先显示精简摘要')
+    expect(api.request.mock.calls.filter(([url]) => url.includes('/details'))).toHaveLength(1)
+  })
   it('automatically loads beyond 4000 and shows a complete graph with cross-page edges', async () => {
     api.request.mockImplementation(async path => path.includes('/details') ? { facts: [], supports: [], rules: [], next_offset: null } : page(path))
     mount()

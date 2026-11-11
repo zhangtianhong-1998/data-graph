@@ -58,4 +58,43 @@ describe('full graph transport', () => {
     expect(api.request.mock.calls.every(call => call[0].includes('focus=n0') && call[0].includes('hops=2') && call[0].includes('traversal=all'))).toBe(true)
     expect(result.nodes).toHaveLength(5001); expect(result.neighborhood_truncated).toBe(false)
   })
+  it('accepts byte-limited pages smaller than the requested count without dropping any endpoint', async () => {
+    api.request.mockImplementation(async path => {
+      const response = page(path), items = response.part === 'nodes' ? nodes : edges
+      const values = items.slice(response.offset, response.offset + 100)
+      return { ...response, nodes: response.part === 'nodes' ? values : [], edges: response.part === 'edges' ? values : [],
+        next_offset: response.offset + values.length < items.length ? response.offset + values.length : null }
+    })
+    const result = await transferGraph('p', { layer: 'business' }, newGraphTransfer(), new AbortController().signal, () => {})
+    expect(result.nodes).toHaveLength(5001); expect(result.edges).toHaveLength(17003)
+    expect(api.request.mock.calls[1][0]).toContain('offset=100')
+  })
+  it('discards a bad edge page atomically then resumes at its unchanged cursor', async () => {
+    let corrupt = true
+    api.request.mockImplementation(async path => {
+      const response = page(path)
+      return corrupt && response.part === 'edges' ? { ...response, edges: [...response.edges.slice(0, -1), { id: 'bad', source: 'n0', target: 'missing' }] } : response
+    })
+    const state = newGraphTransfer()
+    await expect(transferGraph('p', { layer: 'business' }, state, new AbortController().signal, () => {})).rejects.toMatchObject({ code: 'graph_batch_invalid' })
+    expect(state.part).toBe('edges'); expect(state.offset).toBe(0); expect(state.edges.size).toBe(0)
+    expect(state.graph.nodes).toHaveLength(5001)
+    corrupt = false
+    const result = await transferGraph('p', { layer: 'business' }, state, new AbortController().signal, () => {})
+    expect(result.edges).toHaveLength(17003); expect(result.fully_loaded).toBe(true)
+  })
+  it('retries a transient read at the same cursor and still limits repeated failures', async () => {
+    let failures = 2
+    api.request.mockImplementation(async path => {
+      if (path.includes('offset=1000') && failures-- > 0) throw new ApiError('http_503', 503)
+      return page(path)
+    })
+    const state = newGraphTransfer()
+    const result = await transferGraph('p', { layer: 'business' }, state, new AbortController().signal, () => {})
+    expect(result.fully_loaded).toBe(true)
+    expect(api.request.mock.calls.slice(1, 4).map(call => call[0])).toEqual(Array(3).fill(api.request.mock.calls[1][0]))
+    api.request.mockReset().mockRejectedValue(new ApiError('request_timeout'))
+    await expect(transferGraph('p', { layer: 'business' }, newGraphTransfer(), new AbortController().signal, () => {})).rejects.toMatchObject({ code: 'request_timeout' })
+    expect(api.request).toHaveBeenCalledTimes(3)
+  })
 })

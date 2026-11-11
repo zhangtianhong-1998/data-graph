@@ -10,6 +10,7 @@ from lightgraph.construction.workspace import GraphWorkspace, safe_load_yaml
 from lightgraph.errors import LightGraphError
 from lightgraph.graph_neighborhood import neighborhood_paths
 from lightgraph.web.graph_view_cache import cached_generation, load_graph_view, remember_graph, view_token
+from .graph_payload import listed, canvas_item, canvas_page, MAX_PAGE_BYTES
 
 
 def available(config):
@@ -101,7 +102,7 @@ def vocabulary(graph):
 
 def _listed(item):
     """Pages identify and draw facts. Row evidence stays on the detail read."""
-    return {key: value for key, value in item.items() if key not in {'supports', 'provenance'}}
+    return listed(item)
 
 
 def _search_text(node):
@@ -120,6 +121,9 @@ def _focused_page(nodes, edges, focus, hops, offset, limit, traversal='all'):
         raise LightGraphError('graph_item_not_found')
     order, parents = neighborhood_paths(by_id, edges, focus, hops, traversal)
     retained, cursor = {focus}, offset
+    previews = {focus: canvas_item(by_id[focus])}
+    sizes = {focus: len(canonical(previews[focus]).encode('utf-8')) + 1}
+    used = sizes[focus]
     while cursor < len(order):
         path, current = set(), order[cursor]
         while current is not None and current not in retained:
@@ -127,12 +131,20 @@ def _focused_page(nodes, edges, focus, hops, offset, limit, traversal='all'):
             current = parents[current]
         if len(retained | path) > limit:
             break
+        for node in path:
+            if node not in sizes:
+                previews[node] = canvas_item(by_id[node])
+                sizes[node] = len(canonical(previews[node]).encode('utf-8')) + 1
+        extra = sum(sizes[node] for node in path)
+        if used + extra > MAX_PAGE_BYTES:
+            break
         retained |= path
+        used += extra
         cursor += 1
     # A request too small to fit a connecting path must not return a repeating
     # cursor or pretend the disconnected endpoint is a complete neighborhood.
     next_offset = cursor if offset < cursor < len(order) else None
-    return [by_id[i] for i in order], [by_id[i] for i in order if i in retained], parents, next_offset
+    return [by_id[i] for i in order], [previews[i] for i in order if i in retained], parents, next_offset
 
 
 def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", focus="", hops=1,
@@ -156,8 +168,7 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
         # Search chooses a center; its name/type cannot restrict its neighbors.
         selected, page, parents, next_offset = _focused_page(nodes, edges, focus, hops, offset, limit, traversal)
     else:
-        page = selected[offset:offset + limit]
-        next_offset = offset + len(page) if offset + len(page) < len(selected) else None
+        page, next_offset, _ = canvas_page(selected, offset, limit)
     ids = {n["id"] for n in page}
     page_edges = [e for e in edges if e["source"] in ids and e["target"] in ids]
     if focus:
@@ -171,9 +182,9 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
             else:
                 remaining.append(edge)
         page_edges = backbone + sorted(remaining, key=lambda e: focus not in (e['source'], e['target']))
-    local_edges = page_edges[:3000]
+    local_edges, _, _ = canvas_page(page_edges, 0, 3000)
     boundary = sum((e["source"] in ids) != (e["target"] in ids) for e in edges)
-    return {"nodes": [_listed(node) for node in page], "edges": [_listed(edge) for edge in local_edges], "layer": layer,
+    return {"nodes": [canvas_item(node) for node in page], "edges": local_edges, "layer": layer,
             "total_nodes": len(nodes), "total_edges": len(edges), "matched_nodes": len(selected),
             "offset": offset, "page_size": limit, "next_offset": next_offset,
             "truncated": len(page) < len(selected) or len(local_edges) < len(page_edges),
@@ -285,7 +296,7 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             **({"source_kind": source['source_kind'], "evidence_refs": source.get('evidence_refs', [])}
                if source.get('source_kind') == 'metadata_column' else {})}
     return {"facts": facts, "supports": retained[:500], "rules": list(mappings.values()),
-            "nodes": [n for n in graph["nodes"] if n["id"] in endpoints], "display_schema": vocabulary(graph),
+            "nodes": [_listed(n) for n in graph["nodes"] if n["id"] in endpoints], "display_schema": vocabulary(graph),
             "total_facts": len(selected), "total_supports": len(retained), "supports_truncated": len(retained) > 500,
             "total_incident_edges": sum(entity_id in (e['source'], e['target']) for e in graph['edges']) if entity_id else None,
             "next_offset": offset + len(facts) if offset + len(facts) < len(selected) else None,

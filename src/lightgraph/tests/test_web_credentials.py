@@ -347,10 +347,12 @@ def test_connect_failure_rolls_back_config_and_secret(client,monkeypatch):
 
 
 def test_failure_after_catalog_write_cannot_relabel_new_metadata_as_old_authorization(client,monkeypatch):
+    from lightgraph.metadata import publish_metadata
     headers=session(client)
     monkeypatch.setattr('lightgraph.runtime.config.open_sources',fake_open([]))
     request=db_body()
-    assert client.post('/api/projects/alpha/database/connect',headers=headers,json=request).status_code==200
+    initial = client.post('/api/projects/alpha/database/connect',headers=headers,json=request)
+    assert initial.status_code==200
     before=client.get('/api/projects/alpha/config').json()
     def fail(*_a,**_kw):
         raise RuntimeError('render failure after catalog write')
@@ -358,8 +360,13 @@ def test_failure_after_catalog_write_cannot_relabel_new_metadata_as_old_authoriz
     request['allowed_tables']=['new_table']
     assert client.post('/api/projects/alpha/database/connect',headers=headers,json=request).status_code==500
     assert client.get('/api/projects/alpha/config').json()==before
+    monkeypatch.setattr('lightgraph.metadata.publish_metadata',publish_metadata)
     metadata=client.get('/api/projects/alpha/metadata').json()
-    assert metadata['requires_refresh'] and metadata['tables']==[]
+    # The independent last-success cache retains the OLD authorized catalog;
+    # a failed replacement cannot relabel the new tables as that old catalog.
+    assert metadata['requires_refresh'] and metadata['refresh_failed']
+    assert metadata['tables']==initial.json()['metadata']['tables']
+    assert 'new_table' not in str(metadata['tables'])
 
 
 def test_partial_catalog_defers_documents_for_unread_source(client,monkeypatch):

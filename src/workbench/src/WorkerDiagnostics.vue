@@ -89,7 +89,7 @@ onUnmounted(() => { epoch++; controller?.abort(); clearTimeout(timer) })
           <div v-if="entry.database.probe_failure">检查结果：{{ probeFailureLabels[entry.database.probe_failure] || entry.database.probe_failure }}</div>
           <div v-if="entry.database.boundary_recovery_attempts != null">本次快照恢复次数：{{ entry.database.boundary_recovery_attempts }}<span v-if="entry.database.recovery_attempt_limit != null"> / {{ entry.database.recovery_attempt_limit }}</span></div>
           <div v-if="entry.database.terminal">该来源已停止事实查询，请检查原因后新开运行。</div>
-          <p v-if="entry.database.category === 'qualification'" class="field-hint">检查未通过不等于网络断连。只读事务检查失败时不会继续取数；参数绑定或去重检查失败可在新会话上有界重试。</p>
+          <p v-if="entry.database.category === 'qualification'" class="field-hint">检查未通过不等于网络断连。连接预检失败时可在额度内丢弃会话并重建；新会话必须通过全部只读和授权检查才能取数。</p>
         </template>
         <div v-if="entry.exit_code != null">退出码：{{ entry.exit_code }}</div>
         <div v-if="entry.connection_generation != null">连接版本：{{ entry.connection_generation }}</div>

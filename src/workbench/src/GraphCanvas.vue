@@ -141,6 +141,10 @@ async function loadDetails(more = false) {
     const value = await request<Provenance>(`${projectPath(props.projectId)}/graph/details?${selector}&include_candidates=${props.includeCandidates === true}&offset=${offset || 0}`)
     if (epoch !== detailGeneration) return
     for (const node of value.nodes || []) detailNodes.value[node.id] = node
+    const fullNode = selected.value && value.nodes?.find(node => node.id === selected.value!.id)
+    if (selected.value?.overview_only && fullNode && !fullNode.overview_only) selected.value = fullNode
+    const fullEdge = selectedEdge.value?.overview_only === true ? value.facts.find(fact => fact.fact_kind === 'Edge' && fact.id === selectedEdge.value!.id) : undefined
+    if (fullEdge) selectedEdge.value = { ...selectedEdge.value!, qualifiers: fullEdge.payload.qualifiers, overview_only: false }
     detailSchema.value = mergeDisplaySchema(detailSchema.value, value.display_schema)
     details.value = more && details.value ? { ...value, facts: [...details.value.facts, ...value.facts], supports: [...details.value.supports, ...value.supports], rules: [...details.value.rules, ...value.rules] } : value
   } catch (error) { if (epoch === detailGeneration) detailsError.value = error instanceof Error ? error.message : '来源读取失败' }
@@ -493,6 +497,7 @@ onUnmounted(() => { fullEpoch++; fullController?.abort(); pageGeneration++; scen
         <template v-else-if="selected">
           <span class="badge blue">{{ kindName(selected.kind || selected.layer) }}</span> <span class="badge" :class="selected.status === 'accepted' ? 'green' : 'amber'">{{ statusName(selected.status) }}</span>
           <h2 class="detail-name">{{ display(selected) }}</h2><p v-if="labelOrigin(selected)" class="muted small-text">{{ labelOrigin(selected) }}</p>
+          <p v-if="selected.overview_only" class="note">此节点先显示精简摘要，完整属性正在按需读取；读取失败时可重试来源详情。</p>
           <template v-if="Object.keys(nodeIdentity(selected)).length"><h3>业务身份</h3><PropertyTable :values="nodeIdentity(selected)" /></template><p v-if="accessLabel(selected)" class="muted small-text">可见范围：{{ accessLabel(selected) }}（访问授权，不代表业务主体）</p>
           <div class="divider"></div><h3>节点属性</h3>
           <PropertyTable :values="nodeProperties(selected)" :label="propertyName" /><TechnicalDetails :value="selected" />

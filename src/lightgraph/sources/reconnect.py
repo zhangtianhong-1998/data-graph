@@ -77,18 +77,22 @@ def _preflight_can_recover(error):
     # A new session has emitted no fact rows. A failed rollback is authoritative
     # evidence that a half-open/aborted session is unusable even if closed=False.
     diagnostic = safe_database_diagnostic(error) or {}
-    if getattr(error, 'code', None) not in {'database_connection_failed', 'database_preflight_failed',
-                                          'snapshot_close_failed', 'read_only_transaction_failed'}:
-        return False
+    code = getattr(error, 'code', None)
     category = diagnostic.get('category', 'unknown')
     if category == 'qualification':
-        # A replacement has not emitted facts. Require all capabilities on a
-        # new session; a failed constant probe never authorizes using this one.
-        # Read-only attestation is deliberately absent from this allowlist.
-        return (getattr(error, 'code', None) == 'database_preflight_failed'
+        # A rejected preflight session is already closed by its constructor.
+        # Requalifying a replacement does not authorize using the failed session,
+        # including when its readonly attestation failed. A later snapshot_start
+        # attestation failure is not a preflight and remains non-recoverable.
+        probe_codes = {'parameter_binding_unverified': 'database_preflight_failed',
+                       'distinct_projection_unverified': 'database_preflight_failed',
+                       'read_only_transaction_unverified': 'read_only_transaction_unverified'}
+        return (code is not None and code == probe_codes.get(diagnostic.get('probe_code'))
             and diagnostic.get('stage') == 'connection_preflight'
-            and diagnostic.get('probe_code') in {'parameter_binding_unverified', 'distinct_projection_unverified'}
             and diagnostic.get('probe_failure') in {'no_row', 'malformed_row', 'readback_mismatch'})
+    if code not in {'database_connection_failed', 'database_preflight_failed',
+                    'snapshot_close_failed', 'read_only_transaction_failed'}:
+        return False
     return (category in {'connection', 'idle_transaction_timeout', 'shutdown', 'unavailable'}
             or category == 'unknown' and (diagnostic.get('rollback_succeeded') is False
                 or diagnostic.get('connection_closed') is True

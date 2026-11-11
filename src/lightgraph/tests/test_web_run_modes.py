@@ -10,7 +10,7 @@ from lightgraph.tests.construction_worker_fixture import install_scripted_worker
 from lightgraph.tests.test_web_execution import wait_run
 from lightgraph.tests.web_client import RevisionClient
 from lightgraph.web.app import create_app
-from lightgraph.web.execution import RunManager, read_graph
+from lightgraph.web.execution import RunManager, read_graph, read_metadata
 from lightgraph.web.run_traces import read_run_trace
 from lightgraph.web.workspace import Workspace
 
@@ -84,6 +84,46 @@ def test_failed_launch_restores_previous_generation_without_erasing_it(workspace
         assert workspace.output_generation('alpha') == previous
         assert marker.read_bytes() == b'previous publication'
         assert workspace.generation_path('alpha', result['run_id']).is_dir()
+    finally:
+        manager.shutdown()
+
+
+def test_first_fresh_run_migrates_legacy_metadata_before_any_cached_get(workspace, monkeypatch):
+    original = read_metadata(workspace, 'alpha', refresh=True)
+    preview = workspace.project_path('alpha') / 'metadata/catalog-preview.yaml'
+    preview.unlink()  # Simulate a project saved before project-level previews existed.
+    real_popen = subprocess.Popen
+    def child(*args, **kwargs):
+        return real_popen([sys.executable, '-c', 'import sys; sys.stdin.buffer.read()'], **kwargs)
+    monkeypatch.setattr('lightgraph.web.execution.subprocess.Popen', child)
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda *a, **kw: pytest.fail('fresh migration must not connect'))
+    manager = RunManager(workspace)
+    try:
+        run = wait_run(manager, 'alpha', manager.start('alpha', run_mode='fresh')['run_id'])
+        assert run['status'] == 'failed'  # Deliberately no run output.
+        assert preview.exists()
+        result = read_metadata(Workspace(workspace.root), 'alpha')
+        assert result['tables'] == original['tables']
+        assert result['using_saved_metadata'] and not result['requires_refresh']
+    finally:
+        manager.shutdown()
+
+
+def test_fresh_run_stays_on_current_generation_if_preview_migration_cannot_save(workspace, monkeypatch):
+    read_metadata(workspace, 'alpha', refresh=True)
+    (workspace.project_path('alpha') / 'metadata/catalog-preview.yaml').unlink()
+    previous_output = workspace.resolved_config('alpha').output_dir
+    def failed(*args, **kwargs):
+        raise PermissionError('DO_NOT_EXPOSE_PRIVATE_PATH')
+    monkeypatch.setattr('lightgraph.web.execution._save_metadata_preview', failed)
+    monkeypatch.setattr('lightgraph.web.execution.subprocess.Popen', lambda *a, **kw: pytest.fail('migration must finish before launching'))
+    manager = RunManager(workspace)
+    try:
+        with pytest.raises(LightGraphError, match='metadata_preview_persistence_failed'):
+            manager.start('alpha', run_mode='fresh')
+        assert workspace.output_generation('alpha') is None
+        assert workspace.resolved_config('alpha').output_dir == previous_output
+        assert not manager.list('alpha')
     finally:
         manager.shutdown()
 

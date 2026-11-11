@@ -2,10 +2,10 @@
 import { computed, onUnmounted, ref, watch } from 'vue'
 import MetadataPreview from './MetadataPreview.vue'
 import { databaseFactDataAllowed, isDatabaseSource, sourceKindLabel } from './database'
-import { projectPath, request } from './api'
+import { ApiError, projectPath, request } from './api'
 import type { Metadata, ProjectFile, SourceConfig } from './types'
 
-const props = defineProps<{ projectId: string; sources: SourceConfig[]; files: ProjectFile[]; metadata: Metadata; locked: boolean; retentionVerified?: boolean }>()
+const props = defineProps<{ projectId: string; sources: SourceConfig[]; files: ProjectFile[]; metadata: Metadata; locked: boolean; retentionVerified?: boolean; credentialSources?: string[]; credentialErrors?: Record<string, string> }>()
 const emit = defineEmits<{ connect: [source?: SourceConfig]; upload: []; refresh: []; deleteFile: [file: ProjectFile]; deleteSource: [source: SourceConfig]; deleteTable: [source: SourceConfig, table: string] }>()
 const databases = computed(() => props.sources.filter(isDatabaseSource))
 const localFiles = computed(() => props.files.filter(file => file.kind === 'excel' || file.kind === 'csv'))
@@ -57,6 +57,8 @@ onUnmounted(() => { revision++ })
       <div class="input-items" tabindex="0" role="region" aria-label="已接入数据列表">
         <template v-if="kind === 'database'">
           <section v-for="source in databases" :key="source.id" class="database-group">
+            <p v-if="credentialErrors?.[source.id]" class="note amber">{{ new ApiError(credentialErrors[source.id]!).message }}</p>
+            <p v-else-if="source.credential_mode === 'session'" class="field-hint">{{ credentialSources?.includes(source.id) ? '已恢复可用的连接信息；密码不在此显示。' : '暂未恢复连接信息，可点击配置查看；已保存的元数据仍可浏览。' }}</p>
             <div class="source-heading"><div><strong>{{ source.id }}</strong><small>{{ sourceKindLabel(source.kind) }}</small><small>{{ databaseFactDataAllowed(source, retentionVerified) ? '允许读取事实数据' : '仅读取元数据' }}</small></div><div class="actions"><button class="text-button" :disabled="locked" :aria-label="`配置 ${source.id}`" @click="emit('connect', source)">配置</button><button class="text-button danger-text" :disabled="locked" :aria-label="`删除数据库来源 ${source.id}`" @click="emit('deleteSource', source)">删除</button></div></div>
             <div v-for="item in entries.filter(entry => entry.sourceId === source.id)" :key="item.key" class="input-item-row" :class="{ active: current?.key === item.key }"><button class="input-item" :class="{ active: current?.key === item.key }" :aria-pressed="current?.key === item.key" @click="selected = item.key"><span>{{ item.label }}</span><small>表</small></button><button class="text-button danger-text input-delete" :disabled="locked" :aria-label="`移除数据表 ${source.id}.${item.label}`" @click="emit('deleteTable', source, item.label)">移除</button></div>
           </section>
@@ -70,6 +72,9 @@ onUnmounted(() => { revision++ })
       <div class="panel-footer"><span>{{ entries.length }} {{ kind === 'database' ? '张表' : '个文件' }}</span><button class="text-button" :disabled="locked || !sources.length" @click="emit('refresh')">刷新元数据</button></div>
     </section>
     <div class="input-metadata">
+      <p v-if="metadata.metadata_cache_warning" class="note amber">当前表结构仍可查看，但项目元数据副本未保存。请检查工作目录的写入权限后重试。</p>
+      <p v-if="metadata.refresh_failed" class="note amber">上次刷新元数据未完成，当前显示上次成功保存的表结构。请检查连接后再刷新。</p>
+      <p v-else-if="metadata.using_saved_metadata" class="field-hint">显示已保存的表结构，浏览此内容不连接数据库。</p>
       <p v-if="error" class="note amber" role="alert">{{ error }}</p>
       <p v-if="current && !selectedTables.length && !pending" class="note amber">尚未读取此数据的元数据</p>
       <MetadataPreview :key="current?.key || 'empty'" :tables="selectedTables" :files="files" :loading="pending" :title="current?.label || '元数据'"/>

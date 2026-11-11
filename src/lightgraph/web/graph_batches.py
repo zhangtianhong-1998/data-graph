@@ -10,6 +10,7 @@ from pathlib import Path
 from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
 from lightgraph.graph_neighborhood import neighborhood_paths
+from .graph_payload import canvas_page, MAX_PAGE_BYTES
 
 
 def _authorized_view(workspace, pid, config, layer, include_candidates):
@@ -61,11 +62,10 @@ def read_graph_batch(workspace, pid, *, config, layer='business', part='nodes', 
         nodes = [by_id[node] for node in order]
         edges = [edge for edge in edges if edge['source'] in selected and edge['target'] in selected]
     collection = nodes if part == 'nodes' else edges
-    page = collection[offset:offset + limit]
-    next_offset = offset + len(page) if offset + len(page) < len(collection) else None
-    from .construction_graph import _listed
-    return {'nodes': [_listed(item) for item in page] if part == 'nodes' else [],
-            'edges': [_listed(item) for item in page] if part == 'edges' else [],
+    page, next_offset, size = canvas_page(collection, offset, limit)
+    return {'nodes': page if part == 'nodes' else [],
+            'edges': page if part == 'edges' else [],
+            'item_payload_bytes': size, 'item_payload_limit_bytes': MAX_PAGE_BYTES,
             'part': part, 'offset': offset, 'next_offset': next_offset, 'page_size': limit,
             'generation': version, 'complete_batches': True, 'layer': layer,
             'total_nodes': total_nodes, 'total_edges': total_edges,

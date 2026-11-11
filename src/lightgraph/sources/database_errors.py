@@ -22,9 +22,9 @@ def readback_shape_failure(row, width):
 def qualification_error(probe_code, *, engine, stage, failure, connection_closed=None):
     """A probe result did not qualify this session; it proves no network cause.
 
-    Constant readback checks may retry a whole newly acquired session. Readonly
-    attestation remains fail-closed and is never reclassified as a transient IO
-    failure. The caller must still discard every unqualified connection.
+    New-session readbacks may trigger another full qualification attempt.
+    Readonly attestation keeps its own code rather than becoming a transient IO
+    error. Every unqualified connection is discarded before any fact SQL.
     """
     if probe_code not in PROBE_CODES or failure not in PROBE_FAILURES:
         raise ValueError('invalid_qualification_diagnostic')

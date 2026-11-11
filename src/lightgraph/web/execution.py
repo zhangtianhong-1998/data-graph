@@ -288,6 +288,9 @@ class RunManager:
             rid = "run_" + uuid.uuid4().hex[:24]
             previous_generation = None
             if run_mode == "fresh":
+                # Upgrades may have only the old generation's catalog. Preserve
+                # that exact authorized preview before changing the output path.
+                _promote_metadata_preview(config, project)
                 previous_generation = self.workspace.output_generation(pid)
                 config.output_dir = str(self.workspace.generation_path(pid, rid))
             payload = _resolved_payload(config, project, source_credentials=source_credentials,
@@ -673,6 +676,65 @@ def write_metadata_context(config, project_path):
     _save(Path(config.output_dir) / "metadata-context.json", _metadata_context(config, project_path))
 
 
+def _metadata_preview_path(project):
+    path = project / 'metadata' / 'catalog-preview.yaml'
+    if any(entry.is_symlink() for entry in (path, path.parent)):
+        raise LightGraphError('workspace_path_invalid')
+    return path
+
+
+def _save_metadata_preview(project, context, declared):
+    """Keep successful declarations apart from run-specific output directories."""
+    import yaml
+    path = _metadata_preview_path(project)
+    path.parent.mkdir(exist_ok=True)
+    atomic_text(path, yaml.safe_dump({'context': context,
+        'declared': declared.model_dump(mode='json', by_alias=True)}, allow_unicode=True, sort_keys=False))
+
+
+def _read_metadata_preview_entry(project):
+    import yaml
+    from ..catalog import DeclaredCatalog
+    path = _metadata_preview_path(project)
+    if not path.exists():
+        return None
+    try:
+        value = yaml.safe_load(path.read_text(encoding='utf-8'))
+        if not isinstance(value, dict) or not isinstance(value.get('context'), dict):
+            return None
+        return DeclaredCatalog.model_validate(value['declared']), value['context']
+    except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError):
+        return None
+
+
+def _read_metadata_preview(project, context):
+    entry = _read_metadata_preview_entry(project)
+    return entry[0] if entry is not None and entry[1] == context else None
+
+
+def _promote_metadata_preview(config, project):
+    """Migrate a valid legacy catalog without reading a source or old run logs."""
+    import yaml
+    from ..catalog import DeclaredCatalog
+    output = Path(config.output_dir)
+    path = output / 'metadata.yaml'
+    if path.is_symlink():
+        raise LightGraphError('workspace_path_invalid')
+    if not path.exists():
+        return
+    context = _metadata_context(config, project)
+    try:
+        if _json_file(output / 'metadata-context.json') != context:
+            return
+        declared = DeclaredCatalog.model_validate(yaml.safe_load(path.read_text(encoding='utf-8'))['declared'])
+    except (LightGraphError, OSError, ValueError, KeyError, TypeError, yaml.YAMLError):
+        return
+    try:
+        _save_metadata_preview(project, context, declared)
+    except OSError:
+        raise LightGraphError('metadata_preview_persistence_failed') from None
+
+
 def _metadata_neighborhood(view, focus, hops, traversal='all'):
     """Select the neighborhood before the response cap, using authorized metadata."""
     nodes={n['id']:n for n in view['nodes'] if n['layer']=='metadata'}
@@ -704,24 +766,29 @@ def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, sou
     project = workspace.project_path(pid)
     context = _metadata_context(config, project)
     prior_context = None
+    preview = None
+    refresh_failed = False
+    cache_warning = None
     def unread(stale=False):
         return {**_bounded_view({}, "metadata"), "tables": [], "revision": None,
                 "coverage": "not_read", "instance_queries": 0, "requires_refresh": True,
                 "stale_engine_metadata": stale}
     if not refresh:
-        if not path.exists():
-            return unread()
         try:
             cached_context = _json_file(output / "metadata-context.json")
         except LightGraphError:
-            return unread(stale=True)
-        if cached_context != context:
-            return unread(stale=True)
+            cached_context = None
+        if not path.exists() or cached_context != context:
+            preview = _read_metadata_preview(project, context)
+            if preview is None:
+                return unread(stale=path.exists())
+            refresh_failed = cached_context == {"refresh_pending": True}
     else:
         try:
             prior_context = _json_file(output / "metadata-context.json")
         except LightGraphError:
             pass
+        _promote_metadata_preview(config, project)
         # Invalidate the read marker before any artifact can be replaced. A
         # failed graph render or connection rollback must never associate new
         # declarations with the previous source authorization context.
@@ -742,7 +809,7 @@ def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, sou
             if path.is_symlink():
                 raise LightGraphError("workspace_path_invalid")
             try:
-                declared = DeclaredCatalog.model_validate(yaml.safe_load(path.read_text(encoding="utf-8"))["declared"])
+                declared = preview if preview is not None else DeclaredCatalog.model_validate(yaml.safe_load(path.read_text(encoding="utf-8"))["declared"])
             except (OSError, ValueError, KeyError, TypeError):
                 raise LightGraphError("metadata_artifact_invalid") from None
         else:
@@ -756,24 +823,32 @@ def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, sou
                 source_config.sources = [s for s in config.sources if s.id in selected]
             adapters = open_sources(source_config, metadata_only=True, **options)
             declared = declared_catalog(adapters)
-            if selected is not None and path.exists():
+            if selected is not None:
                 # Reuse only declarations tied to unchanged source authorization
-                # and file revisions. Adding a DB never reconnects other DBs.
-                try:
-                    if path.is_symlink():
-                        raise ValueError
-                    prior = DeclaredCatalog.model_validate(yaml.safe_load(path.read_text(encoding="utf-8"))["declared"])
+                # and file revisions. A fresh generation may only have the
+                # project preview; adding a DB must preserve other valid sources.
+                saved = _read_metadata_preview_entry(project)
+                previous = [saved] if saved is not None else []
+                if path.exists():
+                    try:
+                        if path.is_symlink():
+                            raise ValueError
+                        prior = DeclaredCatalog.model_validate(yaml.safe_load(path.read_text(encoding="utf-8"))["declared"])
+                        previous.append((prior, prior_context or {}))
+                    except (LightGraphError, OSError, ValueError, KeyError, TypeError, yaml.YAMLError):
+                        pass
+                retained_tables, retained_sources = {}, {}
+                for prior, saved_context in previous:
                     retained = {sid for sid, revision in context["source_revisions"].items()
-                                if sid not in selected and (prior_context or {}).get("source_revisions", {}).get(sid) == revision}
-                    tables = sorted(declared.tables + [t for t in prior.tables if t.source_id in retained],
-                                    key=lambda t: (t.source_id, t.schema_name, t.name))
-                    descriptions = sorted(declared.sources + [s for s in prior.sources if s.source_id in retained],
-                                          key=lambda s: s.source_id)
-                    declared = DeclaredCatalog(tables=tables, sources=descriptions,
-                        revision=digest(CATALOG_VERSION, [t.model_dump(by_alias=True) for t in tables],
-                                        [s.model_dump() for s in descriptions]))
-                except (LightGraphError, OSError, ValueError, KeyError, TypeError):
-                    pass
+                                if sid not in selected and saved_context.get("source_revisions", {}).get(sid) == revision}
+                    retained_tables.update({(t.source_id, t.schema_name, t.name): t for t in prior.tables if t.source_id in retained})
+                    retained_sources.update({s.source_id: s for s in prior.sources if s.source_id in retained})
+                tables = sorted(declared.tables + list(retained_tables.values()),
+                                key=lambda t: (t.source_id, t.schema_name, t.name))
+                descriptions = sorted(declared.sources + list(retained_sources.values()), key=lambda s: s.source_id)
+                declared = DeclaredCatalog(tables=tables, sources=descriptions,
+                    revision=digest(CATALOG_VERSION, [t.model_dump(by_alias=True) for t in tables],
+                                    [s.model_dump() for s in descriptions]))
             from ..documents import load_documents
             missing = {s.id for s in config.sources} - {s.source_id for s in declared.sources}
             # Table-bound documents cannot be validated against an incomplete
@@ -816,6 +891,17 @@ def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, sou
             if _metadata_context(workspace.resolved_config(pid), project) != context:
                 raise LightGraphError("input_dependency_changed")
             _save(output / "metadata-context.json", context)
+        # Promote legacy successful caches on GET too. Never reconnect or copy
+        # business graph/evidence into this declaration-only project cache.
+        if preview is None:
+            try:
+                _save_metadata_preview(project, context, declared)
+            except OSError:
+                if refresh:
+                    raise LightGraphError('metadata_preview_persistence_failed') from None
+                # This optional copy cannot make an authorized catalog unreadable.
+                # Path-policy errors remain fatal; do not expose filesystem details.
+                cache_warning = 'metadata_preview_persistence_failed'
         graph = _metadata_neighborhood(view,focus,hops,traversal) if focus else _bounded_view(view, "metadata", bounded=not full_graph)
         tables = [{"id": t.source_id + "." + t.qualified_name,
                    **t.model_dump(mode="json", by_alias=True)} for t in declared.tables]
@@ -823,7 +909,9 @@ def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, sou
         return {**graph, "tables": tables, "revision": declared.revision,
                 "sources": [s.model_dump(mode="json") for s in declared.sources],
                 "coverage": "declarations_partial" if missing_sources else "declarations_only", "instance_queries": 0,
-                "requires_refresh": bool(missing_sources), "missing_sources": missing_sources,
+                "requires_refresh": bool(missing_sources) or refresh_failed, "missing_sources": missing_sources,
+                "using_saved_metadata": preview is not None, "refresh_failed": refresh_failed,
+                "metadata_cache_warning": cache_warning,
                 "document_context_deferred": bool(missing_sources),
                 "stale_engine_metadata": stale}
     finally:

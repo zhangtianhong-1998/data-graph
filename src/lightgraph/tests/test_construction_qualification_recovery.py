@@ -19,7 +19,7 @@ from lightgraph.tests.test_sources_gauss import Connection, Cursor
 from lightgraph.tests.test_database_snapshot_recovery import GAUSS_QUALIFIED
 
 
-def star_source(failures, *, readonly_failure=False):
+def star_source(failures, *, readonly_failure=False, after_qualification=False):
     columns = [('indicator', 'text'), ('indicator_name', 'text'), ('region', 'text'),
                ('region_name', 'text'), ('ytd', 'numeric'), ('mtd', 'numeric')]
     data = sqlite3.connect(':memory:')
@@ -35,10 +35,12 @@ def star_source(failures, *, readonly_failure=False):
     class StarCursor(Cursor):
         def execute(self, sql, parameters=None):
             super().execute(sql, parameters)
-            if sql == 'SELECT %s' and self.connection.bad_probe:
+            if sql == 'SELECT %s' and self.connection.bad_probe and not readonly_failure:
                 self.result = [(70,)]  # No business projection has started.
             elif 'current_setting' in sql and readonly_failure and self.connection.bad_probe:
-                self.result = [('off', 'repeatable read')]
+                self.connection.readonly_checks += 1
+                if not after_qualification or self.connection.readonly_checks == 2:
+                    self.result = [('off', 'repeatable read')]
             elif 'information_schema.columns' in sql:
                 self.result = [(name, kind, 'YES') for name, kind in columns]
             elif 'pg_catalog.col_description' in sql:
@@ -59,6 +61,7 @@ def star_source(failures, *, readonly_failure=False):
     def factory(_dsn):
         connection = StarConnection()
         connection.bad_probe = 1 <= len(connections) <= failures
+        connection.readonly_checks = 0
         connections.append(connection)
         return connection
 
@@ -87,9 +90,10 @@ def star_draft(ref):
 
 
 @pytest.mark.parametrize('failures', [1, 4], ids=['recovers', 'exhausts'])
-def test_preflight_recovery_preserves_paired_relations_or_keeps_failed_draft(tmp_path, monkeypatch, failures):
+@pytest.mark.parametrize('readonly_failure', [False, True], ids=['parameter', 'readonly'])
+def test_preflight_recovery_preserves_paired_relations_or_keeps_failed_draft(tmp_path, monkeypatch, failures, readonly_failure):
     monkeypatch.setattr(reconnect, '_recovery_pause', lambda source: None)
-    source, connections, data = star_source(failures)
+    source, connections, data = star_source(failures, readonly_failure=readonly_failure)
     tools = ConstructionTools(RunConfig(sources=[], model={'mode': 'in_environment'}), tmp_path / 'work', adapters=[source])
     try:
         ref = tools.call('inspect_source', table='facts:public.items', operation='get_metadata')['evidence_ref']
@@ -114,12 +118,19 @@ def test_preflight_recovery_preserves_paired_relations_or_keeps_failed_draft(tmp
             assert source.terminal_failure_code is None
         else:
             assert not check['passed']
-            assert tools.call('publish_graph_draft', draft_id='star')['code'] == 'graph_validation_required'
             parent = tools.workspace.get_draft('star')
-            child = tools.call('save_graph_draft', metadata_from_draft='star')['draft_id']
-            assert tools.call('validate_graph_draft', draft_id=child)['passed']
-            assert tools.call('publish_graph_draft', draft_id=child)['nodes'] == 2
-            assert tools.workspace.read_published_graph()['edges'] == []
+            if readonly_failure:
+                # The retry allowance must not silently expand eligibility for
+                # offline publication when readonly qualification stays broken.
+                assert tools.call('publish_graph_draft', draft_id='star')['code'] == 'metadata_catalog_requalification_required'
+                assert tools.call('save_graph_draft', metadata_from_draft='star')['code'] == 'metadata_catalog_requalification_required'
+                assert not tools.workspace.read_published_graph()['nodes']
+            else:
+                assert tools.call('publish_graph_draft', draft_id='star')['code'] == 'graph_validation_required'
+                child = tools.call('save_graph_draft', metadata_from_draft='star')['draft_id']
+                assert tools.call('validate_graph_draft', draft_id=child)['passed']
+                assert tools.call('publish_graph_draft', draft_id=child)['nodes'] == 2
+                assert tools.workspace.read_published_graph()['edges'] == []
             assert tools.workspace.get_draft('star') == parent
     finally:
         tools.close()
@@ -127,9 +138,9 @@ def test_preflight_recovery_preserves_paired_relations_or_keeps_failed_draft(tmp
         data.close()
 
 
-def test_unverified_readonly_session_stops_source_with_actionable_probe_diagnostic(tmp_path, monkeypatch):
+def test_unverified_readonly_snapshot_stops_source_with_actionable_probe_diagnostic(tmp_path, monkeypatch):
     monkeypatch.setattr(reconnect, '_recovery_pause', lambda source: pytest.fail('read-only failure retried'))
-    source, connections, data = star_source(1, readonly_failure=True)
+    source, connections, data = star_source(1, readonly_failure=True, after_qualification=True)
     tools = ConstructionTools(RunConfig(sources=[], model={'mode': 'in_environment'}), tmp_path / 'work', adapters=[source])
     try:
         ref = tools.call('inspect_source', table='facts:public.items', operation='get_metadata')['evidence_ref']
@@ -141,6 +152,7 @@ def test_unverified_readonly_session_stops_source_with_actionable_probe_diagnost
         assert source._reconnect_attempts == 0 and len(connections) == 2
         diagnostic, = [d for d in check['diagnostics'] if d['code'] == 'read_only_transaction_unverified']
         assert diagnostic['database']['probe_code'] == 'read_only_transaction_unverified'
+        assert diagnostic['database']['stage'] == 'snapshot_start'
         assert diagnostic['source_blocked'] is True
         assert all(c.closed for c in connections)
         assert not any('FROM "public"."items"' in sql for c in connections for sql, _ in c.executed)
