@@ -19,7 +19,7 @@ from lightgraph.tests.test_sources_gauss import Connection, Cursor
 from lightgraph.tests.test_database_snapshot_recovery import GAUSS_QUALIFIED
 
 
-def star_source(failures, *, readonly_failure=False, after_qualification=False):
+def star_source(failures, *, readonly_failure=False, after_qualification=False, runtime_failure=None):
     columns = [('indicator', 'text'), ('indicator_name', 'text'), ('region', 'text'),
                ('region_name', 'text'), ('ytd', 'numeric'), ('mtd', 'numeric')]
     data = sqlite3.connect(':memory:')
@@ -32,10 +32,13 @@ def star_source(failures, *, readonly_failure=False, after_qualification=False):
     data.execute('PRAGMA query_only=ON')
     connections = []
 
-    class StarCursor(Cursor):
+    from lightgraph.tests.test_database_runtime_probe_recovery import RuntimeCursor, RuntimeConnection
+    base_cursor, base_connection = (RuntimeCursor, RuntimeConnection) if runtime_failure else (Cursor, Connection)
+
+    class StarCursor(base_cursor):
         def execute(self, sql, parameters=None):
             super().execute(sql, parameters)
-            if sql == 'SELECT %s' and self.connection.bad_probe and not readonly_failure:
+            if sql == 'SELECT %s' and self.connection.bad_probe and not readonly_failure and not runtime_failure:
                 self.result = [(70,)]  # No business projection has started.
             elif 'current_setting' in sql and readonly_failure and self.connection.bad_probe:
                 self.connection.readonly_checks += 1
@@ -54,19 +57,22 @@ def star_source(failures, *, readonly_failure=False, after_qualification=False):
                 self.description, self.result = cursor.description, cursor.fetchall()
                 cursor.close()
 
-    class StarConnection(Connection):
+    class StarConnection(base_connection):
         def cursor(self, name=None):
             return StarCursor(self, name)
 
     def factory(_dsn):
         connection = StarConnection()
         connection.bad_probe = 1 <= len(connections) <= failures
+        if runtime_failure and connection.bad_probe:
+            setattr(connection, runtime_failure, False)
         connection.readonly_checks = 0
         connections.append(connection)
         return connection
 
     source = GaussSource('test-only', source_id='facts', allowed_tables=['public.items'],
-                         connect_factory=factory, verified_capabilities=GAUSS_QUALIFIED)
+                         connect_factory=factory, verified_capabilities=None if runtime_failure else GAUSS_QUALIFIED,
+                         probe_runtime_limits=bool(runtime_failure))
     return source, connections, data
 
 
@@ -157,6 +163,30 @@ def test_unverified_readonly_snapshot_stops_source_with_actionable_probe_diagnos
         assert all(c.closed for c in connections)
         assert not any('FROM "public"."items"' in sql for c in connections for sql, _ in c.executed)
         assert tools.call('publish_graph_draft', draft_id='star')['code'] == 'metadata_catalog_requalification_required'
+    finally:
+        tools.close()
+        source.close()
+        data.close()
+
+
+@pytest.mark.parametrize('control', ['timeout_works', 'cancel_works'])
+def test_runtime_requalification_recovers_and_publishes_indicator_dimension_measure_edges(tmp_path, monkeypatch, control):
+    monkeypatch.setattr(reconnect, '_recovery_pause', lambda source: None)
+    source, connections, data = star_source(1, runtime_failure=control)
+    tools = ConstructionTools(RunConfig(sources=[], model={'mode': 'in_environment'}), tmp_path / 'work', adapters=[source])
+    try:
+        ref = tools.call('inspect_source', table='facts:public.items', operation='get_metadata')['evidence_ref']
+        assert tools.call('save_graph_draft', yaml_text=dump_yaml(star_draft(ref)))['status'] == 'ok'
+        result = tools.call('validate_graph_draft', draft_id='star')
+        assert result['passed'], result
+        assert source._reconnect_attempts == 1 and source.terminal_failure_code is None
+        assert not any('FROM "public"."items"' in sql for sql, _ in connections[1].executed)
+        assert tools.call('publish_graph_draft', draft_id='star')['status'] == 'ok'
+        graph = tools.workspace.read_published_graph()
+        assert len(graph['nodes']) == 5 and len(graph['edges']) == 4
+        assert {edge['type'] for edge in graph['edges']} == {'measured_in', 'uses_measure'}
+        assert all(connection.closed for connection in connections)
+        assert not any(value in dump_yaml(graph) for value in ('123456789', '987654321', '7654321'))
     finally:
         tools.close()
         source.close()

@@ -7,7 +7,8 @@ import type { Run } from './types'
 const props = defineProps<{ run: Run }>()
 type Entry = { time?: string; code: string; stage?: string; error_code?: string; exception_type?: string;
   database?: { stage?: string; category?: string; sqlstate?: string; errno?: number; recovery?: string; connection_closed?: boolean; connection_broken?: boolean;
-    probe_code?: string; probe_failure?: string; boundary_recovery_attempts?: number; recovery_attempt_limit?: number; terminal?: boolean };
+    probe_code?: string; probe_failure?: string; cause_code?: string; recovery_decision?: string;
+    boundary_recovery_attempts?: number; recovery_attempt_limit?: number; terminal?: boolean };
   exit_code?: number; stderr_bytes?: number; connection_generation?: number; reconnect_attempts?: number; frames?: { file: string; line: number }[] }
 type Page = { status: 'available' | 'not_recorded' | 'unavailable' | 'cleared'; events: Entry[]; incomplete: boolean; active: boolean }
 const opened = ref(false), loading = ref(false), error = ref(''), page = ref<Page | null>(null)
@@ -30,9 +31,19 @@ const categories: Record<string, string> = {
 const probeLabels: Record<string, string> = {
   parameter_binding_unverified: '参数绑定', distinct_projection_unverified: '去重查询',
   read_only_transaction_unverified: '只读事务',
+  query_cancel_unverified: '查询取消', statement_timeout_unverified: '语句超时',
+  runtime_control_unverified: '查询中断后的会话检查', cte_union_unverified: 'CTE 与 UNION 查询',
 }
 const probeFailureLabels: Record<string, string> = {
   no_row: '没有返回检查结果', malformed_row: '检查结果格式不符', readback_mismatch: '检查结果与要求不符',
+  interrupt_not_observed: '未观察到预期的查询中断', cancel_not_sent: '未能发出取消请求',
+  cancel_not_completed: '取消操作未完成',
+}
+const recoveryDecisionLabels: Record<string, string> = {
+  retry_new_session: '丢弃当前会话，重新检查新会话', retry_limit_exhausted: '恢复次数已耗尽',
+  qualification_rejected: '资格检查未通过，当前阶段不能重试',
+  deterministic_rejection: '配置、权限或目录检查未通过',
+  unclassified_failure: '失败原因尚未分类，已保留原始错误并停止',
 }
 let epoch = 0, controller: AbortController | undefined, timer: ReturnType<typeof setTimeout> | undefined
 async function load() {
@@ -82,6 +93,8 @@ onUnmounted(() => { epoch++; controller?.abort(); clearTimeout(timer) })
         <div v-if="entry.exception_type">异常类型：{{ entry.exception_type }}</div>
         <template v-if="entry.database"><div>{{ categories[entry.database.category || 'unknown'] || entry.database.category }} · {{ entry.database.stage }}</div>
           <div>SQLSTATE：{{ entry.database.sqlstate || 'unknown' }}<span v-if="entry.database.errno != null"> · 驱动编号：{{ entry.database.errno }}</span></div>
+          <div v-if="entry.database.cause_code">原始错误：{{ entry.database.cause_code }}</div>
+          <div v-if="entry.database.recovery_decision">恢复判定：{{ recoveryDecisionLabels[entry.database.recovery_decision] || entry.database.recovery_decision }}</div>
           <div v-if="entry.database.recovery">恢复结果：{{ entry.database.recovery }}</div>
           <div v-if="entry.database.connection_closed != null">连接已关闭：{{ entry.database.connection_closed ? '是' : '否' }}</div>
           <div v-if="entry.database.connection_broken != null">驱动标记连接损坏：{{ entry.database.connection_broken ? '是' : '否' }}</div>

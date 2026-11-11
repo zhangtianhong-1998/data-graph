@@ -15,10 +15,13 @@ import time
 
 from lightgraph.construction.paths import io_path
 from lightgraph.errors import LightGraphError
+from lightgraph.sources.database_errors import PROBE_CODES
 
 MAX_LOG_BYTES = 128 * 1024
 MAX_LINE_BYTES = 4096
 _TAIL_RESERVE = 8 * 1024
+_EXIT_RESERVE = 4 * 1024
+_MAX_TERMINAL_DATABASE_EVENTS = 4
 _PACKAGE = Path(__file__).resolve().parents[1]
 _EVENTS = frozenset({'worker_starting', 'worker_started', 'worker_finished', 'worker_error',
     'worker_cleanup_error', 'worker_cancel_error', 'worker_process_exited', 'worker_stderr_summary',
@@ -43,7 +46,7 @@ _ERRORS = frozenset({'worker_execution_failed', 'worker_start_failed', 'worker_r
     'database_preflight_failed', 'database_runtime_preflight_failed', 'read_only_transaction_unverified',
     'parameter_binding_unverified', 'distinct_projection_unverified',
     'capability_manifest_binding_mismatch', 'qualified_capability_manifest_required',
-    'authorized_table_unavailable_or_view', 'authorized_column_unavailable', 'invalid_capability_manifest'})
+    'authorized_table_unavailable_or_view', 'authorized_column_unavailable', 'invalid_capability_manifest'}) | PROBE_CODES
 _EXCEPTION_LINE = re.compile(rb'^(?:[a-zA-Z_][a-zA-Z0-9_.]*\.)?([A-Za-z]+Error|KeyboardInterrupt|SystemExit):')
 
 
@@ -157,6 +160,7 @@ class WorkerDiagnostics:
         self.path = worker_log_path(record_path)
         self.lock = threading.Lock()
         self.failed = False
+        self._terminal_database_seen = set()
 
     def emit(self, code, *, error=None, **details):
         try:
@@ -164,7 +168,18 @@ class WorkerDiagnostics:
                                 **(exception_details(error) if error is not None else {}), **details})
             if event is None:
                 return
+            terminal_database = (code == 'worker_database_diagnostic'
+                                 and event.get('database', {}).get('terminal') is True)
             with self.lock:
+                if terminal_database:
+                    # A stopped source may be returned by many subsequent tools.
+                    # Keep distinct terminal causes without spending the exit reserve.
+                    signature = json.dumps({key: event[key] for key in
+                        ('error_code', 'database', 'connection_generation') if key in event}, sort_keys=True)
+                    if (signature in self._terminal_database_seen
+                            or len(self._terminal_database_seen) >= _MAX_TERMINAL_DATABASE_EVENTS):
+                        return
+                    self._terminal_database_seen.add(signature)
                 _check_path(self.path)
                 path = io_path(self.path)
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -174,12 +189,18 @@ class WorkerDiagnostics:
                 fd = os.open(path, flags, 0o600)
                 try:
                     size = os.fstat(fd).st_size
-                    limit = MAX_LOG_BYTES if code in _FINAL_EVENTS else MAX_LOG_BYTES - _TAIL_RESERVE
+                    limit = (MAX_LOG_BYTES - _EXIT_RESERVE if terminal_database else
+                             MAX_LOG_BYTES if code in _FINAL_EVENTS else MAX_LOG_BYTES - _TAIL_RESERVE)
                     if size + len(encoded) > limit:
-                        if size > MAX_LOG_BYTES - _TAIL_RESERVE:
-                            return
-                        event = {'code': 'worker_log_truncated', 'time': event['time']}
-                        encoded = (json.dumps(event, separators=(',', ':')) + '\n').encode()
+                        if terminal_database:
+                            # The trace has its own budget. A full worker log must
+                            # not hide the actual final database cause from it.
+                            encoded = b''
+                        else:
+                            if size > MAX_LOG_BYTES - _TAIL_RESERVE:
+                                return
+                            event = {'code': 'worker_log_truncated', 'time': event['time']}
+                            encoded = (json.dumps(event, separators=(',', ':')) + '\n').encode()
                     if size + len(encoded) <= MAX_LOG_BYTES:
                         remaining = memoryview(encoded)
                         while remaining:

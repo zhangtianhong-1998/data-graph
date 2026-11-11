@@ -1,4 +1,5 @@
-import { ApiError, projectPath, request } from './api'
+import { ApiError, projectPath } from './api'
+import { readGraph } from './graphRead'
 import { mergeDisplaySchema } from './graphLabels'
 import { edgeKey } from './graphScene'
 import type { Graph, GraphEdge, GraphNode } from './types'
@@ -15,23 +16,7 @@ export async function transferGraph(projectId: string, selection: { layer: strin
   while (!state.complete) {
     if (signal.aborted) throw new ApiError('request_cancelled')
     const params = new URLSearchParams({ layer: selection.layer, include_candidates: String(selection.includeCandidates === true), part: state.part, offset: String(state.offset), limit: '1000', generation: state.generation, focus: selection.focus || '', hops: String(selection.hops ?? 2), traversal: selection.traversal ?? 'chains' })
-    let page: Batch | undefined
-    for (let attempt = 0; ; attempt++) {
-      try { page = await request<Batch>(`${projectPath(projectId)}/graph/batches?${params}`, { signal }); break }
-      catch (error) {
-        // Only idempotent reads at the same accepted cursor may retry. A
-        // changed publication/permission never uses this recovery path.
-        if (signal.aborted || attempt >= 2 || !(error instanceof ApiError)
-          || (!['network_unavailable', 'request_timeout', 'http_502', 'http_503', 'http_504'].includes(error.code)
-            && ![502, 503, 504].includes(error.status))) throw error
-        await new Promise<void>(resolve => {
-          const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve() }
-          const timer = setTimeout(done, 100 * (attempt + 1))
-          signal.addEventListener('abort', done, { once: true })
-        })
-        if (signal.aborted) throw new ApiError('request_cancelled')
-      }
-    }
+    const page = await readGraph<Batch>(`${projectPath(projectId)}/graph/batches?${params}`, signal)
     if (signal.aborted) throw new ApiError('request_cancelled')
     if (state.generation && page.generation !== state.generation) throw new ApiError('graph_generation_changed')
     if (!page.generation || page.part !== state.part || page.offset !== state.offset || (page.next_offset !== null && (!Number.isInteger(page.next_offset) || page.next_offset <= state.offset))) throw new ApiError('graph_batch_invalid')

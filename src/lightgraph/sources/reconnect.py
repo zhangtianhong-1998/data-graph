@@ -3,7 +3,8 @@ from copy import deepcopy
 import logging
 import time
 from lightgraph.errors import BudgetExceeded, LightGraphError
-from .database_errors import database_error, safe_database_diagnostic
+from .database_errors import (database_error, safe_database_diagnostic, diagnostic_cause_code,
+                              PROBE_CODES, PROBE_FAILURES, APPLICATION_REJECTIONS)
 
 
 # Applies to one snapshot boundary, including connection qualification and
@@ -37,7 +38,7 @@ def terminal_failure(source):
     return error
 
 
-def latch_terminal_failure(source, error, *, engine, code=None):
+def latch_terminal_failure(source, error, *, engine, code=None, decision=None):
     """Remember safe terminal state, so another tool cannot start the loop again."""
     if source._terminal_failure_code is not None:
         return terminal_failure(source)
@@ -45,8 +46,17 @@ def latch_terminal_failure(source, error, *, engine, code=None):
     if diagnostic is None:
         diagnostic = database_error(code or 'database_reconnect_failed', error.__cause__ or error,
             engine=engine, stage='reconnect').database_diagnostic
+    diagnostic.setdefault('cause_code', diagnostic_cause_code(error))
+    if diagnostic.get('category') == 'unknown' and diagnostic['cause_code'] in APPLICATION_REJECTIONS:
+        diagnostic['category'] = 'configuration_or_catalog'
+    if decision is None:
+        decision = ('qualification_rejected' if diagnostic.get('category') == 'qualification' else
+            'deterministic_rejection' if diagnostic.get('category') in {
+                'authentication', 'permission', 'configuration_or_catalog', 'unsupported'}
+            or diagnostic['cause_code'] in APPLICATION_REJECTIONS
+            else 'unclassified_failure')
     source._terminal_failure_code = code or getattr(error, 'code', 'database_reconnect_failed')
-    source._terminal_failure_diagnostic = {**diagnostic, 'terminal': True,
+    source._terminal_failure_diagnostic = {**diagnostic, 'terminal': True, 'recovery_decision': decision,
         'boundary_recovery_attempts': source._boundary_recoveries,
         'recovery_attempt_limit': MAX_BOUNDARY_RECOVERIES,
         'recovery': 'reconnect_failed' if source._terminal_failure_code == 'database_reconnect_failed'
@@ -84,13 +94,14 @@ def _preflight_can_recover(error):
         # Requalifying a replacement does not authorize using the failed session,
         # including when its readonly attestation failed. A later snapshot_start
         # attestation failure is not a preflight and remains non-recoverable.
-        probe_codes = {'parameter_binding_unverified': 'database_preflight_failed',
-                       'distinct_projection_unverified': 'database_preflight_failed',
-                       'read_only_transaction_unverified': 'read_only_transaction_unverified'}
+        probe_codes = {probe: 'database_preflight_failed' if probe in {
+            'parameter_binding_unverified', 'distinct_projection_unverified'} else probe for probe in PROBE_CODES}
         return (code is not None and code == probe_codes.get(diagnostic.get('probe_code'))
             and diagnostic.get('stage') == 'connection_preflight'
-            and diagnostic.get('probe_failure') in {'no_row', 'malformed_row', 'readback_mismatch'})
+            and diagnostic.get('probe_failure') in PROBE_FAILURES)
     if code not in {'database_connection_failed', 'database_preflight_failed',
+                    'database_runtime_preflight_failed', 'query_cancel_unverified',
+                    'statement_timeout_unverified', 'runtime_control_unverified',
                     'snapshot_close_failed', 'read_only_transaction_failed'}:
         return False
     return (category in {'connection', 'idle_transaction_timeout', 'shutdown', 'unavailable'}
@@ -105,7 +116,8 @@ def _preflight_can_recover(error):
                 # consume the same bounded recovery allowance as connect.
                 # Keep unknown as unknown; explicit capability/catalog and
                 # authentication failures remain non-recoverable above.
-                or getattr(error, 'code', None) == 'database_preflight_failed'
+                or code in {'database_preflight_failed', 'database_runtime_preflight_failed',
+                            'query_cancel_unverified', 'statement_timeout_unverified', 'runtime_control_unverified'}
                 and diagnostic.get('stage') == 'connection_preflight'))
 
 
@@ -134,10 +146,19 @@ def _reserve_recovery(source, *, engine, error=None):
     _check_recovery_budget(source)
     if source._boundary_recoveries >= MAX_BOUNDARY_RECOVERIES:
         raise latch_terminal_failure(source, error or LightGraphError('database_reconnect_failed'),
-                                     engine=engine, code='database_reconnect_failed') from None
+            engine=engine, code='database_reconnect_failed', decision='retry_limit_exhausted') from None
     source._boundary_recoveries += 1
     source._boundary_recovery_used = True
     source._reconnect_attempts += 1
+    if error is not None:
+        diagnostic = safe_database_diagnostic(error) or database_error(
+            'database_reconnect_failed', error, engine=engine, stage='reconnect').database_diagnostic
+        logging.getLogger(__name__).warning('database session replacement scheduled', extra={
+            'error_code': getattr(error, 'code', 'database_reconnect_failed'),
+            'database_diagnostic': {**diagnostic, 'cause_code': diagnostic.get('cause_code', diagnostic_cause_code(error)),
+                'recovery_decision': 'retry_new_session', 'boundary_recovery_attempts': source._boundary_recoveries,
+                'recovery_attempt_limit': MAX_BOUNDARY_RECOVERIES},
+            'connection_generation': source.connection_generation, 'reconnect_attempts': source._reconnect_attempts})
     _recovery_pause(source)
 
 
@@ -245,7 +266,7 @@ def prepare_snapshot(source, *, engine, begin, disconnected):
                 if not (_preflight_can_recover(exc) or qualified_begin_failure): raise
                 if source._boundary_recoveries >= MAX_BOUNDARY_RECOVERIES:
                     raise latch_terminal_failure(source, exc, engine=engine,
-                                                 code='database_reconnect_failed') from None
+                        code='database_reconnect_failed', decision='retry_limit_exhausted') from None
                 # Eligibility is determined once here from the setup failure,
                 # not independently by a flag a driver cleanup may have reset.
                 source._reconnect_allowed = True

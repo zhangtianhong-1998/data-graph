@@ -36,6 +36,14 @@ TERMINAL_QUERY_CODES = frozenset({'query_budget_exhausted', 'db_cu_budget_exhaus
     'run_time_budget_exhausted', 'wall_time_budget_exhausted', 'construction_time_exhausted',
     'returned_rows_budget_exhausted', 'returned_bytes_budget_exhausted'})
 STOP_QUERY_CODES = TERMINAL_QUERY_CODES | {'source_retry_limit_exhausted'}
+METADATA_REQUALIFICATION_ACTION = (
+    'This source no longer qualifies for offline column-definition publication in this run. '
+    'Changing the request or repeating metadata_from_draft cannot restore that qualification. '
+    'Keep the original draft and source failures. You may validate the retained structure with '
+    'mode="structure" and explicitly publish that checked structure with the same mode, if '
+    'its authorization and evidence remain valid. A published structure is not a verified '
+    'instance graph and does not complete the missing dimension members or indicator relations. '
+    'Restore and requalify the source in a new run before completing those instances.')
 
 
 def _file_hash(path):
@@ -204,9 +212,14 @@ class ConstructionTools:
                 detail = safe_database_diagnostic(exc)
                 error = {'code': exc.code, 'retryable': exc.retryable,
                          **({'database': detail} if detail else {})}
+                guidance = failure_guidance([error])
+                if exc.code == 'metadata_catalog_requalification_required':
+                    guidance = {'failure_class': 'source_qualification',
+                        'recovery': 'operator_requalification_required',
+                        'next_action': METADATA_REQUALIFICATION_ACTION}
                 return {"status": "error", **error,
                         "next_action": "Correct the affected request. Record only unmet user requirements as unresolved; optional suggestions are not blockers. Other drafts remain available.",
-                        **failure_guidance([error])}
+                        **guidance}
             except (TypeError, ValueError, KeyError):
                 return {"status": "error", "code": "invalid_construction_arguments"}
             except Exception:
@@ -913,7 +926,8 @@ class ConstructionTools:
             value['metadata_definition_options'] = [option
                 for record in self.workspace.list_drafts()
                 if record.context_fingerprint == self.workspace.context_fingerprint
-                and (option := self._definition_options(record)).get('available')]
+                and ((option := self._definition_options(record)).get('available')
+                     or option.get('reason') == 'metadata_catalog_requalification_required')]
             from .statistics import graph_statistics
             try:
                 graph = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes)
@@ -938,10 +952,23 @@ class ConstructionTools:
                     'for the complete saved YAML. Read validation material for all diagnostics. Do not reconstruct it from session searches.'}
         return {"status": "ok", "format": "yaml", "content": content}
 
-    @staticmethod
-    def _definition_options(record):
+    def _definition_options(self, record):
         from .definitions import definition_options
-        return definition_options(record)
+        option = definition_options(record)
+        if not option.get('available'):
+            return option
+        try:
+            self._check_metadata_catalog(record.draft)
+        except LightGraphError as exc:
+            if exc.code != 'metadata_catalog_requalification_required':
+                raise
+            return {key: value for key, value in option.items() if key not in {'tool', 'arguments', 'next_action'}} | {
+                'available': False, 'reason': exc.code,
+                'next_action': METADATA_REQUALIFICATION_ACTION,
+                'alternative': {'tool': 'validate_graph_draft',
+                    'arguments': {'draft_id': record.draft.draft_id, 'mode': 'structure'},
+                    'fact_data_validation': 'not_run'}}
+        return option
 
     def _unavailable_table_source(self, table):
         # Configured identifiers identify an unavailable source, never create a

@@ -21,7 +21,7 @@ from lightgraph.query import QueryCompiler
 from .base import SourceAdapter, QueryStats, cursor_batches
 from .budget import QueryBudget, BudgetedCursor
 from .gauss_compat import catalog_value, catalog_bool, safe_database_cause, set_optional_lock_timeout
-from .database_errors import connection_is_closed, database_diagnostic, database_error, qualification_error, readback_shape_failure
+from .database_errors import connection_is_closed, database_diagnostic, database_error, qualification_error, readback_shape_failure, annotate_database_error, cleanup_preserving_error
 from .reconnect import configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary, terminal_failure, latch_terminal_failure, prepare_snapshot
 
 REQUIRED_RUNTIME = {"read_only_transaction", "parameter_binding", "metadata_reading", "distinct_projection", "statement_timeout", "query_cancel"}
@@ -98,7 +98,10 @@ class GaussSource(SourceAdapter):
             if hasattr(self, '_connection'):
                 try: self._connection.close()
                 except Exception: pass
-            if isinstance(exc, LightGraphError) or not isinstance(exc, Exception):
+            if isinstance(exc, LightGraphError):
+                annotate_database_error(exc, engine='gauss', stage='connection_preflight')
+                raise
+            if not isinstance(exc, Exception):
                 raise
             raise database_error('database_connection_failed', exc, engine='gauss',
                 stage='connection_preflight') from None
@@ -144,7 +147,7 @@ class GaussSource(SourceAdapter):
             if failure or str(catalog_value(values[0])).lower() not in ("on", "true") or str(catalog_value(values[1])).lower() != "repeatable read":
                 raise qualification_error('read_only_transaction_unverified', engine='gauss', stage=stage,
                     failure=failure or 'readback_mismatch', connection_closed=connection_is_closed(self._connection))
-        finally: cursor.close()
+        finally: cleanup_preserving_error(cursor.close)
 
     def preflight(self, *, probe_runtime_limits: bool = False) -> CapabilityManifest:
         """Bounded controls; runtime cancellation tests require explicit opt-in.
@@ -187,14 +190,16 @@ class GaussSource(SourceAdapter):
                     except Exception:
                         self._manifest.capabilities["cte"] = "unsupported"
                         self._manifest.capabilities["union_all"] = "unknown"
-                finally: cursor.close()
+                finally: cleanup_preserving_error(cursor.close)
                 self._connection.rollback()
                 self._apply_qualification()
                 if probe_runtime_limits:
                     self.verify_runtime_controls()
                 else:
                     self._manifest.actual_database_verified = False
-            except LightGraphError: raise
+            except LightGraphError as exc:
+                annotate_database_error(exc, engine='gauss', stage='connection_preflight')
+                raise
             except Exception as exc:
                 raise database_error('database_preflight_failed', exc, engine='gauss',
                     stage='connection_preflight', connection_closed=connection_is_closed(self._connection)) from None
@@ -249,14 +254,24 @@ class GaussSource(SourceAdapter):
                 self._probe_runtime_control(cancel=True)
                 self._manifest.actual_database_verified = all(
                     self._manifest.capabilities.get(k) == "verified" for k in REQUIRED_RUNTIME)
-            except LightGraphError: raise
+            except LightGraphError as exc:
+                annotate_database_error(exc, engine='gauss', stage='connection_preflight')
+                raise
             except Exception as exc:
-                raise LightGraphError("database_runtime_preflight_failed") from safe_database_cause(exc, logging.getLogger(__name__))
+                raise database_error('database_runtime_preflight_failed', exc, engine='gauss',
+                    stage='connection_preflight', connection_closed=connection_is_closed(self._connection)) from None
             finally:
+                active_error = sys.exc_info()[1]
                 self._manifest.consistent_snapshot = False
                 if not self._closed:
                     try: self._connection.rollback()
-                    except Exception: raise LightGraphError("snapshot_close_failed") from None
+                    except Exception as exc:
+                        if active_error is None:
+                            raise database_error('snapshot_close_failed', exc, engine='gauss',
+                                stage='connection_preflight', rollback_succeeded=False) from None
+                        if isinstance(active_error, LightGraphError):
+                            annotate_database_error(active_error, engine='gauss', stage='connection_preflight')
+                            active_error.database_diagnostic['rollback_succeeded'] = False
             return self.capabilities()
 
     def _read_catalog(self, cursor) -> list[TableSpec]:
@@ -316,10 +331,18 @@ class GaussSource(SourceAdapter):
                     remote = [attribute_maps[target_name].get(i) for i in numbers(remote_keys)]
                     if len(local) != len(remote) or any(c not in target.column_names for c in remote): continue
                     table.foreign_keys.append(ForeignKeySpec(name=name, columns=local, target_schema=remote_schema, target_table=remote_table, target_columns=remote))
+            # Catalog row order is not schema identity. Preserve column order
+            # inside each composite key, but normalize the constraint collection
+            # so a new snapshot cannot mistake a row permutation for a change.
+            table.unique_keys.sort(key=tuple)
+            table.foreign_keys.sort(key=lambda key: (key.name, key.target_schema,
+                key.target_table, tuple(key.columns), tuple(key.target_columns)))
 
     def _probe_runtime_control(self, *, cancel: bool):
-        self._connection.rollback(); self._start_readonly(); cursor = self._cursor()
+        self._connection.rollback(); self._start_readonly(stage='connection_preflight'); cursor = self._cursor()
         interrupted = False; timer = None; cancel_sent = threading.Event()
+        cancel_errors = []
+        probe_code = 'query_cancel_unverified' if cancel else 'statement_timeout_unverified'
         try:
             if cancel:
                 # A short configured statement timeout must not masquerade as
@@ -330,16 +353,21 @@ class GaussSource(SourceAdapter):
                     try:
                         query_connection.cancel()
                         cancel_sent.set()
-                    except Exception:
-                        # Driver details may contain secrets; the probe below
-                        # reports only query_cancel_unverified.
-                        pass
+                    except Exception as exc:
+                        # Retain only until the fixed probe ends, then expose
+                        # classified state instead of driver text or values.
+                        cancel_errors.append(exc)
                 timer = threading.Timer(0.05, send_cancel); timer.daemon = True; timer.start()
             else: cursor.execute("SET LOCAL statement_timeout = '50ms'")
             try: cursor.execute("SELECT pg_catalog.pg_sleep(0.25)")
+            except LightGraphError: raise
             except Exception as exc:
                 interrupted = getattr(exc, "sqlstate", None) == "57014" or getattr(exc, "pgcode", None) == "57014"
+                if not interrupted:
+                    raise database_error(probe_code, exc, engine='gauss', stage='connection_preflight',
+                        connection_closed=connection_is_closed(self._connection)) from None
         finally:
+            active_error = sys.exc_info()[1]
             if timer:
                 timer.cancel()
                 timer.join(timeout=min(2, max(.001, self.query_budget.deadline - time.monotonic())))
@@ -352,17 +380,43 @@ class GaussSource(SourceAdapter):
                     except Exception: pass
                     try: self._connection.close()
                     except Exception: pass
-                    raise LightGraphError('query_cancel_unverified')
-            cursor.close(); self._connection.rollback()
-        if cancel and not cancel_sent.is_set(): interrupted = False
-        if not interrupted: raise LightGraphError("query_cancel_unverified" if cancel else "statement_timeout_unverified")
+                    if active_error is None:
+                        raise qualification_error('query_cancel_unverified', engine='gauss',
+                            stage='connection_preflight', failure='cancel_not_completed', connection_closed=True)
+            # The callback's failure is raised below, outside this finally.
+            # A cursor/rollback failure must not hide its permission category.
+            active_error = active_error or (cancel_errors[0] if cancel_errors else None)
+            try:
+                cursor.close(); self._connection.rollback()
+            except Exception as exc:
+                if active_error is None:
+                    raise database_error('snapshot_close_failed', exc, engine='gauss',
+                        stage='connection_preflight', rollback_succeeded=False) from None
+        if cancel_errors:
+            if isinstance(cancel_errors[0], LightGraphError): raise cancel_errors[0]
+            raise database_error(probe_code, cancel_errors[0], engine='gauss',
+                stage='connection_preflight', connection_closed=connection_is_closed(self._connection)) from None
+        failure = 'cancel_not_sent' if cancel and not cancel_sent.is_set() else 'interrupt_not_observed' if not interrupted else None
+        if failure:
+            raise qualification_error(probe_code, engine='gauss', stage='connection_preflight',
+                failure=failure, connection_closed=connection_is_closed(self._connection))
         # Successful query after rollback confirms the connection has left the
         # cancelled query; driver cancel returning alone is insufficient.
-        self._start_readonly(); check = self._cursor()
+        self._start_readonly(stage='connection_preflight'); check = self._cursor()
         try:
             check.execute("SELECT 1")
-            if check.fetchone()[0] != 1: raise LightGraphError("runtime_control_unverified")
-        finally: check.close(); self._connection.rollback()
+            row = check.fetchone()
+            failure = readback_shape_failure(row, 1)
+            if failure or row[0] != 1 or isinstance(row[0], bool):
+                raise qualification_error('runtime_control_unverified', engine='gauss', stage='connection_preflight',
+                    failure=failure or 'readback_mismatch', connection_closed=connection_is_closed(self._connection))
+        finally:
+            active_error = sys.exc_info()[1]
+            try: check.close(); self._connection.rollback()
+            except Exception as exc:
+                if active_error is None:
+                    raise database_error('snapshot_close_failed', exc, engine='gauss',
+                        stage='connection_preflight', rollback_succeeded=False) from None
         self._manifest.capabilities["query_cancel" if cancel else "statement_timeout"] = "verified"
 
     def describe(self): return [t.model_copy(deep=True) for t in self._tables]

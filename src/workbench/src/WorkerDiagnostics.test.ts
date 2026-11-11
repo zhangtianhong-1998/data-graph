@@ -62,3 +62,18 @@ it('shows the failed capability probe and used recovery allowance without assert
   expect(root.textContent).toContain('该来源已停止事实查询')
   expect(root.textContent).toContain('检查未通过不等于网络断连')
 })
+it.each([
+  ['query_cancel_unverified', 'cancel_not_completed', '查询取消', '取消操作未完成', 'retry_limit_exhausted', '恢复次数已耗尽'],
+  ['statement_timeout_unverified', 'interrupt_not_observed', '语句超时', '未观察到预期的查询中断', 'retry_new_session', '丢弃当前会话，重新检查新会话'],
+  ['runtime_control_unverified', 'malformed_row', '查询中断后的会话检查', '检查结果格式不符', 'qualification_rejected', '资格检查未通过，当前阶段不能重试'],
+  ['cte_union_unverified', 'readback_mismatch', 'CTE 与 UNION 查询', '检查结果与要求不符', 'deterministic_rejection', '配置、权限或目录检查未通过'],
+])('shows the original %s failure and the actual recovery decision', async (probe, failure, probeLabel, failureLabel, decision, decisionLabel) => {
+  api.request.mockResolvedValue({ ...response(), events: [{ code: 'worker_database_diagnostic',
+    error_code: 'database_reconnect_failed', database: { category: 'qualification', stage: 'connection_preflight',
+      cause_code: probe, probe_code: probe, probe_failure: failure, recovery_decision: decision } }] })
+  await mount(); await open()
+  await vi.waitFor(() => expect(root.textContent).toContain(`原始错误：${probe}`))
+  expect(root.textContent).toContain(`恢复判定：${decisionLabel}`)
+  expect(root.textContent).toContain(`检查项目：${probeLabel}`)
+  expect(root.textContent).toContain(`检查结果：${failureLabel}`)
+})

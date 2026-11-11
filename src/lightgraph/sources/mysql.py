@@ -23,7 +23,7 @@ from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler
 from .base import SourceAdapter, QueryStats, cursor_batches
 from .budget import BudgetedCursor, QueryBudget
-from .database_errors import connection_is_closed, database_diagnostic, database_error, qualification_error, readback_shape_failure
+from .database_errors import connection_is_closed, database_diagnostic, database_error, qualification_error, readback_shape_failure, annotate_database_error, cleanup_preserving_error
 from .reconnect import configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary, terminal_failure, latch_terminal_failure, prepare_snapshot
 
 MYSQL_SQL_MODES = frozenset({"ONLY_FULL_GROUP_BY", "STRICT_TRANS_TABLES", "ERROR_FOR_DIVISION_BY_ZERO", "NO_ENGINE_SUBSTITUTION"})
@@ -167,7 +167,10 @@ class MySQLSource(SourceAdapter):
                 raise LightGraphError('runtime_capability_unverified')
         except BaseException as exc:
             self._close_connections()
-            if isinstance(exc, (LightGraphError, KeyboardInterrupt, SystemExit)):
+            if isinstance(exc, LightGraphError):
+                annotate_database_error(exc, engine='mysql', stage='connection_preflight')
+                raise
+            if not isinstance(exc, Exception):
                 raise
             raise database_error('database_connection_failed', exc, engine='mysql',
                 stage='connection_preflight') from None
@@ -243,7 +246,7 @@ class MySQLSource(SourceAdapter):
                 raise qualification_error('read_only_transaction_unverified', engine='mysql', stage=stage,
                     failure=failure or 'readback_mismatch', connection_closed=connection_is_closed(self._connection))
         finally:
-            self._close_cursor(cursor)
+            cleanup_preserving_error(self._close_cursor, cursor)
 
     def _apply_qualification(self):
         if self._qualification is None:
@@ -282,7 +285,7 @@ class MySQLSource(SourceAdapter):
                             or tuple(row[3:5]) != tuple(identity)):
                         raise LightGraphError("query_cancel_connection_mismatch")
                 finally:
-                    self._close_cursor(control)
+                    cleanup_preserving_error(self._close_cursor, control)
                 self._connection_id = row[2]
                 self._manifest.capabilities["read_only_transaction"] = "verified"
                 cursor.execute("SELECT %s", (71,))
@@ -305,10 +308,12 @@ class MySQLSource(SourceAdapter):
                 self._manifest.capabilities["metadata_reading"] = "verified"
                 cursor.execute("WITH p AS (SELECT 1 AS n) SELECT n FROM p UNION ALL SELECT 2")
                 if cursor.fetchall() != [(1,), (2,)]:
-                    raise LightGraphError("cte_union_unverified")
+                    raise qualification_error('cte_union_unverified', engine='mysql', stage='connection_preflight',
+                        failure='readback_mismatch', connection_closed=connection_is_closed(self._connection))
                 self._manifest.capabilities["cte"] = self._manifest.capabilities["union_all"] = "verified"
                 self._apply_qualification()
-            except LightGraphError:
+            except LightGraphError as exc:
+                annotate_database_error(exc, engine='mysql', stage='connection_preflight')
                 raise
             except Exception as exc:
                 raise database_error('database_preflight_failed', exc, engine='mysql',
@@ -402,7 +407,7 @@ class MySQLSource(SourceAdapter):
             try:
                 cursor.execute(f"KILL QUERY {int(connection_id)}")
             finally:
-                self._close_cursor(cursor)
+                cleanup_preserving_error(self._close_cursor, cursor)
 
     def _discard_data_connection(self, *, reconnect_allowed=False):
         self._broken = True
@@ -427,11 +432,13 @@ class MySQLSource(SourceAdapter):
 
     def _probe_runtime_control(self, *, cancel):
         self._rollback()
-        self._start_readonly()
+        self._start_readonly(stage='connection_preflight')
         cursor = self._cursor()
         timer = None
         cancel_sent = threading.Event()
+        cancel_errors = []
         interrupted = False
+        probe_code = 'query_cancel_unverified' if cancel else 'statement_timeout_unverified'
         try:
             cursor.execute(f"SET SESSION max_execution_time = {1000 if cancel else 50}")
             if cancel:
@@ -440,8 +447,8 @@ class MySQLSource(SourceAdapter):
                     try:
                         self._interrupt(target=cancel_target)
                         cancel_sent.set()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        cancel_errors.append(exc)
                 timer = threading.Timer(.05, interrupt)
                 timer.daemon = True
                 timer.start()
@@ -450,25 +457,53 @@ class MySQLSource(SourceAdapter):
                 # expression requires the documented cancellation error instead.
                 cursor.execute("SELECT SLEEP(0.25), 1")
                 cursor.fetchall()
+            except LightGraphError: raise
             except Exception as exc:
                 interrupted = _errno(exc) == (1317 if cancel else 3024)
+                # A timeout during client cancellation does not prove cancel
+                # works. Authentication/permission and other driver errors must
+                # retain their category instead of becoming a failed readback.
+                if not interrupted and not (cancel and _errno(exc) == 3024):
+                    raise database_error(probe_code, exc, engine='mysql', stage='connection_preflight',
+                        connection_closed=connection_is_closed(self._connection)) from None
         finally:
+            active_error = sys.exc_info()[1]
             if timer:
-                timer.cancel(); timer.join(timeout=2)
+                timer.cancel(); timer.join(timeout=min(2, max(.001, self.query_budget.deadline - time.monotonic())))
                 if timer.is_alive():
                     self._discard_data_connection()
-            self._close_cursor(cursor)
-            self._rollback()
-        if self._broken or not interrupted or cancel and not cancel_sent.is_set():
-            raise LightGraphError("query_cancel_unverified" if cancel else "statement_timeout_unverified")
-        self._start_readonly()
+            # A completed cancel callback may already have the primary error,
+            # even though no exception is active on this thread yet.
+            active_error = active_error or (cancel_errors[0] if cancel_errors else None)
+            try:
+                self._close_cursor(cursor)
+                self._rollback()
+            except Exception:
+                if active_error is None: raise
+        if cancel_errors:
+            if isinstance(cancel_errors[0], LightGraphError): raise cancel_errors[0]
+            raise database_error(probe_code, cancel_errors[0], engine='mysql',
+                stage='connection_preflight', connection_closed=connection_is_closed(self._connection)) from None
+        failure = ('cancel_not_completed' if self._broken else
+            'cancel_not_sent' if cancel and not cancel_sent.is_set() else
+            'interrupt_not_observed' if not interrupted else None)
+        if failure:
+            raise qualification_error(probe_code, engine='mysql', stage='connection_preflight',
+                failure=failure, connection_closed=connection_is_closed(self._connection))
+        self._start_readonly(stage='connection_preflight')
         check = self._cursor()
         try:
             check.execute("SELECT 1")
-            if check.fetchone() != (1,):
-                raise LightGraphError("runtime_control_unverified")
+            row = check.fetchone()
+            failure = readback_shape_failure(row, 1)
+            if failure or row[0] != 1 or isinstance(row[0], bool):
+                raise qualification_error('runtime_control_unverified', engine='mysql', stage='connection_preflight',
+                    failure=failure or 'readback_mismatch', connection_closed=connection_is_closed(self._connection))
         finally:
-            self._close_cursor(check); self._rollback()
+            active_error = sys.exc_info()[1]
+            try: self._close_cursor(check); self._rollback()
+            except Exception:
+                if active_error is None: raise
         self._manifest.capabilities["query_cancel" if cancel else "statement_timeout"] = "verified"
 
     def verify_runtime_controls(self):
@@ -505,13 +540,21 @@ class MySQLSource(SourceAdapter):
                 self._probe_runtime_control(cancel=False)
                 self._probe_runtime_control(cancel=True)
                 self._manifest.actual_database_verified = all(self._manifest.capabilities[k] == "verified" for k in REQUIRED_RUNTIME)
-            except LightGraphError:
+            except LightGraphError as exc:
+                annotate_database_error(exc, engine='mysql', stage='connection_preflight')
                 raise
-            except Exception:
-                raise LightGraphError("database_runtime_preflight_failed") from None
+            except Exception as exc:
+                raise database_error('database_runtime_preflight_failed', exc, engine='mysql',
+                    stage='connection_preflight', connection_closed=connection_is_closed(self._connection)) from None
             finally:
+                active_error = sys.exc_info()[1]
                 self._manifest.consistent_snapshot = False
-                self._rollback()
+                try: self._rollback()
+                except Exception:
+                    if active_error is None: raise
+                    if isinstance(active_error, LightGraphError):
+                        annotate_database_error(active_error, engine='mysql', stage='connection_preflight')
+                        active_error.database_diagnostic['rollback_succeeded'] = False
             return self.capabilities()
 
     def describe(self):

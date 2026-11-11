@@ -54,7 +54,89 @@ async function switchToCandidates() {
   expect(graphCalls[1]).toContain('include_candidates=true')
 }
 
+async function openBusinessGraph() {
+  root = document.createElement('div'); document.body.append(root); app = createApp(App); app.mount(root)
+  await vi.waitFor(() => expect(button('运行与结果')).toBeDefined())
+  button('运行与结果').click(); await nextTick(); button('业务图谱').click(); await nextTick()
+}
+
+function graphResponse(label = '已发布业务节点') {
+  return response({ nodes: [{ id: 'published', label }], edges: [] })
+}
+
+function graphFetch(implementation: (url: string, init?: RequestInit) => Promise<Response>) {
+  const original = vi.mocked(fetch).getMockImplementation()!
+  vi.mocked(fetch).mockImplementation((input, init) => String(input).includes('/graph?') ? implementation(String(input), init) : original(input, init))
+}
+
 describe('background graph request isolation', () => {
+  it('recovers an initial 503 before batch loading can start', async () => {
+    let attempts = 0
+    graphFetch(async () => ++attempts === 1 ? new Response('', { status: 503 }) : graphResponse())
+    await openBusinessGraph()
+    await vi.waitFor(() => expect(root.querySelector('.test-node')?.textContent).toBe('已发布业务节点'))
+    expect(attempts).toBe(2)
+    expect(root.textContent).not.toContain('图谱读取失败')
+  })
+
+  it('limits initial failures and keeps a manual initial-read retry instead of an empty success', async () => {
+    let fail = true, attempts = 0
+    graphFetch(async () => { attempts++; if (fail) throw new TypeError('network unavailable'); return graphResponse() })
+    await openBusinessGraph()
+    await vi.waitFor(() => expect(root.querySelector('[role="alert"]')?.textContent).toContain('图谱读取失败'))
+    expect(attempts).toBe(3)
+    expect(root.querySelector('[data-testid="graph-view"]')).toBeNull()
+    fail = false; button('重试读取图谱').click()
+    await vi.waitFor(() => expect(root.querySelector('.test-node')?.textContent).toBe('已发布业务节点'))
+    expect(attempts).toBe(4)
+    expect(root.querySelector('[role="alert"]')).toBeNull()
+  })
+
+  it('does not retry initial access failures', async () => {
+    let attempts = 0
+    graphFetch(async () => { attempts++; return new Response(JSON.stringify({ error: { code: 'graph_access_context_changed' } }), { status: 403 }) })
+    await openBusinessGraph()
+    await vi.waitFor(() => expect(root.querySelector('[role="alert"]')?.textContent).toContain('图谱读取失败'))
+    await new Promise(resolve => setTimeout(resolve, 350))
+    expect(attempts).toBe(1)
+  })
+
+  it('keeps a successful business refresh when metadata is unavailable', async () => {
+    let metadataFails = false, graphVersion = '原图'
+    graphFetch(async () => graphResponse(graphVersion))
+    const original = vi.mocked(fetch).getMockImplementation()!
+    vi.mocked(fetch).mockImplementation((input, init) => metadataFails && String(input).endsWith('/metadata')
+      ? Promise.resolve(new Response(JSON.stringify({ error: { code: 'metadata_unavailable' } }), { status: 503 })) : original(input, init))
+    await openBusinessGraph()
+    await vi.waitFor(() => expect(root.querySelector('.test-node')?.textContent).toBe('原图'))
+    metadataFails = true; graphVersion = '新图'; button('刷新图谱').click()
+    await vi.waitFor(() => expect(root.querySelector('.test-node')?.textContent).toBe('新图'))
+    await vi.waitFor(() => expect(root.querySelector('.error-strip')).not.toBeNull())
+    expect(root.querySelector('[role="alert"]')?.textContent || '').not.toContain('图谱读取失败')
+  })
+
+  it('cancels an old project initial read and never retries or displays its late reply', async () => {
+    const other = { ...project, project_id: 'q', name: '另一个项目' }
+    const original = vi.mocked(fetch).getMockImplementation()!
+    let oldSignal: AbortSignal | null | undefined
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = String(input)
+      if (url === '/api/projects') return Promise.resolve(response({ projects: [project, other] }))
+      if (url === '/api/projects/q') return Promise.resolve(response(other))
+      if (url.startsWith('/api/projects/q/graph?')) return Promise.resolve(graphResponse('另一项目图'))
+      if (url.startsWith('/api/projects/p/graph?')) oldSignal = init?.signal
+      return original(input, init)
+    })
+    await openBusinessGraph()
+    ;[...root.querySelectorAll<HTMLButtonElement>('.project')].find(item => item.textContent?.includes(other.name))!.click()
+    await vi.waitFor(() => expect(root.querySelector('.test-node')?.textContent).toBe('另一项目图'))
+    expect(oldSignal?.aborted).toBe(true)
+    resolveInitial(graphResponse('迟到旧项目图'))
+    await new Promise(resolve => setTimeout(resolve, 350))
+    expect(root.querySelector('.test-node')?.textContent).toBe('另一项目图')
+    expect(graphCalls).toHaveLength(1)
+  })
+
   it('keeps the newer candidate graph visible when the initial request completes late', async () => {
     await switchToCandidates()
     resolveInitial(response({ nodes: [{ id: 'old', label: '旧普通图' }], edges: [] }))

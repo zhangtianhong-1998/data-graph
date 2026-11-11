@@ -54,7 +54,7 @@ Windows 使用 `.venv\Scripts\python.exe` 和 `.venv\Scripts\lightgraph.exe`。�
 
 事实来源断连时，Agent 可从已保存的混合草稿另存度量、维度等列定义草稿，单独验证并发布。已有列定义使用本次授权目录，无需读取经营数值；事实成员及其关联仍留在主草稿中等待验证。目录变化或权限失效不会被当作可离线复用的网络故障，见[快照恢复与独立列定义发布](design/lightweight_graph/RECOVERY_AND_DEFINITIONS_20261110.md)。
 
-已授权来源换新会话时，参数绑定、DISTINCT 或只读资格的预检读回失败，可丢弃会话并在三次恢复额度内重新检查；失败连接不能取数，新会话仍须通过全部检查。首次来源资格检查、后续事务开始时的只读资格错误、认证、权限和目录错误保持原约束。进程诊断显示具体检查项目、失败类型和恢复次数。同次验证中相同的完整事实投影仍可复用，恢复后需验证并发布主草稿才能补上关联边。详见[本轮恢复与加载修订](design/lightweight_graph/READONLY_REFRESH_AND_GRAPH_LOADING_20261110.md)及[关联取数复用](design/lightweight_graph/PREFLIGHT_AND_RELATION_REUSE_20261110.md)。
+已授权来源换新会话时，参数绑定、DISTINCT、只读、超时或取消能力的预检失败，可丢弃会话并在三次恢复额度内重新检查；失败连接不能取数，新会话仍须通过全部检查。首次来源资格检查、后续事务开始时的只读资格错误、认证、权限和目录错误保持原约束。进程诊断保留原始安全错误码、检查项目、恢复决定及次数。同次验证中相同的完整事实投影仍可复用，恢复后需验证并发布主草稿才能补上关联边。详见[抽取期恢复与诊断修订](design/lightweight_graph/RECOVERY_DIAGNOSTICS_20261111.md)及[关联取数复用](design/lightweight_graph/PREFLIGHT_AND_RELATION_REUSE_20261110.md)。
 
 字段本身也可按目标建为定义对象，例如从元数据或文档中的字段说明建立度量定义。`metadata_column` 使用来源、Schema、表、列作为身份，不查询金额值；Agent 必须引用已读取且适用的材料。它可与实际行中的指标关联，分别记录“声明适用”或“观察到非空值”的依据，不自动连接全图指标。空维度编码可用显式 `is_not_null` 筛选；列定义、谓词和跨源内存边界见[本轮设计](design/lightweight_graph/METADATA_OBJECTS_AND_RELATIONS_20261105.md)。
 

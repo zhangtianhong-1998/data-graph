@@ -110,6 +110,61 @@ def test_log_is_bounded_and_never_automatically_removed(tmp_path):
     assert result['events'][-1]['code'] == 'worker_process_exited' and result['events'][-1]['exit_code'] == 7
 
 
+def test_terminal_database_cause_uses_reserved_tail_without_crowding_out_exit(tmp_path):
+    record = tmp_path / 'run.json'
+    sink = WorkerDiagnostics(record)
+    for _ in range(1500):
+        sink.emit('worker_database_diagnostic', stage='construction', error_code='query_execution_failed')
+    assert read_worker_log(record)['incomplete']
+    detail = {'engine': 'gauss', 'stage': 'connection_preflight', 'category': 'qualification',
+        'terminal': True, 'cause_code': 'query_cancel_unverified',
+        'probe_code': 'query_cancel_unverified', 'probe_failure': 'cancel_not_completed',
+        'recovery_decision': 'retry_limit_exhausted', 'boundary_recovery_attempts': 3,
+        'recovery_attempt_limit': 3, 'raw_message': SECRET}
+    trace = RunTrace(trace_path(record))
+    with bind_trace(trace):
+        for _ in range(100):
+            sink.emit('worker_database_diagnostic', stage='construction',
+                error_code='database_reconnect_failed', database=detail, connection_generation=9)
+        # Distinct stopped sources/generations have a small fixed allowance.
+        for generation in range(10, 30):
+            sink.emit('worker_database_diagnostic', stage='construction',
+                error_code='database_reconnect_failed', database=detail, connection_generation=generation)
+        sink.emit('worker_process_exited', exit_code=2)
+    result = read_worker_log(record)
+    terminal = [event for event in result['events'] if event.get('database', {}).get('terminal')]
+    assert len(terminal) == 4
+    assert terminal[0]['database']['cause_code'] == 'query_cancel_unverified'
+    assert result['events'][-1]['code'] == 'worker_process_exited'
+    assert result['events'][-1]['exit_code'] == 2
+    assert sink.path.stat().st_size <= MAX_LOG_BYTES
+    traced = [json.loads(line) for line in trace.path.read_text().splitlines()]
+    assert len(traced) == 5  # Four distinct terminal diagnoses and the process exit.
+    assert SECRET not in worker_log_path(record).read_text() + trace.path.read_text()
+
+
+def test_terminal_database_diagnosis_reaches_trace_even_when_worker_log_is_completely_full(tmp_path):
+    record = tmp_path / 'run.json'
+    sink = WorkerDiagnostics(record)
+    sink.path.parent.mkdir(parents=True, exist_ok=True)
+    # A valid already-full log, e.g. another final writer used the exit reserve.
+    line = b'{"code":"worker_finished"}'
+    sink.path.write_bytes(line + b' ' * (MAX_LOG_BYTES - len(line) - 1) + b'\n')
+    trace = RunTrace(trace_path(record))
+    with bind_trace(trace):
+        for _ in range(20):
+            sink.emit('worker_database_diagnostic', error_code='database_reconnect_failed', database={
+                'terminal': True, 'cause_code': 'statement_timeout_unverified',
+                'recovery_decision': 'retry_limit_exhausted', 'raw_message': SECRET})
+    assert sink.path.stat().st_size == MAX_LOG_BYTES
+    assert read_worker_log(record)['events'] == [{'code': 'worker_finished'}]
+    traced = [json.loads(line) for line in trace.path.read_text().splitlines()]
+    assert len(traced) == 1
+    assert 'statement_timeout_unverified' in trace.path.read_text()
+    assert 'retry_limit_exhausted' in trace.path.read_text()
+    assert SECRET not in trace.path.read_text()
+
+
 def test_log_write_failure_is_visible_without_failing_extraction(tmp_path, monkeypatch):
     record = tmp_path / 'run.json'
     sink = WorkerDiagnostics(record)
@@ -163,6 +218,43 @@ def test_probe_diagnostics_preserve_reason_and_bounds_without_raw_readback(tmp_p
     diagnostic = read_worker_log(record)['events'][-1]['database']
     assert diagnostic.get('probe_code') != SECRET and diagnostic.get('probe_failure') != SECRET
     assert SECRET not in worker_log_path(record).read_text()
+
+
+@pytest.mark.parametrize(('probe', 'failure'), [
+    ('query_cancel_unverified', 'cancel_not_sent'),
+    ('query_cancel_unverified', 'cancel_not_completed'),
+    ('statement_timeout_unverified', 'interrupt_not_observed'),
+    ('runtime_control_unverified', 'malformed_row'),
+    ('cte_union_unverified', 'readback_mismatch'),
+])
+def test_runtime_probe_cause_and_recovery_decision_survive_worker_and_trace(tmp_path, probe, failure):
+    record = tmp_path / 'run.json'
+    sink = WorkerDiagnostics(record)
+    trace = RunTrace(trace_path(record))
+    handler = DatabaseDiagnosticHandler(sink, lambda: 'construction')
+    logger = logging.getLogger('lightgraph.sources.database_errors')
+    detail = {'engine': 'gauss', 'stage': 'connection_preflight', 'category': 'qualification',
+        'cause_code': probe, 'probe_code': probe, 'probe_failure': failure,
+        'recovery_decision': 'retry_limit_exhausted', 'boundary_recovery_attempts': 3,
+        'recovery_attempt_limit': 3, 'terminal': True, 'exception_message': SECRET}
+    event = logger.makeRecord(logger.name, logging.ERROR, __file__, 1, SECRET, (), None,
+        extra={'error_code': 'database_reconnect_failed', 'database_diagnostic': detail})
+    with bind_trace(trace):
+        handler.handle(event)
+        sink.emit('worker_database_diagnostic', error_code=probe, database=detail)
+    events = read_worker_log(record)['events']
+    assert [item['error_code'] for item in events] == ['database_reconnect_failed', probe]
+    for item in events:
+        database = item['database']
+        assert database['cause_code'] == probe
+        assert database['probe_code'] == probe and database['probe_failure'] == failure
+        assert database['recovery_decision'] == 'retry_limit_exhausted'
+        assert database['boundary_recovery_attempts'] == 3
+    assert SECRET not in worker_log_path(record).read_text()
+    assert SECRET not in trace.path.read_text()
+    detail.update(cause_code=SECRET, recovery_decision=SECRET, probe_code=SECRET, probe_failure=SECRET)
+    handler.handle(event)
+    assert SECRET not in str(read_worker_log(record))
 
 
 def test_windows_long_path_and_symlink_destinations(tmp_path):
