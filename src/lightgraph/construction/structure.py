@@ -11,18 +11,23 @@ from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler
 from .access import scope_binding_map
 from .executor import _projection_columns
+from .inherited_endpoints import inherited_contract_error, inherited_keys
 from .models import GraphDraft
 from .metadata_columns import is_metadata_mapping, metadata_endpoint, mapping_predicate, checked_column
 from .quality import name_mapping_advice
 
 
-def validate_structure(draft, tables, *, goal=None, dialects=None, scope_bindings=()):
+def validate_structure(draft, tables, *, goal=None, dialects=None, scope_bindings=(), base_graph=None):
     """Check authorized physical bindings and predicates using only the catalog."""
     draft = GraphDraft.model_validate(draft.model_dump(mode='python', by_alias=True)
                                      if isinstance(draft, GraphDraft) else draft)
     catalog = {(t.source_id, t.schema_name, t.name): t for t in tables}
     visibility = scope_binding_map(scope_bindings)
+    base_types = inherited_keys(base_graph)
     diagnostics, bindings = [], []
+    error = inherited_contract_error(draft, base_types)
+    if error:
+        diagnostics.append({'code': error})
 
     def check(mapping, columns, location):
         key = (mapping.source_id, mapping.schema_name, mapping.table)
@@ -49,7 +54,7 @@ def validate_structure(draft, tables, *, goal=None, dialects=None, scope_binding
                          'table': table.name, 'columns': selected, 'path': location,
                          'predicate': mapping.predicate})
 
-    if not draft.entities:
+    if not draft.entities and not (draft.extends_base_graph and base_types and draft.relations):
         diagnostics.append({'code': 'graph_draft_has_no_entities'})
     for category in ('entities', 'relations'):
         for index, definition in enumerate(getattr(draft, category)):
@@ -77,6 +82,10 @@ def validate_structure(draft, tables, *, goal=None, dialects=None, scope_binding
                 for name in ('source_lookup', 'target_lookup'):
                     lookup = getattr(mapping, name, None)
                     if lookup is not None:
+                        if lookup.source_id == '__base_graph__':
+                            if lookup.table not in base_types:
+                                diagnostics.append({'code': 'base_graph_entity_type_missing', 'path': path + [name]})
+                            continue
                         try:
                             check(lookup, list(dict.fromkeys(lookup.match_columns + lookup.key_columns)), path + [name])
                         except LightGraphError as exc:

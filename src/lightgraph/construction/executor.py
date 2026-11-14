@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter, defaultdict, deque
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 
 from lightgraph.contracts import canonical, digest
@@ -11,8 +11,10 @@ from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.query import QueryCompiler
 from lightgraph.query.predicate import ScopeConjunction
 from lightgraph.sources.base import aggregate_count
+from lightgraph.sources.database_errors import cleanup_preserving_error
 from lightgraph.source_values import (source_scalar, scalar_kind, typed_key, identity_values,
     typed_value, plain_value, SOURCE_KEY_SEMANTICS_VERSION)
+from .inherited_endpoints import InheritedEndpoints, inherited_contract_error
 from .models import GraphDraft, draft_evidence_refs
 from .access import scope_binding_map, support_scope
 from .display import derive_display_graph
@@ -34,6 +36,10 @@ def _projection_columns(mapping):
         columns += list(mapping.display_columns.values())
         if mapping.label_column:
             columns.append(mapping.label_column)
+        if getattr(mapping, 'english_name_column', None):
+            columns.append(mapping.english_name_column)
+        if getattr(mapping, 'description_column', None):
+            columns.append(mapping.description_column)
     return list(dict.fromkeys(columns))
 
 
@@ -61,7 +67,8 @@ def _has_cycle(pairs):
 
 
 def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 1024 * 1024,
-                  max_rows=20000, max_seconds=1800, scope_bindings=(), cancelled=None):
+                  max_rows=20000, max_seconds=1800, scope_bindings=(), cancelled=None,
+                  base_graph=None, enable_co_projection=False):
     """Check complete source projections and build an evidence-labelled graph.
 
     Callers provide an authorized physical catalog. Keys include only explicitly
@@ -75,6 +82,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                      if isinstance(draft, GraphDraft) else draft)
     allowed = {(t.source_id, t.schema_name, t.name): t for t in tables}
     by_source = {t.source_id: adapter for adapter in adapters for t in adapter.describe()}
+    inherited = InheritedEndpoints(base_graph if draft.extends_base_graph else None)
+    local_types = {definition.type for definition in draft.entities}
     nodes, edges, diagnostics = {}, {}, []
     checked, projected_rows, omitted = 0, 0, 0
     deadline = time.monotonic() + max_seconds
@@ -90,6 +99,14 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     unavailable_sources = {}
     incomplete_entity_types = set()
     visibility = scope_binding_map(scope_bindings)
+    sql_count_seconds = 0.0
+    sql_projection_seconds = 0.0
+    projection_operation_seconds = 0.0
+    materialization_seconds = 0.0
+    display_seconds = 0.0
+    co_projection_groups = 0
+    co_projection_hits = 0
+    co_projection_fallbacks = 0
 
     def scope_columns(mapping):
         return visibility.get((mapping.source_id, mapping.schema_name, mapping.table), [])
@@ -117,14 +134,34 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             sorted(set(_projection_columns(mapping) + scope_columns(mapping))),
             predicate_parts, cap])
 
+    def co_projection_group_key(mapping):
+        adapter = by_source.get(mapping.source_id)
+        cap = min(max_rows, adapter.limits.max_result_rows) if adapter else max_rows
+        predicate = mapping_predicate(mapping)
+        predicate_parts = ([predicate.user_predicate, predicate.partition_filter]
+                           if isinstance(predicate, ScopeConjunction) else [predicate, None])
+        return canonical([mapping.source_id, mapping.schema_name, mapping.table, predicate_parts, cap])
+
     # Keep a projection only until its last consumer. Lookup indexes retain
     # their backing rows for this snapshot and therefore remain pinned.
-    remaining_uses = Counter(projection_key(m) for d in draft.entities + draft.relations for m in d.mappings
-                             if not is_metadata_mapping(m))
+    all_row_mappings = [m for d in draft.entities + draft.relations for m in d.mappings
+                        if not is_metadata_mapping(m)]
+    remaining_uses = Counter(projection_key(m) for m in all_row_mappings)
     pinned_projections = {projection_key(lookup) for d in draft.relations for m in d.mappings
-                          for lookup in (m.source_lookup, m.target_lookup) if lookup is not None}
+                          for lookup in (m.source_lookup, m.target_lookup)
+                          if lookup is not None and lookup.source_id != '__base_graph__'}
     projection_sizes = {}
     unique_projections = set()
+    co_groups = defaultdict(dict)
+    if enable_co_projection:
+        for m in all_row_mappings:
+            if getattr(m, 'source_id', None) == '__base_graph__':
+                continue
+            pkey = projection_key(m)
+            gkey = co_projection_group_key(m)
+            if pkey not in co_groups[gkey]:
+                co_groups[gkey][pkey] = m
+    attempted_co_groups = set()
 
     def release_projection(mapping):
         nonlocal cache_bytes
@@ -253,9 +290,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             exc.construction_source_id = mapping.source_id
             raise exc
 
-    def _rows_for(mapping):
-        nonlocal cache_bytes, cache_hits
-        clock()
+    def _prepare_mapping_access(mapping):
         table = allowed.get((mapping.source_id, mapping.schema_name, mapping.table))
         adapter = by_source.get(mapping.source_id)
         if table is None or adapter is None:
@@ -280,49 +315,161 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         cap = min(max_rows, adapter.limits.max_result_rows)
         compiler = QueryCompiler([table], dialect=adapter.compiler.dialect,
                                  physical_columns=adapter.compiler.guard.physical_columns)
-        # Compile against the filtered catalog before the adapter uses its own
-        # catalog, including columns mentioned only in a predicate.
         compiler.projection(table, columns, predicate=predicate, limit=cap)
-        cache_key = projection_key(mapping)
-        if cache_key in projection_cache:
-            cache_hits += 1
-            return projection_cache[cache_key]
-        # A count and its projection need one snapshot. Release it before
-        # materializing or reading another projection, including another source.
-        with source_snapshot(mapping.source_id, adapter, cache_key) as window:
+        return table, adapter, predicate, columns, cap, compiler
+
+    def _run_projection(table, adapter, compiler, columns, predicate, cap, snapshot_key):
+        nonlocal projection_operation_seconds
+        started = time.monotonic()
+        try:
+            return _read_projection(table, adapter, compiler, columns, predicate, cap, snapshot_key)
+        finally:
+            # Includes qualification and snapshot teardown, which are I/O, not
+            # Python graph materialization. Account for failed operations too.
+            projection_operation_seconds += max(0.0, time.monotonic() - started)
+
+    @contextmanager
+    def batch_stream(stream):
+        try:
+            yield stream
+        finally:
+            if hasattr(stream, 'close'):
+                cleanup_preserving_error(stream.close)
+
+    def _read_projection(table, adapter, compiler, columns, predicate, cap, snapshot_key):
+        nonlocal sql_count_seconds, sql_projection_seconds
+        proj_timeout = (adapter.limits.effective_timeout_ms('projection')
+                        if hasattr(adapter.limits, 'effective_timeout_ms') else None)
+        with (adapter.timeout_scope(proj_timeout) if hasattr(adapter, 'timeout_scope') else ExitStack()), \
+             source_snapshot(table.source_id, adapter, snapshot_key) as window:
             query = compiler.profile_column_group(table, columns, predicate=predicate)
             expected = None
-            for batch in adapter.execute(query, row_limit=1):
-                with batch:
-                    for row in batch:
-                        if expected is not None:
-                            raise LightGraphError('invalid_aggregate_shape')
-                        expected = aggregate_count(dict(zip(batch.columns, row)).get('distinct_tuples'))
+            t0 = time.monotonic()
+            try:
+                with batch_stream(adapter.execute(query, row_limit=1)) as stream:
+                    for batch in stream:
+                        with batch:
+                            for row in batch:
+                                if expected is not None:
+                                    raise LightGraphError('invalid_aggregate_shape')
+                                expected = aggregate_count(dict(zip(batch.columns, row)).get('distinct_tuples'))
+            finally:
+                sql_count_seconds += max(0.0, time.monotonic() - t0)
             if expected is None:
                 raise LightGraphError('invalid_aggregate_shape')
             if expected > cap:
                 raise LightGraphError('projection_truncated')
             rows, retained_bytes = [], 0
-            stream = adapter.project(table, columns, predicate=predicate, distinct=True, limit=cap)
+            t1 = time.monotonic()
             try:
-                for batch in stream:
-                    with batch:
-                        if tuple(batch.columns) != tuple(columns):
-                            raise LightGraphError('projection_columns_mismatch')
-                        for row in batch:
-                            clock()
-                            item = dict(zip(batch.columns, (source_scalar(value) for value in row)))
-                            retained_bytes += len(canonical(item).encode())
-                            check_memory('projection', retained_bytes)
-                            if len(rows) >= cap:
-                                raise LightGraphError('projection_truncated')
-                            rows.append(item)
+                with batch_stream(adapter.project(table, columns, predicate=predicate, distinct=True, limit=cap)) as stream:
+                    for batch in stream:
+                        with batch:
+                            if tuple(batch.columns) != tuple(columns):
+                                raise LightGraphError('projection_columns_mismatch')
+                            for row in batch:
+                                clock()
+                                item = dict(zip(batch.columns, (source_scalar(value) for value in row)))
+                                retained_bytes += len(canonical(item).encode())
+                                check_memory('projection', retained_bytes)
+                                if len(rows) >= cap:
+                                    raise LightGraphError('projection_truncated')
+                                rows.append(item)
             finally:
-                if hasattr(stream, 'close'):
-                    stream.close()
+                sql_projection_seconds += max(0.0, time.monotonic() - t1)
             if len(rows) != expected:
                 raise LightGraphError('projection_incomplete')
             window['completed_projections'] = 1
+        return rows, retained_bytes
+
+    def _try_co_projection(mapping, table, adapter, predicate, cap):
+        nonlocal cache_bytes, co_projection_groups, co_projection_hits, co_projection_fallbacks
+        gkey = co_projection_group_key(mapping)
+        peers = co_groups.get(gkey)
+        if not peers or len(peers) < 2 or gkey in attempted_co_groups:
+            return None
+        attempted_co_groups.add(gkey)
+        valid_peers = {}
+        for pkey, peer in peers.items():
+            if remaining_uses.get(pkey, 0) <= 0 and pkey not in pinned_projections:
+                continue
+            try:
+                _, _, _, peer_cols, _, _ = _prepare_mapping_access(peer)
+            except LightGraphError:
+                continue
+            valid_peers[pkey] = peer_cols
+        if len(valid_peers) < 2:
+            return None
+        union_cols = list(dict.fromkeys(c for cols in valid_peers.values() for c in cols))
+        if len(union_cols) > 16:
+            co_projection_fallbacks += 1
+            return None
+        union_compiler = QueryCompiler([table], dialect=adapter.compiler.dialect,
+                                       physical_columns=adapter.compiler.guard.physical_columns)
+        union_compiler.projection(table, union_cols, predicate=predicate, limit=cap)
+        union_key = canonical([table.source_id, table.schema_name, table.name, sorted(union_cols),
+                               [predicate.user_predicate, predicate.partition_filter]
+                               if isinstance(predicate, ScopeConjunction) else [predicate, None], cap])
+        try:
+            union_rows, union_bytes = _run_projection(table, adapter, union_compiler, union_cols, predicate, cap, union_key)
+        except LightGraphError as exc:
+            # Cardinality explosion or working-memory guard: fall back cleanly to narrow projections.
+            if exc.code in {'projection_truncated', 'memory_budget_exhausted'}:
+                co_projection_fallbacks += 1
+                return None
+            raise
+        split_cache = {}
+        split_sizes = {}
+        total_split_bytes = 0
+        try:
+            for pkey, peer_cols in valid_peers.items():
+                seen_tuples = set()
+                seen_bytes = 0
+                subset_rows = []
+                subset_bytes = 0
+                for row in union_rows:
+                    clock()
+                    sub = {c: row[c] for c in peer_cols}
+                    tok = typed_key([row[c] for c in peer_cols])
+                    if tok in seen_tuples:
+                        continue
+                    seen_tuples.add(tok)
+                    size = len(canonical(sub).encode())
+                    subset_bytes += size
+                    total_split_bytes += size
+                    seen_bytes += len(tok.encode()) + 64
+                    check_memory('projection', union_bytes + total_split_bytes + seen_bytes)
+                    subset_rows.append(sub)
+                split_cache[pkey] = subset_rows
+                split_sizes[pkey] = subset_bytes
+        except LightGraphError as exc:
+            if exc.code == 'memory_budget_exhausted':
+                co_projection_fallbacks += 1
+                return None
+            raise
+        del union_rows, union_bytes
+        co_projection_groups += 1
+        unique_projections.add(union_key)
+        for pkey, subset_rows in split_cache.items():
+            projection_cache[pkey] = subset_rows
+            projection_sizes[pkey] = split_sizes[pkey]
+            cache_bytes += split_sizes[pkey]
+        co_projection_hits += len(split_cache) - 1
+        return projection_cache.get(projection_key(mapping))
+
+    def _rows_for(mapping):
+        nonlocal cache_bytes, cache_hits
+        clock()
+        table, adapter, predicate, columns, cap, compiler = _prepare_mapping_access(mapping)
+        cache_key = projection_key(mapping)
+        if cache_key in projection_cache:
+            cache_hits += 1
+            return projection_cache[cache_key]
+        if enable_co_projection:
+            co_rows = _try_co_projection(mapping, table, adapter, predicate, cap)
+            if co_rows is not None:
+                return co_rows
+        rows, retained_bytes = _run_projection(table, adapter, compiler, columns, predicate, cap, cache_key)
         # Reuse only complete observations from this validation; the window above
         # records when each projection was read, without a whole-run snapshot claim.
         cache_bytes += retained_bytes
@@ -340,7 +487,12 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             raise LightGraphError('null_identity_key')
         return key
 
-    def resolve_endpoint(mapping, row, end):
+    def charge_lookup(size):
+        nonlocal lookup_bytes
+        lookup_bytes += size
+        check_memory('lookup_index')
+
+    def resolve_endpoint(mapping, row, end, kind):
         """Resolve only matches for this input row; unrelated sets never combine."""
         nonlocal lookup_bytes, lookup_matches, lookup_omitted
         column = getattr(mapping, end + '_metadata')
@@ -349,6 +501,13 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             return [(physical_column_key(column), None)]
         columns = getattr(mapping, end + '_key_columns')
         lookup = getattr(mapping, end + '_lookup')
+        if ((lookup is not None and lookup.source_id == '__base_graph__') or
+                (lookup is None and kind not in local_types)):
+            answers = inherited.resolve(kind, lookup, columns, key_for(row, columns), end,
+                                        clock=clock, charge=charge_lookup)
+            lookup_matches += len(answers)
+            lookup_omitted += int(not answers)
+            return answers
         if lookup is None:
             return [(key_for(row, columns), None)]
         cache_key = canonical(lookup.model_dump(mode='json', by_alias=True))
@@ -391,12 +550,20 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         return answers
 
     def provenance(kind, index, mapping):
-        return {'definition': kind, 'mapping': index,
+        info = {'definition': kind, 'mapping': index,
                 'source': {'source_id': mapping.source_id, 'schema': mapping.schema_name,
                            'table': mapping.table},
                 'columns': _projection_columns(mapping), 'scope_columns': scope_columns(mapping),
+                **({'property_columns': dict(mapping.properties)} if mapping.properties else {}),
                 **({'constant_properties': mapping.constant_properties} if mapping.constant_properties else {}),
                 **({'context_columns': mapping.context_columns} if mapping.context_columns else {})}
+        if getattr(mapping, 'alias_columns', None):
+            info['alias_columns'] = list(mapping.alias_columns)
+        if getattr(mapping, 'english_name_column', None):
+            info['english_name_column'] = mapping.english_name_column
+        if getattr(mapping, 'description_column', None):
+            info['description_column'] = mapping.description_column
+        return info
 
     def contribution(mapping, row, origin):
         support = {'scope_ref': support_scope(row, scope_columns(mapping)),
@@ -407,10 +574,16 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             # context. Equal rows share evidence; this is not a physical row ID.
             values = {name: row[name] for name in sorted(mapping.context_columns)}
             support['row_context'] = {'id': 'ctx_' + digest(origin['source'], typed_value(values)), 'values': values,
-                                     'value_types': {name: scalar_kind(value) for name, value in values.items()}}
+                                      'value_types': {name: scalar_kind(value) for name, value in values.items()}}
         if hasattr(mapping, 'alias_columns'):
             value = row[mapping.label_column] if mapping.label_column else None
             support['label'] = str(value) if value not in (None, '') else None
+            if getattr(mapping, 'english_name_column', None):
+                en_val = row[mapping.english_name_column]
+                support['english_name'] = str(en_val) if en_val not in (None, '') else None
+            if getattr(mapping, 'description_column', None):
+                desc_val = row[mapping.description_column]
+                support['description'] = str(desc_val) if desc_val not in (None, '') else None
             support['aliases'] = sorted({str(row[column]) for column in mapping.alias_columns
                                          if row[column] is not None})
             if mapping.display_columns:
@@ -443,10 +616,14 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                     'identity_origin': 'physical_column' if is_metadata_mapping(e.mappings[0]) else 'row'}
                     for e in draft.entities],
                    'relations': [r.model_dump(mode='json', exclude={'mappings'}) for r in draft.relations]}
-    if not draft.entities:
+    if not draft.entities and not (draft.relations and draft.extends_base_graph and inherited.keys):
         diagnostic('graph_draft_has_no_entities')
+    mat_started = time.monotonic()
     try:
         clock()
+        contract_error = inherited_contract_error(draft, inherited.keys)
+        if contract_error:
+            raise LightGraphError(contract_error)
         for entity in draft.entities:
             if goal is not None and goal.entity_kinds and entity.type not in goal.entity_kinds:
                 diagnostic('outside_extraction_goal', entity_type=entity.type)
@@ -479,6 +656,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                     support['key_columns'] = mapping.key_columns
                     if mapping.label_column:
                         support['label_column'] = mapping.label_column
+                    if getattr(mapping, 'english_name_column', None):
+                        support['english_name_column'] = mapping.english_name_column
+                    if getattr(mapping, 'description_column', None):
+                        support['description_column'] = mapping.description_column
                     if mapping.display_columns:
                         support['display_columns'] = mapping.display_columns
                     for row in rows:
@@ -504,6 +685,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                             elif not node['label_observed']:
                                 accumulation.replace(node, 'label', str(label))
                                 accumulation.replace(node, 'label_observed', True)
+                        if current_support.get('english_name'):
+                            accumulation.append(node, 'english_names', current_support['english_name'])
+                        if current_support.get('description'):
+                            accumulation.append(node, 'descriptions', current_support['description'])
                         for column in mapping.alias_columns:
                             alias = row[column]
                             if alias is not None:
@@ -556,22 +741,26 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                             'non_null_observed': mapping.metadata_basis == 'observed_non_null'}
                     for row in rows:
                         clock()
-                        sources = resolve_endpoint(mapping, row, 'source')
+                        sources = resolve_endpoint(mapping, row, 'source', relation.source_type)
                         if not sources:
                             # Explicitly omitted input rows cannot produce
                             # a pair and must not fail on an unused target.
                             continue
-                        targets = resolve_endpoint(mapping, row, 'target')
+                        targets = resolve_endpoint(mapping, row, 'target', relation.target_type)
                         # Multiple matches are allowed only when the lookup
                         # explicitly declares many, and only for this row.
                         for source_key, source_match in sources:
                             for target_key, target_match in targets:
                                 clock()
-                                source = identity(relation.source_type, source_key)
-                                target = identity(relation.target_type, target_key)
-                                if source not in nodes or target not in nodes:
-                                    dependency_failed = ((source not in nodes and relation.source_type in incomplete_entity_types)
-                                        or (target not in nodes and relation.target_type in incomplete_entity_types))
+                                base_source = (source_match or {}).get('inherited_node_id')
+                                base_target = (target_match or {}).get('inherited_node_id')
+                                source = base_source or identity(relation.source_type, source_key)
+                                target = base_target or identity(relation.target_type, target_key)
+                                source_known = base_source is not None or source in nodes
+                                target_known = base_target is not None or target in nodes
+                                if not source_known or not target_known:
+                                    dependency_failed = ((not source_known and relation.source_type in incomplete_entity_types)
+                                        or (not target_known and relation.target_type in incomplete_entity_types))
                                     diagnostic('relation_dependency_unavailable' if dependency_failed else
                                                'unresolved_relation_endpoint', **location)
                                     continue
@@ -595,7 +784,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                 matches = [match for match in (source_match, target_match) if match is not None]
                                 if matches:
                                     current_support['lookup_matches'] = matches
-                                    current_support['required_scope_refs'] = sorted({match['scope_ref'] for match in matches})
+                                    current_support['required_scope_refs'] = sorted({scope for match in matches
+                                        for scope in (match['scope_ref'], *match.get('required_scope_refs', []))})
                                     if 'row_context' not in current_support:
                                         values = {c: row[c] for c in sorted(set(_projection_columns(mapping) + scope_columns(mapping)))}
                                         current_support['row_context'] = {
@@ -630,6 +820,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     graph = {'format_version': 1, 'target': 'graph', 'status': 'validated' if passed else 'candidate',
              'source_key_semantics': SOURCE_KEY_SEMANTICS_VERSION,
              'support_visibility_version': 1,
+             **({'extends_base_graph': True} if draft.extends_base_graph else {}),
              'semantic_origin': 'agent_authored', 'purpose': draft.purpose or (goal.purpose if goal else ''),
              'definitions': definitions, 'nodes': sorted(nodes.values(), key=lambda n: n['id']),
              'edges': sorted(edges.values(), key=lambda e: e['id']), 'evidence_refs': sorted(draft_evidence_refs(draft))}
@@ -638,6 +829,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         observed = sorted({support['label'] for support in item['supports'] if support.get('label') is not None})
         if observed:
             item['label'] = observed[0]
+        if 'english_names' in item:
+            item['english_names'].sort()
+        if 'descriptions' in item:
+            item['descriptions'].sort()
         item['aliases'].sort()
     for item in graph['nodes'] + graph['edges']:
         for values in item['properties'].values():
@@ -649,7 +844,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     projection_cache.clear()
     lookup_indexes.clear()
     accumulation.clear()
+    disp_started = time.monotonic()
+    materialization_seconds = max(0.0, disp_started - mat_started - projection_operation_seconds)
     rendered = derive_display_graph(graph, copy=False)
+    display_seconds = max(0.0, time.monotonic() - disp_started)
     rendered_bytes = len(canonical(rendered).encode())
     if rendered_bytes > max_working_bytes:
         diagnostic('memory_budget_exhausted', phase='display', required_bytes=rendered_bytes,
@@ -660,9 +858,19 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         passed = False
     return {'passed': passed, 'diagnostics': diagnostics,
             'source_read_windows': source_read_windows,
+            'phase_timings': {
+                'sql_count_seconds': sql_count_seconds,
+                'sql_projection_seconds': sql_projection_seconds,
+                'projection_operation_seconds': projection_operation_seconds,
+                'materialization_seconds': materialization_seconds,
+                'display_seconds': display_seconds,
+            },
             'metrics': {'mappings_checked': checked, 'projected_distinct_rows': projected_rows,
                         'nodes': len(nodes), 'edges': len(edges), 'equal_endpoints_omitted': omitted,
                         'projection_cache_hits': cache_hits, 'unique_projections': len(unique_projections),
+                        'co_projection_groups': co_projection_groups,
+                        'co_projection_hits': co_projection_hits,
+                        'co_projection_fallbacks': co_projection_fallbacks,
                         'lookup_matches': lookup_matches, 'lookup_inputs_omitted': lookup_omitted,
                         # Serialized payload plus estimated index allowances;
                         # numeric metrics deliberately do not claim actual RSS.

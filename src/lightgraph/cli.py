@@ -51,6 +51,8 @@ def parser():
     c=sub.add_parser('validate',help='校验新图谱 YAML 草稿格式，不查询数据');c.add_argument('drafts',nargs='+')
     c=sub.add_parser('export-graph',help='导出当前授权范围内已发布的图谱 YAML');c.add_argument('config');c.add_argument('output')
     c=sub.add_parser('export-structure',help='导出已发布的结构与映射 YAML，不连接数据源');c.add_argument('config');c.add_argument('output')
+    c=sub.add_parser('merge-graphs',help='确定性合并多单元/继承图谱为标准化终态图谱');c.add_argument('config');c.add_argument('--unit',action='append',default=[])
+    c=sub.add_parser('retrieve-subgraph',help='基于本地向量库与SQLite关系索引检索并叠加子图');c.add_argument('config');c.add_argument('query');c.add_argument('--sync',action='store_true')
     c=sub.add_parser('schema');c.add_argument('output')
     c=sub.add_parser('retain-check');c.add_argument('paths',nargs='+');c.add_argument('--marker',action='append',required=True)
     return p
@@ -135,6 +137,17 @@ def run(args):
         emit({'status':'exported','target':'graph_structure','plans':len(structure['plans']),
               'data_validation':'not_run','instance_enumeration':'not_run',
               'output':str(Path(args.output).resolve()),'format':'yaml'});return 0
+    if args.command=='merge-graphs':
+        from .construction.workflow import merge_project_workflow
+        config=load_config(args.config)
+        summary=merge_project_workflow(config.output_dir, config, unit_ids=args.unit or None)
+        emit({'status':'merged', **summary});return 0
+    if args.command=='retrieve-subgraph':
+        from .web.construction_graph import project_retriever
+        config = load_config(args.config)
+        retriever, _ = project_retriever(config, refresh=args.sync)
+        result = retriever.retrieve(args.query, scopes=config.scopes)
+        emit(result);return 0
     if args.command=='schema':
         out=Path(args.output);out.mkdir(parents=True,exist_ok=True)
         from .catalog import DeclaredCatalog,SemanticCatalog

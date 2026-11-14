@@ -1,6 +1,7 @@
 """Bounded transient batches and common registered-operator interface."""
 from __future__ import annotations
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import math
@@ -90,13 +91,45 @@ class QueryStats:
     elapsed_seconds: float = 0
     scanned_rows: int | None = None
     scan_measurement: str = "unknown"
+    connect_tcp_seconds: float = 0.0
+    preflight_catalog_seconds: float = 0.0
+    preflight_runtime_probe_seconds: float = 0.0
+    snapshot_begin_close_seconds: float = 0.0
+    sql_execute_seconds: float = 0.0
+    catalog_queries: int = 0
+    runtime_probe_runs: int = 0
+    query_timeout_count: int = 0
+    query_cancel_unverified_count: int = 0
     def safe_dict(self): return dict(vars(self))
+    @contextmanager
+    def measure_sql(self):
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.sql_execute_seconds += time.monotonic() - started
+
+_operation_timeouts: ContextVar[dict[int, int]] = ContextVar("source_operation_timeouts", default={})
+
 
 class SourceAdapter:
     """Adapters implement catalog, capability, snapshot and guarded execution."""
     limits: QueryLimits
     compiler: QueryCompiler
     stats: QueryStats
+    def _effective_timeout_ms(self) -> int:
+        return _operation_timeouts.get().get(id(self), self.limits.timeout_ms)
+    @contextmanager
+    def timeout_scope(self, timeout_ms: int | None):
+        if type(timeout_ms) is not int or timeout_ms <= 0:
+            yield
+            return
+        # A simultaneous probe must not change another operation's projection deadline.
+        token = _operation_timeouts.set({**_operation_timeouts.get(), id(self): timeout_ms})
+        try:
+            yield
+        finally:
+            _operation_timeouts.reset(token)
     def install_budget(self, budget):
         if hasattr(self, "query_budget"): budget.absorb(self.query_budget)
         self.query_budget = budget
@@ -194,7 +227,24 @@ class SourceAdapter:
     def __exit__(self, *args): self.close()
 
 
-def cursor_batches(cursor, *, limits: QueryLimits, columns: tuple[str, ...], row_limit: int, stats: QueryStats, deadline: float | None = None, cancelled=None, budget=None) -> Iterator[EphemeralBatch]:
+def cursor_batches(cursor, *, limits: QueryLimits, columns: tuple[str, ...], row_limit: int, stats: QueryStats, deadline: float | None = None, timeout_ms: int | None = None, cancelled=None, budget=None) -> Iterator[EphemeralBatch]:
+    batches = _read_cursor_batches(cursor, limits=limits, columns=columns, row_limit=row_limit,
+        stats=stats, deadline=deadline, ttl_seconds=(timeout_ms or limits.timeout_ms) / 1000,
+        cancelled=cancelled, budget=budget)
+    try:
+        while True:
+            # The consumer may build the graph while holding a yielded batch.
+            # Count only the time spent producing the next batch as SQL time.
+            with stats.measure_sql():
+                batch = next(batches, None)
+            if batch is None:
+                return
+            yield batch
+    finally:
+        batches.close()
+
+
+def _read_cursor_batches(cursor, *, limits, columns, row_limit, stats, deadline, ttl_seconds, cancelled, budget):
     total_rows = total_bytes = 0; pending = []; pending_bytes = 0
     while True:
         if budget is not None: budget.check_time()
@@ -210,12 +260,12 @@ def cursor_batches(cursor, *, limits: QueryLimits, columns: tuple[str, ...], row
         if total_rows > row_limit: raise LightGraphError("result_truncated")
         if size > limits.max_batch_bytes or total_bytes > limits.max_result_bytes: raise LightGraphError("memory_budget_exhausted")
         if pending and (len(pending) >= limits.max_batch_rows or pending_bytes + size > limits.max_batch_bytes):
-            batch = EphemeralBatch(columns, pending, max_rows=limits.max_batch_rows, max_bytes=limits.max_batch_bytes, ttl_seconds=limits.timeout_ms / 1000)
+            batch = EphemeralBatch(columns, pending, max_rows=limits.max_batch_rows, max_bytes=limits.max_batch_bytes, ttl_seconds=ttl_seconds)
             try: yield batch
             finally: batch.release()
             pending = []; pending_bytes = 0
         pending.append(row); pending_bytes += size
     if pending:
-        batch = EphemeralBatch(columns, pending, max_rows=limits.max_batch_rows, max_bytes=limits.max_batch_bytes, ttl_seconds=limits.timeout_ms / 1000)
+        batch = EphemeralBatch(columns, pending, max_rows=limits.max_batch_rows, max_bytes=limits.max_batch_bytes, ttl_seconds=ttl_seconds)
         try: yield batch
         finally: batch.release()

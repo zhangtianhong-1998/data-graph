@@ -34,6 +34,13 @@ class SourceConfig(StrictModel):
     table_name: str | None = None
     schema_name: str = "public"
 
+    @property
+    def file_scope_revision(self) -> dict:
+        """Invalidate artifacts from loaders that ignored file table/column selections."""
+        if self.kind in {"excel_workbook", "csv_file"} and (self.allowed_tables or self.allowed_columns):
+            return {"file_scope_version": 1}
+        return {}
+
     @model_validator(mode="after")
     def check_format(self):
         if not self.id or not self.id.strip():
@@ -135,6 +142,59 @@ class GraphScopeBinding(StrictModel):
         return self
 
 
+class InheritedGraphRef(StrictModel):
+    """Explicit cross-project graph inheritance reference, independent of isolation_domain."""
+    inherit_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    source_project_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    snapshot_path: str | None = Field(default=None, min_length=1)
+    expected_graph_digest: str | None = Field(default=None, min_length=1)
+    allowed_scopes: list[str] = Field(default_factory=lambda: ["public"], min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def check_target(self):
+        if bool(self.source_project_id) == bool(self.snapshot_path):
+            raise ValueError("inherited_graph_source_required")
+        return self
+
+
+class WorkflowUnitConfig(StrictModel):
+    """One parallel execution unit inside a parent project workflow."""
+    unit_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    source_ids: list[str] = Field(default_factory=list, max_length=64)
+    source_table_overrides: dict[str, list[str]] = Field(default_factory=dict, max_length=64)
+    document_ids: list[str] | None = Field(default=None, max_length=128)
+    goal_markdown: str | None = Field(default=None, max_length=32000)
+    probe_filter_hint: str | None = Field(default=None, max_length=2000)
+    max_calls: int | None = Field(default=None, ge=0)
+    max_run_seconds: float | None = Field(default=None, gt=0)
+    enable_co_projection: bool | None = None
+
+
+class MergePolicyConfig(StrictModel):
+    """Deterministic safety rules for merging parallel unit and inherited graphs."""
+    authority_sources: list[str] = Field(default_factory=list, max_length=64)
+    conflict_mode: Literal["strict", "quarantine"] = "quarantine"
+    shared_identity_domains: dict[str, list[str]] = Field(default_factory=dict, max_length=128)
+    shared_entity_types: list[str] = Field(default_factory=list, max_length=128)
+    emit_alignment_candidates: bool = True
+
+
+class WorkflowConfig(StrictModel):
+    """Project-level parallel workflow topology and merge policy."""
+    enabled: bool = False
+    max_parallel_workers: int = Field(default=4, ge=1, le=24)
+    enable_co_projection: bool = False
+    units: list[WorkflowUnitConfig] = Field(default_factory=list, max_length=64)
+    merge_policy: MergePolicyConfig = Field(default_factory=MergePolicyConfig)
+
+    @model_validator(mode="after")
+    def unique_units(self):
+        ids = [unit.unit_id for unit in self.units]
+        if len(set(ids)) != len(ids):
+            raise ValueError("duplicate_workflow_unit_id")
+        return self
+
+
 class RunConfig(StrictModel):
     model_config = ConfigDict(hide_input_in_errors=True)
     _agent: AgentConfig | None = PrivateAttr(default=None)
@@ -163,6 +223,12 @@ class RunConfig(StrictModel):
         description="Cumulative estimated row bytes returned by all source queries across the run, not resident memory, disk space, model tokens or MCP traffic. Null removes only this cumulative byte ceiling.")
     construction_target: Literal["instances", "structure"] = Field(default="instances",
         description="Build concrete instance nodes and edges, or publish only structure and source mappings with no claim of instance validation.")
+    enable_co_projection: bool = Field(default=False,
+        description="Opt-in cardinality-guarded co-projection across mappings on the same table and predicate, with automatic narrow fallback.")
+    inherited_graphs: list[InheritedGraphRef] = Field(default_factory=list, max_length=16,
+        description="Explicitly authorized published graphs inherited from prior projects or snapshots without re-scanning old sources.")
+    workflow: WorkflowConfig | None = Field(default=None,
+        description="Optional in-project parallel workflow units and deterministic merge policy.")
     max_partitions: int = Field(default=256, ge=1, le=4096)
     max_discovery_rounds: int = Field(default=3, ge=1, le=8)
     # Accepted only to read old project configurations. Harness does not split
@@ -215,6 +281,8 @@ class RunConfig(StrictModel):
     def check_source_ids(self):
         if len({s.id for s in self.sources})!=len(self.sources):
             raise ValueError("source_ids_must_be_unique")
+        if len({g.inherit_id for g in self.inherited_graphs}) != len(self.inherited_graphs):
+            raise ValueError("inherit_ids_must_be_unique")
         if not self.document_scopes:raise ValueError("document_scope_required")
         return self
 
@@ -228,6 +296,9 @@ class RunConfig(StrictModel):
         for src in self.sources:
             if src.path:src.path=str((base/src.path).resolve())
             if src.capability_manifest:src.capability_manifest=str((base/src.capability_manifest).resolve())
+        for ref in self.inherited_graphs:
+            if ref.snapshot_path:
+                ref.snapshot_path = str((base / ref.snapshot_path).resolve())
         self.documents=[str((base/p).resolve()) for p in self.documents]
         self.rules=[str((base/p).resolve()) for p in self.rules]
         self.output_dir=str((base/self.output_dir).resolve())
@@ -278,14 +349,16 @@ def open_sources(config, *, metadata_only=False, source_credentials=None, isolat
                 if not s.path:raise LightGraphError("config_invalid")
                 sources.append(ExcelSource(s.path,source_id=s.id,limits=config.limits,
                     header_row=s.header_row,include_hidden=s.include_hidden,query_budget=budget,
-                    max_memory_bytes=config.max_working_bytes,metadata_only=metadata_only))
+                    max_memory_bytes=config.max_working_bytes,metadata_only=metadata_only,
+                    allowed_tables=s.allowed_tables or None,allowed_columns=s.allowed_columns))
             elif s.kind=="csv_file":
                 sources.append(CSVSource(s.path,source_id=s.id,limits=config.limits,
                     encoding=s.encoding,delimiter=s.delimiter,header=s.header,
                     null_values=s.null_values,type_inference=s.type_inference,
                     columns=s.columns,table_name=s.table_name,schema_name=s.schema_name,
                     header_row=s.header_row,max_memory_bytes=config.max_working_bytes,
-                    query_budget=budget,metadata_only=metadata_only))
+                    query_budget=budget,metadata_only=metadata_only,
+                    allowed_tables=s.allowed_tables or None,allowed_columns=s.allowed_columns))
             else:
                 source_metadata_only = metadata_only or s.allow_fact_data is False
                 auto_verify = s.allow_fact_data is True and not source_metadata_only

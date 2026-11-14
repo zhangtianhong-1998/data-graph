@@ -16,9 +16,26 @@ from lightgraph.query.predicate import ScopeConjunction
 from .memory import MemorySource
 from .budget import BudgetedCursor
 
+
+def _cell_value(cell, cached):
+    if cell is None:
+        return None
+    if cell.data_type == "f":
+        return cached.value if cached is not None else None
+    if cell.value is None and cell.data_type == "inlineStr":
+        return ""
+    return cell.value
+
+
 class ExcelSource(MemorySource):
-    def __init__(self, path: str | Path, *, source_id: str = "excel", limits: QueryLimits | None = None, header_row: int = 1, include_hidden: bool = False, max_file_bytes: int = 200 * 1024 * 1024, max_rows: int = 200000, max_columns: int = 2000, max_memory_bytes: int = 128 * 1024 * 1024, query_budget=None, metadata_only: bool = False):
+    def __init__(self, path: str | Path, *, source_id: str = "excel", limits: QueryLimits | None = None, header_row: int = 1, include_hidden: bool = False, max_file_bytes: int = 200 * 1024 * 1024, max_rows: int = 200000, max_columns: int = 2000, max_memory_bytes: int = 128 * 1024 * 1024, query_budget=None, metadata_only: bool = False, allowed_tables: list[str] | None = None, allowed_columns: dict[str, list[str]] | None = None):
         path = Path(path)
+        selected_tables = set(allowed_tables) if allowed_tables is not None else None
+        selected_columns = allowed_columns or {}
+        if allowed_tables is not None and len(allowed_tables) != len(selected_tables):
+            raise LightGraphError("duplicate_authorized_table")
+        if selected_tables is not None and set(selected_columns) - selected_tables:
+            raise LightGraphError("unauthorized_column_scope")
         self.metadata_only = metadata_only
         self.issues: list[dict] = []
         self.issue_counts: dict[str, int] = {}
@@ -47,9 +64,11 @@ class ExcelSource(MemorySource):
             values_book = None if metadata_only else openpyxl.load_workbook(path, read_only=True, data_only=True, keep_links=False)
         except LightGraphError: raise
         except Exception: raise LightGraphError("excel_parse_failed") from None
-        tables, rows = [], {}
+        tables, rows, physical_columns = [], {}, {}
         try:
             for ws in book.worksheets:
+                if selected_tables is not None and f"public.{ws.title}" not in selected_tables:
+                    continue
                 if ws.sheet_state != "visible" and not include_hidden: continue
                 if (ws.max_column or 0) > max_columns: raise LightGraphError("excel_column_limit")
                 # Count while reading too: dimensions in source files may lie.
@@ -68,7 +87,13 @@ class ExcelSource(MemorySource):
                 table = TableSpec(source_id=source_id, schema="public", name=ws.title, columns=[ColumnSpec(
                     name=n, data_type="unknown" if metadata_only else "text", comment="Uploaded Excel header") for n in names])
                 hidden_rows, hidden_columns = self._hidden_positions(path, ws, include_hidden, columns_only=metadata_only)
-                kept = [i for i in range(len(names)) if i + 1 not in hidden_columns]
+                visible = [i for i in range(len(names)) if i + 1 not in hidden_columns]
+                physical_columns[table.qualified_name] = list(names)
+                requested_columns = selected_columns.get(table.qualified_name)
+                if requested_columns is not None and (not requested_columns or
+                        not set(requested_columns) <= {names[i] for i in visible}):
+                    raise LightGraphError("authorized_column_unavailable")
+                kept = [i for i in visible if requested_columns is None or names[i] in requested_columns]
                 table.columns = [table.columns[i] for i in kept]
                 if not kept: continue
                 tables.append(table)
@@ -77,7 +102,9 @@ class ExcelSource(MemorySource):
                     # execute() explicitly rejects queries instead of returning zero rows.
                     rows[table.qualified_name] = ()
                     continue
-                def iterate(sheet=ws, sr=source_rows, vr=value_rows, keep=kept, hidden=hidden_rows, column_names=tuple(names)):
+                excluded = set(visible) - set(kept)
+                def iterate(sheet=ws, sr=source_rows, vr=value_rows, keep=kept, hidden=hidden_rows,
+                            column_names=tuple(names), excluded_columns=excluded):
                     for index, (raw, cached) in enumerate(zip(sr, vr), header_row + 1):
                         if index - header_row > max_rows: raise LightGraphError("excel_row_limit")
                         if index in hidden: continue
@@ -86,27 +113,34 @@ class ExcelSource(MemorySource):
                         for i in keep:
                             cell = raw[i] if i < len(raw) else None
                             cache = cached[i] if i < len(cached) else None
-                            if cell is None: value = None
-                            elif cell.data_type == "f":
-                                value = cache.value if cache else None
-                                if value is None:
-                                    self._pending_formula_columns.setdefault(f"public.{sheet.title}", set()).add(column_names[i])
-                                    self.issue_counts["formula_cache_missing"] = self.issue_counts.get("formula_cache_missing", 0) + 1
-                                    if len(self.issues) < 32:
-                                        self.issues.append({"code": "formula_cache_missing", "sheet": sheet.title, "row": index, "column": i + 1})
-                            else:
-                                value = cell.value
-                                if value is None and cell.data_type == "inlineStr": value = ""
+                            value = _cell_value(cell, cache)
+                            if cell is not None and cell.data_type == "f" and value is None:
+                                self._pending_formula_columns.setdefault(f"public.{sheet.title}", set()).add(column_names[i])
+                                self.issue_counts["formula_cache_missing"] = self.issue_counts.get("formula_cache_missing", 0) + 1
+                                if len(self.issues) < 32:
+                                    self.issues.append({"code": "formula_cache_missing", "sheet": sheet.title, "row": index, "column": i + 1})
                             if isinstance(value, (date, datetime, daytime)): value = value.isoformat()
                             if isinstance(value, int) and not isinstance(value, bool) and cell is not None and re.fullmatch("0+", cell.number_format or ""):
                                 value = str(value).zfill(len(cell.number_format))
                             converted.append(value)
-                        if any(v is not None for v in converted): yield tuple(converted)
+                        populated = any(v is not None for v in converted)
+                        if not populated:
+                            # Preserve the full import's row set. An explicit empty
+                            # string counts as data; a formula without a cache does not.
+                            populated = any(_cell_value(raw[i], cached[i] if i < len(cached) else None)
+                                            is not None for i in excluded_columns if i < len(raw))
+                        if populated: yield tuple(converted)
                 rows[table.qualified_name] = iterate()
+            available_tables = {table.qualified_name for table in tables}
+            if selected_tables is not None and selected_tables - available_tables:
+                raise LightGraphError("authorized_table_unavailable_or_view")
+            if set(selected_columns) - available_tables:
+                raise LightGraphError("unauthorized_column_scope")
             if not tables: raise LightGraphError("excel_no_visible_tables")
             super().__init__(tables, rows, limits=limits, max_memory_bytes=max_memory_bytes, query_budget=query_budget)
             if not metadata_only:
                 self._infer_loaded_types()
+            self.compiler = QueryCompiler(self._tables, dialect="sqlite", physical_columns=physical_columns)
         except LightGraphError:
             if hasattr(self, "_db"): self.close()
             raise
@@ -152,8 +186,6 @@ class ExcelSource(MemorySource):
                 finally:
                     cursor.close(); self._db.set_progress_handler(None, 0)
                     self.stats.elapsed_seconds += time.monotonic() - began
-        self.compiler = QueryCompiler(self._tables, dialect="sqlite",
-            physical_columns={table.qualified_name: table.column_names for table in self._tables})
 
     def project(self, table, columns, predicate=None, distinct=True, limit=None):
         if self.metadata_only:

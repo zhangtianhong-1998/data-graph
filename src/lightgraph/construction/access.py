@@ -44,6 +44,7 @@ def access_fingerprint(config) -> str:
     sources = []
     for source in config.sources:
         sources.append({
+            **source.file_scope_revision,
             'id': source.id, 'kind': source.kind, 'path': source.path,
             'allowed_tables': selection(source.allowed_tables),
             'allowed_columns': None if source.allowed_columns is None else {
@@ -52,6 +53,8 @@ def access_fingerprint(config) -> str:
         })
     return digest({
         'isolation_domain': config.isolation_domain,
+        **({'inherited_graphs': [ref.model_dump(mode='json') for ref in config.inherited_graphs]}
+           if getattr(config, 'inherited_graphs', None) else {}),
         'document_scopes': selection(config.document_scopes),
         'scope_bindings': [{'source_id': key[0], 'schema': key[1], 'table': key[2], 'columns': columns}
                            for key, columns in sorted(scope_binding_map(config.scope_bindings).items())],
@@ -61,7 +64,7 @@ def access_fingerprint(config) -> str:
     })
 
 
-def filter_graph_scopes(graph, scopes):
+def filter_graph_scopes(graph, scopes, *, external_visible_ids=None):
     """Authorize each existence, label, alias, property and edge before display.
 
     Aggregated convenience fields are never trusted to be visible. Rebuild them
@@ -103,11 +106,21 @@ def filter_graph_scopes(graph, scopes):
             continue
         labels = sorted({support['label'] for support in supports if support.get('label') is not None})
         aliases = sorted({alias for support in supports for alias in support.get('aliases', [])})
+        english_names = sorted({support['english_name'] for support in supports
+                                if isinstance(support.get('english_name'), str) and support['english_name'].strip()})
+        descriptions = sorted({support['description'] for support in supports
+                               if isinstance(support.get('description'), str) and support['description'].strip()})
         properties, provenance = attributes(supports)
+        extra = {}
+        if english_names:
+            extra['english_names'] = english_names
+        if descriptions:
+            extra['descriptions'] = descriptions
         nodes.append({**_view_shell(node), 'label': labels[0] if labels else '',
             'aliases': aliases, 'properties': properties, 'provenance': provenance,
-            'supports': supports, 'scopes': sorted({support['scope_ref'] for support in supports})})
-    visible = {node['id'] for node in nodes}
+            'supports': supports, 'scopes': sorted({support['scope_ref'] for support in supports}),
+            **extra})
+    visible = {node['id'] for node in nodes} | set(external_visible_ids or ())
     edges = []
     for edge in graph.get('edges', []):
         if edge['source'] not in visible or edge['target'] not in visible:
@@ -123,11 +136,31 @@ def filter_graph_scopes(graph, scopes):
     definitions = graph.get('definitions', {})
     # The published document is not reused. Copy only the small header; nodes and
     # edges above already own their supports. A second full copy dominated large reads.
-    view = _view_shell(graph)
-    if 'conflict_isolation' in view:
-        # Quarantine IDs are internal merge state, not authorized visible nodes.
-        view['conflict_isolation'].pop('node_ids', None)
-        view['conflict_isolation'].pop('edge_ids', None)
+    # Merge reports and validation records cover the complete run. Keep the
+    # reports on the original artifact; the viewer gets only evidence referenced
+    # by the supports it can read.
+    report_fields = {'conflict_isolation', 'candidate_identity_merges', 'candidate_column_alignments',
+                     'evidence_catalog', 'evidence_refs', 'validation_snapshots', 'read_window'}
+    view = _view_shell(graph, omit=report_fields)
+    if 'evidence_refs' in graph or 'evidence_catalog' in graph:
+        refs = set()
+        for item in nodes + edges:
+            for support in item['supports']:
+                prov = support.get('provenance', {})
+                endpoint = prov.get('metadata_endpoint', {}).get('column', {})
+                for origin in (support, prov, endpoint):
+                    refs.update(origin.get('evidence_refs', []))
+        view['evidence_refs'] = sorted(refs)
+        if 'evidence_catalog' in graph:
+            # Individual records can themselves contain values from other scopes.
+            # Export only their namespaced references and origin identifiers.
+            catalog = graph['evidence_catalog']
+            view['evidence_catalog'] = {ref: {k: v for k, v in catalog[ref].items()
+                if k in ('contributor_id', 'kind', 'original_ref')}
+                for ref in sorted(refs.intersection(catalog))}
+    if 'conflict_isolation' in graph:
+        view['conflict_isolation'] = {k: v for k, v in graph['conflict_isolation'].items()
+            if k in ('nodes', 'edges', 'candidate_retained', 'policy', 'coverage')}
     view['nodes'] = nodes
     view['edges'] = edges
     view['definitions'] = {'entities': [deepcopy(item) for item in definitions.get('entities', []) if item['type'] in entity_types],
@@ -135,7 +168,9 @@ def filter_graph_scopes(graph, scopes):
     return derive_display_graph(view, copy=False)
 
 
-def _view_shell(item):
+def _view_shell(item, *, omit=()):
     """Copy identity and metadata without cloning support evidence again."""
     return deepcopy({key: value for key, value in item.items()
-                     if key not in {'nodes', 'edges', 'supports', 'provenance', 'properties', 'aliases', 'label', 'scopes', 'definitions'}})
+                     if key not in omit and key not in {'nodes', 'edges', 'supports', 'provenance', 'properties', 'aliases',
+                         'english_names', 'descriptions', 'display_label', 'label_origin', 'qualifiers',
+                         'label', 'scopes', 'definitions'}})

@@ -72,6 +72,9 @@ class ConstructionTools:
                                         for adapter in self.unavailable_sources.values()]
         self.executors = {}
         self._read_chunks = {}
+        # Run-local totals; saved validations may belong to previous runs and
+        # cached reuse performs no new materialization.
+        self.validation_phase_timings = Counter()
         try:
             self.query_budget = install_run_query_budget(config, self.adapters)
             self.documents = DocumentCorpus([document for document in load_documents(config.documents)
@@ -100,6 +103,11 @@ class ConstructionTools:
             self._sections = self.documents.contexts_for(list(self.tables.values()))
             self._source_hashes = [(s.id, _file_hash(s.path)) for s in config.sources if s.path]
             self._material_hashes = [(path, _file_hash(path)) for path in config.documents]
+            from .inheritance import load_frozen_base_graph
+            self.base_graph, self.inherited_summary = load_frozen_base_graph(workspace, config=config)
+            if self.base_graph:
+                self.base_graph = filter_graph_scopes(self.base_graph, config.scopes)
+            self._base_visible_ids = {node['id'] for node in (self.base_graph or {}).get('nodes', [])}
             fingerprint = digest(config.goal.model_dump(mode="json", by_alias=True), effective_goal_markdown(config), config.isolation_domain, access_fingerprint(config),
                 [t.model_dump(mode="json", by_alias=True)
                 for _, t in sorted(self.tables.items())],
@@ -113,7 +121,8 @@ class ConstructionTools:
                     if not s.path and s.dsn_env and (value := os.getenv(s.dsn_env)) is not None]}
                     if any(not s.path for s in config.sources) else None,
                 [(d.document_id, d.revision, d.content_hash) for d in self.documents.documents],
-                {'source_key_semantics': SOURCE_KEY_SEMANTICS_VERSION})
+                {'source_key_semantics': SOURCE_KEY_SEMANTICS_VERSION},
+                *((self.inherited_summary,) if self.inherited_summary.get('inherited_count') else ()))
             self.workspace = GraphWorkspace(workspace, fingerprint)
             from .result_materials import ResultMaterialStore, result_token_limit
             self.result_materials = ResultMaterialStore(self.workspace.root, fingerprint,
@@ -303,6 +312,7 @@ class ConstructionTools:
     def describe_sources(self):
         """Return the authorized physical catalog without inferred business roles."""
         titles = {d.document_id: d.title for d in self.documents.documents}
+        source_kinds = {s.id: s.kind for s in self.config.sources}
         return {"status": "ok", "goal": goal_descriptor(self.config),
                 "query_budget": self.query_budget.snapshot(),
                 "construction_target": self.config.construction_target,
@@ -311,7 +321,8 @@ class ConstructionTools:
                 "result_visibility": {"scopes": self.config.scopes,
                     "scope_bindings": [binding.model_dump(mode='json', by_alias=True) for binding in self.config.scope_bindings],
                     "unbound_scope": "public", "managed_by": "operator"},
-                "tables": [{"table": key, "source": t.source_id, "schema": t.schema_name,
+                "tables": [{"table": key, "source": t.source_id, "source_kind": source_kinds.get(t.source_id, ''),
+                            "schema": t.schema_name, "comment": t.comment,
                             "sql_dialect": self.executors[t.source_id].compiler.dialect,
                             "fact_data_allowed": self._fact_data_allowed(t.source_id),
                             "name": t.name, "columns": [c.model_dump(mode="json") for c in t.columns],
@@ -322,6 +333,7 @@ class ConstructionTools:
                                    for s in self._sections}.values()),
                 "unavailable_sources": deepcopy(self.initialization_failures),
                 "source_circuits": self.source_circuits.summary(),
+                **({"inherited_graph_summary": self.inherited_summary} if self.inherited_summary.get("inherited_count") else {}),
                 "workspace": self.workspace.read_summary()}
 
     def _fact_data_allowed(self, source_id):
@@ -689,6 +701,9 @@ class ConstructionTools:
         error = self._metadata_evidence_error(draft)
         if error:
             return error
+        inherit_err = self._inheritance_error(draft)
+        if inherit_err:
+            return inherit_err
         previous_entries = self.workspace._manifest()['drafts']
         record = self.workspace.save_draft(draft)
         entry = previous_entries.get(record.draft.draft_id)
@@ -734,7 +749,8 @@ class ConstructionTools:
                     'A new or smaller draft does not resolve their source/resource failures. '
                     'These are review pointers, not proof that every candidate belongs in the final graph.'}
 
-    def validate_graph_draft(self, draft_id: str, mode: str | None = None):
+    def validate_graph_draft(self, draft_id: str, mode: str | None = None,
+                             force_refresh: bool = False, reuse_validated: bool = False):
         mode = mode or self.config.construction_target
         if mode not in {'instances', 'structure'}:
             raise LightGraphError('invalid_construction_mode')
@@ -744,13 +760,16 @@ class ConstructionTools:
             error = self._metadata_evidence_error(record.draft)
             if error:
                 return error
+            inherit_err = self._inheritance_error(record.draft)
+            if inherit_err:
+                return inherit_err
             for ref in draft_evidence_refs(record.draft):
                 self.workspace.read_evidence(ref)
             from .structure import save_structure_check
             return save_structure_check(self.workspace, draft_id, list(self.tables.values()),
                 access=access_fingerprint(self.config), goal=self.config.goal,
                 dialects={key: value.compiler.dialect for key, value in self.executors.items()},
-                scope_bindings=self.config.scope_bindings)
+                scope_bindings=self.config.scope_bindings, base_graph=self.base_graph)
         if self.config.resolved_model.mode not in {"in_environment", "approved_external"}:
             raise LightGraphError("metadata_only_query_forbidden")
         self._check_current_inputs()
@@ -759,13 +778,42 @@ class ConstructionTools:
         error = self._metadata_evidence_error(record.draft)
         if error:
             return error
+        inherit_err = self._inheritance_error(record.draft)
+        if inherit_err:
+            return inherit_err
         self._require_draft_sources(record.draft)
         if record.status == "stale":
             raise LightGraphError("stale_graph_draft")
         for ref in draft_evidence_refs(record.draft):
             self.workspace.read_evidence(ref)
         from .models import iter_fact_mappings
-        sources = sorted({m.source_id for m in iter_fact_mappings(record.draft)})
+        fact_mappings = list(iter_fact_mappings(record.draft))
+        sources = sorted({m.source_id for m in fact_mappings})
+        immutable_only = bool(sources) and all(
+            getattr(s, 'kind', None) in {'excel_workbook', 'csv_file'}
+            for s in self.config.sources if s.id in sources
+        ) and all(any(s.id == sid for s in self.config.sources) for sid in sources)
+        if (reuse_validated and not force_refresh and immutable_only and record.validation is not None
+                and record.validation.passed
+                and record.validation.revision == record.revision
+                and record.validation.draft_fingerprint == record.fingerprint
+                and record.validation.context_fingerprint == self.workspace.context_fingerprint):
+            reused_graph = self.workspace.read_validation_graph(draft_id, record.validation)
+            if reused_graph.get('access_fingerprint') == access_fingerprint(self.config):
+                visible_graph = filter_graph_scopes(reused_graph, self.config.scopes, external_visible_ids=self._base_visible_ids)
+                from .statistics import graph_statistics
+                from .quality import name_mapping_advice
+                return {"status": "ok", "state": record.status, "passed": True,
+                        "reused_immutable_validation": True,
+                        "diagnostics": [], "metrics": record.validation.metrics,
+                        "statistics": graph_statistics(visible_graph),
+                        "quality_advice": name_mapping_advice(record.draft, visible_graph),
+                        "evidence_ref": record.validation.evidence_refs[0] if record.validation.evidence_refs else None,
+                        "candidate_graph": record.validation.graph_path,
+                        "validation_id": record.validation.validation_id,
+                        "read_window": record.validation.read_window,
+                        "source_circuits": self.source_circuits.summary(),
+                        "semantic_assessment": "agent_authored", "published": False}
         if self.terminal_reason and sources:
             return {**self._stop_queries(self.terminal_reason),
                     'metadata_definitions': self._definition_options(record)}
@@ -778,7 +826,10 @@ class ConstructionTools:
             goal=self.config.goal, max_working_bytes=self.config.max_working_bytes,
             max_rows=self.config.limits.max_result_rows, max_seconds=self.budget.remaining_seconds(),
             scope_bindings=self.config.scope_bindings,
-            cancelled=self._shutdown_requested.is_set)
+            cancelled=self._shutdown_requested.is_set,
+            base_graph=self.base_graph,
+            enable_co_projection=getattr(self.config, 'enable_co_projection', False))
+        self.validation_phase_timings.update(result.get('phase_timings', {}))
         self._check_current_inputs()
         recovery = self._snapshot_recovery_sources(sources)
         from .failures import SOURCE_FAILURES
@@ -818,14 +869,18 @@ class ConstructionTools:
                  'access_fingerprint': access_fingerprint(self.config),
                  'read_window': read_window,
                  'evidence_refs': sorted(draft_evidence_refs(record.draft) | {evidence.ref})}
+        # Store numeric phase timings inside metrics (scalar floats only so metric contracts hold).
+        phase_timings = result.pop('phase_timings', {})
+        metrics_with_timings = {**result['metrics'], **{k: round(v, 4) for k, v in phase_timings.items()}}
+        result['metrics'] = metrics_with_timings
         current = self.workspace.record_validation(draft_id, revision=record.revision,
-            passed=result["passed"], diagnostics=result["diagnostics"], metrics=result["metrics"],
+            passed=result["passed"], diagnostics=result["diagnostics"], metrics=metrics_with_timings,
             evidence_refs=[evidence.ref], graph=graph, read_window=read_window)
         stop = next((d['code'] for d in result['diagnostics'] if d.get('code') in TERMINAL_QUERY_CODES), None)
         budget_state = self._stop_queries(stop) if stop else None
         from .statistics import graph_statistics
         from .quality import name_mapping_advice
-        visible_graph = filter_graph_scopes(graph, self.config.scopes)
+        visible_graph = filter_graph_scopes(graph, self.config.scopes, external_visible_ids=self._base_visible_ids)
         statistics = graph_statistics(visible_graph)
         from .failures import failure_guidance
         diagnostics = result['diagnostics']
@@ -899,7 +954,8 @@ class ConstructionTools:
         publication = self.workspace.publish(draft_id, revision=record.revision, graph=graph,
                                              validation_id=selected.validation_id, isolate_conflicts=True)
         manifest = self.workspace.read_summary()
-        merged = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes)
+        merged = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes,
+                                     external_visible_ids=self._base_visible_ids)
         from .statistics import graph_statistics
         return {"status": "ok", "draft_id": draft_id, "publication": publication,
                 "graph": "manifest.yaml:current_graph", "publications": len(manifest['publications']),
@@ -930,7 +986,8 @@ class ConstructionTools:
                      or option.get('reason') == 'metadata_catalog_requalification_required')]
             from .statistics import graph_statistics
             try:
-                graph = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes)
+                graph = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes,
+                                            external_visible_ids=self._base_visible_ids)
                 value['statistics'] = graph_statistics(graph)
             except LightGraphError as exc:
                 if exc.code != 'stale_published_graph':
@@ -969,6 +1026,14 @@ class ConstructionTools:
                     'arguments': {'draft_id': record.draft.draft_id, 'mode': 'structure'},
                     'fact_data_validation': 'not_run'}}
         return option
+
+    def _inheritance_error(self, draft):
+        from .inherited_endpoints import inherited_contract_error, inherited_keys
+        error = inherited_contract_error(draft, inherited_keys(self.base_graph))
+        if error:
+            return {'status': 'error', 'code': error,
+                    'next_action': 'Use the inherited entity types and ordered key names in inherited_graph_summary.'}
+        return None
 
     def _unavailable_table_source(self, table):
         # Configured identifiers identify an unavailable source, never create a

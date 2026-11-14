@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -130,6 +131,7 @@ class GraphWorkspace:
             raise LightGraphError("construction_context_required")
         self.root = Path(root)
         self.context_fingerprint = context_fingerprint
+        self.write_seconds = 0.0
         self.root.mkdir(parents=True, exist_ok=True)
         self.manifest_path = self.root / "manifest.yaml"
         if not self.manifest_path.exists():
@@ -147,7 +149,11 @@ class GraphWorkspace:
         return manifest
 
     def _save_manifest(self, manifest: dict) -> None:
-        write_yaml(self.manifest_path, manifest)
+        started = time.monotonic()
+        try:
+            write_yaml(self.manifest_path, manifest)
+        finally:
+            self.write_seconds += max(0.0, time.monotonic() - started)
 
     def _read_record(self, relative: str) -> dict:
         if not isinstance(relative, str):
@@ -161,18 +167,22 @@ class GraphWorkspace:
             raise LightGraphError("graph_workspace_record_unavailable") from None
 
     def _append_record(self, folder: str, value: Any) -> str:
-        serialized = dump_yaml(value)
-        relative = f"{folder}/{uuid.uuid4().hex}.yaml"
-        path = self.root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Exclusive creation protects snapshots even if a caller ignores the
-        # single-writer contract. The manifest moves only after fsync succeeds.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as output:
-            output.write(serialized)
-            output.flush()
-            os.fsync(output.fileno())
-        return relative
+        started = time.monotonic()
+        try:
+            serialized = dump_yaml(value)
+            relative = f"{folder}/{uuid.uuid4().hex}.yaml"
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Exclusive creation protects snapshots even if a caller ignores the
+            # single-writer contract. The manifest moves only after fsync succeeds.
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                output.write(serialized)
+                output.flush()
+                os.fsync(output.fileno())
+            return relative
+        finally:
+            self.write_seconds += max(0.0, time.monotonic() - started)
 
     def issue_evidence(self, kind: str, source_ref=None, details: dict | None = None,
                        *, ref: str | None = None) -> EvidenceRecord:
@@ -279,7 +289,9 @@ class GraphWorkspace:
             raise LightGraphError("stale_graph_draft")
         if revision != record.revision:
             raise LightGraphError("graph_draft_revision_conflict")
-        if passed and (not record.draft.entities or diagnostics):
+        inherited_relations = (record.draft.extends_base_graph and record.draft.relations
+                               and record.draft.inherited_entity_types)
+        if passed and (diagnostics or not (record.draft.entities or inherited_relations)):
             raise LightGraphError("invalid_graph_validation_success")
         self._check_refs(evidence_refs or [])
         validation = DataValidation(validation_id='v_' + uuid.uuid4().hex,
@@ -437,7 +449,11 @@ class GraphWorkspace:
             return _merge_graphs([])
         if head['context_fingerprint'] != self.context_fingerprint:
             raise LightGraphError('stale_published_graph')
-        return self._read_record(head['path'])
+        data = self._read_record(head['path'])
+        if data.get('storage_layout') == 'sharded_v1':
+            from .merger import load_sharded_graph
+            return load_sharded_graph(self.root, data)
+        return data
 
     def read_publication_contributors(self) -> list[dict]:
         """Unmerged snapshots retain cross-draft counterexamples for diagnosis."""
@@ -484,6 +500,7 @@ def _merge_graphs(graphs):
     from copy import deepcopy
     from lightgraph.source_values import persisted_identity_key
     result = {'format_version': 1, 'target': 'graph', 'status': 'published',
+              **({'extends_base_graph': True} if any(g.get('extends_base_graph') for g in graphs) else {}),
               'semantic_origin': 'agent_authored', 'definitions': {'entities': [], 'relations': []},
               'nodes': [], 'edges': [], 'evidence_refs': []}
     definitions = {category: {} for category in ('entities', 'relations')}

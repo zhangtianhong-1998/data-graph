@@ -5,7 +5,7 @@ from lightgraph.contracts import canonical
 from lightgraph.source_values import persisted_identity_key
 
 
-def directed_topology(node_ids, edges):
+def directed_topology(node_ids, edges, *, cycle_edge_pairs=None):
     """Count full directed strongly connected components without recursion.
 
     Kahn leftovers include descendants of a cycle. Iterative Kosaraju identifies
@@ -51,6 +51,10 @@ def directed_topology(node_ids, edges):
             cyclic.update(component)
             for node in component:
                 component_of[node] = cyclic_components
+    cyclic_pairs = {(source, target) for source, target in pairs
+                    if source in cyclic and component_of[source] == component_of.get(target)}
+    if cycle_edge_pairs is not None:
+        cycle_edge_pairs.update(cyclic_pairs)
     return {
         'nodes': len(nodes), 'edges': len(edges), 'distinct_endpoint_pairs': len(pairs),
         'roots': sum(not incoming[node] for node in nodes),
@@ -60,8 +64,7 @@ def directed_topology(node_ids, edges):
         'multiple_parent_nodes': sum(len(incoming[node]) > 1 for node in nodes),
         'self_links': sum(edge['source'] == edge['target'] for edge in edges),
         'acyclic': not cyclic, 'cycle_components': cyclic_components, 'cycle_nodes': len(cyclic),
-        'cycle_edges': sum(source in cyclic and target in cyclic and component_of[source] == component_of[target]
-                           for source, target in pairs),
+        'cycle_edges': len(cyclic_pairs),
     }
 
 

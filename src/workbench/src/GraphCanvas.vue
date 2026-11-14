@@ -12,8 +12,10 @@ import { twoHopNeighborhood } from './graphNeighborhood'
 import type { NeighborhoodTraversal } from './graphNeighborhood'
 import PropertyTable from './PropertyTable.vue'
 import TechnicalDetails from './TechnicalDetails.vue'
-import { mergeDisplaySchema, metadataRelationValues, nodeCaption, nodeIdentity, nodeProperties, nodeSearchText, supportOriginName, vocabularyDescription, vocabularyLabel } from './graphLabels'
+import NodeInspector from './NodeInspector.vue'
+import { mergeDisplaySchema, metadataRelationValues, nodeCaption, nodeIdentity, nodeSearchText, supportOriginName, vocabularyDescription, vocabularyLabel } from './graphLabels'
 import type { DisplaySchema, MetadataEndpoint } from './graphLabels'
+import type { StandardNode } from './types'
 
 const props = defineProps<{ graph: Graph; layer: string; loading?: boolean; projectId?: string; includeCandidates?: boolean; configRevision?: string | number }>()
 const search = ref('')
@@ -108,7 +110,7 @@ async function expandNode() {
 }
 const selected = ref<GraphNode | null>(null)
 const selectedEdge = ref<GraphEdge | null>(null)
-type Provenance = { facts: Array<{ id: string; fact_kind: string; status: string; payload: Record<string, unknown> }>; supports: Array<{ id: string; fact_id: string; status: string; origin: string; source_binding: string; rule_id: string; rule_revision?: number; publication_id?: string; document_ref?: string; scope_ref: string; binding?: { source_kind?: string; evidence_refs?: string[]; metadata_endpoint?: MetadataEndpoint; constant_properties?: Record<string, unknown>; row_context?: { values?: Record<string, unknown> }; lookup_matches?: Array<Record<string, unknown>> } }>; rules: Array<Record<string, unknown>>; nodes?: GraphNode[]; display_schema?: DisplaySchema; next_offset: number | null; supports_truncated: boolean; total_incident_edges?: number | null }
+type Provenance = { facts: Array<{ id: string; fact_kind: string; status: string; payload: Record<string, unknown> }>; supports: Array<{ id: string; fact_id: string; status: string; origin: string; source_binding: string; rule_id: string; rule_revision?: number; publication_id?: string; document_ref?: string; scope_ref: string; binding?: { source_kind?: string; evidence_refs?: string[]; metadata_endpoint?: MetadataEndpoint; constant_properties?: Record<string, unknown>; row_context?: { values?: Record<string, unknown> }; lookup_matches?: Array<Record<string, unknown>> } }>; rules: Array<Record<string, unknown>>; nodes?: GraphNode[]; standard_nodes?: StandardNode[]; display_schema?: DisplaySchema; next_offset: number | null; supports_truncated: boolean; total_incident_edges?: number | null }
 const details = ref<Provenance | null>(null), detailsLoading = ref(false), detailsError = ref('')
 const detailNodes = ref<Record<string, GraphNode>>({})
 const detailSchema = ref<DisplaySchema>({})
@@ -146,7 +148,15 @@ async function loadDetails(more = false) {
     const fullEdge = selectedEdge.value?.overview_only === true ? value.facts.find(fact => fact.fact_kind === 'Edge' && fact.id === selectedEdge.value!.id) : undefined
     if (fullEdge) selectedEdge.value = { ...selectedEdge.value!, qualifiers: fullEdge.payload.qualifiers, overview_only: false }
     detailSchema.value = mergeDisplaySchema(detailSchema.value, value.display_schema)
-    details.value = more && details.value ? { ...value, facts: [...details.value.facts, ...value.facts], supports: [...details.value.supports, ...value.supports], rules: [...details.value.rules, ...value.rules] } : value
+    const previous = more ? details.value : null
+    details.value = previous ? {
+      ...value,
+      standard_nodes: [...new Map([...(previous.standard_nodes || []), ...(value.standard_nodes || [])]
+        .map(node => [node.id, node])).values()],
+      facts: [...previous.facts, ...value.facts],
+      supports: [...previous.supports, ...value.supports],
+      rules: [...previous.rules, ...value.rules],
+    } : value
   } catch (error) { if (epoch === detailGeneration) detailsError.value = error instanceof Error ? error.message : '来源读取失败' }
   finally { if (epoch === detailGeneration) detailsLoading.value = false }
 }
@@ -260,7 +270,6 @@ const adjacent = computed(() => {
 const drawnIncidentEdges = computed(() => selected.value ? edges.value.filter(edge => selected.value!.id === edge.source || selected.value!.id === edge.target).length : 0)
 const knownIncidentEdges = computed(() => details.value?.total_incident_edges ?? (selected.value?.id === graph.value.focus_node_id ? graph.value.focus_total_edges as number | undefined : undefined))
 const display = nodeCaption
-const labelOrigin = (node: GraphNode) => ({ declared: '名称由已声明的展示字段生成', relations: '名称由关联对象和业务身份生成', identity: '名称由业务身份生成', metadata: '名称来自字段元数据；此节点代表列定义', metadata_declared: '名称由 Agent 依据元数据或文档声明；此节点代表列定义' }[String(node.label_origin)] || '')
 const accessLabel = (node: GraphNode) => Array.isArray(node.scopes) ? node.scopes.join('、') : ''
 const scopeLabel = (node: GraphNode) => {
   const identity = Object.entries(nodeIdentity(node))
@@ -495,22 +504,32 @@ onUnmounted(() => { fullEpoch++; fullController?.abort(); pageGeneration++; scen
           <button v-if="selected" class="btn small" @click="selectNode(selected)">返回节点详情</button>
         </template>
         <template v-else-if="selected">
-          <span class="badge blue">{{ kindName(selected.kind || selected.layer) }}</span> <span class="badge" :class="selected.status === 'accepted' ? 'green' : 'amber'">{{ statusName(selected.status) }}</span>
-          <h2 class="detail-name">{{ display(selected) }}</h2><p v-if="labelOrigin(selected)" class="muted small-text">{{ labelOrigin(selected) }}</p>
-          <p v-if="selected.overview_only" class="note">此节点先显示精简摘要，完整属性正在按需读取；读取失败时可重试来源详情。</p>
-          <template v-if="Object.keys(nodeIdentity(selected)).length"><h3>业务身份</h3><PropertyTable :values="nodeIdentity(selected)" /></template><p v-if="accessLabel(selected)" class="muted small-text">可见范围：{{ accessLabel(selected) }}（访问授权，不代表业务主体）</p>
-          <div class="divider"></div><h3>节点属性</h3>
-          <PropertyTable :values="nodeProperties(selected)" :label="propertyName" /><TechnicalDetails :value="selected" />
-          <h3>已加载关联 · {{ adjacent.length }}</h3><p class="field-hint" aria-label="节点关联范围">当前画布显示 {{ drawnIncidentEdges }} 条相连关系<template v-if="knownIncidentEdges != null">，当前授权图中共有 {{ knownIncidentEdges }} 条</template><template v-else>；完整关系数量尚未读取</template>。<template v-if="knownIncidentEdges == null || drawnIncidentEdges < knownIncidentEdges">当前是局部视图，不能据此判断节点孤立。</template></p>
-          <button class="btn small" :disabled="pageLoading" @click="showTwoHops(selected)">查看两跳关联</button>
-          <button v-if="serverPaging && !fullTransport && !neighborhood" class="btn small" :disabled="pageLoading || expansionOffsets.get(selected.id) === null" @click="expandNode">{{ expansionOffsets.has(selected.id) ? '继续展开关联' : '展开相邻节点' }}</button>
-          <button v-for="(edge, i) in adjacent.slice(0, 40)" :key="i" type="button" class="edge-detail relation-selection" @click="selectEdge(edge)">
-            <span class="badge" :title="relationDescription(edge.relation)">{{ relationName(edge.relation) }} · {{ statusName(edge.status) }}</span>
-            <p>{{ endpointName(edge.source) }} → {{ endpointName(edge.target) }}</p>
-          </button>
-          <p v-if="adjacent.length > 40" class="muted small-text">仅展示前 40 条关系；来源详情按事实分页读取。</p>
+          <NodeInspector
+            :selected="selected"
+            :details="details"
+            :details-loading="detailsLoading"
+            :details-error="detailsError"
+            :adjacent="adjacent"
+            :drawn-incident-edges="drawnIncidentEdges"
+            :known-incident-edges="knownIncidentEdges"
+            :page-loading="pageLoading"
+            :server-paging="serverPaging"
+            :full-transport="fullTransport"
+            :has-neighborhood="!!neighborhood"
+            :expansion-offset="expansionOffsets.get(selected.id)"
+            :has-expansion-offset="expansionOffsets.has(selected.id)"
+            :vocabulary="vocabulary"
+            :project-id="projectId"
+            :detail-nodes="detailNodes"
+            :all-nodes="graph.nodes"
+            @select-edge="selectEdge"
+            @show-two-hops="showTwoHops"
+            @expand-node="expandNode"
+            @load-more-details="loadDetails(true)"
+            @retry-details="loadDetails(details !== null)"
+          />
         </template>
-        <section v-if="projectId" aria-label="来源支持">
+        <section v-if="projectId && selectedEdge" aria-label="来源支持">
           <div class="divider"></div><h3>来源支持</h3>
           <p v-if="detailsLoading" role="status">正在读取来源…</p><p v-if="detailsError" role="alert">{{ detailsError }}</p>
           <template v-if="details">

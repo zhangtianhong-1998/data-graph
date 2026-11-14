@@ -1,5 +1,49 @@
 {
   "$defs": {
+    "ColumnEndpoint": {
+      "additionalProperties": false,
+      "description": "A fixed column object attached only to observed rows of its own table.",
+      "properties": {
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "table": {
+          "minLength": 1,
+          "title": "Table",
+          "type": "string"
+        },
+        "schema": {
+          "default": "public",
+          "title": "Schema",
+          "type": "string"
+        },
+        "column": {
+          "minLength": 1,
+          "title": "Column",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "description": "Issued metadata or applicable document references supporting this column meaning; never raw values or invented evidence IDs.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "source_id",
+        "table",
+        "column",
+        "evidence_refs"
+      ],
+      "title": "ColumnEndpoint",
+      "type": "object"
+    },
     "EndpointLookup": {
       "additionalProperties": false,
       "description": "Resolve one endpoint through actual equal-key matches in an authorized table.",
@@ -30,6 +74,7 @@
             }
           ],
           "default": null,
+          "description": "Typed Predicate/1.0 filter: is_not_null/is_null have no value, ne uses value; logical all/any/not (and alias). Read reference:predicate-guide.md. No raw SQL.",
           "title": "Predicate"
         },
         "match_columns": {
@@ -108,7 +153,14 @@
         },
         "mappings": {
           "items": {
-            "$ref": "#/$defs/EntityMapping"
+            "anyOf": [
+              {
+                "$ref": "#/$defs/EntityMapping"
+              },
+              {
+                "$ref": "#/$defs/MetadataColumnMapping"
+              }
+            ]
           },
           "maxItems": 128,
           "minItems": 1,
@@ -164,6 +216,7 @@
             }
           ],
           "default": null,
+          "description": "Typed Predicate/1.0 filter: is_not_null/is_null have no value, ne uses value; logical all/any/not (and alias). Read reference:predicate-guide.md. No raw SQL.",
           "title": "Predicate"
         },
         "properties": {
@@ -205,6 +258,12 @@
           "title": "Context Columns",
           "type": "array"
         },
+        "kind": {
+          "const": "row",
+          "default": "row",
+          "title": "Kind",
+          "type": "string"
+        },
         "key_columns": {
           "items": {
             "type": "string"
@@ -224,8 +283,34 @@
             }
           ],
           "default": null,
-          "description": "Physical column containing the primary source name. Choose a confirmed name column when available; omission generates a display/identity fallback and does not check name consistency. Never omit a known name to bypass a conflict.",
+          "description": "Physical column containing the primary source name (e.g. Chinese name). Choose a confirmed name column when available; omission generates a display/identity fallback and does not check name consistency. Never omit a known name to bypass a conflict.",
           "title": "Label Column"
+        },
+        "english_name_column": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Physical column containing a confirmed English name for this object. Leave null if absent; never guess from aliases.",
+          "title": "English Name Column"
+        },
+        "description_column": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Physical column containing row-level object description text. Distinct from database catalog comments.",
+          "title": "Description Column"
         },
         "alias_columns": {
           "description": "Confirmed alternate names, translations or abbreviations for the same object. Display columns alone do not become aliases.",
@@ -252,6 +337,101 @@
         "key_columns"
       ],
       "title": "EntityMapping",
+      "type": "object"
+    },
+    "MetadataColumnMapping": {
+      "additionalProperties": false,
+      "description": "One authorized catalog column as a physical semantic object, not its values.",
+      "properties": {
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "table": {
+          "minLength": 1,
+          "title": "Table",
+          "type": "string"
+        },
+        "schema": {
+          "default": "public",
+          "title": "Schema",
+          "type": "string"
+        },
+        "column": {
+          "minLength": 1,
+          "title": "Column",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "description": "Issued metadata or applicable document references supporting this column meaning; never raw values or invented evidence IDs.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Evidence Refs",
+          "type": "array"
+        },
+        "kind": {
+          "const": "metadata_column",
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Agent-declared primary meaning supported by evidence. If omitted, catalog comment then physical column name is used; no fact values are read.",
+          "title": "Label"
+        },
+        "aliases": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Aliases",
+          "type": "array"
+        },
+        "semantic_annotations": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ]
+          },
+          "description": "Evidence-backed Agent interpretations; recorded as declared annotations, separately from observed catalog metadata.",
+          "maxProperties": 32,
+          "title": "Semantic Annotations",
+          "type": "object"
+        }
+      },
+      "required": [
+        "source_id",
+        "table",
+        "column",
+        "evidence_refs",
+        "kind"
+      ],
+      "title": "MetadataColumnMapping",
       "type": "object"
     },
     "RelationDefinition": {
@@ -339,6 +519,7 @@
             }
           ],
           "default": null,
+          "description": "Typed Predicate/1.0 filter: is_not_null/is_null have no value, ne uses value; logical all/any/not (and alias). Read reference:predicate-guide.md. No raw SQL.",
           "title": "Predicate"
         },
         "properties": {
@@ -385,7 +566,6 @@
             "type": "string"
           },
           "maxItems": 32,
-          "minItems": 1,
           "title": "Source Key Columns",
           "type": "array"
         },
@@ -394,9 +574,47 @@
             "type": "string"
           },
           "maxItems": 32,
-          "minItems": 1,
           "title": "Target Key Columns",
           "type": "array"
+        },
+        "source_metadata": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ColumnEndpoint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "target_metadata": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ColumnEndpoint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "metadata_basis": {
+          "anyOf": [
+            {
+              "enum": [
+                "schema_applies_to_rows",
+                "observed_non_null"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Required for a column endpoint. schema_applies_to_rows declares applicability to actual selected rows using evidence; observed_non_null restricts rows by that physical column IS NOT NULL without retaining its values. NULL absence never proves non-applicability.",
+          "title": "Metadata Basis"
         },
         "source_lookup": {
           "anyOf": [
@@ -433,9 +651,7 @@
       },
       "required": [
         "source_id",
-        "table",
-        "source_key_columns",
-        "target_key_columns"
+        "table"
       ],
       "title": "RelationMapping",
       "type": "object"
@@ -454,6 +670,30 @@
       "maxLength": 4000,
       "title": "Purpose",
       "type": "string"
+    },
+    "extends_base_graph": {
+      "default": false,
+      "description": "Whether this incremental draft references entity types inherited from a frozen base graph.",
+      "title": "Extends Base Graph",
+      "type": "boolean"
+    },
+    "inherited_entity_types": {
+      "description": "Explicitly inherited entity type names available as relation endpoints without re-scanning old sources.",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 128,
+      "title": "Inherited Entity Types",
+      "type": "array"
+    },
+    "inherited_entity_key_arities": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "description": "Optional expected identity key arity per inherited entity type.",
+      "maxProperties": 128,
+      "title": "Inherited Entity Key Arities",
+      "type": "object"
     },
     "entities": {
       "items": {

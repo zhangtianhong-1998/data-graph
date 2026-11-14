@@ -23,9 +23,14 @@ def subset_available(validation):
 
 def exclude_nodes(graph, blocked):
     """Remove whole identities and their incident edges; preserve all other supports."""
+    if not blocked:
+        return graph
     nodes = [n for n in graph.get('nodes', []) if n['id'] not in blocked]
     ids = {n['id'] for n in nodes}
-    edges = [e for e in graph.get('edges', []) if e['source'] in ids and e['target'] in ids]
+    if graph.get('extends_base_graph'):
+        edges = [e for e in graph.get('edges', []) if e['source'] not in blocked and e['target'] not in blocked]
+    else:
+        edges = [e for e in graph.get('edges', []) if e['source'] in ids and e['target'] in ids]
     return {**graph, 'nodes': nodes, 'edges': edges}
 
 

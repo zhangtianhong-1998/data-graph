@@ -356,6 +356,16 @@ class ToolExecutor:
                 "coverage": {"source_scope": "scoped_documents", "result_complete": len(pages)==1,
                 "truncated": len(pages)>1, "selection": "document_window"}}
 
+    @staticmethod
+    @contextmanager
+    def _probe_timeout(adapter):
+        limits = getattr(adapter, 'limits', None)
+        if hasattr(adapter, 'timeout_scope') and hasattr(limits, 'effective_timeout_ms'):
+            with adapter.timeout_scope(limits.effective_timeout_ms('probe')):
+                yield
+        else:
+            yield
+
     @contextmanager
     def _query_deadlines(self, adapters):
         # All adapters in a run may share one budget. Enter each distinct budget
@@ -365,6 +375,8 @@ class ToolExecutor:
         enclosing_deadline = min((budget.deadline for budget in budgets.values()), default=math.inf)
         try:
             with ExitStack() as stack:
+                for adapter in adapters:
+                    stack.enter_context(self._probe_timeout(adapter))
                 for budget in budgets.values():
                     stack.enter_context(budget.deadline_scope(self.budget.deadline_monotonic))
                 yield
@@ -405,7 +417,7 @@ class ToolExecutor:
     def _profile_columns(self, table, columns):
         source = self._table(table)
         names = self._columns(source, columns)
-        with self.adapter.snapshot():
+        with self._probe_timeout(self.adapter), self.adapter.snapshot():
             results = {name: self._aggregate(self.compiler.profile_column(source, name)) for name in names}
         return {"aggregates": results, "aggregate_columns": self._aggregate_columns(source, names),
                 "coverage": self._aggregate_coverage()}
@@ -414,7 +426,7 @@ class ToolExecutor:
         source = self._table(table)
         keys = self._columns(source, keys)
         values = self._columns(source, values)
-        with self.adapter.snapshot():
+        with self._probe_timeout(self.adapter), self.adapter.snapshot():
             nulls = self._aggregate(self.compiler.profile_column_group(source, keys)).get("null_key_rows", 0)
             results = {value: {**self._aggregate(self.compiler.check_fd(source, keys, value)), "null_key_rows": nulls} for value in values}
         return {"aggregates": results, "aggregate_columns": self._aggregate_columns(source, values),

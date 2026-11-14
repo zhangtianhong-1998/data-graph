@@ -93,6 +93,9 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
             observed_calls = max(observed_calls, payload['seq'])
         _trace_event(event)
     try:
+        if getattr(config, 'inherited_graphs', None) and not (workspace / 'inherited' / 'summary.yaml').is_file():
+            from .inheritance import freeze_inherited_graphs
+            freeze_inherited_graphs(config, workspace)
         tools = ConstructionTools(config, workspace, adapters=adapters,
                                   allow_publication=not discover_only)
         deadline = started + config.max_run_seconds
@@ -137,7 +140,8 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
         from .intent import effective_goal_markdown, initial_intent
         from lightgraph.runtime.retention import atomic_text
         atomic_text(workspace / "goal.md", effective_goal_markdown(config))
-        intent = initial_intent(config, metadata["documents"], discover_only=discover_only)
+        intent = initial_intent(config, metadata["documents"], discover_only=discover_only,
+                                inherited_summary=tools.inherited_summary)
         emit_progress("discovery", "stage_started")
         with serve_local_tools(tools) as (url, token):
             token_env = "LIGHTGRAPH_CONSTRUCTION_TOKEN"
@@ -250,10 +254,21 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
                     # artifact stays on disk and must not count as current work.
                     graph = {'nodes': [], 'edges': []}
                     report.issues.append({'code': 'stale_published_graph', 'status': 'unresolved'})
-                from .access import filter_graph_scopes
-                had_published_nodes = bool(graph.get("nodes"))
-                graph = filter_graph_scopes(graph, config.scopes)
-                if had_published_nodes and not graph["nodes"]:
+                from .access import access_fingerprint, filter_graph_scopes
+                from .inheritance import compose_published_graph
+                had_published_facts = bool(graph.get('nodes') or graph.get('edges'))
+                base = tools.base_graph
+                delta = filter_graph_scopes(graph, config.scopes, external_visible_ids=tools._base_visible_ids)
+                published = graph
+                graph = delta
+                if base and published.get('storage_layout') != 'sharded_v1':
+                    report.counts.update(delta_nodes=len(delta['nodes']), delta_edges=len(delta['edges']))
+                    report.validation['published_delta'] = ('nonempty' if delta['nodes'] or delta['edges']
+                                                            else 'empty' if publications else 'not_published')
+                    if publications:
+                        composed = compose_published_graph(published, base, access_fingerprint(config))
+                        graph = filter_graph_scopes(composed, config.scopes)
+                if had_published_facts and not (delta['nodes'] or delta['edges'] or graph['nodes']):
                     report.validation['business_graph_reason'] = 'scope_filtered'
                     report.issues.append({'code': 'business_graph_filtered_by_scopes', 'status': 'diagnostic'})
                 report.counts.update(business_nodes=len(graph.get("nodes", [])),
@@ -286,11 +301,38 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
                     report.issues.extend(draft_issues(records, publications, discover_only=discover_only))
                 report.validation.update(business_graph='not_requested' if structure_target else 'nonempty' if graph.get('nodes') else 'empty',
                     data_checks=report.construction.execution['data_validation'], model_execution=execution_kind)
-                report.counts.update(published_drafts=len(publications),
+                adapter_timings = {
+                    'connect_tcp_seconds': round(sum(getattr(getattr(a, 'stats', None), 'connect_tcp_seconds', 0.0) for a in tools.adapters), 4),
+                    'preflight_catalog_seconds': round(sum(getattr(getattr(a, 'stats', None), 'preflight_catalog_seconds', 0.0) for a in tools.adapters), 4),
+                    'preflight_runtime_probe_seconds': round(sum(getattr(getattr(a, 'stats', None), 'preflight_runtime_probe_seconds', 0.0) for a in tools.adapters), 4),
+                    'snapshot_begin_close_seconds': round(sum(getattr(getattr(a, 'stats', None), 'snapshot_begin_close_seconds', 0.0) for a in tools.adapters), 4),
+                    'sql_execute_seconds': round(sum(getattr(getattr(a, 'stats', None), 'sql_execute_seconds', 0.0) for a in tools.adapters), 4),
+                    **{key: round(tools.validation_phase_timings[key], 4) for key in (
+                        'sql_count_seconds', 'sql_projection_seconds',
+                        'projection_operation_seconds', 'materialization_seconds', 'display_seconds')},
+                    'workspace_write_seconds': round(getattr(tools.workspace, 'write_seconds', 0.0), 4),
+                }
+                report.construction.execution['phase_timings'] = adapter_timings
+                report.counts.update(
+                    published_drafts=len(publications),
                     entity_types=report.construction.summary['entity_type_count'],
                     relation_types=report.construction.summary['relation_type_count'],
                     mappings=report.construction.summary['mapping_count'],
-                    db_queries=sum(getattr(getattr(a, 'stats', None), 'queries', 0) for a in tools.adapters))
+                    db_queries=sum(getattr(getattr(a, 'stats', None), 'queries', 0) for a in tools.adapters),
+                    connect_tcp_seconds=adapter_timings['connect_tcp_seconds'],
+                    preflight_catalog_seconds=adapter_timings['preflight_catalog_seconds'],
+                    preflight_runtime_probe_seconds=adapter_timings['preflight_runtime_probe_seconds'],
+                    snapshot_begin_close_seconds=adapter_timings['snapshot_begin_close_seconds'],
+                    sql_execute_seconds=adapter_timings['sql_execute_seconds'],
+                    sql_count_seconds=adapter_timings['sql_count_seconds'],
+                    sql_projection_seconds=adapter_timings['sql_projection_seconds'],
+                    materialization_seconds=adapter_timings['materialization_seconds'],
+                    workspace_write_seconds=adapter_timings['workspace_write_seconds'],
+                    catalog_queries=sum(getattr(getattr(a, 'stats', None), 'catalog_queries', 0) for a in tools.adapters),
+                    runtime_probe_runs=sum(getattr(getattr(a, 'stats', None), 'runtime_probe_runs', 0) for a in tools.adapters),
+                    query_timeout_count=sum(getattr(getattr(a, 'stats', None), 'query_timeout_count', 0) for a in tools.adapters),
+                    query_cancel_unverified_count=sum(getattr(getattr(a, 'stats', None), 'query_cancel_unverified_count', 0) for a in tools.adapters),
+                )
                 # The admission limit also counts catalog and transaction SQL.
                 # Keep the old data-query metric and expose the actual shared
                 # budget once, rather than summing it once per source.
@@ -310,7 +352,7 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
                     'business_nodes': report.counts['business_nodes'], 'business_edges': report.counts['business_edges']})
                 remaining_work = not records or any(r.draft.unresolved or not draft_is_ready(
                     r, publications, discover_only=discover_only) for r in records)
-                if not structure_target and graph.get('conflict_isolation', {}).get('nodes', 0):
+                if not structure_target and graph.get('conflict_isolation', {}).get('coverage') == 'incomplete':
                     remaining_work = True
                     report.issues.append({'code': 'construction_conflicts_isolated', 'status': 'unresolved'})
                 if structure_target:

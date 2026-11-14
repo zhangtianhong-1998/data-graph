@@ -68,6 +68,17 @@ class QueryLimits(StrictModel):
     max_result_rows: int = Field(default=20000, gt=0)
     max_result_bytes: int = Field(default=16777216, gt=0)
     timeout_ms: int = Field(default=60000, gt=0)
+    probe_timeout_ms: int | None = Field(default=None, gt=0,
+        description="Optional statement timeout override for discovery probes; defaults to timeout_ms.")
+    projection_timeout_ms: int | None = Field(default=None, gt=0,
+        description="Optional statement timeout override for instance validation projections; defaults to timeout_ms.")
+
+    def effective_timeout_ms(self, role: Literal["default", "probe", "projection"] = "default") -> int:
+        if role == "probe" and self.probe_timeout_ms is not None:
+            return self.probe_timeout_ms
+        if role == "projection" and self.projection_timeout_ms is not None:
+            return self.projection_timeout_ms
+        return self.timeout_ms
 
 class RuntimeGuidance(StrictModel):
     """Explicit operator instructions, selected for each ephemeral Agent call."""

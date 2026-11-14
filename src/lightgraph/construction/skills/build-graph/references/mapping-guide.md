@@ -8,9 +8,9 @@
 
 使用当前 `draft_schema` 定义的新映射，不提交旧 RuleSpec。数据源、列选择、对象类型、作用域和关系名称由当前分析产生；用户无需手写这些内容。
 
-实体定义含 `type`、`description`、`key_names` 和 `mappings`。每个物理映射指定 `source_id`、`schema`、`table`、`key_columns`，可指定 `label_column`、`alias_columns`、`properties` 和 `predicate`。`key_names` 表达身份键角色，`key_columns` 按相同次序指向实际字段；不同位置或表可以提供同一类型的多份映射。
+实体定义含 `type`、`description`、`key_names` 和 `mappings`。每个物理映射指定 `source_id`、`schema`、`table`、`key_columns`，可指定 `label_column`、`english_name_column`、`description_column`、`alias_columns`、`properties` 和 `predicate`。`key_names` 表达身份键角色，`key_columns` 按相同次序指向实际字段；不同位置或表可以提供同一类型的多份映射。
 
-名称与身份分开定义。没有单独名称列的关联对象，可以声明 `display_columns`（显示项名到来源列的映射），或使用实体的 `display_mode` 按可见关联对象生成显示名称。具体字段以 schema 为准。不要拿复合身份键的最后一列当作整个对象名称，也不要为显示而改变身份键。
+名称、描述与身份分开定义。确认的英文名列绑定到 `english_name_column`，行级描述文本绑定到 `description_column`；未知或没有独立列时保持为 `null`，不要从别名强猜英文名，也不要把物理表列注释当成具体实例的业务描述。没有单独名称列的关联对象，可以声明 `display_columns`（显示项名到来源列的映射），或使用实体的 `display_mode` 按可见关联对象生成显示名称。具体字段以 schema 为准。不要拿复合身份键的最后一列当作整个对象名称，也不要为显示而改变身份键。
 
 有可靠名称列时明确设置 `label_column`，经确认的其他名称设置 `alias_columns`。未指定主名称时，展示组件会拼成“类型（字段：值）”，再缺少组件才使用关系或身份兜底。组件不会自动成为主名称或别名。校验返回的名称质量提示供修订使用，不要求无名称对象编造名称；同一身份出现矛盾名称应修正身份范围或来源解释，不能把名称改成展示组件掩盖冲突。
 

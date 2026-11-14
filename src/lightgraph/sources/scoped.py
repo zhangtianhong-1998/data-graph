@@ -35,6 +35,9 @@ class GoalScopedSource(SourceAdapter):
     def stats(self):
         return self._adapter.stats
 
+    def timeout_scope(self, timeout_ms):
+        return self._adapter.timeout_scope(timeout_ms)
+
     @property
     def query_budget(self):
         return self._adapter.query_budget

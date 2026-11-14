@@ -75,6 +75,7 @@ def no_backoff(monkeypatch):
 @pytest.mark.parametrize('failures', [1, 4])
 def test_runtime_probe_failure_uses_new_session_or_stops_at_bound(engine, control, probe, failures, caplog):
     source, data, controls, factory = runtime_sessions(engine, count=failures + 2)
+    assert source.stats.snapshot_begin_close_seconds == 0
     for connection in data[1:failures + 1]:
         setattr(connection, control, False)
     try:
@@ -93,6 +94,13 @@ def test_runtime_probe_failure_uses_new_session_or_stops_at_bound(engine, contro
                 read(source)
             assert factory.calls == calls and not data[-1].executed
         assert source._reconnect_attempts == min(failures, 3)
+        attempts = failures + (2 if failures == 1 else 1)
+        assert source.stats.runtime_probe_runs == attempts
+        assert source.stats.catalog_queries == attempts * (4 if engine == 'gauss' else 3)
+        assert source.stats.query_cancel_unverified_count == (failures if control == 'cancel_works' else 0)
+        assert source.stats.query_timeout_count == 0
+        if failures == 1:
+            assert source.stats.snapshot_begin_close_seconds > 0
         assert detail['stage'] == 'connection_preflight' and detail['cause_code'] == probe
         # MySQL's rejected cancellation has a driver category; a successful
         # statement without interruption has an explicit qualification result.

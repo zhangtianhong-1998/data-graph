@@ -100,12 +100,15 @@ def create_server(tools):
                                       if metadata_from_draft is not None else {})}))
 
     @server.tool()
-    async def validate_graph_draft(draft_id: str, mode: Literal['instances', 'structure'] | None = None) -> dict:
+    async def validate_graph_draft(draft_id: str, mode: Literal['instances', 'structure'] | None = None,
+                                   force_refresh: bool = False, reuse_validated: bool = False) -> dict:
         """Check structure without querying facts, or validate complete mapped instances.
         Omitted mode uses the project's construction_target. Every attempt retains
         its own YAML artifact. Name quality advice is non-blocking.
         """
-        return await dispatch("validate_graph_draft", draft_id=draft_id, mode=mode)
+        return await dispatch("validate_graph_draft", draft_id=draft_id, mode=mode,
+                              **({"force_refresh": True} if force_refresh else {}),
+                              **({"reuse_validated": True} if reuse_validated else {}))
 
     @server.tool()
     async def read_workspace(draft_id: str | None = None) -> dict:

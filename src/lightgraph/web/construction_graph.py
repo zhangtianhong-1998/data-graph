@@ -42,7 +42,7 @@ def _record_path(root: Path, relative):
 
 def _view_key(kind, path: Path, stat, access, scopes):
     # Nanosecond timestamps do not survive a JSON number round trip.
-    return {'version': 1, 'kind': kind, 'path': str(path), 'size': stat.st_size,
+    return {'version': 2, 'kind': kind, 'path': str(path), 'size': stat.st_size,
             'mtime_ns': str(stat.st_mtime_ns), 'access': access, 'scopes': scopes}
 
 
@@ -71,11 +71,20 @@ def load_prepared(config):
         raise LightGraphError('graph_workspace_record_unavailable') from None
     key = _view_key('published', published, stat, expected_access, scopes)
 
+    inherited_summary = root / 'inherited' / 'summary.yaml'
+    if inherited_summary.is_file():
+        inherited_stat = inherited_summary.stat()
+        key['frozen_inheritance'] = [inherited_stat.st_size, str(inherited_stat.st_mtime_ns)]
+
     def build():
         workspace = GraphWorkspace(root, head['context_fingerprint'])
         graph = workspace.read_published_graph()
         if graph.get('access_fingerprint') != expected_access:
             raise LightGraphError('graph_access_context_changed')
+        if graph.get('storage_layout') != 'sharded_v1' and (root / 'inherited' / 'summary.yaml').is_file():
+            from lightgraph.construction.inheritance import compose_published_graph, load_frozen_base_graph
+            base_graph, _ = load_frozen_base_graph(root, config=config)
+            graph = compose_published_graph(graph, base_graph, expected_access)
         graph = filter_graph_scopes(graph, config.scopes)
         graph['nodes'] = [{**node, 'kind': node['type'], 'layer': 'business', 'status': 'accepted'}
                           for node in graph.get('nodes', [])]
@@ -90,6 +99,30 @@ def load_graph(config):
     graph, generation = load_prepared(config)
     remember_graph(graph, generation)
     return graph
+
+
+def project_retriever(config, *, refresh=False):
+    """Bind both indexes to the active publication and its current access scope."""
+    from lightgraph.retrieval import SubgraphRetriever, sync_graph_to_retrieval
+    root = Path(config.output_dir) / 'construction'
+    manifest = root / 'manifest.yaml'
+    if root.is_symlink() or manifest.is_symlink():
+        raise LightGraphError('workspace_path_invalid')
+    if manifest.exists():
+        graph, generation = load_prepared(config)
+    else:
+        ensure_supported_access(config)
+        graph = {'nodes': [], 'edges': []}
+        generation = digest('no-construction-publication', access_fingerprint(config), _scope_key(config))
+    directory = Path(config.output_dir) / 'retrieval'
+    if not refresh:
+        try:
+            return SubgraphRetriever(directory, expected_generation=generation), None
+        except LightGraphError as exc:
+            if exc.code != 'retrieval_index_stale':
+                raise
+    result = sync_graph_to_retrieval(graph, directory, generation=generation)
+    return SubgraphRetriever(directory, expected_generation=generation), result
 
 
 def vocabulary(graph):
@@ -109,6 +142,7 @@ def _search_text(node):
     """Search visible business values; never provenance IDs or hidden supports."""
     values = [node.get("display_label", ""), node.get("label", ""), node.get("kind", "")]
     values.extend(node.get("aliases", []))
+    values.extend(node.get("english_names", []))
     for name, value in node.get("identity", {}).items():
         values.extend((name, value))
     return " ".join(str(value) for value in values).casefold()
@@ -203,6 +237,20 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
             "display_schema": vocabulary(graph), "semantic_origin": "agent_authored", "complete_batches": True}
 
 
+def _catalog_tables_for_config(config):
+    output = Path(getattr(config, 'output_dir', '') or '')
+    if not str(output):
+        return []
+    catalog_path = output / 'physical_catalog.yaml'
+    if not catalog_path.is_file() or catalog_path.is_symlink():
+        return []
+    try:
+        payload = safe_load_yaml(catalog_path.read_text(encoding='utf-8'))
+        return list(payload.get('tables') or []) if isinstance(payload, dict) else []
+    except Exception:
+        return []
+
+
 def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_candidates=False):
     if bool(entity_id) == bool(fact_id) or offset < 0:
         raise LightGraphError("graph_selection_invalid")
@@ -248,7 +296,7 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
         if 'supports' not in item:
             return item.get('provenance', [])
         return [{**support.get('provenance', {}), 'scope_ref': support['scope_ref'],
-                 **{key: support[key] for key in ('row_context', 'lookup_matches', 'required_scope_refs')
+                 **{key: support[key] for key in ('row_context', 'lookup_matches', 'required_scope_refs', 'inherited_from')
                     if support.get(key) is not None}}
                 for support in item['supports']]
 
@@ -289,14 +337,26 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             "reference_columns": {name: source[name] for name in ("source_key_columns", "target_key_columns") if name in source},
             "endpoint_lookups": {name: source[name] for name in ('source_lookup', 'target_lookup') if name in source},
             "source_columns": source.get("columns", []), "scope_columns": source.get("scope_columns", []),
-            "label_column": source.get("label_column"), "scope_ref": support["scope_ref"],
+            "label_column": source.get("label_column"),
+            **({"english_name_column": source["english_name_column"]} if source.get("english_name_column") else {}),
+            **({"description_column": source["description_column"]} if source.get("description_column") else {}),
+            "scope_ref": support["scope_ref"],
             "constant_properties": source.get('constant_properties', {}),
             "context_columns": source.get('context_columns', []),
             **({"metadata_endpoint": source['metadata_endpoint']} if 'metadata_endpoint' in source else {}),
             **({"source_kind": source['source_kind'], "evidence_refs": source.get('evidence_refs', [])}
                if source.get('source_kind') == 'metadata_column' else {})}
+    from lightgraph.construction.node_standardizer import standardize_node_details
+    catalog_tables = _catalog_tables_for_config(config)
+    definitions = graph.get("definitions", {})
+    standard_nodes = [
+        standardize_node_details(node, definitions=definitions, catalog_tables=catalog_tables)
+        for node in graph["nodes"] if node["id"] in endpoints
+    ]
     return {"facts": facts, "supports": retained[:500], "rules": list(mappings.values()),
-            "nodes": [_listed(n) for n in graph["nodes"] if n["id"] in endpoints], "display_schema": vocabulary(graph),
+            "nodes": [_listed(n) for n in graph["nodes"] if n["id"] in endpoints],
+            "standard_nodes": standard_nodes,
+            "display_schema": vocabulary(graph),
             "total_facts": len(selected), "total_supports": len(retained), "supports_truncated": len(retained) > 500,
             "total_incident_edges": sum(entity_id in (e['source'], e['target']) for e in graph['edges']) if entity_id else None,
             "next_offset": offset + len(facts) if offset + len(facts) < len(selected) else None,

@@ -31,7 +31,11 @@ class EntityMapping(SourceMapping):
     kind: Literal['row'] = 'row'
     key_columns: list[str] = Field(min_length=1, max_length=32)
     label_column: str | None = Field(default=None,
-        description='Physical column containing the primary source name. Choose a confirmed name column when available; omission generates a display/identity fallback and does not check name consistency. Never omit a known name to bypass a conflict.')
+        description='Physical column containing the primary source name (e.g. Chinese name). Choose a confirmed name column when available; omission generates a display/identity fallback and does not check name consistency. Never omit a known name to bypass a conflict.')
+    english_name_column: str | None = Field(default=None,
+        description='Physical column containing a confirmed English name for this object. Leave null if absent; never guess from aliases.')
+    description_column: str | None = Field(default=None,
+        description='Physical column containing row-level object description text. Distinct from database catalog comments.')
     alias_columns: list[str] = Field(default_factory=list, max_length=32,
         description='Confirmed alternate names, translations or abbreviations for the same object. Display columns alone do not become aliases.')
     display_columns: dict[str, str] = Field(default_factory=dict, max_length=32,
@@ -165,6 +169,12 @@ class RelationDefinition(StrictModel):
 class GraphDraft(StrictModel):
     draft_id: str = Field(min_length=1, max_length=80)
     purpose: str = Field(default="", max_length=4000)
+    extends_base_graph: bool = Field(default=False,
+        description="Whether this incremental draft references entity types inherited from a frozen base graph.")
+    inherited_entity_types: list[str] = Field(default_factory=list, max_length=128,
+        description="Explicitly inherited entity type names available as relation endpoints without re-scanning old sources.")
+    inherited_entity_key_arities: dict[str, int] = Field(default_factory=dict, max_length=128,
+        description="Optional expected identity key arity per inherited entity type.")
     entities: list[EntityDefinition] = Field(default_factory=list, max_length=128)
     relations: list[RelationDefinition] = Field(default_factory=list, max_length=128)
     evidence_refs: list[str] = Field(default_factory=list, max_length=512)
@@ -188,27 +198,48 @@ class GraphDraft(StrictModel):
         for definitions in (self.entities, self.relations):
             if len({d.type for d in definitions}) != len(definitions):
                 raise ValueError("duplicate_graph_type")
+        if self.inherited_entity_types and not self.extends_base_graph:
+            raise ValueError("extends_base_graph_required")
         kinds = {e.type: len(e.key_names) for e in self.entities}
+        inherited = set(self.inherited_entity_types) if self.extends_base_graph else set()
+        entity_map = {e.type: e for e in self.entities}
         for relation in self.relations:
-            if relation.source_type not in kinds or relation.target_type not in kinds:
-                raise ValueError("unknown_relation_entity_type")
+            for end in ('source', 'target'):
+                kind = getattr(relation, end + '_type')
+                if kind not in kinds and kind not in inherited:
+                    raise ValueError("unknown_relation_entity_type")
             for mapping in relation.mappings:
                 for end in ('source', 'target'):
                     kind = getattr(relation, end + '_type')
                     metadata = getattr(mapping, end + '_metadata')
-                    entity = next(item for item in self.entities if item.type == kind)
-                    metadata_entity = isinstance(entity.mappings[0], MetadataColumnMapping)
-                    if (metadata is not None) != metadata_entity:
-                        raise ValueError('relation_endpoint_origin_mismatch')
-                    if metadata is not None:
-                        if not any((m.source_id, m.schema_name, m.table, m.column) ==
-                                   (metadata.source_id, metadata.schema_name, metadata.table, metadata.column)
-                                   for m in entity.mappings):
-                            raise ValueError('metadata_endpoint_mapping_missing')
+                    entity = entity_map.get(kind)
+                    lookup = getattr(mapping, end + '_lookup')
+                    if lookup and lookup.source_id == '__base_graph__':
+                        if kind not in inherited or lookup.table != kind:
+                            raise ValueError('inherited_lookup_type_mismatch')
+                        if lookup.predicate is not None:
+                            raise ValueError('inherited_lookup_predicate_unsupported')
+                    if entity is not None:
+                        metadata_entity = isinstance(entity.mappings[0], MetadataColumnMapping)
+                        if (metadata is not None) != metadata_entity:
+                            raise ValueError('relation_endpoint_origin_mismatch')
+                        if metadata is not None:
+                            if not any((m.source_id, m.schema_name, m.table, m.column) ==
+                                       (metadata.source_id, metadata.schema_name, metadata.table, metadata.column)
+                                       for m in entity.mappings):
+                                raise ValueError('metadata_endpoint_mapping_missing')
+                        else:
+                            lookup = getattr(mapping, end + '_lookup')
+                            keys = lookup.key_columns if lookup else getattr(mapping, end + '_key_columns')
+                            if len(keys) != kinds[kind]:
+                                raise ValueError('relation_key_arity_mismatch')
                     else:
+                        if metadata is not None:
+                            raise ValueError('relation_endpoint_origin_mismatch')
                         lookup = getattr(mapping, end + '_lookup')
                         keys = lookup.key_columns if lookup else getattr(mapping, end + '_key_columns')
-                        if len(keys) != kinds[kind]:
+                        expected_arity = self.inherited_entity_key_arities.get(kind)
+                        if expected_arity is not None and len(keys) != expected_arity:
                             raise ValueError('relation_key_arity_mismatch')
                 if mapping.equal_endpoints == "include" and not relation.allow_self_links:
                     raise ValueError("self_link_permission_required")
@@ -226,7 +257,7 @@ def iter_source_mappings(draft):
             yield mapping
             for name in ('source_lookup', 'target_lookup', 'source_metadata', 'target_metadata'):
                 lookup = getattr(mapping, name, None)
-                if lookup is not None:
+                if lookup is not None and getattr(lookup, 'source_id', None) != '__base_graph__':
                     yield lookup
 
 
@@ -239,7 +270,7 @@ def iter_fact_mappings(draft):
             yield mapping
             for name in ('source_lookup', 'target_lookup'):
                 lookup = getattr(mapping, name, None)
-                if lookup is not None:
+                if lookup is not None and getattr(lookup, 'source_id', None) != '__base_graph__':
                     yield lookup
 
 

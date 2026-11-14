@@ -37,7 +37,7 @@ def construction_summary(records, publications, graph, *, execution_kind='not_ru
     checks = [record.validation for record in records]
     data_validation = ('not_run' if not any(checks) else
                       'passed' if checks and all(check and check.passed for check in checks) else 'failed')
-    if graph.get('conflict_isolation', {}).get('nodes', 0):
+    if graph.get('conflict_isolation', {}).get('coverage') == 'incomplete':
         data_validation = 'conflict_isolated'
     stats = graph_statistics(graph)
     return ConstructionSummary(drafts=drafts,

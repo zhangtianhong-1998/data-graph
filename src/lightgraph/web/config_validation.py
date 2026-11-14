@@ -2,11 +2,13 @@
 from pydantic import ValidationError
 
 from lightgraph.errors import LightGraphError
-from lightgraph.runtime.config import RunConfig, ModelConfig, SourceConfig, AgentConfig, GraphScopeBinding
+from lightgraph.runtime.config import RunConfig, ModelConfig, SourceConfig, AgentConfig, GraphScopeBinding, InheritedGraphRef, WorkflowConfig, WorkflowUnitConfig, MergePolicyConfig
 from lightgraph.contracts import QueryLimits, ExtractionGoal
 
 _FIELDS = frozenset().union(*(model.model_fields for model in (
-    RunConfig, ModelConfig, SourceConfig, AgentConfig, GraphScopeBinding, QueryLimits, ExtractionGoal)))
+    RunConfig, ModelConfig, SourceConfig, AgentConfig, GraphScopeBinding,
+    InheritedGraphRef, WorkflowConfig, WorkflowUnitConfig, MergePolicyConfig,
+    QueryLimits, ExtractionGoal)))
 _HINTS = {
     'missing': '缺少必填字段。',
     'extra_forbidden': '存在不支持的字段，请检查字段名。',

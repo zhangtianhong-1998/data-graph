@@ -244,3 +244,48 @@ def test_visible_relation_details_expose_actual_lookup_pair_evidence(monkeypatch
     assert binding['lookup_matches'][0]['resolved_key'] == ['C1']
     assert binding['required_scope_refs'] == ['public']
     assert details['rules'][0]['endpoint_lookups']['target_lookup']['table'] == 'customers'
+
+
+def test_inherited_lookup_uses_exact_support_and_published_id():
+    table, _, draft = example()
+    draft['entities'] = draft['entities'][:1]
+    draft.update(extends_base_graph=True, inherited_entity_types=['Customer'])
+    lookup = draft['relations'][0]['mappings'][0]['target_lookup']
+    lookup.update(source_id='__base_graph__', table='Customer', match_columns=['label'], key_columns=['id'])
+    # A merged unit can already have a namespaced ID. The name which justifies
+    # this match exists only on B, although the same customer is visible on A.
+    base = {'definitions': {'entities': [{'type': 'Customer', 'key_names': ['id']}]},
+            'nodes': [{'id': 'n_published', 'type': 'Customer', 'identity': {'id': '1.00'},
+                       'identity_types': {'id': 'decimal'},
+                       'supports': [{'scope_ref': 'A', 'label': 'first'},
+                                    {'scope_ref': 'B', 'required_scope_refs': ['C'], 'label': 'other'}]}]}
+    with MemorySource([table], {table.qualified_name: [('O1', 'other', 'public')]}) as src:
+        result = execute_draft(draft, [src], [table], base_graph=base)
+    assert result['passed'], result['diagnostics']
+    edge, = result['graph']['edges']
+    assert edge['target'] == 'n_published'
+    witness, = edge['supports']
+    assert witness['required_scope_refs'] == ['B', 'C']
+    assert witness['lookup_matches'][0]['resolved_key_types'] == ['decimal']
+    for scopes, expected in [(['public', 'A'], 0), (['public', 'B'], 0), (['public', 'B', 'C'], 1)]:
+        view = filter_graph_scopes(result['graph'], scopes, external_visible_ids={'n_published'})
+        assert len(view['edges']) == expected
+
+
+def test_inherited_relation_only_plan_checks_real_key_arity_in_both_modes():
+    from lightgraph.construction.structure import validate_structure
+
+    table, _, draft = example()
+    draft.update(entities=[], extends_base_graph=True, inherited_entity_types=['Order', 'Customer'])
+    mapping = draft['relations'][0]['mappings'][0]
+    del mapping['target_lookup']
+    base = {'definitions': {'entities': [{'type': kind, 'key_names': ['id']} for kind in ('Order', 'Customer')]},
+            'nodes': [{'id': kind + '_from_a_unit', 'type': kind, 'identity': {'id': value},
+                       'supports': [{'scope_ref': 'public'}]} for kind, value in [('Order', 'O1'), ('Customer', 'C1')]]}
+    assert validate_structure(draft, [table], base_graph=base)['passed']
+    with MemorySource([table], {table.qualified_name: [('O1', 'C1', 'public')]}) as src:
+        result = execute_draft(draft, [src], [table], base_graph=base)
+    assert result['passed'] and result['graph']['edges'][0]['target'] == 'Customer_from_a_unit'
+
+    mapping['target_key_columns'] = ['email', 'scope']
+    assert validate_structure(draft, [table], base_graph=base)['diagnostics'][0]['code'] == 'relation_key_arity_mismatch'

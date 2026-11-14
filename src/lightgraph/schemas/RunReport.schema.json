@@ -215,9 +215,7 @@
       "type": "object"
     },
     "validation": {
-      "additionalProperties": {
-        "type": "string"
-      },
+      "additionalProperties": true,
       "title": "Validation",
       "type": "object"
     },

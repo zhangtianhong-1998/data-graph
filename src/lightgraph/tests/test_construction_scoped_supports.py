@@ -169,3 +169,17 @@ def test_empty_new_workspace_does_not_hide_historical_graph_and_corruption_fails
     work.manifest_path.write_text('broken: [')
     with pytest.raises(LightGraphError, match='invalid_graph_yaml'):
         read_graph(workspace, 'project')
+
+
+def test_visible_node_does_not_retain_names_or_merge_details_from_hidden_scope():
+    graph = {'support_visibility_version': 1, 'nodes': [{'id': 'n', 'type': 'item', 'identity': {'id': 1},
+        'english_names': ['private-name'], 'descriptions': ['private-description'],
+        'supports': [{'scope_ref': 'public', 'label': '公开'},
+                     {'scope_ref': 'hidden', 'english_name': 'private-name', 'description': 'private-description'}]}],
+        'edges': [], 'conflict_isolation': {'nodes': 1, 'details': [{'label': 'private-conflict'}]},
+        'candidate_identity_merges': [{'label': 'private-candidate'}],
+        'evidence_catalog': {'private-ref': {'original_ref': 'e18'}}, 'evidence_refs': ['private-ref']}
+    view = filter_graph_scopes(graph, ['public'])
+    assert view['nodes'][0]['label'] == '公开'
+    assert view['conflict_isolation']['nodes'] == 1
+    assert 'private-' not in str(view)

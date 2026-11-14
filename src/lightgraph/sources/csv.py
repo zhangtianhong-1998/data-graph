@@ -9,6 +9,7 @@ from pathlib import Path
 
 from lightgraph.contracts import ColumnSpec, TableSpec
 from lightgraph.errors import LightGraphError
+from lightgraph.query import QueryCompiler
 from .memory import MemorySource
 
 
@@ -71,8 +72,16 @@ class CSVSource(MemorySource):
                  schema_name="public", header_row=1, limits=None,
                  max_file_bytes=200 * 1024 * 1024, max_rows=200000,
                  max_columns=2000, max_memory_bytes=128 * 1024 * 1024,
-                 query_budget=None, metadata_only=False):
+                 query_budget=None, metadata_only=False, allowed_tables=None, allowed_columns=None):
         path = Path(path)
+        qualified_name = f"{schema_name}.{table_name or path.stem}"
+        if allowed_tables is not None:
+            if len(allowed_tables) != len(set(allowed_tables)):
+                raise LightGraphError("duplicate_authorized_table")
+            if set(allowed_tables) != {qualified_name}:
+                raise LightGraphError("authorized_table_unavailable_or_view")
+        if allowed_columns is not None and set(allowed_columns) - {qualified_name}:
+            raise LightGraphError("unauthorized_column_scope")
         if (not isinstance(source_id, str) or not source_id or
                 not isinstance(delimiter, str) or len(delimiter) != 1 or
                 delimiter in '\r\n"\x00' or not isinstance(header, bool) or
@@ -121,12 +130,16 @@ class CSVSource(MemorySource):
                     raise LightGraphError("csv_header_invalid")
                 if len(names) != len(set(names)):
                     raise LightGraphError("csv_duplicate_header")
+                requested = (allowed_columns or {}).get(qualified_name)
+                if requested is not None and (not requested or not set(requested) <= set(names)):
+                    raise LightGraphError("authorized_column_unavailable")
+                kept = [i for i, name in enumerate(names) if requested is None or name in requested]
                 table = TableSpec(
                     source_id=source_id, schema=schema_name,
                     name=table_name or path.stem,
                     columns=[ColumnSpec(name=n, data_type="text",
                                         comment="CSV field parsed as text; no declared type")
-                             for n in names],
+                             for n in (names[i] for i in kept)],
                 )
 
                 def records():
@@ -143,13 +156,15 @@ class CSVSource(MemorySource):
                             raise LightGraphError("csv_row_shape_invalid")
                         if any("\x00" in cell for cell in raw):
                             raise LightGraphError("csv_value_invalid")
-                        yield tuple(None if cell in null_tokens else cell for cell in raw)
+                        yield tuple(None if raw[i] in null_tokens else raw[i] for i in kept)
 
                 super().__init__(
                     [table], {table.qualified_name: () if metadata_only else records()},
                     limits=limits, max_memory_bytes=max_memory_bytes,
                     query_budget=query_budget,
                 )
+                self.compiler = QueryCompiler(self._tables, dialect="sqlite",
+                    physical_columns={qualified_name: names})
                 if not metadata_only:
                     self.format_metadata["input_revision"] = bounded.hasher.hexdigest()
             after = path.stat()

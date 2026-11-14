@@ -94,25 +94,33 @@ class MemorySource(SourceAdapter):
             self.query_budget.charge_query()
             start = time.monotonic(); self._cancelled = False; cursor = self._db.cursor()
             self.stats.queries += 1
-            self._db.set_progress_handler(lambda: int(self._cancelled or (time.monotonic() - start) * 1000 > self.limits.timeout_ms or time.monotonic() > self.query_budget.deadline), 500)
+            timeout_ms = self._effective_timeout_ms()
+            self._db.set_progress_handler(lambda: int(self._cancelled or (time.monotonic() - start) * 1000 > timeout_ms or time.monotonic() > self.query_budget.deadline), 500)
             previous_derived = self._derived_count_sources
             self._derived_count_sources = frozenset(validated.derived_count_sources)
             try:
-                cursor.execute(query.sql, query.parameters)
+                with self.stats.measure_sql():
+                    cursor.execute(query.sql, query.parameters)
                 columns = tuple(d[0] for d in cursor.description)
-                yield from cursor_batches(cursor, limits=self.limits, columns=columns, row_limit=row_limit or self.limits.max_result_rows, stats=self.stats, deadline=start + self.limits.timeout_ms / 1000, cancelled=lambda: self._cancelled, budget=self.query_budget)
-            except LightGraphError: raise
+                yield from cursor_batches(cursor, limits=self.limits, columns=columns, row_limit=row_limit or self.limits.max_result_rows, stats=self.stats, deadline=start + timeout_ms / 1000, timeout_ms=timeout_ms, cancelled=lambda: self._cancelled, budget=self.query_budget)
+            except LightGraphError as exc:
+                if exc.code == "query_timeout":
+                    self.stats.query_timeout_count += 1
+                raise
             except sqlite3.Error as exc:
                 self.query_budget.check_time()
                 code = ("query_cancelled" if self._cancelled else
-                        "query_timeout" if (time.monotonic()-start)*1000 > self.limits.timeout_ms else
+                        "query_timeout" if (time.monotonic()-start)*1000 > timeout_ms else
                         "query_authorization_failed" if getattr(exc, 'sqlite_errorcode', None) == sqlite3.SQLITE_AUTH else
                         "query_execution_failed")
+                if code == "query_timeout":
+                    self.stats.query_timeout_count += 1
                 raise LightGraphError(code) from None
             finally:
                 self._derived_count_sources = previous_derived
                 cursor.close(); self._db.set_progress_handler(None, 0)
-                self.stats.elapsed_seconds += time.monotonic() - start
+                elapsed = max(0.0, time.monotonic() - start)
+                self.stats.elapsed_seconds += elapsed
     def cancel(self, query_id=None): self._cancelled = True; self._db.interrupt()
     def close(self):
         with self._lock:

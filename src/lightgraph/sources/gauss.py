@@ -44,7 +44,7 @@ def product_version(banner: str) -> tuple[str, str]:
     return "unknown", "unknown"
 
 class GaussSource(SourceAdapter):
-    def __init__(self, dsn: str, *, source_id: str = "gauss", allowed_tables: list[str], allowed_columns: dict[str, list[str]] | None = None, limits: QueryLimits | None = None, verified_capabilities: dict | CapabilityManifest | None = None, connect_factory: Callable | None = None, probe_runtime_limits: bool = False, query_budget: QueryBudget | None = None, metadata_only: bool = False, _keep_connection: bool = False):
+    def __init__(self, dsn: str, *, source_id: str = "gauss", allowed_tables: list[str], allowed_columns: dict[str, list[str]] | None = None, limits: QueryLimits | None = None, verified_capabilities: dict | CapabilityManifest | None = None, connect_factory: Callable | None = None, probe_runtime_limits: bool = False, query_budget: QueryBudget | None = None, metadata_only: bool = False, _keep_connection: bool = False, _stats: QueryStats | None = None):
         if not allowed_tables or any(len(t.split(".")) != 2 or any(not p for p in t.split(".")) for t in allowed_tables):
             raise LightGraphError("authorized_catalog_required")
         if len(allowed_tables) != len(set(allowed_tables)):
@@ -54,7 +54,7 @@ class GaussSource(SourceAdapter):
         self.source_id = source_id; self.allowed_tables = tuple(allowed_tables)
         self.metadata_only = metadata_only
         self.allowed_columns = allowed_columns or {}; self.limits = limits or QueryLimits()
-        self.stats = QueryStats(); self._lock = threading.RLock(); self._depth = 0
+        self.stats = _stats if _stats is not None else QueryStats(); self._lock = threading.RLock(); self._depth = 0
         self.query_budget = query_budget or QueryBudget()
         self._closed = False; self._cancelled = False; self._tables = []
         self._physical_column_names = {}
@@ -68,6 +68,8 @@ class GaussSource(SourceAdapter):
                 raise LightGraphError("qualified_capability_manifest_required")
             if not isinstance(self._qualification["capabilities"], dict):
                 raise LightGraphError("invalid_capability_manifest")
+        connect_started = time.monotonic()
+        connect_finished = False
         try:
             self.query_budget.check_time()
             if connect_factory is None:
@@ -87,6 +89,8 @@ class GaussSource(SourceAdapter):
                     min(30, self.limits.timeout_ms // 1000, remaining)), **socket_options)
             else:
                 self._connection = connect_factory(dsn)
+            self.stats.connect_tcp_seconds += max(0.0, time.monotonic() - connect_started)
+            connect_finished = True
             if connection_is_closed(self._connection):
                 raise LightGraphError('database_connection_failed')
             self.query_budget.check_time()
@@ -95,6 +99,8 @@ class GaussSource(SourceAdapter):
                     any(self._manifest.capabilities.get(k) != 'verified' for k in REQUIRED_RUNTIME)):
                 raise LightGraphError('runtime_capability_unverified')
         except BaseException as exc:
+            if not connect_finished:
+                self.stats.connect_tcp_seconds += max(0.0, time.monotonic() - connect_started)
             if hasattr(self, '_connection'):
                 try: self._connection.close()
                 except Exception: pass
@@ -110,7 +116,7 @@ class GaussSource(SourceAdapter):
         reopen_options = {'source_id': source_id, 'allowed_tables': list(self.allowed_tables),
             'allowed_columns': deepcopy(self.allowed_columns), 'limits': self.limits.model_copy(deep=True),
             'verified_capabilities': deepcopy(self._qualification), 'connect_factory': connect_factory,
-            'metadata_only': metadata_only}
+            'metadata_only': metadata_only, '_stats': self.stats}
         configure_reconnection(self, lambda probe, budget: GaussSource(dsn, **reopen_options,
             probe_runtime_limits=probe, query_budget=budget, _keep_connection=True))
         if not _keep_connection:
@@ -134,11 +140,13 @@ class GaussSource(SourceAdapter):
                 self._manifest.capabilities[key] = state
 
     def _start_readonly(self, *, stage='snapshot_start'):
+        started = time.monotonic()
         cursor = self._cursor()
         try:
+            timeout_ms = self._effective_timeout_ms()
             cursor.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             # Fixed adapter controls only. Model/rule SQL cannot access SET.
-            cursor.execute(f"SET LOCAL statement_timeout = '{int(self.limits.timeout_ms)}ms'")
+            cursor.execute(f"SET LOCAL statement_timeout = '{int(timeout_ms)}ms'")
             if self._lock_timeout_supported is not False:
                 self._lock_timeout_supported = set_optional_lock_timeout(cursor, 5000)
             cursor.execute("SELECT pg_catalog.current_setting('transaction_read_only'), pg_catalog.current_setting('transaction_isolation')")
@@ -147,7 +155,12 @@ class GaussSource(SourceAdapter):
             if failure or str(catalog_value(values[0])).lower() not in ("on", "true") or str(catalog_value(values[1])).lower() != "repeatable read":
                 raise qualification_error('read_only_transaction_unverified', engine='gauss', stage=stage,
                     failure=failure or 'readback_mismatch', connection_closed=connection_is_closed(self._connection))
-        finally: cleanup_preserving_error(cursor.close)
+        finally:
+            try:
+                cleanup_preserving_error(cursor.close)
+            finally:
+                if stage == 'snapshot_start':
+                    self.stats.snapshot_begin_close_seconds += max(0.0, time.monotonic() - started)
 
     def preflight(self, *, probe_runtime_limits: bool = False) -> CapabilityManifest:
         """Bounded controls; runtime cancellation tests require explicit opt-in.
@@ -180,7 +193,11 @@ class GaussSource(SourceAdapter):
                             stage='connection_preflight', failure=failure or 'readback_mismatch',
                             connection_closed=connection_is_closed(self._connection))
                     self._manifest.capabilities["distinct_projection"] = "verified"
-                    self._tables = self._read_catalog(cursor)
+                    catalog_started = time.monotonic()
+                    try:
+                        self._tables = self._read_catalog(cursor)
+                    finally:
+                        self.stats.preflight_catalog_seconds += max(0.0, time.monotonic() - catalog_started)
                     self._manifest.capabilities["metadata_reading"] = "verified"
                     try:
                         cursor.execute("WITH p AS (SELECT 1 AS n) SELECT n FROM p UNION ALL SELECT 2")
@@ -249,18 +266,23 @@ class GaussSource(SourceAdapter):
                 raise LightGraphError("product_version_unverified")
             for key in ("statement_timeout", "query_cancel"):
                 self._manifest.capabilities[key] = "unknown"
+            probe_started = time.monotonic()
+            self.stats.runtime_probe_runs += 1
             try:
                 self._probe_runtime_control(cancel=False)
                 self._probe_runtime_control(cancel=True)
                 self._manifest.actual_database_verified = all(
                     self._manifest.capabilities.get(k) == "verified" for k in REQUIRED_RUNTIME)
             except LightGraphError as exc:
+                if exc.code == "query_cancel_unverified":
+                    self.stats.query_cancel_unverified_count += 1
                 annotate_database_error(exc, engine='gauss', stage='connection_preflight')
                 raise
             except Exception as exc:
                 raise database_error('database_runtime_preflight_failed', exc, engine='gauss',
                     stage='connection_preflight', connection_closed=connection_is_closed(self._connection)) from None
             finally:
+                self.stats.preflight_runtime_probe_seconds += max(0.0, time.monotonic() - probe_started)
                 active_error = sys.exc_info()[1]
                 self._manifest.consistent_snapshot = False
                 if not self._closed:
@@ -275,11 +297,14 @@ class GaussSource(SourceAdapter):
             return self.capabilities()
 
     def _read_catalog(self, cursor) -> list[TableSpec]:
+        if len(self.allowed_tables) > 1:
+            return self._read_catalog_batched(cursor)
         tables = []
         attribute_maps = {}
         for name in self.allowed_tables:
             schema, table = name.split(".")
             # Base tables only: a view could invoke a privileged/volatile UDF.
+            self.stats.catalog_queries += 1
             cursor.execute("SELECT c.column_name, c.data_type, c.is_nullable FROM information_schema.columns c JOIN information_schema.tables t ON c.table_schema=t.table_schema AND c.table_name=t.table_name WHERE c.table_schema=%s AND c.table_name=%s AND t.table_type='BASE TABLE' ORDER BY c.ordinal_position", (schema, table))
             columns = []
             self._physical_column_names[name] = set()
@@ -291,6 +316,7 @@ class GaussSource(SourceAdapter):
             if not columns: raise LightGraphError("authorized_table_unavailable_or_view")
             if name in self.allowed_columns and not set(self.allowed_columns[name]) <= {c.name for c in columns}:
                 raise LightGraphError("authorized_column_unavailable")
+            self.stats.catalog_queries += 1
             cursor.execute("SELECT a.attname, pg_catalog.col_description(c.oid, a.attnum), a.attnum, EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conrelid=c.oid AND k.contype='p' AND a.attnum=ANY(k.conkey)) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid WHERE n.nspname=%s AND c.relname=%s AND a.attnum>0 AND NOT a.attisdropped", (schema, table))
             annotation_rows = [tuple(catalog_value(value) for value in row) for row in cursor.fetchall()]
             annotations = {r[0]: (r[1] or "", catalog_bool(r[3])) for r in annotation_rows}
@@ -299,9 +325,89 @@ class GaussSource(SourceAdapter):
                 column.comment, column.primary_key = annotations.get(column.name, ("", False))
                 if len(column.comment.encode("utf-8")) > self.limits.max_batch_bytes:
                     raise LightGraphError("metadata_size_limit")
+            self.stats.catalog_queries += 1
             cursor.execute("SELECT pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=%s AND c.relname=%s", (schema, table))
             record = cursor.fetchone()
             tables.append(TableSpec(source_id=self.source_id, schema=schema, name=table, columns=columns, comment=(catalog_value(record[0]) or "") if record else ""))
+        self._read_constraints(cursor, tables, attribute_maps)
+        return tables
+
+    def _read_catalog_batched(self, cursor) -> list[TableSpec]:
+        """Batch catalog reads across multiple authorized tables while retaining exact checks."""
+        pairs = [tuple(name.split(".")) for name in self.allowed_tables]
+        filters = " OR ".join("(c.table_schema=%s AND c.table_name=%s)" for _ in pairs)
+        pg_filters = " OR ".join("(n.nspname=%s AND c.relname=%s)" for _ in pairs)
+        params = tuple(part for pair in pairs for part in pair)
+
+        self.stats.catalog_queries += 1
+        cursor.execute(
+            "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable "
+            "FROM information_schema.columns c "
+            "JOIN information_schema.tables t ON c.table_schema=t.table_schema AND c.table_name=t.table_name "
+            f"WHERE ({filters}) AND t.table_type='BASE TABLE' ORDER BY c.table_schema, c.table_name, c.ordinal_position",
+            params,
+        )
+        columns_by_table = {name: [] for name in self.allowed_tables}
+        for name in self.allowed_tables:
+            self._physical_column_names[name] = set()
+        for row in cursor.fetchall():
+            schema, table, col, dtype, nullable = (catalog_value(value) for value in row)
+            qname = f"{schema}.{table}"
+            if qname not in columns_by_table:
+                continue
+            self._physical_column_names[qname].add(col)
+            if qname in self.allowed_columns and col not in self.allowed_columns[qname]:
+                continue
+            columns_by_table[qname].append(ColumnSpec(name=col, data_type=dtype, nullable=nullable == "YES"))
+        for name in self.allowed_tables:
+            cols = columns_by_table[name]
+            if not cols:
+                raise LightGraphError("authorized_table_unavailable_or_view")
+            if name in self.allowed_columns and not set(self.allowed_columns[name]) <= {c.name for c in cols}:
+                raise LightGraphError("authorized_column_unavailable")
+
+        self.stats.catalog_queries += 1
+        cursor.execute(
+            "SELECT n.nspname, c.relname, a.attname, pg_catalog.col_description(c.oid, a.attnum), a.attnum, "
+            "EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conrelid=c.oid AND k.contype='p' AND a.attnum=ANY(k.conkey)) "
+            "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+            "JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid "
+            f"WHERE ({pg_filters}) AND a.attnum>0 AND NOT a.attisdropped",
+            params,
+        )
+        annotations_by_table = {name: {} for name in self.allowed_tables}
+        attribute_maps = {name: {} for name in self.allowed_tables}
+        for row in cursor.fetchall():
+            schema, table, col, desc, attnum, is_pk = (catalog_value(value) for value in row)
+            qname = f"{schema}.{table}"
+            if qname not in annotations_by_table:
+                continue
+            annotations_by_table[qname][col] = (desc or "", catalog_bool(is_pk))
+            attribute_maps[qname][int(attnum)] = col
+
+        self.stats.catalog_queries += 1
+        cursor.execute(
+            "SELECT n.nspname, c.relname, pg_catalog.obj_description(c.oid, 'pg_class') "
+            "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+            f"WHERE ({pg_filters})",
+            params,
+        )
+        comments_by_table = {}
+        for row in cursor.fetchall():
+            schema, table, comment = (catalog_value(value) for value in row)
+            comments_by_table[f"{schema}.{table}"] = comment or ""
+
+        tables = []
+        for name in self.allowed_tables:
+            schema, table = name.split(".")
+            cols = columns_by_table[name]
+            anns = annotations_by_table[name]
+            for column in cols:
+                column.comment, column.primary_key = anns.get(column.name, ("", False))
+                if len(column.comment.encode("utf-8")) > self.limits.max_batch_bytes:
+                    raise LightGraphError("metadata_size_limit")
+            tables.append(TableSpec(source_id=self.source_id, schema=schema, name=table, columns=cols,
+                                    comment=comments_by_table.get(name, "")))
         self._read_constraints(cursor, tables, attribute_maps)
         return tables
 
@@ -316,24 +422,48 @@ class GaussSource(SourceAdapter):
             else: raise LightGraphError("constraint_metadata_unsupported")
             if len(result) > 64: raise LightGraphError("constraint_metadata_limit")
             return [int(i) for i in result]
+        batch = len(tables) > 1
+        pairs = [(t.schema_name, t.name) for t in tables]
+        filters = " OR ".join("(n.nspname=%s AND c.relname=%s)" for _ in pairs)
+        prefix = "n.nspname, c.relname, " if batch else ""
+        self.stats.catalog_queries += 1
+        cursor.execute(
+            f"SELECT {prefix}k.conname, k.contype, k.conkey, k.confkey, rn.nspname, rc.relname "
+            "FROM pg_catalog.pg_constraint k JOIN pg_catalog.pg_class c ON c.oid=k.conrelid "
+            "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+            "LEFT JOIN pg_catalog.pg_class rc ON rc.oid=k.confrelid "
+            "LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid=rc.relnamespace "
+            f"WHERE ({filters}) AND k.contype IN ('p','u','f')",
+            tuple(part for pair in pairs for part in pair),
+        )
+        for row in cursor.fetchall():
+            if batch:
+                schema, name = (catalog_value(value) for value in row[:2])
+                table = catalog.get(f"{schema}.{name}")
+                if table is None:
+                    continue
+                row = row[2:]
+            else:
+                table = tables[0]
+            name, kind, local_keys, remote_keys, remote_schema, remote_table = (catalog_value(value) for value in row)
+            local = [attribute_maps[table.qualified_name].get(i) for i in numbers(local_keys)]
+            if not local or any(c not in table.column_names for c in local):
+                continue
+            if kind in ("p", "u"):
+                table.unique_keys.append(local)
+            elif kind == "f":
+                target_name = f"{remote_schema}.{remote_table}"
+                if target_name not in catalog:
+                    continue
+                target = catalog[target_name]
+                remote = [attribute_maps[target_name].get(i) for i in numbers(remote_keys)]
+                if len(local) != len(remote) or any(c not in target.column_names for c in remote):
+                    continue
+                table.foreign_keys.append(ForeignKeySpec(name=name, columns=local,
+                    target_schema=remote_schema, target_table=remote_table, target_columns=remote))
+        # Row order can vary between connections. Preserve composite key order
+        # while normalizing the collection for exact schema comparisons.
         for table in tables:
-            cursor.execute("SELECT k.conname, k.contype, k.conkey, k.confkey, rn.nspname, rc.relname FROM pg_catalog.pg_constraint k JOIN pg_catalog.pg_class c ON c.oid=k.conrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_catalog.pg_class rc ON rc.oid=k.confrelid LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid=rc.relnamespace WHERE n.nspname=%s AND c.relname=%s AND k.contype IN ('p','u','f')", (table.schema_name, table.name))
-            for row in cursor.fetchall():
-                name, kind, local_keys, remote_keys, remote_schema, remote_table = (catalog_value(value) for value in row)
-                local = [attribute_maps[table.qualified_name].get(i) for i in numbers(local_keys)]
-                if not local or any(c not in table.column_names for c in local): continue
-                if kind in ("p", "u"):
-                    table.unique_keys.append(local)
-                elif kind == "f":
-                    target_name = f"{remote_schema}.{remote_table}"
-                    if target_name not in catalog: continue
-                    target = catalog[target_name]
-                    remote = [attribute_maps[target_name].get(i) for i in numbers(remote_keys)]
-                    if len(local) != len(remote) or any(c not in target.column_names for c in remote): continue
-                    table.foreign_keys.append(ForeignKeySpec(name=name, columns=local, target_schema=remote_schema, target_table=remote_table, target_columns=remote))
-            # Catalog row order is not schema identity. Preserve column order
-            # inside each composite key, but normalize the constraint collection
-            # so a new snapshot cannot mistake a row permutation for a change.
             table.unique_keys.sort(key=tuple)
             table.foreign_keys.sort(key=lambda key: (key.name, key.target_schema,
                 key.target_table, tuple(key.columns), tuple(key.target_columns)))
@@ -528,6 +658,7 @@ class GaussSource(SourceAdapter):
                 if outer:
                     self._manifest.consistent_snapshot = False
                     active_error = sys.exc_info()[1]
+                    close_started = time.monotonic()
                     try:
                         if not self._closed:
                             try: self._connection.rollback()
@@ -543,7 +674,10 @@ class GaussSource(SourceAdapter):
                     finally:
                         # No transaction or network connection survives Agent
                         # think-time. Nested queries share this lease only.
-                        self._release_snapshot_connection()
+                        try:
+                            self._release_snapshot_connection()
+                        finally:
+                            self.stats.snapshot_begin_close_seconds += max(0.0, time.monotonic() - close_started)
 
     def execute(self, query, *, row_limit=None):
         # Reject unauthorized SQL before reconnecting or touching a transaction.
@@ -555,28 +689,37 @@ class GaussSource(SourceAdapter):
             start = time.monotonic(); self.stats.queries += 1; self._cancelled = False
             cursor = None; timed_out = threading.Event()
             query_connection = self._connection
+            timeout_ms = self._effective_timeout_ms()
             def timeout():
                 timed_out.set()
                 try: query_connection.cancel()
                 except Exception: pass
             self.query_budget.check_time()
-            timer = threading.Timer(min(self.limits.timeout_ms / 1000, max(0.001, self.query_budget.deadline - time.monotonic())), timeout)
+            timer = threading.Timer(min(timeout_ms / 1000, max(0.001, self.query_budget.deadline - time.monotonic())), timeout)
             timer.daemon = True
             try:
                 # A real server-side cursor prevents libpq from buffering the
                 # whole result even when the Python code fetches one row.
                 cursor = self._cursor(name="lightgraph_" + uuid.uuid4().hex)
-                timer.start(); cursor.execute(sql, query.parameters)
+                timer.start()
+                with self.stats.measure_sql():
+                    cursor.execute(sql, query.parameters)
                 columns = tuple(catalog_value(d.name if hasattr(d, "name") else d[0]) for d in cursor.description)
-                yield from cursor_batches(cursor, limits=self.limits, columns=columns, row_limit=row_limit or self.limits.max_result_rows, stats=self.stats, deadline=start + self.limits.timeout_ms / 1000, cancelled=lambda: self._cancelled, budget=self.query_budget)
+                yield from cursor_batches(cursor, limits=self.limits, columns=columns, row_limit=row_limit or self.limits.max_result_rows, stats=self.stats, deadline=start + timeout_ms / 1000, timeout_ms=timeout_ms, cancelled=lambda: self._cancelled, budget=self.query_budget)
                 if self._cancelled: raise LightGraphError('query_cancelled')
-                if timed_out.is_set(): raise LightGraphError('query_timeout')
+                if timed_out.is_set():
+                    raise LightGraphError('query_timeout')
                 self._manifest.capabilities["cursor_paging"] = "verified"
-            except LightGraphError: raise
+            except LightGraphError as exc:
+                if exc.code == 'query_timeout':
+                    self.stats.query_timeout_count += 1
+                raise
             except Exception as exc:
                 self.query_budget.check_time()
                 state = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
                 code = "query_timeout" if timed_out.is_set() or state == "57014" and not self._cancelled else "query_cancelled" if self._cancelled else "query_execution_failed"
+                if code == "query_timeout":
+                    self.stats.query_timeout_count += 1
                 diagnostic = database_diagnostic(exc, engine='gauss', stage='query')
                 reconnect = (diagnostic['category'] in {'connection', 'idle_transaction_timeout', 'shutdown', 'unavailable'}
                              or diagnostic['category'] == 'unknown' and connection_is_closed(self._connection))
@@ -596,7 +739,8 @@ class GaussSource(SourceAdapter):
                 if cursor is not None:
                     try: cursor.close()
                     except Exception: pass
-                self.stats.elapsed_seconds += time.monotonic() - start
+                elapsed = max(0.0, time.monotonic() - start)
+                self.stats.elapsed_seconds += elapsed
                 if stuck_cancel and sys.exc_info()[1] is None:
                     raise LightGraphError('query_cancel_failed')
     def cancel(self, query_id=None):

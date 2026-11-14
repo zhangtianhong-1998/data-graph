@@ -109,6 +109,17 @@ class StartRun(InputModel):
     run_mode: Literal["continue", "fresh"] = "continue"
 
 
+class RetrieveSubgraphRequest(InputModel):
+    query: str = Field(min_length=1, max_length=4000)
+    top_n: int = Field(default=20, ge=1, le=100)
+    top_p_seeds: int = Field(default=4, ge=1, le=20)
+    hops: int = Field(default=2, ge=1, le=2)
+    max_per_rel: int = Field(default=30, ge=1, le=200)
+    hub_degree_limit: int = Field(default=150, ge=10, le=5000)
+    max_nodes: int = Field(default=80, ge=5, le=500)
+    max_edges: int = Field(default=150, ge=5, le=1000)
+
+
 class NewProject(InputModel):
     name: str=Field(min_length=1,max_length=120)
     project_id: str|None=None
@@ -739,6 +750,50 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     def run_status(pid:str,rid:str):
         workspace.get(pid)
         return manager.get(pid,rid)
+
+    @app.get('/api/projects/{pid}/workflow')
+    def workflow_status(pid: str):
+        workspace.get(pid)
+        return manager.workflow_status(pid)
+
+    @app.post('/api/projects/{pid}/workflow/units/{unit_id}/retry', status_code=202)
+    def retry_workflow_unit(pid: str, unit_id: str, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+        with workspace.lock(pid):
+            mutable(pid)
+            sources, model = resolved_credentials(pid, x_workbench_session)
+            workspace.require_config_revision(pid, if_match)
+            options = {}
+            if sources:
+                options['source_credentials'] = sources
+            if model is not None:
+                options['model_api_key'] = model
+            return manager.retry_unit(pid, unit_id, **options)
+
+    @app.post('/api/projects/{pid}/retrieval/sync')
+    def sync_retrieval(pid: str):
+        from .construction_graph import project_retriever
+        def read(_workspace, _pid, *, config):
+            _, result = project_retriever(config, refresh=True)
+            return result
+        return read_graph_consistently(workspace, pid, read)
+
+    @app.post('/api/projects/{pid}/retrieval/query')
+    def query_retrieval(pid: str, data: RetrieveSubgraphRequest):
+        from .construction_graph import project_retriever
+        def read(_workspace, _pid, *, config):
+            retriever, _ = project_retriever(config)
+            return retriever.retrieve(
+                data.query,
+                scopes=list(config.scopes),
+                top_n=data.top_n,
+                top_p_seeds=data.top_p_seeds,
+                hops=data.hops,
+                max_per_rel=data.max_per_rel,
+                hub_degree_limit=data.hub_degree_limit,
+                max_nodes=data.max_nodes,
+                max_edges=data.max_edges,
+            )
+        return read_graph_consistently(workspace, pid, read)
 
     @app.post('/api/projects/{pid}/runs/{rid}/cancel')
     def cancel_run(pid:str,rid:str):

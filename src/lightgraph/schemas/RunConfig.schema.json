@@ -170,6 +170,123 @@
       "title": "GraphScopeBinding",
       "type": "object"
     },
+    "InheritedGraphRef": {
+      "additionalProperties": false,
+      "description": "Explicit cross-project graph inheritance reference, independent of isolation_domain.",
+      "properties": {
+        "inherit_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "title": "Inherit Id",
+          "type": "string"
+        },
+        "source_project_id": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Project Id"
+        },
+        "snapshot_path": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Snapshot Path"
+        },
+        "expected_graph_digest": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Graph Digest"
+        },
+        "allowed_scopes": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Allowed Scopes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "inherit_id"
+      ],
+      "title": "InheritedGraphRef",
+      "type": "object"
+    },
+    "MergePolicyConfig": {
+      "additionalProperties": false,
+      "description": "Deterministic safety rules for merging parallel unit and inherited graphs.",
+      "properties": {
+        "authority_sources": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "title": "Authority Sources",
+          "type": "array"
+        },
+        "conflict_mode": {
+          "default": "quarantine",
+          "enum": [
+            "strict",
+            "quarantine"
+          ],
+          "title": "Conflict Mode",
+          "type": "string"
+        },
+        "shared_identity_domains": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "maxProperties": 128,
+          "title": "Shared Identity Domains",
+          "type": "object"
+        },
+        "shared_entity_types": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Shared Entity Types",
+          "type": "array"
+        },
+        "emit_alignment_candidates": {
+          "default": true,
+          "title": "Emit Alignment Candidates",
+          "type": "boolean"
+        }
+      },
+      "title": "MergePolicyConfig",
+      "type": "object"
+    },
     "ModelConfig": {
       "additionalProperties": false,
       "properties": {
@@ -454,6 +571,34 @@
           "exclusiveMinimum": 0,
           "title": "Timeout Ms",
           "type": "integer"
+        },
+        "probe_timeout_ms": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional statement timeout override for discovery probes; defaults to timeout_ms.",
+          "title": "Probe Timeout Ms"
+        },
+        "projection_timeout_ms": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional statement timeout override for instance validation projections; defaults to timeout_ms.",
+          "title": "Projection Timeout Ms"
         }
       },
       "title": "QueryLimits",
@@ -809,6 +954,159 @@
       ],
       "title": "SourceConfig",
       "type": "object"
+    },
+    "WorkflowConfig": {
+      "additionalProperties": false,
+      "description": "Project-level parallel workflow topology and merge policy.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "max_parallel_workers": {
+          "default": 4,
+          "maximum": 24,
+          "minimum": 1,
+          "title": "Max Parallel Workers",
+          "type": "integer"
+        },
+        "enable_co_projection": {
+          "default": false,
+          "title": "Enable Co Projection",
+          "type": "boolean"
+        },
+        "units": {
+          "items": {
+            "$ref": "#/$defs/WorkflowUnitConfig"
+          },
+          "maxItems": 64,
+          "title": "Units",
+          "type": "array"
+        },
+        "merge_policy": {
+          "$ref": "#/$defs/MergePolicyConfig"
+        }
+      },
+      "title": "WorkflowConfig",
+      "type": "object"
+    },
+    "WorkflowUnitConfig": {
+      "additionalProperties": false,
+      "description": "One parallel execution unit inside a parent project workflow.",
+      "properties": {
+        "unit_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "title": "Unit Id",
+          "type": "string"
+        },
+        "source_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "title": "Source Ids",
+          "type": "array"
+        },
+        "source_table_overrides": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "maxProperties": 64,
+          "title": "Source Table Overrides",
+          "type": "object"
+        },
+        "document_ids": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 128,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Document Ids"
+        },
+        "goal_markdown": {
+          "anyOf": [
+            {
+              "maxLength": 32000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Goal Markdown"
+        },
+        "probe_filter_hint": {
+          "anyOf": [
+            {
+              "maxLength": 2000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Probe Filter Hint"
+        },
+        "max_calls": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Calls"
+        },
+        "max_run_seconds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Run Seconds"
+        },
+        "enable_co_projection": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Enable Co Projection"
+        }
+      },
+      "required": [
+        "unit_id"
+      ],
+      "title": "WorkflowUnitConfig",
+      "type": "object"
     }
   },
   "additionalProperties": false,
@@ -959,6 +1257,33 @@
       ],
       "title": "Construction Target",
       "type": "string"
+    },
+    "enable_co_projection": {
+      "default": false,
+      "description": "Opt-in cardinality-guarded co-projection across mappings on the same table and predicate, with automatic narrow fallback.",
+      "title": "Enable Co Projection",
+      "type": "boolean"
+    },
+    "inherited_graphs": {
+      "description": "Explicitly authorized published graphs inherited from prior projects or snapshots without re-scanning old sources.",
+      "items": {
+        "$ref": "#/$defs/InheritedGraphRef"
+      },
+      "maxItems": 16,
+      "title": "Inherited Graphs",
+      "type": "array"
+    },
+    "workflow": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WorkflowConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional in-project parallel workflow units and deterministic merge policy."
     },
     "max_partitions": {
       "default": 256,

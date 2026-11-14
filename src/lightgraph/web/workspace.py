@@ -518,6 +518,9 @@ class Workspace:
                     source["capability_manifest"] = registered(source["capability_manifest"], {"yaml"})
             for field, kind in (("documents", "markdown"), ("rules", "yaml")):
                 data[field] = [registered(raw, {kind}) for raw in data.get(field, [])]
+            for inherited in data.get("inherited_graphs", []) if isinstance(data.get("inherited_graphs"), list) else []:
+                if isinstance(inherited, dict) and inherited.get("snapshot_path"):
+                    inherited["snapshot_path"] = registered(inherited["snapshot_path"], {"yaml"})
             if data.get("agent_config"):
                 data["agent_config"] = registered(data["agent_config"], {"yaml"})
                 agent = self._read(self._path(project_id, data["agent_config"]))

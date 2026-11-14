@@ -22,6 +22,26 @@ export interface RunConfig {
 }
 export interface Table { source_id: string; schema: string; name: string; columns: Array<{ name: string; data_type?: string; comment?: string; [key: string]: unknown }> }
 export interface GraphNode { id: string; label?: string; name?: string; kind?: string; layer?: string; status?: string; [key: string]: unknown }
+export interface StandardNodeAttributeOrigin { source_id: string; qualified_table: string; column: string | null; data_type: string }
+export interface StandardNodeAttribute { key: string; label: string; values: unknown[]; data_type: string; origin_tables: StandardNodeAttributeOrigin[] }
+export interface StandardNodeSourceEvidenceField { role: string; field: string; column: string; data_type: string }
+export interface StandardNodeSourceEvidence {
+  source_id: string; source_kind: string; source_kind_label: string; schema: string; table: string; qualified_table: string
+  key_columns: string[]; contributed_fields: StandardNodeSourceEvidenceField[]; scopes: string[]; evidence_refs: string[]
+  inherited_from?: { inherit_id?: string; source_project_id?: string; source_graph_digest?: string } | null
+}
+export interface StandardNodeCatalogNote {
+  source_id: string; qualified_table: string; table_comment: string
+  column_comments: Array<{ column: string; data_type: string; comment: string }>; note_kind: string
+}
+export interface StandardNode {
+  id: string; kind: string; status: string; chinese_name: string | null; english_name: string | null
+  english_name_status: 'mapped' | 'unknown'; display_name: string; aliases: string[]
+  identity: Record<string, unknown>; identity_types: Record<string, string>
+  business_description: string | null; business_description_origin: 'source_column' | 'entity_definition' | 'none'
+  catalog_metadata_notes: StandardNodeCatalogNote[]; attributes: StandardNodeAttribute[]; source_evidences: StandardNodeSourceEvidence[]
+  scopes: string[]
+}
 export interface GraphEdge { id?: string; status?: string; source: string; target: string; relation?: string; [key: string]: unknown }
 export interface Graph { nodes: GraphNode[]; edges: GraphEdge[]; claims?: unknown[]; display_schema?: import('./graphLabels').DisplaySchema; [key: string]: unknown }
 export interface Metadata extends Graph { tables: Table[]; files?: Array<{ name: string; content: string }>; using_saved_metadata?: boolean; refresh_failed?: boolean; requires_refresh?: boolean; metadata_cache_warning?: string | null }

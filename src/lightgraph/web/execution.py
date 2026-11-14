@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 import uuid
 from functools import lru_cache
@@ -158,6 +159,9 @@ def _input_manifest(config, project_path):
     paths = set(config.documents + config.rules)
     if config.agent_config:
         paths.add(config.agent_config)
+    for ref in getattr(config, 'inherited_graphs', []) or []:
+        if ref.snapshot_path:
+            paths.add(ref.snapshot_path)
     for source in config.sources:
         if source.path:
             paths.add(source.path)
@@ -280,7 +284,7 @@ class RunManager:
             from ..construction.intent import effective_goal_markdown
             if not effective_goal_markdown(config).strip():
                 raise LightGraphError("extraction_purpose_required")
-            if not config.sources and not config.documents:
+            if not config.sources and not config.documents and not config.inherited_graphs:
                 raise LightGraphError("project_inputs_required")
             for source in config.sources:
                 if source.credential_mode == "session" and not (source_credentials or {}).get(source.id):
@@ -293,8 +297,41 @@ class RunManager:
                 _promote_metadata_preview(config, project)
                 previous_generation = self.workspace.output_generation(pid)
                 config.output_dir = str(self.workspace.generation_path(pid, rid))
-            payload = _resolved_payload(config, project, source_credentials=source_credentials,
-                                        model_api_key=model_api_key)
+            if config.inherited_graphs:
+                from ..construction.inheritance import authorize_frozen_inheritance, freeze_inherited_graphs
+                if run_mode == "fresh":
+                    self.workspace.select_output_generation(pid, rid, create=True)
+                try:
+                    construction = Path(config.output_dir) / "construction"
+                    if run_mode == "continue" and (construction / "inherited" / "summary.yaml").is_file():
+                        authorize_frozen_inheritance(config, self.workspace)
+                    else:
+                        freeze_inherited_graphs(config, construction, workspace=self.workspace)
+                except Exception:
+                    if run_mode == "fresh":
+                        self.workspace.select_output_generation(pid, previous_generation)
+                    raise
+            if config.workflow and config.workflow.enabled and config.workflow.units:
+                try:
+                    return self._start_workflow(
+                        pid, config, project, runs, rid,
+                        source_credentials=source_credentials,
+                        model_api_key=model_api_key,
+                        run_mode=run_mode,
+                        previous_generation=previous_generation,
+                        generation_already_selected=(run_mode == "fresh" and bool(config.inherited_graphs)),
+                    )
+                except Exception:
+                    if run_mode == "fresh" and self.workspace.output_generation(pid) == rid:
+                        self.workspace.select_output_generation(pid, previous_generation)
+                    raise
+            try:
+                payload = _resolved_payload(config, project, source_credentials=source_credentials,
+                                            model_api_key=model_api_key)
+            except Exception:
+                if run_mode == "fresh" and config.inherited_graphs:
+                    self.workspace.select_output_generation(pid, previous_generation)
+                raise
             result_path = runs / (rid + ".result.json")
             record = {"run_id": rid, "project_id": pid, "status": "queued", "stage": "starting",
                       "created_at": _now(), "finished_at": None, "report": None,
@@ -310,9 +347,9 @@ class RunManager:
             diagnostics = WorkerDiagnostics(result_path)
             diagnostics.emit('worker_starting', stage='launch')
             collector = None
-            generation_selected = False
+            generation_selected = bool(run_mode == "fresh" and config.inherited_graphs)
             try:
-                if run_mode == "fresh":
+                if run_mode == "fresh" and not generation_selected:
                     self.workspace.select_output_generation(pid, rid, create=True)
                     generation_selected = True
                 # The inherited lock stays held if this service crashes while
@@ -347,6 +384,288 @@ class RunManager:
                 return dict(record)
             threading.Thread(target=self._watch, args=(pid, proc), daemon=True).start()
             return dict(record)
+
+    def _start_workflow(self, pid, config, project, runs, rid, *, source_credentials=None,
+                        model_api_key=None, run_mode="continue", previous_generation=None,
+                        generation_already_selected=False, selected_unit_ids=None):
+        from concurrent.futures import ThreadPoolExecutor
+        from ..construction.workspace import safe_load_yaml
+        from ..construction.workflow import (
+            build_unit_config, copy_frozen_inheritance, load_workflow_state,
+            merge_project_workflow, published_unit_attempts, save_workflow_state, unit_output_path,
+        )
+        if run_mode == "fresh" and not generation_already_selected:
+            self.workspace.select_output_generation(pid, rid, create=True)
+        wf = config.workflow
+        deadline = time.monotonic() + config.max_run_seconds
+        target_units = [u for u in wf.units if selected_unit_ids is None or u.unit_id in selected_unit_ids]
+        if not target_units:
+            raise LightGraphError("workflow_unit_not_found")
+        existing_state = load_workflow_state(config.output_dir) if run_mode == "continue" else None
+        payload_deps = _input_manifest(config, project)
+        from ..construction.access import access_fingerprint
+        workflow_input = digest(access_fingerprint(config), config.workflow.model_dump(mode="json"),
+                                config.goal_markdown, config.goal.model_dump(mode="json"), payload_deps)
+        if selected_unit_ids is not None and (existing_state or {}).get("workflow_input") != workflow_input:
+            raise LightGraphError("workflow_input_changed")
+        previous_attempts = (published_unit_attempts(config.output_dir)
+                             if (existing_state or {}).get("workflow_input") == workflow_input else {})
+        units_state = dict((existing_state or {}).get("units") or {}) if selected_unit_ids is not None else {}
+        for unit in wf.units:
+            if unit.unit_id not in units_state or unit in target_units:
+                units_state[unit.unit_id] = {
+                    "unit_id": unit.unit_id,
+                    "status": "queued" if unit in target_units else units_state.get(unit.unit_id, {}).get("status", "pending"),
+                    "run_id": None,
+                    "error_code": None,
+                    "nodes": 0,
+                    "edges": 0,
+                    "updated_at": _now(),
+                }
+        wf_state = {
+            "parent_run_id": rid,
+            "workflow_input": workflow_input,
+            "status": "running",
+            "created_at": _now(),
+            "finished_at": None,
+            "units": units_state,
+            "merge": {"status": "pending"},
+        }
+        save_workflow_state(config.output_dir, wf_state)
+        record = {
+            "run_id": rid, "project_id": pid, "status": "running", "stage": "extracting",
+            "created_at": _now(), "finished_at": None, "report": None,
+            "error_code": None, "cleanup_status": "pending",
+            "dependencies": payload_deps,
+            "run_mode": run_mode,
+            "workflow": True,
+            "workflow_units": [u.unit_id for u in target_units],
+            "output_path": Path(config.output_dir).relative_to(project).as_posix(),
+            "config_revision": self.workspace.config_revision(pid),
+        }
+        _save(runs / (rid + ".json"), record)
+
+        cancel_event = threading.Event()
+        done_event = threading.Event()
+        entry = {
+            "kind": "workflow", "process": None, "record": record,
+            "result": runs / (rid + ".result.json"),
+            "cancel_requested": False, "forced": False, "config": config,
+            "cancel_event": cancel_event, "done_event": done_event,
+            "unit_procs": {}, "state_lock": threading.Lock(),
+        }
+        self._processes[pid] = entry
+
+        env = os.environ.copy()
+        source_root = str(Path(__file__).resolve().parents[2])
+        env["PYTHONPATH"] = source_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+
+        def run_unit(unit):
+            unit_out = unit_output_path(config.output_dir, unit.unit_id, rid)
+            unit_out.mkdir(parents=True, exist_ok=True)
+            copy_frozen_inheritance(Path(config.output_dir) / "construction", unit_out / "construction")
+            unit_config = build_unit_config(config, unit, unit_output_dir=unit_out)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LightGraphError("run_time_budget_exhausted")
+            unit_config.max_run_seconds = min(unit_config.max_run_seconds, remaining)
+            unit_rid = "run_" + uuid.uuid4().hex[:24]
+            unit_result = runs / (unit_rid + ".result.json")
+            unit_payload = _resolved_payload(
+                unit_config, project,
+                source_credentials={k: v for k, v in (source_credentials or {}).items()
+                                    if any(s.id == k for s in unit_config.sources)},
+                model_api_key=model_api_key,
+            )
+            with entry["state_lock"]:
+                if cancel_event.is_set():
+                    units_state[unit.unit_id].update(status="cancelled", error_code="run_cancelled", updated_at=_now())
+                    save_workflow_state(config.output_dir, wf_state)
+                    return {"unit_id": unit.unit_id, "status": "cancelled", "cleanup_status": "completed"}
+                units_state[unit.unit_id].update(status="running", run_id=unit_rid, updated_at=_now())
+                save_workflow_state(config.output_dir, wf_state)
+                with self._service_lock.child_process_options() as child_options:
+                    proc = subprocess.Popen(
+                        [sys.executable, "-m", "lightgraph.web.worker", str(unit_result)],
+                        cwd=project, env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        **child_options,
+                    )
+                entry["unit_procs"][unit.unit_id] = (proc, unit_result)
+            collector = StderrCollector(proc.stderr)
+            try:
+                proc.stdin.write(json.dumps(unit_payload, ensure_ascii=False).encode("utf-8"))
+                proc.stdin.close()
+                try:
+                    proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    # Give the worker its normal cancellation/transaction cleanup window.
+                    atomic_text(_cancel_path(unit_result), "cancel\n")
+                    try:
+                        proc.wait(timeout=self.cancel_timeout)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    raise LightGraphError("run_time_budget_exhausted") from None
+            except BaseException:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                raise
+            finally:
+                collector.finish()
+                with entry["state_lock"]:
+                    entry["unit_procs"].pop(unit.unit_id, None)
+            try:
+                res = _json_file(unit_result)
+            except LightGraphError:
+                res = {"status": "failed", "cleanup_status": "unknown", "error_code": "worker_result_missing"}
+            if cancel_event.is_set():
+                res["status"] = "cancelled"
+                res["error_code"] = "run_cancelled"
+            rep = res.get("report") or {}
+            counts = rep.get("counts") or {}
+            with entry["state_lock"]:
+                units_state[unit.unit_id].update(
+                    status=res.get("status", "failed"),
+                    error_code=res.get("error_code"),
+                    nodes=counts.get("delta_nodes", counts.get("business_nodes", 0)),
+                    edges=counts.get("delta_edges", counts.get("business_edges", 0)),
+                    updated_at=_now(),
+                )
+                save_workflow_state(config.output_dir, wf_state)
+            try:
+                _cancel_path(unit_result).unlink(missing_ok=True)
+            except OSError:
+                pass
+            return {"unit_id": unit.unit_id, **res}
+
+        def coordinator():
+            unit_results = []
+            try:
+                with ThreadPoolExecutor(max_workers=wf.max_parallel_workers) as pool:
+                    futures = {pool.submit(run_unit, unit): unit.unit_id for unit in target_units}
+                    for future, uid in futures.items():
+                        try:
+                            unit_results.append(future.result())
+                        except Exception as exc:
+                            code = _safe_code(getattr(exc, "code", None), "workflow_unit_failed")
+                            with entry["state_lock"]:
+                                units_state[uid].update(status="failed", error_code=code, updated_at=_now())
+                                save_workflow_state(config.output_dir, wf_state)
+                            unit_results.append({"unit_id": uid, "status": "failed", "error_code": code})
+                if cancel_event.is_set():
+                    final_status = "cancelled"
+                    error_code = "run_cancelled"
+                    merge_summary = None
+                else:
+                    attempts = dict(previous_attempts)
+                    for result in unit_results:
+                        uid = result["unit_id"]
+                        unit_manifest = unit_output_path(config.output_dir, uid, rid) / "construction" / "manifest.yaml"
+                        # Keep the last published contribution if its replacement stopped early.
+                        usable = (result["status"] in {"completed", "completed_with_gaps"}
+                                  or (result["status"] == "partial" and uid not in previous_attempts))
+                        if usable and unit_manifest.is_file():
+                            if (safe_load_yaml(unit_manifest.read_text("utf-8")) or {}).get("current_graph"):
+                                attempts[uid] = rid
+                    check_dependencies(payload_deps, project)
+                    if config.inherited_graphs:
+                        from ..construction.inheritance import authorize_frozen_inheritance
+                        authorize_frozen_inheritance(config, self.workspace)
+                    if self.workspace.config_revision(pid) != record["config_revision"]:
+                        raise LightGraphError("input_dependency_changed")
+                    merge_summary = merge_project_workflow(config.output_dir, config, workspace=self.workspace,
+                                                          unit_attempts=attempts)
+                    wf_state["merge"] = {"status": "completed", **merge_summary}
+                    statuses = {u["status"] for u in units_state.values()}
+                    if statuses <= {"completed"}:
+                        gaps = (merge_summary["skipped_units"]
+                                or merge_summary["conflict_isolation"].get("coverage") == "incomplete")
+                        final_status, error_code = ("completed_with_gaps" if gaps else "completed"), None
+                    elif "completed" in statuses or "completed_with_gaps" in statuses:
+                        final_status = "completed_with_gaps" if statuses <= {"completed", "completed_with_gaps"} else "partial"
+                        error_code = None if final_status == "completed_with_gaps" else "workflow_unit_partial"
+                    elif "partial" in statuses:
+                        final_status, error_code = "partial", "workflow_unit_partial"
+                    else:
+                        final_status, error_code = "failed", "workflow_units_failed"
+                wf_state.update(status=final_status, finished_at=_now())
+                save_workflow_state(config.output_dir, wf_state)
+                total_counts = {
+                    "business_nodes": (merge_summary or {}).get("nodes", 0),
+                    "business_edges": (merge_summary or {}).get("edges", 0),
+                    "workflow_units_total": len(wf.units),
+                    "workflow_units_succeeded": sum(u["status"] in {"completed", "completed_with_gaps"} for u in units_state.values()),
+                }
+                report_obj = RunReport(
+                    run_id=rid,
+                    status={"completed": "COMPLETED", "completed_with_gaps": "COMPLETED_WITH_GAPS",
+                            "partial": "PARTIAL", "failed": "FAILED", "cancelled": "PARTIAL"}[final_status],
+                    counts=total_counts,
+                    validation={"workflow_units": len(target_units),
+                                "merge_status": wf_state["merge"].get("status")},
+                )
+                with self.workspace.lock(pid), self._guard:
+                    record.update(
+                        status=final_status,
+                        stage="finished",
+                        finished_at=_now(),
+                        cleanup_status="completed" if all(r.get("cleanup_status") == "completed" for r in unit_results) else "unknown",
+                        error_code=error_code,
+                        report=_safe_report(report_obj),
+                    )
+                    _save(runs / (rid + ".json"), record)
+                    self._processes.pop(pid, None)
+            except Exception as exc:
+                code = _safe_code(getattr(exc, "code", None), "workflow_execution_failed")
+                wf_state.update(status="failed", finished_at=_now(), merge={"status": "failed", "error_code": code})
+                save_workflow_state(config.output_dir, wf_state)
+                with self.workspace.lock(pid), self._guard:
+                    record.update(status="failed", stage="finished", finished_at=_now(),
+                                  cleanup_status="unknown", error_code=code)
+                    _save(runs / (rid + ".json"), record)
+                    self._processes.pop(pid, None)
+            finally:
+                done_event.set()
+
+        threading.Thread(target=coordinator, daemon=True).start()
+        return dict(record)
+
+    def retry_unit(self, pid, unit_id, *, source_credentials=None, model_api_key=None):
+        """Re-run one workflow unit and deterministically replace only its contribution."""
+        with self.workspace.lock(pid), self._guard:
+            if self._closed:
+                raise LightGraphError("run_service_stopped")
+            if self.active(pid):
+                raise LightGraphError("project_run_active")
+            project, runs = self._paths(pid)
+            config = self.workspace.resolved_config(pid).model_copy(deep=True)
+            if not config.workflow or not config.workflow.enabled:
+                raise LightGraphError("workflow_not_enabled")
+            if not any(u.unit_id == unit_id for u in config.workflow.units):
+                raise LightGraphError("workflow_unit_not_found")
+            if config.inherited_graphs:
+                from ..construction.inheritance import authorize_frozen_inheritance
+                authorize_frozen_inheritance(config, self.workspace)
+            rid = "run_" + uuid.uuid4().hex[:24]
+            return self._start_workflow(
+                pid, config, project, runs, rid,
+                source_credentials=source_credentials,
+                model_api_key=model_api_key,
+                run_mode="continue",
+                selected_unit_ids=[unit_id],
+            )
+
+    def workflow_status(self, pid):
+        with self.workspace.lock(pid):
+            config = self.workspace.resolved_config(pid)
+            from ..construction.workflow import load_workflow_state
+            state = load_workflow_state(config.output_dir)
+            return {
+                "enabled": bool(config.workflow and config.workflow.enabled),
+                "units": [u.unit_id for u in config.workflow.units] if config.workflow else [],
+                "state": state,
+            }
 
     def _watch(self, pid, proc):
         proc.wait()
@@ -443,18 +762,39 @@ class RunManager:
             entry = self._processes.get(pid)
             if not entry or entry["record"]["run_id"] != rid:
                 return record
-            proc = entry["process"]
-            if proc.poll() is not None:
-                self._finish(pid, entry)
-                return self.get(pid, rid)
-            entry["cancel_requested"] = True
-            try:
-                # Windows terminate() is a force kill. A private marker lets
-                # every worker run its normal source/transaction cleanup first.
-                atomic_text(_cancel_path(entry["result"]), "cancel\n")
-            except OSError:
-                entry["forced"] = True
-                proc.kill()
+            if entry.get("kind") == "workflow":
+                entry["cancel_requested"] = True
+                entry["cancel_event"].set()
+                with entry["state_lock"]:
+                    active_procs = list(entry["unit_procs"].items())
+                for _uid, (_proc, unit_result) in active_procs:
+                    try:
+                        atomic_text(_cancel_path(unit_result), "cancel\n")
+                    except OSError:
+                        _proc.kill()
+            else:
+                proc = entry["process"]
+                if proc.poll() is not None:
+                    self._finish(pid, entry)
+                    return self.get(pid, rid)
+                entry["cancel_requested"] = True
+                try:
+                    # Windows terminate() is a force kill. A private marker lets
+                    # every worker run its normal source/transaction cleanup first.
+                    atomic_text(_cancel_path(entry["result"]), "cancel\n")
+                except OSError:
+                    entry["forced"] = True
+                    proc.kill()
+        if entry.get("kind") == "workflow":
+            if not entry["done_event"].wait(timeout=self.cancel_timeout + 1):
+                with entry["state_lock"]:
+                    for _uid, (uproc, _ures) in list(entry["unit_procs"].items()):
+                        try:
+                            uproc.kill()
+                        except Exception:
+                            pass
+                entry["done_event"].wait(timeout=5)
+            return self.get(pid, rid)
         try:
             proc.wait(timeout=self.cancel_timeout)
         except subprocess.TimeoutExpired:
@@ -664,9 +1004,11 @@ def resolve_identity(workspace, pid, *, candidate_id=None, verdict=None, decisio
 def _metadata_context(config, project_path):
     paths = {p for source in config.sources for p in (source.path, source.capability_manifest) if p}
     files = _file_manifest(paths, project_path)
-    return {"source_revision": digest([source.model_dump(mode="json") for source in config.sources]),
+    declarations = {source.id: {**source.model_dump(mode="json"), **source.file_scope_revision}
+                    for source in config.sources}
+    return {"source_revision": digest(list(declarations.values())),
             "file_revisions": files,
-            "source_revisions": {source.id: digest(source.model_dump(mode="json"),
+            "source_revisions": {source.id: digest(declarations[source.id],
                 {str(Path(p).resolve().relative_to(project_path.resolve())): files[str(Path(p).resolve().relative_to(project_path.resolve()))]
                  for p in (source.path, source.capability_manifest) if p}) for source in config.sources}}
 

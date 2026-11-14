@@ -66,10 +66,14 @@ def _connect_options(dsn, limits):
         if mode == "DISABLED" and any(options.get(k) for k in ("ssl_ca", "ssl_cert", "ssl_key")):
             raise ValueError
         timeout = max(1, math.ceil(limits.timeout_ms / 1000))
+        # Socket waits must accommodate each configured statement phase. The
+        # active server/client statement deadline still enforces shorter phases.
+        socket_timeout = max(1, math.ceil(max(limits.timeout_ms,
+            limits.probe_timeout_ms or 0, limits.projection_timeout_ms or 0) / 1000))
         result = dict(host=uri.hostname, port=uri.port or 3306, user=unquote(uri.username),
                       password=unquote(uri.password or ""), database=database, charset="utf8mb4",
-                      connect_timeout=min(30, timeout), read_timeout=timeout + 2,
-                      write_timeout=timeout + 2, autocommit=True, local_infile=False, client_flag=0)
+                      connect_timeout=min(30, timeout), read_timeout=socket_timeout + 2,
+                      write_timeout=socket_timeout + 2, autocommit=True, local_infile=False, client_flag=0)
         if mode == "DISABLED":
             result["ssl_disabled"] = True
         if mode == "VERIFY_IDENTITY":
@@ -92,7 +96,7 @@ class MySQLSource(SourceAdapter):
                  allowed_columns: dict[str, list[str]] | None = None, limits: QueryLimits | None = None,
                  verified_capabilities: dict | CapabilityManifest | None = None,
                  connect_factory: Callable | None = None, probe_runtime_limits=False,
-                 query_budget: QueryBudget | None = None, metadata_only: bool = False, _keep_connection: bool = False):
+                 query_budget: QueryBudget | None = None, metadata_only: bool = False, _keep_connection: bool = False, _stats: QueryStats | None = None):
         original_connect_factory = connect_factory
         if not allowed_tables or any(len(t.split(".")) != 2 or any(not p for p in t.split(".")) for t in allowed_tables):
             raise LightGraphError("authorized_catalog_required")
@@ -108,7 +112,7 @@ class MySQLSource(SourceAdapter):
         self.allowed_columns = allowed_columns or {}
         self.limits = limits or QueryLimits()
         self.query_budget = query_budget or QueryBudget()
-        self.stats = QueryStats()
+        self.stats = _stats if _stats is not None else QueryStats()
         self._lock, self._control_lock = threading.RLock(), threading.Lock()
         self._depth = 0
         self._closed = self._broken = self._cancelled = False
@@ -127,6 +131,8 @@ class MySQLSource(SourceAdapter):
                     or not isinstance(self._qualification["capabilities"], dict)):
                 raise LightGraphError("qualified_capability_manifest_required")
         options = _connect_options(dsn, self.limits)
+        connect_started = time.monotonic()
+        connect_finished = False
         try:
             if connect_factory is None:
                 import pymysql
@@ -160,12 +166,16 @@ class MySQLSource(SourceAdapter):
                     raise LightGraphError('database_connection_failed')
             finally:
                 control_options.clear()
+            self.stats.connect_tcp_seconds += max(0.0, time.monotonic() - connect_started)
+            connect_finished = True
             self.query_budget.check_time()
             self.preflight(probe_runtime_limits=probe_runtime_limits)
             if probe_runtime_limits and (not self._manifest.actual_database_verified or
                     any(self._manifest.capabilities.get(k) != 'verified' for k in REQUIRED_RUNTIME)):
                 raise LightGraphError('runtime_capability_unverified')
         except BaseException as exc:
+            if not connect_finished:
+                self.stats.connect_tcp_seconds += max(0.0, time.monotonic() - connect_started)
             self._close_connections()
             if isinstance(exc, LightGraphError):
                 annotate_database_error(exc, engine='mysql', stage='connection_preflight')
@@ -181,7 +191,7 @@ class MySQLSource(SourceAdapter):
         reopen_options = {'source_id': source_id, 'allowed_tables': list(self.allowed_tables),
             'allowed_columns': deepcopy(self.allowed_columns), 'limits': self.limits.model_copy(deep=True),
             'verified_capabilities': deepcopy(self._qualification), 'connect_factory': original_connect_factory,
-            'metadata_only': metadata_only}
+            'metadata_only': metadata_only, '_stats': self.stats}
         configure_reconnection(self, lambda probe, budget: MySQLSource(dsn, **reopen_options,
             probe_runtime_limits=probe, query_budget=budget, _keep_connection=True))
         if not _keep_connection:
@@ -224,15 +234,17 @@ class MySQLSource(SourceAdapter):
                 raw._rows = None
 
     def _start_readonly(self, *, stage='snapshot_start'):
+        started = time.monotonic()
         cursor = self._cursor()
         try:
+            timeout_ms = self._effective_timeout_ms()
             # Guard and driver renderer use ordinary MySQL quoting. Fixed
             # modes prevent ANSI_QUOTES / NO_BACKSLASH_ESCAPES changing the
             # meaning of already-validated literal SQL at the server.
             cursor.execute("SET SESSION sql_mode = '" + ",".join(sorted(MYSQL_SQL_MODES)) + "'")
             cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             cursor.execute("SET SESSION TRANSACTION READ ONLY")
-            cursor.execute(f"SET SESSION max_execution_time = {min(4294967295, int(self.limits.timeout_ms))}")
+            cursor.execute(f"SET SESSION max_execution_time = {min(4294967295, int(timeout_ms))}")
             cursor.execute("SET SESSION lock_wait_timeout = 5")
             cursor.execute("SET SESSION innodb_lock_wait_timeout = 5")
             cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
@@ -241,12 +253,16 @@ class MySQLSource(SourceAdapter):
             failure = readback_shape_failure(row, 4)
             if (failure or str(row[0]).lower() not in {"1", "on", "true"}
                     or str(row[1]).upper().replace("-", " ") != "REPEATABLE READ"
-                    or str(row[2]) != str(min(4294967295, int(self.limits.timeout_ms)))
+                    or str(row[2]) != str(min(4294967295, int(timeout_ms)))
                     or set(str(row[3]).split(",")) != MYSQL_SQL_MODES):
                 raise qualification_error('read_only_transaction_unverified', engine='mysql', stage=stage,
                     failure=failure or 'readback_mismatch', connection_closed=connection_is_closed(self._connection))
         finally:
-            cleanup_preserving_error(self._close_cursor, cursor)
+            try:
+                cleanup_preserving_error(self._close_cursor, cursor)
+            finally:
+                if stage == 'snapshot_start':
+                    self.stats.snapshot_begin_close_seconds += max(0.0, time.monotonic() - started)
 
     def _apply_qualification(self):
         if self._qualification is None:
@@ -304,7 +320,11 @@ class MySQLSource(SourceAdapter):
                         stage='connection_preflight', failure=failure or 'readback_mismatch',
                         connection_closed=connection_is_closed(self._connection))
                 self._manifest.capabilities["distinct_projection"] = "verified"
-                self._tables = self._read_catalog(cursor)
+                catalog_started = time.monotonic()
+                try:
+                    self._tables = self._read_catalog(cursor)
+                finally:
+                    self.stats.preflight_catalog_seconds += max(0.0, time.monotonic() - catalog_started)
                 self._manifest.capabilities["metadata_reading"] = "verified"
                 cursor.execute("WITH p AS (SELECT 1 AS n) SELECT n FROM p UNION ALL SELECT 2")
                 if cursor.fetchall() != [(1,), (2,)]:
@@ -339,6 +359,7 @@ class MySQLSource(SourceAdapter):
         constraints = {}
         for qualified in self.allowed_tables:
             schema, name = qualified.split(".")
+            self.stats.catalog_queries += 1
             cursor.execute("SELECT TABLE_TYPE, ENGINE, TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s", (schema, name))
             row = cursor.fetchone()
             if not row or row[0] != "BASE TABLE":
@@ -348,6 +369,7 @@ class MySQLSource(SourceAdapter):
             comment = row[2] or ""
             if len(comment.encode("utf-8")) > self.limits.max_batch_bytes:
                 raise LightGraphError("metadata_size_limit")
+            self.stats.catalog_queries += 1
             cursor.execute("SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s ORDER BY ORDINAL_POSITION", (schema, name))
             columns = []
             self._physical_column_names[qualified] = set()
@@ -362,6 +384,7 @@ class MySQLSource(SourceAdapter):
                 raise LightGraphError("authorized_column_unavailable")
             table = TableSpec(source_id=self.source_id, schema=schema, name=name, columns=columns, comment=comment)
             tables.append(table)
+            self.stats.catalog_queries += 1
             cursor.execute("SELECT tc.CONSTRAINT_NAME, tc.CONSTRAINT_TYPE, k.COLUMN_NAME, k.ORDINAL_POSITION, k.REFERENCED_TABLE_SCHEMA, k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME FROM information_schema.TABLE_CONSTRAINTS tc JOIN information_schema.KEY_COLUMN_USAGE k ON tc.CONSTRAINT_SCHEMA=k.CONSTRAINT_SCHEMA AND tc.TABLE_NAME=k.TABLE_NAME AND tc.CONSTRAINT_NAME=k.CONSTRAINT_NAME WHERE tc.TABLE_SCHEMA=%s AND tc.TABLE_NAME=%s AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY','UNIQUE','FOREIGN KEY') ORDER BY tc.CONSTRAINT_NAME,k.ORDINAL_POSITION", (schema, name))
             constraints[qualified] = cursor.fetchall()
         catalog = {t.qualified_name: t for t in tables}
@@ -536,17 +559,22 @@ class MySQLSource(SourceAdapter):
             self._manifest.actual_database_verified = False
             for key in ("statement_timeout", "query_cancel"):
                 self._manifest.capabilities[key] = "unknown"
+            probe_started = time.monotonic()
+            self.stats.runtime_probe_runs += 1
             try:
                 self._probe_runtime_control(cancel=False)
                 self._probe_runtime_control(cancel=True)
                 self._manifest.actual_database_verified = all(self._manifest.capabilities[k] == "verified" for k in REQUIRED_RUNTIME)
             except LightGraphError as exc:
+                if exc.code == "query_cancel_unverified":
+                    self.stats.query_cancel_unverified_count += 1
                 annotate_database_error(exc, engine='mysql', stage='connection_preflight')
                 raise
             except Exception as exc:
                 raise database_error('database_runtime_preflight_failed', exc, engine='mysql',
                     stage='connection_preflight', connection_closed=connection_is_closed(self._connection)) from None
             finally:
+                self.stats.preflight_runtime_probe_seconds += max(0.0, time.monotonic() - probe_started)
                 active_error = sys.exc_info()[1]
                 self._manifest.consistent_snapshot = False
                 try: self._rollback()
@@ -636,6 +664,7 @@ class MySQLSource(SourceAdapter):
                 if outer:
                     self._manifest.consistent_snapshot = False
                     active_error = sys.exc_info()[1]
+                    close_started = time.monotonic()
                     try:
                         try:
                             self._rollback()
@@ -648,7 +677,10 @@ class MySQLSource(SourceAdapter):
                     finally:
                         # No transaction or network connection survives Agent
                         # think-time. Nested queries share this lease only.
-                        self._release_snapshot_connection()
+                        try:
+                            self._release_snapshot_connection()
+                        finally:
+                            self.stats.snapshot_begin_close_seconds += max(0.0, time.monotonic() - close_started)
 
     def execute(self, query, *, row_limit=None):
         from lightgraph.query.compiler import mysql_driver_sql
@@ -664,6 +696,7 @@ class MySQLSource(SourceAdapter):
             self._cancelled = False
             started = time.monotonic()
             self.stats.queries += 1
+            timeout_ms = self._effective_timeout_ms()
             cancel_target = self._control, self._connection_id
             def timeout():
                 timed_out.set()
@@ -671,17 +704,18 @@ class MySQLSource(SourceAdapter):
                     self._interrupt(target=cancel_target)
                 except Exception:
                     pass
-            timer = threading.Timer(min(self.limits.timeout_ms / 1000,
+            timer = threading.Timer(min(timeout_ms / 1000,
                 max(.001, self.query_budget.deadline - time.monotonic())), timeout)
             timer.daemon = True
             try:
                 cursor = self._cursor(count_returns=False)
                 timer.start()
-                cursor.execute(sql, query.parameters)
+                with self.stats.measure_sql():
+                    cursor.execute(sql, query.parameters)
                 columns = tuple(col[0] for col in cursor.description)
                 yield from cursor_batches(cursor, limits=self.limits, columns=columns,
                     row_limit=row_limit or self.limits.max_result_rows, stats=self.stats,
-                    deadline=started + self.limits.timeout_ms / 1000,
+                    deadline=started + timeout_ms / 1000, timeout_ms=timeout_ms,
                     cancelled=lambda: self._cancelled, budget=self.query_budget)
                 if self._cancelled:
                     raise LightGraphError("query_cancelled")
@@ -690,12 +724,16 @@ class MySQLSource(SourceAdapter):
                 finished = True
                 self._manifest.capabilities["cursor_paging"] = "verified"
             except LightGraphError as exc:
+                if exc.code == 'query_timeout':
+                    self.stats.query_timeout_count += 1
                 reconnect_allowed = exc.code == 'query_timeout'
                 raise
             except Exception as exc:
                 self.query_budget.check_time()
                 code = ("query_cancelled" if self._cancelled else "query_timeout"
                         if timed_out.is_set() or _errno(exc) in {3024, 1205} else "query_execution_failed")
+                if code == "query_timeout":
+                    self.stats.query_timeout_count += 1
                 diagnostic = database_diagnostic(exc, engine='mysql', stage='query')
                 reconnect_allowed = (not self._cancelled and (code == 'query_timeout'
                     or diagnostic['category'] == 'connection'
@@ -721,7 +759,8 @@ class MySQLSource(SourceAdapter):
                     self._close_cursor(cursor)
                 except Exception:
                     pass
-                self.stats.elapsed_seconds += time.monotonic() - started
+                elapsed = max(0.0, time.monotonic() - started)
+                self.stats.elapsed_seconds += elapsed
 
     def cancel(self, query_id=None):
         if query_id is not None:
