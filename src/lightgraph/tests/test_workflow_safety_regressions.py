@@ -49,6 +49,24 @@ def test_merge_does_not_drop_incompatible_identity_definitions():
         ])
 
 
+def test_independent_outputs_keep_conflicting_type_definitions_and_physical_columns():
+    a = _graph('采购应付')
+    b = _graph('销售应收')
+    b['definitions']['entities'][0]['key_names'] = ['region', 'code']
+    for graph in (a, b):
+        graph['nodes'].append({'id': 'col', 'type': 'Column', 'identity_origin': 'physical_column',
+                               'identity': {'column': 'amount'}, 'supports': []})
+    original = deepcopy([a, b])
+    combined = merge_construction_graphs([
+        {'kind': 'unit', 'contributor_id': 'ap', 'graph': a},
+        {'kind': 'unit', 'contributor_id': 'ar', 'graph': b},
+    ], independent_outputs=True)
+    assert [a, b] == original
+    assert len(combined['nodes']) == len({n['id'] for n in combined['nodes']}) == 4
+    assert len({n['type'] for n in combined['nodes'] if n['type'] != 'Column'}) == 2
+    assert len(combined['definitions']['entities']) == 2
+
+
 def test_published_reader_keeps_old_graph_and_supports_during_next_merge(tmp_path):
     previous = write_sharded_graph(tmp_path, _graph('第一版'), context_fingerprint='old')
     pinned_core = safe_load_yaml((tmp_path / previous['core_path']).read_text('utf-8'))

@@ -7,6 +7,130 @@ export interface ProjectFile {
 }
 export interface Project { project_id: string; name: string; created_at: string; updated_at: string; files: ProjectFile[] }
 export interface SourceConfig { id: string; kind: string; [key: string]: unknown }
+export interface InheritedGraphRef {
+  inherit_id: string
+  source_project_id?: string | null
+  snapshot_path?: string | null
+  allowed_scopes: string[]
+  expected_graph_digest?: string | null
+}
+export interface WorkflowPosition {
+  x: number
+  y: number
+}
+export interface WorkflowUnitConfig {
+  unit_id: string
+  label?: string | null
+  source_ids: string[]
+  source_table_overrides: Record<string, string[]>
+  document_ids: string[] | null
+  goal_markdown?: string | null
+  probe_filter_hint?: string | null
+  max_calls?: number | null
+  max_run_seconds?: number | null
+  enable_co_projection?: boolean | null
+  position?: WorkflowPosition | null
+}
+export interface MergePolicyConfig {
+  shared_entity_types: string[]
+  authority_sources: string[]
+  conflict_mode: 'quarantine' | 'strict'
+  emit_alignment_candidates: boolean
+}
+export interface WorkflowMergeNodeConfig {
+  node_id: string
+  label?: string | null
+  merge_mode: 'deterministic' | 'merge_and_extract'
+  source_ids: string[]
+  source_table_overrides: Record<string, string[]>
+  document_ids: string[] | null
+  goal_markdown?: string | null
+  probe_filter_hint?: string | null
+  max_calls?: number | null
+  max_run_seconds?: number | null
+  enable_co_projection?: boolean | null
+  merge_policy?: MergePolicyConfig | null
+  position?: WorkflowPosition | null
+}
+export interface WorkflowEdgeConfig {
+  edge_id: string
+  source: string
+  target: string
+}
+export interface WorkflowConfig {
+  legacy_merge?: boolean
+  enabled: boolean
+  max_parallel_workers: number
+  enable_co_projection: boolean
+  units: WorkflowUnitConfig[]
+  merge_nodes?: WorkflowMergeNodeConfig[]
+  edges?: WorkflowEdgeConfig[]
+  output_position?: WorkflowPosition | null
+  merge_policy: MergePolicyConfig
+}
+export interface WorkflowMergeNodeState {
+  node_id: string
+  label?: string
+  merge_mode?: string
+  status: string
+  run_id?: string | null
+  error_code?: string | null
+  nodes?: number
+  edges?: number
+  updated_at?: string
+}
+export interface RetrievalStatusResponse {
+  status: 'no_graph' | 'not_vectorized' | 'stale' | 'vectorized'
+  vectorized: boolean
+  stale_reason: string | null
+  has_graph: boolean
+  graph_nodes: number
+  graph_edges: number
+  configured_provider: string
+  configured_model: string
+  configured_base_url: string
+  vector_dim: number | null
+  vector_cards: number | null
+  nodes_indexed: number | null
+  edges_indexed: number | null
+  embedder_model: string | null
+  embedder_provider: string | null
+  synced_at: string | null
+  generation: string
+  config_error: string | null
+}
+export interface EmbeddingConfig {
+  provider?: 'local_hash' | 'openai_compatible'
+  base_url?: string
+  model?: string
+  api_key_env?: string
+  allow_insecure_http?: boolean
+  timeout_seconds?: number
+  batch_size?: number
+  dimensions?: number | null
+  query_instruction?: string
+}
+export interface WorkflowUnitState {
+  unit_id: string
+  label?: string
+  status: string
+  run_id?: string | null
+  error_code?: string | null
+  nodes?: number
+  edges?: number
+  updated_at?: string
+}
+export interface WorkflowState {
+  parent_run_id?: string
+  workflow_input?: string
+  plan_mode?: string
+  status?: string
+  created_at?: string
+  finished_at?: string | null
+  units?: Record<string, WorkflowUnitState>
+  merge_nodes?: Record<string, WorkflowMergeNodeState>
+  merge?: Record<string, unknown>
+}
 export interface RunConfig {
   max_run_seconds?: number
   max_db_queries?: number | null
@@ -17,6 +141,11 @@ export interface RunConfig {
   goal_markdown?: string | null
   goal?: { runtime_guidance?: RuntimeGuidance[]; purpose?: string; entity_kinds?: string[]; relation_kinds?: string[]; include?: string[]; exclude?: string[]; discovery_guidance?: string[]; [key: string]: unknown }
   sources?: SourceConfig[]
+  scopes?: string[]
+  documents?: string[]
+  inherited_graphs?: InheritedGraphRef[]
+  workflow?: WorkflowConfig | null
+  embedding?: EmbeddingConfig
   model?: { mode?: string; base_url?: string; model?: string; api_key_env?: string; stream?: boolean; [key: string]: unknown }
   [key: string]: unknown
 }
@@ -60,6 +189,9 @@ export interface Run {
   stage: string; created_at: string; finished_at?: string; report?: unknown; error_code?: string
   config_revision?: number
   run_mode?: 'continue' | 'fresh'
+  workflow?: boolean
+  workflow_units?: string[]
+  workflow_state?: WorkflowState | null
   output_path?: string
   progress?: RunProgressSnapshot | null
   cleanup_status: 'pending' | 'completed' | 'unknown'

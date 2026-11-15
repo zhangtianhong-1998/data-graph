@@ -34,6 +34,21 @@ Windows 使用 `.venv\Scripts\python.exe` 和 `.venv\Scripts\lightgraph.exe`。�
 
 仓库的 `vendor/deepseek-harness/` 包含固定版本内核与 Python SDK，实际从该目录启动，不依赖个人机器上的 Desktop 应用。来源 commit、许可证、文件哈希和排除清单见[内核来源说明](vendor/deepseek-harness/VENDOR_README.md)。`bootstrap_harness.py --check` 检查已安装依赖及官方 CLI 启动，不调用模型。
 
+## 并行工作流和按需向量化
+
+在「项目配置 → 并行工作流」启用工作流。把两个抽取节点拖到画布，分别选择 A+B、A+C 及各自的知识文档。保存后运行，两个节点按并发数独立抽取。只有抽取节点时，各分支直接输出。要合并时，拖入合并节点并接入两条连线，选择「确定性归并」或「合并抽取」。后者可设置新的抽取目标，从上游已发布的图继续发现关系。
+
+新建工作台项目默认使用本地 Qwen 向量服务。在安装项目的 Python 环境中启动服务：
+
+```bash
+python -m pip install -e '.[embedding]'
+lightgraph embed-server --model Qwen/Qwen3-Embedding-0.6B --port 8002
+```
+
+已有离线权重时，`--model` 可填本地模型目录，再加 `--served-model-name Qwen/Qwen3-Embedding-0.6B` 保持相同的 API 模型名。在「模型配置 → 向量嵌入服务」可测试连接，或更换兼容服务的地址和模型名。
+
+图谱发布后可直接浏览。需要语义检索时，在「运行与结果 → 业务图谱」点击「立即向量化」。任务在后台执行，刷新页面可查看进度状态。完成后在「子图召回」搜索。图谱、可见范围或向量模型变化后，需再次手动向量化。
+
 ## 输入与配置
 
 支持 Excel、CSV、Gauss/MySQL 适配器与 Markdown 文档。数据库实例读取仍受授权范围、只读查询和部署配置约束；连接器存在不代表客户数据库已验收。保留既有来源连接、表列权限、`scopes` 和 `document_scopes`。行支持的可见范围由程序配置 `scope_bindings` 绑定到物理列；无绑定时贡献标记为 `public`，不会根据对象键或列名猜测权限。前端先按范围过滤支持，再重建名称、属性和关系；业务 namespace 本身不授予访问权。`metadata_only` 只允许元数据和知识材料，不发布实例图谱。关闭模型时仅读取目录，不自动猜测对象或关系。

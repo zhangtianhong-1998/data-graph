@@ -203,6 +203,55 @@ class SavedConnections:
         with _LOCK, _safe_storage_errors():
             self._model_path(pid).unlink(missing_ok=True)
 
+    def _embedding_path(self, pid: str) -> Path:
+        if not isinstance(pid, str) or not _PROJECT_ID.fullmatch(pid):
+            raise LightGraphError("saved_connection_invalid")
+        path = self.root / pid / ".model-credentials" / "embedding.enc"
+        _safe_path(path)
+        return path
+
+    def save_embedding(self, pid: str, config, api_key: str) -> None:
+        """Bind an embedding API key to the saved, normalized endpoint."""
+        with _LOCK, _safe_storage_errors():
+            emb = config.embedding
+            if not emb.base_url or not emb.model:
+                raise LightGraphError("embedding_endpoint_required")
+            if not isinstance(api_key, str) or not api_key or len(api_key) > 32768:
+                raise LightGraphError("saved_connection_invalid")
+            path = self._embedding_path(pid)
+            _private_directory(path.parent)
+            cipher = self._cipher(create=True)
+            payload = {"version": 1, "project_id": pid, "base_url": emb.base_url,
+                       "model": emb.model, "api_key": api_key}
+            encoded = cipher.encrypt(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            if len(encoded) > _MAX_PROFILE_BYTES:
+                raise LightGraphError("saved_connection_invalid")
+            _atomic_write(path, encoded)
+
+    def load_embedding(self, pid: str, config) -> str | None:
+        with _LOCK, _safe_storage_errors():
+            path = self._embedding_path(pid)
+            if not path.exists():
+                return None
+            cipher = self._cipher(create=False)
+            try:
+                payload = json.loads(cipher.decrypt(_read(path, _MAX_PROFILE_BYTES)))
+                if (not isinstance(payload, dict) or payload.get("version") != 1 or
+                        not isinstance(payload.get("api_key"), str) or
+                        not 1 <= len(payload["api_key"]) <= 32768):
+                    raise ValueError("invalid_profile")
+            except (InvalidToken, ValueError, TypeError, KeyError):
+                raise LightGraphError("saved_connection_corrupt") from None
+            emb = config.embedding
+            binding = (payload.get("project_id"), payload.get("base_url"), payload.get("model"))
+            if binding != (pid, emb.base_url, emb.model):
+                return None
+            return payload["api_key"]
+
+    def delete_embedding(self, pid: str) -> None:
+        with _LOCK, _safe_storage_errors():
+            self._embedding_path(pid).unlink(missing_ok=True)
+
     def _draft_path(self, pid: str, key: str) -> Path:
         if (not isinstance(pid, str) or not _PROJECT_ID.fullmatch(pid) or
                 not isinstance(key, str) or not (key == "new" or

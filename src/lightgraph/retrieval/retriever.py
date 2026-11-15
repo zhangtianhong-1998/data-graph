@@ -115,6 +115,7 @@ class SubgraphRetriever:
         self.root, manifest = active_index(Path(retrieval_dir), expected_generation)
         self.cohorts = manifest['cohorts']
         self.generation = manifest['generation']
+        self.vector_dim = int(manifest.get('vector_dim') or 0)
         self.index = SQLiteGraphIndex(self.root / 'retrieval.sqlite')
         self.vectors = LocalNumpyVectorStore(self.root / 'vectors')
         self.embedder = embedder or LocalHashEmbedder()
@@ -159,7 +160,13 @@ class SubgraphRetriever:
         truncated_slots = len(slots) > max_slots
         slots = slots[:max_slots]
         slot_surfaces = [slot.surface for slot in slots]
-        q_vectors = self.embedder.embed(slot_surfaces)
+        q_vectors = (
+            self.embedder.embed_queries(slot_surfaces)
+            if hasattr(self.embedder, 'embed_queries')
+            else self.embedder.embed(slot_surfaces)
+        )
+        if self.vector_dim > 0 and q_vectors.ndim == 2 and q_vectors.shape[1] != self.vector_dim:
+            raise LightGraphError('retrieval_index_stale')
         vec_batches = self.vectors.search_batch(q_vectors, scopes=cohorts, top_k=top_n)
 
         slot_results = []

@@ -42,6 +42,10 @@ def error_response(code: str, status: int=400) -> JSONResponse:
 
 
 def error_status(code: str) -> int:
+    if code in {'retrieval_index_stale', 'retrieval_graph_required'}:
+        return 409
+    if code == 'retrieval_jobs_busy':
+        return 429
     if code == 'config_revision_required':
         return 428
     if code.endswith(('_not_found','_missing')) or code in {'project_not_found','file_not_found','run_not_found'}:
@@ -148,6 +152,28 @@ class ModelCredential(InputModel):
     expected_model: ExpectedModel
 
 
+class ExpectedEmbedding(InputModel):
+    base_url: str
+    model: str
+
+
+class EmbeddingCredential(InputModel):
+    api_key: SecretStr = Field(min_length=1, max_length=16384)
+    expected_embedding: ExpectedEmbedding
+
+
+class TestEmbeddingRequest(InputModel):
+    provider: Literal['local_hash', 'openai_compatible'] | None = None
+    base_url: str | None = None
+    model: str | None = None
+    api_key: SecretStr | None = None
+    api_key_env: str | None = None
+    allow_insecure_http: bool | None = None
+    timeout_seconds: float | None = Field(default=None, gt=0)
+    dimensions: int | None = Field(default=None, gt=0)
+    query_instruction: str | None = Field(default=None, max_length=1000)
+
+
 class DeleteConnectionDraft(InputModel):
     revision: int = Field(ge=0,le=9007199254740991)
 
@@ -189,6 +215,8 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     manager=manager_factory(workspace)
     credentials=SessionCredentials()
     saved_connections=SavedConnections(workspace.root)
+    from .retrieval_jobs import RetrievalJobs
+    retrieval_jobs = RetrievalJobs(workspace)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -196,6 +224,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             yield
         finally:
             credentials.clear()
+            await run_in_threadpool(retrieval_jobs.shutdown)
             await run_in_threadpool(manager.shutdown)
 
     app=FastAPI(title='Data Graph Workbench',version='1.1.0',lifespan=lifespan)
@@ -203,6 +232,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     app.state.manager=manager
     app.state.credentials=credentials
     app.state.saved_connections=saved_connections
+    app.state.retrieval_jobs=retrieval_jobs
     app.add_middleware(CORSMiddleware,allow_origins=sorted(ALLOWED_ORIGINS),
         allow_methods=['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
         allow_headers=['Content-Type','X-Workbench-Session','If-Match'],expose_headers=['ETag'],allow_credentials=False)
@@ -280,6 +310,35 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             result['model_environment']=True
         return result
 
+    def embedding_credential_status(pid):
+        config = workspace.resolved_config(pid)
+        err = None
+        has_saved = False
+        try:
+            has_saved = saved_connections.load_embedding(pid, config) is not None
+        except LightGraphError as exc:
+            if not exc.code.startswith('saved_connection_'):
+                raise
+            err = exc.code
+        result = {'embedding': has_saved}
+        if err:
+            result['embedding_error'] = err
+        env_name = config.embedding.api_key_env
+        if env_name and os.environ.get(env_name):
+            result['embedding_environment'] = True
+        return result
+
+    def resolve_embedding_api_key(pid, token, config):
+        if not token:
+            return None
+        credentials.require(pid, token)
+        try:
+            return saved_connections.load_embedding(pid, config)
+        except LightGraphError as exc:
+            if exc.code.startswith('saved_connection_'):
+                return None
+            raise
+
     @app.get('/api/health')
     def health():
         return {'status':'ok','service':'data-graph','version':'1.1.0'}
@@ -309,6 +368,8 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             mutable(pid)
             credentials.require(pid, x_workbench_session)
             workspace.require_config_revision(pid, if_match)
+            if retrieval_jobs.active(pid):
+                raise LightGraphError('retrieval_job_active')
             result = delete_project(workspace, pid)
             credentials.clear_project(pid)
             return result
@@ -373,6 +434,34 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             saved_connections.delete_model(pid)
             credentials.clear_model_sessions(pid)
             return credential_status(pid,x_workbench_session)
+
+    @app.get('/api/projects/{pid}/credentials/embedding')
+    def get_embedding_credential(pid: str):
+        with workspace.lock(pid):
+            workspace.get(pid)
+            return embedding_credential_status(pid)
+
+    @app.put('/api/projects/{pid}/credentials/embedding')
+    def put_embedding_credential(pid: str, data: EmbeddingCredential, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+        with workspace.lock(pid):
+            mutable(pid)
+            credentials.require(pid, x_workbench_session)
+            workspace.require_config_revision(pid, if_match)
+            config = workspace.resolved_config(pid)
+            emb = config.embedding
+            if (data.expected_embedding.base_url, data.expected_embedding.model) != (emb.base_url, emb.model):
+                raise LightGraphError('embedding_credential_binding_conflict')
+            saved_connections.save_embedding(pid, config, data.api_key.get_secret_value())
+            return embedding_credential_status(pid)
+
+    @app.delete('/api/projects/{pid}/credentials/embedding')
+    def delete_embedding_credential(pid: str, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+        with workspace.lock(pid):
+            mutable(pid)
+            credentials.require(pid, x_workbench_session)
+            workspace.require_config_revision(pid, if_match)
+            saved_connections.delete_embedding(pid)
+            return embedding_credential_status(pid)
 
     @app.post('/api/projects/{pid}/database/test')
     def database_test(pid:str,data:DatabaseRequest):
@@ -769,19 +858,82 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
                 options['model_api_key'] = model
             return manager.retry_unit(pid, unit_id, **options)
 
-    @app.post('/api/projects/{pid}/retrieval/sync')
-    def sync_retrieval(pid: str):
+    @app.post('/api/projects/{pid}/workflow/merge')
+    def merge_workflow(pid: str, if_match: str | None = Header(default=None)):
+        with workspace.lock(pid):
+            mutable(pid)
+            workspace.require_config_revision(pid, if_match)
+            return manager.merge_workflow(pid)
+
+    @app.post('/api/projects/{pid}/retrieval/embedding/test')
+    async def test_embedding(pid: str, data: TestEmbeddingRequest | None = None, x_workbench_session: str | None = Header(default=None)):
+        from pydantic import ValidationError
+        from ..runtime.config import EmbeddingConfig
+        from ..retrieval import test_embedding_service
+        with workspace.lock(pid):
+            workspace.get(pid)
+            config = workspace.resolved_config(pid).model_copy(deep=True)
+            saved_binding = (config.embedding.base_url, config.embedding.model, config.embedding.api_key_env)
+        if data is not None:
+            overrides = {k: v for k, v in data.model_dump(exclude={'api_key'}).items() if v is not None}
+            merged = {**config.embedding.model_dump(mode='json'), **overrides}
+            try:
+                config.embedding = EmbeddingConfig.model_validate(merged)
+            except ValidationError:
+                raise LightGraphError('invalid_embedding_config') from None
+        # Test edits must not forward the saved credential to a new endpoint.
+        binding = (config.embedding.base_url, config.embedding.model, config.embedding.api_key_env)
+        saved_key = resolve_embedding_api_key(pid, x_workbench_session, config) if binding == saved_binding else None
+        explicit_key = data.api_key.get_secret_value() if data is not None and data.api_key is not None else (saved_key if binding == saved_binding else '')
+        return await run_in_threadpool(test_embedding_service, config, api_key=explicit_key)
+
+    def schedule_vectorization(pid, token):
         from .construction_graph import project_retriever
+        with workspace.lock(pid):
+            mutable(pid)
+            revision = workspace.get(pid)['config_revision']
+            frozen = workspace.resolved_config(pid).model_copy(deep=True)
+            key = resolve_embedding_api_key(pid, token, frozen)
+
+            def build(_workspace, _pid, *, config):
+                if config != frozen:
+                    raise LightGraphError('graph_read_conflict')
+                _, result = project_retriever(config, refresh=True, embedding_api_key=key)
+                return result
+
+            return retrieval_jobs.start(pid, revision, lambda: read_graph_consistently(workspace, pid, build))
+
+    @app.post('/api/projects/{pid}/retrieval/jobs', status_code=202)
+    def start_vectorization(pid: str, x_workbench_session: str | None = Header(default=None)):
+        job, _ = schedule_vectorization(pid, x_workbench_session)
+        return job
+
+    @app.get('/api/projects/{pid}/retrieval/jobs')
+    def vectorization_job(pid: str):
+        with workspace.lock(pid):
+            workspace.get(pid)
+            return retrieval_jobs.status(pid)
+
+    @app.post('/api/projects/{pid}/retrieval/sync')
+    def sync_retrieval(pid: str, x_workbench_session: str | None = Header(default=None)):
+        # Legacy synchronous clients join the same build as the workbench.
+        _, future = schedule_vectorization(pid, x_workbench_session)
+        return future.result()
+
+    @app.get('/api/projects/{pid}/retrieval/status')
+    def get_retrieval_status(pid: str, x_workbench_session: str | None = Header(default=None)):
+        from .construction_graph import retrieval_status
         def read(_workspace, _pid, *, config):
-            _, result = project_retriever(config, refresh=True)
-            return result
+            emb_key = resolve_embedding_api_key(pid, x_workbench_session, config)
+            return retrieval_status(config, embedding_api_key=emb_key)
         return read_graph_consistently(workspace, pid, read)
 
     @app.post('/api/projects/{pid}/retrieval/query')
-    def query_retrieval(pid: str, data: RetrieveSubgraphRequest):
+    async def query_retrieval(pid: str, data: RetrieveSubgraphRequest, x_workbench_session: str | None = Header(default=None)):
         from .construction_graph import project_retriever
         def read(_workspace, _pid, *, config):
-            retriever, _ = project_retriever(config)
+            emb_key = resolve_embedding_api_key(pid, x_workbench_session, config)
+            retriever, _ = project_retriever(config, embedding_api_key=emb_key)
             return retriever.retrieve(
                 data.query,
                 scopes=list(config.scopes),
@@ -793,7 +945,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
                 max_nodes=data.max_nodes,
                 max_edges=data.max_edges,
             )
-        return read_graph_consistently(workspace, pid, read)
+        return await run_in_threadpool(read_graph_consistently, workspace, pid, read)
 
     @app.post('/api/projects/{pid}/runs/{rid}/cancel')
     def cancel_run(pid:str,rid:str):

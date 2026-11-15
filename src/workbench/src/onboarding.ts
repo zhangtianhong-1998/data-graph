@@ -1,14 +1,14 @@
 import type { SourceConfig } from './types'
 import { splitLines } from './state'
 
-export type ConfigurationTab = 'inputs' | 'documents' | 'goal' | 'settings'
-export type ResultTab = 'metadata' | 'business' | 'runs'
+export type ConfigurationTab = 'inputs' | 'documents' | 'goal' | 'workflow' | 'settings'
+export type ResultTab = 'metadata' | 'business' | 'retrieval' | 'runs'
 export type WorkbenchTab = ConfigurationTab | ResultTab
 export const configurationTabs: Array<{ id: ConfigurationTab; label: string }> = [
-  { id: 'inputs', label: '数据接入' }, { id: 'documents', label: '知识文档' }, { id: 'goal', label: '抽取目标' }, { id: 'settings', label: '模型配置' },
+  { id: 'inputs', label: '数据接入' }, { id: 'documents', label: '知识文档' }, { id: 'goal', label: '抽取目标' }, { id: 'workflow', label: '并行工作流' }, { id: 'settings', label: '模型配置' },
 ]
 export const resultTabs: Array<{ id: ResultTab; label: string }> = [
-  { id: 'metadata', label: '元数据图' }, { id: 'business', label: '业务图谱' }, { id: 'runs', label: '运行记录' },
+  { id: 'metadata', label: '元数据图' }, { id: 'business', label: '业务图谱' }, { id: 'retrieval', label: '子图召回' }, { id: 'runs', label: '运行记录' },
 ]
 export function isResultTab(tab: WorkbenchTab): tab is ResultTab { return resultTabs.some(item => item.id === tab) }
 export type GaussSslMode = 'auto' | 'disable' | 'allow' | 'prefer' | 'require' | 'verify-ca' | 'verify-full'

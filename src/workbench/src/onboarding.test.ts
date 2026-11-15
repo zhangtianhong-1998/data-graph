@@ -5,11 +5,13 @@ import type { ConnectionForm } from './onboarding'
 const form: ConnectionForm = { kind: 'mysql_database', format: 'fields', dsn: 'unused secret', host: ' db.local ', port: '3306', database: 'app', username: 'reader', password: ' p a s s ', schema: '' }
 afterEach(() => { clearSessions(); vi.unstubAllGlobals() })
 describe('配置与运行分离', () => {
-  it('模型和目标只在配置阶段，图谱和日志只在结果阶段', () => {
-    expect(configurationTabs.map(item => item.id)).toEqual(['inputs', 'documents', 'goal', 'settings'])
-    expect(resultTabs.map(item => item.id)).toEqual(['metadata', 'business', 'runs'])
+  it('模型和目标只在配置阶段，图谱、召回和日志只在结果阶段', () => {
+    expect(configurationTabs.map(item => item.id)).toEqual(['inputs', 'documents', 'goal', 'workflow', 'settings'])
+    expect(resultTabs.map(item => item.id)).toEqual(['metadata', 'business', 'retrieval', 'runs'])
     expect(isResultTab('settings')).toBe(false)
+    expect(isResultTab('workflow')).toBe(false)
     expect(isResultTab('metadata')).toBe(true)
+    expect(isResultTab('retrieval')).toBe(true)
   })
 })
 describe('直接连接输入', () => {

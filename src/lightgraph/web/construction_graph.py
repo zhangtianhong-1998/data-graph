@@ -101,9 +101,98 @@ def load_graph(config):
     return graph
 
 
-def project_retriever(config, *, refresh=False):
+def retrieval_status(config, *, embedding_api_key=None) -> dict:
+    """Inspect whether the current published graph has been vectorized (without running embeddings)."""
+    from lightgraph.retrieval import resolve_embedder
+    from lightgraph.retrieval.sync import active_index
+    from lightgraph.retrieval.vector_local import embedder_fingerprint
+
+    root = Path(config.output_dir) / 'construction'
+    manifest = root / 'manifest.yaml'
+    if root.is_symlink() or manifest.is_symlink():
+        raise LightGraphError('workspace_path_invalid')
+
+    graph_nodes = 0
+    graph_edges = 0
+    has_graph = False
+    if manifest.exists():
+        graph, generation = load_prepared(config)
+        graph_nodes = len(graph.get('nodes', []))
+        graph_edges = len(graph.get('edges', []))
+        has_graph = graph_nodes > 0 or graph_edges > 0
+    else:
+        ensure_supported_access(config)
+        generation = digest('no-construction-publication', access_fingerprint(config), _scope_key(config))
+
+    emb_cfg = getattr(config, 'embedding', None)
+    configured_provider = getattr(emb_cfg, 'provider', 'local_hash')
+    configured_model = getattr(emb_cfg, 'model', '') or ('local_hash' if configured_provider == 'local_hash' else '')
+    configured_base_url = getattr(emb_cfg, 'base_url', '')
+
+    config_error = None
+    expected_tag = None
+    try:
+        embedder = resolve_embedder(config, api_key=embedding_api_key)
+        expected_tag = embedder_fingerprint(embedder)
+    except LightGraphError as exc:
+        config_error = exc.code
+
+    retrieval_dir = Path(config.output_dir) / 'retrieval'
+    current_meta = None
+    if (retrieval_dir / 'current.json').is_file():
+        try:
+            _, current_meta = active_index(retrieval_dir)
+        except LightGraphError:
+            current_meta = None
+
+    if not has_graph:
+        status = 'no_graph'
+        stale_reason = None
+    elif current_meta is None:
+        status = 'not_vectorized'
+        stale_reason = 'index_missing'
+    elif current_meta.get('generation') != generation:
+        status = 'stale'
+        stale_reason = 'graph_updated'
+    elif config_error:
+        status = 'stale'
+        stale_reason = 'embedding_config_invalid'
+    elif expected_tag is not None and current_meta.get('embedder') != expected_tag:
+        status = 'stale'
+        stale_reason = 'embedder_changed'
+    else:
+        status = 'vectorized'
+        stale_reason = None
+
+    # A stale build can belong to an earlier, broader scope. Only disclose
+    # its counts when it matches the current authorized graph.
+    if status != 'vectorized':
+        current_meta = None
+    return {
+        'status': status,
+        'vectorized': status == 'vectorized',
+        'stale_reason': stale_reason,
+        'has_graph': has_graph,
+        'graph_nodes': graph_nodes,
+        'graph_edges': graph_edges,
+        'configured_provider': configured_provider,
+        'configured_model': configured_model,
+        'configured_base_url': configured_base_url,
+        'vector_dim': current_meta.get('vector_dim') if current_meta else None,
+        'vector_cards': current_meta.get('vector_cards') if current_meta else None,
+        'nodes_indexed': current_meta.get('nodes_indexed') if current_meta else None,
+        'edges_indexed': current_meta.get('edges_indexed') if current_meta else None,
+        'embedder_model': current_meta.get('embedder_model') if current_meta else None,
+        'embedder_provider': current_meta.get('embedder_provider') if current_meta else None,
+        'synced_at': current_meta.get('synced_at') if current_meta else None,
+        'generation': generation,
+        'config_error': config_error,
+    }
+
+
+def project_retriever(config, *, refresh=False, embedding_api_key=None):
     """Bind both indexes to the active publication and its current access scope."""
-    from lightgraph.retrieval import SubgraphRetriever, sync_graph_to_retrieval
+    from lightgraph.retrieval import SubgraphRetriever, resolve_embedder, sync_graph_to_retrieval
     root = Path(config.output_dir) / 'construction'
     manifest = root / 'manifest.yaml'
     if root.is_symlink() or manifest.is_symlink():
@@ -114,15 +203,15 @@ def project_retriever(config, *, refresh=False):
         ensure_supported_access(config)
         graph = {'nodes': [], 'edges': []}
         generation = digest('no-construction-publication', access_fingerprint(config), _scope_key(config))
+    embedder = resolve_embedder(config, api_key=embedding_api_key)
     directory = Path(config.output_dir) / 'retrieval'
     if not refresh:
-        try:
-            return SubgraphRetriever(directory, expected_generation=generation), None
-        except LightGraphError as exc:
-            if exc.code != 'retrieval_index_stale':
-                raise
-    result = sync_graph_to_retrieval(graph, directory, generation=generation)
-    return SubgraphRetriever(directory, expected_generation=generation), result
+        # Queries never start a potentially expensive index build implicitly.
+        return SubgraphRetriever(directory, embedder=embedder, expected_generation=generation), None
+    if not graph.get('nodes'):
+        raise LightGraphError('retrieval_graph_required')
+    result = sync_graph_to_retrieval(graph, directory, generation=generation, embedder=embedder)
+    return SubgraphRetriever(directory, embedder=embedder, expected_generation=generation), result
 
 
 def vocabulary(graph):

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timezone
 import json
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
@@ -211,7 +213,10 @@ def sync_graph_to_retrieval(
     # replaced matrix or pair it with another generation's SQLite row indices.
     gen_token = generation if generation is not None else digest(graph)
     model_tag = embedder_fingerprint(embedder)
-    build_id = digest('retrieval-v2', gen_token, model_tag)[:32]
+    # A manual rebuild must publish its new vectors even when a service has
+    # changed behind the same model name and URL. Existing readers keep their
+    # immutable build while the pointer switches atomically after success.
+    build_id = uuid4().hex
     builds = root / 'builds'
     builds.mkdir(exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix='.building-', dir=builds))
@@ -221,14 +226,27 @@ def sync_graph_to_retrieval(
         vec_store = LocalNumpyVectorStore(staging / 'vectors')
         vectors = embedder.embed([item['card_text'] for item in vector_items])
         vec_store.replace_all(vector_items, vectors)
-        # Concurrent rebuilds of identical immutable inputs share one directory.
-        try:
-            staging.rename(builds / build_id)
-        except OSError:
-            if not (builds / build_id).is_dir():
-                raise
-        manifest = {'format': 2, 'generation': gen_token, 'build': build_id, 'cohorts': cohorts,
-                    'embedder': model_tag}
+        resolved_dim = int(vectors.shape[1]) if vectors.ndim == 2 and vectors.shape[0] else int(embedder.dim or 0)
+        staging.rename(builds / build_id)
+        synced_at = datetime.now(timezone.utc).isoformat()
+        embedder_provider = 'openai_compatible' if hasattr(embedder, 'base_url') else 'local_hash'
+        embedder_model = getattr(embedder, 'model', 'local_hash') or 'local_hash'
+        nodes_indexed = len(node_rows)
+        edges_indexed = len({row['edge_id'] for row in edge_rows})
+        manifest = {
+            'format': 2,
+            'generation': gen_token,
+            'build': build_id,
+            'cohorts': cohorts,
+            'embedder': model_tag,
+            'embedder_model': embedder_model,
+            'embedder_provider': embedder_provider,
+            'vector_dim': resolved_dim,
+            'nodes_indexed': nodes_indexed,
+            'edges_indexed': edges_indexed,
+            'vector_cards': len(vector_items),
+            'synced_at': synced_at,
+        }
         atomic_text(root / 'current.json', canonical(manifest))
     finally:
         if staging.exists():
@@ -236,10 +254,15 @@ def sync_graph_to_retrieval(
 
     return {
         'status': 'synced',
+        'vectorized': True,
         'generation': gen_token,
-        'nodes_indexed': len(node_rows),
-        'edges_indexed': len({row['edge_id'] for row in edge_rows}),
+        'build': build_id,
+        'nodes_indexed': nodes_indexed,
+        'edges_indexed': edges_indexed,
         'scope_views': len(scope_views),
         'vector_cards': len(vector_items),
-        'vector_dim': int(vectors.shape[1]) if vectors.ndim == 2 and vectors.shape[0] else embedder.dim,
+        'vector_dim': resolved_dim,
+        'embedder_model': embedder_model,
+        'embedder_provider': embedder_provider,
+        'synced_at': synced_at,
     }

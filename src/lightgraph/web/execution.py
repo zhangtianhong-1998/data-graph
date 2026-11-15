@@ -281,6 +281,8 @@ class RunManager:
                 raise LightGraphError("invalid_run_mode")
             project, runs = self._paths(pid)
             config = self.workspace.resolved_config(pid).model_copy(deep=True)
+            if config.workflow and config.workflow.enabled and not config.workflow.units:
+                raise LightGraphError("workflow_units_required")
             from ..construction.intent import effective_goal_markdown
             if not effective_goal_markdown(config).strip():
                 raise LightGraphError("extraction_purpose_required")
@@ -389,46 +391,83 @@ class RunManager:
                         model_api_key=None, run_mode="continue", previous_generation=None,
                         generation_already_selected=False, selected_unit_ids=None):
         from concurrent.futures import ThreadPoolExecutor
-        from ..construction.workspace import safe_load_yaml
+        from ..construction.access import access_fingerprint
+        from ..construction.inheritance import authorize_frozen_inheritance, freeze_inherited_graphs, frozen_contributors
+        from ..construction.merger import merge_construction_graphs
         from ..construction.workflow import (
-            build_unit_config, copy_frozen_inheritance, load_workflow_state,
-            merge_project_workflow, published_unit_attempts, save_workflow_state, unit_output_path,
+            build_merge_node_config, build_unit_config, copy_frozen_inheritance,
+            load_unit_contributor, load_workflow_state, merge_project_workflow,
+            promote_unit_to_project_output, publish_merged_contributors, publish_premerged_graph,
+            published_unit_attempts, resolve_workflow_plan, save_workflow_state, unit_output_path,
         )
+        from ..construction.workspace import safe_load_yaml, write_yaml
+
         if run_mode == "fresh" and not generation_already_selected:
             self.workspace.select_output_generation(pid, rid, create=True)
         wf = config.workflow
+        plan = resolve_workflow_plan(wf)
+        if any(not plan.merge_inputs[mid] for mid in plan.merge_order):
+            raise LightGraphError("workflow_merge_input_required")
         deadline = time.monotonic() + config.max_run_seconds
-        target_units = [u for u in wf.units if selected_unit_ids is None or u.unit_id in selected_unit_ids]
+        active_unit_set = set(plan.extract_ids)
+        if selected_unit_ids and not set(selected_unit_ids) <= active_unit_set:
+            raise LightGraphError("workflow_unit_not_connected")
+        target_units = [
+            u for u in wf.units
+            if (u.unit_id in active_unit_set if selected_unit_ids is None else u.unit_id in selected_unit_ids)
+        ]
         if not target_units:
             raise LightGraphError("workflow_unit_not_found")
         existing_state = load_workflow_state(config.output_dir) if run_mode == "continue" else None
         payload_deps = _input_manifest(config, project)
-        from ..construction.access import access_fingerprint
         workflow_input = digest(access_fingerprint(config), config.workflow.model_dump(mode="json"),
                                 config.goal_markdown, config.goal.model_dump(mode="json"), payload_deps)
         if selected_unit_ids is not None and (existing_state or {}).get("workflow_input") != workflow_input:
             raise LightGraphError("workflow_input_changed")
-        previous_attempts = (published_unit_attempts(config.output_dir)
-                             if (existing_state or {}).get("workflow_input") == workflow_input else {})
+        previous_attempts = {}
+        if (existing_state or {}).get("workflow_input") == workflow_input:
+            previous_attempts = existing_state.get("ready_unit_attempts", published_unit_attempts(config.output_dir))
         units_state = dict((existing_state or {}).get("units") or {}) if selected_unit_ids is not None else {}
         for unit in wf.units:
             if unit.unit_id not in units_state or unit in target_units:
                 units_state[unit.unit_id] = {
                     "unit_id": unit.unit_id,
-                    "status": "queued" if unit in target_units else units_state.get(unit.unit_id, {}).get("status", "pending"),
+                    "label": unit.label or unit.unit_id,
+                    "status": "queued" if unit in target_units else "skipped",
                     "run_id": None,
                     "error_code": None,
                     "nodes": 0,
                     "edges": 0,
                     "updated_at": _now(),
                 }
+            elif unit.label:
+                units_state[unit.unit_id]["label"] = unit.label
+
+        merge_nodes_map = {m.node_id: m for m in wf.merge_nodes}
+        merge_nodes_state = {
+            m.node_id: {
+                "node_id": m.node_id,
+                "label": m.label or m.node_id,
+                "merge_mode": m.merge_mode,
+                "status": "queued" if m.node_id in plan.merge_order else "skipped",
+                "run_id": None,
+                "error_code": None,
+                "nodes": 0,
+                "edges": 0,
+                "updated_at": _now(),
+            }
+            for m in wf.merge_nodes
+        }
         wf_state = {
             "parent_run_id": rid,
             "workflow_input": workflow_input,
+            "ready_unit_attempts": previous_attempts,
+            "plan_mode": plan.mode,
             "status": "running",
             "created_at": _now(),
             "finished_at": None,
             "units": units_state,
+            "merge_nodes": merge_nodes_state,
             "merge": {"status": "pending"},
         }
         save_workflow_state(config.output_dir, wf_state)
@@ -460,46 +499,41 @@ class RunManager:
         source_root = str(Path(__file__).resolve().parents[2])
         env["PYTHONPATH"] = source_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
 
-        def run_unit(unit):
-            unit_out = unit_output_path(config.output_dir, unit.unit_id, rid)
-            unit_out.mkdir(parents=True, exist_ok=True)
-            copy_frozen_inheritance(Path(config.output_dir) / "construction", unit_out / "construction")
-            unit_config = build_unit_config(config, unit, unit_output_dir=unit_out)
+        def run_worker_config(node_key: str, state_bucket: dict, node_config: RunConfig) -> dict:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise LightGraphError("run_time_budget_exhausted")
-            unit_config.max_run_seconds = min(unit_config.max_run_seconds, remaining)
-            unit_rid = "run_" + uuid.uuid4().hex[:24]
-            unit_result = runs / (unit_rid + ".result.json")
-            unit_payload = _resolved_payload(
-                unit_config, project,
+            node_config.max_run_seconds = min(node_config.max_run_seconds, remaining)
+            node_rid = "run_" + uuid.uuid4().hex[:24]
+            node_result = runs / (node_rid + ".result.json")
+            node_payload = _resolved_payload(
+                node_config, project,
                 source_credentials={k: v for k, v in (source_credentials or {}).items()
-                                    if any(s.id == k for s in unit_config.sources)},
+                                    if any(s.id == k for s in node_config.sources)},
                 model_api_key=model_api_key,
             )
             with entry["state_lock"]:
                 if cancel_event.is_set():
-                    units_state[unit.unit_id].update(status="cancelled", error_code="run_cancelled", updated_at=_now())
+                    state_bucket[node_key].update(status="cancelled", error_code="run_cancelled", updated_at=_now())
                     save_workflow_state(config.output_dir, wf_state)
-                    return {"unit_id": unit.unit_id, "status": "cancelled", "cleanup_status": "completed"}
-                units_state[unit.unit_id].update(status="running", run_id=unit_rid, updated_at=_now())
+                    return {"unit_id": node_key, "status": "cancelled", "cleanup_status": "completed"}
+                state_bucket[node_key].update(status="running", run_id=node_rid, updated_at=_now())
                 save_workflow_state(config.output_dir, wf_state)
                 with self._service_lock.child_process_options() as child_options:
                     proc = subprocess.Popen(
-                        [sys.executable, "-m", "lightgraph.web.worker", str(unit_result)],
+                        [sys.executable, "-m", "lightgraph.web.worker", str(node_result)],
                         cwd=project, env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                         **child_options,
                     )
-                entry["unit_procs"][unit.unit_id] = (proc, unit_result)
+                entry["unit_procs"][node_key] = (proc, node_result)
             collector = StderrCollector(proc.stderr)
             try:
-                proc.stdin.write(json.dumps(unit_payload, ensure_ascii=False).encode("utf-8"))
+                proc.stdin.write(json.dumps(node_payload, ensure_ascii=False).encode("utf-8"))
                 proc.stdin.close()
                 try:
                     proc.wait(timeout=max(0.0, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
-                    # Give the worker its normal cancellation/transaction cleanup window.
-                    atomic_text(_cancel_path(unit_result), "cancel\n")
+                    atomic_text(_cancel_path(node_result), "cancel\n")
                     try:
                         proc.wait(timeout=self.cancel_timeout)
                     except subprocess.TimeoutExpired:
@@ -514,9 +548,9 @@ class RunManager:
             finally:
                 collector.finish()
                 with entry["state_lock"]:
-                    entry["unit_procs"].pop(unit.unit_id, None)
+                    entry["unit_procs"].pop(node_key, None)
             try:
-                res = _json_file(unit_result)
+                res = _json_file(node_result)
             except LightGraphError:
                 res = {"status": "failed", "cleanup_status": "unknown", "error_code": "worker_result_missing"}
             if cancel_event.is_set():
@@ -525,7 +559,7 @@ class RunManager:
             rep = res.get("report") or {}
             counts = rep.get("counts") or {}
             with entry["state_lock"]:
-                units_state[unit.unit_id].update(
+                state_bucket[node_key].update(
                     status=res.get("status", "failed"),
                     error_code=res.get("error_code"),
                     nodes=counts.get("delta_nodes", counts.get("business_nodes", 0)),
@@ -534,10 +568,17 @@ class RunManager:
                 )
                 save_workflow_state(config.output_dir, wf_state)
             try:
-                _cancel_path(unit_result).unlink(missing_ok=True)
+                _cancel_path(node_result).unlink(missing_ok=True)
             except OSError:
                 pass
-            return {"unit_id": unit.unit_id, **res}
+            return {"unit_id": node_key, **res}
+
+        def run_unit(unit):
+            unit_out = unit_output_path(config.output_dir, unit.unit_id, rid)
+            unit_out.mkdir(parents=True, exist_ok=True)
+            copy_frozen_inheritance(Path(config.output_dir) / "construction", unit_out / "construction")
+            unit_config = build_unit_config(config, unit, unit_output_dir=unit_out)
+            return run_worker_config(unit.unit_id, units_state, unit_config)
 
         def coordinator():
             unit_results = []
@@ -570,14 +611,209 @@ class RunManager:
                                 attempts[uid] = rid
                     check_dependencies(payload_deps, project)
                     if config.inherited_graphs:
-                        from ..construction.inheritance import authorize_frozen_inheritance
                         authorize_frozen_inheritance(config, self.workspace)
                     if self.workspace.config_revision(pid) != record["config_revision"]:
                         raise LightGraphError("input_dependency_changed")
-                    merge_summary = merge_project_workflow(config.output_dir, config, workspace=self.workspace,
-                                                          unit_attempts=attempts)
-                    wf_state["merge"] = {"status": "completed", **merge_summary}
-                    statuses = {u["status"] for u in units_state.values()}
+                    # Leaf publications can be retried independently of a blocked terminal node.
+                    wf_state["ready_unit_attempts"] = attempts
+
+                    if plan.merge_order:
+                        root_construction = Path(config.output_dir) / "construction"
+                        root_construction.mkdir(parents=True, exist_ok=True)
+                        if getattr(config, "inherited_graphs", None) and not (root_construction / "inherited" / "summary.yaml").is_file():
+                            freeze_inherited_graphs(config, root_construction, workspace=self.workspace)
+                        base_contributors, _ = frozen_contributors(root_construction, config=config)
+
+                        units_by_id = {u.unit_id: u for u in wf.units}
+                        unit_contribs: dict[str, dict] = {}
+                        included_units: list[str] = []
+                        skipped_units: list[str] = []
+                        for uid in plan.extract_ids:
+                            if uid not in attempts:
+                                skipped_units.append(uid)
+                                continue
+                            out_dir = unit_output_path(config.output_dir, uid, attempts[uid])
+                            c = load_unit_contributor(out_dir, uid)
+                            if c is None:
+                                skipped_units.append(uid)
+                                continue
+                            expected_acc = access_fingerprint(build_unit_config(config, units_by_id[uid], unit_output_dir=out_dir))
+                            if c["graph"].get("access_fingerprint") != expected_acc:
+                                raise LightGraphError("graph_access_context_changed")
+                            unit_contribs[uid] = c
+                            included_units.append(uid)
+
+                        merge_node_contribs: dict[str, dict] = {}
+                        merge_outputs: dict[str, dict] = {}
+                        for mid in plan.merge_order:
+                            if cancel_event.is_set():
+                                raise LightGraphError("run_cancelled")
+                            mnode = merge_nodes_map[mid]
+                            eff_policy = mnode.merge_policy or wf.merge_policy
+                            in_ids = plan.merge_inputs.get(mid, [])
+                            unavailable = [i for i in in_ids if i not in unit_contribs and i not in merge_node_contribs]
+                            # A failed replacement must keep the prior root visible; its
+                            # old publication is not a successful dependency of this run.
+                            unavailable.extend(i for i in in_ids if i in units_state and units_state[i]["status"] not in {"completed", "completed_with_gaps"})
+                            if unavailable:
+                                merge_nodes_state[mid].update(status="skipped", error_code="workflow_units_not_ready", updated_at=_now())
+                                save_workflow_state(config.output_dir, wf_state)
+                                continue
+                            has_upstream_merge = any(i in merge_node_contribs for i in in_ids)
+                            node_inputs: list[dict] = []
+                            if not has_upstream_merge:
+                                node_inputs.extend(base_contributors)
+                            for iid in in_ids:
+                                if iid in unit_contribs:
+                                    node_inputs.append(unit_contribs[iid])
+                                elif iid in merge_node_contribs:
+                                    node_inputs.append(merge_node_contribs[iid])
+
+                            merged_upstream = merge_construction_graphs(
+                                node_inputs,
+                                target_access_fingerprint=access_fingerprint(config),
+                                merge_policy=eff_policy,
+                            )
+
+                            if mnode.merge_mode == "merge_and_extract":
+                                m_out = unit_output_path(config.output_dir, mid, rid)
+                                m_out.mkdir(parents=True, exist_ok=True)
+                                snap_path = m_out / "upstream-merged-snapshot.yaml"
+                                write_yaml(snap_path, {
+                                    **merged_upstream,
+                                    "status": "published",
+                                    "target": "graph",
+                                    "support_visibility_version": 1,
+                                })
+                                up_summary = f"{len(merged_upstream.get('nodes', []))} 个节点、{len(merged_upstream.get('edges', []))} 条边"
+                                m_cfg = build_merge_node_config(
+                                    config, mnode,
+                                    upstream_snapshot_path=snap_path,
+                                    upstream_summary=up_summary,
+                                    node_output_dir=m_out,
+                                )
+                                freeze_inherited_graphs(m_cfg, m_out / "construction", workspace=self.workspace)
+                                m_res = run_worker_config(mid, merge_nodes_state, m_cfg)
+                                unit_results.append(m_res)
+                                if cancel_event.is_set():
+                                    raise LightGraphError("run_cancelled")
+                                if m_res.get("status") not in {"completed", "completed_with_gaps", "partial"}:
+                                    continue
+                                m_delta = load_unit_contributor(m_out, mid)
+                                combine_list = [{"contributor_id": f"upstream_{mid}", "kind": "base", "graph": merged_upstream}]
+                                if m_delta is not None:
+                                    if m_delta["graph"].get("access_fingerprint") != access_fingerprint(m_cfg):
+                                        raise LightGraphError("graph_access_context_changed")
+                                    combine_list.append(m_delta)
+                                combined = merge_construction_graphs(
+                                    combine_list,
+                                    target_access_fingerprint=access_fingerprint(config),
+                                    merge_policy=eff_policy,
+                                )
+                                merge_outputs[mid] = combined
+                                merge_node_contribs[mid] = {
+                                    "contributor_id": mid,
+                                    "kind": "merged",
+                                    "graph": combined,
+                                    "evidence_records": m_delta["evidence_records"] if m_delta else {},
+                                }
+                                merge_nodes_state[mid].update(
+                                    nodes=len(combined.get("nodes", [])),
+                                    edges=len(combined.get("edges", [])),
+                                    updated_at=_now(),
+                                )
+                                save_workflow_state(config.output_dir, wf_state)
+                            else:
+                                merge_outputs[mid] = merged_upstream
+                                merge_node_contribs[mid] = {
+                                    "contributor_id": mid,
+                                    "kind": "merged",
+                                    "graph": merged_upstream,
+                                    "evidence_records": {},
+                                }
+                                merge_nodes_state[mid].update(
+                                    status="completed",
+                                    nodes=len(merged_upstream.get("nodes", [])),
+                                    edges=len(merged_upstream.get("edges", [])),
+                                    updated_at=_now(),
+                                )
+                                save_workflow_state(config.output_dir, wf_state)
+
+                        # Publish terminal outputs
+                        if cancel_event.is_set():
+                            raise LightGraphError("run_cancelled")
+                        check_dependencies(payload_deps, project)
+                        if self.workspace.config_revision(pid) != record["config_revision"]:
+                            raise LightGraphError("input_dependency_changed")
+                        if config.inherited_graphs:
+                            authorize_frozen_inheritance(config, self.workspace)
+                        if any(tid not in merge_outputs and tid not in unit_contribs for tid in plan.terminal_ids):
+                            merge_summary = None
+                            wf_state["merge"] = {"status": "skipped", "error_code": "workflow_units_not_ready"}
+                        elif len(plan.terminal_ids) == 1 and plan.terminal_ids[0] in merge_outputs:
+                            merge_summary = publish_premerged_graph(
+                                config.output_dir,
+                                config,
+                                merged=merge_outputs[plan.terminal_ids[0]],
+                                included_units=included_units,
+                                skipped_units=skipped_units,
+                                unit_attempts=attempts,
+                                mode="dag_merge",
+                            )
+                        else:
+                            terminal_contribs: list[dict] = []
+                            if any(tid in unit_contribs for tid in plan.terminal_ids):
+                                terminal_contribs.extend(base_contributors)
+                            for tid in plan.terminal_ids:
+                                if tid in merge_node_contribs:
+                                    terminal_contribs.append(merge_node_contribs[tid])
+                                elif tid in unit_contribs:
+                                    terminal_contribs.append(unit_contribs[tid])
+                            if not terminal_contribs:
+                                terminal_contribs = list(base_contributors)
+                            merge_summary = publish_merged_contributors(
+                                config.output_dir,
+                                config,
+                                contributors=terminal_contribs,
+                                included_units=included_units,
+                                skipped_units=skipped_units,
+                                unit_attempts=attempts,
+                                merge_policy=wf.merge_policy,
+                                mode="dag_merge",
+                                independent_terminals=True,
+                            )
+                        if merge_summary is not None:
+                            wf_state["merge"] = {"status": "completed", **merge_summary}
+                    elif plan.mode == "direct_single" and len(plan.terminal_ids) == 1:
+                        only_uid = plan.terminal_ids[0]
+                        if only_uid in attempts:
+                            merge_summary = promote_unit_to_project_output(
+                                config.output_dir,
+                                config,
+                                unit_id=only_uid,
+                                attempt=attempts[only_uid],
+                                workspace=self.workspace,
+                            )
+                        else:
+                            merge_summary = merge_project_workflow(
+                                config.output_dir, config, workspace=self.workspace,
+                                unit_ids=plan.extract_ids, unit_attempts=attempts, mode="direct_output",
+                            )
+                        wf_state["merge"] = {"status": "direct_output", **merge_summary}
+                    else:
+                        merge_summary = merge_project_workflow(
+                            config.output_dir, config, workspace=self.workspace,
+                            unit_ids=plan.extract_ids, unit_attempts=attempts,
+                            mode="direct_multi_output" if plan.mode == "direct_multi" else "merged",
+                        )
+                        wf_state["merge"] = {
+                            "status": "direct_multi_output" if plan.mode == "direct_multi" else "completed",
+                            **merge_summary,
+                        }
+
+                    active_statuses = [units_state[uid]["status"] for uid in plan.extract_ids if uid in units_state]
+                    active_statuses.extend(merge_nodes_state[mid]["status"] for mid in plan.merge_order if mid in merge_nodes_state)
+                    statuses = set(active_statuses) or {u["status"] for u in units_state.values()}
                     if statuses <= {"completed"}:
                         gaps = (merge_summary["skipped_units"]
                                 or merge_summary["conflict_isolation"].get("coverage") == "incomplete")
@@ -594,8 +830,11 @@ class RunManager:
                 total_counts = {
                     "business_nodes": (merge_summary or {}).get("nodes", 0),
                     "business_edges": (merge_summary or {}).get("edges", 0),
-                    "workflow_units_total": len(wf.units),
-                    "workflow_units_succeeded": sum(u["status"] in {"completed", "completed_with_gaps"} for u in units_state.values()),
+                    "workflow_units_total": len(plan.extract_ids),
+                    "workflow_units_succeeded": sum(
+                        units_state[uid]["status"] in {"completed", "completed_with_gaps"}
+                        for uid in plan.extract_ids if uid in units_state
+                    ),
                 }
                 report_obj = RunReport(
                     run_id=rid,
@@ -617,11 +856,16 @@ class RunManager:
                     _save(runs / (rid + ".json"), record)
                     self._processes.pop(pid, None)
             except Exception as exc:
-                code = _safe_code(getattr(exc, "code", None), "workflow_execution_failed")
-                wf_state.update(status="failed", finished_at=_now(), merge={"status": "failed", "error_code": code})
+                cancelled = cancel_event.is_set()
+                code = "run_cancelled" if cancelled else _safe_code(getattr(exc, "code", None), "workflow_execution_failed")
+                terminal_status = "cancelled" if cancelled else "failed"
+                for node in list(units_state.values()) + list(merge_nodes_state.values()):
+                    if node["status"] in {"queued", "running"}:
+                        node.update(status=terminal_status, error_code=code, updated_at=_now())
+                wf_state.update(status=terminal_status, finished_at=_now(), merge={"status": terminal_status, "error_code": code})
                 save_workflow_state(config.output_dir, wf_state)
                 with self.workspace.lock(pid), self._guard:
-                    record.update(status="failed", stage="finished", finished_at=_now(),
+                    record.update(status=terminal_status, stage="finished", finished_at=_now(),
                                   cleanup_status="unknown", error_code=code)
                     _save(runs / (rid + ".json"), record)
                     self._processes.pop(pid, None)
@@ -629,7 +873,7 @@ class RunManager:
                 done_event.set()
 
         threading.Thread(target=coordinator, daemon=True).start()
-        return dict(record)
+        return dict(record, workflow_state=wf_state)
 
     def retry_unit(self, pid, unit_id, *, source_credentials=None, model_api_key=None):
         """Re-run one workflow unit and deterministically replace only its contribution."""
@@ -659,13 +903,90 @@ class RunManager:
     def workflow_status(self, pid):
         with self.workspace.lock(pid):
             config = self.workspace.resolved_config(pid)
-            from ..construction.workflow import load_workflow_state
+            from ..construction.workflow import load_workflow_state, resolve_workflow_plan
+            from ..construction.workspace import safe_load_yaml
             state = load_workflow_state(config.output_dir)
+            summary_path = Path(config.output_dir) / "construction" / "workflow-merge-summary.yaml"
+            merge_summary = None
+            if summary_path.is_file():
+                try:
+                    merge_summary = safe_load_yaml(summary_path.read_text(encoding="utf-8"))
+                except Exception:
+                    merge_summary = None
+            plan = resolve_workflow_plan(config.workflow) if config.workflow else None
             return {
                 "enabled": bool(config.workflow and config.workflow.enabled),
+                "plan_mode": plan.mode if plan else None,
                 "units": [u.unit_id for u in config.workflow.units] if config.workflow else [],
+                "unit_details": [
+                    {
+                        "unit_id": u.unit_id,
+                        "label": u.label or u.unit_id,
+                        "source_ids": list(u.source_ids),
+                        "source_table_overrides": dict(u.source_table_overrides),
+                        "document_ids": list(u.document_ids) if u.document_ids is not None else None,
+                    }
+                    for u in (config.workflow.units if config.workflow else [])
+                ],
+                "merge_nodes": [
+                    {
+                        "node_id": m.node_id,
+                        "label": m.label or m.node_id,
+                        "merge_mode": m.merge_mode,
+                    }
+                    for m in (config.workflow.merge_nodes if config.workflow else [])
+                ],
+                "edges": [e.model_dump(mode="json") for e in (config.workflow.edges if config.workflow else [])],
                 "state": state,
+                "merge_summary": merge_summary,
             }
+
+    def merge_workflow(self, pid):
+        """Re-run deterministic merge across currently published workflow units and inherited graphs."""
+        with self.workspace.lock(pid), self._guard:
+            if self._closed:
+                raise LightGraphError("run_service_stopped")
+            if self.active(pid):
+                raise LightGraphError("project_run_active")
+            config = self.workspace.resolved_config(pid).model_copy(deep=True)
+            if not config.workflow or not config.workflow.enabled:
+                raise LightGraphError("workflow_not_enabled")
+            from ..construction.workflow import (
+                load_workflow_state, merge_project_workflow, promote_unit_to_project_output,
+                published_unit_attempts, resolve_workflow_plan, save_workflow_state,
+            )
+            attempts = published_unit_attempts(config.output_dir)
+            if not attempts and not config.inherited_graphs:
+                raise LightGraphError("workflow_units_not_ready")
+            plan = resolve_workflow_plan(config.workflow)
+            if plan.merge_order:
+                # This synchronous legacy endpoint cannot replay extraction nodes.
+                # Never replace DAG output with just its leaf-unit publications.
+                raise LightGraphError("workflow_dag_requires_run")
+            if plan.mode == "direct_single" and len(plan.terminal_ids) == 1 and plan.terminal_ids[0] in attempts:
+                summary = promote_unit_to_project_output(
+                    config.output_dir,
+                    config,
+                    unit_id=plan.terminal_ids[0],
+                    attempt=attempts[plan.terminal_ids[0]],
+                    workspace=self.workspace,
+                )
+                merge_status = "direct_output"
+            else:
+                summary = merge_project_workflow(
+                    config.output_dir,
+                    config,
+                    workspace=self.workspace,
+                    unit_ids=plan.extract_ids or None,
+                    unit_attempts=attempts,
+                    mode="direct_multi_output" if plan.mode == "direct_multi" else "merged",
+                )
+                merge_status = "direct_multi_output" if plan.mode == "direct_multi" else "completed"
+            state = load_workflow_state(config.output_dir)
+            if isinstance(state, dict):
+                state["merge"] = {"status": merge_status, **summary}
+                save_workflow_state(config.output_dir, state)
+            return summary
 
     def _watch(self, pid, proc):
         proc.wait()
@@ -745,6 +1066,12 @@ class RunManager:
         diagnostics = read_worker_log(path)
         record = dict(record, worker_diagnostics={key: diagnostics[key] for key in ('status', 'incomplete')},
                       worker_diagnostic_events=len(diagnostics['events']))
+        if record.get("workflow") and record.get("output_path"):
+            from ..construction.workflow import load_workflow_state
+            out_dir = path.parent.parent / record["output_path"]
+            wf_state = load_workflow_state(out_dir)
+            if wf_state is not None and wf_state.get("parent_run_id") == record.get("run_id"):
+                record["workflow_state"] = wf_state
         return record
 
     def list(self, pid):

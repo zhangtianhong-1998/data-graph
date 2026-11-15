@@ -248,6 +248,7 @@ sys.exit(0)
             cfg['model'] = {'mode': 'in_environment', 'model': 'offline', 'base_url': 'https://model.invalid/v1'}
         cfg['workflow'] = {
             'enabled': True,
+            'legacy_merge': True,
             'max_parallel_workers': 2,
             'units': [
                 {'unit_id': 'u1'},
@@ -408,11 +409,13 @@ sys.exit(0)
             up = client.post('/api/projects/six_p/files', headers={'If-Match': etag}, files={'file': ('doc.md', f, 'text/markdown')})
             etag = up.headers['etag']
         cfg = client.get('/api/projects/six_p/config').json()
+        cfg['embedding'] = {'provider': 'local_hash'}
         cfg['goal_markdown'] = '# 继承基础图谱并开展6并行扩展'
         cfg['model'] = {'mode': 'in_environment', 'model': 'offline', 'base_url': 'https://model.invalid/v1'}
         cfg['inherited_graphs'] = [{'inherit_id': 'base_v1', 'source_project_id': 'base_p', 'allowed_scopes': ['public']}]
         cfg['workflow'] = {
             'enabled': True,
+            'legacy_merge': True,
             'max_parallel_workers': 6,
             'units': [{'unit_id': f'u{i}'} for i in range(1, 7)],
             'merge_policy': {'shared_entity_types': ['Indicator', 'Dimension']},

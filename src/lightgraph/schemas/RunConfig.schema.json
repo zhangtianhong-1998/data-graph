@@ -1,5 +1,90 @@
 {
   "$defs": {
+    "EmbeddingConfig": {
+      "additionalProperties": false,
+      "description": "Configurable, replaceable semantic embedding service for subgraph retrieval.",
+      "properties": {
+        "provider": {
+          "default": "local_hash",
+          "enum": [
+            "local_hash",
+            "openai_compatible"
+          ],
+          "title": "Provider",
+          "type": "string"
+        },
+        "base_url": {
+          "default": "",
+          "title": "Base Url",
+          "type": "string"
+        },
+        "model": {
+          "default": "",
+          "title": "Model",
+          "type": "string"
+        },
+        "api_key": {
+          "anyOf": [
+            {
+              "format": "password",
+              "type": "string",
+              "writeOnly": true
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Api Key"
+        },
+        "api_key_env": {
+          "default": "LIGHTGRAPH_EMBEDDING_API_KEY",
+          "title": "Api Key Env",
+          "type": "string"
+        },
+        "allow_insecure_http": {
+          "default": false,
+          "title": "Allow Insecure Http",
+          "type": "boolean"
+        },
+        "timeout_seconds": {
+          "default": 30.0,
+          "exclusiveMinimum": 0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "batch_size": {
+          "default": 32,
+          "maximum": 512,
+          "minimum": 1,
+          "title": "Batch Size",
+          "type": "integer"
+        },
+        "dimensions": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional vector dimension; auto-detected when null (e.g. 1024 for Qwen3-Embedding-0.6B).",
+          "title": "Dimensions"
+        },
+        "query_instruction": {
+          "default": "",
+          "description": "Optional instruction prefix prepended only to retrieval queries (e.g. Qwen3-Embedding Instruct format).",
+          "maxLength": 1000,
+          "title": "Query Instruction",
+          "type": "string"
+        }
+      },
+      "title": "EmbeddingConfig",
+      "type": "object"
+    },
     "EntityTypeDefinition": {
       "additionalProperties": false,
       "properties": {
@@ -964,6 +1049,12 @@
           "title": "Enabled",
           "type": "boolean"
         },
+        "legacy_merge": {
+          "default": false,
+          "description": "Explicit compatibility mode for old edge-less workflows that implicitly merged all units.",
+          "title": "Legacy Merge",
+          "type": "boolean"
+        },
         "max_parallel_workers": {
           "default": 4,
           "maximum": 24,
@@ -984,6 +1075,33 @@
           "title": "Units",
           "type": "array"
         },
+        "merge_nodes": {
+          "items": {
+            "$ref": "#/$defs/WorkflowMergeNodeConfig"
+          },
+          "maxItems": 16,
+          "title": "Merge Nodes",
+          "type": "array"
+        },
+        "edges": {
+          "items": {
+            "$ref": "#/$defs/WorkflowEdgeConfig"
+          },
+          "maxItems": 256,
+          "title": "Edges",
+          "type": "array"
+        },
+        "output_position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowPosition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "merge_policy": {
           "$ref": "#/$defs/MergePolicyConfig"
         }
@@ -991,15 +1109,68 @@
       "title": "WorkflowConfig",
       "type": "object"
     },
-    "WorkflowUnitConfig": {
+    "WorkflowEdgeConfig": {
       "additionalProperties": false,
-      "description": "One parallel execution unit inside a parent project workflow.",
+      "description": "Directed DAG wire connecting extract -> merge, merge -> merge, or node -> output.",
       "properties": {
-        "unit_id": {
+        "edge_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Edge Id",
+          "type": "string"
+        },
+        "source": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Source",
+          "type": "string"
+        },
+        "target": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Target",
+          "type": "string"
+        }
+      },
+      "required": [
+        "edge_id",
+        "source",
+        "target"
+      ],
+      "title": "WorkflowEdgeConfig",
+      "type": "object"
+    },
+    "WorkflowMergeNodeConfig": {
+      "additionalProperties": false,
+      "description": "A merge or merge-and-extract node joining upstream workflow outputs.",
+      "properties": {
+        "node_id": {
           "maxLength": 64,
           "minLength": 1,
           "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
-          "title": "Unit Id",
+          "title": "Node Id",
+          "type": "string"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "merge_mode": {
+          "default": "deterministic",
+          "enum": [
+            "deterministic",
+            "merge_and_extract"
+          ],
+          "title": "Merge Mode",
           "type": "string"
         },
         "source_ids": {
@@ -1100,6 +1271,187 @@
           ],
           "default": null,
           "title": "Enable Co Projection"
+        },
+        "merge_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MergePolicyConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowPosition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "node_id"
+      ],
+      "title": "WorkflowMergeNodeConfig",
+      "type": "object"
+    },
+    "WorkflowPosition": {
+      "additionalProperties": false,
+      "description": "Canvas coordinates for visual workflow DAG orchestration.",
+      "properties": {
+        "x": {
+          "default": 0.0,
+          "title": "X",
+          "type": "number"
+        },
+        "y": {
+          "default": 0.0,
+          "title": "Y",
+          "type": "number"
+        }
+      },
+      "title": "WorkflowPosition",
+      "type": "object"
+    },
+    "WorkflowUnitConfig": {
+      "additionalProperties": false,
+      "description": "One parallel execution unit (extract node) inside a parent project workflow.",
+      "properties": {
+        "unit_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "title": "Unit Id",
+          "type": "string"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "source_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "title": "Source Ids",
+          "type": "array"
+        },
+        "source_table_overrides": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "maxProperties": 64,
+          "title": "Source Table Overrides",
+          "type": "object"
+        },
+        "document_ids": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 128,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Document Ids"
+        },
+        "goal_markdown": {
+          "anyOf": [
+            {
+              "maxLength": 32000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Goal Markdown"
+        },
+        "probe_filter_hint": {
+          "anyOf": [
+            {
+              "maxLength": 2000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Probe Filter Hint"
+        },
+        "max_calls": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Calls"
+        },
+        "max_run_seconds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Run Seconds"
+        },
+        "enable_co_projection": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Enable Co Projection"
+        },
+        "position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowPosition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -1172,6 +1524,10 @@
     },
     "model": {
       "$ref": "#/$defs/ModelConfig"
+    },
+    "embedding": {
+      "$ref": "#/$defs/EmbeddingConfig",
+      "description": "Configurable, replaceable embedding service for subgraph retrieval (local OpenAI-compatible server or offline fallback)."
     },
     "output_dir": {
       "default": "runs/default",

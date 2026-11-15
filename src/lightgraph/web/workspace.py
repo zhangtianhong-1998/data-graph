@@ -148,10 +148,10 @@ def _no_credentials(data) -> None:
                     raise LightGraphError("credential_bearing_url_forbidden")
             except ValueError:
                 raise LightGraphError("invalid_model_url") from None
-        for key in ("llm", "model", "credentials", "connection"):
+        for key in ("llm", "model", "embedding", "credentials", "connection"):
             check(value.get(key))
 
-    if set(data) & {"llm", "model", "sources", "base_url", "api_key_env", "api_key"}:
+    if set(data) & {"llm", "model", "embedding", "sources", "base_url", "api_key_env", "api_key"}:
         check(data)
     for source in data.get("sources", []) if isinstance(data.get("sources", []), list) else []:
         check(source)
@@ -311,7 +311,12 @@ class Workspace:
             self._write_yaml(path / "project.yaml", project)
             for folder in ("files", "output", "runs"):
                 (path / folder).mkdir()
+            # New workbench projects offer the local semantic service. Older
+            # saved projects without embedding settings keep their existing index.
             config = RunConfig(sources=[], isolation_domain=project_id, output_dir="output",
+                               embedding={"provider": "openai_compatible", "base_url": "http://127.0.0.1:8002/v1",
+                                          "model": "Qwen/Qwen3-Embedding-0.6B",
+                                          "query_instruction": "Given a business question, retrieve relevant graph entities."},
                                goal={"purpose": "", "entity_kinds": [], "relation_kinds": []}).model_dump(mode="json")
             self._write_config(project_id, config)
             return self.get(project_id)

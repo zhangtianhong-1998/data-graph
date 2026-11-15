@@ -2,12 +2,17 @@
 from pydantic import ValidationError
 
 from lightgraph.errors import LightGraphError
-from lightgraph.runtime.config import RunConfig, ModelConfig, SourceConfig, AgentConfig, GraphScopeBinding, InheritedGraphRef, WorkflowConfig, WorkflowUnitConfig, MergePolicyConfig
+from lightgraph.runtime.config import (
+    RunConfig, ModelConfig, EmbeddingConfig, SourceConfig, AgentConfig, GraphScopeBinding,
+    InheritedGraphRef, WorkflowConfig, WorkflowUnitConfig, WorkflowMergeNodeConfig,
+    WorkflowEdgeConfig, WorkflowPosition, MergePolicyConfig,
+)
 from lightgraph.contracts import QueryLimits, ExtractionGoal
 
 _FIELDS = frozenset().union(*(model.model_fields for model in (
-    RunConfig, ModelConfig, SourceConfig, AgentConfig, GraphScopeBinding,
-    InheritedGraphRef, WorkflowConfig, WorkflowUnitConfig, MergePolicyConfig,
+    RunConfig, ModelConfig, EmbeddingConfig, SourceConfig, AgentConfig, GraphScopeBinding,
+    InheritedGraphRef, WorkflowConfig, WorkflowUnitConfig, WorkflowMergeNodeConfig,
+    WorkflowEdgeConfig, WorkflowPosition, MergePolicyConfig,
     QueryLimits, ExtractionGoal)))
 _HINTS = {
     'missing': '缺少必填字段。',
@@ -29,6 +34,15 @@ _HINTS = {
 _RULES = {
     'context_window_must_exceed_output_reservation': '总上下文窗口须大于最大输出 tokens。',
     'invalid_model_key_environment': '环境变量名只能包含英文字母、数字和下划线，且不能以数字开头。',
+    'invalid_embedding_key_environment': '环境变量名只能包含英文字母、数字和下划线，且不能以数字开头。',
+    'invalid_embedding_base_url': '向量服务地址必须是有效的 HTTP(S) URL，且不能包含账号、密码或查询参数。',
+    'workflow_cycle_detected': '工作流连线不能存在环路，请检查节点连接方向。',
+    'workflow_edge_source_unknown': '工作流连线起点引用了不存在的节点。',
+    'workflow_edge_target_unknown': '工作流连线终点只能是合并节点或最终输出。',
+    'duplicate_workflow_unit_id': '工作流中存在重复的抽取节点编号。',
+    'duplicate_workflow_merge_node_id': '工作流中存在重复的合并节点编号。',
+    'duplicate_workflow_node_id': '抽取节点与合并节点编号不能重复。',
+    'reserved_workflow_node_id': '节点编号不能使用保留名称 output。',
     'csv_format_config_required': 'CSV 来源需要路径、编码、分隔符、表头、空值和类型设置；建议从数据接入页面添加。',
     'source_id_required': '来源编号不能为空。',
 }

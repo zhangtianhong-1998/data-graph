@@ -1,6 +1,7 @@
-"""In-project parallel workflow unit builder, merger orchestrator, and state persistence."""
+"""In-project parallel workflow DAG planner, unit builder, merge orchestrator, and state persistence."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import re
@@ -9,7 +10,14 @@ from typing import Any
 
 from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
-from lightgraph.runtime.config import RunConfig, WorkflowUnitConfig
+from lightgraph.runtime.config import (
+    InheritedGraphRef,
+    MergePolicyConfig,
+    RunConfig,
+    WorkflowConfig,
+    WorkflowMergeNodeConfig,
+    WorkflowUnitConfig,
+)
 from lightgraph.runtime.retention import atomic_text
 from .access import access_fingerprint
 from .inheritance import freeze_inherited_graphs, frozen_contributors
@@ -40,22 +48,145 @@ def published_unit_attempts(project_output_dir):
     return dict((manifest.get('current_graph') or {}).get('workflow_units') or {})
 
 
-def build_unit_config(
-    project_config: RunConfig,
-    unit: WorkflowUnitConfig,
+_WORKSPACE_DOC_NAME = re.compile(r'^(f_[a-f0-9]{16})_(.+)$')
+
+
+def _document_matches(doc: str, wanted: set[str]) -> bool:
+    path = Path(doc)
+    name = path.name
+    stem = path.stem
+    norm = doc.replace('\\', '/')
+    match = _WORKSPACE_DOC_NAME.match(name)
+    file_id = match.group(1) if match else None
+    orig_name = match.group(2) if match else None
+    orig_stem = Path(orig_name).stem if orig_name else None
+    for token in wanted:
+        w = str(token).strip()
+        if not w:
+            continue
+        w_norm = w.replace('\\', '/')
+        if doc == w or name == w or stem == w or norm.endswith('/' + w_norm):
+            return True
+        if file_id and w == file_id:
+            return True
+        if orig_name and (w == orig_name or w == orig_stem):
+            return True
+    return False
+
+
+@dataclass(frozen=True)
+class WorkflowPlan:
+    mode: str  # 'direct_single' | 'direct_multi' | 'dag_merge' | 'legacy_merge'
+    extract_ids: list[str]
+    merge_order: list[str]
+    merge_inputs: dict[str, list[str]]
+    terminal_ids: list[str]
+    explicit_dag: bool
+
+
+def resolve_workflow_plan(wf: WorkflowConfig) -> WorkflowPlan:
+    """Resolve an orchestrated DAG (extract nodes, optional merge nodes, optional output wires)."""
+    unit_ids = [u.unit_id for u in wf.units]
+    merge_ids = [m.node_id for m in wf.merge_nodes]
+    unit_set = set(unit_ids)
+    merge_set = set(merge_ids)
+    explicit_dag = bool(wf.merge_nodes or wf.edges)
+
+    if not explicit_dag:
+        mode = ('direct_single' if len(unit_ids) == 1 else
+                'legacy_merge' if wf.legacy_merge else 'direct_multi')
+        return WorkflowPlan(
+            mode=mode,
+            extract_ids=list(unit_ids),
+            merge_order=[],
+            merge_inputs={},
+            terminal_ids=list(unit_ids),
+            explicit_dag=False,
+        )
+
+    outgoing: dict[str, list[str]] = {nid: [] for nid in unit_ids + merge_ids}
+    incoming: dict[str, list[str]] = {nid: [] for nid in merge_ids + ['output']}
+    for edge in wf.edges:
+        outgoing.setdefault(edge.source, []).append(edge.target)
+        incoming.setdefault(edge.target, []).append(edge.source)
+
+    # Determine terminal nodes feeding final output.
+    if incoming['output']:
+        terminal_ids = list(dict.fromkeys(incoming['output']))
+    else:
+        terminal_ids = [node_id for node_id in unit_ids + merge_ids if not outgoing[node_id]]
+
+    effective_incoming: dict[str, list[str]] = {
+        mid: list(dict.fromkeys(incoming.get(mid, [])))
+        for mid in merge_ids
+    }
+
+    # Backward traversal from terminal nodes to collect active extract & merge nodes.
+    reachable_extract: set[str] = set()
+    reachable_merge: set[str] = set()
+    stack = list(terminal_ids)
+    visited: set[str] = set()
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        if cur in unit_set:
+            reachable_extract.add(cur)
+        elif cur in merge_set:
+            reachable_merge.add(cur)
+            for src in effective_incoming.get(cur, []):
+                stack.append(src)
+
+    # Preserve declared order for active extract nodes; topological order for active merge nodes.
+    extract_ids = [uid for uid in unit_ids if uid in reachable_extract]
+    merge_order: list[str] = []
+    placed = set(extract_ids)
+    remaining = [mid for mid in merge_ids if mid in reachable_merge]
+    while remaining:
+        progressed = False
+        for mid in list(remaining):
+            deps = [d for d in effective_incoming.get(mid, []) if d in reachable_extract or d in reachable_merge]
+            if all(d in placed for d in deps):
+                merge_order.append(mid)
+                placed.add(mid)
+                remaining.remove(mid)
+                progressed = True
+        if not progressed:
+            raise LightGraphError('workflow_cycle_detected')
+
+    if merge_order:
+        mode = 'dag_merge'
+    elif len(terminal_ids) <= 1:
+        mode = 'direct_single'
+    else:
+        mode = 'direct_multi'
+
+    return WorkflowPlan(
+        mode=mode,
+        extract_ids=extract_ids,
+        merge_order=merge_order,
+        merge_inputs={mid: [d for d in effective_incoming.get(mid, []) if d in placed] for mid in merge_order},
+        terminal_ids=terminal_ids,
+        explicit_dag=True,
+    )
+
+
+def _apply_scoped_inputs(
+    cloned: RunConfig,
     *,
-    unit_output_dir: str | Path,
+    source_ids: list[str],
+    source_table_overrides: dict[str, list[str]],
+    document_ids: list[str] | None,
 ) -> RunConfig:
-    """Derive a scoped RunConfig for one parallel unit without mutating the parent."""
-    cloned = project_config.model_copy(deep=True)
-    if unit.source_ids:
+    if source_ids:
         known = {s.id for s in cloned.sources}
-        missing = sorted(set(unit.source_ids) - known)
+        missing = sorted(set(source_ids) - known)
         if missing:
             raise LightGraphError('source_not_found')
-        cloned.sources = [s for s in cloned.sources if s.id in unit.source_ids]
+        cloned.sources = [s for s in cloned.sources if s.id in source_ids]
 
-    for sid, tables in unit.source_table_overrides.items():
+    for sid, tables in source_table_overrides.items():
         source = next((s for s in cloned.sources if s.id == sid), None)
         if source is None:
             raise LightGraphError('source_not_found')
@@ -82,16 +213,31 @@ def build_unit_config(
         )
     ]
 
-    if unit.document_ids is not None:
-        wanted = set(unit.document_ids)
-        cloned.documents = [
-            doc for doc in cloned.documents
-            if doc in wanted or Path(doc).name in wanted or Path(doc).stem in wanted
-        ]
+    if document_ids is not None:
+        wanted = set(document_ids)
+        cloned.documents = [doc for doc in cloned.documents if _document_matches(doc, wanted)]
+    return cloned
+
+
+def build_unit_config(
+    project_config: RunConfig,
+    unit: WorkflowUnitConfig,
+    *,
+    unit_output_dir: str | Path,
+) -> RunConfig:
+    """Derive a scoped RunConfig for one parallel extract node without mutating the parent."""
+    cloned = project_config.model_copy(deep=True)
+    _apply_scoped_inputs(
+        cloned,
+        source_ids=unit.source_ids,
+        source_table_overrides=unit.source_table_overrides,
+        document_ids=unit.document_ids,
+    )
 
     base_goal = effective_goal_markdown(project_config)
     extra_parts = [base_goal] if base_goal.strip() else []
-    extra_parts.append(f'## 并行单元上下文 ({unit.unit_id})\n\n仅处理当前单元已授权来源与表范围，产出的增量图将由项目融合器统一归并。')
+    unit_heading = f'{unit.label} ({unit.unit_id})' if unit.label else unit.unit_id
+    extra_parts.append(f'## 并行单元上下文 ({unit_heading})\n\n仅处理当前单元已授权来源与表范围，产出的增量图将由项目融合器统一归并。')
     if unit.goal_markdown and unit.goal_markdown.strip():
         extra_parts.append(unit.goal_markdown.strip())
     if unit.probe_filter_hint and unit.probe_filter_hint.strip():
@@ -116,6 +262,71 @@ def build_unit_config(
     )
     cloned.workflow = None
     cloned.output_dir = str(unit_output_dir)
+    return cloned
+
+
+def build_merge_node_config(
+    project_config: RunConfig,
+    merge_node: WorkflowMergeNodeConfig,
+    *,
+    upstream_snapshot_path: str | Path,
+    upstream_summary: str,
+    node_output_dir: str | Path,
+) -> RunConfig:
+    """Derive a RunConfig for a full-node merge-and-extract step with frozen upstream base."""
+    cloned = project_config.model_copy(deep=True)
+    _apply_scoped_inputs(
+        cloned,
+        source_ids=merge_node.source_ids,
+        source_table_overrides=merge_node.source_table_overrides,
+        document_ids=merge_node.document_ids,
+    )
+
+    inherit_id = f'upstream_{merge_node.node_id}'
+    if len(inherit_id) > 64:
+        inherit_id = f'upstream_{digest(merge_node.node_id)[:32]}'
+    # Upstream is already the complete union of project inheritance and its
+    # branches. Re-adding project references makes base identities ambiguous.
+    cloned.inherited_graphs = [
+        InheritedGraphRef(
+            inherit_id=inherit_id,
+            snapshot_path=str(Path(upstream_snapshot_path).resolve()),
+            allowed_scopes=list(cloned.scopes or ['public']),
+        ),
+    ]
+
+    base_goal = effective_goal_markdown(project_config)
+    extra_parts = [base_goal] if base_goal.strip() else []
+    heading = f'{merge_node.label} ({merge_node.node_id})' if merge_node.label else merge_node.node_id
+    extra_parts.append(
+        f'## 全节点合并抽取上下文 ({heading})\n\n'
+        f'本节点已汇总并只读继承上游分节点抽取成果（{upstream_summary}）。\n'
+        '请重点检查跨分支、跨表之间尚未打通的关联关系与全局语义补全，使用 `__base_graph__` 复用已抽取实体，避免无意义重复全表扫表。'
+    )
+    if merge_node.goal_markdown and merge_node.goal_markdown.strip():
+        extra_parts.append(merge_node.goal_markdown.strip())
+    if merge_node.probe_filter_hint and merge_node.probe_filter_hint.strip():
+        extra_parts.append(f'### 全节点探查范围建议\n\n{merge_node.probe_filter_hint.strip()}')
+    cloned.goal_markdown = '\n\n'.join(extra_parts)
+
+    if merge_node.max_run_seconds is not None:
+        cloned.max_run_seconds = merge_node.max_run_seconds
+    if merge_node.max_calls is not None:
+        if cloned._agent is not None:
+            cloned._agent = cloned._agent.model_copy(
+                update={'llm': cloned._agent.llm.model_copy(update={'max_calls': merge_node.max_calls})}
+            )
+        else:
+            cloned.model = cloned.model.model_copy(update={'max_calls': merge_node.max_calls})
+
+    wf = project_config.workflow
+    cloned.enable_co_projection = (
+        merge_node.enable_co_projection
+        if merge_node.enable_co_projection is not None
+        else bool(wf.enable_co_projection) if wf is not None else project_config.enable_co_projection
+    )
+    cloned.workflow = None
+    cloned.output_dir = str(node_output_dir)
     return cloned
 
 
@@ -170,6 +381,141 @@ def load_unit_contributor(unit_output_dir: str | Path, unit_id: str) -> dict[str
     }
 
 
+def publish_premerged_graph(
+    project_output_dir: str | Path,
+    project_config: RunConfig,
+    *,
+    merged: dict[str, Any],
+    included_units: list[str],
+    skipped_units: list[str],
+    unit_attempts: dict[str, str],
+    mode: str = 'dag_merge',
+) -> dict[str, Any]:
+    """Persist an already-merged graph dict as the sharded root construction publication."""
+    root_output = Path(project_output_dir)
+    root_construction = root_output / 'construction'
+    root_construction.mkdir(parents=True, exist_ok=True)
+    ctx_fingerprint = digest('workflow_merge_v2', access_fingerprint(project_config), merged)
+    persisted = write_sharded_graph(
+        root_construction,
+        merged,
+        context_fingerprint=ctx_fingerprint,
+        unit_attempts={uid: unit_attempts[uid] for uid in included_units if uid in unit_attempts},
+    )
+    merge_summary = {
+        'format_version': 1,
+        'mode': mode,
+        'merged_at': _now(),
+        'included_units': included_units,
+        'skipped_units': skipped_units,
+        'inherited_ids': sorted({
+            sup['inherited_from']['inherit_id']
+            for item in merged.get('nodes', []) + merged.get('edges', [])
+            for sup in item.get('supports', [])
+            if isinstance(sup.get('inherited_from'), dict) and sup['inherited_from'].get('inherit_id')
+        }),
+        'nodes': persisted['nodes'],
+        'edges': persisted['edges'],
+        'shard_count': persisted['shard_count'],
+        'candidate_identity_merges': len(merged.get('candidate_identity_merges', [])),
+        'candidate_column_alignments': len(merged.get('candidate_column_alignments', [])),
+        'conflict_isolation': {
+            k: v for k, v in (merged.get('conflict_isolation') or {}).items()
+            if k not in {'node_ids', 'edge_ids'}
+        },
+    }
+    write_yaml(root_construction / 'workflow-merge-summary.yaml', merge_summary)
+    write_yaml(root_construction / 'merge-alignment-candidates.yaml', {
+        'candidate_identity_merges': merged.get('candidate_identity_merges', []),
+        'candidate_column_alignments': merged.get('candidate_column_alignments', []),
+    })
+    return merge_summary
+
+
+def publish_merged_contributors(
+    project_output_dir: str | Path,
+    project_config: RunConfig,
+    *,
+    contributors: list[dict[str, Any]],
+    included_units: list[str],
+    skipped_units: list[str],
+    unit_attempts: dict[str, str],
+    merge_policy: MergePolicyConfig | None = None,
+    mode: str = 'merged',
+    independent_terminals: bool = False,
+) -> dict[str, Any]:
+    """Deterministically combine prepared contributors and publish sharded root construction graph."""
+    wf = project_config.workflow
+    # Independent outputs must not inherit a cross-unit identity merge policy.
+    direct = independent_terminals or mode in {'direct_output', 'direct_multi_output'}
+    policy = (MergePolicyConfig(emit_alignment_candidates=False)
+              if direct else
+              merge_policy or (wf.merge_policy if wf is not None else None))
+    merged = merge_construction_graphs(
+        contributors,
+        target_access_fingerprint=access_fingerprint(project_config),
+        merge_policy=policy,
+        independent_outputs=direct,
+    )
+    return publish_premerged_graph(
+        project_output_dir,
+        project_config,
+        merged=merged,
+        included_units=included_units,
+        skipped_units=skipped_units,
+        unit_attempts=unit_attempts,
+        mode=mode,
+    )
+
+
+def promote_unit_to_project_output(
+    project_output_dir: str | Path,
+    project_config: RunConfig,
+    *,
+    unit_id: str,
+    attempt: str | None = None,
+    workspace=None,
+) -> dict[str, Any]:
+    """Promote a single extract node directly as the final project output when no merge node is configured."""
+    root_output = Path(project_output_dir)
+    root_construction = root_output / 'construction'
+    root_construction.mkdir(parents=True, exist_ok=True)
+    inherited_dir = root_construction / 'inherited'
+    if getattr(project_config, 'inherited_graphs', None) and not (inherited_dir / 'summary.yaml').is_file():
+        freeze_inherited_graphs(project_config, root_construction, workspace=workspace)
+
+    contributors, _ = frozen_contributors(root_construction, config=project_config)
+    wf = project_config.workflow
+    units = {u.unit_id: u for u in wf.units} if wf else {}
+    if unit_id not in units:
+        raise LightGraphError('workflow_unit_not_found')
+
+    attempts = published_unit_attempts(root_output)
+    chosen_attempt = attempt if attempt is not None else attempts.get(unit_id)
+    output_dir = unit_output_path(root_output, unit_id, chosen_attempt)
+    contrib = load_unit_contributor(output_dir, unit_id)
+    included: list[str] = []
+    skipped: list[str] = []
+    if contrib is None:
+        skipped.append(unit_id)
+    else:
+        expected_access = access_fingerprint(build_unit_config(project_config, units[unit_id], unit_output_dir=output_dir))
+        if contrib['graph'].get('access_fingerprint') != expected_access:
+            raise LightGraphError('graph_access_context_changed')
+        contributors.append(contrib)
+        included.append(unit_id)
+
+    return publish_merged_contributors(
+        root_output,
+        project_config,
+        contributors=contributors,
+        included_units=included,
+        skipped_units=skipped,
+        unit_attempts={unit_id: chosen_attempt} if chosen_attempt else {},
+        mode='direct_output',
+    )
+
+
 def merge_project_workflow(
     project_output_dir: str | Path,
     project_config: RunConfig,
@@ -177,13 +523,13 @@ def merge_project_workflow(
     workspace=None,
     unit_ids: list[str] | None = None,
     unit_attempts: dict[str, str] | None = None,
+    mode: str = 'merged',
 ) -> dict[str, Any]:
     """Deterministically merge inherited base graphs and parallel workflow unit publications."""
     root_output = Path(project_output_dir)
     root_construction = root_output / 'construction'
     root_construction.mkdir(parents=True, exist_ok=True)
 
-    contributors: list[dict[str, Any]] = []
     inherited_dir = root_construction / 'inherited'
     if getattr(project_config, 'inherited_graphs', None) and not (inherited_dir / 'summary.yaml').is_file():
         freeze_inherited_graphs(project_config, root_construction, workspace=workspace)
@@ -212,37 +558,15 @@ def merge_project_workflow(
         contributors.append(contrib)
         included_units.append(uid)
 
-    policy = wf.merge_policy if wf is not None else None
-    merged = merge_construction_graphs(
-        contributors,
-        target_access_fingerprint=access_fingerprint(project_config),
-        merge_policy=policy,
+    return publish_merged_contributors(
+        root_output,
+        project_config,
+        contributors=contributors,
+        included_units=included_units,
+        skipped_units=skipped_units,
+        unit_attempts=attempts,
+        mode=mode,
     )
-    ctx_fingerprint = digest('workflow_merge_v2', access_fingerprint(project_config), merged)
-    persisted = write_sharded_graph(root_construction, merged, context_fingerprint=ctx_fingerprint,
-                                    unit_attempts={uid: attempts[uid] for uid in included_units if uid in attempts})
-    merge_summary = {
-        'format_version': 1,
-        'merged_at': _now(),
-        'included_units': included_units,
-        'skipped_units': skipped_units,
-        'inherited_ids': [c['contributor_id'] for c in contributors if c['kind'] == 'base'],
-        'nodes': persisted['nodes'],
-        'edges': persisted['edges'],
-        'shard_count': persisted['shard_count'],
-        'candidate_identity_merges': len(merged.get('candidate_identity_merges', [])),
-        'candidate_column_alignments': len(merged.get('candidate_column_alignments', [])),
-        'conflict_isolation': {
-            k: v for k, v in (merged.get('conflict_isolation') or {}).items()
-            if k not in {'node_ids', 'edge_ids'}
-        },
-    }
-    write_yaml(root_construction / 'workflow-merge-summary.yaml', merge_summary)
-    write_yaml(root_construction / 'merge-alignment-candidates.yaml', {
-        'candidate_identity_merges': merged.get('candidate_identity_merges', []),
-        'candidate_column_alignments': merged.get('candidate_column_alignments', []),
-    })
-    return merge_summary
 
 
 def workflow_state_path(project_output_dir: str | Path) -> Path:

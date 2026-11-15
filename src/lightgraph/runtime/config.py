@@ -157,9 +157,16 @@ class InheritedGraphRef(StrictModel):
         return self
 
 
+class WorkflowPosition(StrictModel):
+    """Canvas coordinates for visual workflow DAG orchestration."""
+    x: float = 0.0
+    y: float = 0.0
+
+
 class WorkflowUnitConfig(StrictModel):
-    """One parallel execution unit inside a parent project workflow."""
+    """One parallel execution unit (extract node) inside a parent project workflow."""
     unit_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    label: str | None = Field(default=None, max_length=120)
     source_ids: list[str] = Field(default_factory=list, max_length=64)
     source_table_overrides: dict[str, list[str]] = Field(default_factory=dict, max_length=64)
     document_ids: list[str] | None = Field(default=None, max_length=128)
@@ -168,6 +175,40 @@ class WorkflowUnitConfig(StrictModel):
     max_calls: int | None = Field(default=None, ge=0)
     max_run_seconds: float | None = Field(default=None, gt=0)
     enable_co_projection: bool | None = None
+    position: WorkflowPosition | None = None
+
+
+class EmbeddingConfig(StrictModel):
+    """Configurable, replaceable semantic embedding service for subgraph retrieval."""
+    model_config = ConfigDict(hide_input_in_errors=True)
+    provider: Literal["local_hash", "openai_compatible"] = "local_hash"
+    base_url: str = ""
+    model: str = ""
+    api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
+    api_key_env: str = "LIGHTGRAPH_EMBEDDING_API_KEY"
+    allow_insecure_http: bool = False
+    timeout_seconds: float = Field(default=30.0, gt=0)
+    batch_size: int = Field(default=32, ge=1, le=512)
+    dimensions: int | None = Field(default=None, gt=0,
+        description="Optional vector dimension; auto-detected when null (e.g. 1024 for Qwen3-Embedding-0.6B).")
+    query_instruction: str = Field(default="", max_length=1000,
+        description="Optional instruction prefix prepended only to retrieval queries (e.g. Qwen3-Embedding Instruct format).")
+
+    @field_validator("base_url")
+    @classmethod
+    def normalize_embedding_endpoint(cls, value):
+        from .model_endpoint import normalize_embedding_base_url
+        return normalize_embedding_base_url(value)
+
+    @field_validator("model", "api_key_env")
+    @classmethod
+    def normalize_embedding_identifier(cls, value, info):
+        value = value.strip()
+        if info.field_name == "api_key_env" and not value:
+            value = "LIGHTGRAPH_EMBEDDING_API_KEY"
+        if info.field_name == "api_key_env" and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError("invalid_embedding_key_environment")
+        return value
 
 
 class MergePolicyConfig(StrictModel):
@@ -179,19 +220,84 @@ class MergePolicyConfig(StrictModel):
     emit_alignment_candidates: bool = True
 
 
+class WorkflowMergeNodeConfig(StrictModel):
+    """A merge or merge-and-extract node joining upstream workflow outputs."""
+    node_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    label: str | None = Field(default=None, max_length=120)
+    merge_mode: Literal["deterministic", "merge_and_extract"] = "deterministic"
+    source_ids: list[str] = Field(default_factory=list, max_length=64)
+    source_table_overrides: dict[str, list[str]] = Field(default_factory=dict, max_length=64)
+    document_ids: list[str] | None = Field(default=None, max_length=128)
+    goal_markdown: str | None = Field(default=None, max_length=32000)
+    probe_filter_hint: str | None = Field(default=None, max_length=2000)
+    max_calls: int | None = Field(default=None, ge=0)
+    max_run_seconds: float | None = Field(default=None, gt=0)
+    enable_co_projection: bool | None = None
+    merge_policy: MergePolicyConfig | None = None
+    position: WorkflowPosition | None = None
+
+
+class WorkflowEdgeConfig(StrictModel):
+    """Directed DAG wire connecting extract -> merge, merge -> merge, or node -> output."""
+    edge_id: str = Field(min_length=1, max_length=128)
+    source: str = Field(min_length=1, max_length=64)
+    target: str = Field(min_length=1, max_length=64)
+
+
 class WorkflowConfig(StrictModel):
     """Project-level parallel workflow topology and merge policy."""
     enabled: bool = False
+    legacy_merge: bool = Field(default=False,
+        description="Explicit compatibility mode for old edge-less workflows that implicitly merged all units.")
     max_parallel_workers: int = Field(default=4, ge=1, le=24)
     enable_co_projection: bool = False
     units: list[WorkflowUnitConfig] = Field(default_factory=list, max_length=64)
+    merge_nodes: list[WorkflowMergeNodeConfig] = Field(default_factory=list, max_length=16)
+    edges: list[WorkflowEdgeConfig] = Field(default_factory=list, max_length=256)
+    output_position: WorkflowPosition | None = None
     merge_policy: MergePolicyConfig = Field(default_factory=MergePolicyConfig)
 
     @model_validator(mode="after")
-    def unique_units(self):
-        ids = [unit.unit_id for unit in self.units]
-        if len(set(ids)) != len(ids):
+    def validate_dag(self):
+        unit_ids = [unit.unit_id for unit in self.units]
+        merge_ids = [node.node_id for node in self.merge_nodes]
+        if len(set(unit_ids)) != len(unit_ids):
             raise ValueError("duplicate_workflow_unit_id")
+        if len(set(merge_ids)) != len(merge_ids):
+            raise ValueError("duplicate_workflow_merge_node_id")
+        all_ids = unit_ids + merge_ids
+        if "output" in all_ids:
+            raise ValueError("reserved_workflow_node_id")
+        if len(set(all_ids)) != len(all_ids):
+            raise ValueError("duplicate_workflow_node_id")
+        known_sources = set(all_ids)
+        known_targets = set(merge_ids) | {"output"}
+        adj: dict[str, list[str]] = {nid: [] for nid in known_sources}
+        for edge in self.edges:
+            if edge.source not in known_sources:
+                raise ValueError("workflow_edge_source_unknown")
+            if edge.target not in known_targets:
+                raise ValueError("workflow_edge_target_unknown")
+            if edge.source == edge.target:
+                raise ValueError("workflow_cycle_detected")
+            adj[edge.source].append(edge.target)
+        # Detect any cycle in the directed graph.
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def dfs(node: str) -> None:
+            if node in visited or node == "output":
+                return
+            if node in visiting:
+                raise ValueError("workflow_cycle_detected")
+            visiting.add(node)
+            for nxt in adj.get(node, ()):
+                dfs(nxt)
+            visiting.remove(node)
+            visited.add(node)
+
+        for nid in adj:
+            dfs(nid)
         return self
 
 
@@ -208,6 +314,8 @@ class RunConfig(StrictModel):
         description="User-authored Markdown construction objective. Null renders the legacy goal fields; source authorization remains in typed configuration.")
     limits: QueryLimits = Field(default_factory=QueryLimits)
     model: ModelConfig = Field(default_factory=ModelConfig)
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig,
+        description="Configurable, replaceable embedding service for subgraph retrieval (local OpenAI-compatible server or offline fallback).")
     output_dir: str = "runs/default"
     record_trace: bool = Field(default=True,
         description="Record the complete local run trajectory with credentials redacted; retain until manually cleared.")

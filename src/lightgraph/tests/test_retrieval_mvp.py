@@ -151,6 +151,9 @@ def test_retrieval_web_endpoints_and_cli(tmp_path):
     app = create_app(tmp_path / 'workspace')
     with TestClient(app) as client:
         client.post('/api/projects', json={'name': 'RetProj', 'project_id': 'ret_p'})
+        project_config = app.state.workspace.get_config('ret_p')
+        assert project_config['embedding']['model'] == 'Qwen/Qwen3-Embedding-0.6B'
+        app.state.workspace.save_config('ret_p', {**project_config, 'embedding': {'provider': 'local_hash'}})
         out_dir = app.state.workspace.project_path('ret_p') / 'output' / 'construction'
         # Save a simple published graph using ConstructionTools directly
         from lightgraph.contracts import ColumnSpec, TableSpec
@@ -208,7 +211,7 @@ def test_edge_supports_require_every_scope_and_degree_uses_visible_edges(tmp_pat
     assert not search.retrieve('营业收入', scopes=['finance'])['nodes']
 
 
-def test_web_query_follows_publication_then_scope_change_without_manual_sync(tmp_path):
+def test_web_query_requires_manual_build_after_publication_and_scope_change(tmp_path):
     from lightgraph.construction.tools import ConstructionTools
     from lightgraph.construction.workspace import dump_yaml
     from lightgraph.sources import MemorySource
@@ -227,9 +230,16 @@ def test_web_query_follows_publication_then_scope_change_without_manual_sync(tmp
             return response.json()
 
         config = workspace.get_config(pid)
-        config.update(scopes=['A', 'B'], scope_bindings=bindings)
+        config.update(scopes=['A', 'B'], scope_bindings=bindings, embedding={'provider': 'local_hash'})
         workspace.save_config(pid, config)
-        assert query('A名称')['nodes'] == []
+        def assert_manual_build_required():
+            denied = client.post(endpoint, json={'query': 'A名称'})
+            assert denied.json()['error']['code'] == 'retrieval_index_stale'
+
+        def build():
+            client.post(f'/api/projects/{pid}/retrieval/sync').raise_for_status()
+
+        assert_manual_build_required()
         run = workspace.resolved_config(pid)
         run.model.mode = 'in_environment'
         with MemorySource([table], {table.qualified_name: rows}) as source:
@@ -240,9 +250,13 @@ def test_web_query_follows_publication_then_scope_change_without_manual_sync(tmp
                 assert tools.call('publish_graph_draft', draft_id='objects')['status'] == 'ok'
             finally:
                 tools.close()
+        assert_manual_build_required()
+        build()
         assert 'B上游' in {n['display_name'] for n in query('B上游')['nodes']}
         config['scopes'] = ['A']
         workspace.save_config(pid, config)
+        assert_manual_build_required()
+        build()
         result = query('A名称')
         assert 'A名称' in {n['display_name'] for n in result['nodes']}
         assert all(name not in str(result) for name in ('B名称', 'B上游', 'B别名'))
@@ -283,21 +297,25 @@ def test_subgraph_seed_limit_and_shared_candidate_without_path(tmp_path):
     assert result['truncated']
 
 
-def test_vector_model_binding_and_repeated_sync_share_immutable_generation(tmp_path):
+def test_vector_model_binding_and_repeated_sync_publish_separate_builds(tmp_path):
     import pytest
     from lightgraph.errors import LightGraphError
     from lightgraph.retrieval import LocalHashEmbedder
 
     graph = _sample_graph()
-    sync_graph_to_retrieval(graph, tmp_path)
+    initial = sync_graph_to_retrieval(graph, tmp_path)
+    old_reader = SubgraphRetriever(tmp_path)
 
     class OtherModel(LocalHashEmbedder):
         pass
 
     with pytest.raises(LightGraphError, match='retrieval_index_stale'):
         SubgraphRetriever(tmp_path, embedder=OtherModel())
-    sync_graph_to_retrieval(graph, tmp_path)
-    assert len(list((tmp_path / 'builds').iterdir())) == 1
+    rebuilt = sync_graph_to_retrieval(graph, tmp_path)
+    assert initial['generation'] == rebuilt['generation']
+    assert initial['build'] != rebuilt['build']
+    assert len(list((tmp_path / 'builds').iterdir())) == 2
+    assert old_reader.retrieve('营业收入')['nodes']
 
 
 def test_edge_can_bridge_nodes_with_different_independent_scope_grants(tmp_path):

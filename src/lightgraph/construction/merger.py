@@ -45,6 +45,11 @@ def _rewrite_evidence_in_graph(
     def register(orig_ref: str) -> str:
         scoped = _scope_ref_token(kind, contributor_id, orig_ref)
         if scoped not in catalog:
+            previous = (graph.get('evidence_catalog') or {}).get(orig_ref)
+            if previous:
+                # A nested DAG merge already carries the original source witness.
+                catalog[scoped] = deepcopy(previous)
+                return scoped
             record = (evidence_records or {}).get(orig_ref) or {}
             catalog[scoped] = {
                 'scoped_ref': scoped,
@@ -85,7 +90,7 @@ def _node_shared_allowed(
     shared_types: set[str],
     base_node_ids: set[str],
 ) -> bool:
-    if kind == 'base':
+    if kind in {'base', 'merged'}:
         return True
     if node.get('id') in base_node_ids:
         # A local occurrence with the same code remains independent unless explicitly shared.
@@ -101,6 +106,7 @@ def _merge_contributor_nodes_and_edges(
     *,
     policy: MergePolicyConfig,
     target_access_fingerprint: str | None = None,
+    independent_outputs: bool = False,
 ) -> dict[str, Any]:
     """Merge graphs while blocking unverified cross-unit auto-merges & auto-connections."""
     shared_types = set(policy.shared_entity_types)
@@ -154,6 +160,9 @@ def _merge_contributor_nodes_and_edges(
             base_node_ids.update(ids)
         prepared_contributors.append((cid, ckind, rewritten))
 
+    if independent_outputs:
+        _qualify_conflicting_output_types(prepared_contributors)
+
     merged_nodes: dict[str, dict[str, Any]] = {}
     merged_edges: dict[str, dict[str, Any]] = {}
     quarantined_nodes: set[str] = set()
@@ -187,7 +196,7 @@ def _merge_contributor_nodes_and_edges(
         for raw_node in graph.get('nodes', []):
             node = deepcopy(raw_node)
             orig_id = node['id']
-            can_share = _node_shared_allowed(
+            can_share = (not independent_outputs or ckind == 'base') and _node_shared_allowed(
                 node,
                 kind=ckind,
                 shared_types=shared_types,
@@ -253,7 +262,7 @@ def _merge_contributor_nodes_and_edges(
             edge = deepcopy(raw_edge)
             def resolve_endpoint(key):
                 original = edge[key]
-                if ckind == 'base':
+                if ckind in {'base', 'merged'}:
                     # A frozen publication is self-contained. Its historical lookup
                     # witnesses describe how the publisher established this edge.
                     if original not in id_remap:
@@ -278,7 +287,9 @@ def _merge_contributor_nodes_and_edges(
             src, dst = resolve_endpoint('source'), resolve_endpoint('target')
             edge['source'] = src
             edge['target'] = dst
-            if src != raw_edge['source'] or dst != raw_edge['target']:
+            if independent_outputs and ckind != 'base':
+                edge['id'] = 'r_' + digest('unit_scoped', cid, edge['id'])
+            elif src != raw_edge['source'] or dst != raw_edge['target']:
                 edge['id'] = 'r_' + digest(edge['type'], src, dst)
             eid = edge['id']
             existing_edge = merged_edges.get(eid)
@@ -301,6 +312,8 @@ def _merge_contributor_nodes_and_edges(
 
     # Label conflict detection & authority resolution on merged nodes.
     for node_id, node in list(merged_nodes.items()):
+        if independent_outputs:
+            break
         if node.get('identity_origin') == 'physical_column':
             continue
         by_scope: dict[str, list[tuple[str, str]]] = defaultdict(list)
@@ -356,6 +369,8 @@ def _merge_contributor_nodes_and_edges(
 
     # Global acyclic guard across merged contributors using iterative Kosaraju SCC.
     for rel_def in definitions['relations'].values():
+        if independent_outputs:
+            break
         if not rel_def.get('acyclic'):
             continue
         rel_type = rel_def['type']
@@ -441,11 +456,52 @@ def _merge_contributor_nodes_and_edges(
     return derive_display_graph(result, copy=False)
 
 
+def _qualify_conflicting_output_types(prepared):
+    """Keep both branch definitions when displaying independent graphs in one canvas.
+
+    Only the projection gets qualified names. Source publications retain the
+    original names, IDs and evidence. Relations follow their branch's entities.
+    """
+    for category, items in (('entities', 'nodes'), ('relations', 'edges')):
+        shapes = defaultdict(set)
+        for _, _, graph in prepared:
+            for definition in graph.get('definitions', {}).get(category, []):
+                comparable = {k: v for k, v in definition.items() if k != 'description'}
+                if category == 'entities':
+                    comparable.setdefault('display_mode', 'auto')
+                    comparable.setdefault('identity_origin', 'row')
+                shapes[definition['type']].add(canonical(comparable))
+        occupied = set(shapes)
+        for cid, kind, graph in prepared:
+            if kind == 'base':
+                continue
+            aliases = {}
+            for definition in graph.get('definitions', {}).get(category, []):
+                name = definition['type']
+                if len(shapes[name]) < 2:
+                    continue
+                label = f'{name[:98 - len(cid)]} ({cid})'[:100]
+                while label in occupied:
+                    label = f'{name[:66]}_{digest(label, cid)[:32]}'
+                occupied.add(label)
+                aliases[name] = label
+                definition['type'] = label
+            for item in graph.get(items, []):
+                if item['type'] in aliases:
+                    item['type'] = aliases[item['type']]
+            if category == 'entities':
+                for relation in graph.get('definitions', {}).get('relations', []):
+                    for endpoint in ('source_type', 'target_type'):
+                        if relation.get(endpoint) in aliases:
+                            relation[endpoint] = aliases[relation[endpoint]]
+
+
 def merge_construction_graphs(
     contributors: list[dict[str, Any]],
     *,
     target_access_fingerprint: str | None = None,
     merge_policy: MergePolicyConfig | dict[str, Any] | None = None,
+    independent_outputs: bool = False,
 ) -> dict[str, Any]:
     """Public entry point for deterministic cross-unit / cross-project graph merging."""
     policy = (
@@ -456,6 +512,7 @@ def merge_construction_graphs(
         contributors,
         policy=policy,
         target_access_fingerprint=target_access_fingerprint,
+        independent_outputs=independent_outputs,
     )
 
 

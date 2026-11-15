@@ -53,6 +53,14 @@ def parser():
     c=sub.add_parser('export-structure',help='导出已发布的结构与映射 YAML，不连接数据源');c.add_argument('config');c.add_argument('output')
     c=sub.add_parser('merge-graphs',help='确定性合并多单元/继承图谱为标准化终态图谱');c.add_argument('config');c.add_argument('--unit',action='append',default=[])
     c=sub.add_parser('retrieve-subgraph',help='基于本地向量库与SQLite关系索引检索并叠加子图');c.add_argument('config');c.add_argument('query');c.add_argument('--sync',action='store_true')
+    c=sub.add_parser('embed-server',help='启动可替换的本地 OpenAI 兼容向量嵌入服务（支持 Qwen3-Embedding-0.6B）')
+    c.add_argument('--model',default='Qwen/Qwen3-Embedding-0.6B',help='本地目录或 HuggingFace 模型名')
+    c.add_argument('--served-model-name', help='API 对外使用的模型名，适用于从本地目录加载权重')
+    c.add_argument('--host',default='127.0.0.1')
+    c.add_argument('--port',type=int,default=8002)
+    c.add_argument('--backend',choices=('auto','sentence_transformers','transformers'),default='auto')
+    c.add_argument('--device',default=None)
+    c.add_argument('--trust-remote-code',action='store_true')
     c=sub.add_parser('schema');c.add_argument('output')
     c=sub.add_parser('retain-check');c.add_argument('paths',nargs='+');c.add_argument('--marker',action='append',required=True)
     return p
@@ -138,9 +146,14 @@ def run(args):
               'data_validation':'not_run','instance_enumeration':'not_run',
               'output':str(Path(args.output).resolve()),'format':'yaml'});return 0
     if args.command=='merge-graphs':
-        from .construction.workflow import merge_project_workflow
-        config=load_config(args.config)
-        summary=merge_project_workflow(config.output_dir, config, unit_ids=args.unit or None)
+        from .construction.workflow import merge_project_workflow, resolve_workflow_plan
+        config = load_config(args.config)
+        plan = resolve_workflow_plan(config.workflow) if config.workflow else None
+        if plan and plan.merge_order:
+            raise LightGraphError('workflow_dag_requires_run')
+        mode = {'direct_single': 'direct_output', 'direct_multi': 'direct_multi_output'}.get(plan.mode, 'merged') if plan else 'merged'
+        units = args.unit or (plan.extract_ids if plan else None)
+        summary = merge_project_workflow(config.output_dir, config, unit_ids=units, mode=mode)
         emit({'status':'merged', **summary});return 0
     if args.command=='retrieve-subgraph':
         from .web.construction_graph import project_retriever
@@ -148,6 +161,16 @@ def run(args):
         retriever, _ = project_retriever(config, refresh=args.sync)
         result = retriever.retrieve(args.query, scopes=config.scopes)
         emit(result);return 0
+    if args.command=='embed-server':
+        from .retrieval.local_embed_server import load_local_backend, create_embedding_app
+        import uvicorn
+        backend = load_local_backend(args.model, backend=args.backend, device=args.device,
+                                     trust_remote_code=args.trust_remote_code)
+        if args.served_model_name:
+            backend.model_name = args.served_model_name
+        print(f'Embedding 服务已启动：http://{args.host}:{args.port}/v1  模型：{backend.model_name}（维度 {backend.dim}）')
+        uvicorn.run(create_embedding_app(backend), host=args.host, port=args.port, access_log=False)
+        return 0
     if args.command=='schema':
         out=Path(args.output);out.mkdir(parents=True,exist_ok=True)
         from .catalog import DeclaredCatalog,SemanticCatalog
