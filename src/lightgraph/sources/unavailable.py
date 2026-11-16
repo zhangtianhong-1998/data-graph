@@ -34,12 +34,12 @@ def isolatable_initialization_failure(error):
 
 
 class UnavailableSource(SourceAdapter):
-    def __init__(self, source, error, *, limits, query_budget):
+    def __init__(self, source, error, *, limits, query_budget, stats=None):
         self.source_id = source.id
         self.allowed_tables = tuple(source.allowed_tables)
         self.limits = limits.model_copy(deep=True)
         self.query_budget = query_budget
-        self.stats = QueryStats()
+        self.stats = stats if stats is not None else QueryStats()
         self.metadata_only = True
         self.terminal_failure_code = error.code
         self._diagnostic = safe_database_diagnostic(error)

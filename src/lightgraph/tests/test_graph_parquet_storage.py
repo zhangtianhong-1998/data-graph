@@ -182,3 +182,36 @@ def test_rows_are_not_subject_to_the_yaml_record_limit(tmp_path, monkeypatch):
     path = tmp_path / "record"
     write_graph_record(path, value)
     assert read_graph_record(path) == value
+def test_parquet_fsync_uses_writable_descriptor(tmp_path, monkeypatch):
+    """Enforce Windows _commit semantics even on POSIX test hosts."""
+    import errno
+    import os
+    from pathlib import Path
+    from lightgraph.construction.graph_storage import read_graph_record, write_graph_record
+
+    modes = {}
+    flushed = []
+    original_open, original_fsync = Path.open, os.fsync
+
+    def record_open(path, mode='r', *args, **kwargs):
+        stream = original_open(path, mode, *args, **kwargs)
+        if path.suffix == '.parquet':
+            modes[os.fstat(stream.fileno()).st_ino] = mode
+        return stream
+
+    def windows_fsync(fd):
+        inode = os.fstat(fd).st_ino
+        if inode in modes:
+            mode = modes[inode]
+            if '+' not in mode and not any(flag in mode for flag in 'wax'):
+                raise OSError(errno.EBADF, 'fsync requires a writable descriptor')
+            flushed.append(inode)
+        original_fsync(fd)
+
+    monkeypatch.setattr(Path, 'open', record_open)
+    monkeypatch.setattr(os, 'fsync', windows_fsync)
+    graph = {'nodes': [{'id': 'n1', 'type': 'Item'}], 'edges': []}
+    path = tmp_path / 'snapshot'
+    write_graph_record(path, graph)
+    assert len(flushed) == 2
+    assert read_graph_record(path) == graph

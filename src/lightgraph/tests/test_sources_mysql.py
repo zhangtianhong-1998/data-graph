@@ -54,7 +54,7 @@ class Cursor:
                 db.sql_mode = sql.split("'")[1]
         elif sql.startswith('SET SESSION max_execution_time'):
             db.timeout = int(sql.rsplit('=', 1)[1])
-            if db.timeout == 1000:
+            if db.timeout == 5000:
                 db.cancel_probe_pending = True
                 db.cancel_probe_started.clear()
                 db.cancel_attempt_finished.clear()
@@ -83,7 +83,7 @@ class Cursor:
                 ('uq_name', 'UNIQUE', 'name', 2, None, None, None),
                 ('fk_parent', 'FOREIGN KEY', 'tenant', 1, 'analytics', 'items', 'tenant'),
                 ('fk_parent', 'FOREIGN KEY', 'parent_code', 2, 'analytics', 'items', 'code')]
-        elif sql == 'SELECT SLEEP(0.25), 1':
+        elif sql.startswith('SELECT SLEEP('):
             if db.timeout == 50:
                 if db.timeout_works:
                     raise DBError(3024, 'PRIVATE_TIMEOUT_DETAIL')
@@ -334,7 +334,7 @@ def test_cancel_probe_does_not_accept_server_timeout_as_cancellation():
             adapter.verify_runtime_controls()
         assert not adapter.capabilities().actual_database_verified
         assert adapter.capabilities().capabilities['query_cancel'] == 'unknown'
-        assert ('SET SESSION max_execution_time = 1000', None) in driver.main.executed
+        assert ('SET SESSION max_execution_time = 5000', None) in driver.main.executed
 
 
 def test_timeout_probe_cannot_be_assumed_from_set_acceptance():

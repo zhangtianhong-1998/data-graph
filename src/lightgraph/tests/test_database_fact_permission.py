@@ -23,7 +23,7 @@ class GaussCursor(gauss_fixture.Cursor):
     def execute(self, sql, parameters=None):
         if sql.startswith('SET LOCAL statement_timeout'):
             self.connection.timeout_probe = "'50ms'" in sql
-        if sql == 'SELECT pg_catalog.pg_sleep(0.25)':
+        if sql.startswith('SELECT pg_catalog.pg_sleep('):
             self.connection.executed.append((sql, parameters))
             if self.connection.timeout_probe:
                 if self.connection.timeout_works:

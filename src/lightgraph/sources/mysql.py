@@ -463,7 +463,7 @@ class MySQLSource(SourceAdapter):
         interrupted = False
         probe_code = 'query_cancel_unverified' if cancel else 'statement_timeout_unverified'
         try:
-            cursor.execute(f"SET SESSION max_execution_time = {1000 if cancel else 50}")
+            cursor.execute(f"SET SESSION max_execution_time = {5000 if cancel else 50}")
             if cancel:
                 cancel_target = self._control, self._connection_id
                 def interrupt():
@@ -478,7 +478,7 @@ class MySQLSource(SourceAdapter):
             try:
                 # Sole SELECT SLEEP returns 1 on interruption; adding a second
                 # expression requires the documented cancellation error instead.
-                cursor.execute("SELECT SLEEP(0.25), 1")
+                cursor.execute(f"SELECT SLEEP({1.0 if cancel else 0.25}), 1")
                 cursor.fetchall()
             except LightGraphError: raise
             except Exception as exc:

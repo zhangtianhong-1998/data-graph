@@ -26,6 +26,11 @@ from .reconnect import configure_reconnection, new_snapshot_recovery_allowed, re
 
 REQUIRED_RUNTIME = {"read_only_transaction", "parameter_binding", "metadata_reading", "distinct_projection", "statement_timeout", "query_cancel"}
 
+# A cancel request travels separately from the SQL command. Give it room to
+# arrive while the probe is running even on a busy or high-latency connection.
+_CANCEL_SLEEP_SECONDS = 1.0
+_CANCEL_GUARD_MS = 5000
+
 
 def product_version(banner: str) -> tuple[str, str]:
     """Bind a version adjacent to the actual product, never PostgreSQL/compiler.
@@ -166,7 +171,7 @@ class GaussSource(SourceAdapter):
         """Bounded controls; runtime cancellation tests require explicit opt-in.
 
         Opt-in must be run in a deployment-approved isolated environment. The
-        only deliberate wait is 0.25 seconds and it reads no customer data.
+        fixed sleep queries read no customer data.
         """
         with self._lock:
             try:
@@ -471,31 +476,46 @@ class GaussSource(SourceAdapter):
     def _probe_runtime_control(self, *, cancel: bool):
         self._connection.rollback(); self._start_readonly(stage='connection_preflight'); cursor = self._cursor()
         interrupted = False; timer = None; cancel_sent = threading.Event()
+        cancel_started = threading.Event()
         cancel_errors = []
         probe_code = 'query_cancel_unverified' if cancel else 'statement_timeout_unverified'
         try:
             if cancel:
                 # A short configured statement timeout must not masquerade as
                 # successful client cancellation (both report SQLSTATE 57014).
-                cursor.execute("SET LOCAL statement_timeout = '1000ms'")
+                setup_started = time.monotonic()
+                cursor.execute(f"SET LOCAL statement_timeout = '{_CANCEL_GUARD_MS}ms'")
+                # Allow for sending the next statement over this connection.
+                # The round trip just observed is a local scheduling estimate.
+                delay = min(0.5, max(0.05, time.monotonic() - setup_started))
                 query_connection = self._connection
                 def send_cancel():
                     try:
+                        cancel_started.set()
                         query_connection.cancel()
                         cancel_sent.set()
                     except Exception as exc:
                         # Retain only until the fixed probe ends, then expose
                         # classified state instead of driver text or values.
                         cancel_errors.append(exc)
-                timer = threading.Timer(0.05, send_cancel); timer.daemon = True; timer.start()
+                timer = threading.Timer(delay, send_cancel); timer.daemon = True; timer.start()
             else: cursor.execute("SET LOCAL statement_timeout = '50ms'")
-            try: cursor.execute("SELECT pg_catalog.pg_sleep(0.25)")
+            sleep_seconds = _CANCEL_SLEEP_SECONDS if cancel else 0.25
+            query_started = time.monotonic()
+            try: cursor.execute(f"SELECT pg_catalog.pg_sleep({sleep_seconds})")
             except LightGraphError: raise
             except Exception as exc:
                 interrupted = getattr(exc, "sqlstate", None) == "57014" or getattr(exc, "pgcode", None) == "57014"
                 if not interrupted:
                     raise database_error(probe_code, exc, engine='gauss', stage='connection_preflight',
                         connection_closed=connection_is_closed(self._connection)) from None
+                if cancel:
+                    # Both server statement timeout and client cancel use 57014.
+                    # A callback that starts after the exception (including while
+                    # joining below), or a response reaching the guard deadline,
+                    # cannot attest that our client interrupted this statement.
+                    interrupted = (cancel_started.is_set() and
+                                   time.monotonic() - query_started < _CANCEL_GUARD_MS / 1000)
         finally:
             active_error = sys.exc_info()[1]
             if timer:

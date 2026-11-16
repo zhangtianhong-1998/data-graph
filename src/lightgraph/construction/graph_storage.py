@@ -94,7 +94,8 @@ def _write_rows(path: Path, rows: list[dict]) -> None:
         if batch:
             writer.write_table(pa.Table.from_pylist(batch, schema=schema))
     os.chmod(path, 0o600)
-    with path.open("rb") as stream:
+    # Windows _commit (used by fsync) requires a writable descriptor.
+    with path.open("rb+") as stream:
         os.fsync(stream.fileno())
 
 

@@ -26,10 +26,10 @@ class RuntimeCursor(gauss.Cursor):
         result = super().execute(sql, parameters)
         if sql.startswith('SET LOCAL statement_timeout'):
             self.connection.timeout = int(re.search(r"'([0-9]+)ms'", sql).group(1))
-            if self.connection.timeout == 1000:
+            if self.connection.timeout == 5000:
                 self.connection.cancel_finished.clear()
                 self.connection.cancelled = False
-        if sql == 'SELECT pg_catalog.pg_sleep(0.25)':
+        if sql.startswith('SELECT pg_catalog.pg_sleep('):
             if self.connection.timeout == 50:
                 if self.connection.timeout_works:
                     raise PGError('57014')
@@ -132,7 +132,7 @@ def inject_sleep_error(connection, error):
         result = original(*args, **kwargs)
         execute = result.execute
         def fault(sql, parameters=None):
-            if 'SLEEP(0.25)' in sql or 'pg_sleep(0.25)' in sql:
+            if 'SLEEP(' in sql or 'pg_sleep(' in sql:
                 raise error
             return execute(sql, parameters)
         result.execute = fault

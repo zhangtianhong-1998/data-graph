@@ -161,8 +161,8 @@ def test_cancel_callback_permission_survives_main_probe_cursor_close_failure(eng
 
         def wrapped(sql, parameters=None):
             nonlocal cancel_probe
-            cancel_probe = (sql in {'SELECT SLEEP(0.25), 1', 'SELECT pg_catalog.pg_sleep(0.25)'}
-                            and failed_connection.timeout == 1000)
+            cancel_probe = (sql == 'SELECT pg_catalog.pg_sleep(1.0)' or
+                            sql == 'SELECT SLEEP(1.0), 1' and failed_connection.timeout == 5000)
             return execute(sql, parameters)
 
         def fail_close():

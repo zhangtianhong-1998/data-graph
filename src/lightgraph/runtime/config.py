@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import re
+from functools import partial
 from pathlib import Path
 from typing import Literal
 import yaml
@@ -449,6 +450,8 @@ def install_run_query_budget(config, adapters):
 
 def open_sources(config, *, metadata_only=False, source_credentials=None, isolate_database_failures=False):
     from ..sources import ExcelSource, CSVSource, GaussSource, MySQLSource
+    from ..sources.base import QueryStats
+    from ..sources.reconnect import open_database_source
     sources=[]
     budget=run_query_budget(config)
     try:
@@ -499,9 +502,14 @@ def open_sources(config, *, metadata_only=False, source_credentials=None, isolat
                     # Verify the current connection, rather than treating the
                     # checkbox or a previously uploaded file as capability proof.
                     options['probe_runtime_limits'] = True
+                stats = QueryStats()
+                options['_stats'] = stats
+                open_adapter = partial(adapter, dsn, source_id=s.id, allowed_tables=s.allowed_tables,
+                    allowed_columns=s.allowed_columns, limits=config.limits, verified_capabilities=verified,
+                    query_budget=budget, **options)
                 try:
-                    sources.append(adapter(dsn,source_id=s.id,allowed_tables=s.allowed_tables,
-                        allowed_columns=s.allowed_columns,limits=config.limits,verified_capabilities=verified,query_budget=budget,**options))
+                    sources.append(open_database_source(open_adapter, budget,
+                        engine='mysql' if s.kind == 'mysql_database' else 'gauss'))
                 except LightGraphError as exc:
                     from ..sources.unavailable import UnavailableSource, isolatable_initialization_failure
                     if not isolate_database_failures or not isolatable_initialization_failure(exc):
@@ -512,7 +520,7 @@ def open_sources(config, *, metadata_only=False, source_credentials=None, isolat
                     if budget.snapshot()['remaining_queries'] == 0:
                         from ..errors import BudgetExceeded
                         raise BudgetExceeded('query_budget_exhausted') from None
-                    sources.append(UnavailableSource(s, exc, limits=config.limits, query_budget=budget))
+                    sources.append(UnavailableSource(s, exc, limits=config.limits, query_budget=budget, stats=stats))
         return sources
     except Exception:
         for s in sources:s.close()

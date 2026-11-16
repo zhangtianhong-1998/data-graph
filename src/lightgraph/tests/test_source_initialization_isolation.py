@@ -11,6 +11,7 @@ from lightgraph.construction.workspace import dump_yaml, safe_load_yaml
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.runtime.config import RunConfig, open_sources
 from lightgraph.sources import CSVSource
+from lightgraph.sources.reconnect import INITIAL_PREFLIGHT_ATTEMPTS
 from lightgraph.sources.database_errors import database_error
 from lightgraph.sources.unavailable import UnavailableSource
 
@@ -82,7 +83,7 @@ def test_isolation_preserves_shared_budget_and_never_invents_a_catalog(tmp_path,
             with pytest.raises(LightGraphError, match='^database_connection_failed$'):
                 with failed.snapshot():
                     pytest.fail('unavailable source entered a snapshot')
-        assert outage == ['offline']
+        assert outage == ['offline'] * INITIAL_PREFLIGHT_ATTEMPTS
         assert 'PRIVATE' not in json.dumps(failed.initialization_failure)
         assert not hasattr(failed, '_reopen')
     finally:
@@ -153,7 +154,7 @@ def test_failed_first_source_does_not_block_later_source_or_grant_fact_access(tm
         metadata = tools.call('inspect_source', table='offline:public.items', operation='get_metadata')
         assert metadata['code'] == 'source_initialization_failed' and metadata['cause_code'] == code
         publish_healthy(tools)
-        assert len(calls) == 1
+        assert len(calls) == (INITIAL_PREFLIGHT_ATTEMPTS if code == 'database_connection_failed' else 1)
     finally:
         tools.close()
 
@@ -186,7 +187,7 @@ def test_tools_keep_failed_source_visible_and_publish_only_independent_work(tmp_
         stopped = tools.call('inspect_source', table='offline:public.items', operation='profile_columns',
                              arguments={'columns': ['code']})
         assert stopped['code'] == 'source_retry_limit_exhausted'
-        assert outage == ['offline']
+        assert outage == ['offline'] * INITIAL_PREFLIGHT_ATTEMPTS
         assert 'offline' in tools.call('read_workspace')['content']
     finally:
         tools.close()
@@ -242,4 +243,4 @@ def test_worker_uses_real_startup_and_tools_with_session_credentials(tmp_path, m
     assert saved['report']['counts']['business_nodes'] == 2
     assert saved['report']['validation']['source_initialization_failures'][0]['source_id'] == 'offline'
     assert 'PRIVATE' not in path.read_text()
-    assert outage == ['offline']
+    assert outage == ['offline'] * INITIAL_PREFLIGHT_ATTEMPTS

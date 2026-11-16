@@ -344,7 +344,8 @@ def test_cli_connect_check_requalifies_each_physical_connection(tmp_path,monkeyp
     assert all(db.closed for db in driver.connections)
 
 
-@pytest.mark.parametrize("cancel_outcome", ["cancelled", "driver_error", "ignored", "late", "never"])
+@pytest.mark.parametrize("cancel_outcome", ["cancelled", "driver_error", "ignored", "late", "never",
+                                           "interrupted_before_cancel", "server_timeout"])
 def test_cancel_probe_cannot_be_satisfied_by_short_statement_timeout(monkeypatch, cancel_outcome):
     import re
     import threading
@@ -352,6 +353,8 @@ def test_cancel_probe_cannot_be_satisfied_by_short_statement_timeout(monkeypatch
     from lightgraph.contracts import QueryLimits
 
     timers = []
+    clock = [0.]
+    monkeypatch.setattr("lightgraph.sources.gauss.time", SimpleNamespace(monotonic=lambda: clock[0]))
 
     class ProbeTimer:
         """Control query/cancel ordering without relying on OS timer scheduling."""
@@ -375,7 +378,7 @@ def test_cancel_probe_cannot_be_satisfied_by_short_statement_timeout(monkeypatch
             assert timeout is not None and 0 < timeout <= 2
             # A callback already running cannot be stopped by Timer.cancel().
             # Model it returning only after the query has finished normally.
-            if cancel_outcome == "late":
+            if cancel_outcome in {"late", "interrupted_before_cancel"}:
                 self.fire()
             self.joined = True
 
@@ -394,8 +397,13 @@ def test_cancel_probe_cannot_be_satisfied_by_short_statement_timeout(monkeypatch
                 self.connection.timeout=int(re.search(r"'([0-9]+)ms'",sql).group(1))
             if "pg_sleep" in sql:
                 if self.connection.timeout<250:raise Cancelled("PRIVATE_TIMEOUT_DETAIL")
+                if cancel_outcome == "interrupted_before_cancel":
+                    raise Cancelled("PRIVATE_UNRELATED_INTERRUPT")
                 if cancel_outcome not in {"late", "never"}:
                     timers[0].fire()
+                if cancel_outcome == "server_timeout":
+                    clock[0] += self.connection.timeout / 1000
+                    raise Cancelled("PRIVATE_GUARD_TIMEOUT")
                 if self.connection.cancelled:raise Cancelled("PRIVATE_CANCEL_DETAIL")
             return super().execute(sql,parameters)
     class RuntimeConnection(Connection):
@@ -415,6 +423,55 @@ def test_cancel_probe_cannot_be_satisfied_by_short_statement_timeout(monkeypatch
             assert source.capabilities().capabilities["query_cancel"]=="unknown"
     assert len(timers) == 1 and timers[0].stopped and timers[0].joined
     assert all(db.closed for db in driver.connections)
+
+
+def test_parallel_gauss_workers_can_qualify_with_delayed_cancel_delivery():
+    """Each backend processes its own cancellation after the old 250ms sleep."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    ready = threading.Barrier(2)
+
+    class Cancelled(Exception):
+        sqlstate = '57014'
+
+    class DelayedCursor(Cursor):
+        def execute(self, sql, parameters=None):
+            if sql.startswith('SET LOCAL statement_timeout'):
+                self.connection.testing_timeout = "'50ms'" in sql
+            if sql.startswith('SELECT pg_catalog.pg_sleep('):
+                if self.connection.testing_timeout:
+                    raise Cancelled()
+                ready.wait(timeout=4)
+                natural_duration = float(sql.split('(')[1].rstrip(')'))
+                # Model cancellation delivery over a separate, 350ms connection.
+                if self.connection.delivered.wait(natural_duration):
+                    raise Cancelled()
+            return super().execute(sql, parameters)
+
+    class DelayedConnection(Connection):
+        def __init__(self):
+            super().__init__()
+            self.delivered = threading.Event()
+            self.delivery_delay = threading.Event()
+
+        def cursor(self, name=None):
+            return DelayedCursor(self, name)
+
+        def cancel(self):
+            self.delivery_delay.wait(.35)
+            self.delivered.set()
+
+    def qualify(source_id):
+        db = DelayedConnection()
+        with GaussSource('fixture', source_id=source_id, allowed_tables=['public.items'],
+                         connect_factory=lambda _: db, probe_runtime_limits=True) as source:
+            assert source.capabilities().actual_database_verified
+            assert db.closed
+            assert sum(sql == 'SELECT 1' for sql, _ in db.executed) == 2
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        list(workers.map(qualify, ('extract_1', 'extract_2')))
 
 
 class ByteCatalogCursor(Cursor):
