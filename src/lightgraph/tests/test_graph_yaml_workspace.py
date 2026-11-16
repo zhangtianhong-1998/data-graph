@@ -96,14 +96,14 @@ def test_publish_requires_exact_graph_revision_and_preserves_independent_outputs
     with pytest.raises(LightGraphError, match='validated_graph_mismatch'):
         store.publish('物品关系', revision=1, graph=changed)
     first = store.publish('物品关系', revision=1, graph=graph())
-    first_bytes = (tmp_path / first['graph']).read_bytes()
+    first_files = {p: p.read_bytes() for p in (tmp_path / first['graph']).iterdir()}
     other = payload('另一个', '位置')
     store.save_draft(other)
     second_graph = graph('n2', '位置')
     store.record_validation('另一个', revision=1, passed=True, graph=second_graph)
     store.publish('另一个', revision=1, graph=second_graph)
     assert len(store.read_published_graph()['nodes']) == 2
-    assert (tmp_path / first['graph']).read_bytes() == first_bytes
+    assert all(p.read_bytes() == content for p, content in first_files.items())
     conflicting = payload('冲突')
     store.save_draft(conflicting)
     store.record_validation('冲突', revision=1, passed=True, graph=changed)

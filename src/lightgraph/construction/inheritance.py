@@ -4,12 +4,14 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 import re
+import uuid
 from typing import Any
 
 from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
 from .access import access_fingerprint, filter_graph_scopes
-from .workspace import safe_load_yaml, write_yaml
+from .workspace import read_internal_yaml, write_yaml
+from .graph_storage import read_graph_record, write_graph_record
 
 
 def _namespace_ref(prefix: str, ref: str) -> str:
@@ -61,9 +63,9 @@ def load_inherited_source_graph(ref, *, workspace=None) -> tuple[dict[str, Any],
         graph = load_graph(source_config)
     else:
         path = Path(ref.snapshot_path)
-        if not path.is_file() or path.is_symlink():
+        if not (path.is_file() or path.is_dir()) or path.is_symlink():
             raise LightGraphError('inherited_graph_snapshot_not_found')
-        raw = safe_load_yaml(path.read_text(encoding='utf-8'), max_bytes=128 * 1024 * 1024)
+        raw = read_graph_record(path) if path.is_dir() else read_internal_yaml(path)
         if not isinstance(raw, dict) or raw.get('status') != 'published' or raw.get('target') != 'graph':
             raise LightGraphError('invalid_inherited_graph_snapshot')
         graph = filter_graph_scopes(raw, ref.allowed_scopes)
@@ -93,11 +95,11 @@ def freeze_inherited_graphs(config, construction_dir: str | Path, *, workspace=N
         tagged = _namespace_graph_evidence(graph, inherit_id=ref.inherit_id,
                                            source_project_id=ref.source_project_id, source_digest=actual_digest)
         frozen_digest = digest(tagged)
-        snapshot_file = f'{ref.inherit_id}-{frozen_digest}.yaml'
-        write_yaml(inherited_dir / snapshot_file, {
-            'format_version': 1, 'inherit_id': ref.inherit_id, 'source_graph_digest': actual_digest,
-            'source_project_id': ref.source_project_id, 'allowed_scopes': ref.allowed_scopes, 'graph': tagged,
-        })
+        # Short independent generations avoid MAX_PATH and let interrupted
+        # writes remain unreferenced without blocking a retry of the same graph.
+        snapshot_file = uuid.uuid4().hex + '.graph'
+        snapshot_path = inherited_dir / snapshot_file
+        write_graph_record(snapshot_path, tagged)
         summaries.append({
             'inherit_id': ref.inherit_id, 'source_project_id': ref.source_project_id,
             'source_access': graph.get('access_fingerprint'),
@@ -139,7 +141,7 @@ def frozen_contributors(construction_dir, *, config=None):
         if config is not None and config.inherited_graphs:
             raise LightGraphError('inherited_graph_snapshot_not_found')
         return [], empty
-    summary = safe_load_yaml(summary_path.read_text(encoding='utf-8'))
+    summary = read_internal_yaml(summary_path)
     if not isinstance(summary, dict) or not isinstance(summary.get('inherited'), list):
         raise LightGraphError('invalid_inherited_graph_snapshot')
     if config is not None:
@@ -153,11 +155,15 @@ def frozen_contributors(construction_dir, *, config=None):
             raise LightGraphError('invalid_inherited_graph_snapshot')
         filename = item.get('snapshot_file', f'{iid}.yaml')
         path = (inherited_dir / filename).resolve()
-        if path.parent != inherited_dir.resolve() or not path.is_file():
+        if path.parent != inherited_dir.resolve() or not (path.is_file() or path.is_dir()):
             raise LightGraphError('inherited_graph_snapshot_not_found')
-        payload = safe_load_yaml(path.read_text(encoding='utf-8'), max_bytes=128 * 1024 * 1024)
-        graph = payload.get('graph') if isinstance(payload, dict) else None
-        if not isinstance(graph, dict) or payload.get('inherit_id') != iid:
+        if path.is_dir():
+            graph = read_graph_record(path)
+        else:
+            # Historical YAML snapshots retain their wrapper and long filename.
+            payload = read_internal_yaml(path)
+            graph = payload.get('graph') if isinstance(payload, dict) and payload.get('inherit_id') == iid else None
+        if not isinstance(graph, dict):
             raise LightGraphError('invalid_inherited_graph_snapshot')
         if item.get('frozen_digest') and digest(graph) != item['frozen_digest']:
             raise LightGraphError('inherited_graph_digest_mismatch')
@@ -173,7 +179,7 @@ def load_frozen_base_graph(construction_dir: str | Path, *, config=None):
 
 def compose_published_graph(graph, base_graph, access):
     """A unit publishes a delta; a sharded project already contains its base."""
-    if not base_graph or graph.get('storage_layout') == 'sharded_v1':
+    if not base_graph or graph.get('storage_layout') in {'sharded_v1', 'parquet_v1'}:
         return graph
     from .merger import merge_construction_graphs
     return merge_construction_graphs([

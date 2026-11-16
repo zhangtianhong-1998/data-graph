@@ -7,15 +7,15 @@ import json
 from pathlib import Path
 from typing import Any
 import unicodedata
+import uuid
 
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import MergePolicyConfig
-from lightgraph.runtime.retention import atomic_text
 from lightgraph.source_values import persisted_identity_key
 from .display import derive_display_graph
 from .statistics import directed_topology
-from .workspace import safe_load_yaml, write_yaml
+from .workspace import read_internal_yaml, write_yaml
 
 SHARD_COUNT = 32
 
@@ -522,52 +522,16 @@ def _shard_bucket(identifier: str) -> str:
 
 def write_sharded_graph(construction_dir: str | Path, merged: dict[str, Any], *, context_fingerprint: str,
                         unit_attempts: dict[str, str] | None = None) -> dict[str, Any]:
-    """Persist core topology in graph-core.yaml and shard heavy supports/provenance across JSON shards."""
+    """Publish an immutable Parquet snapshot (name retained for API compatibility)."""
+    from .graph_storage import write_graph_record
     root = Path(construction_dir)
-    # A pinned reader must see the old topology and its exact evidence even during another merge.
-    publication = 'published/' + digest(merged)
-    (root / publication / 'evidence-shards').mkdir(parents=True, exist_ok=True)
-
-    buckets: dict[str, dict[str, dict[str, Any]]] = defaultdict(lambda: {'nodes': {}, 'edges': {}})
-    core_nodes = []
-    for node in merged.get('nodes', []):
-        nid = node['id']
-        bucket = _shard_bucket(nid)
-        buckets[bucket]['nodes'][nid] = {
-            'supports': node.get('supports', []),
-            'provenance': node.get('provenance', []),
-        }
-        core_nodes.append({k: v for k, v in node.items() if k not in {'supports', 'provenance'}})
-
-    core_edges = []
-    for edge in merged.get('edges', []):
-        eid = edge['id']
-        bucket = _shard_bucket(eid)
-        buckets[bucket]['edges'][eid] = {
-            'supports': edge.get('supports', []),
-            'provenance': edge.get('provenance', []),
-        }
-        core_edges.append({k: v for k, v in edge.items() if k not in {'supports', 'provenance'}})
-
-    shard_files = {}
-    for bucket, payload in sorted(buckets.items()):
-        rel = f'{publication}/evidence-shards/{bucket}'
-        atomic_text(root / rel, json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
-        shard_files[bucket] = rel
-
-    core = {
-        **{k: v for k, v in merged.items() if k not in {'nodes', 'edges'}},
-        'storage_layout': 'sharded_v1',
-        'evidence_shards': shard_files,
-        'nodes': core_nodes,
-        'edges': core_edges,
-    }
-    core_rel = f'{publication}/graph-core.yaml'
-    write_yaml(root / core_rel, core)
-
+    (root / 'published').mkdir(parents=True, exist_ok=True)
+    publication = 'published/' + uuid.uuid4().hex + '.graph'
+    graph = {**merged, 'storage_layout': 'parquet_v1'}
+    write_graph_record(root / publication, graph)
     manifest_path = root / 'manifest.yaml'
     manifest = (
-        safe_load_yaml(manifest_path.read_text(encoding='utf-8'))
+        read_internal_yaml(manifest_path)
         if manifest_path.exists()
         else {'format_version': 1, 'target': 'graph', 'drafts': {}, 'evidence': {}, 'evidence_history': {}, 'publications': {}}
     )
@@ -575,15 +539,16 @@ def write_sharded_graph(construction_dir: str | Path, merged: dict[str, Any], *,
         'context_fingerprint': context_fingerprint,
         **({'workflow_units': unit_attempts} if unit_attempts is not None else {}),
         'access_fingerprint': merged.get('access_fingerprint'),
-        'path': core_rel,
-        'storage_layout': 'sharded_v1',
+        'path': publication,
+        'storage_layout': 'parquet_v1',
     }
     write_yaml(manifest_path, manifest)
     return {
-        'core_path': core_rel,
-        'shard_count': len(shard_files),
-        'nodes': len(core_nodes),
-        'edges': len(core_edges),
+        'core_path': publication,
+        'shard_count': 2,
+        'storage_layout': 'parquet_v1',
+        'nodes': len(merged.get('nodes', [])),
+        'edges': len(merged.get('edges', [])),
     }
 
 

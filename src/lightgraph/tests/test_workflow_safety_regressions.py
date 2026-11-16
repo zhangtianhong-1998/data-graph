@@ -68,16 +68,15 @@ def test_independent_outputs_keep_conflicting_type_definitions_and_physical_colu
 
 
 def test_published_reader_keeps_old_graph_and_supports_during_next_merge(tmp_path):
+    from lightgraph.construction.graph_storage import read_graph_record
     previous = write_sharded_graph(tmp_path, _graph('第一版'), context_fingerprint='old')
-    pinned_core = safe_load_yaml((tmp_path / previous['core_path']).read_text('utf-8'))
     replacement = write_sharded_graph(tmp_path, _graph('第二版'), context_fingerprint='new')
-    old = load_sharded_graph(tmp_path, pinned_core)
+    old = read_graph_record(tmp_path / previous['core_path'])
     assert old['nodes'][0]['supports'][0]['label'] == '第一版'
     assert previous['core_path'] != replacement['core_path']
-    corrupt = deepcopy(pinned_core)
-    corrupt['evidence_shards'] = {}
-    with pytest.raises(LightGraphError, match='graph_workspace_record_unavailable'):
-        load_sharded_graph(tmp_path, corrupt)
+    (tmp_path / previous['core_path'] / 'nodes.parquet').write_bytes(b'corrupt')
+    with pytest.raises(LightGraphError):
+        read_graph_record(tmp_path / previous['core_path'])
 
 @pytest.mark.parametrize('rows, publish, cycle', [
     ([('1', '2')], True, False), ([], True, False), ([], False, False),

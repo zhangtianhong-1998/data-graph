@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import WorkflowNodeInputs from './WorkflowNodeInputs.vue'
 import type {
   InheritedGraphRef,
@@ -294,6 +294,13 @@ function buildPresetSplit(withMerge: boolean) {
 
 // --- Drag & Drop (Palette -> Canvas, Move Nodes, Connect Ports) ---
 const canvasRef = ref<HTMLElement | null>(null)
+const zoom = ref(1)
+const fitMode = ref(true)
+const viewportSize = ref({ width: 0, height: 0 })
+const MIN_ZOOM = 0.1
+const MAX_ZOOM = 2
+let resizeObserver: ResizeObserver | undefined
+const panState = ref<{ x: number; y: number; left: number; top: number } | null>(null)
 const pendingWireFrom = ref<string | null>(null)
 const wirePointer = ref<WorkflowPosition | null>(null)
 let wireDrag: { sourceId: string; x: number; y: number; moved: boolean } | null = null
@@ -304,6 +311,8 @@ const dragState = ref<{
   startY: number
   origX: number
   origY: number
+  scrollLeft: number
+  scrollTop: number
 } | null>(null)
 
 const NODE_W = 216
@@ -379,6 +388,81 @@ const canvasWidth = computed(() => {
   return maxX
 })
 
+// Nodes and wires share logical coordinates. The scroll area reserves the
+// scaled extent, while only the scene itself is transformed.
+const sceneExtent = computed(() => ({
+  width: `${Math.max(viewportSize.value.width, canvasWidth.value * zoom.value)}px`,
+  height: `${Math.max(viewportSize.value.height, canvasHeight.value * zoom.value)}px`,
+}))
+
+function canvasPoint(clientX: number, clientY: number): WorkflowPosition {
+  const canvas = canvasRef.value!
+  const rect = canvas.getBoundingClientRect()
+  return {
+    x: (clientX - rect.left - canvas.clientLeft + canvas.scrollLeft) / zoom.value,
+    y: (clientY - rect.top - canvas.clientTop + canvas.scrollTop) / zoom.value,
+  }
+}
+
+async function setZoom(value: number, clientX?: number, clientY?: number) {
+  const canvas = canvasRef.value
+  if (!canvas || dragState.value || wireDrag || panState.value) return
+  const rect = canvas.getBoundingClientRect()
+  const x = clientX ?? rect.left + canvas.clientWidth / 2
+  const y = clientY ?? rect.top + canvas.clientHeight / 2
+  const anchor = canvasPoint(x, y)
+  fitMode.value = false
+  zoom.value = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value))
+  await nextTick()
+  canvas.scrollLeft = anchor.x * zoom.value - (x - rect.left - canvas.clientLeft)
+  canvas.scrollTop = anchor.y * zoom.value - (y - rect.top - canvas.clientTop)
+  if (pendingWireFrom.value) wirePointer.value = canvasPoint(x, y)
+}
+
+function fitCanvas() {
+  const canvas = canvasRef.value
+  if (!canvas) return
+  fitMode.value = true
+  if (!canvas.clientWidth || !canvas.clientHeight) return
+  zoom.value = Math.max(MIN_ZOOM, Math.min(1,
+    canvas.clientWidth / canvasWidth.value, canvas.clientHeight / canvasHeight.value))
+  canvas.scrollLeft = 0
+  canvas.scrollTop = 0
+}
+
+function onCanvasWheel(event: WheelEvent) {
+  if (!event.ctrlKey && !event.metaKey) return
+  event.preventDefault()
+  const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 400 : 1)
+  void setZoom(zoom.value * Math.exp(-delta * 0.002), event.clientX, event.clientY)
+}
+
+function startCanvasPan(event: MouseEvent) {
+  if (event.button !== 0 || !canvasRef.value || pendingWireFrom.value) return
+  if ((event.target as Element).closest('.wf-node, .wf-edge-delete')) return
+  panState.value = { x: event.clientX, y: event.clientY,
+    left: canvasRef.value.scrollLeft, top: canvasRef.value.scrollTop }
+  window.addEventListener('mousemove', onWindowMouseMove)
+  window.addEventListener('mouseup', onWindowMouseUp)
+  event.preventDefault()
+}
+
+onMounted(() => {
+  const resize = () => {
+    const canvas = canvasRef.value
+    if (!canvas) return
+    viewportSize.value = { width: canvas.clientWidth, height: canvas.clientHeight }
+    if (fitMode.value) fitCanvas()
+  }
+  if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(resize)
+    if (canvasRef.value) resizeObserver.observe(canvasRef.value)
+  }
+  resize()
+})
+watch([canvasWidth, canvasHeight], () => { if (fitMode.value) fitCanvas() })
+onUnmounted(() => resizeObserver?.disconnect())
+
 function onPaletteDragStart(kind: 'extract' | 'merge', event: DragEvent) {
   if (props.locked || !event.dataTransfer) return
   event.dataTransfer.setData('application/x-lightgraph-node', kind)
@@ -389,10 +473,10 @@ function onCanvasDrop(event: DragEvent) {
   if (props.locked || !canvasRef.value) return
   const kind = event.dataTransfer?.getData('application/x-lightgraph-node')
   if (kind !== 'extract' && kind !== 'merge') return
-  const rect = canvasRef.value.getBoundingClientRect()
+  const point = canvasPoint(event.clientX, event.clientY)
   const pos = {
-    x: Math.max(16, event.clientX - rect.left + canvasRef.value.scrollLeft - NODE_W / 2),
-    y: Math.max(16, event.clientY - rect.top + canvasRef.value.scrollTop - NODE_H / 2),
+    x: Math.max(16, point.x - NODE_W / 2),
+    y: Math.max(16, point.y - NODE_H / 2),
   }
   if (kind === 'extract') addExtractNode(pos)
   else addMergeNode(pos)
@@ -402,6 +486,7 @@ function startNodeDrag(nodeId: string, event: MouseEvent) {
   if (props.locked || event.button !== 0) return
   const target = event.target as HTMLElement
   if (target.closest('button') || target.closest('.wf-port')) return
+  fitMode.value = false
   selectedId.value = nodeId
   const pos = nodePosition(nodeId)
   dragState.value = {
@@ -410,20 +495,29 @@ function startNodeDrag(nodeId: string, event: MouseEvent) {
     startY: event.clientY,
     origX: pos.x,
     origY: pos.y,
+    scrollLeft: canvasRef.value?.scrollLeft || 0,
+    scrollTop: canvasRef.value?.scrollTop || 0,
   }
   window.addEventListener('mousemove', onWindowMouseMove)
   window.addEventListener('mouseup', onWindowMouseUp)
 }
 
 function onWindowMouseMove(event: MouseEvent) {
+  if (panState.value && canvasRef.value) {
+    canvasRef.value.scrollLeft = panState.value.left - (event.clientX - panState.value.x)
+    canvasRef.value.scrollTop = panState.value.top - (event.clientY - panState.value.y)
+    return
+  }
   if (props.locked) return
   if (wireDrag && Math.hypot(event.clientX - wireDrag.x, event.clientY - wireDrag.y) > 3) {
     wireDrag.moved = true
     pendingWireFrom.value = wireDrag.sourceId
   }
   if (dragState.value) {
-    const dx = event.clientX - dragState.value.startX
-    const dy = event.clientY - dragState.value.startY
+    const dx = (event.clientX - dragState.value.startX
+      + (canvasRef.value?.scrollLeft || 0) - dragState.value.scrollLeft) / zoom.value
+    const dy = (event.clientY - dragState.value.startY
+      + (canvasRef.value?.scrollTop || 0) - dragState.value.scrollTop) / zoom.value
     const nx = Math.max(12, Math.round(dragState.value.origX + dx))
     const ny = Math.max(12, Math.round(dragState.value.origY + dy))
     const id = dragState.value.nodeId
@@ -438,11 +532,7 @@ function onWindowMouseMove(event: MouseEvent) {
       }
     }
   } else if (pendingWireFrom.value && canvasRef.value) {
-    const rect = canvasRef.value.getBoundingClientRect()
-    wirePointer.value = {
-      x: event.clientX - rect.left + canvasRef.value.scrollLeft,
-      y: event.clientY - rect.top + canvasRef.value.scrollTop,
-    }
+    wirePointer.value = canvasPoint(event.clientX, event.clientY)
   }
 }
 
@@ -459,6 +549,7 @@ function cancelWire() {
 }
 
 function onWindowMouseUp(event: MouseEvent) {
+  panState.value = null
   if (dragState.value) {
     const { nodeId, origX, origY } = dragState.value
     dragState.value = null
@@ -476,7 +567,7 @@ function onWindowMouseUp(event: MouseEvent) {
 }
 
 onUnmounted(stopPointerListeners)
-watch(() => props.locked, locked => { if (locked) { dragState.value = null; cancelWire() } })
+watch(() => props.locked, locked => { if (locked) { dragState.value = null; panState.value = null; cancelWire() } })
 
 function startWireDrag(sourceId: string, event: MouseEvent) {
   if (props.locked || event.button !== 0) return
@@ -807,7 +898,7 @@ const topologySummary = computed(() => {
         <div class="panel-head">
           <div>
             <h2>编排画布</h2>
-            <small class="muted">{{ pendingWireFrom ? `正在从「${pendingWireFrom}」连线…请点击目标输入端口 ○` : '点击任意节点在右侧配置表、知识库与抽取策略' }}</small>
+            <small class="muted">{{ pendingWireFrom ? `正在从「${pendingWireFrom}」连线…请点击目标输入端口 ○` : '点击节点配置表、知识文档与抽取策略' }}</small>
           </div>
           <div class="actions">
             <button v-if="pendingWireFrom" class="btn small" type="button" @click="cancelWire">取消连线</button>
@@ -815,118 +906,133 @@ const topologySummary = computed(() => {
           </div>
         </div>
 
+        <div class="wf-viewport-toolbar">
+          <div class="actions" role="group" aria-label="画布缩放">
+            <button class="btn small" type="button" aria-label="缩小画布" :disabled="zoom <= MIN_ZOOM" @click="setZoom(zoom / 1.2)">−</button>
+            <button class="btn small wf-zoom-value" type="button" aria-label="恢复 100% 缩放" @click="setZoom(1)">{{ Math.round(zoom * 100) }}%</button>
+            <button class="btn small" type="button" aria-label="放大画布" :disabled="zoom >= MAX_ZOOM" @click="setZoom(zoom * 1.2)">＋</button>
+            <button class="btn small" type="button" :aria-pressed="fitMode" @click="fitCanvas">适应画布</button>
+          </div>
+          <small class="muted">Ctrl / ⌘ + 滚轮缩放，拖动空白处平移</small>
+        </div>
         <div
           ref="canvasRef"
           class="wf-canvas"
-          :style="{ minHeight: `${canvasHeight}px` }"
+          :class="{ panning: !!panState }"
           @dragover.prevent
           @drop="onCanvasDrop"
+          @wheel="onCanvasWheel"
+          @mousedown="startCanvasPan"
         >
-          <svg class="wf-edges-svg" :width="canvasWidth" :height="canvasHeight">
-            <defs>
-              <marker id="wf-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-                <path d="M0,0 L8,4 L0,8 Z" fill="#5b84d7" />
-              </marker>
-            </defs>
-            <g v-for="edge in renderedEdges" :key="edge.edge_id" class="wf-edge-group">
-              <path :d="edge.path" class="wf-edge-path" marker-end="url(#wf-arrow)" />
-              <g class="wf-edge-delete" :transform="`translate(${edge.midX}, ${edge.midY})`" @click.stop="removeEdge(edge.edge_id)">
-                <circle r="9" />
-                <text dy="3.5">×</text>
-              </g>
-            </g>
-            <path
-              v-if="pendingWireFrom && wirePointer"
-              :d="bezierPath(outputPortCoords(pendingWireFrom), wirePointer)"
-              class="wf-edge-preview"
-            />
-          </svg>
+          <div class="wf-scene-extent" :style="sceneExtent">
+            <div class="wf-scene" :style="{ width: `${canvasWidth}px`, height: `${canvasHeight}px`, transform: `scale(${zoom})` }">
+              <svg class="wf-edges-svg" :width="canvasWidth" :height="canvasHeight">
+                <defs>
+                  <marker id="wf-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 Z" fill="#5b84d7" />
+                  </marker>
+                </defs>
+                <g v-for="edge in renderedEdges" :key="edge.edge_id" class="wf-edge-group">
+                  <path :d="edge.path" class="wf-edge-path" marker-end="url(#wf-arrow)" />
+                  <g class="wf-edge-delete" :transform="`translate(${edge.midX}, ${edge.midY})`" @click.stop="removeEdge(edge.edge_id)">
+                    <circle r="9" />
+                    <text dy="3.5">×</text>
+                  </g>
+                </g>
+                <path
+                  v-if="pendingWireFrom && wirePointer"
+                  :d="bezierPath(outputPortCoords(pendingWireFrom), wirePointer)"
+                  class="wf-edge-preview"
+                />
+              </svg>
 
-          <!-- 抽取节点卡片 -->
-          <div
-            v-for="unit in current.units"
-            :key="unit.unit_id"
-            class="wf-node wf-node-extract"
-            :class="{ selected: selectedId === unit.unit_id }"
-            :style="{ left: `${nodePosition(unit.unit_id).x}px`, top: `${nodePosition(unit.unit_id).y}px` }"
-            @mousedown="startNodeDrag(unit.unit_id, $event)"
-            @click.stop="selectedId = unit.unit_id"
-          >
-            <div class="wf-node-head">
-              <span class="badge blue">抽取</span>
-              <strong>{{ unit.label || unit.unit_id }}</strong>
-            </div>
-            <div class="wf-node-body">
-              <span class="wf-chip">{{ nodeTableChip(unit) }}</span>
-              <span class="wf-chip">{{ nodeDocChip(unit) }}</span>
-            </div>
-            <button
-              type="button"
-              class="wf-port wf-port-out"
-              :class="{ active: pendingWireFrom === unit.unit_id }"
-              :title="`从 ${unit.label || unit.unit_id} 连线输出`"
-              @mousedown.stop.prevent="startWireDrag(unit.unit_id, $event)"
-              @click.stop="startOrToggleWireFrom(unit.unit_id)"
-            >●</button>
-          </div>
+              <!-- 抽取节点卡片 -->
+              <div
+                v-for="unit in current.units"
+                :key="unit.unit_id"
+                class="wf-node wf-node-extract"
+                :class="{ selected: selectedId === unit.unit_id }"
+                :style="{ left: `${nodePosition(unit.unit_id).x}px`, top: `${nodePosition(unit.unit_id).y}px` }"
+                @mousedown="startNodeDrag(unit.unit_id, $event)"
+                @click.stop="selectedId = unit.unit_id"
+              >
+                <div class="wf-node-head">
+                  <span class="badge blue">抽取</span>
+                  <strong>{{ unit.label || unit.unit_id }}</strong>
+                </div>
+                <div class="wf-node-body">
+                  <span class="wf-chip">{{ nodeTableChip(unit) }}</span>
+                  <span class="wf-chip">{{ nodeDocChip(unit) }}</span>
+                </div>
+                <button
+                  type="button"
+                  class="wf-port wf-port-out"
+                  :class="{ active: pendingWireFrom === unit.unit_id }"
+                  :title="`从 ${unit.label || unit.unit_id} 连线输出`"
+                  @mousedown.stop.prevent="startWireDrag(unit.unit_id, $event)"
+                  @click.stop="startOrToggleWireFrom(unit.unit_id)"
+                >●</button>
+              </div>
 
-          <!-- 合并节点卡片 -->
-          <div
-            v-for="mnode in (current.merge_nodes || [])"
-            :key="mnode.node_id"
-            class="wf-node wf-node-merge"
-            :class="{ selected: selectedId === mnode.node_id }"
-            :style="{ left: `${nodePosition(mnode.node_id).x}px`, top: `${nodePosition(mnode.node_id).y}px` }"
-            @mousedown="startNodeDrag(mnode.node_id, $event)"
-            @click.stop="selectedId = mnode.node_id"
-          >
-            <button
-              type="button"
-              class="wf-port wf-port-in"
-              :class="{ ready: !!pendingWireFrom && pendingWireFrom !== mnode.node_id }"
-              :title="`连接到 ${mnode.label || mnode.node_id}`"
-              :data-wire-target="mnode.node_id"
-              @click.stop="completeWireTo(mnode.node_id)"
-            >○</button>
-            <div class="wf-node-head">
-              <span class="badge amber">{{ mnode.merge_mode === 'merge_and_extract' ? '合并抽取' : '合并' }}</span>
-              <strong>{{ mnode.label || mnode.node_id }}</strong>
-            </div>
-            <div class="wf-node-body">
-              <span class="wf-chip">{{ mnode.merge_mode === 'merge_and_extract' ? '全局联合抽取 + 归并' : '确定性安全归并' }}</span>
-            </div>
-            <button
-              type="button"
-              class="wf-port wf-port-out"
-              :class="{ active: pendingWireFrom === mnode.node_id }"
-              :title="`从 ${mnode.label || mnode.node_id} 连线输出`"
-              @mousedown.stop.prevent="startWireDrag(mnode.node_id, $event)"
-              @click.stop="startOrToggleWireFrom(mnode.node_id)"
-            >●</button>
-          </div>
+              <!-- 合并节点卡片 -->
+              <div
+                v-for="mnode in (current.merge_nodes || [])"
+                :key="mnode.node_id"
+                class="wf-node wf-node-merge"
+                :class="{ selected: selectedId === mnode.node_id }"
+                :style="{ left: `${nodePosition(mnode.node_id).x}px`, top: `${nodePosition(mnode.node_id).y}px` }"
+                @mousedown="startNodeDrag(mnode.node_id, $event)"
+                @click.stop="selectedId = mnode.node_id"
+              >
+                <button
+                  type="button"
+                  class="wf-port wf-port-in"
+                  :class="{ ready: !!pendingWireFrom && pendingWireFrom !== mnode.node_id }"
+                  :title="`连接到 ${mnode.label || mnode.node_id}`"
+                  :data-wire-target="mnode.node_id"
+                  @click.stop="completeWireTo(mnode.node_id)"
+                >○</button>
+                <div class="wf-node-head">
+                  <span class="badge amber">{{ mnode.merge_mode === 'merge_and_extract' ? '合并抽取' : '合并' }}</span>
+                  <strong>{{ mnode.label || mnode.node_id }}</strong>
+                </div>
+                <div class="wf-node-body">
+                  <span class="wf-chip">{{ mnode.merge_mode === 'merge_and_extract' ? '全局联合抽取 + 归并' : '确定性安全归并' }}</span>
+                </div>
+                <button
+                  type="button"
+                  class="wf-port wf-port-out"
+                  :class="{ active: pendingWireFrom === mnode.node_id }"
+                  :title="`从 ${mnode.label || mnode.node_id} 连线输出`"
+                  @mousedown.stop.prevent="startWireDrag(mnode.node_id, $event)"
+                  @click.stop="startOrToggleWireFrom(mnode.node_id)"
+                >●</button>
+              </div>
 
-          <!-- 最终输出节点 -->
-          <div
-            class="wf-node wf-node-output"
-            :class="{ selected: selectedId === 'output' }"
-            :style="{ left: `${nodePosition('output').x}px`, top: `${nodePosition('output').y}px` }"
-            @mousedown="startNodeDrag('output', $event)"
-            @click.stop="selectedId = 'output'"
-          >
-            <button
-              type="button"
-              class="wf-port wf-port-in"
-              :class="{ ready: !!pendingWireFrom }"
-              title="连接到最终图谱输出"
-              data-wire-target="output"
-              @click.stop="completeWireTo('output')"
-            >○</button>
-            <div class="wf-node-head">
-              <span class="badge green">输出</span>
-              <strong>最终图谱</strong>
-            </div>
-            <div class="wf-node-body">
-              <span class="wf-chip">本次运行结果</span>
+              <!-- 最终输出节点 -->
+              <div
+                class="wf-node wf-node-output"
+                :class="{ selected: selectedId === 'output' }"
+                :style="{ left: `${nodePosition('output').x}px`, top: `${nodePosition('output').y}px` }"
+                @mousedown="startNodeDrag('output', $event)"
+                @click.stop="selectedId = 'output'"
+              >
+                <button
+                  type="button"
+                  class="wf-port wf-port-in"
+                  :class="{ ready: !!pendingWireFrom }"
+                  title="连接到最终图谱输出"
+                  data-wire-target="output"
+                  @click.stop="completeWireTo('output')"
+                >○</button>
+                <div class="wf-node-head">
+                  <span class="badge green">输出</span>
+                  <strong>最终图谱</strong>
+                </div>
+                <div class="wf-node-body">
+                  <span class="wf-chip">本次运行结果</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>

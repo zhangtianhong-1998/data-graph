@@ -179,10 +179,15 @@ def test_draft_repair_preserves_other_drafts_and_exact_validated_graph(tmp_path)
         assert tools.workspace.get_draft('设备').status == 'validated'
         assert tools.workspace.get_draft('待修订').status == 'needs_revision'
         checked = tools.call('validate_graph_draft', draft_id='设备')
-        path = tools.workspace.root / checked['candidate_graph']
-        modified = safe_load_yaml(path.read_text(encoding='utf-8'))
+        modified = tools.workspace._read_record(checked['candidate_graph'])
         modified['nodes'][0]['label'] = 'tampered'
-        path.write_text(dump_yaml(modified), encoding='utf-8')
+        # Even a self-consistent replacement snapshot cannot reuse a validation
+        # receipt for different graph content.
+        replacement = tools.workspace._append_record('previews', modified)
+        current = tools.workspace._manifest()['drafts']['设备']['current']
+        receipt = tools.workspace._read_record(current)
+        receipt['validation']['graph_path'] = replacement
+        (tools.workspace.root / current).write_text(dump_yaml(receipt), encoding='utf-8')
         assert tools.call('publish_graph_draft', draft_id='设备')['code'] == 'validated_graph_mismatch'
     finally:
         tools.close()

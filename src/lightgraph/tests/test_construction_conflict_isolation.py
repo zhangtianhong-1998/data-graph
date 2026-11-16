@@ -107,13 +107,13 @@ def test_cross_draft_conflict_quarantines_both_contributors_and_can_be_repaired(
     clean = deepcopy(first['nodes'][0]); clean['id'] = 'clean'; clean['identity'] = {'code': 'clean'}
     first['nodes'].append(clean)
     entry = publish('first', first)
-    original = (work.root / entry['graph']).read_bytes()
+    original = {p: p.read_bytes() for p in (work.root / entry['graph']).iterdir()}
     second = graph(label='New name')
     publish('second', second)
     merged = work.read_published_graph()
     assert [n['id'] for n in merged['nodes']] == ['clean']
     assert merged['conflict_isolation']['nodes'] == 1
-    assert (work.root / entry['graph']).read_bytes() == original
+    assert all(p.read_bytes() == content for p, content in original.items())
     # Revalidate the repaired contributor. Quarantine is recomputed from the
     # active publication set, not a permanent blacklist.
     publish('second', graph(label='Old name'))

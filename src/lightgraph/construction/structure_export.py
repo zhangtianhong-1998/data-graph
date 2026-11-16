@@ -6,7 +6,7 @@ from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
 from .access import access_fingerprint, ensure_supported_access
 from .structure import structure_ready
-from .workspace import GraphWorkspace, safe_load_yaml
+from .workspace import GraphWorkspace, read_internal_yaml
 
 
 class _ReadOnlyWorkspace(GraphWorkspace):
@@ -43,7 +43,7 @@ def load_published_structures(config):
     if not path.exists():
         raise LightGraphError('structure_publication_required')
     try:
-        manifest = safe_load_yaml(path.read_text(encoding='utf-8'))
+        manifest = read_internal_yaml(path)
     except OSError:
         raise LightGraphError('graph_workspace_record_unavailable') from None
     if (not isinstance(manifest, dict) or manifest.get('format_version') != 1

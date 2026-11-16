@@ -8,7 +8,7 @@ from lightgraph.errors import LightGraphError
 from .access import access_fingerprint, ensure_supported_access
 from .models import GraphDraft
 from .structure_export import _ReadOnlyWorkspace
-from .workspace import safe_load_yaml
+from .workspace import read_internal_yaml
 
 
 def load_structure_preview(config, *, draft_id=None, revision=None):
@@ -32,7 +32,7 @@ def load_structure_preview(config, *, draft_id=None, revision=None):
             raise LightGraphError('structure_preview_not_found')
         return result
     try:
-        manifest = safe_load_yaml(path.read_text(encoding='utf-8'))
+        manifest = read_internal_yaml(path)
     except OSError:
         raise LightGraphError('graph_workspace_record_unavailable') from None
     if (not isinstance(manifest, dict) or manifest.get('format_version') != 1

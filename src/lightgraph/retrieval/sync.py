@@ -4,8 +4,10 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 import json
+import errno
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -16,6 +18,20 @@ from lightgraph.runtime.retention import atomic_text
 from lightgraph.construction.access import filter_graph_scopes
 from .store_sqlite import SQLiteGraphIndex, normalize_term
 from .vector_local import Embedder, LocalHashEmbedder, LocalNumpyVectorStore, embedder_fingerprint
+
+
+def _publish_staging(staging: Path, destination: Path) -> None:
+    """Retry transient Windows sharing locks before advancing the index pointer."""
+    for attempt in range(11):
+        try:
+            staging.rename(destination)
+            return
+        except OSError as exc:
+            transient = (getattr(exc, 'winerror', None) in {5, 32, 33}
+                         or exc.errno in {errno.EACCES, errno.EBUSY, errno.EPERM})
+            if not transient or attempt == 10:
+                raise
+            time.sleep(.05)
 
 
 def _node_source_tables(node: dict[str, Any]) -> list[str]:
@@ -227,7 +243,7 @@ def sync_graph_to_retrieval(
         vectors = embedder.embed([item['card_text'] for item in vector_items])
         vec_store.replace_all(vector_items, vectors)
         resolved_dim = int(vectors.shape[1]) if vectors.ndim == 2 and vectors.shape[0] else int(embedder.dim or 0)
-        staging.rename(builds / build_id)
+        _publish_staging(staging, builds / build_id)
         synced_at = datetime.now(timezone.utc).isoformat()
         embedder_provider = 'openai_compatible' if hasattr(embedder, 'base_url') else 'local_hash'
         embedder_model = getattr(embedder, 'model', 'local_hash') or 'local_hash'
@@ -250,7 +266,9 @@ def sync_graph_to_retrieval(
         atomic_text(root / 'current.json', canonical(manifest))
     finally:
         if staging.exists():
-            shutil.rmtree(staging)
+            # Cleanup must not replace the original publication error if the
+            # same external lock still holds files in the abandoned staging dir.
+            shutil.rmtree(staging, ignore_errors=True)
 
     return {
         'status': 'synced',

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from lightgraph.contracts import digest, canonical
 from lightgraph.construction.access import access_fingerprint, ensure_supported_access, filter_graph_scopes
-from lightgraph.construction.workspace import GraphWorkspace, safe_load_yaml
+from lightgraph.construction.workspace import GraphWorkspace, read_internal_yaml
 from lightgraph.errors import LightGraphError
 from lightgraph.graph_neighborhood import neighborhood_paths
 from lightgraph.web.graph_view_cache import cached_generation, load_graph_view, remember_graph, view_token
@@ -20,7 +20,7 @@ def available(config):
         return False
     if root.is_symlink() or manifest.is_symlink():
         raise LightGraphError('workspace_path_invalid')
-    value = safe_load_yaml(manifest.read_text(encoding='utf-8'))
+    value = read_internal_yaml(manifest)
     if not isinstance(value, dict) or value.get('format_version') != 1 or value.get('target') != 'graph':
         raise LightGraphError('invalid_graph_workspace_manifest')
     return bool(value.get('current_graph'))
@@ -53,7 +53,7 @@ def load_prepared(config):
     manifest_path = root / 'manifest.yaml'
     if root.is_symlink() or manifest_path.is_symlink():
         raise LightGraphError('workspace_path_invalid')
-    manifest = safe_load_yaml(manifest_path.read_text(encoding='utf-8'))
+    manifest = read_internal_yaml(manifest_path)
     head = manifest.get('current_graph')
     expected_access = access_fingerprint(config)
     scopes = _scope_key(config)
@@ -70,6 +70,17 @@ def load_prepared(config):
     except OSError:
         raise LightGraphError('graph_workspace_record_unavailable') from None
     key = _view_key('published', published, stat, expected_access, scopes)
+    if published.is_dir():
+        try:
+            names = ('metadata.yaml', 'nodes.parquet', 'edges.parquet')
+            if any((published / name).is_symlink() for name in names):
+                raise LightGraphError('invalid_graph_workspace_record')
+            key['parquet_files'] = [
+                [name, (published / name).stat().st_size, str((published / name).stat().st_mtime_ns)]
+                for name in names
+            ]
+        except OSError:
+            raise LightGraphError('graph_workspace_record_unavailable') from None
 
     inherited_summary = root / 'inherited' / 'summary.yaml'
     if inherited_summary.is_file():
@@ -81,7 +92,7 @@ def load_prepared(config):
         graph = workspace.read_published_graph()
         if graph.get('access_fingerprint') != expected_access:
             raise LightGraphError('graph_access_context_changed')
-        if graph.get('storage_layout') != 'sharded_v1' and (root / 'inherited' / 'summary.yaml').is_file():
+        if graph.get('storage_layout') not in {'sharded_v1', 'parquet_v1'} and (root / 'inherited' / 'summary.yaml').is_file():
             from lightgraph.construction.inheritance import compose_published_graph, load_frozen_base_graph
             base_graph, _ = load_frozen_base_graph(root, config=config)
             graph = compose_published_graph(graph, base_graph, expected_access)
@@ -334,7 +345,7 @@ def _catalog_tables_for_config(config):
     if not catalog_path.is_file() or catalog_path.is_symlink():
         return []
     try:
-        payload = safe_load_yaml(catalog_path.read_text(encoding='utf-8'))
+        payload = read_internal_yaml(catalog_path)
         return list(payload.get('tables') or []) if isinstance(payload, dict) else []
     except Exception:
         return []

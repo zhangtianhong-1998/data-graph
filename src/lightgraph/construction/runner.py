@@ -69,7 +69,7 @@ def _trace_event(event):
 
 
 def run_construction(config, adapters=None, *, discover_only=False, cancel_requested=None,
-                     runtime=None, options=None, run_id=None):
+                     runtime=None, options=None, run_id=None, drop_unbound_documents=False):
     """Let the Agent choose tools and publish; report actual durable outcomes.
 
     ``runtime`` is an explicit test seam, not a second production Agent engine.
@@ -97,7 +97,8 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
             from .inheritance import freeze_inherited_graphs
             freeze_inherited_graphs(config, workspace)
         tools = ConstructionTools(config, workspace, adapters=adapters,
-                                  allow_publication=not discover_only)
+                                  allow_publication=not discover_only,
+                                  drop_unbound_documents=drop_unbound_documents)
         deadline = started + config.max_run_seconds
         tools.budget.tighten_deadline(deadline)
         # Keep counters and the earlier deadline when borrowing already-open
@@ -261,7 +262,7 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
                 delta = filter_graph_scopes(graph, config.scopes, external_visible_ids=tools._base_visible_ids)
                 published = graph
                 graph = delta
-                if base and published.get('storage_layout') != 'sharded_v1':
+                if base and published.get('storage_layout') not in {'sharded_v1', 'parquet_v1'}:
                     report.counts.update(delta_nodes=len(delta['nodes']), delta_edges=len(delta['edges']))
                     report.validation['published_delta'] = ('nonempty' if delta['nodes'] or delta['edges']
                                                             else 'empty' if publications else 'not_published')

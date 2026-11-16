@@ -113,6 +113,7 @@ def execute(payload, result_path):
         metadata_before = metadata_path.stat().st_mtime_ns if metadata_path.exists() else None
         report = run_construction(config, sources,
             cancel_requested=lambda: cancelled or _cancel_path(result_path).exists(),
+            drop_unbound_documents=payload.get('scoped_workflow_run') is True,
             run_id=result_path.name.removesuffix('.result.json'))
         check_cancelled()
         status = {"COMPLETED": "completed", "COMPLETED_WITH_GAPS": "completed_with_gaps",

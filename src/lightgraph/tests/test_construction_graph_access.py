@@ -49,7 +49,7 @@ def test_program_access_fingerprint_bound_to_validation_and_merged_head(publishe
     manifest = safe_load_yaml((tools.workspace.root / 'manifest.yaml').read_text())
     assert manifest['current_graph']['access_fingerprint'] == expected
     for publication in tools.workspace.read_summary()['publications']:
-        artifact = safe_load_yaml((tools.workspace.root / publication['graph']).read_text())
+        artifact = tools.workspace._read_record(publication['graph'])
         assert artifact['access_fingerprint'] == expected
         assert tools.workspace.get_draft(publication['draft_id']).validation.graph_digest
 
@@ -69,7 +69,7 @@ def test_program_access_fingerprint_bound_to_validation_and_merged_head(publishe
 ])
 def test_access_change_denies_old_graph_without_removing_it(published, change):
     config, tools = published
-    artifacts = {path: path.read_bytes() for path in (tools.workspace.root / 'published').glob('*.yaml')}
+    artifacts = {path: path.read_bytes() for path in (tools.workspace.root / 'published').rglob('*') if path.is_file()}
     changed = config.model_copy(deep=True)
     change(changed)
     with pytest.raises(LightGraphError, match='graph_access_context_changed'):
@@ -97,10 +97,10 @@ def test_head_and_artifact_must_both_match_current_access(published):
     config, tools = published
     path = tools.workspace.root / 'manifest.yaml'
     manifest = safe_load_yaml(path.read_text())
-    graph_path = tools.workspace.root / manifest['current_graph']['path']
-    graph = safe_load_yaml(graph_path.read_text())
+    graph = tools.workspace._read_record(manifest['current_graph']['path'])
     graph.pop('access_fingerprint')
-    write_yaml(graph_path, graph)
+    manifest['current_graph']['path'] = tools.workspace._append_record('published', graph)
+    write_yaml(path, manifest)
     with pytest.raises(LightGraphError, match='graph_access_context_changed'):
         load_graph(config)
 
@@ -208,7 +208,7 @@ def test_replacing_the_published_file_drops_the_cached_view(published, monkeypat
     assert load_graph(config)['nodes']
     assert calls['n'] == 0
     manifest = safe_load_yaml((tools.workspace.root / 'manifest.yaml').read_text())
-    path = tools.workspace.root / manifest['current_graph']['path']
+    path = tools.workspace.root / manifest['current_graph']['path'] / 'nodes.parquet'
     before = path.stat().st_mtime_ns
     payload = path.read_bytes()
     path.write_bytes(payload)

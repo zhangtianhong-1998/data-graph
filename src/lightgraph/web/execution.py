@@ -161,7 +161,11 @@ def _input_manifest(config, project_path):
         paths.add(config.agent_config)
     for ref in getattr(config, 'inherited_graphs', []) or []:
         if ref.snapshot_path:
-            paths.add(ref.snapshot_path)
+            snapshot = Path(ref.snapshot_path)
+            if snapshot.is_dir() and not snapshot.is_symlink():
+                paths.update(str(snapshot / name) for name in ('metadata.yaml', 'nodes.parquet', 'edges.parquet'))
+            else:
+                paths.add(ref.snapshot_path)
     for source in config.sources:
         if source.path:
             paths.add(source.path)
@@ -400,7 +404,8 @@ class RunManager:
             promote_unit_to_project_output, publish_merged_contributors, publish_premerged_graph,
             published_unit_attempts, resolve_workflow_plan, save_workflow_state, unit_output_path,
         )
-        from ..construction.workspace import safe_load_yaml, write_yaml
+        from ..construction.workspace import read_internal_yaml
+        from ..construction.graph_storage import write_graph_record
 
         if run_mode == "fresh" and not generation_already_selected:
             self.workspace.select_output_generation(pid, rid, create=True)
@@ -512,6 +517,7 @@ class RunManager:
                                     if any(s.id == k for s in node_config.sources)},
                 model_api_key=model_api_key,
             )
+            node_payload['scoped_workflow_run'] = True
             with entry["state_lock"]:
                 if cancel_event.is_set():
                     state_bucket[node_key].update(status="cancelled", error_code="run_cancelled", updated_at=_now())
@@ -607,7 +613,7 @@ class RunManager:
                         usable = (result["status"] in {"completed", "completed_with_gaps"}
                                   or (result["status"] == "partial" and uid not in previous_attempts))
                         if usable and unit_manifest.is_file():
-                            if (safe_load_yaml(unit_manifest.read_text("utf-8")) or {}).get("current_graph"):
+                            if (read_internal_yaml(unit_manifest) or {}).get("current_graph"):
                                 attempts[uid] = rid
                     check_dependencies(payload_deps, project)
                     if config.inherited_graphs:
@@ -629,17 +635,28 @@ class RunManager:
                         included_units: list[str] = []
                         skipped_units: list[str] = []
                         for uid in plan.extract_ids:
-                            if uid not in attempts:
+                            if (uid not in attempts
+                                    or units_state[uid]['status'] not in {'completed', 'completed_with_gaps'}):
                                 skipped_units.append(uid)
                                 continue
                             out_dir = unit_output_path(config.output_dir, uid, attempts[uid])
-                            c = load_unit_contributor(out_dir, uid)
+                            try:
+                                c = load_unit_contributor(out_dir, uid)
+                                expected_acc = access_fingerprint(build_unit_config(config, units_by_id[uid], unit_output_dir=out_dir))
+                                if c is not None and c['graph'].get('access_fingerprint') != expected_acc:
+                                    raise LightGraphError('graph_access_context_changed')
+                            except (LightGraphError, OSError, ValueError) as exc:
+                                # A bad contributor belongs to its extract node;
+                                # downstream merges have not run and are skipped.
+                                code = _safe_code(getattr(exc, 'code', None), 'graph_workspace_record_unavailable')
+                                units_state[uid].update(status='failed', error_code=code, updated_at=_now())
+                                attempts.pop(uid, None)
+                                skipped_units.append(uid)
+                                save_workflow_state(config.output_dir, wf_state)
+                                continue
                             if c is None:
                                 skipped_units.append(uid)
                                 continue
-                            expected_acc = access_fingerprint(build_unit_config(config, units_by_id[uid], unit_output_dir=out_dir))
-                            if c["graph"].get("access_fingerprint") != expected_acc:
-                                raise LightGraphError("graph_access_context_changed")
                             unit_contribs[uid] = c
                             included_units.append(uid)
 
@@ -678,8 +695,8 @@ class RunManager:
                             if mnode.merge_mode == "merge_and_extract":
                                 m_out = unit_output_path(config.output_dir, mid, rid)
                                 m_out.mkdir(parents=True, exist_ok=True)
-                                snap_path = m_out / "upstream-merged-snapshot.yaml"
-                                write_yaml(snap_path, {
+                                snap_path = m_out / "upstream.graph"
+                                write_graph_record(snap_path, {
                                     **merged_upstream,
                                     "status": "published",
                                     "target": "graph",
@@ -697,13 +714,19 @@ class RunManager:
                                 unit_results.append(m_res)
                                 if cancel_event.is_set():
                                     raise LightGraphError("run_cancelled")
-                                if m_res.get("status") not in {"completed", "completed_with_gaps", "partial"}:
+                                if m_res.get("status") not in {"completed", "completed_with_gaps"}:
                                     continue
-                                m_delta = load_unit_contributor(m_out, mid)
+                                try:
+                                    m_delta = load_unit_contributor(m_out, mid)
+                                    if m_delta is not None and m_delta['graph'].get('access_fingerprint') != access_fingerprint(m_cfg):
+                                        raise LightGraphError('graph_access_context_changed')
+                                except (LightGraphError, OSError, ValueError) as exc:
+                                    code = _safe_code(getattr(exc, 'code', None), 'graph_workspace_record_unavailable')
+                                    merge_nodes_state[mid].update(status='failed', error_code=code, updated_at=_now())
+                                    save_workflow_state(config.output_dir, wf_state)
+                                    continue
                                 combine_list = [{"contributor_id": f"upstream_{mid}", "kind": "base", "graph": merged_upstream}]
                                 if m_delta is not None:
-                                    if m_delta["graph"].get("access_fingerprint") != access_fingerprint(m_cfg):
-                                        raise LightGraphError("graph_access_context_changed")
                                     combine_list.append(m_delta)
                                 combined = merge_construction_graphs(
                                     combine_list,
@@ -904,13 +927,13 @@ class RunManager:
         with self.workspace.lock(pid):
             config = self.workspace.resolved_config(pid)
             from ..construction.workflow import load_workflow_state, resolve_workflow_plan
-            from ..construction.workspace import safe_load_yaml
+            from ..construction.workspace import read_internal_yaml
             state = load_workflow_state(config.output_dir)
             summary_path = Path(config.output_dir) / "construction" / "workflow-merge-summary.yaml"
             merge_summary = None
             if summary_path.is_file():
                 try:
-                    merge_summary = safe_load_yaml(summary_path.read_text(encoding="utf-8"))
+                    merge_summary = read_internal_yaml(summary_path)
                 except Exception:
                     merge_summary = None
             plan = resolve_workflow_plan(config.workflow) if config.workflow else None

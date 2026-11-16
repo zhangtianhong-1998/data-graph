@@ -25,7 +25,7 @@ def test_budget_failure_retains_snapshot_and_publishes_without_reading_database(
         checked = tools.call('validate_graph_draft', draft_id=draft['draft_id'])
         assert checked['passed']
         first_path = tools.workspace.root / checked['candidate_graph']
-        original = first_path.read_bytes()
+        original = {p: p.read_bytes() for p in first_path.iterdir()}
         budget = opened[0].query_budget
         budget.max_queries = budget.queries
         failed = tools.call('validate_graph_draft', draft_id=draft['draft_id'])
@@ -33,7 +33,7 @@ def test_budget_failure_retains_snapshot_and_publishes_without_reading_database(
         assert failed['resource_state']['code'] == 'query_budget_exhausted'
         assert failed['resource_state']['retryable'] is False
         assert failed['candidate_graph'] != checked['candidate_graph']
-        assert first_path.read_bytes() == original
+        assert all(p.read_bytes() == content for p, content in original.items())
         record = tools.workspace.get_draft(draft['draft_id'])
         assert record.last_successful_validation.validation_id == checked['validation_id']
         assert record.validation.validation_id == failed['validation_id']
@@ -171,8 +171,8 @@ def test_immutable_graph_digest_guard(tmp_path):
     workspace = GraphWorkspace(tmp_path, 'context')
     workspace.save_draft(payload('items'))
     checked = workspace.record_validation('items', revision=1, passed=True, graph=graph()).validation
-    path = workspace.root / checked.graph_path
-    path.write_text(dump_yaml(graph(label='tampered')), encoding='utf-8')
+    replacement = workspace._append_record('previews', graph(label='tampered'))
+    checked = checked.model_copy(update={'graph_path': replacement})
     with pytest.raises(LightGraphError, match='validated_graph_mismatch'):
         workspace.read_validation_graph('items', checked)
 

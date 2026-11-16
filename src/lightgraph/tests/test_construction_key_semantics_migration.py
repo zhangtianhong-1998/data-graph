@@ -26,7 +26,8 @@ def test_legacy_context_requires_revalidation_without_deleting_history(tmp_path)
         assert tools.call('save_graph_draft', yaml_text=dump_yaml(proposal))['status'] == 'ok'
         assert tools.call('validate_graph_draft', draft_id=name)['passed']
         assert tools.call('publish_graph_draft', draft_id=name)['status'] == 'ok'
-        historical_files = {path: path.read_bytes() for path in (workspace / 'published').glob('*.yaml')}
+        historical_files = {path: path.read_bytes() for path in (workspace / 'published').rglob('*') if path.is_file()}
+        assert historical_files
     finally:
         tools.close()
 

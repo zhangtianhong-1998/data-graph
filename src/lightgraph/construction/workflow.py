@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ from .access import access_fingerprint
 from .inheritance import freeze_inherited_graphs, frozen_contributors
 from .intent import effective_goal_markdown
 from .merger import merge_construction_graphs, write_sharded_graph
-from .workspace import GraphWorkspace, safe_load_yaml, write_yaml
+from .workspace import GraphWorkspace, read_internal_yaml, write_yaml
 
 
 def _now() -> str:
@@ -44,7 +45,7 @@ def published_unit_attempts(project_output_dir):
     manifest_path = Path(project_output_dir) / 'construction' / 'manifest.yaml'
     if not manifest_path.is_file():
         return {}
-    manifest = safe_load_yaml(manifest_path.read_text('utf-8'))
+    manifest = read_internal_yaml(manifest_path)
     return dict((manifest.get('current_graph') or {}).get('workflow_units') or {})
 
 
@@ -337,26 +338,38 @@ def copy_frozen_inheritance(parent_construction_dir: str | Path, unit_constructi
         return
     dst_dir = Path(unit_construction_dir) / 'inherited'
     dst_dir.mkdir(parents=True, exist_ok=True)
-    summary_text = (src_dir / 'summary.yaml').read_text('utf-8')
-    for ref in safe_load_yaml(summary_text)['inherited']:
+    summary = read_internal_yaml(src_dir / 'summary.yaml')
+    from .graph_storage import read_graph_record, write_graph_record
+    for ref in summary['inherited']:
         name = ref.get('snapshot_file') or (ref['inherit_id'] + '.yaml')
-        if Path(name).name != name:
+        if Path(name).name != name or name in {'.', '..'}:
             raise LightGraphError('invalid_inherited_graph_snapshot')
-        atomic_text(dst_dir / name, (src_dir / name).read_text('utf-8'))
-    atomic_text(dst_dir / 'summary.yaml', summary_text)
+        source = src_dir / name
+        if source.is_symlink():
+            raise LightGraphError('invalid_inherited_graph_snapshot')
+        if source.is_dir():
+            graph = read_graph_record(source)
+            if ref.get('frozen_digest') and digest(graph) != ref['frozen_digest']:
+                raise LightGraphError('inherited_graph_digest_mismatch')
+            name = uuid.uuid4().hex + '.graph'
+            write_graph_record(dst_dir / name, graph)
+            ref['snapshot_file'] = name
+        else:
+            atomic_text(dst_dir / name, source.read_text('utf-8'))
+    write_yaml(dst_dir / 'summary.yaml', summary)
 
 
 def _read_workspace_evidence_map(construction_dir: Path) -> dict[str, dict[str, Any]]:
     manifest_path = construction_dir / 'manifest.yaml'
     if not manifest_path.is_file():
         return {}
-    manifest = safe_load_yaml(manifest_path.read_text(encoding='utf-8'))
+    manifest = read_internal_yaml(manifest_path)
     records: dict[str, dict[str, Any]] = {}
     for ref, rel in (manifest.get('evidence') or {}).items():
         path = (construction_dir / rel).resolve()
         if path.is_relative_to(construction_dir.resolve()) and path.is_file():
             try:
-                records[ref] = safe_load_yaml(path.read_text(encoding='utf-8'))
+                records[ref] = read_internal_yaml(path)
             except Exception:
                 continue
     return records
@@ -367,7 +380,7 @@ def load_unit_contributor(unit_output_dir: str | Path, unit_id: str) -> dict[str
     manifest_path = construction_dir / 'manifest.yaml'
     if not manifest_path.is_file():
         return None
-    manifest = safe_load_yaml(manifest_path.read_text(encoding='utf-8'))
+    manifest = read_internal_yaml(manifest_path)
     head = manifest.get('current_graph') if isinstance(manifest, dict) else None
     if not head or not head.get('path'):
         return None

@@ -51,10 +51,37 @@ def _file_hash(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def _drop_unbound_documents(corpus: DocumentCorpus, tables) -> DocumentCorpus:
+    """Bind a scoped worker's documents without widening explicit bindings.
+
+    Only missing catalog objects are expected after scope narrowing. Ambiguity,
+    invalid section expansion and all other document errors remain fatal.
+    """
+    tables = list(tables)
+    missing = {'invalid_document_source_binding', 'invalid_document_table_binding',
+               'invalid_document_column_binding'}
+    try:
+        return corpus.bind_catalog(tables)
+    except LightGraphError as exc:
+        if exc.code not in missing:
+            raise
+    retained = []
+    for document in corpus.documents:
+        try:
+            DocumentCorpus([document]).bind_catalog(tables)
+        except LightGraphError as exc:
+            if exc.code not in missing:
+                raise
+        else:
+            retained.append(document)
+    return DocumentCorpus(retained).bind_catalog(tables)
+
+
 class ConstructionTools:
     """Own one run's sources, issued evidence, and durable candidate workspace."""
 
-    def __init__(self, config, workspace, *, adapters=None, allow_publication=True):
+    def __init__(self, config, workspace, *, adapters=None, allow_publication=True,
+                 drop_unbound_documents=False):
         self.config = config = config.model_copy(deep=True)
         ensure_supported_access(config)
         # This is a host capability, never an Agent-supplied tool argument.
@@ -80,6 +107,10 @@ class ConstructionTools:
             self.documents = DocumentCorpus([document for document in load_documents(config.documents)
                 if document.document_id not in config.removed_document_ids])
             mapping = {t.source_id: adapter for adapter in self.adapters for t in adapter.describe()}
+            if drop_unbound_documents:
+                catalog = {(t.source_id, t.qualified_name): t
+                           for adapter in mapping.values() for t in adapter.describe()}
+                self.documents = _drop_unbound_documents(self.documents, catalog.values())
             self._adapters_by_source = {**mapping, **self.unavailable_sources}
             self._fact_data_denied = {source.id for source in config.sources
                 if source.allow_fact_data is False}

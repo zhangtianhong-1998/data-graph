@@ -1,4 +1,4 @@
-"""Versioned YAML graph workspace; one construction worker owns each writer.
+"""Versioned graph workspace; one construction worker owns each writer.
 
 Immutable records are written before atomically advancing the manifest. An
 interrupted write may leave an unreferenced record, but never a manifest pointing
@@ -23,6 +23,10 @@ from lightgraph.errors import LightGraphError
 from lightgraph.runtime.retention import atomic_text
 
 from .models import DataValidation, DraftRecord, EvidenceRecord, GraphDraft, draft_evidence_refs
+
+# Only legacy/internal records use this compatibility limit. Agent-authored YAML
+# remains bounded at 8 MiB; instance graphs are stored in Parquet, not YAML.
+INTERNAL_YAML_MAX_BYTES = 512 * 1024 * 1024
 
 # These failures describe an unsuccessful attempt, not a counterexample to the
 # facts in an earlier completed snapshot. Semantic conflicts are excluded.
@@ -115,6 +119,14 @@ def dump_yaml(value: Any) -> str:
     return yaml.dump(value, Dumper=_GraphYamlDumper, allow_unicode=True, sort_keys=False)
 
 
+def read_internal_yaml(path: str | Path) -> Any:
+    """Read existing internal YAML with a bound checked before allocating text."""
+    path = Path(path)
+    if path.stat().st_size > INTERNAL_YAML_MAX_BYTES:
+        raise LightGraphError('yaml_document_too_large')
+    return safe_load_yaml(path.read_text(encoding='utf-8'), max_bytes=INTERNAL_YAML_MAX_BYTES)
+
+
 def write_yaml(path: str | Path, value: Any) -> None:
     atomic_text(path, dump_yaml(value))
 
@@ -140,7 +152,7 @@ class GraphWorkspace:
         self._manifest()
 
     def _manifest(self) -> dict:
-        manifest = safe_load_yaml(self.manifest_path.read_text(encoding="utf-8"))
+        manifest = read_internal_yaml(self.manifest_path)
         if (not isinstance(manifest, dict) or manifest.get("format_version") != 1
                 or manifest.get("target") != "graph"
                 or not isinstance(manifest.get("drafts"), dict)
@@ -162,14 +174,25 @@ class GraphWorkspace:
         if not path.is_relative_to(self.root.resolve()) or path == self.root.resolve():
             raise LightGraphError("invalid_graph_workspace_record")
         try:
-            return safe_load_yaml(path.read_text(encoding="utf-8"), max_bytes=128 * 1024 * 1024)
+            if path.is_dir():
+                from .graph_storage import read_graph_record
+                return read_graph_record(path)
+            return read_internal_yaml(path)
         except OSError:
             raise LightGraphError("graph_workspace_record_unavailable") from None
 
     def _append_record(self, folder: str, value: Any) -> str:
         started = time.monotonic()
         try:
+            if folder in {'previews', 'published'} and isinstance(value, dict):
+                from .graph_storage import write_graph_record
+                relative = f'{folder}/{uuid.uuid4().hex}.graph'
+                (self.root / folder).mkdir(parents=True, exist_ok=True)
+                write_graph_record(self.root / relative, value)
+                return relative
             serialized = dump_yaml(value)
+            if len(serialized.encode('utf-8')) > INTERNAL_YAML_MAX_BYTES:
+                raise LightGraphError('yaml_document_too_large')
             relative = f"{folder}/{uuid.uuid4().hex}.yaml"
             path = self.root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
