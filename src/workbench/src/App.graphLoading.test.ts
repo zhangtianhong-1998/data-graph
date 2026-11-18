@@ -27,6 +27,7 @@ beforeEach(() => {
       if (graphCalls.length === 1) return new Promise<Response>((resolve, reject) => { resolveInitial = resolve; rejectInitial = reject })
       return Promise.resolve(response({ nodes: [{ id: 'candidate', label: '新候选图', status: 'candidate' }], edges: [] }))
     }
+    if (url.includes('/graph/contexts?')) return Promise.resolve(response({ contexts: [], support_counts: {}, next_offset: null }))
     if (url.endsWith('/graph/versions')) return Promise.resolve(response({ versions: [] }))
     if (url === '/api/projects') return Promise.resolve(response({ projects: [project] }))
     if (url === '/api/projects/p') return Promise.resolve(response(project))

@@ -469,6 +469,12 @@ def publish_premerged_graph(
         'shard_count': persisted['shard_count'],
         'candidate_identity_merges': len(merged.get('candidate_identity_merges', [])),
         'candidate_column_alignments': len(merged.get('candidate_column_alignments', [])),
+        'pending_definitions': len(merged.get('definition_conflicts', [])),
+        'pending_relations': len(merged.get('unresolved_relations', [])),
+        'pending_topology_checks': len(merged.get('context_cycle_diagnostics', [])),
+        'semantic_status': 'pending_alignment' if any(merged.get(field) for field in (
+            'definition_conflicts', 'unresolved_relations', 'context_cycle_diagnostics',
+            'candidate_identity_merges', 'candidate_column_alignments')) else 'no_pending_alignment',
         'conflict_isolation': {
             k: v for k, v in (merged.get('conflict_isolation') or {}).items()
             if k not in {'node_ids', 'edge_ids'}
@@ -478,6 +484,9 @@ def publish_premerged_graph(
     write_yaml(root_construction / 'merge-alignment-candidates.yaml', {
         'candidate_identity_merges': merged.get('candidate_identity_merges', []),
         'candidate_column_alignments': merged.get('candidate_column_alignments', []),
+        'definition_conflicts': merged.get('definition_conflicts', []),
+        'unresolved_relations': merged.get('unresolved_relations', []),
+        'context_cycle_diagnostics': merged.get('context_cycle_diagnostics', []),
     })
     return merge_summary
 

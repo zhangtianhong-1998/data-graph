@@ -6,6 +6,28 @@ from pydantic import Field, field_validator, model_validator
 from lightgraph.contracts import StrictModel, canonical
 
 
+class BusinessContextMapping(StrictModel):
+    """Declared applicability of a fact, independent of access and provenance."""
+    status: Literal['unknown', 'global', 'scoped'] = 'unknown'
+    columns: dict[str, str] = Field(default_factory=dict, max_length=32,
+        description='Semantic dimension/role to authorized physical column, e.g. owning_project: PROJECT_ID. Never infer from a column name.')
+    values: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=32,
+        description='Explicitly declared constant applicability dimensions; these are not observed source values.')
+
+    @model_validator(mode='after')
+    def coherent_context(self):
+        if set(self.columns) & set(self.values):
+            raise ValueError('business_context_source_conflict')
+        if any(not name.strip() for name in (*self.columns, *self.values)) or any(
+                not column.strip() for column in self.columns.values()):
+            raise ValueError('invalid_business_context_dimension')
+        if self.status == 'scoped' and not (self.columns or self.values):
+            raise ValueError('scoped_business_context_requires_dimensions')
+        if self.status != 'scoped' and (self.columns or self.values):
+            raise ValueError('business_context_dimensions_require_scoped_status')
+        return self
+
+
 class SourceMapping(StrictModel):
     source_id: str = Field(min_length=1)
     table: str = Field(min_length=1)
@@ -17,6 +39,8 @@ class SourceMapping(StrictModel):
         description='Agent-declared mapping annotations, such as the observed slot or endpoint positions. Not identity keys or source-verified values.')
     context_columns: list[str] = Field(default_factory=list, max_length=32,
         description='Authorized columns that identify a source-row context shared across mappings. Retained on each support, never added to entity identity. Use the same column set for related mappings.')
+    business_context: BusinessContextMapping = Field(default_factory=BusinessContextMapping,
+        description='Business applicability of each observed fact, separate from context_columns (row provenance) and access scopes. Omission means unknown, never global.')
 
     @model_validator(mode='after')
     def unambiguous_property_sources(self):
@@ -79,6 +103,14 @@ class EntityDefinition(StrictModel):
     type: str = Field(min_length=1, max_length=100)
     description: str = Field(default="", max_length=4000)
     key_names: list[str] = Field(min_length=1, max_length=32)
+    identity_scope: Literal['unknown', 'global', 'scoped'] = Field(default='unknown',
+        description='Whether the complete key identifies a globally shared object or an object within explicit business dimensions. Global requires an evidence-backed identity_domain, never same-name or same-code guessing. Unknown preserves legacy identities without asserting global uniqueness.')
+    identity_domain: str | None = Field(default=None, min_length=1, max_length=200,
+        description='Evidence-backed code system or shared identity authority. A source table or matching spelling alone does not prove a shared business domain.')
+    identity_evidence_refs: list[str] = Field(default_factory=list, max_length=128,
+        description='Issued evidence supporting the declared identity domain and grain; global identity requires at least one reference.')
+    identity_context_keys: list[str] = Field(default_factory=list, max_length=32,
+        description='For scoped identities, the subset of key_names defining the business identity boundary, e.g. project in [project, code]. These must already be present in every mapping key_columns and relation endpoint key.')
     mappings: list[EntityMapping | MetadataColumnMapping] = Field(min_length=1, max_length=128)
     display_mode: Literal['auto', 'identity', 'relations'] = Field(default='auto',
         description='For objects without a source label: derive from visible relations or the complete identity. Explicit source labels always take precedence.')
@@ -87,12 +119,24 @@ class EntityDefinition(StrictModel):
     def consistent_key_arity(self):
         if len(set(self.key_names)) != len(self.key_names):
             raise ValueError("duplicate_identity_key_name")
+        if len(set(self.identity_context_keys)) != len(self.identity_context_keys):
+            raise ValueError('duplicate_identity_context_key')
+        if not set(self.identity_context_keys) <= set(self.key_names):
+            raise ValueError('identity_context_key_not_in_identity')
+        if (self.identity_scope == 'scoped') != bool(self.identity_context_keys):
+            raise ValueError('scoped_identity_requires_context_keys')
+        if self.identity_scope == 'global' and (not self.identity_domain or not self.identity_evidence_refs):
+            raise ValueError('global_identity_requires_domain_evidence')
+        if self.identity_domain is not None and not self.identity_domain.strip():
+            raise ValueError('invalid_identity_domain')
         metadata = [isinstance(m, MetadataColumnMapping) for m in self.mappings]
         if any(metadata):
             if not all(metadata):
                 raise ValueError('mixed_entity_identity_origins')
             if self.key_names != COLUMN_IDENTITY_NAMES:
                 raise ValueError('metadata_column_identity_required')
+            if self.identity_domain or self.identity_scope != 'unknown':
+                raise ValueError('metadata_column_business_identity_forbidden')
             return self
         if any(len(m.key_columns) != len(self.key_names) for m in self.mappings):
             raise ValueError("entity_key_arity_mismatch")
@@ -307,5 +351,6 @@ class DraftRecord(StrictModel):
 
 
 def draft_evidence_refs(draft: GraphDraft) -> set[str]:
-    return set(draft.evidence_refs).union(*(set(getattr(mapping, 'evidence_refs', []))
+    return set(draft.evidence_refs).union(*(set(entity.identity_evidence_refs) for entity in draft.entities),
+        *(set(getattr(mapping, 'evidence_refs', []))
         for mapping in iter_source_mappings(draft)))

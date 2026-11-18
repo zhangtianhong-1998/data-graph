@@ -42,11 +42,14 @@ def test_unrelated_row_collision_with_inherited_base_keeps_both_identities():
 def test_merge_does_not_drop_incompatible_identity_definitions():
     regional = _graph('采购应付')
     regional['definitions']['entities'][0]['key_names'] = ['region', 'code']
-    with pytest.raises(LightGraphError, match='published_definition_conflict'):
-        merge_construction_graphs([
-            {'kind': 'unit', 'contributor_id': 'ledger', 'graph': _graph('采购应付')},
-            {'kind': 'unit', 'contributor_id': 'billing', 'graph': regional},
-        ])
+    regional['nodes'][0]['identity']['region'] = 'north'
+    merged = merge_construction_graphs([
+        {'kind': 'unit', 'contributor_id': 'ledger', 'graph': _graph('采购应付')},
+        {'kind': 'unit', 'contributor_id': 'billing', 'graph': regional},
+    ])
+    assert len(merged['nodes']) == len(merged['definitions']['entities']) == 2
+    assert merged['definition_conflicts'][0]['status'] == 'unresolved'
+    assert merged['conflict_isolation']['nodes'] == 0
 
 
 def test_independent_outputs_keep_conflicting_type_definitions_and_physical_columns():

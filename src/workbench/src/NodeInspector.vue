@@ -90,9 +90,10 @@ const endpointName = (id: unknown) => {
   return node ? nodeCaption(node) : '节点名称尚未加载'
 }
 
-const factTitle = (fact: FactItem) => fact.fact_kind === 'PropertyValue' ? propertyName(String(fact.payload.name || '')) : fact.fact_kind === 'Edge' ? relationName(fact.payload.relation) : '对象存在'
+const factTitle = (fact: FactItem) => fact.fact_kind === 'PropertyValue' ? propertyName(String(fact.payload.name || '')) : fact.fact_kind === 'Edge' ? relationName(fact.payload.relation) : fact.fact_kind === 'UnresolvedRelation' ? '待确认关系' : '对象存在'
 const visibleQualifiers = (value: unknown) => Object.fromEntries(Object.entries((value || {}) as Record<string, unknown>).filter(([key]) => !['semantic_basis', 'document_ref', 'source_group'].includes(key)))
-const factValues = (fact: FactItem) => fact.fact_kind === 'PropertyValue' ? { [String(fact.payload.name)]: fact.payload.value } : fact.fact_kind === 'Edge' ? visibleQualifiers(fact.payload.qualifiers) : { kind: kindName(fact.payload.kind) }
+const contextValues = (value: unknown) => { const c = value as { status?: string; dimensions?: Record<string, unknown> } | undefined; return !c || c.status === 'unknown' ? { '适用范围': '尚未确认' } : c.status === 'global' ? { '适用范围': '通用知识' } : { '适用范围': c.dimensions } }
+const factValues = (fact: FactItem) => fact.fact_kind === 'PropertyValue' ? { [String(fact.payload.name)]: fact.payload.value, ...contextValues(fact.payload.business_context) } : fact.fact_kind === 'Edge' ? { ...visibleQualifiers(fact.payload.qualifiers), ...contextValues(fact.payload.business_context) } : fact.fact_kind === 'UnresolvedRelation' ? { '状态': '端点尚未确认', '候选端点': fact.payload.candidate_endpoints, '观察': fact.payload.observations } : { kind: kindName(fact.payload.kind) }
 const sourceSummary = (rule: Record<string, unknown>) => Object.fromEntries(Object.entries((rule.source || {}) as Record<string, unknown>).filter(([, value]) => value != null && value !== ''))
 const lookupValues = (match: Record<string, unknown>) => ({
   '关联端点': match.endpoint === 'source' ? '关系起点' : '关系终点',
@@ -187,10 +188,10 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
           </div>
           <PropertyTable :values="{ 值: attr.values }" />
           <details v-if="attr.observations?.length" class="attr-origin">
-            <summary>逐值查看来源（{{ attr.observations.length }} 条观察）</summary>
+            <summary>逐值查看适用范围与来源（{{ attr.observations.length }} 条观察）</summary>
             <article v-for="(obs, index) in attr.observations" :key="index" class="support-detail">
               <PropertyTable :values="{ '值': obs.value, '来源': [obs.source_id, obs.qualified_table, obs.column].filter(Boolean).join(' · '), ...(obs.original_property ? { '原属性': obs.original_property } : {}), ...(obs.raw_value !== undefined ? { '原值': obs.raw_value } : {}), ...(obs.scope_ref ? { '可见范围': obs.scope_ref } : {}), ...(obs.evidence_refs?.length ? { '证据引用': obs.evidence_refs } : {}) }"/>
-              <template v-if="obs.row_context?.values"><strong>同一行的上下文</strong><PropertyTable :values="obs.row_context.values"/></template>
+              <PropertyTable :values="contextValues(obs.business_context)"/><template v-if="obs.row_context?.values"><strong>同一行的上下文</strong><PropertyTable :values="obs.row_context.values"/></template>
             </article>
           </details>
           <div v-else-if="attr.origin_tables.length" class="muted small-text attr-origin">

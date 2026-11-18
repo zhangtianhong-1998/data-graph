@@ -1567,7 +1567,7 @@ def read_graph_consistently(workspace, pid, reader, **options):
     return result
 
 
-def read_graph(workspace, pid, layer="business", *, include_candidates=False,offset=0,limit=240,q='',kind='',focus='',hops=1,traversal='all',config=None):
+def read_graph(workspace, pid, layer="business", *, include_candidates=False,offset=0,limit=240,q='',kind='',focus='',hops=1,traversal='all',config=None,business_context=None):
     """Publication heads, not stale graph.json exports, determine current results."""
     from ..store import GraphStore
     if layer == "metadata":
@@ -1576,7 +1576,9 @@ def read_graph(workspace, pid, layer="business", *, include_candidates=False,off
     from . import construction_graph
     if construction_graph.available(config):
         return construction_graph.graph_page(config, layer=layer, offset=offset, limit=limit,
-            q=q, kind=kind, focus=focus, hops=hops, traversal=traversal, include_candidates=include_candidates)
+            q=q, kind=kind, focus=focus, hops=hops, traversal=traversal, include_candidates=include_candidates, business_context=business_context)
+    if business_context is not None:
+        return {**_bounded_view({}, layer), "include_candidates": include_candidates, "business_context": business_context}
     path = Path(config.output_dir) / "graph.sqlite"
     if path.is_symlink():
         raise LightGraphError("workspace_path_invalid")
@@ -1598,7 +1600,7 @@ def read_graph(workspace, pid, layer="business", *, include_candidates=False,off
     return result
 
 
-def read_graph_details(workspace, pid, *, entity_id=None, fact_id=None, include_candidates=False, offset=0, config=None):
+def read_graph_details(workspace, pid, *, entity_id=None, fact_id=None, include_candidates=False, offset=0, config=None, business_context=None):
     """Return bounded fact-level provenance only after support authorization."""
     from ..store import GraphStore
     if bool(entity_id) == bool(fact_id) or offset < 0:
@@ -1607,7 +1609,9 @@ def read_graph_details(workspace, pid, *, entity_id=None, fact_id=None, include_
     from . import construction_graph
     if construction_graph.available(config):
         return construction_graph.graph_details(config, entity_id=entity_id, fact_id=fact_id,
-            offset=offset, include_candidates=include_candidates)
+            offset=offset, include_candidates=include_candidates, business_context=business_context)
+    if business_context is not None:
+        raise LightGraphError("graph_item_not_found")
     path = Path(config.output_dir) / "graph.sqlite"
     if path.is_symlink():
         raise LightGraphError("workspace_path_invalid")

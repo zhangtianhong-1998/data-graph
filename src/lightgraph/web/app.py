@@ -8,6 +8,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from pathlib import Path
 import os
+import json
 import uuid
 import re
 from typing import Literal
@@ -122,6 +123,7 @@ class ResumeRun(InputModel):
 
 class RetrieveSubgraphRequest(InputModel):
     query: str = Field(min_length=1, max_length=4000)
+    business_context: dict | None = None
     top_n: int = Field(default=20, ge=1, le=100)
     top_p_seeds: int = Field(default=4, ge=1, le=20)
     hops: int = Field(default=2, ge=1, le=2)
@@ -776,12 +778,29 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             workspace.require_config_revision(pid, if_match)
             return graph_history.migrate_version(workspace, pid, version, data)
 
+    def parse_business_context(value):
+        from lightgraph.construction.contexts import normalize_context_selection
+        if value is None:
+            return None
+        try:
+            if len(value) > 8192:
+                raise ValueError()
+            return normalize_context_selection(json.loads(value))
+        except (ValueError, TypeError):
+            raise LightGraphError('business_context_invalid') from None
+
+    @app.get('/api/projects/{pid}/graph/contexts')
+    def graph_contexts(pid: str, version: str | None = None, offset: int = 0, limit: int = 200):
+        return graph_history.read_consistently(workspace, pid, graph_history.read_contexts,
+                                              version=version, offset=offset, limit=limit)
+
     @app.get('/api/projects/{pid}/graph')
-    def graph(pid:str,layer:str='business',include_candidates:bool=False,offset:int=0,limit:int=240,q:str='',kind:str='',focus:str='',hops:int=1,traversal:str='all',version:str|None=None):
+    def graph(pid:str,layer:str='business',include_candidates:bool=False,offset:int=0,limit:int=240,q:str='',kind:str='',focus:str='',hops:int=1,traversal:str='all',version:str|None=None,business_context:str|None=None):
         if layer not in ('business','metadata'):raise LightGraphError('graph_layer_invalid')
         if hops not in (1,2) or traversal not in ('all','chains'):raise LightGraphError('graph_page_invalid')
         selection = dict(layer=layer, include_candidates=include_candidates, offset=offset, limit=limit,
-                         q=q, kind=kind, focus=focus, hops=hops, traversal=traversal)
+                         q=q, kind=kind, focus=focus, hops=hops, traversal=traversal,
+                         business_context=parse_business_context(business_context))
         if version is not None:
             return graph_history.read_consistently(workspace, pid, graph_history.read_page, version=version, **selection)
         reader = graph_history.read_consistently if layer == 'business' else read_graph_consistently
@@ -789,18 +808,20 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
 
     @app.get('/api/projects/{pid}/graph/batches')
     def graph_batches(pid:str,layer:str='business',part:str='nodes',offset:int=0,limit:int=1000,
-                      generation:str='',include_candidates:bool=False,focus:str='',hops:int=2,traversal:str='chains',version:str|None=None):
+                      generation:str='',include_candidates:bool=False,focus:str='',hops:int=2,traversal:str='chains',version:str|None=None,business_context:str|None=None):
         from .graph_batches import read_graph_batch
         selection = dict(layer=layer, part=part, offset=offset, limit=limit, generation=generation,
-                         include_candidates=include_candidates, focus=focus, hops=hops, traversal=traversal)
+                         include_candidates=include_candidates, focus=focus, hops=hops, traversal=traversal,
+                         business_context=parse_business_context(business_context))
         if version is not None:
             return graph_history.read_consistently(workspace, pid, graph_history.read_batch, version=version, **selection)
         reader = graph_history.read_consistently if layer == 'business' else read_graph_consistently
         return reader(workspace, pid, read_graph_batch, **selection)
 
     @app.get('/api/projects/{pid}/graph/details')
-    def graph_details(pid:str,entity_id:str|None=None,fact_id:str|None=None,include_candidates:bool=False,offset:int=0,version:str|None=None):
-        selection = dict(entity_id=entity_id, fact_id=fact_id, include_candidates=include_candidates, offset=offset)
+    def graph_details(pid:str,entity_id:str|None=None,fact_id:str|None=None,include_candidates:bool=False,offset:int=0,version:str|None=None,business_context:str|None=None):
+        selection = dict(entity_id=entity_id, fact_id=fact_id, include_candidates=include_candidates, offset=offset,
+                         business_context=parse_business_context(business_context))
         if version is not None:
             return graph_history.read_consistently(workspace, pid, graph_history.read_details, version=version, **selection)
         return graph_history.read_consistently(workspace, pid, read_graph_details, **selection)
@@ -995,6 +1016,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             retriever, _ = project_retriever(config, embedding_api_key=emb_key)
             return retriever.retrieve(
                 data.query,
+                business_context=data.business_context,
                 scopes=list(config.scopes),
                 top_n=data.top_n,
                 top_p_seeds=data.top_p_seeds,

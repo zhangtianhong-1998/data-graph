@@ -556,13 +556,22 @@ class GraphWorkspace:
 def _merge_graphs(graphs, *, fusion_policy=None):
     """Combine independently checked subgraphs without silently replacing facts."""
     from lightgraph.source_values import persisted_identity_key
-    from .fusion import merge_definition, deduplicate_supports, stamp_execution
+    from .fusion import (merge_definition, deduplicate_supports, stamp_execution,
+                         retain_definition_variants, definition_conflict_diagnostics)
+    # A noisy independent draft keeps its own definition and facts. Never mutate
+    # the validated publication, whose digest remains part of the audit trail.
+    graphs = [deepcopy(graph) for graph in graphs]
+    retain_definition_variants(graphs, self_contained=[False] * len(graphs))
     result = {'format_version': 1, 'target': 'graph', 'status': 'published',
               **({'extends_base_graph': True} if any(g.get('extends_base_graph') for g in graphs) else {}),
               'semantic_origin': 'agent_authored', 'definitions': {'entities': [], 'relations': []},
               'nodes': [], 'edges': [], 'evidence_refs': []}
     definitions = {category: {} for category in ('entities', 'relations')}
     items = {category: {} for category in ('nodes', 'edges')}
+    retained_global_labels = not fusion_policy and any(
+        definition.get('identity_scope') == 'global' and definition.get('identity_domain')
+        and definition.get('identity_evidence_refs')
+        for graph in graphs for definition in graph.get('definitions', {}).get('entities', []))
     key_versions = {graph.get('source_key_semantics', 'legacy_scalar_v1') for graph in graphs}
     if len(key_versions) > 1:
         raise LightGraphError('published_graph_key_semantics_conflict')
@@ -597,11 +606,10 @@ def _merge_graphs(graphs, *, fusion_policy=None):
         for category in items:
             for item in graph.get(category, []):
                 if fusion_policy:
-                    item = deepcopy(item)
                     stamp_execution(item, graph)
                 previous = items[category].get(item['id'])
                 if previous is None:
-                    items[category][item['id']] = item if fusion_policy else deepcopy(item)
+                    items[category][item['id']] = item
                     continue
                 fixed = ('type',) if category == 'nodes' else ('type', 'source', 'target')
                 if (any(previous.get(key) != item.get(key) for key in fixed)
@@ -618,7 +626,16 @@ def _merge_graphs(graphs, *, fusion_policy=None):
                     if 'supports' not in previous or 'supports' not in item:
                         if previous.get('label') != item.get('label'):
                             raise LightGraphError('published_graph_identity_conflict')
-                    elif not fusion_policy or fusion_policy.label_conflict_policy != 'retain_variants':
+                    else:
+                        contract = definitions['entities'].get(item['type'], {})
+                        default_global = (not fusion_policy and contract.get('identity_scope') == 'global'
+                            and item.get('identity_domain')
+                            and contract.get('identity_domain') == item['identity_domain']
+                            and contract.get('identity_evidence_refs'))
+                        retained_global_labels = retained_global_labels or bool(default_global)
+                        reject_labels = not default_global and (not fusion_policy
+                            or fusion_policy.label_conflict_policy != 'retain_variants')
+                    if 'supports' in previous and 'supports' in item and reject_labels:
                         labels = {}
                         for support in previous['supports'] + item['supports']:
                             label = support.get('label')
@@ -638,12 +655,18 @@ def _merge_graphs(graphs, *, fusion_policy=None):
                     for value in values:
                         if canonical(value) not in {canonical(v) for v in merged}:
                             merged.append(deepcopy(value))
-    result['definitions'] = {key: list(value.values()) for key, value in definitions.items()}
+    result['definitions'] = {key: [value[name] for name in sorted(value)] for key, value in definitions.items()}
     result.update({key: sorted(value.values(), key=lambda item: item['id']) for key, value in items.items()})
+    result['definition_conflicts'] = definition_conflict_diagnostics(result)
+    pending = {canonical(item): item for graph in graphs for item in graph.get('unresolved_relations', [])}
+    result['unresolved_relations'] = [pending[key] for key in sorted(pending)]
     if fusion_policy:
         result['label_conflict_policy'] = fusion_policy.label_conflict_policy
         result['fusion_policy'] = fusion_policy.model_dump(mode='json')
         result['fusion_policy_digest'] = digest(result['fusion_policy'])
+    elif retained_global_labels:
+        result['label_conflict_policy'] = 'retain_variants'
+    if fusion_policy or retained_global_labels:
         for item in result['nodes'] + result['edges']:
             if 'supports' in item:
                 deduplicate_supports(item)
@@ -653,10 +676,19 @@ def _merge_graphs(graphs, *, fusion_policy=None):
             node['label'] = labels[0]
     # Separate valid drafts can form a cycle only after their edges are joined.
     # Check declared graph constraints before atomically advancing any head.
-    from .executor import _has_cycle
+    from .context_topology import detect_context_cycles
+    result['context_cycle_diagnostics'] = []
     for relation in result['definitions']['relations']:
-        if relation.get('acyclic') and _has_cycle({(edge['source'], edge['target'])
-                for edge in result['edges'] if edge['type'] == relation['type']}):
+        if not relation.get('acyclic'):
+            continue
+        edges = [edge for edge in result['edges'] if edge['type'] == relation['type']]
+        topology = detect_context_cycles(edges)
+        if not topology['complete']:
+            result['context_cycle_diagnostics'].append({'status': 'unresolved',
+                'reason': 'context_cycle_analysis_incomplete', 'relation': relation['type'],
+                'node_ids': sorted({edge[end] for edge in edges for end in ('source', 'target')}),
+                'edge_ids': sorted(edge['id'] for edge in edges)})
+        if topology['cycle_edge_ids']:
             raise LightGraphError('published_relation_cycle')
     from .display import derive_display_graph
     return derive_display_graph(result)

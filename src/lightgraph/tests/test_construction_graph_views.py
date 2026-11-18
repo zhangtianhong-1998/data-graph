@@ -203,3 +203,45 @@ def test_details_keep_same_row_context_and_mapping_position(data):
     assert result['rules'][0]['constant_properties'] == {'position': 'slot_b'}
     assert result['rules'][0]['context_columns'] == ['path_id', 'code']
     assert result['total_incident_edges'] == 1
+
+
+def test_unresolved_relation_is_inspectable_without_becoming_a_traversal_edge(data):
+    from lightgraph.construction.access import filter_graph_scopes
+    value = {'support_visibility_version': 1, 'nodes': [
+        {'id': nid, 'type': 'Item', 'supports': [{'scope_ref': 'public', 'label': nid}]} for nid in ('a', 'b')],
+        'edges': [], 'definitions': {'entities': [{'type': 'Item', 'key_names': ['code']}], 'relations': []},
+        'unresolved_relations': [{'id': 'pending', 'status': 'unresolved', 'reason': 'definition_endpoint_ambiguous',
+            'node_ids': ['a', 'b'], 'candidate_endpoints': {'source': ['a', 'b'], 'target': ['b']},
+            'original_endpoints': {'source': 'hidden_old_id'},
+            'supports': [{'scope_ref': 'public', 'properties': {'amount': [100]},
+                          'provenance': {'definition': 'uses', 'source': {'source_id': 'C', 'table': 't'}}},
+                         {'scope_ref': 'private', 'properties': {'secret': ['HIDDEN']}, 'provenance': {}}]}]}
+    config = SimpleNamespace(scopes=['public'])
+    graph = views.select_business_context(filter_graph_scopes(value, config.scopes), config, None)
+    graph['nodes'] = [{**node, 'kind': node['type']} for node in graph['nodes']]
+    page = views.graph_page(config, prepared_graph=graph, include_candidates=True)
+    assert not page['edges'] and page['pending_relation_count'] == 1
+    assert 'supports' not in page['unresolved_relations'][0]
+    detail = views.graph_details(config, prepared_graph=graph, fact_id='pending')
+    assert detail['facts'][0]['status'] == 'unresolved'
+    assert detail['facts'][0]['fact_kind'] == 'UnresolvedRelation'
+    assert detail['facts'][0]['payload']['observations'][0]['properties']['amount'] == [100]
+    assert all(support['status'] == 'unresolved' for support in detail['supports'])
+    assert 'HIDDEN' not in str(detail) and 'hidden_old_id' not in str(detail)
+
+
+def test_equal_fact_context_merges_citations_despite_different_physical_columns(data):
+    node = data['nodes'][0]
+    node['properties'] = {'amount': [100]}
+    node['supports'] = [{'scope_ref': 'public', 'properties': {'amount': [100]},
+        'business_context': {'version': 1, 'status': 'scoped', 'dimensions': {'project': 'M'},
+                             'value_types': {'project': 'text'}, 'observed_columns': {'project': column}},
+        'provenance': {'definition': 'Item', 'source': {'source_id': source, 'table': 'facts'}}}
+        for source, column in [('A', 'proj'), ('B', 'project_id')]]
+    detail = views.graph_details(SimpleNamespace(), entity_id=node['id'])
+    facts = [f for f in detail['facts'] if f['fact_kind'] == 'PropertyValue' and f['payload']['name'] == 'amount']
+    assert len(facts) == 1
+    assert facts[0]['payload']['business_context']['dimensions'] == {'project': 'M'}
+    supports = [s for s in detail['supports'] if s['fact_id'] == facts[0]['id']]
+    assert len(supports) == 2
+    assert {s['binding']['business_context']['observed_columns']['project'] for s in supports} == {'proj', 'project_id'}

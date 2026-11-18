@@ -1,5 +1,6 @@
 """Deterministic, explicit identity fusion and source-observation preservation."""
 from copy import deepcopy
+from collections import defaultdict
 import unicodedata
 
 from lightgraph.contracts import canonical, digest
@@ -25,15 +26,177 @@ def normalize_value(value, operations):
     return value
 
 
+def definition_contract(definition):
+    """Compare meaning independently of presentation and internal variant names."""
+    result = {k: deepcopy(v) for k, v in definition.items()
+              if k not in {'description', 'display_mode', 'original_type', 'definition_variant',
+                           'identity_evidence_refs'}}
+    result['type'] = definition.get('original_type', definition['type'])
+    if 'key_names' in result:
+        result.setdefault('identity_origin', 'row')
+        result.setdefault('identity_scope', 'unknown')
+        result.setdefault('identity_context_keys', [])
+        result.setdefault('identity_domain', None)
+    return result
+
+
+def relation_identity(edge):
+    """Retain business context when a definition or endpoint changes an edge ID."""
+    from .contexts import business_context_identity
+    context = business_context_identity(edge)
+    parts = [edge['type'], edge['source'], edge['target']]
+    if context.get('status') != 'unknown' or context.get('dimensions'):
+        parts.append(context)
+    return 'r_' + digest(*parts)
+
+
+def retain_definition_variants(graphs, *, self_contained=None):
+    """Keep incompatible contracts as stable local variants, preserving all facts.
+
+    Mutates private graph copies only. Compatibility is deliberately conservative:
+    a different key, scope, derivation or relation constraint needs alignment, not
+    a guessed winning definition. Compatible families retain their ordinary type.
+    """
+    self_contained = self_contained or [True] * len(graphs)
+    remaps = [{} for _ in graphs]
+    for category, item_key in (('entities', 'nodes'), ('relations', 'edges')):
+        families = defaultdict(set)
+        already_qualified = set()
+        name_owners = defaultdict(set)
+        previous_names = defaultdict(set)
+        for graph in graphs:
+            for definition in graph.get('definitions', {}).get(category, []):
+                contract = definition_contract(definition)
+                family = contract['type']
+                signature = digest(contract)
+                families[family].add(signature)
+                name_owners[definition['type']].add((family, signature))
+                if definition.get('definition_variant'):
+                    already_qualified.add(family)
+                    previous_names[(family, signature)].add(definition['type'])
+        variant_names = {}
+        for family, signatures in sorted(families.items()):
+            if len(signatures) < 2 and family not in already_qualified:
+                continue
+            for signature in sorted(signatures):
+                owner = (family, signature)
+                existing = sorted(name for name in previous_names[owner] if name_owners[name] == {owner})
+                name = existing[0] if existing else f'{family[:60]}__def_{signature[:32]}'
+                attempt = 0
+                while name_owners.get(name, {owner}) != {owner}:
+                    name = '__definition_' + digest('definition_namespace_v1', family, signature, attempt)
+                    attempt += 1
+                name_owners[name].add(owner)
+                variant_names[owner] = name
+        for index, graph in enumerate(graphs):
+            aliases = {}
+            for definition in graph.get('definitions', {}).get(category, []):
+                contract = definition_contract(definition)
+                family, signature = contract['type'], digest(contract)
+                if len(families[family]) < 2 and family not in already_qualified:
+                    continue
+                old_type = definition['type']
+                variant_type = variant_names[(family, signature)]
+                variant = {'version': 1, 'contract_digest': signature}
+                aliases[old_type] = (variant_type, family, variant)
+                definition.update(type=variant_type, original_type=family, definition_variant=variant)
+            for item in graph.get(item_key, []):
+                if item['type'] not in aliases:
+                    continue
+                previous_type = item['type']
+                previous_variant = item.get('definition_variant', {})
+                variant_type, family, variant = aliases[previous_type]
+                item.update(type=variant_type, original_type=family, definition_variant=deepcopy(variant))
+                if (category == 'entities' and previous_type != variant_type
+                        and previous_variant.get('contract_digest') != variant['contract_digest']):
+                    previous_id = item['id']
+                    original = item.get('unit_original_id', previous_id)
+                    variant_id = 'n_' + digest('definition_variant_v1', variant['contract_digest'], original)
+                    if item.get('unit_id') and 'unit_original_id' in item:
+                        item['unit_original_id'] = variant_id
+                        item['id'] = 'n_' + digest('unit_scoped', item['unit_id'], variant_id)
+                    else:
+                        item['id'] = variant_id
+                    remaps[index][previous_id] = item['id']
+                elif category == 'relations' and previous_type != variant_type:
+                    item['id'] = relation_identity(item)
+            for pending in graph.get('unresolved_relations', []):
+                if category == 'relations' and pending.get('type') in aliases:
+                    variant_type, family, variant = aliases[pending['type']]
+                    pending.update(type=variant_type, original_type=family, definition_variant=deepcopy(variant))
+                if category == 'entities':
+                    pending['candidate_endpoints'] = {
+                        key: sorted({remaps[index].get(nid, nid) for nid in values})
+                        for key, values in pending.get('candidate_endpoints', {}).items()}
+                    pending['node_ids'] = sorted({remaps[index].get(nid, nid) for nid in pending.get('node_ids', [])})
+            if category == 'entities':
+                for definition in graph.get('definitions', {}).get('relations', []):
+                    for endpoint in ('source_type', 'target_type'):
+                        if definition.get(endpoint) in aliases:
+                            definition[endpoint] = aliases[definition[endpoint]][0]
+                for edge in graph.get('edges', []):
+                    changed = False
+                    for endpoint in ('source', 'target'):
+                        previous = edge[endpoint]
+                        inherited = any(match.get('endpoint') == endpoint
+                                        and match.get('inherited_node_id') == previous
+                                        for support in edge.get('supports', [])
+                                        for match in support.get('lookup_matches', []))
+                        if previous in remaps[index] and (self_contained[index] or not inherited):
+                            edge[endpoint] = remaps[index][previous]
+                            changed = True
+                            for support in edge.get('supports', []):
+                                for match in support.get('lookup_matches', []):
+                                    if match.get('endpoint') == endpoint and match.get('inherited_node_id') == previous:
+                                        match['inherited_node_id'] = edge[endpoint]
+                    if changed:
+                        edge['id'] = relation_identity(edge)
+    for graph in graphs:
+        for edge in graph.get('edges', []):
+            if edge.get('business_context'):
+                edge['id'] = relation_identity(edge)
+    return remaps
+
+
+def definition_conflict_diagnostics(graph):
+    """Describe unresolved definition families using final, access-filterable IDs."""
+    result = []
+    for category, item_key in (('entities', 'nodes'), ('relations', 'edges')):
+        families = defaultdict(set)
+        for definition in graph.get('definitions', {}).get(category, []):
+            if definition.get('definition_variant'):
+                families[definition['original_type']].add(definition['type'])
+        for family, variants in sorted(families.items()):
+            if len(variants) < 2:
+                continue
+            affected = [item for item in graph.get(item_key, []) if item['type'] in variants]
+            node_ids = ({item['id'] for item in affected} if category == 'entities'
+                        else {item[end] for item in affected for end in ('source', 'target')})
+            edge_ids = ({edge['id'] for edge in graph.get('edges', [])
+                         if edge['source'] in node_ids or edge['target'] in node_ids}
+                        if category == 'entities' else {item['id'] for item in affected})
+            result.append({'status': 'unresolved', 'reason': 'incompatible_definition_contracts',
+                           'category': category, 'original_type': family,
+                           'definition_ids': sorted(variants), 'node_ids': sorted(node_ids),
+                           'edge_ids': sorted(edge_ids)})
+    return result
+
+
 def merge_definition(previous, incoming):
     """Only identity/relationship contracts block; display text is not identity."""
     if previous is None:
-        return deepcopy(incoming)
-    presentation = {'description', 'display_mode'}
-    if ({k: v for k, v in previous.items() if k not in presentation}
-            != {k: v for k, v in incoming.items() if k not in presentation}):
+        result = deepcopy(incoming)
+        if 'key_names' in result:
+            for name, default in (('identity_origin', 'row'), ('identity_scope', 'unknown'),
+                                  ('identity_context_keys', []), ('identity_domain', None)):
+                result.setdefault(name, default)
+        return result
+    if definition_contract(previous) != definition_contract(incoming):
         raise LightGraphError('published_definition_conflict')
     result = deepcopy(previous)
+    if 'identity_evidence_refs' in previous or 'identity_evidence_refs' in incoming:
+        result['identity_evidence_refs'] = sorted(set(previous.get('identity_evidence_refs', []))
+                                                  | set(incoming.get('identity_evidence_refs', [])))
     descriptions = sorted({d.get('description', '') for d in (previous, incoming)} - {''})
     if descriptions:
         result['description'] = descriptions[0]
@@ -90,7 +253,7 @@ def prepare_graph(graph, policy, *, copy=True):
     original_key_names = {d['type']: list(d['key_names']) for d in result.get('definitions', {}).get('entities', [])}
 
     def prepared(item, keys):
-        if 'identity_domain' not in item:
+        if not item.get('identity_domain') or not (result.get('fusion_policy_version') or previous):
             return False
         expected = canonical_rules.get(item['type'])
         if expected is not None and (item['identity_domain'] != expected.identity_domain
@@ -106,6 +269,11 @@ def prepare_graph(graph, policy, *, copy=True):
             continue
         if definition.get('identity_origin', 'row') != 'row':
             raise LightGraphError('fusion_physical_identity_forbidden')
+        if definition.get('identity_domain') not in (None, rule.identity_domain):
+            raise LightGraphError('fusion_identity_domain_conflict')
+        if definition.get('identity_context_keys'):
+            key_aliases = {source: target for target, source in rule.key_mapping.items()}
+            definition['identity_context_keys'] = [key_aliases[key] for key in definition['identity_context_keys']]
         definition.update(type=rule.canonical_type, key_names=sorted(rule.key_mapping), identity_domain=rule.identity_domain)
     for definition in result.get('definitions', {}).get('relations', []):
         for end in ('source_type', 'target_type'):
@@ -119,6 +287,8 @@ def prepare_graph(graph, policy, *, copy=True):
             continue
         if node.get('identity_origin', 'row') != 'row':
             raise LightGraphError('fusion_physical_identity_forbidden')
+        if node.get('identity_domain') not in (None, rule.identity_domain):
+            raise LightGraphError('fusion_identity_domain_conflict')
         original = {key: deepcopy(node[key]) for key in ('id', 'type', 'identity', 'identity_types') if key in node}
         if any(value is None for value in original['identity'].values()):
             raise LightGraphError('fusion_missing_identity_value')
@@ -160,7 +330,7 @@ def prepare_graph(graph, policy, *, copy=True):
         if old[0] != old[1] and edge['source'] == edge['target'] and not relations.get(edge['type'], {}).get('allow_self_links'):
             raise LightGraphError('self_link_forbidden')
         if old != (edge['source'], edge['target']):
-            edge['id'] = 'r_' + digest(edge['type'], edge['source'], edge['target'])
+            edge['id'] = relation_identity(edge)
         for support in edge.get('supports', []):
             if old != (edge['source'], edge['target']):
                 support.setdefault('endpoint_origins', []).append({'edge_id': old_edge_id,

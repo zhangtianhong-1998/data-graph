@@ -2,7 +2,7 @@ import { ApiError, projectPath } from './api'
 import { readGraph } from './graphRead'
 import { mergeDisplaySchema } from './graphLabels'
 import { edgeKey } from './graphScene'
-import type { Graph, GraphEdge, GraphNode } from './types'
+import type { Graph, GraphEdge, GraphNode, BusinessContext } from './types'
 
 type Batch = Graph & { part: 'nodes' | 'edges'; offset: number; next_offset: number | null; generation: string; matched_nodes: number; matched_edges: number }
 export type GraphTransfer = { part: 'nodes' | 'edges'; offset: number; generation: string; version?: string; complete: boolean; nodes: Map<string, GraphNode>; edges: Map<string, GraphEdge>; graph: Graph }
@@ -12,11 +12,12 @@ export function newGraphTransfer(): GraphTransfer {
 
 /** A cursor advances only after an accepted page. Pausing keeps that cursor;
  * resuming rechecks its publication and authorization on the server. */
-export async function transferGraph(projectId: string, selection: { layer: string; version?: string; includeCandidates?: boolean; focus?: string; hops?: number; traversal?: string }, state: GraphTransfer, signal: AbortSignal, onPage: (graph: Graph) => void) {
+export async function transferGraph(projectId: string, selection: { layer: string; version?: string; businessContext?: BusinessContext | null; includeCandidates?: boolean; focus?: string; hops?: number; traversal?: string }, state: GraphTransfer, signal: AbortSignal, onPage: (graph: Graph) => void) {
   if (state.version && selection.version && state.version !== selection.version) throw new ApiError('graph_generation_changed')
   while (!state.complete) {
     if (signal.aborted) throw new ApiError('request_cancelled')
     const params = new URLSearchParams({ layer: selection.layer, include_candidates: String(selection.includeCandidates === true), part: state.part, offset: String(state.offset), limit: '1000', generation: state.generation, focus: selection.focus || '', hops: String(selection.hops ?? 2), traversal: selection.traversal ?? 'chains' })
+    if (selection.businessContext != null && selection.layer === 'business') params.set('business_context', JSON.stringify(selection.businessContext))
     if (state.version || selection.version) params.set('version', state.version || selection.version!)
     const page = await readGraph<Batch>(`${projectPath(projectId)}/graph/batches?${params}`, signal)
     if (signal.aborted) throw new ApiError('request_cancelled')

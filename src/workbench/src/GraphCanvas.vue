@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { request, projectPath } from './api'
-import type { Graph, GraphNode, GraphEdge } from './types'
+import type { Graph, GraphNode, GraphEdge, BusinessContext } from './types'
 import { fitCamera, zoomCamera } from './graphViewport'
 import { wrapGraphLabel } from './graphLabelLayout'
 import { mergeScene, placeNodes, sceneBounds, hitNode } from './graphScene'
@@ -17,9 +17,10 @@ import { mergeDisplaySchema, metadataRelationValues, nodeCaption, nodeIdentity, 
 import type { DisplaySchema, MetadataEndpoint } from './graphLabels'
 import type { StandardNode } from './types'
 
-const props = defineProps<{ graph: Graph; layer: string; loading?: boolean; projectId?: string; includeCandidates?: boolean; configRevision?: string | number; version?: string }>()
+const props = defineProps<{ graph: Graph; layer: string; loading?: boolean; projectId?: string; includeCandidates?: boolean; configRevision?: string | number; version?: string; businessContext?: BusinessContext | null }>()
 const snapshotVersion = computed(() => props.layer === 'business' ? props.version || (typeof props.graph.version_id === 'string' ? props.graph.version_id : '') : '')
 function graphUrl(endpoint: string, params: URLSearchParams) {
+  if (props.businessContext != null && props.layer === 'business') params.set('business_context', JSON.stringify(props.businessContext))
   if (snapshotVersion.value) params.set('version', snapshotVersion.value)
   return `${projectPath(props.projectId!)}/${endpoint}?${params}`
 }
@@ -46,7 +47,7 @@ async function loadFullGraph(restart = false) {
   if (restart || !fullTransfer) fullTransfer = newGraphTransfer()
   fullLoading.value = true; fullPaused.value = false; fullError.value = ''
   try {
-    await transferGraph(props.projectId, { layer: props.layer, version: snapshotVersion.value, includeCandidates: props.includeCandidates }, fullTransfer, fullController.signal, value => {
+    await transferGraph(props.projectId, { layer: props.layer, version: snapshotVersion.value, businessContext: props.businessContext, includeCandidates: props.includeCandidates }, fullTransfer, fullController.signal, value => {
       if (epoch === fullEpoch) remote.value = value
     })
     if (epoch === fullEpoch && !neighborhood.value && !cameraTouched) { await nextTick(); fit() }
@@ -129,9 +130,10 @@ const endpointName = (id: unknown) => {
   const node = graph.value.nodes.find(item => item.id === key) || detailNodes.value[key]
   return node ? nodeCaption(node) : '节点名称尚未加载'
 }
-const factTitle = (fact: Provenance['facts'][number]) => fact.fact_kind === 'PropertyValue' ? propertyName(String(fact.payload.name || '')) : fact.fact_kind === 'Edge' ? relationName(fact.payload.relation) : '对象存在'
+const factTitle = (fact: Provenance['facts'][number]) => fact.fact_kind === 'PropertyValue' ? propertyName(String(fact.payload.name || '')) : fact.fact_kind === 'Edge' ? relationName(fact.payload.relation) : fact.fact_kind === 'UnresolvedRelation' ? '待确认关系' : '对象存在'
 const visibleQualifiers = (value: unknown) => Object.fromEntries(Object.entries((value || {}) as Record<string, unknown>).filter(([key]) => !['semantic_basis', 'document_ref', 'source_group'].includes(key)))
-const factValues = (fact: Provenance['facts'][number]) => fact.fact_kind === 'PropertyValue' ? { [String(fact.payload.name)]: fact.payload.value } : fact.fact_kind === 'Edge' ? visibleQualifiers(fact.payload.qualifiers) : { kind: kindName(fact.payload.kind) }
+const contextValues = (value: unknown) => { const c = value as { status?: string; dimensions?: Record<string, unknown> } | undefined; return !c || c.status === 'unknown' ? { '适用范围': '尚未确认' } : c.status === 'global' ? { '适用范围': '通用知识' } : { '适用范围': c.dimensions } }
+const factValues = (fact: Provenance['facts'][number]) => fact.fact_kind === 'PropertyValue' ? { [String(fact.payload.name)]: fact.payload.value, ...contextValues(fact.payload.business_context) } : fact.fact_kind === 'Edge' ? { ...visibleQualifiers(fact.payload.qualifiers), ...contextValues(fact.payload.business_context) } : fact.fact_kind === 'UnresolvedRelation' ? { '状态': '端点尚未确认', '候选端点': fact.payload.candidate_endpoints, '观察': fact.payload.observations } : { kind: kindName(fact.payload.kind) }
 const sourceSummary = (rule: Record<string, unknown>) => Object.fromEntries(Object.entries((rule.source || {}) as Record<string, unknown>).filter(([, value]) => value != null && value !== ''))
 const lookupValues = (match: Record<string, unknown>) => ({ '关联端点': match.endpoint === 'source' ? '关系起点' : '关系终点', '匹配来源': match.source, '本行字段': match.input_columns, '本行取值': match.input_values, '目标匹配字段': match.match_columns, '目标身份字段': match.key_columns, '匹配后的身份': match.resolved_key, '可见范围': match.scope_ref })
 const mappingValues = (rule: Record<string, unknown>) => Object.fromEntries(['identity_columns', 'namespace_columns', 'attribute_columns', 'hierarchy_columns', 'reference_columns', 'concept_columns', 'source_columns', 'scope_columns', 'label_column', 'constant_properties', 'context_columns', 'endpoint_lookups'].filter(key => rule[key] && (typeof rule[key] === 'string' || Object.keys(rule[key] as object).length)).map(key => [key, rule[key]]))
@@ -212,7 +214,7 @@ async function showTwoHops(node: GraphNode, traversal: NeighborhoodTraversal = n
     const value = complete || !props.projectId
       ? preview
       : fullTransport.value
-        ? await transferGraph(props.projectId, { layer: props.layer, version: snapshotVersion.value, includeCandidates: props.includeCandidates, focus: node.id, hops: 2, traversal }, newGraphTransfer(), sceneController.signal, value => {
+        ? await transferGraph(props.projectId, { layer: props.layer, version: snapshotVersion.value, businessContext: props.businessContext, includeCandidates: props.includeCandidates, focus: node.id, hops: 2, traversal }, newGraphTransfer(), sceneController.signal, value => {
             if (epoch !== pageGeneration) return
             const center = value.nodes.find(item => item.id === node.id) || node
             neighborhood.value = { center, graph: value, traversal, preview: value.fully_loaded !== true }
@@ -403,7 +405,7 @@ function paint() {
   ctx.globalAlpha = 1
 }
 watch([bitmap, positions, zoom, offset, viewport, selected, selectedEdge, search, selectedKind], paint, { flush: 'post' })
-watch([() => props.graph, () => props.layer, () => props.projectId, () => props.includeCandidates, snapshotVersion], () => {
+watch([() => props.graph, () => props.layer, () => props.projectId, () => props.includeCandidates, () => props.businessContext, snapshotVersion], () => {
   fullEpoch++; fullController?.abort(); fullTransfer = undefined; fullLoading.value = false; fullPaused.value = false; fullError.value = ''; cameraTouched = false
   pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); neighborhood.value = null; savedScene = null; remote.value = null; pageLoading.value = false; positions.value = placeNodes({ ...props.graph, nodes: props.graph.nodes })
   search.value = ''; searchMatches.value = null; searchMatchCount.value = null; selectedKind.value = ''; expansionOffsets.value.clear(); clearSelection(); reset()

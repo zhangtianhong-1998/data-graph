@@ -1,10 +1,12 @@
 """Resolve inherited relation endpoints against the supports of a frozen graph."""
 from collections import defaultdict
+from copy import deepcopy
 from itertools import product
 
-from lightgraph.contracts import canonical
+from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
 from lightgraph.source_values import identity_cell, scalar_cell, scalar_kind, typed_key
+from .contexts import support_business_context, intersect_business_contexts
 
 
 def inherited_keys(graph):
@@ -58,7 +60,7 @@ class InheritedEndpoints:
             self.nodes[node['type']].append(node)
         self.indexes = {}
 
-    def resolve(self, kind, lookup, columns, values, end, *, clock, charge):
+    def resolve(self, kind, lookup, columns, values, end, *, clock, charge, business_context=None):
         keys = self.keys.get(kind)
         if not keys:
             raise LightGraphError('inherited_entity_type_missing')
@@ -72,30 +74,44 @@ class InheritedEndpoints:
                     # Names and properties from different supports cannot form a
                     # composite match. Preserve the access conditions of this witness.
                     required = tuple(sorted({support['scope_ref'], *support.get('required_scope_refs', [])}))
+                    witness = (node['id'], digest(support))
                     for cells in product(*(_cells(node, support, name) for name in match)):
                         clock()
                         token = canonical(cells)
-                        witness = (node['id'], support['scope_ref'], required)
+                        # Same node and permission can still have different names,
+                        # contexts and source observations. Keep each actual witness.
                         if witness not in index[token]:
-                            charge(len(token.encode()) + len(canonical(witness).encode()) + 32)
-                            index[token][witness] = node
+                            charge(len(token.encode()) + len(canonical(witness).encode()) + 192)
+                            index[token][witness] = (node, support, required)
             self.indexes[index_key] = index
         matched = self.indexes[index_key].get(typed_key(values), {})
         if not matched:
             if lookup and lookup.on_missing == 'omit':
                 return []
             raise LightGraphError('lookup_reference_unmatched' if lookup else 'unresolved_relation_endpoint')
+        compatible = {key: value for key, value in matched.items()
+                      if intersect_business_contexts(business_context or {}, support_business_context(value[1])) is not None}
+        if not compatible:
+            if lookup and lookup.on_missing == 'omit':
+                return []
+            raise LightGraphError('inherited_lookup_context_unmatched')
+        matched = compatible
         if (lookup is None or lookup.cardinality == 'one') and len({w[0] for w in matched}) > 1:
             raise LightGraphError('lookup_reference_ambiguous')
         results = []
-        for (nid, scope, required), node in matched.items():
+        for (nid, _), (node, support, required) in matched.items():
             key = [node['identity'][name] for name in keys]
+            provenance = support.get('provenance', {})
+            refs = sorted(set(support.get('evidence_refs', [])) | set(provenance.get('evidence_refs', [])))
             results.append((key, {
                 'endpoint': end, 'source': {'source_id': '__base_graph__', 'schema': 'inherited', 'table': kind},
                 'match_columns': list(match), 'key_columns': keys, 'input_columns': columns,
                 'input_values': values, 'resolved_key': key,
                 'input_value_types': [scalar_kind(value) for value in values],
                 'resolved_key_types': [identity_cell(node, name)[0] for name in keys],
-                'scope_ref': scope, 'required_scope_refs': list(required), 'inherited_node_id': nid,
+                'scope_ref': support['scope_ref'], 'required_scope_refs': list(required), 'inherited_node_id': nid,
+                'business_context': support_business_context(support), 'evidence_refs': refs,
+                **{name: deepcopy(support[name]) for name in ('row_context', 'observation_id') if name in support},
+                **({'provenance': deepcopy(provenance)} if provenance else {}),
             }))
         return results

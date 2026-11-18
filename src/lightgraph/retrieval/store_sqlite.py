@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Sequence
 import unicodedata
+from lightgraph.contracts import canonical
 
 
 def normalize_term(value: Any) -> str:
@@ -49,6 +50,7 @@ class SQLiteGraphIndex:
                     description TEXT,
                     source_tables_json TEXT NOT NULL,
                     scopes_json TEXT NOT NULL,
+                    observations_json TEXT NOT NULL,
                     PRIMARY KEY (node_id, scope_ref)
                 );
                 CREATE TABLE IF NOT EXISTS kg_node_terms (
@@ -72,6 +74,7 @@ class SQLiteGraphIndex:
                     scopes_json TEXT NOT NULL,
                     evidence_refs_json TEXT NOT NULL,
                     source_tables_json TEXT NOT NULL,
+                    observations_json TEXT NOT NULL,
                     PRIMARY KEY (edge_id, scope_ref)
                 );
                 CREATE INDEX IF NOT EXISTS idx_terms_norm_scope ON kg_node_terms(term_norm, scope_ref);
@@ -104,12 +107,12 @@ class SQLiteGraphIndex:
                 )
                 conn.executemany(
                     'INSERT INTO kg_node_scope_views (node_id, scope_ref, chinese_name, english_name, '
-                    'display_name, aliases_json, description, source_tables_json, scopes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    'display_name, aliases_json, description, source_tables_json, scopes_json, observations_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     [
                         (v['node_id'], v['scope_ref'], v.get('chinese_name'), v.get('english_name'),
                          v['display_name'], json.dumps(v.get('aliases', []), ensure_ascii=False),
                          v.get('description'), json.dumps(v.get('source_tables', []), ensure_ascii=False),
-                         json.dumps(v['scopes'], ensure_ascii=False))
+                         json.dumps(v['scopes'], ensure_ascii=False), json.dumps(v.get('observations', []), ensure_ascii=False))
                         for v in scope_views
                     ],
                 )
@@ -124,13 +127,14 @@ class SQLiteGraphIndex:
                 )
                 conn.executemany(
                     'INSERT INTO kg_edges (edge_id, scope_ref, src_id, dst_id, rel_type, weight, qualifiers_json, '
-                    'scopes_json, evidence_refs_json, source_tables_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    'scopes_json, evidence_refs_json, source_tables_json, observations_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     [
                         (e['edge_id'], e['scope_ref'], e['src_id'], e['dst_id'], e['rel_type'], float(e.get('weight', 1.0)),
                          json.dumps(e.get('qualifiers', {}), ensure_ascii=False),
                          json.dumps(e.get('scopes', []), ensure_ascii=False),
                          json.dumps(e.get('evidence_refs', []), ensure_ascii=False),
-                         json.dumps(e.get('source_tables', []), ensure_ascii=False))
+                         json.dumps(e.get('source_tables', []), ensure_ascii=False),
+                         json.dumps(e.get('observations', []), ensure_ascii=False))
                         for e in edges
                     ],
                 )
@@ -235,7 +239,7 @@ class SQLiteGraphIndex:
                 ids,
             ).fetchall()
             view_rows = conn.execute(
-                f'SELECT node_id, scope_ref, chinese_name, english_name, display_name, aliases_json, description, source_tables_json, scopes_json '
+                f'SELECT node_id, scope_ref, chinese_name, english_name, display_name, aliases_json, description, source_tables_json, scopes_json, observations_json '
                 f'FROM kg_node_scope_views WHERE node_id IN ({id_ph}) AND scope_ref IN ({sc_ph})',
                 [*ids, *scope_list],
             ).fetchall()
@@ -255,6 +259,7 @@ class SQLiteGraphIndex:
             aliases = sorted({a for v in vlist for a in json.loads(v['aliases_json'])})
             descs = sorted({v['description'] for v in vlist if v['description']})
             src_tables = sorted({t for v in vlist for t in json.loads(v['source_tables_json'])})
+            observations = {canonical(item): item for view in vlist for item in json.loads(view['observations_json'])}
             result[nid] = {
                 'id': nid,
                 'kind': b['kind'],
@@ -267,6 +272,7 @@ class SQLiteGraphIndex:
                 'description': '；'.join(descs) if descs else None,
                 'source_tables': src_tables,
                 'scopes': sorted({scope for view in vlist for scope in json.loads(view['scopes_json'])}),
+                'observations': [observations[key] for key in sorted(observations)],
             }
         return result
 
@@ -373,15 +379,18 @@ class SQLiteGraphIndex:
                     retained_endpoints.update(new_ids)
                     qualifiers = defaultdict(list)
                     refs, tables = set(), set()
+                    observations = {}
                     for record in chain((row,), versions):
                         refs.update(json.loads(record['evidence_refs_json']))
                         tables.update(json.loads(record['source_tables_json']))
+                        observations.update({canonical(item): item for item in json.loads(record['observations_json'])})
                         for key, values in json.loads(record['qualifiers_json']).items():
                             for value in values:
                                 if value not in qualifiers[key]:
                                     qualifiers[key].append(value)
                     candidate_edges.append({**dict(row), 'evidence_refs': refs,
-                                            'source_tables': tables, 'qualifiers': dict(qualifiers)})
+                                            'source_tables': tables, 'qualifiers': dict(qualifiers),
+                                            'observations': [observations[key] for key in sorted(observations)]})
                 fetched = self.load_authorized_nodes(retained_endpoints - set(nodes), scopes=scope_list)
                 for row in candidate_edges:
                     src, dst = row['src_id'], row['dst_id']
@@ -402,6 +411,7 @@ class SQLiteGraphIndex:
                             'qualifiers': row['qualifiers'],
                             'evidence_refs': sorted(row['evidence_refs']),
                             'source_tables': sorted(row['source_tables']),
+                            'observations': row['observations'],
                         }
                 frontier = sorted(next_frontier_candidates)
 

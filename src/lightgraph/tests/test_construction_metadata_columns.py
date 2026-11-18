@@ -298,12 +298,15 @@ def test_publication_never_merges_column_identity_with_coincidental_row_values()
         catalog_graph = execute_draft(column_draft(), [source], [table])['graph']
         row_graph = execute_draft(row, [rows], [rows_table])['graph']
         assert catalog_graph['nodes'][0]['id'] == row_graph['nodes'][0]['id']
-        with pytest.raises(LightGraphError, match='published_definition_conflict'):
-            _merge_graphs([catalog_graph, row_graph])
+        combined = _merge_graphs([catalog_graph, row_graph])
+        assert len(combined['nodes']) == 2
+        assert len(combined['definitions']['entities']) == 2
+        assert combined['definition_conflicts'][0]['status'] == 'unresolved'
         # Historical graphs with no origin still mean row values.
         row_graph['definitions']['entities'][0].pop('identity_origin')
-        with pytest.raises(LightGraphError, match='published_definition_conflict'):
-            _merge_graphs([row_graph, catalog_graph])
+        historical = _merge_graphs([row_graph, catalog_graph])
+        assert len(historical['nodes']) == 2
+        assert {n['id'] for n in historical['nodes']} == {n['id'] for n in combined['nodes']}
         assert len(_merge_graphs([row_graph, deepcopy(row_graph)])['nodes']) == 1
         enriched = column_draft(); enriched['entities'][0]['mappings'][0].update(label='同期季度累计')
         declared_graph = execute_draft(enriched, [source], [table])['graph']

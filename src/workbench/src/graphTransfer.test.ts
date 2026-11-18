@@ -29,6 +29,11 @@ describe('full graph transport', () => {
     await transferGraph('p', { layer: 'business', version: 'v_old' }, newGraphTransfer(), new AbortController().signal, () => {})
     expect(api.request.mock.calls.every(call => new URL(call[0], 'http://local').searchParams.get('version') === 'v_old')).toBe(true)
   })
+  it('keeps the business context on every node and edge batch', async () => {
+    api.request.mockImplementation(async path => page(path))
+    await transferGraph('p', { layer: 'business', businessContext: { project: 'M' } }, newGraphTransfer(), new AbortController().signal, () => {})
+    expect(api.request.mock.calls.every(call => JSON.parse(new URL(call[0], 'http://local').searchParams.get('business_context')!)?.project === 'M')).toBe(true)
+  })
   it('pause aborts outstanding reads and resumes at the first unaccepted batch', async () => {
     const controller = new AbortController(), state = newGraphTransfer()
     api.request.mockImplementation(async path => page(path))

@@ -347,9 +347,8 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     const budget = root.querySelector<HTMLInputElement>('#inspector-merge-0-calls')!
     budget.value = '17'
     budget.dispatchEvent(new Event('input', { bubbles: true }))
-    const conflict = root.querySelector<HTMLSelectElement>('#merge-conflict-mode')!
-    conflict.value = 'strict'
-    conflict.dispatchEvent(new Event('change', { bubbles: true }))
+    expect(root.querySelector('#merge-conflict-mode')).toBeNull()
+    expect(root.querySelector('#merge-shared-types')).toBeNull()
     await nextTick()
 
     button('保存工作流配置').click()
@@ -365,7 +364,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(config.workflow?.merge_nodes?.[0]?.merge_mode).toBe('merge_and_extract')
     expect(config.workflow?.merge_nodes?.[0]).toMatchObject({
       max_calls: 17, document_ids: ['files/f_1_doc_ab.md'], source_table_overrides: { db1: ['dm.table_b', 'dm.table_c'] },
-      merge_policy: { conflict_mode: 'strict' },
+      merge_policy: null,
     })
     expect(config.workflow?.merge_policy.conflict_mode).toBe('quarantine')
     expect(config.workflow?.edges?.map(e => [e.source, e.target])).toEqual([

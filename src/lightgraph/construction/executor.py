@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import time
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
 from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 from datetime import datetime, timezone
 
 from lightgraph.contracts import canonical, digest
@@ -20,6 +21,9 @@ from .models import GraphDraft, draft_evidence_refs
 from .access import scope_binding_map, support_scope
 from .display import derive_display_graph
 from .accumulation import GraphAccumulator
+from .contexts import (materialize_business_context, identity_business_context, business_context_identity,
+                       intersect_business_contexts)
+from .context_topology import detect_context_cycles
 from .metadata_columns import (is_metadata_mapping, physical_column_key, metadata_endpoint,
                                mapping_predicate, checked_column, column_node, merge_column_supports)
 
@@ -31,7 +35,8 @@ def _projection_columns(mapping):
         return list(dict.fromkeys(mapping.match_columns + mapping.key_columns))
     keys = (mapping.key_columns if hasattr(mapping, 'key_columns') else
             mapping.source_key_columns + mapping.target_key_columns)
-    columns = list(keys) + list(mapping.properties.values()) + mapping.context_columns
+    columns = (list(keys) + list(mapping.properties.values()) + mapping.context_columns
+               + list(mapping.business_context.columns.values()))
     if hasattr(mapping, 'alias_columns'):
         columns += mapping.alias_columns
         columns += list(mapping.display_columns.values())
@@ -45,26 +50,6 @@ def _projection_columns(mapping):
 
 
 projection_columns = _projection_columns
-
-
-def _has_cycle(pairs):
-    outgoing = defaultdict(set)
-    incoming = defaultdict(int)
-    for source, target in pairs:
-        if target not in outgoing[source]:
-            outgoing[source].add(target)
-            incoming[target] += 1
-        incoming.setdefault(source, 0)
-    ready = deque(node for node, count in incoming.items() if not count)
-    visited = 0
-    while ready:
-        node = ready.popleft()
-        visited += 1
-        for target in outgoing[node]:
-            incoming[target] -= 1
-            if not incoming[target]:
-                ready.append(target)
-    return visited != len(incoming)
 
 
 @reuse_validation_sessions
@@ -85,7 +70,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     allowed = {(t.source_id, t.schema_name, t.name): t for t in tables}
     by_source = {t.source_id: adapter for adapter in adapters for t in adapter.describe()}
     inherited = InheritedEndpoints(base_graph if draft.extends_base_graph else None)
-    local_types = {definition.type for definition in draft.entities}
+    local_definitions = {definition.type: definition for definition in draft.entities}
+    local_types = set(local_definitions)
     nodes, edges, diagnostics = {}, {}, []
     checked, projected_rows, omitted = 0, 0, 0
     deadline = time.monotonic() + max_seconds
@@ -503,6 +489,9 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         return rows
 
     def identity(kind, key):
+        definition = local_definitions.get(kind)
+        if definition is not None and definition.identity_domain:
+            return 'n_' + digest('identity_domain_v1', definition.identity_domain, kind, identity_values(key))
         return 'n_' + digest(kind, identity_values(key))
 
     def key_for(row, columns):
@@ -516,7 +505,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         lookup_bytes += size
         check_memory('lookup_index')
 
-    def resolve_endpoint(mapping, row, end, kind):
+    def resolve_endpoint(mapping, row, end, kind, *, business_context=None):
         """Resolve only matches for this input row; unrelated sets never combine."""
         nonlocal lookup_bytes, lookup_matches, lookup_omitted
         column = getattr(mapping, end + '_metadata')
@@ -528,7 +517,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         if ((lookup is not None and lookup.source_id == '__base_graph__') or
                 (lookup is None and kind not in local_types)):
             answers = inherited.resolve(kind, lookup, columns, key_for(row, columns), end,
-                                        clock=clock, charge=charge_lookup)
+                                        clock=clock, charge=charge_lookup, business_context=business_context)
             lookup_matches += len(answers)
             lookup_omitted += int(not answers)
             return answers
@@ -581,7 +570,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                 **({'predicate': mapping.predicate} if mapping.predicate else {}),
                 **({'property_columns': dict(mapping.properties)} if mapping.properties else {}),
                 **({'constant_properties': mapping.constant_properties} if mapping.constant_properties else {}),
-                **({'context_columns': mapping.context_columns} if mapping.context_columns else {})}
+                **({'context_columns': mapping.context_columns} if mapping.context_columns else {}),
+                'business_context_mapping': mapping.business_context.model_dump(mode='json')}
         if getattr(mapping, 'alias_columns', None):
             info['alias_columns'] = list(mapping.alias_columns)
         if getattr(mapping, 'english_name_column', None):
@@ -590,9 +580,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             info['description_column'] = mapping.description_column
         return info
 
-    def contribution(mapping, row, origin):
+    def contribution(mapping, row, origin, *, identity_context=None):
         support = {'scope_ref': support_scope(row, scope_columns(mapping)),
-                   'provenance': origin, 'properties': {}}
+                   'provenance': origin, 'properties': {},
+                   'business_context': materialize_business_context(mapping, row, identity_context=identity_context)}
         properties(support, mapping, row)
         if mapping.context_columns:
             # A stable content key links projections of the same authorized row
@@ -637,7 +628,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             if value is not None:
                 accumulation.append(item, 'properties', value, property_name=name)
 
-    definitions = {'entities': [{**e.model_dump(mode='json', exclude={'mappings'}),
+    definitions = {'entities': [{**e.model_dump(mode='json', exclude={'mappings'}, exclude_none=True),
                     'identity_origin': 'physical_column' if is_metadata_mapping(e.mappings[0]) else 'row'}
                     for e in draft.entities],
                    'relations': [r.model_dump(mode='json', exclude={'mappings'}) for r in draft.relations]}
@@ -659,6 +650,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                     clock()
                     if is_metadata_mapping(mapping):
                         node = column_node(entity, index, mapping, allowed, goal)
+                        for item_support in node.get('supports', []):
+                            if entity.identity_evidence_refs:
+                                item_support['evidence_refs'] = sorted(set(item_support.get('evidence_refs', []))
+                                                                       | set(entity.identity_evidence_refs))
                         previous_node = nodes.get(node['id'])
                         if previous_node is not None:
                             previous_size = len(canonical(previous_node).encode())
@@ -691,18 +686,29 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                         clock()
                         key = key_for(row, mapping.key_columns)
                         node_id = identity(entity.type, key)
+                        identity_context = identity_business_context(entity, dict(zip(entity.key_names, key)),
+                                                                     dict(zip(entity.key_names, map(scalar_kind, key))))
                         label = row[mapping.label_column] if mapping.label_column else None
                         if label == '':
                             label = None
-                        current_support = contribution(mapping, row, support)
+                        try:
+                            current_support = contribution(mapping, row, support, identity_context=identity_context)
+                        except LightGraphError as exc:
+                            error_diagnostic(exc, node_id=node_id, **location)
+                            continue
+                        if entity.identity_evidence_refs:
+                            current_support['evidence_refs'] = sorted(set(entity.identity_evidence_refs))
                         node = nodes.get(node_id)
                         if node is None:
                             node = nodes[node_id] = {'id': node_id, 'type': entity.type,
                                 'label': str(label) if label is not None else '',
                                 'label_observed': label is not None,
                                 'identity': dict(zip(entity.key_names, key)),
+                                'identity_context': identity_context,
                                 'identity_types': dict(zip(entity.key_names, map(scalar_kind, key))), 'aliases': [],
                                 'properties': {}, 'provenance': [], 'supports': []}
+                            if entity.identity_domain:
+                                node['identity_domain'] = entity.identity_domain
                             accumulation.register(node)
                         if label is not None:
                             if label_conflict_policy != 'retain_variants' and accumulation.label_conflicts(node_id, current_support['scope_ref'], str(label)):
@@ -736,7 +742,6 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             if goal is not None and goal.relation_kinds and relation.type not in goal.relation_kinds:
                 diagnostic('outside_relation_goal', relation_type=relation.type)
                 continue
-            pairs = set()
             for index, mapping in enumerate(relation.mappings):
                 location = {'relation_type': relation.type, 'mapping': index, 'source_id': mapping.source_id}
                 try:
@@ -766,17 +771,44 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                             'non_null_observed': mapping.metadata_basis == 'observed_non_null'}
                     for row in rows:
                         clock()
-                        sources = resolve_endpoint(mapping, row, 'source', relation.source_type)
+                        row_support = contribution(mapping, row, support)
+                        sources = resolve_endpoint(mapping, row, 'source', relation.source_type,
+                                                   business_context=row_support['business_context'])
                         if not sources:
                             # Explicitly omitted input rows cannot produce
                             # a pair and must not fail on an unused target.
                             continue
-                        targets = resolve_endpoint(mapping, row, 'target', relation.target_type)
+                        targets = resolve_endpoint(mapping, row, 'target', relation.target_type,
+                                                   business_context=row_support['business_context'])
+                        compatible_context_pairs = 0
                         # Multiple matches are allowed only when the lookup
                         # explicitly declares many, and only for this row.
                         for source_key, source_match in sources:
                             for target_key, target_match in targets:
                                 clock()
+                                current_support = contribution(mapping, row, support)
+                                matches = [deepcopy(match) for match in (source_match, target_match) if match is not None]
+                                inherited_contexts = [match['business_context'] for match in matches
+                                                      if 'inherited_node_id' in match]
+                                if inherited_contexts:
+                                    context = intersect_business_contexts(current_support['business_context'], *inherited_contexts)
+                                    if context is None:
+                                        continue
+                                    current_support['declared_business_context'] = current_support['business_context']
+                                    current_support['business_context'] = context
+                                compatible_context_pairs += 1
+                                if matches:
+                                    current_support['lookup_matches'] = matches
+                                    current_support['required_scope_refs'] = sorted({scope for match in matches
+                                        for scope in (match['scope_ref'], *match.get('required_scope_refs', []))})
+                                    refs = sorted({ref for match in matches for ref in match.get('evidence_refs', [])})
+                                    if refs:
+                                        current_support['evidence_refs'] = refs
+                                    if 'row_context' not in current_support:
+                                        values = {c: row[c] for c in sorted(set(_projection_columns(mapping) + scope_columns(mapping)))}
+                                        current_support['row_context'] = {
+                                            'id': 'ctx_' + digest(support['source'], typed_value(values)), 'values': values,
+                                            'value_types': {name: scalar_kind(value) for name, value in values.items()}}
                                 base_source = (source_match or {}).get('inherited_node_id')
                                 base_target = (target_match or {}).get('inherited_node_id')
                                 source = base_source or identity(relation.source_type, source_key)
@@ -796,27 +828,21 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                     if mapping.equal_endpoints == 'error' or not relation.allow_self_links:
                                         diagnostic('self_link_forbidden', **location)
                                         continue
-                                pairs.add((source, target))
-                                edge_id = 'r_' + digest(relation.type, source, target)
+                                context_identity = business_context_identity(current_support)
+                                edge_id = ('r_' + digest(relation.type, source, target, context_identity)
+                                           if context_identity['status'] != 'unknown' or context_identity['dimensions']
+                                           else 'r_' + digest(relation.type, source, target))
                                 edge = edges.get(edge_id)
                                 if edge is None:
                                     edge = edges[edge_id] = {'id': edge_id, 'type': relation.type,
-                                        'source': source, 'target': target, 'properties': {}, 'provenance': [], 'supports': []}
+                                        'source': source, 'target': target, 'properties': {}, 'provenance': [], 'supports': [],
+                                        'business_context': current_support['business_context']}
                                     accumulation.register(edge)
                                 graph_properties(edge, mapping, row)
                                 accumulation.append(edge, 'provenance', support)
-                                current_support = contribution(mapping, row, support)
-                                matches = [match for match in (source_match, target_match) if match is not None]
-                                if matches:
-                                    current_support['lookup_matches'] = matches
-                                    current_support['required_scope_refs'] = sorted({scope for match in matches
-                                        for scope in (match['scope_ref'], *match.get('required_scope_refs', []))})
-                                    if 'row_context' not in current_support:
-                                        values = {c: row[c] for c in sorted(set(_projection_columns(mapping) + scope_columns(mapping)))}
-                                        current_support['row_context'] = {
-                                            'id': 'ctx_' + digest(support['source'], typed_value(values)), 'values': values,
-                                            'value_types': {name: scalar_kind(value) for name, value in values.items()}}
                                 accumulation.append(edge, 'supports', current_support)
+                        if targets and not compatible_context_pairs:
+                            diagnostic('inherited_lookup_context_conflict', **location)
                 except LightGraphError as exc:
                     failed_operation(exc)
                     if isinstance(exc, BudgetExceeded) or exc.code in {'memory_budget_exhausted', 'construction_time_exhausted', 'construction_cancelled',
@@ -827,8 +853,13 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                 finally:
                     rows = None
                     release_projection(mapping)
-            if relation.acyclic and _has_cycle(pairs):
-                diagnostic('relation_cycle', relation_type=relation.type)
+            if relation.acyclic:
+                cycle_check = detect_context_cycles([edge for edge in edges.values() if edge['type'] == relation.type], check=clock)
+                if cycle_check['cycle_edge_ids']:
+                    diagnostic('relation_cycle', relation_type=relation.type)
+                if not cycle_check['complete']:
+                    diagnostic('context_cycle_analysis_incomplete', relation_type=relation.type,
+                               reason=cycle_check['incomplete_reason'], explored_states=cycle_check['explored_states'])
     except LightGraphError as exc:
         error_diagnostic(exc)
         if exc.code in {'memory_budget_exhausted', 'construction_cancelled'}:

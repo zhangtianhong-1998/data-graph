@@ -16,6 +16,7 @@ from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.retention import atomic_text
 from lightgraph.construction.access import filter_graph_scopes
+from lightgraph.construction.contexts import business_context_identity
 from .store_sqlite import SQLiteGraphIndex, normalize_term
 from .vector_local import Embedder, LocalHashEmbedder, LocalNumpyVectorStore, embedder_fingerprint
 
@@ -73,6 +74,20 @@ def _edge_source_info(edge: dict[str, Any]) -> tuple[list[str], list[str], list[
     return sorted(scopes), sorted(refs), sorted(tables)
 
 
+def _observations(item):
+    """Keep each qualified assertion with its own values and supporting sources."""
+    result = []
+    for support in item.get('supports', []):
+        scopes, refs, tables = _edge_source_info({'supports': [support]})
+        result.append({'business_context': business_context_identity(support),
+                       'properties': support.get('properties', {}),
+                       'evidence_refs': refs, 'source_tables': tables, 'scopes': scopes,
+                       **{key: support[key] for key in ('observation_id', 'label', 'row_context', 'provenance',
+                           'execution_origins', 'lookup_matches', 'endpoint_origins', 'identity_origins',
+                           'inherited_from', 'contributor_id', 'required_scope_refs') if key in support}})
+    return result
+
+
 def active_index(root: Path, expected_generation: str | None = None) -> tuple[Path, dict]:
     """Pin a complete index build before reading any topology, terms or vectors."""
     try:
@@ -83,7 +98,9 @@ def active_index(root: Path, expected_generation: str | None = None) -> tuple[Pa
         path = root / 'builds' / build
         if not isinstance(manifest['cohorts'], dict) or not isinstance(manifest['embedder'], str):
             raise ValueError
-        if manifest['format'] != 2 or (expected_generation is not None and manifest['generation'] != expected_generation):
+        if manifest['format'] != 3 or (expected_generation is not None and manifest['generation'] != expected_generation):
+            raise ValueError
+        if not isinstance(manifest['cohort_contexts'], dict) or set(manifest['cohort_contexts']) != set(manifest['cohorts']):
             raise ValueError
         if not all((path / file).is_file() for file in ('retrieval.sqlite', 'vectors/vectors.npy', 'vectors/vectors_meta.sqlite')):
             raise ValueError
@@ -99,23 +116,39 @@ def sync_graph_to_retrieval(
     embedder: Embedder | None = None,
     generation: str | None = None,
 ) -> dict[str, Any]:
-    """Index nodes/edges per scope_ref so restricted aliases never bias public vector scores."""
+    """Index each permission/context slice before producing terms or embeddings.
+
+    Context is applicability, not authorization. The query independently selects
+    eligible slices on both axes before ranking and every graph traversal.
+    """
     root = Path(retrieval_dir)
     root.mkdir(parents=True, exist_ok=True)
     embedder = embedder or LocalHashEmbedder()
 
-    # Each support requires its primary scope AND all lookup scopes. Never turn
-    # that conjunction into a list of independent grants.
-    requirements = set()
+    if graph.get('support_visibility_version') != 1 and (graph.get('nodes') or graph.get('edges')):
+        raise LightGraphError('graph_support_visibility_missing')
+    # One exact slice per support keeps a shared entity's K-only names,
+    # descriptions, properties and edges out of its M embedding entirely.
+    # Permission conjunctions remain independent of business context values.
+    cohorts, cohort_contexts, cohort_graphs = {}, {}, {}
     for collection in ('nodes', 'edges'):
         for item in graph.get(collection, []):
+            grouped = defaultdict(list)
             for support in item.get('supports', []):
                 required = {support.get('scope_ref'), *support.get('required_scope_refs', [])}
                 if all(isinstance(scope, str) for scope in required):
-                    requirements.add(tuple(sorted(required)))
-    if graph.get('support_visibility_version') != 1 and (graph.get('nodes') or graph.get('edges')):
-        raise LightGraphError('graph_support_visibility_missing')
-    cohorts = {canonical(scopes): scopes for scopes in sorted(requirements)}
+                    context = business_context_identity(support)
+                    token = digest('retrieval-support-cohort-v1', sorted(required), context)
+                    cohorts[token] = sorted(required)
+                    cohort_contexts[token] = context
+                    grouped[token].append(support)
+            for token, supports in grouped.items():
+                shard = cohort_graphs.setdefault(token, {
+                    'nodes': [], 'edges': [], 'support_visibility_version': 1,
+                    'definitions': graph.get('definitions', {}),
+                    'label_conflict_policy': graph.get('label_conflict_policy'),
+                })
+                shard[collection].append({**item, 'supports': supports})
     node_rows = {}
     edge_rows = []
     endpoint_ids = {node['id'] for node in graph.get('nodes', [])}
@@ -124,7 +157,8 @@ def sync_graph_to_retrieval(
     vector_items: list[dict[str, Any]] = []
 
     for scope_ref, required_scopes in cohorts.items():
-        scoped_graph = filter_graph_scopes(graph, required_scopes, external_visible_ids=endpoint_ids)
+        scoped_graph = filter_graph_scopes(cohort_graphs[scope_ref], required_scopes,
+                                           external_visible_ids=endpoint_ids)
         scoped_nodes = {n['id']: n for n in scoped_graph['nodes']}
         neighbors_by_node: dict[str, list[str]] = defaultdict(list)
         for e in scoped_graph.get('edges', []):
@@ -134,6 +168,7 @@ def sync_graph_to_retrieval(
                 'edge_id': e['id'], 'scope_ref': scope_ref, 'src_id': e['source'], 'dst_id': e['target'],
                 'rel_type': rel, 'weight': 1.0, 'qualifiers': e.get('properties') or {},
                 'scopes': scopes, 'evidence_refs': refs, 'source_tables': tables,
+                'observations': _observations(e),
             })
             src_node = scoped_nodes.get(e['source'])
             dst_node = scoped_nodes.get(e['target'])
@@ -174,6 +209,7 @@ def sync_graph_to_retrieval(
                 'aliases': aliases,
                 'description': description,
                 'source_tables': src_tables,
+                'observations': _observations(node),
             })
 
             seen_terms: set[tuple[str, str, int]] = set()
@@ -250,10 +286,11 @@ def sync_graph_to_retrieval(
         nodes_indexed = len(node_rows)
         edges_indexed = len({row['edge_id'] for row in edge_rows})
         manifest = {
-            'format': 2,
+            'format': 3,
             'generation': gen_token,
             'build': build_id,
             'cohorts': cohorts,
+            'cohort_contexts': cohort_contexts,
             'embedder': model_tag,
             'embedder_model': embedder_model,
             'embedder_provider': embedder_provider,

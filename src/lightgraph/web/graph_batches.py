@@ -39,16 +39,22 @@ def _authorized_view(workspace, pid, config, layer, include_candidates):
 
 def read_graph_batch(workspace, pid, *, config, layer='business', part='nodes', offset=0,
                      limit=1000, generation='', include_candidates=False,
-                     focus='', hops=2, traversal='chains', prepared_view=None):
+                     focus='', hops=2, traversal='chains', prepared_view=None, business_context=None):
     if (layer not in ('business', 'metadata') or part not in ('nodes', 'edges')
             or offset < 0 or not 1 <= limit <= 1000 or hops not in (1, 2)
             or traversal not in ('all', 'chains')):
         raise LightGraphError('graph_page_invalid')
     graph, version = prepared_view if prepared_view is not None else _authorized_view(workspace, pid, config, layer, include_candidates)
+    if business_context is not None and layer == 'business':
+        from .construction_graph import select_business_context
+        if graph.get('support_visibility_version') == 1:
+            graph = select_business_context(graph, config, business_context)
+        else:
+            graph = {'nodes': [], 'edges': [], 'display_schema': {}}
     # Include access/selection even for legacy and empty views. A cursor from
     # another project, authorization or neighborhood must never be reusable.
     binding = pid if graph.get('version_id') else (str(Path(config.output_dir).resolve()), config.model_dump(mode='json'))
-    version = digest(version, binding, layer, include_candidates, focus, hops, traversal)
+    version = digest(version, binding, layer, include_candidates, focus, hops, traversal, business_context)
     if generation and generation != version:
         raise LightGraphError('graph_generation_changed')
     nodes, edges = graph['nodes'], graph['edges']
@@ -75,5 +81,5 @@ def read_graph_batch(workspace, pid, *, config, layer='business', part='nodes', 
             'focus_node_id': focus or None, 'focus_hops': hops, 'focus_traversal': traversal,
             'focus_neighbor_count': max(0, len(nodes) - 1) if focus else 0,
             'view_scope': 'neighborhood' if focus else 'full_graph',
-            'include_candidates': include_candidates,
+            'include_candidates': include_candidates, 'business_context': business_context,
             'truncated': True, 'edges_truncated': False}

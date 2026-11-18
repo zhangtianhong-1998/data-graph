@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 from lightgraph.contracts import canonical
+from .contexts import support_business_context, normalize_business_context
 
 _SOURCE_KIND_LABELS = {
     'gauss_database': 'GaussDB',
@@ -214,6 +215,7 @@ def standardize_node_details(
             attr_origins[attr_key][(source_id, tkey[1], tkey[2], col_name)] = origin
             value_origin = {**origin, 'value': entry['value'], 'raw_value': entry['raw_value'],
                             'original_property': entry['original_property'], 'scope_ref': support.get('scope_ref'),
+                            'business_context': support_business_context(support),
                             'evidence_refs': sorted(set(prov.get('evidence_refs', [])) | set(support.get('evidence_refs', [])))}
             for detail in ('observation_id', 'row_context', 'execution_origins'):
                 if detail in support:
@@ -271,6 +273,9 @@ def standardize_node_details(
         'aliases': list(node.get('aliases') or []),
         'identity': deepcopy(node.get('identity') or {}),
         'identity_types': deepcopy(node.get('identity_types') or {}),
+        'identity_context': normalize_business_context(node.get('identity_context')),
+        'business_contexts': sorted({canonical(support_business_context(s)): support_business_context(s)
+                                     for s in supports}.values(), key=canonical) or [normalize_business_context(None)],
         'business_description': business_description,
         'business_description_origin': business_description_origin,
         'catalog_metadata_notes': [catalog_notes_map[k] for k in sorted(catalog_notes_map)],

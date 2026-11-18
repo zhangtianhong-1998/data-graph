@@ -699,10 +699,6 @@ function updateWorkers(raw: string) {
   commit(next)
 }
 
-function updateSharedTypes(raw: string) {
-  updateMergePolicyField('shared_entity_types', raw.split(/[,，、\n]/).map(s => s.trim()).filter(Boolean))
-}
-
 const selectedMergePolicy = computed(() =>
   current.value.merge_nodes?.[selectedMergeIndex.value]?.merge_policy || current.value.merge_policy,
 )
@@ -712,19 +708,6 @@ const selectedFusion = computed<FusionPolicy>(() => {
   const project = props.projectFusion || { version: 1 as const, label_conflict_policy: 'retain_variants' as const, entity_rules: [] }
   return explicit || (policy.conflict_mode === 'strict' ? { ...project, label_conflict_policy: 'strict' } : project)
 })
-
-function toggleAuthoritySource(sourceId: string) {
-  const list = selectedMergePolicy.value.authority_sources || []
-  updateMergePolicyField('authority_sources', list.includes(sourceId) ? list.filter(s => s !== sourceId) : [...list, sourceId])
-}
-
-function updateMergePolicyField<K extends keyof MergePolicyConfig>(key: K, value: MergePolicyConfig[K]) {
-  const next = normalizeWorkflow(current.value)
-  const node = next.merge_nodes?.[selectedMergeIndex.value]
-  if (!node) return
-  node.merge_policy = { ...selectedMergePolicy.value, [key]: value }
-  commit(next)
-}
 
 // --- Inherited Base Graphs ---
 const selectedInheritProject = ref('')
@@ -1144,55 +1127,8 @@ const topologySummary = computed(() => {
             </template>
 
             <div class="unit-section">
-              <div class="unit-section-head">
-                <h3>本节点归并策略</h3>
-              </div>
-              <p class="field-hint">{{ current.merge_nodes[selectedMergeIndex]!.merge_policy ? '使用本节点独立配置。' : '当前继承全局策略，编辑后仅作用于本节点。' }}</p>
-              <FusionEditor :key="projectId + '/' + selectedId" :model-value="selectedFusion" :locked="locked" title="此节点的跨源实体合并规则" @update:model-value="updateMergePolicyField('fusion_policy', $event)"/>
-              <button v-if="current.merge_nodes[selectedMergeIndex]!.merge_policy" class="btn small" :disabled="locked" @click="updateMergeNodeField(selectedMergeIndex, 'merge_policy', null)">恢复继承全局策略</button>
-              <div class="field">
-                <label for="merge-shared-types">允许跨分支直并的实体类型</label>
-                <input
-                  id="merge-shared-types"
-                  :value="selectedMergePolicy.shared_entity_types.join(', ')"
-                  :disabled="locked"
-                  placeholder="逗号分隔，如 Customer, Contract"
-                  @change="updateSharedTypes(($event.target as HTMLInputElement).value)"
-                />
-              </div>
-              <div class="field">
-                <label for="merge-conflict-mode">冲突处理</label>
-                <select
-                  id="merge-conflict-mode"
-                  :value="selectedMergePolicy.conflict_mode"
-                  :disabled="locked"
-                  @change="updateMergePolicyField('conflict_mode', ($event.target as HTMLSelectElement).value as 'quarantine' | 'strict')"
-                >
-                  <option value="quarantine">隔离冲突与环路，保留可信证据</option>
-                  <option value="strict">发现跨分支冲突立即阻断</option>
-                </select>
-              </div>
-              <div v-if="sources.length" class="field">
-                <label>权威来源优先</label>
-                <label v-for="src in sources" :key="src.id" class="check-option compact">
-                  <input
-                    type="checkbox"
-                    :checked="selectedMergePolicy.authority_sources.includes(src.id)"
-                    :disabled="locked"
-                    @change="toggleAuthoritySource(src.id)"
-                  />
-                  <span>{{ src.id }}</span>
-                </label>
-              </div>
-              <label class="checkbox-line">
-                <input
-                  type="checkbox"
-                  :checked="selectedMergePolicy.emit_alignment_candidates"
-                  :disabled="locked"
-                  @change="updateMergePolicyField('emit_alignment_candidates', ($event.target as HTMLInputElement).checked)"
-                />
-                <span>输出跨分支待审对齐候选</span>
-              </label>
+              <FusionEditor :key="projectId + '/' + selectedId" :model-value="selectedFusion" :locked="locked"/>
+              <p v-if="current.merge_nodes[selectedMergeIndex]!.merge_policy" class="field-hint">此节点保留已有自定义策略。</p>
             </div>
           </div>
         </template>

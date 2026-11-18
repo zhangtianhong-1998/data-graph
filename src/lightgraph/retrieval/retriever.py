@@ -6,14 +6,154 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 from typing import Any, Callable, Sequence
+from itertools import combinations
 
+from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
+from lightgraph.construction.contexts import business_context_matches, normalize_context_selection, support_business_context
 from .sync import active_index
 from .store_sqlite import SQLiteGraphIndex, normalize_term
 from .vector_local import Embedder, LocalHashEmbedder, LocalNumpyVectorStore, embedder_fingerprint
 
 _SPLIT_RE = re.compile(r'[，,。；;、\s\?\!？！/\\|]+|(?:以及|并且|还有|或者|与|和|跟|及)')
 _NOISE_TOKENS = frozenset({'请问', '帮我', '查询', '看一下', '看看', '什么', '怎么', '如何', '有哪些', '为什么', '的', '了', '吗', '呢', '里', '中'})
+_PATH_STATE_LIMIT = 4096
+_PATH_STATE_BYTES = 2 * 1024 * 1024
+_PATH_OUTPUT_BYTES = 512 * 1024
+_PATH_WITNESS_ATTEMPTS = 4096
+
+
+def _join_contexts(left, right):
+    """A path must satisfy every observed qualifier, never just graph adjacency."""
+    dimensions = dict(left['dimensions'])
+    for name, value in right['dimensions'].items():
+        if name in dimensions and canonical(dimensions[name]) != canonical(value):
+            return None
+        dimensions[name] = value
+    status = ('unknown' if 'unknown' in (left['status'], right['status']) else
+              'scoped' if dimensions else 'global')
+    return {'status': status, 'dimensions': dict(sorted(dimensions.items()))}
+
+
+def _observation_groups(item):
+    groups = {}
+    for observation in item.get('observations') or [{}]:
+        context = support_business_context(observation)
+        context = {key: context[key] for key in ('status', 'dimensions')}
+        # Row witnesses are alternatives, not interchangeable votes for a
+        # business context. Keep them separate even when project/month agree.
+        key = canonical([context, observation.get('row_context'),
+                         (observation.get('provenance') or {}).get('source'),
+                         (observation.get('provenance') or {}).get('context_columns')])
+        groups.setdefault(key, (context, []))[1].append(observation)
+    return [groups[key] for key in sorted(groups)]
+
+
+def _row_witnesses(observations):
+    result = {}
+    for observation in observations:
+        row = observation.get('row_context') or {}
+        provenance = observation.get('provenance') or {}
+        source, columns = provenance.get('source') or {}, provenance.get('context_columns')
+        if (not row.get('id') or not source.get('source_id') or not source.get('table')
+                or not isinstance(columns, list) or not columns
+                or not all(isinstance(column, str) for column in columns)
+                or not isinstance(row.get('values'), dict) or not set(columns) <= set(row['values'])):
+            continue
+        # Compare only declared, identical source-row grains. A different
+        # table or a different column set is not evidence of a contradiction.
+        domain = canonical([source['source_id'], source.get('schema', 'public'), source['table'], sorted(columns)])
+        result[domain] = row['id']
+    return result
+
+
+def _join_rows(left, right):
+    if any(domain in left and left[domain] != row_id for domain, row_id in right.items()):
+        return None
+    return {**left, **right}
+
+
+def _context_paths(nodes, adjacency, seeds_by_slot, hops):
+    """Bounded alternate witness paths; different contexts remain distinct.
+
+    Neighborhood expansion supplies a union of individually visible facts. Only
+    compatible edge and endpoint observations can support a path assertion.
+    """
+    all_paths, hit_slots, truncated = {}, defaultdict(set), False
+    state_count, state_bytes, state_attempts = 0, 0, 0
+    for slot, seeds in seeds_by_slot.items():
+        if state_attempts >= _PATH_STATE_LIMIT:
+            truncated = True
+            break
+        routes, seen, queue = defaultdict(list), set(), deque()
+
+        def retain(node_id, context, rows, steps, visited):
+            nonlocal truncated, state_count, state_bytes, state_attempts
+            if state_attempts >= _PATH_STATE_LIMIT:
+                truncated = True
+                return
+            state_attempts += 1
+            # Store a fixed-size signature, never a second full copy of all
+            # observation payloads in the deduplication set.
+            serialized = canonical([node_id, context, rows, steps])
+            key = digest(serialized)
+            if key in seen:
+                return
+            size = len(serialized.encode('utf-8'))
+            if (state_count >= _PATH_STATE_LIMIT or state_bytes + size > _PATH_STATE_BYTES
+                    or len(routes[node_id]) >= 64):
+                truncated = True
+                return
+            state_count += 1
+            state_bytes += size
+            seen.add(key)
+            routes[node_id].append({'business_context': context, 'row_witnesses': rows, 'steps': steps})
+            hit_slots[node_id].add(slot)
+            queue.append((node_id, context, rows, steps, visited))
+
+        for sid in seeds:
+            if sid in nodes:
+                for context, observations in _observation_groups(nodes[sid]):
+                    retain(sid, context, _row_witnesses(observations), [], frozenset({sid}))
+        while queue and state_attempts < _PATH_STATE_LIMIT:
+            current, context, rows, steps, visited = queue.popleft()
+            if len(steps) >= hops:
+                continue
+            for edge in adjacency[current]:
+                if state_attempts >= _PATH_STATE_LIMIT:
+                    truncated = True
+                    break
+                target = edge['target'] if edge['source'] == current else edge['source']
+                if target in visited or target not in nodes:
+                    continue
+                for edge_context, observations in _observation_groups(edge):
+                    if state_attempts >= _PATH_STATE_LIMIT:
+                        truncated = True
+                        break
+                    joined = _join_contexts(context, edge_context)
+                    joined_rows = _join_rows(rows, _row_witnesses(observations))
+                    if joined is None or joined_rows is None:
+                        continue
+                    for target_context, target_observations in _observation_groups(nodes[target]):
+                        if state_attempts >= _PATH_STATE_LIMIT:
+                            truncated = True
+                            break
+                        applicable = _join_contexts(joined, target_context)
+                        applicable_rows = _join_rows(joined_rows, _row_witnesses(target_observations))
+                        if applicable is None or applicable_rows is None:
+                            continue
+                        refs = sorted({ref for observation in observations for ref in observation.get('evidence_refs', [])})
+                        tables = sorted({table for observation in observations for table in observation.get('source_tables', [])})
+                        step = {'edge_id': edge['id'], 'source': edge['source'], 'target': edge['target'],
+                                'relation': edge['relation'],
+                                'direction': 'outgoing' if edge['source'] == current else 'incoming',
+                                'business_context': edge_context, 'observations': observations,
+                                'evidence_refs': refs, 'source_tables': tables}
+                        retain(target, applicable, applicable_rows, steps + [step], visited | {target})
+        all_paths[slot] = dict(routes)
+        if queue:
+            truncated = True
+    return all_paths, hit_slots, truncated
 
 
 @dataclass(frozen=True)
@@ -114,6 +254,7 @@ class SubgraphRetriever:
                  expected_generation: str | None = None):
         self.root, manifest = active_index(Path(retrieval_dir), expected_generation)
         self.cohorts = manifest['cohorts']
+        self.cohort_contexts = manifest['cohort_contexts']
         self.generation = manifest['generation']
         self.vector_dim = int(manifest.get('vector_dim') or 0)
         self.index = SQLiteGraphIndex(self.root / 'retrieval.sqlite')
@@ -127,6 +268,7 @@ class SubgraphRetriever:
         query: str,
         *,
         scopes: Sequence[str] | set[str] = ('public',),
+        business_context: dict[str, Any] | None = None,
         top_n: int = 20,
         top_p_seeds: int = 4,
         hops: int = 2,
@@ -137,14 +279,18 @@ class SubgraphRetriever:
         extractor: Callable[[str], list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         scope_list = sorted({str(s) for s in scopes})
+        selection = normalize_context_selection(business_context)
         allowed = set(scope_list)
-        cohorts = [token for token, required in self.cohorts.items() if allowed.issuperset(required)]
+        cohorts = [token for token, required in self.cohorts.items()
+                   if allowed.issuperset(required) and business_context_matches(
+                       {'business_context': self.cohort_contexts[token]}, selection)]
         known_terms = self.index.authorized_terms(cohorts)
         slots = decompose_query(query, known_terms=known_terms, extractor=extractor)
         if not slots:
             return {
                 'query': query,
                 'scopes': scope_list,
+                'business_context': selection,
                 'slots': [],
                 'nodes': [],
                 'edges': [],
@@ -234,53 +380,73 @@ class SubgraphRetriever:
             adj[e['source']].append(e)
             adj[e['target']].append(e)
 
-        slot_reach_paths: dict[str, dict[str, list[dict[str, Any]]]] = {}
-        node_hit_slots: dict[str, set[str]] = defaultdict(set)
+        slot_routes, node_hit_slots, path_truncated = _context_paths(nodes_map, adj, seeds_by_slot, hops)
 
-        for slot_name, slot_seeds in seeds_by_slot.items():
-            visited_paths: dict[str, list[dict[str, Any]]] = {}
-            q = deque()
-            for sid in slot_seeds:
-                if sid in nodes_map and sid not in visited_paths:
-                    visited_paths[sid] = []
-                    node_hit_slots[sid].add(slot_name)
-                    q.append((sid, 0))
-            while q:
-                cur, depth = q.popleft()
-                if depth >= hops:
-                    continue
-                for e in adj[cur]:
-                    nxt = e['target'] if e['source'] == cur else e['source']
-                    if nxt not in visited_paths:
-                        visited_paths[nxt] = visited_paths[cur] + [{
-                            'edge_id': e['id'],
-                            'source': e['source'],
-                            'target': e['target'],
-                            'relation': e['relation'],
-                            'direction': 'outgoing' if e['source'] == cur else 'incoming',
-                            'evidence_refs': e['evidence_refs'],
-                            'source_tables': e['source_tables'],
-                        }]
-                        node_hit_slots[nxt].add(slot_name)
-                        q.append((nxt, depth + 1))
-            slot_reach_paths[slot_name] = visited_paths
-
-        # Identify bridge nodes reached by >= 2 distinct query slots via real edges.
+        # A common endpoint is a bridge only when at least two real paths have
+        # compatible conditions. Keep alternate witnesses rather than combining
+        # different months or measures into one alleged proof.
         bridge_nodes = []
+        path_output_bytes, witness_attempts = 2, 0
         for nid, hit_slots in sorted(node_hit_slots.items()):
-            if len(hit_slots) >= 2 and nid in nodes_map and any(slot_reach_paths[name][nid] for name in hit_slots):
-                node_info = nodes_map[nid]
-                bridge_nodes.append({
-                    'node_id': nid,
-                    'kind': node_info['kind'],
-                    'display_name': node_info['display_name'],
-                    'bridge_role': 'intermediate_bridge' if nid not in seed_set else 'cross_slot_node',
-                    'matched_slots': sorted(hit_slots),
-                    'real_paths_by_slot': {
-                        sname: slot_reach_paths[sname][nid]
-                        for sname in sorted(hit_slots)
-                    },
-                })
+            if witness_attempts >= _PATH_WITNESS_ATTEMPTS:
+                path_truncated = True
+                break
+            groups, seen_groups = [], set()
+            bridge_header = None
+            for first, second in combinations(sorted(hit_slots), 2):
+                for left in slot_routes[first][nid]:
+                    for right in slot_routes[second][nid]:
+                        if witness_attempts >= _PATH_WITNESS_ATTEMPTS:
+                            path_truncated = True
+                            break
+                        witness_attempts += 1
+                        if not left['steps'] and not right['steps']:
+                            continue
+                        context = _join_contexts(left['business_context'], right['business_context'])
+                        rows = _join_rows(left['row_witnesses'], right['row_witnesses'])
+                        if context is None or rows is None:
+                            continue
+                        witness = {'business_context': context,
+                                   'context_status': 'unverified' if context['status'] == 'unknown' else 'compatible',
+                                   'path_semantics': 'condition_compatible_evidence_chain',
+                                   'observed_path': False, 'row_witnesses': rows,
+                                   'paths_by_slot': {first: left['steps'], second: right['steps']}}
+                        serialized = canonical(witness)
+                        signature = digest(serialized)
+                        if signature in seen_groups:
+                            continue
+                        if len(groups) >= 128:
+                            path_truncated = True
+                            break
+                        header = bridge_header
+                        if header is None:
+                            node_info = nodes_map[nid]
+                            header = {
+                                'node_id': nid, 'kind': node_info['kind'], 'display_name': node_info['display_name'],
+                                'bridge_role': 'intermediate_bridge' if nid not in seed_set else 'cross_slot_node',
+                                'matched_slots': sorted(witness['paths_by_slot']),
+                                'real_paths_by_slot': witness['paths_by_slot'], 'path_groups': [],
+                                'context_status': witness['context_status'],
+                                'path_semantics': witness['path_semantics'], 'observed_path': False,
+                            }
+                        # Include the primary path's duplicate preview and all
+                        # bridge headers in the one query-wide output budget.
+                        size = len(serialized.encode('utf-8')) + 1
+                        if not groups:
+                            size += len(canonical(header).encode('utf-8')) + 1
+                        if path_output_bytes + size > _PATH_OUTPUT_BYTES:
+                            path_truncated = True
+                            continue
+                        path_output_bytes += size
+                        bridge_header = header
+                        seen_groups.add(signature)
+                        groups.append(witness)
+                    if len(groups) >= 128 or witness_attempts >= _PATH_WITNESS_ATTEMPTS:
+                        break
+                if len(groups) >= 128 or witness_attempts >= _PATH_WITNESS_ATTEMPTS:
+                    break
+            if groups:
+                bridge_nodes.append({**bridge_header, 'path_groups': groups})
         bridge_nodes.sort(key=lambda b: (0 if b['bridge_role'] == 'intermediate_bridge' else 1, -len(b['matched_slots']), b['node_id']))
 
         # Compute undirected connected components so disconnected query targets are explicit.
@@ -315,12 +481,15 @@ class SubgraphRetriever:
         return {
             'query': query,
             'scopes': scope_list,
+            'business_context': selection,
             'slots': slot_results,
             'nodes': output_nodes,
             'edges': edges,
             'bridge_nodes': bridge_nodes,
             'connected_components': connected_components,
-            'truncated': expanded['truncated'] or truncated_slots,
-            'truncation_reasons': expanded['truncation_reasons'] + (['slot_limit_reached'] if truncated_slots else []),
+            'truncated': expanded['truncated'] or truncated_slots or path_truncated,
+            'truncation_reasons': expanded['truncation_reasons'] + (['slot_limit_reached'] if truncated_slots else [])
+                                  + (['path_budget_reached'] if path_truncated else []),
+            'connected_components_semantics': 'visible_fact_union_not_context_proof',
             'hub_skipped_nodes': expanded['hub_skipped_nodes'],
         }

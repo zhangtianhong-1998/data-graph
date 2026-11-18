@@ -1,3 +1,4 @@
+export type BusinessContext = Record<string, string | number | boolean>
 export type GuidanceStage = 'T0_discovery' | 'T1_table_discovery' | 'T2_cross_table' | 'T3_hierarchy' | 'T4_document' | 'T5_revision' | 'semantic_review'
 export type RuntimeGuidance = { text: string; injection: 'global' | 'task' | 'iteration' | 'semantic_review'; stages: GuidanceStage[] }
 export interface DocumentScope { source_ids: string[]; tables: string[]; columns: string[] }
@@ -166,7 +167,8 @@ export interface RunConfig {
 export interface Table { source_id: string; schema: string; name: string; columns: Array<{ name: string; data_type?: string; comment?: string; [key: string]: unknown }> }
 export interface GraphNode { id: string; label?: string; name?: string; kind?: string; layer?: string; status?: string; [key: string]: unknown }
 export interface StandardNodeAttributeOrigin { source_id: string; qualified_table: string; column: string | null; data_type: string }
-export interface AttributeObservation { row_context?: { values?: Record<string, unknown> } | null; value: unknown; raw_value?: unknown; original_property?: string; source_id: string; qualified_table: string; column?: string | null; scope_ref?: string; evidence_refs?: string[]; observation_id?: string }
+export interface FactContext { version?: number; status: 'global' | 'scoped' | 'unknown'; dimensions: BusinessContext }
+export interface AttributeObservation { business_context?: FactContext; row_context?: { values?: Record<string, unknown> } | null; value: unknown; raw_value?: unknown; original_property?: string; source_id: string; qualified_table: string; column?: string | null; scope_ref?: string; evidence_refs?: string[]; observation_id?: string }
 export interface StandardNodeAttribute { observations?: AttributeObservation[]; key: string; label: string; values: unknown[]; data_type: string; origin_tables: StandardNodeAttributeOrigin[] }
 export interface StandardNodeSourceEvidenceField { role: string; field: string; column: string; data_type: string }
 export interface StandardNodeSourceEvidence {

@@ -1,7 +1,12 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { ensureSession, projectPath, request } from './api'
-import type { EmbeddingConfig, RetrievalStatusResponse } from './types'
+import BusinessContextSelect from './BusinessContextSelect.vue'
+import PropertyTable from './PropertyTable.vue'
+import type { BusinessContext, FactContext, EmbeddingConfig, RetrievalStatusResponse } from './types'
+
+type Observation = { business_context?: FactContext; properties?: Record<string, unknown>; evidence_refs?: string[]; source_tables?: string[] }
+type PathStep = { source: string; target: string; relation: string; direction?: string; observations?: Observation[] }
 
 interface RetrievalQueryResponse {
   query: string
@@ -42,6 +47,7 @@ interface RetrievalQueryResponse {
     target: string
     evidence_refs?: string[]
     source_tables?: string[]
+    observations?: Observation[]
     [key: string]: unknown
   }>
   bridge_nodes: Array<{
@@ -50,6 +56,8 @@ interface RetrievalQueryResponse {
     display_name: string
     bridge_role: string
     matched_slots: string[]
+    context_status?: string
+    path_groups?: Array<{ business_context: FactContext; context_status: string; paths_by_slot: Record<string, PathStep[]> }>
   }>
   connected_components: string[][]
   truncated: boolean
@@ -69,11 +77,16 @@ const emit = defineEmits<{
 }>()
 
 const queryText = ref('')
+const businessContext = ref<BusinessContext | null>(null)
 const hops = ref<1 | 2>(2)
 const topPSeeds = ref(4)
 const working = ref(false)
 const panelError = ref('')
 const result = ref<RetrievalQueryResponse | null>(null)
+let queryEpoch = 0
+
+watch(businessContext, () => { queryEpoch++; result.value = null; working.value = false })
+watch(() => props.projectId, () => { queryEpoch++; businessContext.value = null; result.value = null; working.value = false })
 
 const activeStatus = computed(() => props.status)
 
@@ -90,26 +103,32 @@ const nodeMap = computed(() => {
   for (const n of result.value?.nodes || []) map.set(n.id, n)
   return map
 })
+const contextLabel = (context?: FactContext) => !context || context.status === 'unknown' ? '适用范围尚未确认'
+  : context.status === 'global' ? '通用知识' : Object.entries(context.dimensions).map(([key, value]) => `${key}：${String(value)}`).join(' · ')
+const nodeLabel = (id: string) => nodeMap.value.get(id)?.display_name || id
 
 async function runQuery() {
   const q = queryText.value.trim()
   if (!q || working.value || props.syncing || !props.status?.vectorized) return
+  const epoch = ++queryEpoch
   working.value = true
   panelError.value = ''
   try {
     await ensureSession(props.projectId)
-    result.value = await request<RetrievalQueryResponse>(`${projectPath(props.projectId)}/retrieval/query`, {
+    const value = await request<RetrievalQueryResponse>(`${projectPath(props.projectId)}/retrieval/query`, {
       method: 'POST',
       body: JSON.stringify({
         query: q,
+        business_context: businessContext.value,
         hops: hops.value,
         top_p_seeds: topPSeeds.value,
       }),
     })
+    if (epoch === queryEpoch) result.value = value
   } catch (err) {
-    panelError.value = err instanceof Error ? err.message : '子图召回失败，请重试。'
+    if (epoch === queryEpoch) panelError.value = err instanceof Error ? err.message : '子图召回失败，请重试。'
   } finally {
-    working.value = false
+    if (epoch === queryEpoch) working.value = false
   }
 }
 </script>
@@ -204,6 +223,7 @@ async function runQuery() {
               placeholder="输入自然语言问题、实体名称或指标编码"
             />
           </div>
+          <BusinessContextSelect v-model="businessContext" :project-id="projectId" :refresh-key="status?.generation" :disabled="working || syncing"/>
           <div class="retrieval-params">
             <div class="field">
               <label for="retrieval-hops">图扩展跳数</label>
@@ -231,6 +251,8 @@ async function runQuery() {
           <span class="badge blue">连通分量 {{ result.connected_components.length }}</span>
         </div>
         <div class="panel-body">
+          <p v-if="result.truncated" class="note amber">结果达到读取或路径分析上限，当前展示部分内容。</p>
+          <p class="field-hint">连通分量表示事实之间存在邻接。推理依据按适用条件分别列出，不把邻接并集当成一条完整推导。</p>
           <div class="report-summary">
             <div><small>子图节点</small><strong>{{ result.nodes.length }}</strong></div>
             <div><small>真实有向边</small><strong>{{ result.edges.length }}</strong></div>
@@ -268,10 +290,23 @@ async function runQuery() {
           </div>
           <div class="panel-body">
             <div v-if="result.bridge_nodes.length" class="bridge-box">
-              <h3>跨槽位桥接节点（多跳交汇中心，未虚构直接边）</h3>
-              <p v-for="b in result.bridge_nodes" :key="b.node_id" class="field-hint">
-                <strong>{{ b.display_name || b.node_id }}</strong>（{{ b.kind }}）关联槽位：{{ b.matched_slots.join('、') }}
-              </p>
+              <h3>共同关联对象与路径依据</h3>
+              <article v-for="b in result.bridge_nodes" :key="b.node_id">
+                <p><strong>{{ b.display_name || b.node_id }}</strong>（{{ b.kind }}）关联：{{ b.matched_slots.join('、') }} <span v-if="b.context_status === 'unverified'" class="badge amber">适用条件未确认</span></p>
+                <details v-for="(group, index) in b.path_groups || []" :key="index">
+                  <summary>{{ contextLabel(group.business_context) }} · 第 {{ index + 1 }} 组路径</summary>
+                  <div v-for="(steps, slot) in group.paths_by_slot" :key="slot">
+                    <strong>{{ slot }}</strong>
+                    <ol><li v-for="(step, position) in steps" :key="position">
+                      {{ nodeLabel(step.source) }} → {{ step.relation }} → {{ nodeLabel(step.target) }}
+                      <div v-for="(observation, observationIndex) in step.observations || []" :key="observationIndex">
+                        <small>{{ contextLabel(observation.business_context) }}</small>
+                        <PropertyTable :values="{ ...observation.properties, '引用': observation.evidence_refs || [], '来源': observation.source_tables || [] }"/>
+                      </div>
+                    </li></ol>
+                  </div>
+                </details>
+              </article>
             </div>
             <div v-if="!result.nodes.length" class="empty-state"><p>未命中满足授权作用域的节点。</p></div>
             <div v-else class="table-scroll">
@@ -298,12 +333,16 @@ async function runQuery() {
             <div v-if="!result.edges.length" class="empty-state"><p>当前子图没有真实关联边。</p></div>
             <div v-else class="table-scroll">
               <table>
-                <thead><tr><th>起点</th><th>关系</th><th>终点</th></tr></thead>
+                <thead><tr><th>起点</th><th>关系</th><th>终点</th><th>适用范围与依据</th></tr></thead>
                 <tbody>
                   <tr v-for="edge in result.edges" :key="edge.id">
                     <td>{{ nodeMap.get(edge.source)?.display_name || edge.source }}</td>
                     <td><span class="badge blue">{{ edge.relation }}</span></td>
                     <td>{{ nodeMap.get(edge.target)?.display_name || edge.target }}</td>
+                    <td><details v-for="(observation, index) in edge.observations || []" :key="index">
+                      <summary>{{ contextLabel(observation.business_context) }}</summary>
+                      <PropertyTable :values="{ ...observation.properties, '引用': observation.evidence_refs || [], '来源': observation.source_tables || [] }"/>
+                    </details></td>
                   </tr>
                 </tbody>
               </table>

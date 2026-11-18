@@ -48,7 +48,7 @@ def _record_path(root: Path, relative):
 
 def _view_key(kind, path: Path, stat, access, scopes):
     # Nanosecond timestamps do not survive a JSON number round trip.
-    return {'version': 3, 'kind': kind, 'path': str(path), 'size': stat.st_size,
+    return {'version': 4, 'kind': kind, 'path': str(path), 'size': stat.st_size,
             'mtime_ns': str(stat.st_mtime_ns), 'access': access, 'scopes': scopes}
 
 
@@ -203,8 +203,8 @@ def retrieval_status(config, *, embedding_api_key=None) -> dict:
         status = 'no_graph'
         stale_reason = None
     elif current_meta is None:
-        status = 'not_vectorized'
-        stale_reason = 'index_missing'
+        status = 'stale' if (retrieval_dir / 'current.json').is_file() else 'not_vectorized'
+        stale_reason = 'index_incompatible' if status == 'stale' else 'index_missing'
     elif current_meta.get('generation') != generation:
         status = 'stale'
         stale_reason = 'graph_updated'
@@ -270,15 +270,50 @@ def project_retriever(config, *, refresh=False, embedding_api_key=None):
 
 def vocabulary(graph):
     definitions = graph.get("definitions", {})
-    return {"entity_types": [{"name": e["type"], "description": e.get("description", "")}
+    return {"entity_types": [{"name": e["type"], **({'display_label': e['original_type']} if e.get('original_type') else {}), "description": e.get("description", "")}
                              for e in definitions.get("entities", [])],
-            "relations": [{"name": e["type"], "description": e.get("description", "")}
+            "relations": [{"name": e["type"], **({'display_label': e['original_type']} if e.get('original_type') else {}), "description": e.get("description", "")}
                           for e in definitions.get("relations", [])], "properties": []}
 
 
 def _listed(item):
     """Pages identify and draw facts. Row evidence stays on the detail read."""
     return listed(item)
+
+
+def select_business_context(graph, config, selection):
+    """Filter supports before traversal, keeping business scope separate from access."""
+    if selection is None:
+        return graph
+    result = filter_graph_scopes(graph, config.scopes, business_context=selection)
+    result['nodes'] = [{**n, 'kind': n['type'], 'layer': 'business', 'status': n.get('status', 'accepted')}
+                       for n in result.get('nodes', [])]
+    result['edges'] = [{**e, 'relation': e['type'], 'status': e.get('status', 'accepted'),
+                        'qualifiers': e.get('properties', {})} for e in result.get('edges', [])]
+    return result
+
+
+def context_options(config, *, prepared_graph=None, offset=0, limit=200):
+    """Offer only observed, authorized business dimensions, never source credentials."""
+    from lightgraph.construction.contexts import support_business_context
+    if offset < 0 or not 1 <= limit <= 500:
+        raise LightGraphError('graph_selection_invalid')
+    graph = prepared_graph if prepared_graph is not None else load_graph(config)
+    options = {}
+    counts = Counter()
+    for item in graph.get('nodes', []) + graph.get('edges', []):
+        for support in item.get('supports', []):
+            context = support_business_context(support)
+            counts[context['status']] += 1
+            if context['status'] == 'scoped':
+                dimensions = context['dimensions']
+                # Single dimensions let a project query span its months/versions.
+                for value in [dimensions, *({key: val} for key, val in dimensions.items())]:
+                    options[canonical(value)] = value
+    ordered = [options[key] for key in sorted(options)]
+    return {'version_id': graph.get('version_id'), 'contexts': ordered[offset:offset + limit],
+            'total_contexts': len(ordered), 'support_counts': dict(counts),
+            'next_offset': offset + limit if offset + limit < len(ordered) else None}
 
 
 def _search_text(node):
@@ -325,12 +360,13 @@ def _focused_page(nodes, edges, focus, hops, offset, limit, traversal='all'):
 
 
 def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", focus="", hops=1,
-               include_candidates=False, traversal='all', prepared_graph=None):
+               include_candidates=False, traversal='all', prepared_graph=None, business_context=None):
     if traversal not in ('all', 'chains'):
         raise LightGraphError('graph_page_invalid')
     if layer not in {"business", "metadata", "provenance", "all"} or offset < 0 or not 1 <= limit <= 1000 or hops not in {1, 2}:
         raise LightGraphError("graph_selection_invalid")
     graph = prepared_graph if prepared_graph is not None else load_graph(config)
+    graph = select_business_context(graph, config, business_context)
     generation = cached_generation(graph) or digest(graph)
     nodes = graph["nodes"] if layer in {"business", "all"} else []
     edges = graph["edges"] if nodes else []
@@ -376,7 +412,15 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
             "view_scope": "neighborhood" if focus else "search_results" if q or kind else "graph_page",
             "focus_filters_ignored": bool(focus and (q or kind)),
             "neighborhood_truncated": bool(focus and (len(page) < len(selected) or len(local_edges) < len(page_edges))),
-            "include_candidates": include_candidates, "candidate_view_available": False,
+            "business_context": business_context,
+            "include_candidates": include_candidates, "candidate_view_available": True,
+            "alignment_candidates": graph.get('candidate_identity_merges', [])[:200] if include_candidates else [],
+            "definition_conflicts": graph.get('definition_conflicts', [])[:200] if include_candidates else [],
+            "pending_alignment_count": len(graph.get('candidate_identity_merges', [])),
+            "pending_definition_count": len(graph.get('definition_conflicts', [])),
+            "unresolved_relations": [_listed(item) for item in graph.get('unresolved_relations', [])[:200]] if include_candidates else [],
+            "pending_relation_count": len(graph.get('unresolved_relations', [])),
+            "context_cycle_diagnostics": graph.get('context_cycle_diagnostics', [])[:200] if include_candidates else [],
             "display_schema": vocabulary(graph), "semantic_origin": "agent_authored", "complete_batches": True}
 
 
@@ -394,17 +438,20 @@ def _catalog_tables_for_config(config):
         return []
 
 
-def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_candidates=False, prepared_graph=None):
+def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_candidates=False, prepared_graph=None,
+                  business_context=None):
+    from lightgraph.construction.contexts import business_context_identity
     if bool(entity_id) == bool(fact_id) or offset < 0:
         raise LightGraphError("graph_selection_invalid")
     graph = prepared_graph if prepared_graph is not None else load_graph(config)
+    graph = select_business_context(graph, config, business_context)
     selected = []
     supports = []
 
-    def add(identifier, kind, payload, provenance):
+    def add(identifier, kind, payload, provenance, *, status='accepted'):
         if fact_id and identifier != fact_id:
             return
-        selected.append({"id": identifier, "fact_kind": kind, "status": "accepted", "payload": payload})
+        selected.append({"id": identifier, "fact_kind": kind, "status": status, "payload": payload})
         for index, source in enumerate(provenance):
             binding = source.get("source", {})
             location = ".".join(str(binding.get(key, "")) for key in ("source_id", "schema", "table") if binding.get(key))
@@ -412,7 +459,7 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             origin = {'authorized_catalog': 'metadata', 'agent_declared_semantics': 'agent_declared'}.get(
                 source.get('origin'), 'source_query')
             supports.append({"id": support_id, "support_id": support_id, "fact_id": identifier,
-                             "status": "accepted", "origin": origin,
+                             "status": status, "origin": origin,
                              "rule_id": source.get("definition", ""),
                              "source_binding": location, "binding": source,
                              "scope_ref": source.get('scope_ref', 'public')})
@@ -429,7 +476,7 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
                 matches = canonical(value) in {canonical(item) for item in support.get('properties', {}).get(name, [])}
             if matches:
                 origin = {**support.get('provenance', {}), 'scope_ref': support['scope_ref']}
-                for key in ('row_context', 'observation_id', 'execution_origins', 'identity_origins'):
+                for key in ('row_context', 'business_context', 'observation_id', 'execution_origins', 'identity_origins'):
                     if key in support:
                         origin[key] = support[key]
                 mapped = [obs for obs in support.get('property_observations', [])
@@ -444,7 +491,7 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
         if 'supports' not in item:
             return item.get('provenance', [])
         return [{**support.get('provenance', {}), 'scope_ref': support['scope_ref'],
-                 **{key: support[key] for key in ('row_context', 'lookup_matches', 'required_scope_refs', 'inherited_from',
+                 **{key: support[key] for key in ('row_context', 'business_context', 'lookup_matches', 'required_scope_refs', 'inherited_from',
                      'observation_id', 'execution_origins', 'endpoint_origins')
                     if support.get(key) is not None}}
                 for support in item['supports']]
@@ -455,21 +502,45 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             raise LightGraphError("graph_item_not_found")
         for node in nodes:
             identifier = node["id"]
-            add(identifier, "NodeExistence", {"entity_id": identifier, "kind": node["kind"]}, support_origins(node))
+            add(identifier, "NodeExistence", {"entity_id": identifier, "kind": node["kind"],
+                **({'identity_context': node['identity_context']} if 'identity_context' in node else {})}, support_origins(node))
             properties = {**node.get("properties", {}), "label": node.get("label_variants") or [node["label"]], "alias": node.get("aliases", [])}
             for name, values in properties.items():
                 for value in values:
-                    add(digest(identifier, name, value), "PropertyValue", {"entity_id": identifier,
-                        "name": name, "value": value}, property_origins(node, name, value))
+                    origins = property_origins(node, name, value)
+                    groups = {}
+                    for origin in origins:
+                        # Physical column bindings belong to the citation. Equal
+                        # applicability and value form one fact across sources.
+                        context = business_context_identity(origin) if 'business_context' in origin else None
+                        groups.setdefault(canonical(context), (context, []))[1].append(origin)
+                    for context, sources in groups.values() if groups else [(None, origins)]:
+                        # The same value under M and K is two assertions. A source
+                        # list alone must not erase the condition that made it true.
+                        fact = digest(identifier, name, value, context) if context is not None else digest(identifier, name, value)
+                        add(fact, "PropertyValue", {"entity_id": identifier,
+                            "name": name, "value": value,
+                            **({'business_context': context} if context is not None else {})}, sources)
     for edge in graph["edges"]:
         if edge["id"] == fact_id or entity_id and entity_id in {edge["source"], edge["target"]}:
             add(edge["id"], "Edge", {"source": edge["source"], "target": edge["target"],
-                "relation": edge["relation"], "qualifiers": edge.get("properties", {})}, support_origins(edge))
+                "relation": edge["relation"], "qualifiers": edge.get("properties", {}),
+                **({'business_context': edge['business_context']} if 'business_context' in edge else {}),
+                'observations': [{k: s[k] for k in ('business_context', 'properties', 'row_context', 'observation_id') if k in s}
+                                 for s in edge.get('supports', [])]}, support_origins(edge))
+    if include_candidates or fact_id:
+        for pending in graph.get('unresolved_relations', []):
+            if pending['id'] == fact_id or entity_id and entity_id in pending.get('node_ids', []):
+                add(pending['id'], 'UnresolvedRelation', {
+                    'reason': pending.get('reason'), 'candidate_endpoints': pending.get('candidate_endpoints', {}),
+                    'observations': [{k: s[k] for k in ('business_context', 'properties', 'row_context', 'observation_id') if k in s}
+                                     for s in pending.get('supports', [])]}, support_origins(pending), status='unresolved')
     if not selected:
         raise LightGraphError("graph_item_not_found")
     facts = selected[offset:offset + 50]
     fact_ids = {f["id"] for f in facts}
     endpoints = {f["payload"].get(k) for f in facts for k in ("source", "target", "entity_id")}
+    endpoints.update(nid for f in facts for ids in f['payload'].get('candidate_endpoints', {}).values() for nid in ids)
     retained = [s for s in supports if s["fact_id"] in fact_ids]
     # Describe the actual visible supports, not a newer unvalidated draft. Old
     # publications may lack mapping revision numbers; do not invent revision 1.
@@ -502,7 +573,8 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
         standardize_node_details(node, definitions=definitions, catalog_tables=catalog_tables)
         for node in graph["nodes"] if node["id"] in endpoints
     ]
-    return {"version_id": graph.get("version_id"), "facts": facts, "supports": retained[:500], "rules": list(mappings.values()),
+    return {"version_id": graph.get("version_id"), "business_context": business_context,
+            "facts": facts, "supports": retained[:500], "rules": list(mappings.values()),
             "nodes": [_listed(n) for n in graph["nodes"] if n["id"] in endpoints],
             "standard_nodes": standard_nodes,
             "display_schema": vocabulary(graph),

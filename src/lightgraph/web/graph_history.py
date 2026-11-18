@@ -232,6 +232,15 @@ def _prepared(workspace, pid, config, version):
     return effective, graph, generation
 
 
+def read_contexts(workspace, pid, *, config, version=None, **options):
+    if version is not None:
+        effective, graph, _ = _prepared(workspace, pid, config, version)
+        return construction_graph.context_options(effective, prepared_graph=graph, **options)
+    if not construction_graph.available(config):
+        return {'contexts': [], 'total_contexts': 0, 'support_counts': {}, 'next_offset': None}
+    return construction_graph.context_options(config, **options)
+
+
 def read_page(workspace, pid, *, config, version, **options):
     if options.get('layer', 'business') != 'business':
         raise LightGraphError('graph_layer_invalid')

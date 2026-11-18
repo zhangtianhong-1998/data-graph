@@ -86,6 +86,7 @@ export function vocabularyLabel(category: keyof DisplaySchema, raw: unknown, sch
     const title = opening && opening.length <= 24 ? opening : declared
     return title.length > 24 ? title.slice(0, 23) + '…' : title
   }
+  if (entry?.display_label) return entry.display_label.length > 24 ? entry.display_label.slice(0, 23) + '…' : entry.display_label
   return builtin || (chinese(name) ? name : `${name}（未提供中文名）`)
 }
 export function vocabularyDescription(category: keyof DisplaySchema, raw: unknown, schema: DisplaySchema = {}): string {
