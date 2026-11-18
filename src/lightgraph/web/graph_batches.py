@@ -39,16 +39,16 @@ def _authorized_view(workspace, pid, config, layer, include_candidates):
 
 def read_graph_batch(workspace, pid, *, config, layer='business', part='nodes', offset=0,
                      limit=1000, generation='', include_candidates=False,
-                     focus='', hops=2, traversal='chains'):
+                     focus='', hops=2, traversal='chains', prepared_view=None):
     if (layer not in ('business', 'metadata') or part not in ('nodes', 'edges')
             or offset < 0 or not 1 <= limit <= 1000 or hops not in (1, 2)
             or traversal not in ('all', 'chains')):
         raise LightGraphError('graph_page_invalid')
-    graph, version = _authorized_view(workspace, pid, config, layer, include_candidates)
+    graph, version = prepared_view if prepared_view is not None else _authorized_view(workspace, pid, config, layer, include_candidates)
     # Include access/selection even for legacy and empty views. A cursor from
     # another project, authorization or neighborhood must never be reusable.
-    version = digest(version, str(Path(config.output_dir).resolve()), config.model_dump(mode='json'),
-                     layer, include_candidates, focus, hops, traversal)
+    binding = pid if graph.get('version_id') else (str(Path(config.output_dir).resolve()), config.model_dump(mode='json'))
+    version = digest(version, binding, layer, include_candidates, focus, hops, traversal)
     if generation and generation != version:
         raise LightGraphError('graph_generation_changed')
     nodes, edges = graph['nodes'], graph['edges']
@@ -67,7 +67,7 @@ def read_graph_batch(workspace, pid, *, config, layer='business', part='nodes', 
             'edges': page if part == 'edges' else [],
             'item_payload_bytes': size, 'item_payload_limit_bytes': MAX_PAGE_BYTES,
             'part': part, 'offset': offset, 'next_offset': next_offset, 'page_size': limit,
-            'generation': version, 'complete_batches': True, 'layer': layer,
+            'generation': version, 'version_id': graph.get('version_id'), 'complete_batches': True, 'layer': layer,
             'total_nodes': total_nodes, 'total_edges': total_edges,
             'matched_nodes': len(nodes), 'matched_edges': len(edges),
             'display_schema': graph.get('display_schema', {}),

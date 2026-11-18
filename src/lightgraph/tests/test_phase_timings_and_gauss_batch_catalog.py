@@ -141,8 +141,15 @@ def test_co_projection_merges_same_table_narrow_mappings_and_falls_back_on_high_
         ],
     }
     with MemorySource([table], {table.qualified_name: rows_small}) as src:
-        res_co = execute_draft(draft, [src], [table], enable_co_projection=True)
+        from lightgraph.construction.projection_reuse import ImmutableProjections
+        immutable = ImmutableProjections({'s': 'same-file'}, 1024 * 1024)
+        res_co = execute_draft(draft, [src], [table], enable_co_projection=True, immutable_projections=immutable)
         q_co = src.stats.queries
+        # A semantically revised draft asks for the same complete column sets.
+        revised = {**draft, 'purpose': 'revised purpose'}
+        reused = execute_draft(revised, [src], [table], enable_co_projection=True, immutable_projections=immutable)
+        assert reused['passed'] and reused['metrics']['immutable_projection_hits'] == 2
+        assert src.stats.queries == q_co and reused['graph']['nodes'] == res_co['graph']['nodes']
     with MemorySource([table], {table.qualified_name: rows_small}) as src_sep:
         res_sep = execute_draft(draft, [src_sep], [table], enable_co_projection=False)
         q_sep = src_sep.stats.queries

@@ -10,6 +10,7 @@ from lightgraph.contracts import canonical, digest
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.query import QueryCompiler
 from lightgraph.query.predicate import ScopeConjunction
+from lightgraph.sources.validation_session import reuse_validation_sessions
 from lightgraph.sources.base import aggregate_count
 from lightgraph.sources.database_errors import cleanup_preserving_error
 from lightgraph.source_values import (source_scalar, scalar_kind, typed_key, identity_values,
@@ -66,9 +67,10 @@ def _has_cycle(pairs):
     return visited != len(incoming)
 
 
+@reuse_validation_sessions
 def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 1024 * 1024,
                   max_rows=20000, max_seconds=1800, scope_bindings=(), cancelled=None,
-                  base_graph=None, enable_co_projection=False):
+                  base_graph=None, enable_co_projection=False, label_conflict_policy="quarantine", immutable_projections=None):
     """Check complete source projections and build an evidence-labelled graph.
 
     Callers provide an authorized physical catalog. Keys include only explicitly
@@ -94,6 +96,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     peak_working_bytes = 0
     projection_cache, lookup_indexes = {}, {}
     cache_hits = 0
+    reusable_hits = 0
     lookup_matches, lookup_omitted = 0, 0
     source_read_windows = []
     unavailable_sources = {}
@@ -255,6 +258,9 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         nonlocal peak_working_bytes
         required = (graph_bytes + cache_bytes + lookup_bytes + accumulation_index_bytes
                     + pending_projection_bytes)
+        if immutable_projections is not None:
+            immutable_projections.trim(max_working_bytes - required)
+            required += immutable_projections.bytes
         peak_working_bytes = max(peak_working_bytes, required)
         if required > max_working_bytes:
             error = LightGraphError('memory_budget_exhausted')
@@ -391,6 +397,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         attempted_co_groups.add(gkey)
         valid_peers = {}
         for pkey, peer in peers.items():
+            if pkey in projection_cache or (immutable_projections is not None and immutable_projections.contains(peer.source_id, pkey)):
+                continue
             if remaining_uses.get(pkey, 0) <= 0 and pkey not in pinned_projections:
                 continue
             try:
@@ -454,17 +462,30 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             projection_cache[pkey] = subset_rows
             projection_sizes[pkey] = split_sizes[pkey]
             cache_bytes += split_sizes[pkey]
+            if immutable_projections is not None:
+                immutable_projections.put(mapping.source_id, pkey, subset_rows, split_sizes[pkey], source_read_windows[-1])
+        check_memory('projection')
         co_projection_hits += len(split_cache) - 1
         return projection_cache.get(projection_key(mapping))
 
     def _rows_for(mapping):
-        nonlocal cache_bytes, cache_hits
+        nonlocal cache_bytes, cache_hits, reusable_hits
         clock()
         table, adapter, predicate, columns, cap, compiler = _prepare_mapping_access(mapping)
         cache_key = projection_key(mapping)
         if cache_key in projection_cache:
             cache_hits += 1
             return projection_cache[cache_key]
+        previous = immutable_projections.get(mapping.source_id, cache_key) if immutable_projections is not None else None
+        if previous is not None:
+            rows, size, window = previous
+            projection_cache[cache_key] = rows
+            projection_sizes[cache_key] = size
+            cache_bytes += size
+            check_memory('immutable_projection')
+            reusable_hits += 1
+            source_read_windows.append({**window, 'reused_immutable_projection': True})
+            return rows
         if enable_co_projection:
             co_rows = _try_co_projection(mapping, table, adapter, predicate, cap)
             if co_rows is not None:
@@ -475,6 +496,9 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         cache_bytes += retained_bytes
         projection_sizes[cache_key] = retained_bytes
         unique_projections.add(cache_key)
+        if immutable_projections is not None:
+            immutable_projections.put(mapping.source_id, cache_key, rows, retained_bytes, source_read_windows[-1])
+            check_memory('projection')
         projection_cache[cache_key] = rows
         return rows
 
@@ -554,6 +578,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                 'source': {'source_id': mapping.source_id, 'schema': mapping.schema_name,
                            'table': mapping.table},
                 'columns': _projection_columns(mapping), 'scope_columns': scope_columns(mapping),
+                **({'predicate': mapping.predicate} if mapping.predicate else {}),
                 **({'property_columns': dict(mapping.properties)} if mapping.properties else {}),
                 **({'constant_properties': mapping.constant_properties} if mapping.constant_properties else {}),
                 **({'context_columns': mapping.context_columns} if mapping.context_columns else {})}
@@ -680,7 +705,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                 'properties': {}, 'provenance': [], 'supports': []}
                             accumulation.register(node)
                         if label is not None:
-                            if accumulation.label_conflicts(node_id, current_support['scope_ref'], str(label)):
+                            if label_conflict_policy != 'retain_variants' and accumulation.label_conflicts(node_id, current_support['scope_ref'], str(label)):
                                 diagnostic('same_identity_conflicting_label', node_id=node_id, **location)
                             elif not node['label_observed']:
                                 accumulation.replace(node, 'label', str(label))
@@ -819,7 +844,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     passed = not diagnostics
     graph = {'format_version': 1, 'target': 'graph', 'status': 'validated' if passed else 'candidate',
              'source_key_semantics': SOURCE_KEY_SEMANTICS_VERSION,
-             'support_visibility_version': 1,
+             'support_visibility_version': 1, 'label_conflict_policy': label_conflict_policy,
              **({'extends_base_graph': True} if draft.extends_base_graph else {}),
              'semantic_origin': 'agent_authored', 'purpose': draft.purpose or (goal.purpose if goal else ''),
              'definitions': definitions, 'nodes': sorted(nodes.values(), key=lambda n: n['id']),
@@ -849,6 +874,9 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     rendered = derive_display_graph(graph, copy=False)
     display_seconds = max(0.0, time.monotonic() - disp_started)
     rendered_bytes = len(canonical(rendered).encode())
+    if immutable_projections is not None:
+        immutable_projections.trim(max_working_bytes - rendered_bytes)
+        peak_working_bytes = max(peak_working_bytes, rendered_bytes + immutable_projections.bytes)
     if rendered_bytes > max_working_bytes:
         diagnostic('memory_budget_exhausted', phase='display', required_bytes=rendered_bytes,
                    limit_bytes=max_working_bytes)
@@ -867,7 +895,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             },
             'metrics': {'mappings_checked': checked, 'projected_distinct_rows': projected_rows,
                         'nodes': len(nodes), 'edges': len(edges), 'equal_endpoints_omitted': omitted,
-                        'projection_cache_hits': cache_hits, 'unique_projections': len(unique_projections),
+                        'projection_cache_hits': cache_hits, 'immutable_projection_hits': reusable_hits, 'unique_projections': len(unique_projections),
                         'co_projection_groups': co_projection_groups,
                         'co_projection_hits': co_projection_hits,
                         'co_projection_fallbacks': co_projection_fallbacks,

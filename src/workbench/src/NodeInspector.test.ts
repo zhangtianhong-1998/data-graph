@@ -52,6 +52,10 @@ describe('标准化节点详情面板 (NodeInspector)', () => {
           key: 'unit',
           label: '计量单位',
           values: ['万元', { '范围': '国内' }],
+          observations: [
+            { value: '万元', raw_value: '万元', source_id: 'gauss_main', qualified_table: 'dm.income', column: 'unit_name', scope_ref: 'public' },
+            { value: { '范围': '国内' }, source_id: 'csv_1', qualified_table: 'csv.supplement', column: 'unit_scope' },
+          ],
           data_type: 'character varying',
           origin_tables: [{ source_id: 'gauss_main', qualified_table: 'dm.dma_fin_income_f', column: 'unit_name', data_type: 'character varying' }],
         },
@@ -123,6 +127,10 @@ describe('标准化节点详情面板 (NodeInspector)', () => {
     expect(text).toContain('character varying')
     expect(root.querySelector('.dynamic-attr-item')?.textContent).toContain('国内')
     expect(root.querySelector('.dynamic-attr-item')?.textContent).not.toContain('[object Object]')
+    const observations = [...root.querySelectorAll('.dynamic-attr-item .support-detail')].map(el => el.textContent)
+    expect(observations).toHaveLength(2)
+    expect(observations[0]).toContain('万元'); expect(observations[0]).toContain('dm.income')
+    expect(observations[1]).toContain('国内'); expect(observations[1]).toContain('csv.supplement')
     expect(text).toContain('dm.dma_fin_income_f')
     expect(text).toContain('dm.dma_fin_ebg_order_f')
     expect(text).toContain('unit_income:e1')

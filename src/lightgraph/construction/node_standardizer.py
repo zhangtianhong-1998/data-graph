@@ -5,6 +5,8 @@ from collections import defaultdict
 from copy import deepcopy
 from typing import Any
 
+from lightgraph.contracts import canonical
+
 _SOURCE_KIND_LABELS = {
     'gauss_database': 'GaussDB',
     'mysql_database': 'MySQL',
@@ -73,7 +75,8 @@ def standardize_node_details(
     })
     if not source_labels and label_origin == 'source' and isinstance(node.get('label'), str) and node['label'].strip():
         source_labels = [node['label'].strip()]
-    chinese_name = source_labels[0] if source_labels else None
+    display_source = node.get('display_label')
+    chinese_name = display_source if display_source in source_labels else next(iter(source_labels), None)
 
     explicit_english = sorted({
         str(s['english_name']).strip()
@@ -108,6 +111,7 @@ def standardize_node_details(
     source_groups: dict[tuple[str, str, str], dict[str, Any]] = {}
     catalog_notes_map: dict[tuple[str, str, str], dict[str, Any]] = {}
 
+    observations = defaultdict(list)
     for support in supports:
         prov = support.get('provenance') if isinstance(support.get('provenance'), dict) else {}
         src = prov.get('source') if isinstance(prov.get('source'), dict) else {}
@@ -194,23 +198,27 @@ def standardize_node_details(
                 add_field('metadata_column', '物理列定义', col_name)
 
         prop_col_map = prov.get('property_columns') if isinstance(prov.get('property_columns'), dict) else {}
-        for attr_key, attr_values in (support.get('properties') or {}).items():
-            if not attr_values:
-                continue
-            col_name = prop_col_map.get(attr_key, '')
+        entries = support.get('property_observations', [])
+        if not entries:
+            entries = [{'property': name, 'original_property': name, 'value': value, 'raw_value': value}
+                       for name, values in (support.get('properties') or {}).items() for value in values]
+        for entry in entries:
+            attr_key = entry['property']
+            col_name = prop_col_map.get(entry['original_property'], '')
             col_meta = (table_meta or {}).get('columns', {}).get(col_name, {})
             dtype = col_meta.get('data_type') or 'unknown'
-            attr_label = (property_labels or {}).get(attr_key, attr_key)
             if col_name:
-                add_field('attribute', attr_label, col_name)
-            origin_key = (source_id, tkey[1], tkey[2], col_name)
-            attr_origins[attr_key][origin_key] = {
-                'source_id': source_id,
-                'qualified_table': qtable or source_id,
-                'column': col_name or None,
-                'data_type': dtype,
-                'column_comment': col_meta.get('comment') or '',
-            }
+                add_field('attribute', (property_labels or {}).get(attr_key, attr_key), col_name)
+            origin = {'source_id': source_id, 'qualified_table': qtable or source_id,
+                      'column': col_name or None, 'data_type': dtype}
+            attr_origins[attr_key][(source_id, tkey[1], tkey[2], col_name)] = origin
+            value_origin = {**origin, 'value': entry['value'], 'raw_value': entry['raw_value'],
+                            'original_property': entry['original_property'], 'scope_ref': support.get('scope_ref'),
+                            'evidence_refs': sorted(set(prov.get('evidence_refs', [])) | set(support.get('evidence_refs', [])))}
+            for detail in ('observation_id', 'row_context', 'execution_origins'):
+                if detail in support:
+                    value_origin[detail] = deepcopy(support[detail])
+            observations[attr_key].append(value_origin)
 
     # Construction graph attributes live under properties. Presentation and
     # future runtime fields at the node root are never business attributes.
@@ -225,6 +233,7 @@ def standardize_node_details(
             'key': key,
             'label': (property_labels or {}).get(key, key),
             'values': norm_values,
+            'observations': sorted(observations.get(key, []), key=canonical),
             'data_type': dtypes[0] if len(dtypes) == 1 else (' / '.join(dtypes) if dtypes else 'unknown'),
             'origin_tables': [
                 {
@@ -257,6 +266,8 @@ def standardize_node_details(
         'english_name': english_name,
         'english_name_status': english_name_status,
         'display_name': display_name,
+        'label_variants': list(node.get('label_variants', [])),
+        'label_conflict': bool(node.get('label_conflict')),
         'aliases': list(node.get('aliases') or []),
         'identity': deepcopy(node.get('identity') or {}),
         'identity_types': deepcopy(node.get('identity_types') or {}),

@@ -27,6 +27,7 @@ beforeEach(() => {
       if (graphCalls.length === 1) return new Promise<Response>((resolve, reject) => { resolveInitial = resolve; rejectInitial = reject })
       return Promise.resolve(response({ nodes: [{ id: 'candidate', label: '新候选图', status: 'candidate' }], edges: [] }))
     }
+    if (url.endsWith('/graph/versions')) return Promise.resolve(response({ versions: [] }))
     if (url === '/api/projects') return Promise.resolve(response({ projects: [project] }))
     if (url === '/api/projects/p') return Promise.resolve(response(project))
     if (url.endsWith('/session')) return Promise.resolve(response({ session_id: 'session' }))
@@ -70,6 +71,31 @@ function graphFetch(implementation: (url: string, init?: RequestInit) => Promise
 }
 
 describe('background graph request isolation', () => {
+  it('keeps the selected history visible when the previous version responds late', async () => {
+    const original = vi.mocked(fetch).getMockImplementation()!
+    let finishA!: (value: Response) => void
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const url = String(input)
+      if (url.endsWith('/graph/versions')) return Promise.resolve(response({ versions: [{ version_id: 'a' }, { version_id: 'b' }] }))
+      if (url.includes('/graph?')) {
+        const version = new URL(url, 'http://localhost').searchParams.get('version')
+        if (version === 'a') return new Promise<Response>(resolve => { finishA = resolve })
+        return Promise.resolve(graphResponse(version === 'b' ? '历史乙' : '项目当前图'))
+      }
+      return original(input, init)
+    })
+    await openBusinessGraph()
+    await vi.waitFor(() => expect(root.querySelectorAll('#graph-version option')).toHaveLength(3))
+    const select = root.querySelector<HTMLSelectElement>('#graph-version')!
+    select.value = 'a'; select.dispatchEvent(new Event('change')); await nextTick()
+    select.value = 'b'; select.dispatchEvent(new Event('change')); await nextTick()
+    await vi.waitFor(() => expect(root.querySelector('.test-node')?.textContent).toBe('历史乙'))
+    finishA(graphResponse('迟到的历史甲'))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(root.querySelector('.test-node')?.textContent).toBe('历史乙')
+    select.value = ''; select.dispatchEvent(new Event('change'))
+    await vi.waitFor(() => expect(root.querySelector('.test-node')?.textContent).toBe('项目当前图'))
+  })
   it('recovers an initial 503 before batch loading can start', async () => {
     let attempts = 0
     graphFetch(async () => ++attempts === 1 ? new Response('', { status: 503 }) : graphResponse())

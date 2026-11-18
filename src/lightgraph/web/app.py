@@ -25,6 +25,7 @@ from starlette.staticfiles import StaticFiles
 
 from lightgraph.errors import LightGraphError
 from .workspace import Workspace
+from . import graph_history
 from .execution import RunManager, read_graph, read_graph_details, read_graph_consistently, read_metadata, identity_review, resolve_identity
 from .credentials import SessionCredentials
 from .saved_connections import SavedConnections
@@ -111,6 +112,12 @@ class InputModel(BaseModel):
 
 class StartRun(InputModel):
     run_mode: Literal["continue", "fresh"] = "continue"
+
+
+class ResumeRun(InputModel):
+    action: Literal['rerun_node', 'publish_artifact', 'recompose_legacy_merge'] = 'rerun_node'
+    from_node_id: str | None = Field(default=None, pattern=r'^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')
+    artifact_id: str | None = Field(default=None, pattern=r'^artifact_[a-f0-9]{32}$')
 
 
 class RetrieveSubgraphRequest(InputModel):
@@ -242,6 +249,10 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     @app.exception_handler(LightGraphError)
     async def safe_error(request,exc):
         from .config_validation import ConfigValidationError
+        from ..construction.checkpoints import WorkflowCheckpointError
+        if isinstance(exc, WorkflowCheckpointError) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', exc.node_id):
+            return JSONResponse({'error': {'code': exc.code, 'node_id': exc.node_id}},
+                                status_code=error_status(exc.code), headers={'Cache-Control': 'no-store'})
         if isinstance(exc, ConfigValidationError):
             return JSONResponse({'error': {'code': exc.code, 'diagnostics': exc.diagnostics}},
                                 status_code=400, headers={'Cache-Control': 'no-store'})
@@ -694,7 +705,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     @app.get('/api/projects/{pid}/config')
     def config(pid:str):
         with workspace.lock(pid):
-            return versioned(pid,workspace.get_config(pid))
+            return versioned(pid,workspace.get_config(pid, offline=True))
 
     @app.put('/api/projects/{pid}/config')
     def save_config(pid:str,data:dict,if_match:str|None=Header(default=None)):
@@ -755,25 +766,44 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             options={'source_credentials':sources} if sources else {}
             return read_metadata(workspace,pid,refresh=True,**options)
 
+    @app.get('/api/projects/{pid}/graph/versions')
+    def graph_versions(pid: str):
+        return graph_history.read_consistently(workspace, pid, graph_history.list_versions)
+
+    @app.post('/api/projects/{pid}/graph/versions/{version}/migrate')
+    def migrate_graph(pid: str, version: str, data: dict, if_match: str | None = Header(default=None)):
+        with workspace.lock(pid):
+            workspace.require_config_revision(pid, if_match)
+            return graph_history.migrate_version(workspace, pid, version, data)
+
     @app.get('/api/projects/{pid}/graph')
-    def graph(pid:str,layer:str='business',include_candidates:bool=False,offset:int=0,limit:int=240,q:str='',kind:str='',focus:str='',hops:int=1,traversal:str='all'):
+    def graph(pid:str,layer:str='business',include_candidates:bool=False,offset:int=0,limit:int=240,q:str='',kind:str='',focus:str='',hops:int=1,traversal:str='all',version:str|None=None):
         if layer not in ('business','metadata'):raise LightGraphError('graph_layer_invalid')
         if hops not in (1,2) or traversal not in ('all','chains'):raise LightGraphError('graph_page_invalid')
-        return read_graph_consistently(workspace,pid,read_graph,layer=layer,
-            include_candidates=include_candidates,offset=offset,limit=limit,q=q,kind=kind,focus=focus,hops=hops,traversal=traversal)
+        selection = dict(layer=layer, include_candidates=include_candidates, offset=offset, limit=limit,
+                         q=q, kind=kind, focus=focus, hops=hops, traversal=traversal)
+        if version is not None:
+            return graph_history.read_consistently(workspace, pid, graph_history.read_page, version=version, **selection)
+        reader = graph_history.read_consistently if layer == 'business' else read_graph_consistently
+        return reader(workspace, pid, read_graph, **selection)
 
     @app.get('/api/projects/{pid}/graph/batches')
     def graph_batches(pid:str,layer:str='business',part:str='nodes',offset:int=0,limit:int=1000,
-                      generation:str='',include_candidates:bool=False,focus:str='',hops:int=2,traversal:str='chains'):
+                      generation:str='',include_candidates:bool=False,focus:str='',hops:int=2,traversal:str='chains',version:str|None=None):
         from .graph_batches import read_graph_batch
-        return read_graph_consistently(workspace,pid,read_graph_batch,layer=layer,part=part,
-            offset=offset,limit=limit,generation=generation,include_candidates=include_candidates,
-            focus=focus,hops=hops,traversal=traversal)
+        selection = dict(layer=layer, part=part, offset=offset, limit=limit, generation=generation,
+                         include_candidates=include_candidates, focus=focus, hops=hops, traversal=traversal)
+        if version is not None:
+            return graph_history.read_consistently(workspace, pid, graph_history.read_batch, version=version, **selection)
+        reader = graph_history.read_consistently if layer == 'business' else read_graph_consistently
+        return reader(workspace, pid, read_graph_batch, **selection)
 
     @app.get('/api/projects/{pid}/graph/details')
-    def graph_details(pid:str,entity_id:str|None=None,fact_id:str|None=None,include_candidates:bool=False,offset:int=0):
-        return read_graph_consistently(workspace,pid,read_graph_details,entity_id=entity_id,fact_id=fact_id,
-                                      include_candidates=include_candidates,offset=offset)
+    def graph_details(pid:str,entity_id:str|None=None,fact_id:str|None=None,include_candidates:bool=False,offset:int=0,version:str|None=None):
+        selection = dict(entity_id=entity_id, fact_id=fact_id, include_candidates=include_candidates, offset=offset)
+        if version is not None:
+            return graph_history.read_consistently(workspace, pid, graph_history.read_details, version=version, **selection)
+        return graph_history.read_consistently(workspace, pid, read_graph_details, **selection)
 
     @app.get('/api/projects/{pid}/graph/structure')
     def graph_structure(pid:str,draft_id:str|None=None,revision:int|None=None):
@@ -844,6 +874,35 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     def workflow_status(pid: str):
         workspace.get(pid)
         return manager.workflow_status(pid)
+
+    @app.post('/api/projects/{pid}/runs/{rid}/resume', status_code=202)
+    def resume_workflow(pid: str, rid: str, data: ResumeRun, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+        with workspace.lock(pid):
+            mutable(pid)
+            workspace.require_config_revision(pid, if_match)
+            if data.action == 'publish_artifact':
+                if not data.artifact_id or data.from_node_id:
+                    raise LightGraphError('invalid_workflow_resume_request')
+                return manager.resume(pid, rid, action=data.action, artifact_id=data.artifact_id)
+            if not data.from_node_id or data.artifact_id:
+                raise LightGraphError('invalid_workflow_resume_request')
+            if data.action == 'recompose_legacy_merge':
+                return manager.resume(pid, rid, action=data.action, from_node_id=data.from_node_id)
+            from ..construction.workflow import resolve_workflow_plan
+            from .execution import _workflow_descendants
+            config = workspace.resolved_config(pid)
+            if not config.workflow or not config.workflow.enabled:
+                raise LightGraphError('workflow_not_enabled')
+            rerun = _workflow_descendants(resolve_workflow_plan(config.workflow), data.from_node_id)
+            workers = [u for u in config.workflow.units if u.unit_id in rerun]
+            workers.extend(m for m in config.workflow.merge_nodes if m.node_id in rerun and m.merge_mode == 'merge_and_extract')
+            sources, model = {}, None
+            if workers:
+                all_sources = [s.id for s in config.sources]
+                needed = {sid for node in workers for sid in (node.source_ids or all_sources)}
+                sources, model = resolved_credentials(pid, x_workbench_session, source_ids=needed)
+            return manager.resume(pid, rid, from_node_id=data.from_node_id,
+                                  source_credentials=sources, model_api_key=model)
 
     @app.post('/api/projects/{pid}/workflow/units/{unit_id}/retry', status_code=202)
     def retry_workflow_unit(pid: str, unit_id: str, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):

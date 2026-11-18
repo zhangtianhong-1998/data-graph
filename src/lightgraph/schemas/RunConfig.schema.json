@@ -85,6 +85,89 @@
       "title": "EmbeddingConfig",
       "type": "object"
     },
+    "EntityFusionRule": {
+      "additionalProperties": false,
+      "description": "Explicit cross-source identity mapping; never infer identity from labels.",
+      "properties": {
+        "entity_type": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Entity Type",
+          "type": "string"
+        },
+        "canonical_type": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Canonical Type",
+          "type": "string"
+        },
+        "identity_domain": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Identity Domain",
+          "type": "string"
+        },
+        "key_mapping": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Canonical identity key name -> existing node identity key name. Every identity key must be mapped; dropping keys is forbidden.",
+          "maxProperties": 32,
+          "minProperties": 1,
+          "title": "Key Mapping",
+          "type": "object"
+        },
+        "key_normalizers": {
+          "additionalProperties": {
+            "items": {
+              "enum": [
+                "trim",
+                "casefold",
+                "nfkc"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "maxProperties": 32,
+          "title": "Key Normalizers",
+          "type": "object"
+        },
+        "property_aliases": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Existing property name -> canonical property name. Use source_id.schema.table.property for a table-specific mapping. Units and meaning must already agree.",
+          "maxProperties": 128,
+          "title": "Property Aliases",
+          "type": "object"
+        },
+        "property_normalizers": {
+          "additionalProperties": {
+            "items": {
+              "enum": [
+                "trim",
+                "casefold",
+                "nfkc"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "maxProperties": 128,
+          "title": "Property Normalizers",
+          "type": "object"
+        }
+      },
+      "required": [
+        "entity_type",
+        "canonical_type",
+        "identity_domain",
+        "key_mapping"
+      ],
+      "title": "EntityFusionRule",
+      "type": "object"
+    },
     "EntityTypeDefinition": {
       "additionalProperties": false,
       "properties": {
@@ -218,6 +301,37 @@
         }
       },
       "title": "ExtractionGoal",
+      "type": "object"
+    },
+    "FusionPolicyConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 1,
+          "default": 1,
+          "title": "Version",
+          "type": "integer"
+        },
+        "label_conflict_policy": {
+          "default": "retain_variants",
+          "enum": [
+            "retain_variants",
+            "quarantine",
+            "strict"
+          ],
+          "title": "Label Conflict Policy",
+          "type": "string"
+        },
+        "entity_rules": {
+          "items": {
+            "$ref": "#/$defs/EntityFusionRule"
+          },
+          "maxItems": 128,
+          "title": "Entity Rules",
+          "type": "array"
+        }
+      },
+      "title": "FusionPolicyConfig",
       "type": "object"
     },
     "GraphScopeBinding": {
@@ -367,6 +481,18 @@
           "default": true,
           "title": "Emit Alignment Candidates",
           "type": "boolean"
+        },
+        "fusion_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FusionPolicyConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Explicit versioned fusion rules. Null preserves legacy low-level merge behavior; workflow execution inherits the project policy."
         }
       },
       "title": "MergePolicyConfig",
@@ -1480,6 +1606,9 @@
       "default": "default",
       "title": "Isolation Domain",
       "type": "string"
+    },
+    "fusion_policy": {
+      "$ref": "#/$defs/FusionPolicyConfig"
     },
     "sources": {
       "items": {

@@ -41,6 +41,37 @@ def unit_output_path(project_output_dir: str | Path, unit_id: str, attempt: str 
     return Path(project_output_dir) / 'attempts' / attempt / unit_id
 
 
+def run_output_path(project, relative):
+    """Resolve only project-owned output lineages from a persisted run record."""
+    if not isinstance(relative, str) or not re.fullmatch(r'output(?:/generations/run_[0-9a-f]{24})?', relative):
+        raise LightGraphError('invalid_output_generation')
+    project = Path(project)
+    path = project
+    for part in Path(relative).parts:
+        path = path / part
+        if path.is_symlink():
+            raise LightGraphError('invalid_output_generation')
+    return path
+
+
+def committed_unit_output(output, uid, attempt):
+    """Follow an attempt to its original generation after an explicit resume."""
+    local = unit_output_path(output, uid, attempt)
+    output = Path(output)
+    project = output.parent if output.name == 'output' else output.parents[2] if output.parent.name == 'generations' else None
+    if attempt is None or project is None:
+        return local
+    run_file = project / 'runs' / (attempt + '.json')
+    if not run_file.exists():
+        return local
+    if run_file.is_symlink():
+        raise LightGraphError('invalid_workflow_attempt')
+    record = json.loads(run_file.read_text('utf-8'))
+    if record.get('run_id') != attempt or record.get('project_id') != project.name:
+        raise LightGraphError('invalid_workflow_attempt')
+    return unit_output_path(run_output_path(project, record['output_path']), uid, attempt)
+
+
 def published_unit_attempts(project_output_dir):
     manifest_path = Path(project_output_dir) / 'construction' / 'manifest.yaml'
     if not manifest_path.is_file():
@@ -303,6 +334,8 @@ def build_merge_node_config(
         f'## 全节点合并抽取上下文 ({heading})\n\n'
         f'本节点已汇总并只读继承上游分节点抽取成果（{upstream_summary}）。\n'
         '请重点检查跨分支、跨表之间尚未打通的关联关系与全局语义补全，使用 `__base_graph__` 复用已抽取实体，避免无意义重复全表扫表。'
+        '已提交的上游图由编排器归并，本节点只保存有新证据的补充映射。先检查补充目标涉及的实体和端点；'
+        '已有规则足以覆盖目标时即可结束，无需重建或重新验证原抽取草稿。'
     )
     if merge_node.goal_markdown and merge_node.goal_markdown.strip():
         extra_parts.append(merge_node.goal_markdown.strip())
@@ -321,6 +354,7 @@ def build_merge_node_config(
             cloned.model = cloned.model.model_copy(update={'max_calls': merge_node.max_calls})
 
     wf = project_config.workflow
+    cloned.fusion_policy = effective_merge_policy(project_config, merge_node).fusion_policy
     cloned.enable_co_projection = (
         merge_node.enable_co_projection
         if merge_node.enable_co_projection is not None
@@ -408,11 +442,14 @@ def publish_premerged_graph(
     root_output = Path(project_output_dir)
     root_construction = root_output / 'construction'
     root_construction.mkdir(parents=True, exist_ok=True)
+    from .snapshot_registry import register_access_context
+    policy_id = register_access_context(root_construction, project_config)
     ctx_fingerprint = digest('workflow_merge_v2', access_fingerprint(project_config), merged)
     persisted = write_sharded_graph(
         root_construction,
         merged,
         context_fingerprint=ctx_fingerprint,
+        result_policy_id=policy_id,
         unit_attempts={uid: unit_attempts[uid] for uid in included_units if uid in unit_attempts},
     )
     merge_summary = {
@@ -445,6 +482,16 @@ def publish_premerged_graph(
     return merge_summary
 
 
+def effective_merge_policy(config, node=None):
+    workflow_policy = config.workflow.merge_policy if config.workflow else MergePolicyConfig()
+    policy = (getattr(node, 'merge_policy', None) or workflow_policy).model_copy(deep=True)
+    inherited = policy.fusion_policy or workflow_policy.fusion_policy
+    if inherited is None and policy.conflict_mode == "strict" and "fusion_policy" not in config.model_fields_set:
+        inherited = config.fusion_policy.model_copy(update={"label_conflict_policy": "strict"})
+    policy.fusion_policy = inherited or config.fusion_policy
+    return policy
+
+
 def publish_merged_contributors(
     project_output_dir: str | Path,
     project_config: RunConfig,
@@ -458,12 +505,11 @@ def publish_merged_contributors(
     independent_terminals: bool = False,
 ) -> dict[str, Any]:
     """Deterministically combine prepared contributors and publish sharded root construction graph."""
-    wf = project_config.workflow
     # Independent outputs must not inherit a cross-unit identity merge policy.
     direct = independent_terminals or mode in {'direct_output', 'direct_multi_output'}
     policy = (MergePolicyConfig(emit_alignment_candidates=False)
               if direct else
-              merge_policy or (wf.merge_policy if wf is not None else None))
+              merge_policy or effective_merge_policy(project_config))
     merged = merge_construction_graphs(
         contributors,
         target_access_fingerprint=access_fingerprint(project_config),
@@ -505,7 +551,7 @@ def promote_unit_to_project_output(
 
     attempts = published_unit_attempts(root_output)
     chosen_attempt = attempt if attempt is not None else attempts.get(unit_id)
-    output_dir = unit_output_path(root_output, unit_id, chosen_attempt)
+    output_dir = committed_unit_output(root_output, unit_id, chosen_attempt)
     contrib = load_unit_contributor(output_dir, unit_id)
     included: list[str] = []
     skipped: list[str] = []
@@ -560,7 +606,7 @@ def merge_project_workflow(
         if uid not in attempts and unit_attempts is not None:
             skipped_units.append(uid)
             continue
-        output_dir = unit_output_path(root_output, uid, attempts.get(uid))
+        output_dir = committed_unit_output(root_output, uid, attempts.get(uid))
         contrib = load_unit_contributor(output_dir, uid)
         if contrib is None:
             skipped_units.append(uid)
@@ -586,15 +632,45 @@ def workflow_state_path(project_output_dir: str | Path) -> Path:
     return Path(project_output_dir) / 'workflow-state.json'
 
 
-def save_workflow_state(project_output_dir: str | Path, state: dict[str, Any]) -> None:
-    atomic_text(workflow_state_path(project_output_dir), json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2))
+def _state_path(output, run_id=None):
+    if run_id is not None and (not isinstance(run_id, str) or not re.fullmatch(r'run_[a-f0-9]{24}', run_id)):
+        raise LightGraphError('run_not_found')
+    path = (Path(output) / 'workflow-runs' / (run_id + '.json')
+            if run_id else workflow_state_path(output))
+    if path.parent.is_symlink() or path.is_symlink():
+        raise LightGraphError('workspace_path_invalid')
+    return path
 
 
-def load_workflow_state(project_output_dir: str | Path) -> dict[str, Any] | None:
-    path = workflow_state_path(project_output_dir)
+def archive_workflow_state(project_output_dir, state):
+    """Keep the last pre-checkpoint installation's state before switching runs."""
+    if state:
+        path = _state_path(project_output_dir, state['parent_run_id'])
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_text(path, json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2))
+
+
+def save_workflow_state(project_output_dir: str | Path, state: dict[str, Any], *, current_only=False) -> None:
+    payload = json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2)
+    rid = state.get('parent_run_id')
+    if rid and not current_only:
+        path = _state_path(project_output_dir, rid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_text(path, payload)
+    atomic_text(_state_path(project_output_dir), payload)
+
+
+def load_workflow_state(project_output_dir: str | Path, run_id: str | None = None) -> dict[str, Any] | None:
+    path = _state_path(project_output_dir, run_id)
+    if run_id and not path.exists():
+        # Old installations have only the last state, never borrow another run.
+        current = load_workflow_state(project_output_dir)
+        return current if current and current.get('parent_run_id') == run_id else None
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text(encoding='utf-8'))
+        value = json.loads(path.read_text(encoding='utf-8'))
+        return value if isinstance(value, dict) else None
     except (OSError, ValueError):
         return None

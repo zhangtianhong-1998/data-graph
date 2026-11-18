@@ -23,7 +23,8 @@ def authored():
 
 
 def test_return_exhaustion_precedes_conflict_advice_and_retains_resumable_draft(tmp_path):
-    config = RunConfig(sources=[], model={'mode': 'in_environment'}, max_returned_bytes=1024)
+    config = RunConfig(sources=[], model={'mode': 'in_environment'}, max_returned_bytes=1024,
+                       fusion_policy={'label_conflict_policy': 'quarantine'})
     with source() as adapter:
         tools = ConstructionTools(config, tmp_path/'work', adapters=[adapter])
         try:

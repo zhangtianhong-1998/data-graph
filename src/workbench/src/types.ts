@@ -31,7 +31,17 @@ export interface WorkflowUnitConfig {
   enable_co_projection?: boolean | null
   position?: WorkflowPosition | null
 }
+export interface EntityFusionRule {
+  entity_type: string; canonical_type: string; identity_domain: string
+  key_mapping: Record<string, string>; property_aliases?: Record<string, string>
+  key_normalizers?: Record<string, string[]>; property_normalizers?: Record<string, string[]>
+}
+export interface FusionPolicy {
+  version: 1; label_conflict_policy: 'retain_variants' | 'strict' | 'quarantine'
+  entity_rules: EntityFusionRule[]
+}
 export interface MergePolicyConfig {
+  fusion_policy?: FusionPolicy | null
   shared_entity_types: string[]
   authority_sources: string[]
   conflict_mode: 'quarantine' | 'strict'
@@ -121,6 +131,9 @@ export interface WorkflowUnitState {
   updated_at?: string
 }
 export interface WorkflowState {
+  artifacts?: Record<string, { artifact_id: string; graph_kind: string; coverage?: string }>
+  terminal_ids?: string[]
+  resumed_from_run_id?: string
   parent_run_id?: string
   workflow_input?: string
   plan_mode?: string
@@ -132,6 +145,7 @@ export interface WorkflowState {
   merge?: Record<string, unknown>
 }
 export interface RunConfig {
+  fusion_policy?: FusionPolicy
   max_run_seconds?: number
   max_db_queries?: number | null
   max_returned_rows?: number | null
@@ -152,7 +166,8 @@ export interface RunConfig {
 export interface Table { source_id: string; schema: string; name: string; columns: Array<{ name: string; data_type?: string; comment?: string; [key: string]: unknown }> }
 export interface GraphNode { id: string; label?: string; name?: string; kind?: string; layer?: string; status?: string; [key: string]: unknown }
 export interface StandardNodeAttributeOrigin { source_id: string; qualified_table: string; column: string | null; data_type: string }
-export interface StandardNodeAttribute { key: string; label: string; values: unknown[]; data_type: string; origin_tables: StandardNodeAttributeOrigin[] }
+export interface AttributeObservation { row_context?: { values?: Record<string, unknown> } | null; value: unknown; raw_value?: unknown; original_property?: string; source_id: string; qualified_table: string; column?: string | null; scope_ref?: string; evidence_refs?: string[]; observation_id?: string }
+export interface StandardNodeAttribute { observations?: AttributeObservation[]; key: string; label: string; values: unknown[]; data_type: string; origin_tables: StandardNodeAttributeOrigin[] }
 export interface StandardNodeSourceEvidenceField { role: string; field: string; column: string; data_type: string }
 export interface StandardNodeSourceEvidence {
   source_id: string; source_kind: string; source_kind_label: string; schema: string; table: string; qualified_table: string
@@ -164,6 +179,7 @@ export interface StandardNodeCatalogNote {
   column_comments: Array<{ column: string; data_type: string; comment: string }>; note_kind: string
 }
 export interface StandardNode {
+  label_variants?: string[]; label_conflict?: boolean
   id: string; kind: string; status: string; chinese_name: string | null; english_name: string | null
   english_name_status: 'mapped' | 'unknown'; display_name: string; aliases: string[]
   identity: Record<string, unknown>; identity_types: Record<string, string>

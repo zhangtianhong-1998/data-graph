@@ -333,6 +333,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     await nextTick()
     expect(root.querySelectorAll('.wf-node-merge')).toHaveLength(1)
     const modeSelect = root.querySelector<HTMLSelectElement>('#inspector-merge-mode-0')!
+    expect(modeSelect.value).toBe('deterministic')
     modeSelect.value = 'merge_and_extract'
     modeSelect.dispatchEvent(new Event('change', { bubbles: true }))
     await nextTick()

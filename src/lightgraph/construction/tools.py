@@ -102,6 +102,7 @@ class ConstructionTools:
         # Run-local totals; saved validations may belong to previous runs and
         # cached reuse performs no new materialization.
         self.validation_phase_timings = Counter()
+        self.projection_counts = Counter()
         try:
             self.query_budget = install_run_query_budget(config, self.adapters)
             self.documents = DocumentCorpus([document for document in load_documents(config.documents)
@@ -133,6 +134,11 @@ class ConstructionTools:
                            for key, table in executor.tables.items()}
             self._sections = self.documents.contexts_for(list(self.tables.values()))
             self._source_hashes = [(s.id, _file_hash(s.path)) for s in config.sources if s.path]
+            from .projection_reuse import ImmutableProjections
+            file_sources = {s.id for s in config.sources if s.kind in {'csv_file', 'excel_workbook'}}
+            self._immutable_projections = ImmutableProjections(
+                [(sid, sha) for sid, sha in self._source_hashes if sid in file_sources] if self._own_adapters else [],
+                min(8 * 1024**2, config.max_working_bytes // 8))
             self._material_hashes = [(path, _file_hash(path)) for path in config.documents]
             from .inheritance import load_frozen_base_graph
             self.base_graph, self.inherited_summary = load_frozen_base_graph(workspace, config=config)
@@ -153,8 +159,11 @@ class ConstructionTools:
                     if any(not s.path for s in config.sources) else None,
                 [(d.document_id, d.revision, d.content_hash) for d in self.documents.documents],
                 {'source_key_semantics': SOURCE_KEY_SEMANTICS_VERSION},
+                config.fusion_policy.model_dump(mode='json'),
                 *((self.inherited_summary,) if self.inherited_summary.get('inherited_count') else ()))
             self.workspace = GraphWorkspace(workspace, fingerprint)
+            from .snapshot_registry import register_access_context
+            self.workspace.result_policy_id = register_access_context(self.workspace.root, config)
             from .result_materials import ResultMaterialStore, result_token_limit
             self.result_materials = ResultMaterialStore(self.workspace.root, fingerprint,
                 self._result_access(), result_token_limit(config.resolved_model))
@@ -200,6 +209,8 @@ class ConstructionTools:
                 pass
 
     def close(self):
+        if hasattr(self, '_immutable_projections'):
+            self._immutable_projections.trim(0)
         if hasattr(self, 'result_materials'):
             self.result_materials.close()
         for executor in set(self.executors.values()):
@@ -853,14 +864,22 @@ class ConstructionTools:
             stopped['metadata_definitions'] = self._definition_options(record)
             return stopped
         started = datetime.now(timezone.utc).isoformat()
+        # A repeated validation of the same revision is an explicit re-check;
+        # reuse_validated above is the separate opt-in for its committed result.
+        reread = force_refresh or (record.validation is not None and record.validation.revision == record.revision)
+        if reread:
+            self._immutable_projections.trim(0)
         result = execute_draft(record.draft, self.adapters, list(self.tables.values()),
             goal=self.config.goal, max_working_bytes=self.config.max_working_bytes,
             max_rows=self.config.limits.max_result_rows, max_seconds=self.budget.remaining_seconds(),
             scope_bindings=self.config.scope_bindings,
             cancelled=self._shutdown_requested.is_set,
-            base_graph=self.base_graph,
+            base_graph=self.base_graph, label_conflict_policy=self.config.fusion_policy.label_conflict_policy,
+            immutable_projections=self._immutable_projections if self._immutable_projections.versions else None,
             enable_co_projection=getattr(self.config, 'enable_co_projection', False))
         self.validation_phase_timings.update(result.get('phase_timings', {}))
+        self.projection_counts.update({k: result['metrics'].get(k, 0) for k in (
+            'immutable_projection_hits', 'projection_cache_hits', 'co_projection_hits', 'unique_projections')})
         self._check_current_inputs()
         recovery = self._snapshot_recovery_sources(sources)
         from .failures import SOURCE_FAILURES
@@ -917,7 +936,7 @@ class ConstructionTools:
         diagnostics = result['diagnostics']
         from .conflicts import subset_available, isolate_validation
         subset = None
-        if subset_available(current.validation):
+        if self.config.fusion_policy.label_conflict_policy == 'quarantine' and subset_available(current.validation):
             try:
                 clean = isolate_validation(graph, diagnostics)
                 subset = {'nodes': len(clean['nodes']), 'edges': len(clean['edges']),
@@ -936,6 +955,8 @@ class ConstructionTools:
                 'validation_material': 'validation:' + draft_id,
                 'conflicts_material': 'conflicts:' + draft_id,
                 'publishable_subset': subset,
+                'label_conflict_policy': self.config.fusion_policy.label_conflict_policy,
+                'retained_label_conflicts': sum(bool(n.get('label_conflict')) for n in visible_graph['nodes']),
                 'draft_material': 'draft:' + draft_id, "statistics": statistics,
                 'effective_limits': {'max_working_bytes': self.config.max_working_bytes,
                     'max_returned_rows': self.config.max_returned_rows,
@@ -978,12 +999,14 @@ class ConstructionTools:
         record = self.workspace.get_draft(draft_id)
         self._check_metadata_catalog(record.draft)
         self._require_draft_sources(record.draft)
-        selected = self.workspace.select_validation(draft_id, validation_id, isolate_conflicts=True)
+        isolate = self.config.fusion_policy.label_conflict_policy == 'quarantine'
+        selected = self.workspace.select_validation(draft_id, validation_id, isolate_conflicts=isolate)
         graph = self.workspace.read_validation_graph(draft_id, selected)
         if graph.get('access_fingerprint') != access_fingerprint(self.config):
             raise LightGraphError('validated_graph_access_mismatch')
         publication = self.workspace.publish(draft_id, revision=record.revision, graph=graph,
-                                             validation_id=selected.validation_id, isolate_conflicts=True)
+                                             validation_id=selected.validation_id, isolate_conflicts=isolate,
+                                             fusion_policy=self.config.fusion_policy)
         manifest = self.workspace.read_summary()
         merged = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes,
                                      external_visible_ids=self._base_visible_ids)
@@ -1004,7 +1027,9 @@ class ConstructionTools:
         if changed:
             raise LightGraphError('construction_source_changed')
 
-    def read_workspace(self, draft_id: str | None = None):
+    def read_workspace(self, draft_id: str | None = None, *, summary_only=False, offset=0):
+        if summary_only:
+            return {'status': 'ok', 'summary_only': True, **self.workspace.draft_index(draft_id, offset=offset)}
         value = self.workspace.get_draft(draft_id).model_dump(mode="json", by_alias=True) if draft_id else self.workspace.read_summary()
         if draft_id is None:
             value['retained_failed_work'] = self._retained_failed_work()

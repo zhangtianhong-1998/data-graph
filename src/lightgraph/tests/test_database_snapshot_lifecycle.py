@@ -186,3 +186,35 @@ def test_cancelling_between_snapshots_stops_without_touching_closed_connection(e
         assert factory.calls == calls and source._reconnect_attempts == 0
         assert source.terminal_failure_code is None
     finally: source.close()
+
+
+@pytest.mark.parametrize('engine', ['gauss', 'mysql'])
+@pytest.mark.parametrize('abort', [False, True])
+def test_validation_reuses_session_only_between_completed_transactions(engine, abort):
+    from lightgraph.sources.validation_session import reuse_validation_sessions
+    source, data, controls, factory = sessions(engine)
+
+    @reuse_validation_sessions
+    def validate():
+        assert read(source) == [('001', 'Expenses')]
+        assert not data[1].closed and not source.capabilities().consistent_snapshot
+        before = len(data[1].executed)
+        assert read(source) == [('001', 'Expenses')]
+        begins = 'BEGIN' if engine == 'gauss' else 'START TRANSACTION'
+        assert any(sql.startswith(begins) for sql, _ in data[1].executed[before:])
+        if abort:
+            raise ValueError('validation stopped')
+
+    try:
+        if abort:
+            with pytest.raises(ValueError, match='validation stopped'):
+                validate()
+        else:
+            validate()
+        assert data[1].closed and all(c.closed for c in controls[:2])
+        assert source._connection_acquisitions == 2
+        assert source.stats.physical_connections_opened == (4 if engine == 'mysql' else 2)
+        assert read(source) == [('001', 'Expenses')]
+        assert source._connection_acquisitions == 3 and data[2].closed
+    finally:
+        source.close()

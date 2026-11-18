@@ -6,6 +6,7 @@ are not evidence: an old artifact's fallback can include now-hidden information.
 from collections import Counter, defaultdict
 from copy import deepcopy
 
+from .fusion import annotate_visible_variants
 from lightgraph.contracts import canonical
 from lightgraph.source_values import identity_cell
 
@@ -38,9 +39,15 @@ def derive_display_graph(graph, *, copy=True):
     base = {}
     for node in by_id.values():
         supports = node.get('supports')
+        if result.get('label_conflict_policy') == 'retain_variants' and supports is not None:
+            annotate_visible_variants(node)
         # Legacy non-support fixtures have only a source label. Runtime graph
         # access rejects missing support metadata before reaching this function.
         labels = sorted({support['label'] for support in supports or [] if support.get('label') not in (None, '')})
+        preferred = [(s['label_priority'], s['label']) for s in supports or []
+                     if isinstance(s.get('label_priority'), int) and s.get('label')]
+        if preferred:
+            labels = [min(preferred)[1]]
         if supports is None and node.get('label') and node.get('label_origin', 'source') == 'source':
             labels = [node['label']]
         declared = defaultdict(list)

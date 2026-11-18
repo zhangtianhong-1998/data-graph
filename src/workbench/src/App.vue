@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import GraphCanvas from './GraphCanvas.vue'
+import GraphHistory from './GraphHistory.vue'
 import StructurePreview from './StructurePreview.vue'
 import RunIssues from './RunIssues.vue'
 import ConstructionReport from './ConstructionReport.vue'
@@ -17,6 +18,7 @@ import DiscoveryCandidates from './DiscoveryCandidates.vue'
 import DatabaseSourceDialog from './DatabaseSourceDialog.vue'
 import DataInputs from './DataInputs.vue'
 import WorkflowEditor from './WorkflowEditor.vue'
+import FusionEditor from './FusionEditor.vue'
 import RetrievalPanel from './RetrievalPanel.vue'
 import { useVectorization } from './useVectorization'
 import ConfirmDelete from './ConfirmDelete.vue'
@@ -27,7 +29,7 @@ import { ApiError, ensureSession, clearSessions, clearSession, json, projectPath
 import { assertNoCredentials, graphOutcome, isActive, runLabels, stageLabel } from './state'
 import { WorkbenchLocation } from './workbenchLocation'
 import { readGraph } from './graphRead'
-import type { DocumentScope, EmbeddingConfig, Graph, InheritedGraphRef, Metadata, Project, ProjectFile, RetrievalStatusResponse, Run, RunConfig, SourceConfig, WorkflowConfig, WorkflowState } from './types'
+import type { FusionPolicy, DocumentScope, EmbeddingConfig, Graph, InheritedGraphRef, Metadata, Project, ProjectFile, RetrievalStatusResponse, Run, RunConfig, SourceConfig, WorkflowConfig, WorkflowState } from './types'
 
 
 const projects = ref<Project[]>([])
@@ -89,6 +91,9 @@ const internalEmbeddingHttp = computed(() => {
     return url.protocol === 'http:' && !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(url.hostname)
   } catch { return false }
 })
+const defaultFusion: FusionPolicy = { version: 1, label_conflict_policy: 'retain_variants', entity_rules: [] }
+const fusionPolicy = ref<FusionPolicy>(defaultFusion)
+const fusionDirty = computed(() => JSON.stringify(fusionPolicy.value) !== JSON.stringify(config.value.fusion_policy ?? defaultFusion))
 const workflowConfig = ref<WorkflowConfig | null>(null)
 const inheritedGraphs = ref<InheritedGraphRef[]>([])
 const workflowRunStatus = ref<{ enabled: boolean; units: string[]; state: WorkflowState | null; merge_summary?: Record<string, unknown> | null } | null>(null)
@@ -156,6 +161,12 @@ type CredentialStatus = { database_sources: string[]; database_errors?: Record<s
 const credentials = ref<CredentialStatus>({ database_sources: [], model: false })
 const metadata = ref<Metadata>({ tables: [], nodes: [], edges: [] })
 const business = ref<Graph>({ nodes: [], edges: [] })
+const selectedGraphVersion = ref('')
+async function selectGraphVersion(version: string) {
+  selectedGraphVersion.value = version
+  business.value = { nodes: [], edges: [] }; structurePreviewOpen.value = false
+  await loadBusinessGraph()
+}
 const structurePreviewOpen = ref(false)
 const graphLoading = ref(false), graphError = ref('')
 let graphRequestEpoch = 0
@@ -173,10 +184,15 @@ const visibleWorkflowState = computed(() => {
 const canEditWorkflowRun = computed(() => Boolean(config.value.workflow?.enabled && selectedRun.value &&
   workflowRunStatus.value?.state?.parent_run_id === selectedRun.value.run_id))
 const workflowOutputLabel = computed(() => {
-  const status = visibleWorkflowState.value?.merge?.status
+  const merge = visibleWorkflowState.value?.merge
+  const status = merge?.status
+  const coverage = (merge?.conflict_isolation as { coverage?: string } | undefined)?.coverage
+  if (merge?.publication_status === 'published' && coverage === 'incomplete') return '已发布，覆盖有缺口'
+  if (merge?.publication_status === 'retained_previous') return '未发布新图，仍显示上次结果'
+  if (merge?.publication_status === 'blocked') return '本次未生成项目输出，可在历史版本查看已提交的节点图'
   if (status === 'direct_output') return '抽取节点直接输出'
   if (status === 'direct_multi_output') return '各抽取分支独立输出'
-  return status || '待运行'
+  return merge?.publication_status === 'published' ? '已发布' : status || '待运行'
 })
 const runPollError = ref<string | null>(null)
 const newProjectOpen = ref(false), newName = ref(''), newId = ref('')
@@ -204,7 +220,7 @@ const queryLimitDirty = computed(() => effectiveQueryLimit.value !== (config.val
 const embeddingDirty = computed(() => JSON.stringify(embedding.value) !== JSON.stringify(config.value.embedding || {}))
 const workflowDirty = computed(() => JSON.stringify(workflowConfig.value) !== JSON.stringify(config.value.workflow ?? null))
 const inheritedDirty = computed(() => JSON.stringify(inheritedGraphs.value) !== JSON.stringify(config.value.inherited_graphs || []))
-const formDirty = computed(() => traceRecording.value !== (config.value.record_trace !== false) || runSeconds.value !== (config.value.max_run_seconds ?? runSecondsDefault) || queryLimitDirty.value || Object.keys(resourceChanges.value).length > 0 || constructionTarget.value !== (config.value.construction_target ?? 'instances') || purpose.value !== goalMarkdown(config.value) || JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}) || embeddingDirty.value || workflowDirty.value || inheritedDirty.value)
+const formDirty = computed(() => traceRecording.value !== (config.value.record_trace !== false) || runSeconds.value !== (config.value.max_run_seconds ?? runSecondsDefault) || queryLimitDirty.value || Object.keys(resourceChanges.value).length > 0 || constructionTarget.value !== (config.value.construction_target ?? 'instances') || purpose.value !== goalMarkdown(config.value) || JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}) || embeddingDirty.value || workflowDirty.value || inheritedDirty.value || fusionDirty.value)
 const dirty = computed(() => !!modelKey.value || !!embeddingKey.value || formDirty.value || agentLimitsDirty.value)
 const advancedDirty = computed(() => configTextChanged(advanced.value, advancedBaseline.value))
 function previewConfig(): RunConfig {
@@ -216,12 +232,13 @@ function previewConfig(): RunConfig {
   if (traceRecording.value !== (config.value.record_trace !== false)) value.record_trace = traceRecording.value
   if (!value.agent_config && JSON.stringify(model.value) !== JSON.stringify(config.value.model || {})) value.model = { ...model.value }
   if (embeddingDirty.value || 'embedding' in config.value) value.embedding = JSON.parse(JSON.stringify(embedding.value)) as EmbeddingConfig
+  if (fusionDirty.value) value.fusion_policy = fusionPolicy.value
   if (workflowDirty.value || 'workflow' in config.value) value.workflow = workflowConfig.value ? JSON.parse(JSON.stringify(workflowConfig.value)) as WorkflowConfig : null
   if (inheritedDirty.value || 'inherited_graphs' in config.value) value.inherited_graphs = JSON.parse(JSON.stringify(inheritedGraphs.value)) as InheritedGraphRef[]
   return value
 }
 function resetAdvanced() { advanced.value = advancedBaseline.value = JSON.stringify(previewConfig(), null, 2) }
-watch([purpose, runSeconds, effectiveQueryLimit, resources, constructionTarget, traceRecording, model, embedding, workflowConfig, inheritedGraphs], () => {
+watch([purpose, runSeconds, effectiveQueryLimit, resources, constructionTarget, traceRecording, model, embedding, workflowConfig, inheritedGraphs, fusionPolicy], () => {
   // The JSON view follows the form until the user edits the JSON itself.
   if (!advancedDirty.value) resetAdvanced()
 }, { deep: true })
@@ -254,6 +271,7 @@ function fillForms(value: RunConfig) {
   traceRecording.value = value.record_trace !== false
   model.value = JSON.parse(JSON.stringify(value.model || {}))
   embedding.value = JSON.parse(JSON.stringify(value.embedding || {}))
+  fusionPolicy.value = JSON.parse(JSON.stringify(value.fusion_policy ?? defaultFusion))
   workflowConfig.value = value.workflow ? JSON.parse(JSON.stringify(value.workflow)) : null
   inheritedGraphs.value = JSON.parse(JSON.stringify(value.inherited_graphs || []))
   advanced.value = advancedBaseline.value = JSON.stringify(value, null, 2)
@@ -264,6 +282,7 @@ function formConfig(): RunConfig {
   const value: RunConfig = { ...config.value, ...resourceChanges.value, record_trace: traceRecording.value, max_run_seconds: runSeconds.value!, max_db_queries: effectiveQueryLimit.value, construction_target: constructionTarget.value, goal_markdown: purpose.value }
   if (!value.agent_config) value.model = { ...model.value }
   if (embeddingDirty.value || 'embedding' in config.value) value.embedding = JSON.parse(JSON.stringify(embedding.value)) as EmbeddingConfig
+  if (fusionDirty.value) value.fusion_policy = fusionPolicy.value
   if (workflowDirty.value || 'workflow' in config.value) value.workflow = workflowConfig.value ? JSON.parse(JSON.stringify(workflowConfig.value)) as WorkflowConfig : null
   if (inheritedDirty.value || 'inherited_graphs' in config.value) value.inherited_graphs = JSON.parse(JSON.stringify(inheritedGraphs.value)) as InheritedGraphRef[]
   assertNoCredentials(value)
@@ -285,7 +304,7 @@ async function reloadProjects(select?: string) {
 async function loadProject(id: string) {
   if (project.value?.project_id === id && !loading.value) return
   if (project.value && project.value.project_id !== id && (dirty.value || advancedDirty.value) && !window.confirm('当前项目有未保存的配置修改。切换项目会放弃这些修改，继续吗？')) return
-  runMode.value = 'continue'
+  runMode.value = 'continue'; selectedGraphVersion.value = ''
   workbenchLocation.selectProject(id)
   const epoch = ++generation
   graphController?.abort()
@@ -328,6 +347,7 @@ function applyProjectConfig(nextProject: Project, nextConfig: RunConfig, preserv
     purpose: purpose.value !== goalMarkdown(config.value) ? purpose.value : undefined,
     model: JSON.stringify(model.value) !== JSON.stringify(config.value.model || {}) ? JSON.parse(JSON.stringify(model.value)) as typeof model.value : undefined,
     embedding: embeddingDirty.value ? JSON.parse(JSON.stringify(embedding.value)) as EmbeddingConfig : undefined,
+    fusionPolicy: fusionDirty.value ? fusionPolicy.value : undefined,
     workflowConfig: workflowDirty.value ? JSON.parse(JSON.stringify(workflowConfig.value)) as WorkflowConfig | null : undefined,
     inheritedGraphs: inheritedDirty.value ? JSON.parse(JSON.stringify(inheritedGraphs.value)) as InheritedGraphRef[] : undefined,
   } : null
@@ -347,6 +367,7 @@ function applyProjectConfig(nextProject: Project, nextConfig: RunConfig, preserv
     if (edits.purpose !== undefined) purpose.value = edits.purpose
     if (edits.model !== undefined && !agentConfigRemoved) model.value = edits.model
     if (edits.embedding !== undefined) embedding.value = edits.embedding
+    if (edits.fusionPolicy) fusionPolicy.value = edits.fusionPolicy
     if (edits.workflowConfig !== undefined) workflowConfig.value = edits.workflowConfig
     if (edits.inheritedGraphs !== undefined) inheritedGraphs.value = edits.inheritedGraphs
   }
@@ -371,10 +392,14 @@ async function loadBusinessGraph(p = path.value, epoch = generation) {
   const controller = new AbortController(); graphController = controller
   graphLoading.value = true; graphError.value = ''
   try {
-    const graph = await readGraph<Graph>(`${p}/graph?layer=business&include_candidates=${includeCandidates.value}&limit=1000`, controller.signal)
+    const graph = await readGraph<Graph>(`${p}/graph?layer=business&include_candidates=${includeCandidates.value}&limit=1000${selectedGraphVersion.value ? `&version=${encodeURIComponent(selectedGraphVersion.value)}` : ''}`, controller.signal)
     if (epoch === generation && requestEpoch === graphRequestEpoch) business.value = graph
   } catch (exception) {
-    if (epoch === generation && requestEpoch === graphRequestEpoch) graphError.value = exception instanceof Error ? exception.message : '图谱读取失败，请重试。'
+    if (epoch === generation && requestEpoch === graphRequestEpoch) {
+      // A previous view cannot stand in for a currently denied or invalid snapshot.
+      if (exception instanceof ApiError && exception.status >= 400 && exception.status < 500) business.value = { nodes: [], edges: [] }
+      graphError.value = exception instanceof Error ? exception.message : '图谱读取失败，请重试。'
+    }
   } finally { if (epoch === generation && requestEpoch === graphRequestEpoch) graphLoading.value = false }
 }
 function schedulePoll(epoch: number) {
@@ -541,6 +566,24 @@ async function retryWorkflowUnit(unitId: string) {
     notify(`已单独重跑链路 ${unitId}`)
   })
 }
+async function resumeWorkflow(target: { from_node_id: string; action?: 'recompose_legacy_merge' } | { artifact_id: string }) {
+  const original = selectedRun.value
+  if (!original || !project.value) return
+  await action(async () => {
+    if (dirty.value || advancedDirty.value) await saveDraft()
+    const actionName = 'artifact_id' in target ? 'publish_artifact' : target.action || 'rerun_node'
+    if (actionName === 'rerun_node') await ensureSession(original.project_id)
+    const run = await request<Run>(`${projectPath(original.project_id)}/runs/${encodeURIComponent(original.run_id)}/resume`, {
+      method: 'POST', headers: revisionHeaders(), body: json({ ...target, action: actionName }),
+    })
+    runs.value = [run, ...runs.value.filter(item => item.run_id !== run.run_id)]
+    selectedRun.value = run; tab.value = 'runs'
+    schedulePoll(generation)
+    if (!isActive(run)) await loadBusinessGraph()
+    try { await refreshWorkflowStatus() } catch { /* The selected run has its own state. */ }
+    notify(actionName === 'rerun_node' ? '已创建新的节点恢复运行' : '已创建项目发布任务')
+  })
+}
 async function remergeWorkflow() {
   await action(async () => {
     if (dirty.value || advancedDirty.value) await saveDraft()
@@ -693,8 +736,7 @@ async function startRun() {
     await saveDraft()
     const run = await request<Run>(`${path.value}/runs`, { method: 'POST', headers: revisionHeaders(), body: JSON.stringify({ run_mode: runMode.value }) })
     if (run.run_mode === 'fresh' && run.status !== 'failed') {
-      business.value = { nodes: [], edges: [] }; structurePreviewOpen.value = false
-      void loadBusinessGraph()
+      if (!selectedGraphVersion.value) { business.value = { nodes: [], edges: [] }; structurePreviewOpen.value = false; void loadBusinessGraph() }
     }
     runPollError.value = null
     runs.value = [run, ...runs.value.filter(item => item.run_id !== run.run_id)]; selectedRun.value = run; tab.value = 'runs'; schedulePoll(generation)
@@ -806,6 +848,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
             <div class="layout-two"><section class="panel"><div class="panel-head"><h2>抽取目标</h2><span class="badge">Markdown</span></div><div class="panel-body"><div class="field"><label for="purpose">目标与要求</label><textarea id="purpose" v-model="purpose" :disabled="locked" class="goal-input" maxlength="64000" placeholder="# 本次目标&#10;&#10;说明希望发现的对象、属性和关系。&#10;&#10;## 补充说明&#10;&#10;可填写业务定义、关注范围、排除内容和验收要求。"/><p class="field-hint">目标与知识材料统一使用 Markdown。目标直接指导本次构建，知识文档按分析需要读取；文字内容不会改变数据接入权限。</p></div><p v-if="config.goal?.entity_kinds?.length || config.goal?.relation_kinds?.length" class="note">当前配置还有限定类型：{{ [...(config.goal.entity_kinds || []), ...(config.goal.relation_kinds || [])].join('、') }}。这些程序约束保留在完整配置中，编辑 Markdown 不会自动解除。</p></div><div class="panel-footer"><span>保存后保留 Markdown 原文；下次运行使用已保存修订</span><button class="btn primary" :disabled="locked" @click="action(async () => { await saveForms(); notify('抽取目标已保存') })">保存目标</button></div></section><aside class="stack"><section class="panel"><div class="panel-head"><h2>知识材料</h2></div><div class="panel-body"><p>已有 {{ documentFiles.length }} 份 Markdown 文档。可补充数据字典、业务说明或关系定义，不必预先编写抽取规则。</p><button class="btn" @click="tab = 'documents'">管理知识文档</button></div></section><section class="panel"><div class="panel-head"><h2>项目概况</h2></div><div class="panel-body"><div class="scope-row"><span>数据来源</span><strong>{{ config.sources?.length || 0 }}</strong></div><div class="scope-row"><span>已读取的表</span><strong>{{ metadata.tables.length }}</strong></div><div class="scope-row"><span>业务图节点</span><strong>{{ business.total_nodes ?? business.nodes.length }}</strong></div></div></section></aside></div>
           </template>
           <template v-if="tab === 'workflow'">
+            <FusionEditor :key="project.project_id" v-model="fusionPolicy" :locked="locked"/>
             <WorkflowEditor
               :project-id="project.project_id"
               :projects="projects"
@@ -814,6 +857,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
               :documents="documentFiles.filter(file => (config.documents || []).some(doc => doc === file.relative_path || doc === file.file_id || doc === file.name || doc.endsWith('/' + file.relative_path)))"
               :scopes="Array.isArray(config.scopes) ? config.scopes : ['public']"
               :workflow="workflowConfig"
+              :project-fusion="fusionPolicy"
               :inherited-graphs="inheritedGraphs"
               :locked="locked"
               :dirty="dirty || advancedDirty"
@@ -833,7 +877,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
             <div class="intro"><div><h2>知识文档</h2></div><button class="btn primary" :disabled="locked" @click="documentInput?.click()">＋ 上传 Markdown</button><input ref="documentInput" type="file" hidden multiple accept=".md,.markdown" @change="upload"/></div>
             <div class="document-layout"><section class="panel"><div class="panel-head"><h2>Markdown 知识材料</h2><span class="badge">{{ documentFiles.length }} 个文档</span></div><div v-if="!documentFiles.length" class="empty-state"><h3>添加知识材料</h3><p>支持 Markdown 数据说明、业务定义和分析经验；运行时按需要读取，不会一次性塞入全部原文。</p></div><div v-for="file in documentFiles" :key="file.file_id" class="doc-row"><span class="file-icon">MD</span><div class="file-info"><h3>{{ file.name }}</h3><div class="chips"><span v-if="!Array.isArray(config.documents) || !config.documents.includes(file.relative_path)" class="badge amber">未参与抽取</span><span class="badge blue">{{ purposeLabels[file.purpose] || '待分类' }}</span><span class="badge">{{ file.scope?.tables?.length ? `绑定 ${file.scope.tables.length} 张表` : file.scope?.source_ids?.length || file.scope?.columns?.length ? '限定范围' : '全局使用' }}</span></div><p v-if="file.scope?.tables?.length" class="break">{{ file.scope.tables.join('、') }}</p><p>{{ size(file.size) }}</p><div class="actions"><button class="btn small" :disabled="busy" @click="showContent(file)">查看原文</button><button class="btn small" :disabled="locked" @click="openBinding(file)">设置用途与范围</button><button class="btn small danger-text" :disabled="locked" :aria-label="`删除文档 ${file.name}`" @click="askDeletion({ kind: 'file', file })">删除</button></div></div></div></section></div>
           </template>
-          <template v-if="tab === 'metadata' || tab === 'business'"><div class="intro"><div><h2>{{ tab === 'metadata' ? '元数据关联图' : '业务知识图谱' }}</h2></div><div class="actions"><template v-if="tab === 'business' && (business.nodes.length > 0 || retrievalStatus?.has_graph)"><span class="badge" :class="retrievalStatus?.status === 'vectorized' ? 'green' : 'amber'">{{ retrievalStatus?.status === 'vectorized' ? `已完成向量化 · ${retrievalStatus.embedder_model || 'local_hash'} (${retrievalStatus.vector_dim ?? '—'}维)` : retrievalStatus?.status === 'stale' ? '图谱或模型已变更 · 待重新向量化' : '未向量化' }}</span><button class="btn" :class="{ primary: !retrievalStatus?.vectorized }" :disabled="vectorizing || busy" @click="vectorizeGraph">{{ vectorizing ? '正在向量化…' : retrievalStatus?.vectorized ? '重新向量化' : '立即向量化' }}</button></template><button v-if="tab === 'business'" class="btn" :aria-expanded="structurePreviewOpen" @click="structurePreviewOpen = !structurePreviewOpen">{{ structurePreviewOpen ? '收起结构方案' : '查看结构方案' }}</button><button class="btn" :disabled="busy" @click="action(refreshGraphs)">刷新图谱</button></div></div><p v-if="tab === 'metadata' && metadata.requires_refresh" class="note graph-notice">{{ metadata.tables.length ? '目前仅显示已读取来源的元数据；其他来源仍需连接并读取。' : '尚未读取元数据。请在「项目配置 → 数据接入」连接来源并读取元数据。' }}</p><p v-if="tab === 'metadata' && metadata.stale_engine_metadata" class="note amber graph-notice">元数据声明已更新。重新运行抽取后，会刷新与新声明对应的关系。</p><label v-if="tab === 'business'" class="checkbox-line"><input v-model="includeCandidates" type="checkbox" :disabled="busy"/>显示候选与未决关系</label><p v-if="tab === 'business' && graphError" class="note amber" role="alert">图谱读取失败：{{ graphError }} <button class="text-button" @click="loadBusinessGraph()">重试读取图谱</button></p><StructurePreview v-if="tab === 'business' && structurePreviewOpen" :key="project.project_id" :project-id="project.project_id" :config-revision="configRevision"/><GraphCanvas v-if="tab !== 'business' || !graphError || business.nodes.length > 0" :graph="tab === 'metadata' ? metadata : business" :layer="tab" :loading="busy || (tab === 'business' && graphLoading)" :project-id="project.project_id" :include-candidates="includeCandidates" :config-revision="configRevision"/><IdentityCandidates v-if="tab === 'business'" :project-id="project.project_id" :config-revision="configRevision" :graph="business" :disabled="locked || dirty || advancedDirty" @changed="action(refreshGraphs)"/><DiscoveryCandidates v-if="tab === 'business'" :project-id="project.project_id" :config-revision="configRevision" :refresh-key="business" :disabled="locked || dirty || advancedDirty"/><section v-if="tab === 'metadata' && metadata.tables.length" class="panel metadata-table"><div class="panel-head"><h2>表与列</h2></div><details v-for="table in metadata.tables" :key="tableKey(table)"><summary>{{ tableKey(table) }} <span class="muted">{{ table.columns.length }} 列</span></summary><div class="table-scroll"><table><thead><tr><th>字段</th><th>类型</th><th>注释</th></tr></thead><tbody><tr v-for="column in table.columns" :key="column.name"><td>{{ column.name }}</td><td>{{ column.data_type || '—' }}</td><td>{{ column.comment || '—' }}</td></tr></tbody></table></div></details></section></template>
+          <template v-if="tab === 'metadata' || tab === 'business'"><div class="intro"><div><h2>{{ tab === 'metadata' ? '元数据关联图' : '业务知识图谱' }}</h2></div><div class="actions"><template v-if="tab === 'business' && !selectedGraphVersion && (business.nodes.length > 0 || retrievalStatus?.has_graph)"><span class="badge" :class="retrievalStatus?.status === 'vectorized' ? 'green' : 'amber'">{{ retrievalStatus?.status === 'vectorized' ? `已完成向量化 · ${retrievalStatus.embedder_model || 'local_hash'} (${retrievalStatus.vector_dim ?? '—'}维)` : retrievalStatus?.status === 'stale' ? '图谱或模型已变更 · 待重新向量化' : '未向量化' }}</span><button class="btn" :class="{ primary: !retrievalStatus?.vectorized }" :disabled="vectorizing || busy" @click="vectorizeGraph">{{ vectorizing ? '正在向量化…' : retrievalStatus?.vectorized ? '重新向量化' : '立即向量化' }}</button></template><button v-if="tab === 'business' && !selectedGraphVersion" class="btn" :aria-expanded="structurePreviewOpen" @click="structurePreviewOpen = !structurePreviewOpen">{{ structurePreviewOpen ? '收起结构方案' : '查看结构方案' }}</button><button class="btn" :disabled="busy" @click="action(refreshGraphs)">刷新图谱</button></div></div><p v-if="tab === 'metadata' && metadata.requires_refresh" class="note graph-notice">{{ metadata.tables.length ? '目前仅显示已读取来源的元数据；其他来源仍需连接并读取。' : '尚未读取元数据。请在「项目配置 → 数据接入」连接来源并读取元数据。' }}</p><p v-if="tab === 'metadata' && metadata.stale_engine_metadata" class="note amber graph-notice">元数据声明已更新。重新运行抽取后，会刷新与新声明对应的关系。</p><GraphHistory v-if="tab === 'business'" :project-id="project.project_id" :model-value="selectedGraphVersion" :config-revision="configRevision" :refresh-key="business" @update:model-value="selectGraphVersion"/><label v-if="tab === 'business'" class="checkbox-line"><input v-model="includeCandidates" type="checkbox" :disabled="busy"/>显示候选与未决关系</label><p v-if="tab === 'business' && graphError" class="note amber" role="alert">图谱读取失败：{{ graphError }} <button class="text-button" @click="loadBusinessGraph()">重试读取图谱</button></p><StructurePreview v-if="tab === 'business' && !selectedGraphVersion && structurePreviewOpen" :key="project.project_id" :project-id="project.project_id" :config-revision="configRevision"/><GraphCanvas v-if="tab !== 'business' || !graphError || business.nodes.length > 0" :graph="tab === 'metadata' ? metadata : business" :layer="tab" :version="tab === 'business' ? selectedGraphVersion : undefined" :loading="busy || (tab === 'business' && graphLoading)" :project-id="project.project_id" :include-candidates="includeCandidates" :config-revision="configRevision"/><IdentityCandidates v-if="tab === 'business' && !selectedGraphVersion" :project-id="project.project_id" :config-revision="configRevision" :graph="business" :disabled="locked || dirty || advancedDirty" @changed="action(refreshGraphs)"/><DiscoveryCandidates v-if="tab === 'business' && !selectedGraphVersion" :project-id="project.project_id" :config-revision="configRevision" :refresh-key="business" :disabled="locked || dirty || advancedDirty"/><section v-if="tab === 'metadata' && metadata.tables.length" class="panel metadata-table"><div class="panel-head"><h2>表与列</h2></div><details v-for="table in metadata.tables" :key="tableKey(table)"><summary>{{ tableKey(table) }} <span class="muted">{{ table.columns.length }} 列</span></summary><div class="table-scroll"><table><thead><tr><th>字段</th><th>类型</th><th>注释</th></tr></thead><tbody><tr v-for="column in table.columns" :key="column.name"><td>{{ column.name }}</td><td>{{ column.data_type || '—' }}</td><td>{{ column.comment || '—' }}</td></tr></tbody></table></div></details></section></template>
           <p v-if="vectorError && (tab === 'retrieval' || (tab === 'business' && retrievalStatus?.has_graph))" class="note amber">{{ vectorError }}</p>
           <template v-if="tab === 'retrieval'">
             <RetrievalPanel :key="project.project_id" :syncing="vectorizing" :project-id="project.project_id" :embedding="config.embedding" :status="retrievalStatus" :busy="busy || loading || dirty || advancedDirty || locked" @vectorize="vectorizeGraph"/>
@@ -850,7 +894,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
               <div class="panel-body">
                 <div class="table-scroll">
                   <table>
-                    <thead><tr><th>节点</th><th>类型</th><th>状态</th><th>增量节点</th><th>增量边</th><th>子运行编号</th><th>说明</th><th>操作</th></tr></thead>
+                    <thead><tr><th>节点</th><th>类型</th><th>状态</th><th>节点数</th><th>关系数</th><th>子运行编号</th><th>说明</th><th>操作</th></tr></thead>
                     <tbody>
                       <tr v-for="u in Object.values(visibleWorkflowState?.units || {})" :key="u.unit_id">
                         <td><strong>{{ u.label || u.unit_id }}</strong> <span class="mono muted">{{ u.unit_id }}</span></td>
@@ -860,7 +904,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
                         <td>{{ u.edges ?? 0 }}</td>
                         <td class="mono">{{ u.run_id || '—' }}</td>
                         <td>{{ u.error_code ? new ApiError(u.error_code).message : '正常' }}</td>
-                        <td><button class="btn small" :disabled="locked || !canEditWorkflowRun || u.status === 'skipped'" @click="retryWorkflowUnit(u.unit_id)">单独重跑</button></td>
+                        <td><button v-if="!visibleWorkflowState?.artifacts" class="btn small" :disabled="locked || !canEditWorkflowRun || u.status === 'skipped'" @click="retryWorkflowUnit(u.unit_id)">单独重跑</button><button v-if="visibleWorkflowState?.artifacts" class="btn small" :disabled="locked || !config.workflow?.enabled" @click="resumeWorkflow({ from_node_id: u.unit_id })">从此节点重新运行</button></td>
                       </tr>
                       <tr v-for="m in Object.values(visibleWorkflowState?.merge_nodes || {})" :key="m.node_id">
                         <td><strong>{{ m.label || m.node_id }}</strong> <span class="mono muted">{{ m.node_id }}</span></td>
@@ -870,13 +914,15 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
                         <td>{{ m.edges ?? 0 }}</td>
                         <td class="mono">{{ m.run_id || '—' }}</td>
                         <td>{{ m.error_code ? new ApiError(m.error_code).message : '正常' }}</td>
-                        <td>—</td>
+                        <td><button class="btn small" :disabled="locked || !config.workflow?.enabled" @click="resumeWorkflow({ from_node_id: m.node_id })">从此节点重新运行</button>
+                          <button v-if="!visibleWorkflowState?.artifacts && m.merge_mode === 'merge_and_extract' && ['partial', 'completed', 'completed_with_gaps'].includes(m.status)" class="btn small" :disabled="locked || dirty || advancedDirty" @click="resumeWorkflow({ from_node_id: m.node_id, action: 'recompose_legacy_merge' })">从原合并产物恢复发布</button>
+                          <button v-if="visibleWorkflowState?.terminal_ids?.length === 1 && visibleWorkflowState.terminal_ids[0] === m.node_id && visibleWorkflowState.artifacts?.[m.node_id]?.graph_kind === 'node_full'" class="btn small" :disabled="locked" @click="resumeWorkflow({ artifact_id: visibleWorkflowState.artifacts[m.node_id]!.artifact_id })">仅发布此结果</button></td>
                       </tr>
                     </tbody>
                   </table>
                 </div>
                 <p v-if="visibleWorkflowState?.merge" class="note">
-                  输出状态：<strong>{{ workflowOutputLabel }}</strong>
+                  项目输出：<strong>{{ workflowOutputLabel }}</strong>
                   <template v-if="visibleWorkflowState?.merge?.nodes !== undefined">
                     · 终态节点 {{ visibleWorkflowState?.merge?.nodes }} 个
                     · 终态边 {{ visibleWorkflowState?.merge?.edges }} 条
@@ -885,7 +931,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
                 </p>
               </div>
             </section>
-            <RunProgress v-if="selectedRun" :key="`${selectedRun.project_id}:${selectedRun.run_id}`" :run="selectedRun" :refresh-error="runPollError === selectedRun.run_id"/><section v-if="selectedRun" class="panel run-report"><div class="panel-head"><h2>运行详情</h2><span class="badge">{{ selectedRun.run_id }}</span></div><div class="panel-body"><div class="report-summary"><div><small>执行状态</small><strong>{{ runLabels[selectedRun.status] }}</strong></div><div><small>当前阶段</small><strong>{{ stageLabel(selectedRun.progress?.stage || selectedRun.stage) }}</strong></div><div><small>运行方式</small><strong>{{ selectedRun.run_mode === 'fresh' ? '从零开始' : '继续上次工作' }}</strong></div><div><small>配置修订</small><strong>{{ selectedRun.config_revision ?? '历史记录未提供' }}</strong></div><div><small>结束时间</small><strong>{{ time(selectedRun.finished_at) }}</strong></div></div><p v-if="graphOutcome(selectedRun.report)" class="note">{{ graphOutcome(selectedRun.report) }}</p><p v-if="selectedRun.error_code" class="note amber">{{ new ApiError(selectedRun.error_code).message }}</p><p v-if="selectedRun.run_mode === 'fresh'" class="field-hint">本轮使用独立空白工作区。图谱页显示当前工作区，不会随历史记录切换；本轮成果目录见下方，历史文件和轨迹仍保留。</p><p v-if="selectedRun.output_path" class="field-hint">本轮成果目录：{{ selectedRun.output_path }}</p><p class="field-hint">资源释放指关闭连接和释放运行内存；运行轨迹保留，需在下方主动清理。</p><ConstructionReport :report="selectedRun.report"/><RunIssues :report="selectedRun.report"/><TechnicalDetails v-if="selectedRun.report" :value="selectedRun.report" title="报告原始结构"/><p v-else class="note">{{ isActive(selectedRun) ? '运行尚未结束，报告会在后端生成后显示。' : '此运行没有可读取的报告，请结合状态和错误码判断。' }}</p></div></section><RunTrace v-if="selectedRun" :key="`${selectedRun.project_id}:${selectedRun.run_id}`" :run="selectedRun" :config-revision="configRevision"/></template>
+            <RunProgress v-if="selectedRun" :key="`${selectedRun.project_id}:${selectedRun.run_id}`" :run="selectedRun" :refresh-error="runPollError === selectedRun.run_id"/><section v-if="selectedRun" class="panel run-report"><div class="panel-head"><h2>运行详情</h2><span class="badge">{{ selectedRun.run_id }}</span></div><div class="panel-body"><div class="report-summary"><div><small>执行状态</small><strong>{{ runLabels[selectedRun.status] }}</strong></div><div><small>当前阶段</small><strong>{{ stageLabel(selectedRun.progress?.stage || selectedRun.stage) }}</strong></div><div><small>运行方式</small><strong>{{ selectedRun.run_mode === 'fresh' ? '从零开始' : '继续上次工作' }}</strong></div><div><small>配置修订</small><strong>{{ selectedRun.config_revision ?? '历史记录未提供' }}</strong></div><div><small>结束时间</small><strong>{{ time(selectedRun.finished_at) }}</strong></div></div><p v-if="graphOutcome(selectedRun.report)" class="note">{{ graphOutcome(selectedRun.report) }}</p><p v-if="selectedRun.error_code" class="note amber">{{ new ApiError(selectedRun.error_code).message }}</p><p v-if="selectedRun.run_mode === 'fresh'" class="field-hint">本轮使用独立空白工作区。可在图谱页的版本列表中查看本轮及历史成果；本轮成果目录见下方。</p><p v-if="selectedRun.output_path" class="field-hint">本轮成果目录：{{ selectedRun.output_path }}</p><p class="field-hint">资源释放指关闭连接和释放运行内存；运行轨迹保留，需在下方主动清理。</p><ConstructionReport :report="selectedRun.report"/><RunIssues :report="selectedRun.report"/><TechnicalDetails v-if="selectedRun.report" :value="selectedRun.report" title="报告原始结构"/><p v-else class="note">{{ isActive(selectedRun) ? '运行尚未结束，报告会在后端生成后显示。' : '此运行没有可读取的报告，请结合状态和错误码判断。' }}</p></div></section><RunTrace v-if="selectedRun" :key="`${selectedRun.project_id}:${selectedRun.run_id}`" :run="selectedRun" :config-revision="configRevision"/></template>
           <template v-if="tab === 'settings'"><div class="intro"><div><h2>模型配置</h2></div></div><div class="layout-two"><section class="panel"><div class="panel-head"><h2>模型连接</h2><span class="badge blue">运行设置</span></div><div class="panel-body"><p v-if="config.agent_config" class="note amber">当前配置引用独立模型文件 {{ config.agent_config }}。连接信息在该文件中配置，下方可调整额度和超时；保存时会生成新配置，保留原文件。</p><template v-else><div class="field"><label for="model-mode">模型模式</label><select id="model-mode" v-model="model.mode" :disabled="locked"><option value="disabled">关闭模型，暂不启动自主构建</option><option value="metadata_only">仅元数据，不向模型发送样本</option><option value="in_environment">环境内模型，可使用受限样本</option><option value="approved_external">已批准的外部模型</option></select></div><div class="field"><label for="model-url">服务 Base URL</label><input id="model-url" v-model="model.base_url" :disabled="locked" placeholder="https://model.example.com/v1" autocomplete="off"/><p class="field-hint">使用兼容 Chat Completions 的地址；不要在 URL 中包含密钥。</p></div><div class="two-fields"><div class="field"><label for="model-name">模型名称</label><input id="model-name" v-model="model.model" :disabled="locked" placeholder="模型服务提供的名称"/></div><div class="field"><label for="model-key">API key</label><input id="model-key" v-model="modelKey" :disabled="locked" type="password" autocomplete="new-password" :placeholder="credentials.model ? '已在本机保存，留空保留' : credentials.model_environment ? '服务器已配置，可留空' : '填写模型服务的 API key'"/></div></div><p class="credential-status field-hint"><span class="badge" :class="credentials.model || credentials.model_environment ? 'green' : ''">{{ credentials.model ? '已在本机保存密钥' : credentials.model_environment ? '已配置服务器环境变量' : '尚未配置密钥' }}</span><button v-if="credentials.model || credentials.model_error" class="text-button" :disabled="locked" @click="clearModelCredential">清除密钥</button></p><p v-if="credentials.model_error" class="note amber" role="alert">{{ new ApiError(credentials.model_error).message }}</p><details class="model-advanced"><summary>使用服务器环境变量（可选）</summary><div class="field"><label for="model-key-env">API key 环境变量名</label><input id="model-key-env" v-model="model.api_key_env" :disabled="locked" placeholder="LIGHTGRAPH_API_KEY" autocomplete="off"/></div></details><p class="field-hint">连接和接口参数由后台自动适配。</p><label v-if="internalHttpEndpoint" class="checkbox-line"><input id="model-allow-http" v-model="model.allow_insecure_http" type="checkbox" :disabled="locked"/>允许使用此内部 HTTP 服务</label></template>
 <div class="field"><label for="construction-target">构建结果</label><select id="construction-target" v-model="constructionTarget" :disabled="locked"><option value="instances">生成实例图谱</option><option value="structure">仅生成结构与映射</option></select><p class="field-hint">结构与映射可以单独保存和发布；这不代表具体节点、关系或全部数据已经验证。</p></div>
 <div class="field"><label for="max-db-queries">数据查询次数上限</label><label class="checkbox-line"><input id="query-count-unlimited" v-model="queryCountUnlimited" type="checkbox" :disabled="locked"/>不限次数</label><input id="max-db-queries" type="number" min="1" step="1" :value="maxDbQueries ?? ''" :disabled="locked || queryCountUnlimited" placeholder="填写正整数" @input="maxDbQueries = ($event.target as HTMLInputElement).value === '' ? null : Number(($event.target as HTMLInputElement).value)"/><p class="field-hint">所有数据来源共用，包括元数据与事务控制查询。不限次数仍受单次查询超时、整次运行时限和数据量限制。</p></div>

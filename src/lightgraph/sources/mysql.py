@@ -24,6 +24,7 @@ from lightgraph.query import QueryCompiler
 from .base import SourceAdapter, QueryStats, cursor_batches
 from .budget import BudgetedCursor, QueryBudget
 from .database_errors import connection_is_closed, database_diagnostic, database_error, qualification_error, readback_shape_failure, annotate_database_error, cleanup_preserving_error
+from .validation_session import keep_session
 from .reconnect import configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary, terminal_failure, latch_terminal_failure, prepare_snapshot
 
 MYSQL_SQL_MODES = frozenset({"ONLY_FULL_GROUP_BY", "STRICT_TRANS_TABLES", "ERROR_FOR_DIVISION_BY_ZERO", "NO_ENGINE_SUBSTITUTION"})
@@ -155,6 +156,7 @@ class MySQLSource(SourceAdapter):
             self._connection = connect_factory(**options)
             if connection_is_closed(self._connection):
                 raise LightGraphError('database_connection_failed')
+            self.stats.physical_connections_opened += 1
             self.query_budget.check_time()
             control_options = {**options, "connect_timeout": min(5, options["connect_timeout"],
                                max(1, math.ceil(self.query_budget.deadline - time.monotonic()))),
@@ -164,6 +166,7 @@ class MySQLSource(SourceAdapter):
                 self._control = connect_factory(**control_options)
                 if connection_is_closed(self._control):
                     raise LightGraphError('database_connection_failed')
+                self.stats.physical_connections_opened += 1
             finally:
                 control_options.clear()
             self.stats.connect_tcp_seconds += max(0.0, time.monotonic() - connect_started)
@@ -675,10 +678,12 @@ class MySQLSource(SourceAdapter):
                                 active_error.database_diagnostic = {**getattr(active_error, 'database_diagnostic', {}),
                                     'rollback_succeeded': False, 'recovery': 'reconnect_required'}
                     finally:
-                        # No transaction or network connection survives Agent
-                        # think-time. Nested queries share this lease only.
+                        # A successful validation may reuse the physical connection
+                        # for its next projection, after rollback. No open transaction
+                        # or leased session crosses the tool-call boundary.
                         try:
-                            self._release_snapshot_connection()
+                            if active_error is not None or not keep_session(self):
+                                self._release_snapshot_connection()
                         finally:
                             self.stats.snapshot_begin_close_seconds += max(0.0, time.monotonic() - close_started)
 

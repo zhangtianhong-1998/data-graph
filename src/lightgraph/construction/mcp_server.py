@@ -111,9 +111,10 @@ def create_server(tools):
                               **({"reuse_validated": True} if reuse_validated else {}))
 
     @server.tool()
-    async def read_workspace(draft_id: str | None = None) -> dict:
-        """Recover saved drafts, revisions, checks and unresolved items without replaying raw rows."""
-        return await dispatch("read_workspace", draft_id=draft_id)
+    async def read_workspace(draft_id: str | None = None, summary_only: bool = False, offset: int = 0) -> dict:
+        """Set summary_only to list revisions and validation status, 50 drafts per page, without rereading the graph."""
+        return await dispatch("read_workspace", draft_id=draft_id,
+                              **({'summary_only': True, 'offset': offset} if summary_only else {}))
 
     @server.tool()
     async def publish_graph_draft(draft_id: str, validation_id: str | None = None,

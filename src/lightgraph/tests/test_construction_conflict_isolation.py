@@ -13,8 +13,9 @@ from lightgraph.tests.test_construction_tools import config_for, draft
 from lightgraph.tests.test_graph_yaml_workspace import payload, graph
 
 
-def conflict_tools(tmp_path):
+def conflict_tools(tmp_path, *, label_policy='quarantine'):
     config = config_for(tmp_path)
+    config.fusion_policy.label_conflict_policy = label_policy
     (tmp_path / 'input.csv').write_text('编码,名称,归属,密钥\n001,甲,003,x\n002,乙旧名,001,x\n002,乙新名,001,x\n003,丙,001,x\n', encoding='utf-8')
     tools = ConstructionTools(config, tmp_path / 'work')
     table = tools.describe_sources()['tables'][0]
@@ -141,6 +142,7 @@ from lightgraph.construction.runner import run_construction
 
 def test_runner_reports_usable_subset_and_goal_gap(tmp_path, scripted_bridge):
     config = configuration(tmp_path)
+    config.fusion_policy.label_conflict_policy = 'quarantine'
     (tmp_path / 'items.csv').write_text('代号,中文名\n001,甲\n002,旧乙\n002,新乙\n', encoding='utf-8')
     def runtime(*args, **kwargs):
         tools = scripted_bridge['tools']
@@ -159,6 +161,7 @@ def test_runner_reports_usable_subset_and_goal_gap(tmp_path, scripted_bridge):
 
 def test_runner_cross_draft_conflicts_are_gaps_even_when_both_local_checks_pass(tmp_path, scripted_bridge):
     config = configuration(tmp_path)
+    config.fusion_policy.label_conflict_policy = 'quarantine'
     (tmp_path / 'items.csv').write_text('代号,中文名,别名\n001,甲,甲\n002,旧乙,新乙\n', encoding='utf-8')
     def runtime(*args, **kwargs):
         tools = scripted_bridge['tools']

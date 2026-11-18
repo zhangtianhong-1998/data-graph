@@ -5,7 +5,8 @@ import pytest
 
 from lightgraph.construction.access import access_fingerprint
 from lightgraph.construction.tools import ConstructionTools
-from lightgraph.construction.workspace import GraphWorkspace, dump_yaml, safe_load_yaml, write_yaml
+from lightgraph.construction import graph_storage
+from lightgraph.construction.workspace import dump_yaml, safe_load_yaml, write_yaml
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import RunConfig
 from lightgraph.web.construction_graph import graph_details, load_graph
@@ -65,7 +66,8 @@ def test_program_access_fingerprint_bound_to_validation_and_merged_head(publishe
     lambda config: setattr(config.sources[0], 'allowed_tables', ['another_table']),
     lambda config: setattr(config.sources[0], 'allowed_columns', {'public.source': ['编号']}),
     lambda config: setattr(config.sources[0], 'credential_revision', 'revision2'),
-    lambda config: setattr(config.sources[0], 'path', '/new/source.csv'),
+    lambda config: setattr(config.sources[0], 'path', '/new/unrelated.csv'),
+    lambda config: setattr(config.sources[0], 'allow_fact_data', False),
 ])
 def test_access_change_denies_old_graph_without_removing_it(published, change):
     config, tools = published
@@ -166,13 +168,13 @@ def test_repeated_pages_and_two_hops_read_the_published_file_once(published, mon
     config, _tools = published
     clear_graph_views()
     calls = {'n': 0}
-    original = GraphWorkspace.read_published_graph
+    original = graph_storage.read_graph_record
 
     def wrapped(self):
         calls['n'] += 1
         return original(self)
 
-    monkeypatch.setattr(GraphWorkspace, 'read_published_graph', wrapped)
+    monkeypatch.setattr(graph_storage, 'read_graph_record', wrapped)
     graph = load_graph(config)
     node_id = graph['nodes'][0]['id']
     details = graph_details(config, entity_id=node_id)
@@ -198,13 +200,13 @@ def test_replacing_the_published_file_drops_the_cached_view(published, monkeypat
     config, tools = published
     load_graph(config)
     calls = {'n': 0}
-    original = GraphWorkspace.read_published_graph
+    original = graph_storage.read_graph_record
 
     def wrapped(self):
         calls['n'] += 1
         return original(self)
 
-    monkeypatch.setattr(GraphWorkspace, 'read_published_graph', wrapped)
+    monkeypatch.setattr(graph_storage, 'read_graph_record', wrapped)
     assert load_graph(config)['nodes']
     assert calls['n'] == 0
     manifest = safe_load_yaml((tools.workspace.root / 'manifest.yaml').read_text())

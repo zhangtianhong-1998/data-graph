@@ -241,3 +241,20 @@ def test_report_keeps_budget_cause_and_successful_publication(tmp_path, scripted
     assert report.counts['business_nodes'] == 2 and report.counts['rules_published'] == 1
     assert any(i['code'] == 'query_budget_exhausted' for i in report.issues)
     assert report.counts['db_query_admissions'] > 0
+
+
+def test_progress_page_reads_revisions_without_reading_published_graph(tmp_path, monkeypatch):
+    tools = ConstructionTools(configuration(tmp_path), tmp_path / 'progress')
+    try:
+        draft = save_object(tools)
+        checked = tools.call('validate_graph_draft', draft_id=draft['draft_id'])
+        assert checked['passed']
+        monkeypatch.setattr(tools.workspace, 'read_published_graph',
+                            lambda: pytest.fail('progress listing should not load a graph'))
+        index = tools.call('read_workspace', summary_only=True)
+        assert index['total_drafts'] == 1 and index['next_offset'] is None
+        summary, = index['drafts']
+        assert summary['draft_id'] == draft['draft_id'] and summary['validation_passed']
+        assert summary['draft_material'] == 'draft:' + draft['draft_id'] and 'mappings' not in summary
+    finally:
+        tools.close()

@@ -99,6 +99,7 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
         tools = ConstructionTools(config, workspace, adapters=adapters,
                                   allow_publication=not discover_only,
                                   drop_unbound_documents=drop_unbound_documents)
+        tools.workspace.publication_run_id = report.run_id
         deadline = started + config.max_run_seconds
         tools.budget.tighten_deadline(deadline)
         # Keep counters and the earlier deadline when borrowing already-open
@@ -329,6 +330,8 @@ def run_construction(config, adapters=None, *, discover_only=False, cancel_reque
                     sql_projection_seconds=adapter_timings['sql_projection_seconds'],
                     materialization_seconds=adapter_timings['materialization_seconds'],
                     workspace_write_seconds=adapter_timings['workspace_write_seconds'],
+                    **tools.projection_counts,
+                    physical_connections_opened=sum(getattr(getattr(a, 'stats', None), 'physical_connections_opened', 0) for a in tools.adapters),
                     catalog_queries=sum(getattr(getattr(a, 'stats', None), 'catalog_queries', 0) for a in tools.adapters),
                     runtime_probe_runs=sum(getattr(getattr(a, 'stats', None), 'runtime_probe_runs', 0) for a in tools.adapters),
                     query_timeout_count=sum(getattr(getattr(a, 'stats', None), 'query_timeout_count', 0) for a in tools.adapters),

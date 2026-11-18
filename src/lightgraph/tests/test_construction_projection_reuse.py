@@ -128,3 +128,22 @@ def test_incomplete_projection_is_never_reused_for_later_column_relations():
         assert result['metrics']['unique_projections'] == 0
         assert len(source.windows) == 3
         assert [d['code'] for d in result['diagnostics']] == ['result_truncated'] * 3
+
+
+def test_revised_mapping_reuses_only_matching_immutable_projections():
+    from lightgraph.construction.projection_reuse import ImmutableProjections
+
+    table, draft = example()
+    cache = ImmutableProjections({'s': 'immutable-file-digest'}, 1 << 20)
+    with TrackedSource([table], {table.qualified_name: [('I1', 'A', 1, 2)]}, activity=[]) as source:
+        first = execute_draft(draft, [source], [table], immutable_projections=cache)
+        assert first['passed']
+        revised = deepcopy(draft)
+        revised['entities'][0]['mappings'][0]['properties'] = {'area': 'scope'}
+        second = execute_draft(revised, [source], [table], immutable_projections=cache)
+        assert second['passed'] and second['metrics']['immutable_projection_hits'] == 1
+        assert len(source.windows) == 2  # one matching read reused; changed set of columns read afresh
+        assert pairs(second) == pairs(first)
+        assert next(n for n in second['graph']['nodes'] if n['type'] == 'Indicator')['properties'] == {'area': ['A']}
+        reused, = [w for w in second['source_read_windows'] if w.get('reused_immutable_projection')]
+        assert reused['opened_at'] == first['source_read_windows'][0]['opened_at']

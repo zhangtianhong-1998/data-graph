@@ -24,6 +24,11 @@ describe('full graph transport', () => {
     expect(api.request).toHaveBeenCalledTimes(24)
     expect(api.request.mock.calls.slice(1).every(call => call[0].includes('generation=same'))).toBe(true)
   })
+  it('pins all batches to the selected historical publication', async () => {
+    api.request.mockImplementation(async path => ({ ...page(path), version_id: 'v_old' }))
+    await transferGraph('p', { layer: 'business', version: 'v_old' }, newGraphTransfer(), new AbortController().signal, () => {})
+    expect(api.request.mock.calls.every(call => new URL(call[0], 'http://local').searchParams.get('version') === 'v_old')).toBe(true)
+  })
   it('pause aborts outstanding reads and resumes at the first unaccepted batch', async () => {
     const controller = new AbortController(), state = newGraphTransfer()
     api.request.mockImplementation(async path => page(path))

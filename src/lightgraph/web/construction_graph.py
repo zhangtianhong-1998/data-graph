@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from lightgraph.contracts import digest, canonical
 from lightgraph.construction.access import access_fingerprint, ensure_supported_access, filter_graph_scopes
-from lightgraph.construction.workspace import GraphWorkspace, read_internal_yaml
+from lightgraph.construction.workspace import read_internal_yaml
 from lightgraph.errors import LightGraphError
 from lightgraph.graph_neighborhood import neighborhood_paths
 from lightgraph.web.graph_view_cache import cached_generation, load_graph_view, remember_graph, view_token
@@ -33,28 +33,35 @@ def _scope_key(config):
 def _record_path(root: Path, relative):
     if not isinstance(relative, str) or not relative:
         raise LightGraphError('invalid_graph_workspace_record')
-    path = (root / relative).resolve()
-    base = root.resolve()
-    if not path.is_relative_to(base) or path == base:
+    name = PureWindowsPath(relative)
+    if name.anchor or not name.parts or '..' in name.parts:
         raise LightGraphError('invalid_graph_workspace_record')
-    return path
+    if root.is_symlink():
+        raise LightGraphError('invalid_graph_workspace_record')
+    path = root
+    for part in name.parts:
+        path = path / part
+        if path.is_symlink():
+            raise LightGraphError('invalid_graph_workspace_record')
+    return path.resolve()
 
 
 def _view_key(kind, path: Path, stat, access, scopes):
     # Nanosecond timestamps do not survive a JSON number round trip.
-    return {'version': 2, 'kind': kind, 'path': str(path), 'size': stat.st_size,
+    return {'version': 3, 'kind': kind, 'path': str(path), 'size': stat.st_size,
             'mtime_ns': str(stat.st_mtime_ns), 'access': access, 'scopes': scopes}
 
 
-def load_prepared(config):
+def load_prepared(config, *, root=None, head=None, authorization_root=None):
     """Return the authorized display graph and the token that identifies it."""
     ensure_supported_access(config)
-    root = Path(config.output_dir) / 'construction'
+    selected_head = head is not None
+    root = Path(root) if root is not None else Path(config.output_dir) / 'construction'
     manifest_path = root / 'manifest.yaml'
     if root.is_symlink() or manifest_path.is_symlink():
         raise LightGraphError('workspace_path_invalid')
-    manifest = read_internal_yaml(manifest_path)
-    head = manifest.get('current_graph')
+    manifest = read_internal_yaml(manifest_path) if not selected_head else {}
+    head = head if selected_head else manifest.get('current_graph')
     expected_access = access_fingerprint(config)
     scopes = _scope_key(config)
     cache_dir = root / 'view-cache'
@@ -62,14 +69,17 @@ def load_prepared(config):
         key = _view_key('empty', manifest_path.resolve(), manifest_path.stat(), expected_access, scopes)
         return load_graph_view(cache_dir, key, lambda: (
             {'nodes': [], 'edges': [], 'definitions': {}, 'status': 'empty'}, view_token(key)))
-    if head.get('access_fingerprint') != expected_access:
-        raise LightGraphError('graph_access_context_changed')
+    from lightgraph.construction.snapshot_registry import authorize_snapshot, snapshot_id
+    policy_record = authorize_snapshot(authorization_root or root, head, config)
     published = _record_path(root, head.get('path'))
     try:
         stat = published.stat()
     except OSError:
         raise LightGraphError('graph_workspace_record_unavailable') from None
     key = _view_key('published', published, stat, expected_access, scopes)
+    key['snapshot'] = snapshot_id(head, root=root)
+    key['policy'] = head.get('result_policy_id')
+    key['graph_digest'] = head.get('graph_digest')
     if published.is_dir():
         try:
             names = ('metadata.yaml', 'nodes.parquet', 'edges.parquet')
@@ -82,21 +92,54 @@ def load_prepared(config):
         except OSError:
             raise LightGraphError('graph_workspace_record_unavailable') from None
 
-    inherited_summary = root / 'inherited' / 'summary.yaml'
-    if inherited_summary.is_file():
-        inherited_stat = inherited_summary.stat()
-        key['frozen_inheritance'] = [inherited_stat.st_size, str(inherited_stat.st_mtime_ns)]
+    # A checkpoint contains exactly the published component named in its
+    # commit. A worker publication may additionally have a pinned inherited base.
+    compose_base = bool(config.inherited_graphs and head.get('graph_kind') not in
+                        {'project_full', 'node_full', 'node_delta', 'node_base'})
+    pinned_summary = head.get('inherited_summary')
+    if compose_base and 'inherited_summary' in head and not pinned_summary:
+        compose_base = False
+    if compose_base:
+        if pinned_summary is None:
+            path = _record_path(root, 'inherited/summary.yaml')
+            if not path.is_file():
+                raise LightGraphError('inherited_graph_snapshot_not_found')
+            pinned_summary = read_internal_yaml(path)
+        key['frozen_inheritance'] = view_token({'summary': pinned_summary})
+        # Replacements or corruption of frozen constituents also invalidate a cached view.
+        stamps = []
+        for item in pinned_summary['inherited']:
+            path = _record_path(root / 'inherited', item.get('snapshot_file') or (item['inherit_id'] + '.yaml'))
+            files = [path / n for n in ('metadata.yaml', 'nodes.parquet', 'edges.parquet')] if path.is_dir() else [path]
+            for file in files:
+                if file.is_symlink() or not file.is_file():
+                    raise LightGraphError('inherited_graph_snapshot_not_found')
+                info = file.stat()
+                stamps.append([file.name, info.st_size, str(info.st_mtime_ns)])
+        key['inherited_files'] = stamps
 
     def build():
-        workspace = GraphWorkspace(root, head['context_fingerprint'])
-        graph = workspace.read_published_graph()
-        if graph.get('access_fingerprint') != expected_access:
+        if published.is_dir():
+            from lightgraph.construction.graph_storage import read_graph_record
+            graph = read_graph_record(published)
+        else:
+            graph = read_internal_yaml(published)
+        if graph.get('storage_layout') == 'sharded_v1':
+            from lightgraph.construction.merger import load_sharded_graph
+            graph = load_sharded_graph(root, graph)
+        graph.pop('_checkpoint_evidence_records', None)
+        if graph.get('access_fingerprint') != head.get('access_fingerprint'):
             raise LightGraphError('graph_access_context_changed')
-        if graph.get('storage_layout') not in {'sharded_v1', 'parquet_v1'} and (root / 'inherited' / 'summary.yaml').is_file():
+        if head.get('graph_digest') and published.is_dir():
+            if read_internal_yaml(published / 'metadata.yaml').get('graph_digest') != head['graph_digest']:
+                raise LightGraphError('graph_parquet_checksum_mismatch')
+        if compose_base and graph.get('storage_layout') not in {'sharded_v1', 'parquet_v1'}:
             from lightgraph.construction.inheritance import compose_published_graph, load_frozen_base_graph
-            base_graph, _ = load_frozen_base_graph(root, config=config)
+            base_graph, _ = load_frozen_base_graph(root, config=config, summary=pinned_summary,
+                                                    authorized_digest=(policy_record or {}).get('inheritance_digest'))
             graph = compose_published_graph(graph, base_graph, expected_access)
         graph = filter_graph_scopes(graph, config.scopes)
+        graph['version_id'] = snapshot_id(head, root=root)
         graph['nodes'] = [{**node, 'kind': node['type'], 'layer': 'business', 'status': 'accepted'}
                           for node in graph.get('nodes', [])]
         graph['edges'] = [{**edge, 'relation': edge['type'], 'status': 'accepted',
@@ -282,12 +325,12 @@ def _focused_page(nodes, edges, focus, hops, offset, limit, traversal='all'):
 
 
 def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", focus="", hops=1,
-               include_candidates=False, traversal='all'):
+               include_candidates=False, traversal='all', prepared_graph=None):
     if traversal not in ('all', 'chains'):
         raise LightGraphError('graph_page_invalid')
     if layer not in {"business", "metadata", "provenance", "all"} or offset < 0 or not 1 <= limit <= 1000 or hops not in {1, 2}:
         raise LightGraphError("graph_selection_invalid")
-    graph = load_graph(config)
+    graph = prepared_graph if prepared_graph is not None else load_graph(config)
     generation = cached_generation(graph) or digest(graph)
     nodes = graph["nodes"] if layer in {"business", "all"} else []
     edges = graph["edges"] if nodes else []
@@ -324,7 +367,7 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
             "truncated": len(page) < len(selected) or len(local_edges) < len(page_edges),
             "edges_truncated": len(local_edges) < len(page_edges), "matched_edges": len(page_edges),
             "boundary_edges": boundary,
-            "generation": generation, "query_strategy": "published_yaml", "kinds": sorted(counts),
+            "generation": generation, "version_id": graph.get("version_id"), "query_strategy": "published_yaml", "kinds": sorted(counts),
             "kind_counts": dict(counts), "focus_node_id": focus or None,
             "focus_neighbor_count": max(0, len(selected) - 1) if focus else 0, "focus_hops": hops,
             "focus_traversal": traversal,
@@ -351,10 +394,10 @@ def _catalog_tables_for_config(config):
         return []
 
 
-def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_candidates=False):
+def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_candidates=False, prepared_graph=None):
     if bool(entity_id) == bool(fact_id) or offset < 0:
         raise LightGraphError("graph_selection_invalid")
-    graph = load_graph(config)
+    graph = prepared_graph if prepared_graph is not None else load_graph(config)
     selected = []
     supports = []
 
@@ -386,8 +429,13 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
                 matches = canonical(value) in {canonical(item) for item in support.get('properties', {}).get(name, [])}
             if matches:
                 origin = {**support.get('provenance', {}), 'scope_ref': support['scope_ref']}
-                if support.get('row_context') is not None:
-                    origin['row_context'] = support['row_context']
+                for key in ('row_context', 'observation_id', 'execution_origins', 'identity_origins'):
+                    if key in support:
+                        origin[key] = support[key]
+                mapped = [obs for obs in support.get('property_observations', [])
+                          if obs['property'] == name and canonical(obs['value']) == canonical(value)]
+                if mapped:
+                    origin['property_observations'] = mapped
                 if origin not in origins:
                     origins.append(origin)
         return origins
@@ -396,7 +444,8 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
         if 'supports' not in item:
             return item.get('provenance', [])
         return [{**support.get('provenance', {}), 'scope_ref': support['scope_ref'],
-                 **{key: support[key] for key in ('row_context', 'lookup_matches', 'required_scope_refs', 'inherited_from')
+                 **{key: support[key] for key in ('row_context', 'lookup_matches', 'required_scope_refs', 'inherited_from',
+                     'observation_id', 'execution_origins', 'endpoint_origins')
                     if support.get(key) is not None}}
                 for support in item['supports']]
 
@@ -407,7 +456,7 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
         for node in nodes:
             identifier = node["id"]
             add(identifier, "NodeExistence", {"entity_id": identifier, "kind": node["kind"]}, support_origins(node))
-            properties = {**node.get("properties", {}), "label": [node["label"]], "alias": node.get("aliases", [])}
+            properties = {**node.get("properties", {}), "label": node.get("label_variants") or [node["label"]], "alias": node.get("aliases", [])}
             for name, values in properties.items():
                 for value in values:
                     add(digest(identifier, name, value), "PropertyValue", {"entity_id": identifier,
@@ -447,13 +496,13 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             **({"source_kind": source['source_kind'], "evidence_refs": source.get('evidence_refs', [])}
                if source.get('source_kind') == 'metadata_column' else {})}
     from lightgraph.construction.node_standardizer import standardize_node_details
-    catalog_tables = _catalog_tables_for_config(config)
+    catalog_tables = _catalog_tables_for_config(config) if prepared_graph is None else []
     definitions = graph.get("definitions", {})
     standard_nodes = [
         standardize_node_details(node, definitions=definitions, catalog_tables=catalog_tables)
         for node in graph["nodes"] if node["id"] in endpoints
     ]
-    return {"facts": facts, "supports": retained[:500], "rules": list(mappings.values()),
+    return {"version_id": graph.get("version_id"), "facts": facts, "supports": retained[:500], "rules": list(mappings.values()),
             "nodes": [_listed(n) for n in graph["nodes"] if n["id"] in endpoints],
             "standard_nodes": standard_nodes,
             "display_schema": vocabulary(graph),

@@ -12,8 +12,9 @@ import uuid
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import MergePolicyConfig
-from lightgraph.source_values import persisted_identity_key
+from lightgraph.source_values import identity_cell, persisted_identity_key
 from .display import derive_display_graph
+from .fusion import deduplicate_supports, label_priority, merge_definition, prepare_graph
 from .statistics import directed_topology
 from .workspace import read_internal_yaml, write_yaml
 
@@ -70,6 +71,10 @@ def _rewrite_evidence_in_graph(
             if not isinstance(support, dict):
                 continue
             support.setdefault('contributor_id', contributor_id)
+            for origin in support.get('execution_origins', []):
+                origin.setdefault('contributor_id', contributor_id)
+                if origin.get('evidence_refs'):
+                    origin['evidence_refs'] = [register(r) for r in origin['evidence_refs']]
             prov = support.get('provenance')
             if isinstance(prov, dict) and prov.get('evidence_refs'):
                 prov['evidence_refs'] = [register(r) for r in prov['evidence_refs']]
@@ -101,6 +106,36 @@ def _node_shared_allowed(
     return node.get('type') in shared_types
 
 
+def _same_name_candidates(nodes, seen_groups):
+    """Explain cross-contributor homonyms without forming quadratic node pairs."""
+    groups = defaultdict(set)
+    for node in nodes.values():
+        if node.get('identity_origin') == 'physical_column':
+            continue
+        for support in node.get('supports', []):
+            name = _norm_label(support.get('observed_label') or support.get('label'))
+            if name:
+                groups[name].add((node['id'], support.get('contributor_id', '')))
+    for name, members in sorted(groups.items()):
+        node_ids = tuple(sorted({nid for nid, _ in members}))
+        contributors = sorted({cid for _, cid in members if cid})
+        if len(node_ids) < 2 or len(contributors) < 2 or node_ids in seen_groups:
+            continue
+        group = [nodes[nid] for nid in node_ids]
+        types = sorted({node['type'] for node in group})
+        if len(types) > 1:
+            reason = 'same_label_different_entity_types'
+        elif len({frozenset(node['identity']) for node in group}) > 1:
+            reason = 'same_label_different_identity_keys'
+        elif len({tuple(identity_cell(node, k)[0] for k in sorted(node['identity'])) for node in group}) > 1:
+            reason = 'same_label_different_key_types'
+        else:
+            reason = 'same_label_different_identities'
+        yield {'status': 'candidate_only', 'reason': reason, 'normalized_label': name, 'entity_types': types,
+               'node_ids': list(node_ids), 'contributors': contributors}
+        seen_groups.add(node_ids)
+
+
 def _merge_contributor_nodes_and_edges(
     contributors: list[dict[str, Any]],
     *,
@@ -109,10 +144,12 @@ def _merge_contributor_nodes_and_edges(
     independent_outputs: bool = False,
 ) -> dict[str, Any]:
     """Merge graphs while blocking unverified cross-unit auto-merges & auto-connections."""
+    fusion = policy.fusion_policy
     shared_types = set(policy.shared_entity_types)
     for types in policy.shared_identity_domains.values():
         shared_types.update(types)
 
+    explicit_domains = {(r.canonical_type, r.identity_domain) for r in fusion.entity_rules} if fusion else set()
     authority = set(policy.authority_sources)
     definitions = {'entities': {}, 'relations': {}}
     evidence_catalog: dict[str, dict[str, Any]] = {}
@@ -120,6 +157,7 @@ def _merge_contributor_nodes_and_edges(
     validation_snapshots: list[dict[str, Any]] = []
 
     base_node_ids: set[str] = set()
+    base_remap: dict[str, str] = {}
     prepared_contributors: list[tuple[str, str, dict[str, Any]]] = []
     key_versions = {c['graph']['source_key_semantics'] for c in contributors if c['graph'].get('source_key_semantics')}
     if len(key_versions) > 1:
@@ -140,10 +178,16 @@ def _merge_contributor_nodes_and_edges(
             contributor_id=cid,
             evidence_records=item.get('evidence_records'),
         )
+        if fusion and fusion.entity_rules and not independent_outputs:
+            rewritten = prepare_graph(rewritten, fusion, copy=False)
         evidence_catalog.update(cat)
         for ref in rewritten.get('evidence_refs', []):
             if ref not in evidence_refs:
                 evidence_refs.append(ref)
+        for snapshot in rewritten.get('validation_snapshots', []):
+            origin = {'contributor_id': cid, 'kind': ckind, **snapshot}
+            if origin not in validation_snapshots:
+                validation_snapshots.append(origin)
         if rewritten.get('read_window'):
             validation_snapshots.append({
                 'contributor_id': cid,
@@ -155,9 +199,14 @@ def _merge_contributor_nodes_and_edges(
         if ckind == 'base':
             ids = {n['id'] for n in rewritten.get('nodes', [])}
             # Base lookups resolve by node id. Ambiguous projects cannot be used as a single endpoint.
-            if ids & base_node_ids:
+            explicit_shared = {n['id'] for n in rewritten.get('nodes', [])
+                               if (n['type'], n.get('identity_domain')) in explicit_domains}
+            if (ids & base_node_ids) - explicit_shared:
                 raise LightGraphError('ambiguous_inherited_identity')
             base_node_ids.update(ids)
+            for old, new in zip(item['graph'].get('nodes', []), rewritten.get('nodes', []), strict=True):
+                if base_remap.setdefault(old['id'], new['id']) != new['id']:
+                    raise LightGraphError('ambiguous_inherited_identity')
         prepared_contributors.append((cid, ckind, rewritten))
 
     if independent_outputs:
@@ -183,14 +232,7 @@ def _merge_contributor_nodes_and_edges(
                     copied.setdefault('display_mode', 'auto')
                     copied.setdefault('identity_origin', 'row')
                 prev = definitions[category].get(copied['type'])
-                if prev is None:
-                    definitions[category][copied['type']] = copied
-                elif prev != copied:
-                    if ({k: v for k, v in prev.items() if k != 'description'}
-                            != {k: v for k, v in copied.items() if k != 'description'}):
-                        raise LightGraphError('published_definition_conflict')
-                    if not prev.get('description') and copied.get('description'):
-                        prev['description'] = copied['description']
+                definitions[category][copied['type']] = merge_definition(prev, copied)
 
         id_remap: dict[str, str] = {}
         for raw_node in graph.get('nodes', []):
@@ -202,6 +244,8 @@ def _merge_contributor_nodes_and_edges(
                 shared_types=shared_types,
                 base_node_ids=base_node_ids,
             )
+            if (node['type'], node.get('identity_domain')) in explicit_domains and not independent_outputs:
+                can_share = True
             if not can_share:
                 # Isolate cross-unit entities without declared shared identity domain.
                 scoped_id = 'n_' + digest('unit_scoped', cid, orig_id)
@@ -216,7 +260,7 @@ def _merge_contributor_nodes_and_edges(
             if existing is None:
                 merged_nodes[target_id] = node
             else:
-                if (existing.get('type') != node.get('type')
+                if (existing.get('type') != node.get('type') or existing.get('identity_domain') != node.get('identity_domain')
                         or persisted_identity_key(existing) != persisted_identity_key(node)
                         or existing.get('identity_origin', 'row') != node.get('identity_origin', 'row')):
                     raise LightGraphError('published_graph_identity_conflict')
@@ -272,11 +316,16 @@ def _merge_contributor_nodes_and_edges(
                               for match in support.get('lookup_matches', []))
                           for support in edge.get('supports', [])}
                 if True in scopes:
-                    if original not in base_node_ids or not graph.get('extends_base_graph'):
+                    canonical_id = base_remap.get(original, original)
+                    if canonical_id not in base_node_ids or not graph.get('extends_base_graph'):
                         raise LightGraphError('published_relation_endpoint_unavailable')
-                    if False in scopes and id_remap.get(original, original) != original:
+                    if False in scopes and id_remap.get(original, original) != canonical_id:
                         raise LightGraphError('ambiguous_inherited_identity')
-                    return original
+                    for support in edge.get('supports', []):
+                        for match in support.get('lookup_matches', []):
+                            if match.get('endpoint') == key and match.get('inherited_node_id') == original:
+                                match['inherited_node_id'] = canonical_id
+                    return canonical_id
                 if original in id_remap:
                     return id_remap[original]
                 # Shared types can connect contributions that independently verify the same domain.
@@ -316,6 +365,16 @@ def _merge_contributor_nodes_and_edges(
             break
         if node.get('identity_origin') == 'physical_column':
             continue
+        if fusion and fusion.label_conflict_policy == 'retain_variants':
+            for support in node.get('supports', []):
+                if support.get('observed_label') and not support.get('label'):
+                    support['label'] = support['observed_label']
+                if authority:
+                    priority = label_priority(support, policy.authority_sources)
+                    support.pop('label_priority', None)
+                    if priority is not None:
+                        support['label_priority'] = priority
+            continue
         by_scope: dict[str, list[tuple[str, str]]] = defaultdict(list)
         for support in node.get('supports', []):
             lbl = support.get('label')
@@ -348,7 +407,8 @@ def _merge_contributor_nodes_and_edges(
                     if variant not in node.setdefault('aliases', []):
                         node['aliases'].append(variant)
                 continue
-            if policy.conflict_mode == 'strict':
+            label_policy = fusion.label_conflict_policy if fusion else policy.conflict_mode
+            if label_policy == 'strict':
                 raise LightGraphError('published_graph_identity_conflict')
             quarantined_nodes.add(node_id)
             conflict_details.append({
@@ -414,6 +474,8 @@ def _merge_contributor_nodes_and_edges(
                     'contributors': sorted({i['contributor_id'] for i in items}),
                     'identity': items[0]['identity'],
                 })
+        candidate_identity_merges.extend(_same_name_candidates(
+            merged_nodes, {tuple(c['node_ids']) for c in candidate_identity_merges}))
         for norm, items in sorted(column_label_buckets.items()):
             unique_cols = {i['node_id']: i for i in items}
             if len(unique_cols) > 1:
@@ -449,6 +511,15 @@ def _merge_contributor_nodes_and_edges(
             'coverage': 'incomplete' if (quarantined_nodes or quarantined_edges or upstream_isolations) else 'complete',
         },
     }
+    if fusion:
+        result['fusion_policy'] = fusion.model_dump(mode='json')
+        result['fusion_policy_digest'] = digest(result['fusion_policy'])
+        result['label_conflict_policy'] = fusion.label_conflict_policy
+        for item in result['nodes'] + result['edges']:
+            if 'supports' in item:
+                deduplicate_supports(item)
+    if independent_outputs and any(c['graph'].get('label_conflict_policy') == 'retain_variants' for c in contributors):
+        result['label_conflict_policy'] = 'retain_variants'
     if key_versions:
         result['source_key_semantics'] = next(iter(key_versions))
     if target_access_fingerprint:
@@ -521,7 +592,7 @@ def _shard_bucket(identifier: str) -> str:
 
 
 def write_sharded_graph(construction_dir: str | Path, merged: dict[str, Any], *, context_fingerprint: str,
-                        unit_attempts: dict[str, str] | None = None) -> dict[str, Any]:
+                        unit_attempts: dict[str, str] | None = None, result_policy_id: str | None = None) -> dict[str, Any]:
     """Publish an immutable Parquet snapshot (name retained for API compatibility)."""
     from .graph_storage import write_graph_record
     root = Path(construction_dir)
@@ -535,13 +606,20 @@ def write_sharded_graph(construction_dir: str | Path, merged: dict[str, Any], *,
         if manifest_path.exists()
         else {'format_version': 1, 'target': 'graph', 'drafts': {}, 'evidence': {}, 'evidence_history': {}, 'publications': {}}
     )
+    old_head = manifest.get('current_graph')
+    if old_head and 'version_id' not in old_head:
+        manifest.setdefault('graph_history', []).append(deepcopy(old_head))
     manifest['current_graph'] = {
         'context_fingerprint': context_fingerprint,
+        **({'result_policy_id': result_policy_id} if result_policy_id else {}),
         **({'workflow_units': unit_attempts} if unit_attempts is not None else {}),
         'access_fingerprint': merged.get('access_fingerprint'),
         'path': publication,
         'storage_layout': 'parquet_v1',
     }
+    from .snapshot_registry import record_graph_head
+    record_graph_head(manifest, manifest['current_graph'], root=root, graph_kind='project_full',
+                      coverage=merged.get('conflict_isolation', {}).get('coverage', 'complete'))
     write_yaml(manifest_path, manifest)
     return {
         'core_path': publication,

@@ -91,6 +91,7 @@ class QueryStats:
     elapsed_seconds: float = 0
     scanned_rows: int | None = None
     scan_measurement: str = "unknown"
+    physical_connections_opened: int = 0  # includes MySQL cancellation/control sessions
     connect_tcp_seconds: float = 0.0
     preflight_catalog_seconds: float = 0.0
     preflight_runtime_probe_seconds: float = 0.0

@@ -212,6 +212,55 @@ class EmbeddingConfig(StrictModel):
         return value
 
 
+class EntityFusionRule(StrictModel):
+    """Explicit cross-source identity mapping; never infer identity from labels."""
+    entity_type: str = Field(min_length=1, max_length=100)
+    canonical_type: str = Field(min_length=1, max_length=100)
+    identity_domain: str = Field(min_length=1, max_length=100)
+    key_mapping: dict[str, str] = Field(min_length=1, max_length=32,
+        description="Canonical identity key name -> existing node identity key name. Every identity key must be mapped; dropping keys is forbidden.")
+    key_normalizers: dict[str, list[Literal['trim', 'casefold', 'nfkc']]] = Field(default_factory=dict, max_length=32)
+    property_aliases: dict[str, str] = Field(default_factory=dict, max_length=128,
+        description="Existing property name -> canonical property name. Use source_id.schema.table.property for a table-specific mapping. Units and meaning must already agree.")
+    property_normalizers: dict[str, list[Literal['trim', 'casefold', 'nfkc']]] = Field(default_factory=dict, max_length=128)
+
+    @model_validator(mode='after')
+    def unambiguous_keys(self):
+        if (len(set(self.key_mapping.values())) != len(self.key_mapping)
+                or any(not value.strip() for pair in self.key_mapping.items() for value in pair)
+                or not set(self.key_normalizers) <= set(self.key_mapping)
+                or any(not value.strip() for pair in self.property_aliases.items() for value in pair)):
+            raise ValueError('invalid_fusion_key_mapping')
+        return self
+
+
+class FusionPolicyConfig(StrictModel):
+    version: Literal[1] = 1
+    label_conflict_policy: Literal['retain_variants', 'quarantine', 'strict'] = 'retain_variants'
+    entity_rules: list[EntityFusionRule] = Field(default_factory=list, max_length=128)
+
+    @model_validator(mode='after')
+    def unambiguous_domains(self):
+        signatures = set()
+        input_types = {}
+        canonical_types = {}
+        for rule in self.entity_rules:
+            signature = (rule.entity_type, frozenset(rule.key_mapping.values()))
+            if signature in signatures:
+                raise ValueError('duplicate_fusion_entity_rule')
+            signatures.add(signature)
+            target = (rule.canonical_type, rule.identity_domain)
+            if input_types.setdefault(rule.entity_type, target) != target:
+                raise ValueError('incompatible_fusion_identity_contract')
+            contract = (rule.identity_domain, tuple(sorted(rule.key_mapping)))
+            if canonical_types.setdefault(rule.canonical_type, contract) != contract:
+                raise ValueError('incompatible_fusion_identity_contract')
+        # A previously canonicalized type must remain stable in downstream merges.
+        if any(t in input_types and input_types[t] != (t, contract[0]) for t, contract in canonical_types.items()):
+            raise ValueError('incompatible_fusion_identity_contract')
+        return self
+
+
 class MergePolicyConfig(StrictModel):
     """Deterministic safety rules for merging parallel unit and inherited graphs."""
     authority_sources: list[str] = Field(default_factory=list, max_length=64)
@@ -219,6 +268,8 @@ class MergePolicyConfig(StrictModel):
     shared_identity_domains: dict[str, list[str]] = Field(default_factory=dict, max_length=128)
     shared_entity_types: list[str] = Field(default_factory=list, max_length=128)
     emit_alignment_candidates: bool = True
+    fusion_policy: FusionPolicyConfig | None = Field(default=None,
+        description="Explicit versioned fusion rules. Null preserves legacy low-level merge behavior; workflow execution inherits the project policy.")
 
 
 class WorkflowMergeNodeConfig(StrictModel):
@@ -307,6 +358,7 @@ class RunConfig(StrictModel):
     _agent: AgentConfig | None = PrivateAttr(default=None)
     agent_config: str | None = Field(default=None, min_length=1)
     isolation_domain: str = "default"
+    fusion_policy: FusionPolicyConfig = Field(default_factory=FusionPolicyConfig)
     sources: list[SourceConfig]
     documents: list[str] = Field(default_factory=list)
     rules: list[str] = Field(default_factory=list)

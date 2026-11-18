@@ -63,6 +63,11 @@ const standardNode = computed<StandardNode | null>(() =>
   props.details?.standard_nodes?.find(item => item.id === props.selected.id) ?? null,
 )
 
+const nameVariants = computed(() => {
+  if (standardNode.value?.label_conflict) return standardNode.value.label_variants || []
+  return props.selected.label_conflict && Array.isArray(props.selected.label_variants) ? props.selected.label_variants : []
+})
+
 const statusName = (value?: unknown) => ({ accepted: '已接受', candidate: '候选', unresolved: '未决', conflict: '冲突' }[String(value)] || '状态未提供')
 const kindName = (value: unknown) => vocabularyLabel('entity_types', value, props.vocabulary)
 const relationName = (value: unknown) => vocabularyLabel('relations', value, props.vocabulary)
@@ -119,6 +124,7 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
     <span class="badge blue">{{ kindName(selected.kind || selected.layer) }}</span>
     <span class="badge" :class="selected.status === 'accepted' ? 'green' : 'amber'">{{ statusName(selected.status) }}</span>
     <h2 class="detail-name">{{ nodeCaption(selected) }}</h2>
+    <p v-if="nameVariants.length" class="note amber">来源名称不一致：{{ nameVariants.join('、') }}。此节点保留各来源的记录。</p>
     <p v-if="labelOrigin(selected)" class="muted small-text">{{ labelOrigin(selected) }}</p>
     <p v-if="selected.overview_only" class="note">此节点先显示精简摘要，完整属性正在按需读取；读取失败时可重试来源详情。</p>
 
@@ -180,7 +186,14 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
             <span v-if="attr.data_type && attr.data_type !== 'unknown'" class="badge">{{ attr.data_type }}</span>
           </div>
           <PropertyTable :values="{ 值: attr.values }" />
-          <div v-if="attr.origin_tables.length" class="muted small-text attr-origin">
+          <details v-if="attr.observations?.length" class="attr-origin">
+            <summary>逐值查看来源（{{ attr.observations.length }} 条观察）</summary>
+            <article v-for="(obs, index) in attr.observations" :key="index" class="support-detail">
+              <PropertyTable :values="{ '值': obs.value, '来源': [obs.source_id, obs.qualified_table, obs.column].filter(Boolean).join(' · '), ...(obs.original_property ? { '原属性': obs.original_property } : {}), ...(obs.raw_value !== undefined ? { '原值': obs.raw_value } : {}), ...(obs.scope_ref ? { '可见范围': obs.scope_ref } : {}), ...(obs.evidence_refs?.length ? { '证据引用': obs.evidence_refs } : {}) }"/>
+              <template v-if="obs.row_context?.values"><strong>同一行的上下文</strong><PropertyTable :values="obs.row_context.values"/></template>
+            </article>
+          </details>
+          <div v-else-if="attr.origin_tables.length" class="muted small-text attr-origin">
             来源：{{ attr.origin_tables.map(o => o.column ? `${o.qualified_table}.${o.column}` : o.qualified_table).join('、') }}
           </div>
         </div>

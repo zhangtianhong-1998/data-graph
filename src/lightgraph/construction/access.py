@@ -140,7 +140,8 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None):
     # reports on the original artifact; the viewer gets only evidence referenced
     # by the supports it can read.
     report_fields = {'conflict_isolation', 'candidate_identity_merges', 'candidate_column_alignments',
-                     'evidence_catalog', 'evidence_refs', 'validation_snapshots', 'read_window'}
+                     'evidence_catalog', 'evidence_refs', 'validation_snapshots', 'read_window',
+                     'quality_diagnostics', 'fusion_diagnostics', 'fusion_policy'}
     view = _view_shell(graph, omit=report_fields)
     if 'evidence_refs' in graph or 'evidence_catalog' in graph:
         refs = set()
@@ -173,4 +174,4 @@ def _view_shell(item, *, omit=()):
     return deepcopy({key: value for key, value in item.items()
                      if key not in omit and key not in {'nodes', 'edges', 'supports', 'provenance', 'properties', 'aliases',
                          'english_names', 'descriptions', 'display_label', 'label_origin', 'qualifiers',
-                         'label', 'scopes', 'definitions'}})
+                         'label', 'label_variants', 'label_conflict', 'scopes', 'definitions'}})

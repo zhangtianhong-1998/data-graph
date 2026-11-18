@@ -17,7 +17,12 @@ import { mergeDisplaySchema, metadataRelationValues, nodeCaption, nodeIdentity, 
 import type { DisplaySchema, MetadataEndpoint } from './graphLabels'
 import type { StandardNode } from './types'
 
-const props = defineProps<{ graph: Graph; layer: string; loading?: boolean; projectId?: string; includeCandidates?: boolean; configRevision?: string | number }>()
+const props = defineProps<{ graph: Graph; layer: string; loading?: boolean; projectId?: string; includeCandidates?: boolean; configRevision?: string | number; version?: string }>()
+const snapshotVersion = computed(() => props.layer === 'business' ? props.version || (typeof props.graph.version_id === 'string' ? props.graph.version_id : '') : '')
+function graphUrl(endpoint: string, params: URLSearchParams) {
+  if (snapshotVersion.value) params.set('version', snapshotVersion.value)
+  return `${projectPath(props.projectId!)}/${endpoint}?${params}`
+}
 const search = ref('')
 const selectedKind = ref('')
 const remote = ref<Graph | null>(null), pageLoading = ref(false), pageError = ref('')
@@ -41,7 +46,7 @@ async function loadFullGraph(restart = false) {
   if (restart || !fullTransfer) fullTransfer = newGraphTransfer()
   fullLoading.value = true; fullPaused.value = false; fullError.value = ''
   try {
-    await transferGraph(props.projectId, { layer: props.layer, includeCandidates: props.includeCandidates }, fullTransfer, fullController.signal, value => {
+    await transferGraph(props.projectId, { layer: props.layer, version: snapshotVersion.value, includeCandidates: props.includeCandidates }, fullTransfer, fullController.signal, value => {
       if (epoch === fullEpoch) remote.value = value
     })
     if (epoch === fullEpoch && !neighborhood.value && !cameraTouched) { await nextTick(); fit() }
@@ -73,11 +78,11 @@ async function loadScene(options: { focus?: string; q?: string; kind?: string; m
   const start = options.more ? expansionOffsets.value.get(focus) || 0 : 0
   const params = new URLSearchParams({ layer: props.layer, include_candidates: String(props.includeCandidates === true), offset: String(start), limit: focus ? '240' : '1000', q: options.q || '', kind: options.kind || '', focus })
   try {
-    let value = await request<Graph>(`${projectPath(props.projectId!)}/graph?${params}`, { signal: sceneController.signal })
+    let value = await request<Graph>(graphUrl('graph', params), { signal: sceneController.signal })
     if (epoch !== pageGeneration) return
     if (graph.value.generation && value.generation !== graph.value.generation) {
       // A new publication cannot be merged into the old scene or provenance.
-      params.set('offset', '0'); value = await request<Graph>(`${projectPath(props.projectId!)}/graph?${params}`, { signal: sceneController.signal })
+      params.set('offset', '0'); value = await request<Graph>(graphUrl('graph', params), { signal: sceneController.signal })
       if (epoch !== pageGeneration) return
       clearSelection(); positions.value = placeNodes(value); expansionOffsets.value.clear()
       remote.value = value
@@ -92,7 +97,7 @@ async function loadScene(options: { focus?: string; q?: string; kind?: string; m
       // Search pages contain edges only between matching nodes. Load the
       // selected result's real neighborhood without forwarding name/type filters.
       const nearbyParams = new URLSearchParams({ layer: props.layer, include_candidates: String(props.includeCandidates === true), focus: center.id, hops: '1', limit: '1000', offset: '0' })
-      const nearby = await request<Graph>(`${projectPath(props.projectId!)}/graph?${nearbyParams}`, { signal: sceneController.signal })
+      const nearby = await request<Graph>(graphUrl('graph', nearbyParams), { signal: sceneController.signal })
       if (epoch !== pageGeneration) return
       if (value.generation && nearby.generation !== value.generation) { pageError.value = '图谱已更新，请重新搜索以加载同一版本的关联。'; return }
       remote.value = mergeScene(graph.value, nearby)
@@ -140,7 +145,7 @@ async function loadDetails(more = false) {
   detailsLoading.value = true; detailsError.value = ''
   if (!more) details.value = null
   try {
-    const value = await request<Provenance>(`${projectPath(props.projectId)}/graph/details?${selector}&include_candidates=${props.includeCandidates === true}&offset=${offset || 0}`)
+    const value = await request<Provenance>(graphUrl('graph/details', new URLSearchParams(`${selector}&include_candidates=${props.includeCandidates === true}&offset=${offset || 0}`)))
     if (epoch !== detailGeneration) return
     for (const node of value.nodes || []) detailNodes.value[node.id] = node
     const fullNode = selected.value && value.nodes?.find(node => node.id === selected.value!.id)
@@ -207,12 +212,12 @@ async function showTwoHops(node: GraphNode, traversal: NeighborhoodTraversal = n
     const value = complete || !props.projectId
       ? preview
       : fullTransport.value
-        ? await transferGraph(props.projectId, { layer: props.layer, includeCandidates: props.includeCandidates, focus: node.id, hops: 2, traversal }, newGraphTransfer(), sceneController.signal, value => {
+        ? await transferGraph(props.projectId, { layer: props.layer, version: snapshotVersion.value, includeCandidates: props.includeCandidates, focus: node.id, hops: 2, traversal }, newGraphTransfer(), sceneController.signal, value => {
             if (epoch !== pageGeneration) return
             const center = value.nodes.find(item => item.id === node.id) || node
             neighborhood.value = { center, graph: value, traversal, preview: value.fully_loaded !== true }
           })
-        : await request<Graph>(`${projectPath(props.projectId!)}/graph?${params}`, { signal: sceneController.signal })
+        : await request<Graph>(graphUrl('graph', params), { signal: sceneController.signal })
     if (epoch !== pageGeneration) return
     const center = value.nodes.find(item => item.id === node.id)
     if (!center) { pageError.value = '当前图谱中已找不到这个节点，请刷新图谱。'; return }
@@ -398,7 +403,7 @@ function paint() {
   ctx.globalAlpha = 1
 }
 watch([bitmap, positions, zoom, offset, viewport, selected, selectedEdge, search, selectedKind], paint, { flush: 'post' })
-watch([() => props.graph, () => props.layer, () => props.projectId, () => props.includeCandidates], () => {
+watch([() => props.graph, () => props.layer, () => props.projectId, () => props.includeCandidates, snapshotVersion], () => {
   fullEpoch++; fullController?.abort(); fullTransfer = undefined; fullLoading.value = false; fullPaused.value = false; fullError.value = ''; cameraTouched = false
   pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); neighborhood.value = null; savedScene = null; remote.value = null; pageLoading.value = false; positions.value = placeNodes({ ...props.graph, nodes: props.graph.nodes })
   search.value = ''; searchMatches.value = null; searchMatchCount.value = null; selectedKind.value = ''; expansionOffsets.value.clear(); clearSelection(); reset()
@@ -437,7 +442,10 @@ watch(canvas, element => {
   })
   observer.observe(element); void nextTick(fit)
 }, { flush: 'post' })
-onUnmounted(() => { fullEpoch++; fullController?.abort(); pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); observer?.disconnect() })
+onUnmounted(() => {
+  detailGeneration++; pageGeneration++; fullEpoch++
+  fullController?.abort(); sceneController?.abort(); clearTimeout(searchTimer); observer?.disconnect()
+})
 </script>
 
 <template>

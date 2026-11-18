@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import WorkflowNodeInputs from './WorkflowNodeInputs.vue'
+import FusionEditor from './FusionEditor.vue'
 import type {
+  FusionPolicy,
   InheritedGraphRef,
   MergePolicyConfig,
   Metadata,
@@ -23,6 +25,7 @@ const props = defineProps<{
   documents: ProjectFile[]
   scopes: string[]
   workflow: WorkflowConfig | null
+  projectFusion?: FusionPolicy
   inheritedGraphs: InheritedGraphRef[]
   locked: boolean
   dirty: boolean
@@ -170,8 +173,8 @@ function makeMergeNode(
   const mid = nextId('merge', used)
   return {
     node_id: mid,
-    label: label || `合并抽取节点 ${merges.length + 1}`,
-    merge_mode: 'merge_and_extract',
+    label: label || `合并节点 ${merges.length + 1}`,
+    merge_mode: 'deterministic',
     source_ids: [],
     source_table_overrides: {},
     document_ids: null,
@@ -274,8 +277,7 @@ function buildPresetSplit(withMerge: boolean) {
   next.units = units
   next.max_parallel_workers = Math.min(4, Math.max(1, units.length))
   if (withMerge) {
-    const m = makeMergeNode(units, [], { x: 360, y: Math.max(80, Math.round((units.length * 130) / 2 - 40)) }, '全节点合并抽取')
-    m.merge_mode = 'merge_and_extract'
+    const m = makeMergeNode(units, [], { x: 360, y: Math.max(80, Math.round((units.length * 130) / 2 - 40)) }, '合并各表结果')
     next.merge_nodes = [m]
     next.edges = [
       ...units.map(u => ({ edge_id: `e_${u.unit_id}_${m.node_id}`, source: u.unit_id, target: m.node_id })),
@@ -704,6 +706,12 @@ function updateSharedTypes(raw: string) {
 const selectedMergePolicy = computed(() =>
   current.value.merge_nodes?.[selectedMergeIndex.value]?.merge_policy || current.value.merge_policy,
 )
+const selectedFusion = computed<FusionPolicy>(() => {
+  const policy = selectedMergePolicy.value
+  const explicit = policy.fusion_policy || current.value.merge_policy.fusion_policy
+  const project = props.projectFusion || { version: 1 as const, label_conflict_policy: 'retain_variants' as const, entity_rules: [] }
+  return explicit || (policy.conflict_mode === 'strict' ? { ...project, label_conflict_policy: 'strict' } : project)
+})
 
 function toggleAuthoritySource(sourceId: string) {
   const list = selectedMergePolicy.value.authority_sources || []
@@ -815,7 +823,7 @@ const topologySummary = computed(() => {
       <div class="actions">
         <button class="btn" :disabled="locked || !sources.length" @click="emit('refreshTables')">读取数据表</button>
         <button class="btn" :disabled="locked || !sources.length" @click="buildPresetSplit(false)">按表拆分直出</button>
-        <button class="btn" :disabled="locked || !sources.length" @click="buildPresetSplit(true)">按表拆分+合并抽取</button>
+        <button class="btn" :disabled="locked || !sources.length" @click="buildPresetSplit(true)">按表拆分并合并</button>
       </div>
     </div>
 
@@ -1123,8 +1131,8 @@ const topologySummary = computed(() => {
                 :disabled="locked"
                 @change="updateMergeNodeField(selectedMergeIndex, 'merge_mode', ($event.target as HTMLSelectElement).value as 'deterministic' | 'merge_and_extract')"
               >
-                <option value="deterministic">确定性安全归并（快速合并，不额外调用模型）</option>
-                <option value="merge_and_extract">全节点合并抽取（合并上游底座后再联合抽取跨分支关系）</option>
+                <option value="deterministic">合并已有结果（不查询数据库，不调用模型）</option>
+                <option value="merge_and_extract">全节点合并抽取（另外启动模型，补充跨分支关系）</option>
               </select>
             </div>
 
@@ -1140,6 +1148,7 @@ const topologySummary = computed(() => {
                 <h3>本节点归并策略</h3>
               </div>
               <p class="field-hint">{{ current.merge_nodes[selectedMergeIndex]!.merge_policy ? '使用本节点独立配置。' : '当前继承全局策略，编辑后仅作用于本节点。' }}</p>
+              <FusionEditor :key="projectId + '/' + selectedId" :model-value="selectedFusion" :locked="locked" title="此节点的跨源实体合并规则" @update:model-value="updateMergePolicyField('fusion_policy', $event)"/>
               <button v-if="current.merge_nodes[selectedMergeIndex]!.merge_policy" class="btn small" :disabled="locked" @click="updateMergeNodeField(selectedMergeIndex, 'merge_policy', null)">恢复继承全局策略</button>
               <div class="field">
                 <label for="merge-shared-types">允许跨分支直并的实体类型</label>

@@ -45,6 +45,8 @@ def construction_summary(records, publications, graph, *, execution_kind='not_ru
                  'entity_type_count': stats['entity_type_count'], 'relation_type_count': stats['relation_type_count'],
                  'mapping_count': sum(stats['observed_mappings'].values())},
         execution={'model_runtime': execution_kind, 'data_validation': data_validation,
+                   'nodes_with_label_variants': sum(len(node.get('label_variants', [])) > 1 for node in graph.get('nodes', [])),
+                   'nodes_with_label_conflicts': sum(bool(node.get('label_conflict')) for node in graph.get('nodes', [])),
                    'conflict_isolation': {k: v for k, v in graph.get('conflict_isolation', {}).items()
                                           if k not in {'node_ids', 'edge_ids'}},
                    'instance_publications': [{k: v for k, v in p.items() if k in {

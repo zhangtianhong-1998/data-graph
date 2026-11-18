@@ -489,7 +489,7 @@ class Workspace:
                 raise
             return deepcopy(file)
 
-    def _normalize_config(self, project_id: str, value: dict, project: dict | None = None) -> dict:
+    def _normalize_config(self, project_id: str, value: dict, project: dict | None = None, *, offline=False) -> dict:
         if not isinstance(value, dict):
             raise LightGraphError("invalid_project_config")
         _no_credentials(value)
@@ -508,7 +508,7 @@ class Workspace:
             if len(matches) != 1 or matches[0]["kind"] not in allowed:
                 raise LightGraphError("config_path_must_be_unambiguous_project_file")
             path = self._path(project_id, matches[0]["relative_path"])
-            if not path.is_file():
+            if not offline and not path.is_file():
                 raise LightGraphError("project_file_not_found")
             return matches[0]["relative_path"]
 
@@ -528,9 +528,10 @@ class Workspace:
                     inherited["snapshot_path"] = registered(inherited["snapshot_path"], {"yaml"})
             if data.get("agent_config"):
                 data["agent_config"] = registered(data["agent_config"], {"yaml"})
-                agent = self._read(self._path(project_id, data["agent_config"]))
-                _no_credentials(agent)
-                AgentConfig.model_validate(agent)
+                if not offline:
+                    agent = self._read(self._path(project_id, data["agent_config"]))
+                    _no_credentials(agent)
+                    AgentConfig.model_validate(agent)
             return RunConfig.model_validate(data).model_dump(mode="json")
         except LightGraphError:
             raise
@@ -540,9 +541,9 @@ class Workspace:
         except Exception:
             raise LightGraphError("invalid_project_config") from None
 
-    def get_config(self, project_id: str) -> dict:
+    def get_config(self, project_id: str, *, offline=False) -> dict:
         with self.lock(project_id):
-            return self._normalize_config(project_id, self._read(self._path(project_id, "config.yaml")))
+            return self._normalize_config(project_id, self._read(self._path(project_id, "config.yaml")), offline=offline)
 
     def save_config(self, project_id: str, value: dict) -> dict:
         with self.lock(project_id):
@@ -599,6 +600,17 @@ class Workspace:
                 config = RunConfig.model_validate(data).resolve_paths(self.project_path(project_id))
             except Exception:
                 raise LightGraphError("invalid_project_config") from None
+            generation = self.output_generation(project_id)
+            if generation is not None:
+                config.output_dir = str(self.generation_path(project_id, generation))
+            return config
+
+    def result_config(self, project_id: str) -> RunConfig:
+        """Read result permissions without opening removed sources or model files."""
+        with self.lock(project_id):
+            data = self.get_config(project_id, offline=True)
+            data["agent_config"] = None
+            config = RunConfig.model_validate(data).resolve_paths(self.project_path(project_id))
             generation = self.output_generation(project_id)
             if generation is not None:
                 config.output_dir = str(self.generation_path(project_id, generation))

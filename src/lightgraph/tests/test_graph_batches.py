@@ -80,9 +80,9 @@ def test_two_hops_is_complete_above_1000_nodes(published):
 def test_cursor_rejects_changed_publication_permissions_or_selection(published):
     config, _ = published
     first = read_graph_batch(None, 'p', config=config)
-    for change in ({'scopes': []}, {'max_db_queries': 20}):
-        with pytest.raises(LightGraphError, match='graph_generation_changed'):
-            read_graph_batch(None, 'p', config=config.model_copy(update=change), generation=first['generation'])
+    read_graph_batch(None, 'p', config=config.model_copy(update={'max_db_queries': 20}), generation=first['generation'])
+    with pytest.raises(LightGraphError, match='graph_generation_changed'):
+        read_graph_batch(None, 'p', config=config.model_copy(update={'scopes': []}), generation=first['generation'])
     with pytest.raises(LightGraphError, match='graph_generation_changed'):
         read_graph_batch(None, 'p', config=config, generation=first['generation'], focus='n00000')
     publish_fixture(config, 1001)

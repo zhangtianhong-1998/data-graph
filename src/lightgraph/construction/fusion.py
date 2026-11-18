@@ -1,0 +1,265 @@
+"""Deterministic, explicit identity fusion and source-observation preservation."""
+from copy import deepcopy
+import unicodedata
+
+from lightgraph.contracts import canonical, digest
+from lightgraph.errors import LightGraphError
+from lightgraph.runtime.config import FusionPolicyConfig
+from lightgraph.source_values import persisted_identity_key
+
+
+def normalize_value(value, operations):
+    if not operations:
+        return value
+    if not isinstance(value, str):
+        raise LightGraphError('fusion_normalization_type_mismatch')
+    for operation in operations:
+        if operation == 'trim':
+            value = value.strip()
+        elif operation == 'casefold':
+            value = value.casefold()
+        elif operation == 'nfkc':
+            value = unicodedata.normalize('NFKC', value)
+    if not value:
+        raise LightGraphError('fusion_empty_normalized_value')
+    return value
+
+
+def merge_definition(previous, incoming):
+    """Only identity/relationship contracts block; display text is not identity."""
+    if previous is None:
+        return deepcopy(incoming)
+    presentation = {'description', 'display_mode'}
+    if ({k: v for k, v in previous.items() if k not in presentation}
+            != {k: v for k, v in incoming.items() if k not in presentation}):
+        raise LightGraphError('published_definition_conflict')
+    result = deepcopy(previous)
+    descriptions = sorted({d.get('description', '') for d in (previous, incoming)} - {''})
+    if descriptions:
+        result['description'] = descriptions[0]
+    if 'display_mode' in previous or 'display_mode' in incoming:
+        modes = {d.get('display_mode', 'auto') for d in (previous, incoming)}
+        result['display_mode'] = next(iter(modes)) if len(modes) == 1 else 'auto'
+    return result
+
+
+def _property_observations(properties, rule, source):
+    prefix = (f"{source['source_id']}.{source.get('schema') or 'public'}.{source['table']}."
+              if source.get('source_id') and source.get('table') else '')
+    for name, values in sorted(properties.items()):
+        target = rule.property_aliases.get(prefix + name, rule.property_aliases.get(name, name))
+        for raw in values:
+            yield {'property': target, 'value': normalize_value(raw, rule.property_normalizers.get(target, [])),
+                   'original_property': name, 'raw_value': raw}
+
+
+def _property_values(observations):
+    result = {}
+    for observation in observations:
+        value = observation['value']
+        result.setdefault(observation['property'], {})[canonical(value)] = value
+    return {name: [bucket[key] for key in sorted(bucket)] for name, bucket in sorted(result.items())}
+
+
+def prepare_graph(graph, policy, *, copy=True):
+    """Return a new graph with explicit type/key mapping and rewritten endpoints.
+
+    No key may be dropped, and physical-column identities remain source-specific.
+    Original identities/properties are retained within their authorized supports.
+    """
+    policy = policy if isinstance(policy, FusionPolicyConfig) else FusionPolicyConfig.model_validate(policy)
+    result = deepcopy(graph) if copy else graph
+    rules = {(r.entity_type, frozenset(r.key_mapping.values())): r for r in policy.entity_rules}
+    target_types = {r.entity_type: r.canonical_type for r in policy.entity_rules}
+    previous = result.get('fusion_policy', {})
+    for old in previous.get('entity_rules', []):
+        new = rules.get((old['entity_type'], frozenset(old['key_mapping'].values())))
+        if new and new.model_dump(mode='json') != old:
+            # A canonical node can already represent several original identities.
+            # Re-keying it requires its pre-fusion contributions and edge witnesses.
+            raise LightGraphError('fusion_policy_requires_original_contributions')
+
+    def rule_for(entity_type, keys):
+        rule = rules.get((entity_type, frozenset(keys)))
+        if rule is None and entity_type in target_types:
+            raise LightGraphError('fusion_identity_keys_mismatch')
+        return rule
+
+    canonical_rules = {rule.canonical_type: rule for rule in policy.entity_rules}
+    remap = {}
+    original_key_names = {d['type']: list(d['key_names']) for d in result.get('definitions', {}).get('entities', [])}
+
+    def prepared(item, keys):
+        if 'identity_domain' not in item:
+            return False
+        expected = canonical_rules.get(item['type'])
+        if expected is not None and (item['identity_domain'] != expected.identity_domain
+                                     or set(keys) != set(expected.key_mapping)):
+            raise LightGraphError('fusion_identity_keys_mismatch')
+        return True
+
+    for definition in result.get('definitions', {}).get('entities', []):
+        if prepared(definition, definition['key_names']):
+            continue
+        rule = rule_for(definition['type'], definition['key_names'])
+        if rule is None:
+            continue
+        if definition.get('identity_origin', 'row') != 'row':
+            raise LightGraphError('fusion_physical_identity_forbidden')
+        definition.update(type=rule.canonical_type, key_names=sorted(rule.key_mapping), identity_domain=rule.identity_domain)
+    for definition in result.get('definitions', {}).get('relations', []):
+        for end in ('source_type', 'target_type'):
+            if definition.get(end) in target_types:
+                definition[end] = target_types[definition[end]]
+    for node in result.get('nodes', []):
+        if prepared(node, node['identity']):
+            continue
+        rule = rule_for(node['type'], node['identity'])
+        if rule is None:
+            continue
+        if node.get('identity_origin', 'row') != 'row':
+            raise LightGraphError('fusion_physical_identity_forbidden')
+        original = {key: deepcopy(node[key]) for key in ('id', 'type', 'identity', 'identity_types') if key in node}
+        if any(value is None for value in original['identity'].values()):
+            raise LightGraphError('fusion_missing_identity_value')
+        if any(rule.key_normalizers.get(key) and original.get('identity_types', {}).get(source, 'text') != 'text'
+               for key, source in rule.key_mapping.items()):
+            raise LightGraphError('fusion_normalization_type_mismatch')
+        node['identity'] = {key: normalize_value(original['identity'][source], rule.key_normalizers.get(key, []))
+                            for key, source in sorted(rule.key_mapping.items())}
+        node['identity_types'] = {key: original.get('identity_types', {})[source]
+            for key, source in sorted(rule.key_mapping.items()) if source in original.get('identity_types', {})}
+        node.update(type=rule.canonical_type, identity_domain=rule.identity_domain)
+        node['id'] = 'n_' + digest('fusion_v1', rule.identity_domain, rule.canonical_type, persisted_identity_key(node))
+        remap[original['id']] = node['id']
+        observations = []
+        for support in node.get('supports', []):
+            physical = support.get('provenance', {}).get('key_columns', [])
+            names = original_key_names.get(original['type'], [])
+            if physical and len(names) == len(physical):
+                support['original_key_values'] = {col: original['identity'][name] for col, name in zip(physical, names)}
+            if original not in support.setdefault('identity_origins', []):
+                support['identity_origins'].append(original)
+            if rule.property_aliases or rule.property_normalizers:
+                support.setdefault('observed_properties', deepcopy(support.get('properties', {})))
+                fields = _property_observations(support['observed_properties'], rule,
+                                                support.get('provenance', {}).get('source', {}))
+                support['property_observations'] = list(fields)
+                observations.extend(support['property_observations'])
+                support['properties'] = _property_values(support['property_observations'])
+        if rule.property_aliases or rule.property_normalizers:
+            if not node.get('supports'):
+                observations = _property_observations(node.get('properties', {}), rule, {})
+            node['properties'] = _property_values(observations)
+    relations = {rel['type']: rel for rel in result.get('definitions', {}).get('relations', [])}
+    for edge in result.get('edges', []):
+        old_edge_id = edge['id']
+        old = (edge['source'], edge['target'])
+        edge['source'] = remap.get(edge['source'], edge['source'])
+        edge['target'] = remap.get(edge['target'], edge['target'])
+        if old[0] != old[1] and edge['source'] == edge['target'] and not relations.get(edge['type'], {}).get('allow_self_links'):
+            raise LightGraphError('self_link_forbidden')
+        if old != (edge['source'], edge['target']):
+            edge['id'] = 'r_' + digest(edge['type'], edge['source'], edge['target'])
+        for support in edge.get('supports', []):
+            if old != (edge['source'], edge['target']):
+                support.setdefault('endpoint_origins', []).append({'edge_id': old_edge_id,
+                    'source': old[0], 'target': old[1]})
+            for match in support.get('lookup_matches', []):
+                if match.get('inherited_node_id') in remap:
+                    match['inherited_node_id'] = remap[match['inherited_node_id']]
+    result['label_conflict_policy'] = policy.label_conflict_policy
+    result['fusion_policy_version'] = policy.version
+    result['fusion_policy_digest'] = digest(policy.model_dump(mode='json'))
+    return result
+
+
+def stamp_execution(item, graph):
+    """Tie each observation to its source validation, including repeated draft runs."""
+    stamp = {k: graph[k] for k in ('draft_id', 'draft_revision', 'validation_id') if k in graph}
+    if stamp:
+        for support in item.get('supports', []):
+            support['validation_origin'] = stamp
+
+
+def label_priority(support, authority_sources):
+    """Match an explicitly preferred source, table, or original name column."""
+    prov = support.get('provenance', {})
+    src = prov.get('source', {})
+    source_id = src.get('source_id')
+    if not source_id:
+        return None
+    names = {source_id}
+    if src.get('table'):
+        table = '.'.join([source_id, src.get('schema') or 'public', src['table']])
+        names.add(table)
+        if prov.get('label_column'):
+            names.add(table + '.' + prov['label_column'])
+    return next((idx for idx, name in enumerate(authority_sources) if name in names), None)
+
+
+def deduplicate_supports(item):
+    """Count source observations once, retaining every extraction execution.
+
+    Scope, source columns, row context, raw and normalized values identify an
+    observation. Execution provenance records each independent extraction.
+    """
+    if 'identity' in item:
+        owner = [item['type'], item.get('identity_domain'), persisted_identity_key(item)]
+    else:
+        owner = [item['type'], item.get('source'), item.get('target')]
+    collected = {}
+    for support in item.get('supports', []):
+        provenance = support.get('provenance', {})
+        execution = {key: support[key] for key in ('contributor_id',) if key in support}
+        execution.update(support.get('validation_origin', {}))
+        execution.update({key: provenance[key] for key in ('definition', 'mapping') if key in provenance})
+        refs = sorted(set(support.get('evidence_refs', [])) | set(provenance.get('evidence_refs', [])))
+        if refs:
+            execution['evidence_refs'] = refs
+        observed = dict(support)
+        for key in ('contributor_id', 'evidence_refs', 'execution_origins', 'observation_id', 'identity_origins', 'validation_origin', 'label_authority', 'label_priority'):
+            observed.pop(key, None)
+        # A normalizer can map two raw codes in one table to a single key.
+        # Their raw source rows are separate observations even when their names agree.
+        raw_keys = [origin.get('identity') for origin in support.get('identity_origins', [])]
+        if raw_keys and 'original_key_values' not in observed:
+            observed['original_identities'] = sorted(raw_keys, key=canonical)
+        if 'provenance' in observed:
+            observed['provenance'] = dict(provenance)
+            for key in ('definition', 'mapping', 'evidence_refs'):
+                observed['provenance'].pop(key, None)
+        observation = 'obs_' + digest(owner, observed)
+        support.pop('validation_origin', None)
+        target = collected.setdefault(observation, {**support, 'observation_id': observation, 'execution_origins': []})
+        for origin in support.get('execution_origins') or ([execution] if execution else []):
+            if origin not in target['execution_origins']:
+                target['execution_origins'].append(origin)
+        for origin in support.get('identity_origins', []):
+            if origin not in target.setdefault('identity_origins', []):
+                target['identity_origins'].append(origin)
+        for where in (None, 'provenance'):
+            src = support if where is None else support.get(where, {})
+            dst = target if where is None else target.setdefault(where, {})
+            if 'evidence_refs' in src:
+                dst['evidence_refs'] = sorted(set(dst.get('evidence_refs', [])) | set(src['evidence_refs']))
+    for target in collected.values():
+        target['execution_origins'].sort(key=canonical)
+        if 'identity_origins' in target:
+            target['identity_origins'].sort(key=canonical)
+    item['supports'] = [collected[key] for key in sorted(collected)]
+
+
+def annotate_visible_variants(node):
+    """Derived presentation only: invoke after filtering supports for visibility."""
+    variants = {}
+    for support in node.get('supports', []):
+        label = support.get('observed_label', support.get('label'))
+        if label is not None:
+            variants.setdefault(str(label), set()).add(support.get('scope_ref', 'public'))
+    node['label_variants'] = sorted(variants)
+    by_scope = {}
+    for label, scopes in variants.items():
+        for scope in scopes:
+            by_scope.setdefault(scope, set()).add(label)
+    node['label_conflict'] = any(len(labels) > 1 for labels in by_scope.values())

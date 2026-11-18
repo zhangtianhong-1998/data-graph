@@ -5,17 +5,19 @@ import { edgeKey } from './graphScene'
 import type { Graph, GraphEdge, GraphNode } from './types'
 
 type Batch = Graph & { part: 'nodes' | 'edges'; offset: number; next_offset: number | null; generation: string; matched_nodes: number; matched_edges: number }
-export type GraphTransfer = { part: 'nodes' | 'edges'; offset: number; generation: string; complete: boolean; nodes: Map<string, GraphNode>; edges: Map<string, GraphEdge>; graph: Graph }
+export type GraphTransfer = { part: 'nodes' | 'edges'; offset: number; generation: string; version?: string; complete: boolean; nodes: Map<string, GraphNode>; edges: Map<string, GraphEdge>; graph: Graph }
 export function newGraphTransfer(): GraphTransfer {
   return { part: 'nodes', offset: 0, generation: '', complete: false, nodes: new Map(), edges: new Map(), graph: { nodes: [], edges: [], truncated: true } }
 }
 
 /** A cursor advances only after an accepted page. Pausing keeps that cursor;
  * resuming rechecks its publication and authorization on the server. */
-export async function transferGraph(projectId: string, selection: { layer: string; includeCandidates?: boolean; focus?: string; hops?: number; traversal?: string }, state: GraphTransfer, signal: AbortSignal, onPage: (graph: Graph) => void) {
+export async function transferGraph(projectId: string, selection: { layer: string; version?: string; includeCandidates?: boolean; focus?: string; hops?: number; traversal?: string }, state: GraphTransfer, signal: AbortSignal, onPage: (graph: Graph) => void) {
+  if (state.version && selection.version && state.version !== selection.version) throw new ApiError('graph_generation_changed')
   while (!state.complete) {
     if (signal.aborted) throw new ApiError('request_cancelled')
     const params = new URLSearchParams({ layer: selection.layer, include_candidates: String(selection.includeCandidates === true), part: state.part, offset: String(state.offset), limit: '1000', generation: state.generation, focus: selection.focus || '', hops: String(selection.hops ?? 2), traversal: selection.traversal ?? 'chains' })
+    if (state.version || selection.version) params.set('version', state.version || selection.version!)
     const page = await readGraph<Batch>(`${projectPath(projectId)}/graph/batches?${params}`, signal)
     if (signal.aborted) throw new ApiError('request_cancelled')
     if (state.generation && page.generation !== state.generation) throw new ApiError('graph_generation_changed')
@@ -44,6 +46,9 @@ export async function transferGraph(projectId: string, selection: { layer: strin
     if (complete && (state.nodes.size + newNodes.size !== page.matched_nodes || state.edges.size + newEdges.size !== page.matched_edges)) throw new ApiError('graph_batch_incomplete')
     // Commit only after every record and completion count has passed. A bad
     // page cannot contaminate the retained scene or move the resume cursor.
+    const version = typeof page.version_id === 'string' ? page.version_id : selection.version
+    if (version && ((state.version && state.version !== version) || (selection.version && selection.version !== version))) throw new ApiError('graph_generation_changed')
+    state.version = version || state.version
     state.generation = page.generation
     for (const [id, node] of newNodes) state.nodes.set(id, node)
     for (const [id, edge] of newEdges) state.edges.set(id, edge)

@@ -11,6 +11,7 @@ import os
 import re
 import time
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -139,6 +140,7 @@ class GraphWorkspace:
     """Retain Agent-authored models, exact data checks and immutable graph versions."""
 
     def __init__(self, root: str | Path, context_fingerprint: str):
+        self.result_policy_id = None
         if not context_fingerprint:
             raise LightGraphError("construction_context_required")
         self.root = Path(root)
@@ -274,7 +276,9 @@ class GraphWorkspace:
         return record
 
     def get_draft(self, draft_id: str) -> DraftRecord:
-        entry = self._manifest()["drafts"].get(draft_id)
+        return self._read_draft_entry(draft_id, self._manifest()["drafts"].get(draft_id))
+
+    def _read_draft_entry(self, draft_id, entry):
         if entry is None:
             raise LightGraphError("unknown_graph_draft")
         payload = self._read_record(entry['current'])
@@ -394,7 +398,7 @@ class GraphWorkspace:
         raise LightGraphError('graph_conflict_evidence_missing')
 
     def publish(self, draft_id: str, *, revision: int, graph: dict,
-                validation_id: str | None = None, isolate_conflicts=False) -> dict:
+                validation_id: str | None = None, isolate_conflicts=False, fusion_policy=None) -> dict:
         """Publish the exact validated graph, retaining independent draft outputs.
 
         Semantic definitions remain Agent-authored. Publication attests only to
@@ -418,13 +422,15 @@ class GraphWorkspace:
         existing = publications.get(draft_id)
         # Once quarantine is in use, a strict low-level caller must not silently
         # reintroduce an identity blocked by another active publication.
-        isolate_conflicts = isolate_conflicts or any(
-            value.get('conflict_policy') == 'isolate' for value in publications.values())
+        if fusion_policy is None:
+            isolate_conflicts = isolate_conflicts or any(value.get('conflict_policy') in {'isolate', 'quarantine'}
+                and value.get('context_fingerprint') == self.context_fingerprint for value in publications.values())
+        policy_name = fusion_policy.label_conflict_policy if fusion_policy else ('isolate' if isolate_conflicts else 'reject')
         if (existing and existing['revision'] == revision
                 and existing['context_fingerprint'] == self.context_fingerprint
                 and existing.get('validation_id') == validation.validation_id
                 and existing.get('graph_digest') == validation.graph_digest
-                and existing.get('conflict_policy', 'reject') == ('isolate' if isolate_conflicts else 'reject')):
+                and existing.get('conflict_policy', 'reject') == policy_name):
             if record.status != publication_status:
                 restored = record.model_copy(update={'status': publication_status})
                 relative = self._append_record('drafts', self._draft_record_payload(restored))
@@ -435,30 +441,42 @@ class GraphWorkspace:
         entry = {'draft_id': draft_id, 'revision': revision, 'context_fingerprint': self.context_fingerprint,
                  'draft_fingerprint': record.fingerprint, 'graph_digest': validation.graph_digest,
                  'validation_id': validation.validation_id, 'read_window': validation.read_window,
-                 'semantic_origin': 'agent_authored', 'conflict_policy': 'isolate' if isolate_conflicts else 'reject',
+                 'semantic_origin': 'agent_authored', 'conflict_policy': policy_name,
                  'coverage': 'conflict_isolated' if isolated else 'complete',
                  'published_nodes': len(graph.get('nodes', [])), 'published_edges': len(graph.get('edges', [])),
                  'isolated_nodes': graph.get('conflict_isolation', {}).get('nodes', 0),
                  'isolated_edges': graph.get('conflict_isolation', {}).get('edges', 0)}
-        published = {**graph, 'status': 'published', 'semantic_origin': 'agent_authored'}
+        published = {**graph, 'status': 'published', 'semantic_origin': 'agent_authored',
+                     **({'validation_id': validation.validation_id} if validation.validation_id else {})}
         entry['published_graph_digest'] = digest(published)
         # Check conflicts against every still-current independent publication
         # before advancing either the publication set or the merged graph head.
         graphs = [self._read_record(value['graph']) for key, value in publications.items()
                   if key != draft_id and value['context_fingerprint'] == self.context_fingerprint]
         contributors = graphs + [published]
+        if fusion_policy and fusion_policy.entity_rules:
+            from .fusion import prepare_graph
+            contributors = [prepare_graph(g, fusion_policy) for g in contributors]
         if isolate_conflicts:
             contributors, isolation = isolate_publications(contributors)
-            merged = _merge_graphs(contributors)
+            merged = _merge_graphs(contributors, fusion_policy=fusion_policy)
             merged['conflict_isolation'] = isolation
         else:
-            merged = _merge_graphs(contributors)
+            merged = _merge_graphs(contributors, fusion_policy=fusion_policy)
         entry['graph'] = self._append_record('published', published)
         manifest.setdefault('publication_history', []).append(entry)
         publications[draft_id] = entry
+        old_head = manifest.get('current_graph')
+        if old_head and 'version_id' not in old_head:
+            manifest.setdefault('graph_history', []).append(deepcopy(old_head))
         manifest['current_graph'] = {'context_fingerprint': self.context_fingerprint,
+                                     **({'result_policy_id': self.result_policy_id} if self.result_policy_id else {}),
+                                     **({'run_id': self.publication_run_id} if getattr(self, 'publication_run_id', None) else {}),
                                      'access_fingerprint': merged.get('access_fingerprint'),
                                      'path': self._append_record('published', merged)}
+        from .snapshot_registry import record_graph_head
+        record_graph_head(manifest, manifest['current_graph'], root=self.root,
+                          coverage=merged.get('conflict_isolation', {}).get('coverage', 'complete'))
         published_record = record.model_copy(update={'status': publication_status})
         relative = self._append_record('drafts', self._draft_record_payload(published_record))
         manifest['drafts'][draft_id]['history'].append(relative)
@@ -484,7 +502,24 @@ class GraphWorkspace:
                 if entry['context_fingerprint'] == self.context_fingerprint]
 
     def list_drafts(self) -> list[DraftRecord]:
-        return [self.get_draft(key) for key in self._manifest()["drafts"]]
+        return [self._read_draft_entry(key, entry) for key, entry in self._manifest()["drafts"].items()]
+
+    def draft_index(self, draft_id=None, *, offset=0):
+        """A bounded progress page with no graph materialization or evidence scan."""
+        manifest = self._manifest()
+        ids = [draft_id] if draft_id is not None else sorted(manifest['drafts'])
+        if not isinstance(offset, int) or offset < 0:
+            raise LightGraphError('invalid_page')
+        page = []
+        for key in ids[offset:offset + 50]:
+            record = self._read_draft_entry(key, manifest['drafts'].get(key))
+            check = record.validation
+            page.append({'draft_id': key, 'revision': record.revision, 'status': record.status,
+                         'validation_passed': check.passed if check else None,
+                         'unresolved_count': len(record.draft.unresolved) if record.status != 'stale' else None,
+                         'draft_material': 'draft:' + key, 'validation_material': 'validation:' + key if check else None})
+        return {'drafts': page, 'total_drafts': len(ids),
+                'next_offset': offset + len(page) if offset + len(page) < len(ids) else None}
 
     def read_summary(self) -> dict:
         manifest = self._manifest()
@@ -518,10 +553,10 @@ class GraphWorkspace:
                                  if p['context_fingerprint'] == self.context_fingerprint]}
 
 
-def _merge_graphs(graphs):
+def _merge_graphs(graphs, *, fusion_policy=None):
     """Combine independently checked subgraphs without silently replacing facts."""
-    from copy import deepcopy
     from lightgraph.source_values import persisted_identity_key
+    from .fusion import merge_definition, deduplicate_supports, stamp_execution
     result = {'format_version': 1, 'target': 'graph', 'status': 'published',
               **({'extends_base_graph': True} if any(g.get('extends_base_graph') for g in graphs) else {}),
               'semantic_origin': 'agent_authored', 'definitions': {'entities': [], 'relations': []},
@@ -558,21 +593,23 @@ def _merge_graphs(graphs):
                     definition.setdefault('display_mode', 'auto')
                     definition.setdefault('identity_origin', 'row')
                 previous = definitions[category].get(definition['type'])
-                if previous is not None and previous != definition:
-                    raise LightGraphError('published_definition_conflict')
-                definitions[category][definition['type']] = deepcopy(definition)
+                definitions[category][definition['type']] = merge_definition(previous, definition)
         for category in items:
             for item in graph.get(category, []):
+                if fusion_policy:
+                    item = deepcopy(item)
+                    stamp_execution(item, graph)
                 previous = items[category].get(item['id'])
                 if previous is None:
-                    items[category][item['id']] = deepcopy(item)
+                    items[category][item['id']] = item if fusion_policy else deepcopy(item)
                     continue
                 fixed = ('type',) if category == 'nodes' else ('type', 'source', 'target')
                 if (any(previous.get(key) != item.get(key) for key in fixed)
                         or category == 'nodes' and persisted_identity_key(previous) != persisted_identity_key(item)):
                     raise LightGraphError('published_graph_identity_conflict')
                 if category == 'nodes':
-                    if previous.get('identity_origin', 'row') != item.get('identity_origin', 'row'):
+                    if (previous.get('identity_origin', 'row') != item.get('identity_origin', 'row')
+                            or previous.get('identity_domain') != item.get('identity_domain')):
                         raise LightGraphError('published_graph_identity_conflict')
                     if previous.get('identity_origin') == 'physical_column':
                         from .metadata_columns import merge_column_supports
@@ -581,7 +618,7 @@ def _merge_graphs(graphs):
                     if 'supports' not in previous or 'supports' not in item:
                         if previous.get('label') != item.get('label'):
                             raise LightGraphError('published_graph_identity_conflict')
-                    else:
+                    elif not fusion_policy or fusion_policy.label_conflict_policy != 'retain_variants':
                         labels = {}
                         for support in previous['supports'] + item['supports']:
                             label = support.get('label')
@@ -590,7 +627,7 @@ def _merge_graphs(graphs):
                                 values.add(label)
                                 if len(values) > 1:
                                     raise LightGraphError('published_graph_identity_conflict')
-                for key in ('aliases', 'provenance', 'supports'):
+                for key in ('aliases', 'provenance', 'supports', 'english_names', 'descriptions'):
                     if key in item:
                         values = previous.setdefault(key, [])
                         for value in item[key]:
@@ -603,6 +640,13 @@ def _merge_graphs(graphs):
                             merged.append(deepcopy(value))
     result['definitions'] = {key: list(value.values()) for key, value in definitions.items()}
     result.update({key: sorted(value.values(), key=lambda item: item['id']) for key, value in items.items()})
+    if fusion_policy:
+        result['label_conflict_policy'] = fusion_policy.label_conflict_policy
+        result['fusion_policy'] = fusion_policy.model_dump(mode='json')
+        result['fusion_policy_digest'] = digest(result['fusion_policy'])
+        for item in result['nodes'] + result['edges']:
+            if 'supports' in item:
+                deduplicate_supports(item)
     for node in result['nodes']:
         labels = sorted({support['label'] for support in node.get('supports', []) if support.get('label') is not None})
         if labels:

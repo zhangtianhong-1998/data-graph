@@ -6,7 +6,22 @@ const messages: Record<string, string> = {
   scope_binding_conflict: '同一来源表存在不同的范围列绑定，请核对 scope_bindings 后重试。',
   graph_support_visibility_missing: '该图缺少逐条来源证据的可见范围，请按当前绑定重新验证和发布。',
   graph_read_conflict: '图谱读取期间项目配置已变化，请重新加载图谱。',
-  graph_access_context_changed: '来源或访问权限已改变，旧图暂不展示。历史文件保留，请按当前授权重新验证和发布。',
+  graph_access_context_changed: '当前授权无法读取此图。若只移动过目录，可在历史版本中核验原项目路径。',
+  graph_version_not_found: '找不到此历史版本，请刷新版本列表。',
+  graph_access_migration_evidence_mismatch: '原项目信息与发布记录不一致，无法核验旧图。',
+  workflow_checkpoint_invalid: '该节点的存档缺失或校验不通过，请重新运行生成它的节点。',
+  workflow_resume_input_changed: '需要复用的上游节点已变更，请从变更的节点重新运行。',
+  workflow_resume_source_invalid: '请选择已结束的工作流运行。',
+  workflow_checkpoint_missing: '没有可复用的上游节点存档，请从该上游节点重新运行。',
+  workflow_resume_state_missing: '找不到属于这次运行的节点记录，无法从这里恢复。',
+  workflow_terminal_artifact_required: '仅能直接发布工作流唯一输出节点已提交的完整图。',
+  workflow_legacy_merge_unavailable: '这次旧运行不满足原合并产物恢复条件，可查看已有历史版本。',
+  workflow_legacy_worker_unverified: '无法将旧合并节点的执行记录与这次运行对应，已保留原图。',
+  workflow_legacy_upstream_unverified: '旧合并节点的上游快照无法核验，不能重新组合。',
+  workflow_legacy_delta_unverified: '旧合并节点的已提交增量无法核验，不能恢复发布。',
+  invalid_previous_project_root: '请填写搬迁前的项目绝对路径，包括原盘符或根目录。',
+  workflow_partial_artifact_unverified: '缺少可验证的部分发布记录，已保留原项目图。',
+  workflow_checkpoint_immutable: '同一运行已有不同的节点存档，请用新的运行恢复。',
   network_unavailable: '无法连接服务，请确认后端已启动。', invalid_response: '服务返回的内容无法读取，请刷新后重试。',
   request_timeout: '请求超时，请检查后端服务、数据库地址和网络后重试。',
   request_cancelled: '请求已取消。',
@@ -118,9 +133,10 @@ const messages: Record<string, string> = {
   inherited_graph_not_found: '指定的继承基准图谱不存在或尚未发布有效图谱。',
 }
 export class ApiError extends Error {
-  constructor(public code: string, public status = 0, diagnostics: unknown = []) {
+  constructor(public code: string, public status = 0, diagnostics: unknown = [], nodeId?: unknown) {
     const fields = Array.isArray(diagnostics) ? diagnostics.slice(0, 16).filter(item => item && typeof item.path === 'string' && /^[A-Za-z0-9_.\[\]<>-]{1,160}$/.test(item.path) && typeof item.hint === 'string' && item.hint.length <= 200).map(item => `${item.path}：${item.hint}`) : []
-    super([messages[code] || `操作未完成（${code}）`, ...fields].join('\n')); this.name = 'ApiError'
+    const node = typeof nodeId === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(nodeId) ? [`涉及节点：${nodeId}`] : []
+    super([...node, messages[code] || `操作未完成（${code}）`, ...fields].join('\n')); this.name = 'ApiError'
   }
 }
 // Tokens and credentials stay in this page's memory, never browser storage.
@@ -168,7 +184,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       const code = (data as { error?: { code?: unknown } })?.error?.code
       // Render only the short public error code; never reflect raw server errors or HTML.
       throw new ApiError(typeof code === 'string' && /^[a-zA-Z0-9_.:-]{1,100}$/.test(code) ? code : `http_${response.status}`, response.status,
-        ['invalid_project_config', 'invalid_model_limits'].includes(String(code)) ? (data as { error?: { diagnostics?: unknown } })?.error?.diagnostics : [])
+        ['invalid_project_config', 'invalid_model_limits'].includes(String(code)) ? (data as { error?: { diagnostics?: unknown } })?.error?.diagnostics : [], (data as { error?: { node_id?: unknown } })?.error?.node_id)
     }
     if (data !== null && typeof data === 'object' && response.headers.get('etag')) responseRevisions.set(data, response.headers.get('etag')!)
     return data as T

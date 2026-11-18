@@ -22,6 +22,7 @@ from .base import SourceAdapter, QueryStats, cursor_batches
 from .budget import QueryBudget, BudgetedCursor
 from .gauss_compat import catalog_value, catalog_bool, safe_database_cause, set_optional_lock_timeout
 from .database_errors import connection_is_closed, database_diagnostic, database_error, qualification_error, readback_shape_failure, annotate_database_error, cleanup_preserving_error
+from .validation_session import keep_session
 from .reconnect import configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary, terminal_failure, latch_terminal_failure, prepare_snapshot
 
 REQUIRED_RUNTIME = {"read_only_transaction", "parameter_binding", "metadata_reading", "distinct_projection", "statement_timeout", "query_cancel"}
@@ -98,6 +99,7 @@ class GaussSource(SourceAdapter):
             connect_finished = True
             if connection_is_closed(self._connection):
                 raise LightGraphError('database_connection_failed')
+            self.stats.physical_connections_opened += 1
             self.query_budget.check_time()
             self.preflight(probe_runtime_limits=probe_runtime_limits)
             if probe_runtime_limits and (not self._manifest.actual_database_verified or
@@ -692,10 +694,12 @@ class GaussSource(SourceAdapter):
                                     active_error.database_diagnostic = {**getattr(active_error, 'database_diagnostic', {}),
                                         'rollback_succeeded': False, 'recovery': 'reconnect_required'}
                     finally:
-                        # No transaction or network connection survives Agent
-                        # think-time. Nested queries share this lease only.
+                        # A successful validation may reuse the physical connection
+                        # for its next projection, after rollback. No open transaction
+                        # or leased session crosses the tool-call boundary.
                         try:
-                            self._release_snapshot_connection()
+                            if active_error is not None or not keep_session(self):
+                                self._release_snapshot_connection()
                         finally:
                             self.stats.snapshot_begin_close_seconds += max(0.0, time.monotonic() - close_started)
 
