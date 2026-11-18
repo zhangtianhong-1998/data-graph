@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 import uvicorn
 import yaml
+from jsonschema import Draft202012Validator, SchemaError
 from mcp.server.fastmcp import FastMCP
 
 from lightgraph.construction.harness import HarnessOptions, run_goal
@@ -30,6 +31,7 @@ def test_native_request_clips_large_arguments_and_history_reads_before_threshold
     requests, events, calls, page_values = [], [], [], []
     huge_yaml = 'SAVED_INPUT_START\n' + '中文😀x' * 20000 + '\nSAVED_INPUT_END'
     refs = {}
+    rejected_tools = []
     class Host:
         def call(self, name, **arguments):
             calls.append((name, arguments))
@@ -45,6 +47,19 @@ def test_native_request_clips_large_arguments_and_history_reads_before_threshold
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             requests.append(request)
+            # Check the provider-facing tools on every turn, including after
+            # retention rewrites. A permissive fake model masks schema errors.
+            for tool in request['tools']:
+                function = tool['function']
+                schema = function.get('parameters')
+                try:
+                    if not isinstance(schema, dict) or schema.get('type') != 'object':
+                        raise ValueError('function parameters must have type object')
+                    Draft202012Validator.check_schema(schema)
+                except (ValueError, SchemaError) as error:
+                    rejected_tools.append((function['name'], str(error)))
+                    self.send_error(400, 'Invalid function parameters')
+                    return
             count = len(requests)
             if count == 1:
                 delta = function_call('mcp__graph__save_graph_draft', {'draft_id': 'fixture-draft', 'yaml_text': huge_yaml})
@@ -76,6 +91,7 @@ def test_native_request_clips_large_arguments_and_history_reads_before_threshold
                 mcp_url=url, mcp_token_env='GRAPH_TEST_TOKEN',
                 environment={'GRAPH_TEST_TOKEN': token, 'OPENAI_API_KEY': 'local-test-only'},
                 on_event=events.append)
+        assert not rejected_tools, rejected_tools
         assert result['finish_reason'] == 'completed', result
         assert len(requests) == 5 and len(calls) == 1
         assert calls[0][1]['yaml_text'] == huge_yaml

@@ -295,9 +295,14 @@ export function apply(ctx, config) {
     name: 'session_event_read_page',
     description: 'Read bounded pages of one original native session event. Same workspace authorization as session_event_read. Follow next_offset; offsets count Unicode code points. Prefer read_material for current graph artifacts.',
     parameters: {
-      session_id: { type: 'string', description: 'Session id; omit for current session.' },
-      seq: { type: 'integer', required: true, description: 'Original event sequence number.' },
-      offset: { type: 'integer', description: 'Unicode character offset; default 0.' },
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'Session id; omit for current session.' },
+        seq: { type: 'integer', minimum: 0, description: 'Original event sequence number.' },
+        offset: { type: 'integer', minimum: 0, description: 'Unicode character offset; default 0.' },
+      },
+      required: ['seq'],
+      additionalProperties: false,
     },
     output: { schema: { type: 'string' }, render: (_args, value) => [textBlock(value)] },
     isConcurrencySafe: () => true,

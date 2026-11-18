@@ -5,6 +5,28 @@ import shutil
 import subprocess
 
 import pytest
+from jsonschema import Draft202012Validator
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='Node is required to register the DSH plugin')
+def test_session_event_read_page_registers_object_parameter_schema():
+    plugin = Path(__file__).parents[1] / 'construction/runtime/context-retention.mjs'
+    script = """
+const {apply} = await import(process.argv[1])
+const schemas = {}
+apply({tools: {register(tool) { schemas[tool.name] = tool.parameters }}, on() {}}, {})
+console.log(JSON.stringify(schemas))
+"""
+    result = subprocess.run(['node', '--input-type=module', '-e', script, plugin.as_uri()],
+                            check=True, capture_output=True, text=True, timeout=10)
+    schema = json.loads(result.stdout)['session_event_read_page']
+    assert schema.get('type') == 'object'
+    Draft202012Validator.check_schema(schema)
+    arguments = Draft202012Validator(schema)
+    assert arguments.is_valid({'seq': 0})
+    assert arguments.is_valid({'session_id': 'fixture', 'seq': 1, 'offset': 0})
+    for invalid in ({}, {'seq': '1'}, {'seq': -1}, {'seq': 1, 'offset': -1}, {'seq': 1, 'extra': 2}):
+        assert not arguments.is_valid(invalid)
 
 
 def test_native_context_retention_replays_and_respects_complete_tool_groups(tmp_path):
