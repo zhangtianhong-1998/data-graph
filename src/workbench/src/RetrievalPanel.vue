@@ -9,6 +9,13 @@ import type { AvailableRetrievalContext, BusinessContext, FactContext, Embedding
 type Observation = { business_context?: FactContext; properties?: Record<string, unknown>; evidence_refs?: string[]; source_tables?: string[] }
 type PathStep = { source: string; target: string; relation: string; direction?: string; observations?: Observation[] }
 
+interface PathResult {
+  status: 'found' | 'no_visible_seed' | 'target_not_reached' | 'incomplete' | 'no_compatible_path'
+  equally_ranked_paths?: number
+  uncovered_seed_ids: string[]
+  paths: Array<{ node_ids: string[]; edge_ids: string[]; stop_reason: string; business_context?: FactContext }>
+}
+
 interface RetrievalQueryResponse {
   available_context?: AvailableRetrievalContext
   plan?: {
@@ -36,12 +43,8 @@ interface RetrievalQueryResponse {
     stop_reason: string
     witnesses: Array<{fact_id: string; conditions: Array<{text: string; node_id: string}>; row_id: string; edge_ids: string[]}>
   }
-  drilldown?: {
-    status: 'found' | 'no_visible_seed' | 'target_not_reached'
-    equally_ranked_paths?: number
-    uncovered_seed_ids: string[]
-    paths: Array<{ node_ids: string[]; edge_ids: string[]; stop_reason: string; business_context?: FactContext }>
-  }
+  drilldown?: PathResult
+  traverse?: PathResult
   query: string
   scopes: string[]
   slots: Array<{
@@ -112,7 +115,7 @@ const emit = defineEmits<{
 const queryText = ref('')
 const businessContext = ref<BusinessContext | null>(null)
 const atomicOpen = ref(false)
-const mode = ref<'search' | 'id' | 'drilldown'>('search')
+const mode = ref<'search' | 'id' | 'drilldown' | 'traverse'>('search')
 const method = ref<'hybrid' | 'keyword' | 'vector'>('hybrid')
 const field = ref<'all' | 'name' | 'description'>('all')
 const hops = ref<0 | 1 | 2>(2)
@@ -122,11 +125,13 @@ const nodeId = ref('')
 const seedIds = ref('')
 const pathHint = ref('')
 const relationTypes = ref('')
-const direction = ref<'outgoing' | 'incoming'>('outgoing')
+const direction = ref<'outgoing' | 'incoming' | 'both'>('outgoing')
 const targetId = ref('')
 const maxDepth = ref(12)
 const listValues = (value: string) => [...new Set(value.split(/[，,\n]/).map(item => item.trim()).filter(Boolean))]
-const bySeedIds = computed(() => mode.value === 'drilldown' && seedInput.value === 'ids')
+const pathMode = computed(() => mode.value === 'drilldown' || mode.value === 'traverse')
+const bySeedIds = computed(() => pathMode.value && seedInput.value === 'ids')
+watch(mode, value => { direction.value = value === 'traverse' ? 'both' : 'outgoing' })
 const hasInput = computed(() => atomicOpen.value && mode.value === 'id' ? Boolean(nodeId.value.trim()) : atomicOpen.value && bySeedIds.value ? listValues(seedIds.value).length > 0 : Boolean(queryText.value.trim()))
 const topPSeeds = ref(4)
 const working = ref(false)
@@ -146,11 +151,13 @@ watch(() => props.projectId, () => {
   businessContext.value = null
   queryText.value = nodeId.value = seedIds.value = pathHint.value = targetId.value = relationTypes.value = ''
 })
+const pathResult = computed(() => result.value?.traverse || result.value?.drilldown)
 const activeStatus = computed(() => props.status)
 const showMainGraph = computed(() => result.value && (
   !result.value.available_context || result.value.nodes.length > 0 || result.value.edges.length > 0
 ))
 const stopLabels: Record<string, string> = {
+  anchors_connected: '已连接指定节点', path_selected: '已找到有来源的关联路径', level_reached: '已到指定层级',
   leaf: '已到当前关系和范围内的叶节点', target_reached: '已到指定终点',
   depth_limit: '已到深度上限', output_limit: '已到返回数量上限',
   cycle: '遇到环路', search_limit: '已到搜索上限',
@@ -178,13 +185,14 @@ async function runQuery() {
     body.query = queryText.value.trim()
   } else if (mode.value === 'id') {
     Object.assign(body, { node_id: nodeId.value.trim(), hops: idHops.value })
-  } else if (mode.value === 'drilldown') {
-    Object.assign(body, { mode: 'drilldown', direction: direction.value, max_depth: maxDepth.value })
+  } else if (pathMode.value) {
+    Object.assign(body, { mode: mode.value, direction: direction.value, max_depth: maxDepth.value })
     if (bySeedIds.value) {
       body.seed_ids = listValues(seedIds.value)
-      if (pathHint.value.trim()) body.query = pathHint.value.trim()
+      if (mode.value === 'drilldown' && pathHint.value.trim()) body.query = pathHint.value.trim()
     } else {
-      Object.assign(body, { query: queryText.value.trim(), field: field.value, method: method.value })
+      body.query = queryText.value.trim()
+      if (mode.value === 'drilldown') Object.assign(body, { field: field.value, method: method.value })
     }
     if (relationTypes.value.trim()) body.relation_types = listValues(relationTypes.value)
     if (targetId.value.trim()) body.target_id = targetId.value.trim()
@@ -221,29 +229,29 @@ async function runQuery() {
       <div class="panel-body">
         <form class="retrieval-form" @submit.prevent="runQuery">
           <div v-if="!atomicOpen" class="field">
-            <label for="retrieval-query">分析问题</label>
-            <textarea id="retrieval-query" v-model="queryText" maxlength="4000" rows="3" required :disabled="working" placeholder="例如：华东地区的设备收入，可以按哪些产品下钻？"/>
+            <label for="retrieval-query">问题</label>
+            <textarea id="retrieval-query" v-model="queryText" maxlength="4000" rows="3" required :disabled="working" placeholder="输入想查的问题，或粘贴一段文字"/>
           </div>
           <button type="button" class="text-button atomic-toggle" :aria-expanded="atomicOpen" @click="atomicOpen = !atomicOpen">{{ atomicOpen ? '返回问题检索' : '调试检索算子' }}</button>
           <template v-if="atomicOpen">
           <div class="retrieval-modes" role="group" aria-label="检索方式">
-            <button v-for="item in ([['search','文本检索'], ['id','按节点 ID'], ['drilldown','路径下钻']] as const)" :key="item[0]" type="button" :aria-pressed="mode === item[0]" @click="mode = item[0]">{{ item[1] }}</button>
+            <button v-for="item in ([['search','文本检索'], ['id','按节点 ID'], ['traverse','多层关联'], ['drilldown','路径下钻']] as const)" :key="item[0]" type="button" :aria-pressed="mode === item[0]" @click="mode = item[0]">{{ item[1] }}</button>
           </div>
-          <div v-if="mode === 'drilldown'" class="field">
-            <label for="drilldown-start">路径起点</label>
-            <select id="drilldown-start" v-model="seedInput"><option value="query">用文本匹配起点</option><option value="ids">指定节点 ID</option></select>
+          <div v-if="pathMode" class="field">
+            <label for="drilldown-start">{{ mode === 'traverse' ? '路径节点' : '路径起点' }}</label>
+            <select id="drilldown-start" v-model="seedInput"><option value="query">{{ mode === 'traverse' ? '从问题识别' : '用文本匹配起点' }}</option><option value="ids">指定节点 ID</option></select>
           </div>
           <div v-if="mode === 'id'" class="field">
             <label for="retrieval-node-id">节点 ID</label>
             <input id="retrieval-node-id" maxlength="512" v-model="nodeId" required :disabled="working" autocomplete="off"/>
           </div>
           <div v-else-if="bySeedIds" class="field">
-            <label for="drilldown-seeds">起点 ID</label>
+            <label for="drilldown-seeds">{{ mode === 'traverse' ? '路径须经过的节点 ID' : '起点 ID' }}</label>
             <textarea id="drilldown-seeds" v-model="seedIds" required :disabled="working" rows="2" placeholder="每行一个，也可用逗号分隔"/>
           </div>
           <div v-else class="field">
             <label for="retrieval-query">问题或关键词</label>
-            <input id="retrieval-query" maxlength="4000" v-model="queryText" required :disabled="working" placeholder="输入问题、实体名称或指标编码"/>
+            <input id="retrieval-query" maxlength="4000" v-model="queryText" required :disabled="working" placeholder="输入问题、实体名称或编码"/>
           </div>
           <div v-if="mode === 'search' || (mode === 'drilldown' && !bySeedIds)" class="retrieval-params">
             <div class="field"><label for="retrieval-field">匹配字段</label>
@@ -257,13 +265,13 @@ async function runQuery() {
             <div class="field"><label for="retrieval-id-hops">返回范围</label><select id="retrieval-id-hops" v-model.number="idHops" :disabled="working"><option :value="0">仅此节点</option><option :value="1">一跳邻域</option><option :value="2">两跳邻域</option></select></div>
           </div>
           <details v-else class="retrieval-options">
-            <summary>{{ mode === 'drilldown' ? '下钻条件' : '召回范围' }}</summary>
+            <summary>{{ pathMode ? '路径条件' : '召回范围' }}</summary>
             <div class="retrieval-params">
               <div v-if="mode === 'search'" class="field"><label for="retrieval-seeds">每个关键词的起点数</label><input id="retrieval-seeds" v-model.number="topPSeeds" type="number" min="1" max="20" required :disabled="working"/></div>
               <div v-if="mode === 'search'" class="field"><label for="retrieval-hops">邻域</label><select id="retrieval-hops" v-model.number="hops" :disabled="working"><option :value="0">仅匹配节点</option><option :value="1">一跳</option><option :value="2">两跳</option></select></div>
               <template v-else>
-                <div v-if="bySeedIds" class="field"><label for="drilldown-hint">关注的内容</label><input id="drilldown-hint" v-model="pathHint" maxlength="4000" placeholder="可选，用于选择路径" :disabled="working"/></div>
-                <div class="field"><label for="drilldown-direction">方向</label><select id="drilldown-direction" v-model="direction" :disabled="working"><option value="outgoing">沿出边</option><option value="incoming">沿入边</option></select></div>
+                <div v-if="bySeedIds && mode === 'drilldown'" class="field"><label for="drilldown-hint">关注的内容</label><input id="drilldown-hint" v-model="pathHint" maxlength="4000" placeholder="可选，用于选择路径" :disabled="working"/></div>
+                <div class="field"><label for="drilldown-direction">方向</label><select id="drilldown-direction" v-model="direction" :disabled="working"><option v-if="mode === 'traverse'" value="both">双向查找</option><option value="outgoing">沿出边</option><option value="incoming">沿入边</option></select></div>
                 <div class="field"><label for="drilldown-depth">最大深度</label><input id="drilldown-depth" v-model.number="maxDepth" type="number" min="1" max="64" required :disabled="working"/></div>
                 <div class="field"><label for="drilldown-relations">关系类型</label><input id="drilldown-relations" v-model="relationTypes" placeholder="可选，多个类型用逗号分隔" :disabled="working"/></div>
                 <div class="field"><label for="drilldown-target">终点 ID</label><input id="drilldown-target" maxlength="512" v-model="targetId" placeholder="可选" :disabled="working"/></div>
@@ -271,7 +279,7 @@ async function runQuery() {
             </div>
           </details>
           </template>
-          <details class="retrieval-options"><summary>限定业务范围</summary>
+          <details class="retrieval-options"><summary>限定适用范围</summary>
           <BusinessContextSelect v-model="businessContext" :project-id="projectId" :refresh-key="status?.generation" :disabled="working || syncing"/>
           </details>
           <div class="actions">
@@ -325,12 +333,12 @@ async function runQuery() {
               <p v-else-if="result.dimensional.stop_reason === 'search_limit'">已到本次搜索上限，可能还有其他符合条件的结果。</p>
             </template>
           </section>
-          <div v-if="result.drilldown" class="retrieved-paths">
-            <h3>下钻路径</h3>
-            <p v-if="(result.drilldown.equally_ranked_paths || 0) > 1" class="field-hint">本次搜索发现 {{ result.drilldown.equally_ranked_paths }} 条并列路径，当前展示其中一条。</p>
-            <p v-if="!result.drilldown.paths.length">{{ result.drilldown.status === 'no_visible_seed' ? '当前范围内没有匹配的起点。' : '搜索范围内没有到达指定终点的路径。' }}</p>
-            <p v-if="result.drilldown.uncovered_seed_ids.length" class="field-hint">未进入此路径的起点：{{ result.drilldown.uncovered_seed_ids.map(nodeLabel).join('、') }}</p>
-            <article v-for="(path, index) in result.drilldown.paths" :key="index">
+          <div v-if="pathResult" class="retrieved-paths">
+            <h3>{{ result.traverse ? '关联路径' : '下钻路径' }}</h3>
+            <p v-if="(pathResult.equally_ranked_paths || 0) > 1" class="field-hint">本次搜索发现 {{ pathResult.equally_ranked_paths }} 条并列路径，当前展示其中一条。</p>
+            <p v-if="!pathResult.paths.length">{{ pathResult.status === 'no_visible_seed' ? '当前范围内没有匹配的起点。' : '在本次搜索范围内未找到满足全部要求的路径。' }}</p>
+            <p v-if="pathResult.uncovered_seed_ids.length" class="field-hint">未进入此路径的起点：{{ pathResult.uncovered_seed_ids.map(nodeLabel).join('、') }}</p>
+            <article v-for="(path, index) in pathResult.paths" :key="index">
               <ol>
                 <li v-for="(id, position) in path.node_ids" :key="position">
                   <span v-if="position" class="path-relation">

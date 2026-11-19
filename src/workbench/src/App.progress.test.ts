@@ -62,6 +62,25 @@ async function showRuns() {
 }
 
 describe('运行页面实时更新', () => {
+  it('节点说明显示失败阶段、系统错误号及实际尝试次数，旧运行只显示错误码', async () => {
+    await showRuns()
+    live = Object.assign(run('alpha', 2), {
+      status: 'partial', workflow: true,
+      workflow_state: {
+        units: { a: { unit_id: 'a', status: 'failed', error_code: 'workflow_unit_failed' } },
+        merge_nodes: { m: { node_id: 'm', status: 'failed', error_code: 'workflow_access_context_register_failed',
+          failure_detail: { stage: 'access_context_register', exception_type: 'PermissionError', errno: 13, winerror: 32, attempts: 4 } } },
+      },
+    })
+    await vi.advanceTimersByTimeAsync(1000)
+    await flush()
+    const rows = [...root.querySelectorAll('tr')]
+    const merge = rows.find(row => row.textContent?.includes('workflow_access_context_register_failed'))
+    expect(merge?.textContent).toContain('登记访问范围 · PermissionError · errno 13 · WinError 32 · 共尝试 4 次')
+    const extract = rows.find(row => row.textContent?.includes('workflow_unit_failed'))
+    expect(extract).toBeDefined()
+    expect(extract?.textContent).not.toContain('共尝试')
+  })
   it('通过真实轮询入口更新阶段进度和新日志，避免重复追加旧快照', async () => {
     await showRuns()
     expect(root.textContent).toContain('alpha.public.table_1')

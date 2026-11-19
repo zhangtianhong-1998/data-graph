@@ -1,7 +1,7 @@
 """Deterministic, permission-preserving multi-unit graph merger with sharded evidence persistence."""
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -679,6 +679,37 @@ def _qualify_conflicting_output_types(prepared):
                     for endpoint in ('source_type', 'target_type'):
                         if relation.get(endpoint) in aliases:
                             relation[endpoint] = aliases[relation[endpoint]]
+
+
+def identity_candidate_node_counts(graph):
+    """Count distinct nodes across candidate groups, including nodes listed in several groups."""
+    memberships = Counter()
+    for group in graph.get('candidate_identity_merges', ()):
+        ids = group.get('node_ids') if isinstance(group, dict) else None
+        if not isinstance(ids, list) or not ids or not all(isinstance(node_id, str) for node_id in ids):
+            # A historical report without group membership cannot supply these counts.
+            return {}
+        memberships.update(set(ids))
+    return {
+        'candidate_identity_nodes': len(memberships),
+        'candidate_identity_nodes_in_multiple_groups': sum(count > 1 for count in memberships.values()),
+    }
+
+
+def merge_accounting(contributors, graph):
+    """Counts for this merge attempt, including inherited inputs; candidates may overlap."""
+    isolation = graph.get('conflict_isolation') or {}
+    return {
+        'input_nodes': sum(len(c['graph'].get('nodes', ())) for c in contributors),
+        'input_edges': sum(len(c['graph'].get('edges', ())) for c in contributors),
+        'output_nodes': len(graph['nodes']),
+        'output_edges': len(graph['edges']),
+        'candidate_identity_groups': len(graph.get('candidate_identity_merges', ())),
+        **identity_candidate_node_counts(graph),
+        'quarantined_nodes': isolation.get('nodes', 0),
+        'quarantined_edges': isolation.get('edges', 0),
+        'unresolved_relations': len(graph.get('unresolved_relations', ())),
+    }
 
 
 def merge_construction_graphs(

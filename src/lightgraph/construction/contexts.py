@@ -1,4 +1,4 @@
-"""Explicit business applicability; never inferred from provenance or access scope.
+"""Explicit applicability of a statement, tracked independently of provenance and read access.
 
 Each support is one observation and carries its own dimensions. Missing legacy
 metadata means unknown, not globally applicable. Identity boundaries are a

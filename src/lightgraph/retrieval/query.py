@@ -1,7 +1,9 @@
 """Validated retrieval contract shared by the project HTTP API and CLI."""
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+
+from lightgraph.contracts import canonical
 
 
 class Condition(BaseModel):
@@ -21,12 +23,12 @@ class Condition(BaseModel):
 class RetrieveSubgraphRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', hide_input_in_errors=True)
 
-    mode: Literal['search', 'drilldown', 'auto', 'dimensional'] = 'search'
+    mode: Literal['search', 'drilldown', 'auto', 'dimensional', 'traverse'] = 'search'
     query: str = Field(default='', max_length=4000)
     node_id: str | None = Field(default=None, min_length=1, max_length=512)
     field: Literal['all', 'name', 'description'] = 'all'
     method: Literal['hybrid', 'keyword', 'vector'] = 'hybrid'
-    business_context: dict | None = None
+    business_context: dict | None = Field(default=None, validation_alias=AliasChoices('applicability', 'business_context'))
     top_n: int = Field(default=20, ge=1, le=100)
     top_p_seeds: int = Field(default=4, ge=1, le=20)
     hops: int | None = Field(default=None, ge=0, le=2)
@@ -36,7 +38,8 @@ class RetrieveSubgraphRequest(BaseModel):
     max_edges: int = Field(default=150, ge=1, le=1000)
     seed_ids: list[Annotated[str, Field(min_length=1, max_length=512)]] = Field(default_factory=list, max_length=32)
     target_id: str | None = Field(default=None, min_length=1, max_length=512)
-    direction: Literal['outgoing', 'incoming'] = 'outgoing'
+    target_kind: str | None = Field(default=None, min_length=1, max_length=256)
+    direction: Literal['outgoing', 'incoming', 'both'] = 'outgoing'
     relation_types: list[Annotated[str, Field(min_length=1, max_length=512)]] = Field(default_factory=list, max_length=64)
     max_depth: int = Field(default=12, ge=1, le=64)
 
@@ -47,6 +50,14 @@ class RetrieveSubgraphRequest(BaseModel):
     @classmethod
     def natural_language_default(cls, values):
         # A smaller output budget must not bypass project/condition recognition.
+        if isinstance(values, dict) and 'applicability' in values:
+            values = dict(values)
+            selector = values.pop('applicability')
+            if 'business_context' in values and canonical(values['business_context']) != canonical(selector):
+                raise ValueError('conflicting_context_selectors')
+            values['business_context'] = selector
+        if isinstance(values, dict) and values.get('mode') == 'traverse' and 'direction' not in values:
+            values = {**values, 'direction': 'both'}
         query_options = {'query', 'business_context', 'max_nodes', 'max_edges', 'max_depth'}
         if isinstance(values, dict) and 'query' in values and set(values) <= query_options:
             return {**values, 'mode': 'auto'}
@@ -56,6 +67,14 @@ class RetrieveSubgraphRequest(BaseModel):
     def validate_lookup(self):
         options = self.model_fields_set
         ranking = {'field', 'method', 'top_n'}
+        if self.mode == 'traverse':
+            if bool(self.query.strip()) == bool(self.seed_ids):
+                raise ValueError('traverse_requires_query_or_anchors')
+            if options & ({'node_id', 'conditions', 'drill_role', 'hops', 'top_p_seeds', 'max_per_rel', 'hub_degree_limit'} | ranking):
+                raise ValueError('unsupported_traversal_options')
+            return self
+        if self.direction == 'both' or 'target_kind' in options:
+            raise ValueError('general_path_options_require_traverse')
         if self.mode == 'auto':
             if not self.query.strip() or options - {'mode', 'query', 'business_context', 'max_depth', 'max_nodes', 'max_edges'}:
                 raise ValueError('auto_requires_natural_language_query')
@@ -87,12 +106,18 @@ class RetrieveSubgraphRequest(BaseModel):
         return self
 
     def run(self, retriever, scopes):
-        if self.mode in {'auto', 'dimensional'}:
+        if self.mode == 'traverse' and self.seed_ids:
+            from .traversal import retrieve_traversal
+            return retrieve_traversal(retriever, self.query, scopes, business_context=self.business_context,
+                seed_ids=self.seed_ids, direction=self.direction, relation_types=self.relation_types,
+                target_id=self.target_id, target_kind=self.target_kind, max_depth=self.max_depth,
+                max_nodes=self.max_nodes, max_edges=self.max_edges)
+        if self.mode in {'auto', 'dimensional', 'traverse'}:
             from .planned import retrieve_planned
             return retrieve_planned(retriever, self, scopes)
         if self.mode == 'drilldown':
             from .drilldown import retrieve_drilldown
-            options = self.model_dump(exclude={'mode', 'node_id', 'hops', 'top_p_seeds', 'max_per_rel', 'hub_degree_limit', 'conditions', 'drill_role'})
+            options = self.model_dump(exclude={'mode', 'target_kind', 'node_id', 'hops', 'top_p_seeds', 'max_per_rel', 'hub_degree_limit', 'conditions', 'drill_role'})
             return retrieve_drilldown(retriever, scopes=scopes, **options)
-        options = self.model_dump(exclude={'mode', 'seed_ids', 'target_id', 'direction', 'relation_types', 'max_depth', 'conditions', 'drill_role'})
+        options = self.model_dump(exclude={'mode', 'target_kind', 'seed_ids', 'target_id', 'direction', 'relation_types', 'max_depth', 'conditions', 'drill_role'})
         return retriever.retrieve(scopes=scopes, **options)

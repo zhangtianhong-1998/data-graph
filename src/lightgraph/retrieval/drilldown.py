@@ -1,4 +1,4 @@
-"""Select one evidence-compatible directed path for a drilldown query."""
+"""Return a hierarchy chain or an explicitly directed legacy drilldown with compatible row witnesses."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,17 +6,9 @@ import heapq
 import re
 
 from lightgraph.construction.contexts import normalize_context_selection
-from lightgraph.contracts import canonical
 from lightgraph.errors import LightGraphError
+from .path_evidence import FANOUT, MAX_EXPANSIONS, MAX_STATES, MAX_WITNESS_PAIRS, evidence_preview, path_node
 from .retriever import _join_contexts, _join_rows, _observation_groups, _row_witnesses
-
-
-# Search limits are separate from the size of the answer. A wide frontier or
-# many incompatible row witnesses must not use an unbounded number of SQL calls.
-_MAX_EXPANSIONS = 128
-_MAX_WITNESS_PAIRS = 8192
-_MAX_STATES = 2048
-_FANOUT = 48
 
 
 @dataclass
@@ -43,26 +35,6 @@ def _matched(query_terms, witness, node):
     aliases = ' '.join(str(value) for value in witness.get('aliases') or ())
     keys = ' '.join(str(value) for value in node['identity'].values())
     return query_terms.intersection(_terms(' '.join([text, aliases, keys])))
-
-
-def _evidence_preview(witness):
-    """Large attribute maps and execution histories are available via exact-ID lookup."""
-    if len(canonical(witness).encode('utf-8')) <= 2048:
-        return witness
-    refs = witness.get('evidence_refs') or []
-    return {'projection': 'reference_only', 'observation_id': witness.get('observation_id'),
-            'label': str(witness.get('label') or '')[:256], 'business_context': witness.get('business_context'),
-            'evidence_refs': refs[:8], 'evidence_ref_count': len(refs),
-            'source_tables': (witness.get('source_tables') or [])[:8]}
-
-
-def _path_node(node, witness, slots, is_seed):
-    # The index's display name/description may already aggregate several
-    # authorized business contexts. Render the particular witness used here.
-    return {'id': node['id'], 'kind': node['kind'], 'identity': node['identity'],
-            'display_name': witness.get('label') or node['id'],
-            'source_tables': witness.get('source_tables', []), 'description': witness.get('description'),
-            'observations': [witness], 'is_seed': is_seed, 'matched_slots': slots, 'is_bridge': False}
 
 
 def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_ids=(), relation_types=(),
@@ -115,8 +87,8 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
 
     def neighbors(nid, traversal):
         page = retriever.index.expand_neighborhood(
-            [nid], scopes=cohorts, hops=1, max_nodes=_FANOUT + 1, max_edges=_FANOUT,
-            max_per_rel=_FANOUT, relation_types=relation_types, direction=traversal,
+            [nid], scopes=cohorts, hops=1, max_nodes=FANOUT + 1, max_edges=FANOUT,
+            max_per_rel=FANOUT, relation_types=relation_types, direction=traversal,
             preferred_neighbor_ids=sorted(preferred), hierarchies=hierarchies)
         nodes.update(page['nodes'])
         return page
@@ -170,7 +142,7 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
         elif not backwards and path.ids[-1] == target_id:
             consider(path, 'target_reached')
             return
-        if states >= _MAX_STATES:
+        if states >= MAX_STATES:
             reasons.add('path_state_budget_reached')
             consider(path, 'search_limit')
             return
@@ -190,7 +162,7 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
         _, path = heapq.heappop(queue)
         current = path.ids[-1]
         if current not in adjacency:
-            if len(adjacency) >= _MAX_EXPANSIONS:
+            if len(adjacency) >= MAX_EXPANSIONS:
                 reasons.add('adjacency_budget_reached')
                 consider(path, 'search_limit')
                 continue
@@ -203,7 +175,7 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
             nid = edge['target'] if edge['source'] == current else edge['source']
             for edge_ctx, edge_obs in _observation_groups(edge):
                 pairs += 1
-                if pairs > _MAX_WITNESS_PAIRS:
+                if pairs > MAX_WITNESS_PAIRS:
                     break
                 ctx = _join_contexts(path.context, edge_ctx)
                 rows = _join_rows(path.rows, _row_witnesses(edge_obs))
@@ -211,7 +183,7 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
                     continue
                 for node_ctx, node_obs in _observation_groups(nodes[nid]):
                     pairs += 1
-                    if pairs > _MAX_WITNESS_PAIRS:
+                    if pairs > MAX_WITNESS_PAIRS:
                         break
                     joined = _join_contexts(ctx, node_ctx)
                     witnesses = _join_rows(rows, _row_witnesses(node_obs))
@@ -228,11 +200,11 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
                     enqueue(_Path((*path.ids, nid), (*path.edges, edge), (*path.node_witnesses, witness),
                                   (*path.edge_witnesses, edge_obs[0]), joined, witnesses,
                                   path.terms.union(_matched(query_terms, witness, nodes[nid]))))
-                if pairs > _MAX_WITNESS_PAIRS or depth_limited:
+                if pairs > MAX_WITNESS_PAIRS or depth_limited:
                     break
-            if pairs > _MAX_WITNESS_PAIRS or depth_limited:
+            if pairs > MAX_WITNESS_PAIRS or depth_limited:
                 break
-        if pairs > _MAX_WITNESS_PAIRS:
+        if pairs > MAX_WITNESS_PAIRS:
             reasons.add('witness_budget_reached')
             consider(path, 'search_limit')
             for _, pending in queue:
@@ -249,9 +221,9 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
     if best:
         for nid, witness in zip(best.ids, best.node_witnesses):
             matched = [s['surface'] for s in slots if any(c['node_id'] == nid for c in s['candidates'])]
-            answer['nodes'].append(_path_node(nodes[nid], _evidence_preview(witness), matched, nid in seed_set))
+            answer['nodes'].append(path_node(nodes[nid], evidence_preview(witness), matched, nid in seed_set))
         for edge, witness in zip(best.edges, best.edge_witnesses):
-            witness = _evidence_preview(witness)
+            witness = evidence_preview(witness)
             answer['edges'].append({**{k: edge[k] for k in ('id', 'relation', 'source', 'target')},
                                     'observations': [witness], 'evidence_refs': witness.get('evidence_refs', []),
                                     'source_tables': witness.get('source_tables', [])})

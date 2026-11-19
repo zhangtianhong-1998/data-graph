@@ -4,7 +4,7 @@ from copy import deepcopy
 import pytest
 
 from lightgraph.construction.access import filter_graph_scopes
-from lightgraph.construction.merger import merge_construction_graphs
+from lightgraph.construction.merger import identity_candidate_node_counts, merge_accounting, merge_construction_graphs
 from lightgraph.tests.test_cross_source_fusion import source_graph
 
 
@@ -27,6 +27,36 @@ def unit(name, graph, kind='unit', **options):
     return {'contributor_id': name, 'kind': kind, 'graph': graph, **options}
 
 
+def test_legacy_candidate_without_member_ids_omits_unknown_counts():
+    assert identity_candidate_node_counts({'candidate_identity_merges': [{'label': '旧候选'}]}) == {}
+
+
+def test_overlapping_identity_candidates_count_members_once_in_run_and_publication(tmp_path):
+    from lightgraph.construction.workflow import publish_premerged_graph
+    from lightgraph.construction.workspace import read_internal_yaml
+    from lightgraph.tests.test_construction_tools import config_for
+
+    contributors = []
+    for source, kind in [('a', 'Catalogue'), ('b', 'Catalogue'), ('c', 'Collection')]:
+        graph = source_graph(kind, 'code', '01', source, '同名对象', 'note', source)
+        graph['nodes'] = graph['nodes'][:1]
+        graph['edges'] = []
+        contributors.append(unit(source, graph))
+    merged = merge_construction_graphs(contributors)
+    assert sorted(len(c['node_ids']) for c in merged['candidate_identity_merges']) == [2, 3]
+    assert all(c['status'] == 'candidate_only' for c in merged['candidate_identity_merges'])
+    config = config_for(tmp_path)
+    output = tmp_path / 'publication'
+    publish_premerged_graph(output, config, merged=merged, included_units=['a', 'b', 'c'],
+                            skipped_units=[], unit_attempts={})
+    summary = read_internal_yaml(output / 'construction' / 'workflow-merge-summary.yaml')
+    assert summary['nodes'] == 3 and summary['candidate_identity_merges'] == 2
+    assert summary['semantic_status'] == 'pending_alignment'
+    for record in (summary, merge_accounting(contributors, merged)):
+        assert record['candidate_identity_nodes'] == 3
+        assert record['candidate_identity_nodes_in_multiple_groups'] == 2
+
+
 def test_alias_replay_combines_typed_source_facts_and_rewires_edges():
     a = unit('A_C', projection())
     b = unit('B_C', projection('经营指标', '指标编码'))
@@ -38,6 +68,12 @@ def test_alias_replay_combines_typed_source_facts_and_rewires_edges():
     assert len(result['nodes']) == 2 and len(result['edges']) == 1
     assert len(result['definitions']['entities']) == 1
     assert result['candidate_identity_merges'] == []
+    assert merge_accounting(graphs, result) == {
+        'input_nodes': 4, 'input_edges': 2, 'output_nodes': 2, 'output_edges': 1,
+        'candidate_identity_groups': 0, 'quarantined_nodes': 0, 'quarantined_edges': 0,
+        'candidate_identity_nodes': 0, 'candidate_identity_nodes_in_multiple_groups': 0,
+        'unresolved_relations': 0,
+    }
     edge, = result['edges']
     node = next(n for n in result['nodes'] if n['id'] == edge['source'])
     assert node['type'] == result['definitions']['relations'][0]['source_type']

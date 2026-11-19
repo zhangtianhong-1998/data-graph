@@ -68,7 +68,7 @@ export function metadataRelationValues(endpoint: MetadataEndpoint): Record<strin
     '表': column.table, '字段': column.column,
     ...(endpoint.meaning_origin === 'agent_declared' ? { '关系含义': 'Agent 依据材料声明' } : {}),
     ...(endpoint.row_membership === 'observed_projection' ? { '行对象依据': '来自实际投影行' } : {}),
-    '非空观测': endpoint.non_null_observed === true ? '已观察到非空值；未保留经营数值' : '未声明已观察到非空值',
+    '非空观测': endpoint.non_null_observed === true ? '已观察到非空值，未保留字段值' : '未声明已观察到非空值',
     '证据引用': column.evidence_refs || [] }
 }
 const chinese = (value: string) => /[\u3400-\u9fff]/.test(value)

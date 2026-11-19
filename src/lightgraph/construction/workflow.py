@@ -21,9 +21,10 @@ from lightgraph.runtime.config import (
 )
 from lightgraph.runtime.retention import atomic_text
 from .access import access_fingerprint
+from .artifact_io import artifact_step
 from .inheritance import freeze_inherited_graphs, frozen_contributors
 from .intent import effective_goal_markdown
-from .merger import merge_construction_graphs, write_sharded_graph
+from .merger import identity_candidate_node_counts, merge_construction_graphs, write_sharded_graph
 from .workspace import GraphWorkspace, read_internal_yaml, write_yaml
 
 
@@ -498,6 +499,7 @@ def publish_premerged_graph(
         'edges': persisted['edges'],
         'shard_count': persisted['shard_count'],
         'candidate_identity_merges': len(merged.get('candidate_identity_merges', [])),
+        **identity_candidate_node_counts(merged),
         'candidate_column_alignments': len(merged.get('candidate_column_alignments', [])),
         'pending_definitions': len(merged.get('definition_conflicts', [])),
         'pending_relations': len(merged.get('unresolved_relations', [])),
@@ -695,9 +697,8 @@ def save_workflow_state(project_output_dir: str | Path, state: dict[str, Any], *
     rid = state.get('parent_run_id')
     if rid and not current_only:
         path = _state_path(project_output_dir, rid)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_text(path, payload)
-    atomic_text(_state_path(project_output_dir), payload)
+        artifact_step('state_history_write', atomic_text, path, payload)
+    artifact_step('state_current_write', atomic_text, _state_path(project_output_dir), payload)
 
 
 def load_workflow_state(project_output_dir: str | Path, run_id: str | None = None) -> dict[str, Any] | None:

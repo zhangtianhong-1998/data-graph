@@ -122,7 +122,7 @@ describe('标准化节点详情面板 (NodeInspector)', () => {
     expect(text).toContain('企业级云专线')
     expect(text).toContain('Enterprise Cloud Line')
     expect(text).toContain('面向政企客户的云网融合产品')
-    expect(text).toContain('物理目录注释')
+    expect(text).toContain('源表或列的目录注释')
     expect(text).toContain('收入事实宽表')
     expect(text).toContain('character varying')
     expect(root.querySelector('.dynamic-attr-item')?.textContent).toContain('国内')

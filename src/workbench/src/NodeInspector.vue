@@ -76,8 +76,8 @@ const relationDescription = (value: unknown) => vocabularyDescription('relations
 
 const labelOrigin = (node: GraphNode) => ({
   declared: '名称由已声明的展示字段生成',
-  relations: '名称由关联对象和业务身份生成',
-  identity: '名称由业务身份生成',
+  relations: '名称由关联对象和身份键生成',
+  identity: '名称由身份键生成',
   metadata: '名称来自字段元数据；此节点代表列定义',
   metadata_declared: '名称由 Agent 依据元数据或文档声明；此节点代表列定义',
 }[String(node.label_origin)] || '')
@@ -153,10 +153,10 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
           <h3>节点描述</h3>
           <span class="badge">{{ descriptionOriginLabel(standardNode.business_description_origin) }}</span>
         </div>
-        <p class="standard-desc">{{ standardNode.business_description || '暂无业务描述' }}</p>
+        <p class="standard-desc">{{ standardNode.business_description || '暂无实体描述' }}</p>
 
         <div v-if="standardNode.catalog_metadata_notes.length" class="catalog-notes">
-          <p class="muted small-text">物理目录注释（表/列元数据声明，非单指标业务口径）：</p>
+          <p class="muted small-text">源表或列的目录注释</p>
           <div v-for="note in standardNode.catalog_metadata_notes" :key="`${note.source_id}:${note.qualified_table}`" class="catalog-note-item">
             <strong>{{ note.source_id }} · {{ note.qualified_table }}</strong>
             <span v-if="note.table_comment"> · 表注释：{{ note.table_comment }}</span>
@@ -172,10 +172,10 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
 
     <template v-if="Object.keys(nodeIdentity(selected)).length">
       <div class="divider"></div>
-      <h3>业务身份</h3>
+      <h3>实体身份</h3>
       <PropertyTable :values="nodeIdentity(selected)" />
     </template>
-    <p v-if="accessLabel(selected)" class="muted small-text">可见范围：{{ accessLabel(selected) }}（访问授权，不代表业务主体）</p>
+    <p v-if="accessLabel(selected)" class="muted small-text">可见范围：{{ accessLabel(selected) }}（访问授权）</p>
 
     <div class="divider"></div>
     <h3>节点属性</h3>
@@ -257,12 +257,12 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
           <PropertyTable :values="factValues(fact)" :label="propertyName" />
           <div v-for="support in details.supports.filter(item => item.fact_id === fact.id)" :key="support.id" class="support-detail">
             <PropertyTable :values="{ '支持状态': statusName(support.status), '来源类型': supportOriginName(support.origin), '可见范围': support.scope_ref, '数据位置': support.source_binding, ...(support.rule_revision != null ? { '映射修订': support.rule_revision } : {}) }" />
-            <p v-if="support.binding?.source_kind === 'metadata_column'" class="muted small-text">{{ support.origin === 'agent_declared' ? '名称和含义是 Agent 依据材料作出的声明，引用可追溯不代表已独立确认业务解释。' : '此支持来自授权目录中的列定义，不是经营数值的查询结果。' }}</p>
+            <p v-if="support.binding?.source_kind === 'metadata_column'" class="muted small-text">{{ support.origin === 'agent_declared' ? '名称和含义由 Agent 根据所引材料解释，仍需独立核实。' : '此处引用授权数据目录中的列定义。' }}</p>
             <PropertyTable v-if="support.binding?.evidence_refs?.length" :values="{ '证据引用': support.binding.evidence_refs }" />
             <div v-if="support.binding?.metadata_endpoint" class="metadata-relation-basis">
               <h5>行对象与列定义的关系依据</h5>
               <PropertyTable :values="metadataRelationValues(support.binding.metadata_endpoint)" />
-              <p class="muted small-text">{{ support.binding.metadata_endpoint.basis === 'schema_applies_to_rows' ? '适用性来自元数据或文档声明；行对象实际存在，但这份支持不证明经营数值非空。' : support.binding.metadata_endpoint.basis === 'observed_non_null' ? '仅连接实际非空行中的对象；空值不代表该定义不适用。' : '请查看原始映射，当前无法解释此关系依据。' }}</p>
+              <p class="muted small-text">{{ support.binding.metadata_endpoint.basis === 'schema_applies_to_rows' ? '适用性来自元数据或文档。已找到对应记录，该字段是否非空尚未验证。' : support.binding.metadata_endpoint.basis === 'observed_non_null' ? '只连接该字段有值的记录。空值的适用性尚未验证。' : '请查看原始映射，当前无法解释此关系依据。' }}</p>
             </div>
             <div v-if="support.binding?.constant_properties && Object.keys(support.binding.constant_properties).length">
               <h5>来源位置与固定属性</h5>

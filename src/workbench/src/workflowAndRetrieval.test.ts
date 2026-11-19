@@ -558,7 +558,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(root.textContent).not.toContain('只符合部分条件')
     await search({ available_context: { ...emptyContext, status: 'no_confirmed_match' } }, '当前可见范围内未能确认匹配')
     expect(root.querySelector('[aria-label="来源原文"]')).toBeNull()
-    await search({ available_context: { ...emptyContext, status: 'scope_unresolved' } }, '请明确要查询的业务范围')
+    await search({ available_context: { ...emptyContext, status: 'scope_unresolved' } }, '尚未确认问题所指的适用范围')
     await search({ available_context: { ...emptyContext, status: 'search_unavailable' } }, '语义检索当前不可用')
   })
   it('按字段检索、精确 ID 及下钻分别传递对应参数，切换时清除旧结果', async () => {
@@ -617,6 +617,20 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(root.textContent).toContain('已到指定终点')
     expect(root.textContent).toContain('2 条并列路径，当前展示其中一条')
     expect(root.textContent).toContain('project：M')
+
+    button('多层关联').click()
+    await nextTick()
+    retrievalFixture = { traverse: { status: 'found', uncovered_seed_ids: [], paths: [
+      {node_ids: ['n1','n2'], edge_ids:['e1'], stop_reason:'anchors_connected'}] },
+      nodes:[{id:'n1', kind:'文献', display_name:'海图'}, {id:'n2', kind:'展品', display_name:'罗盘'}],
+      edges:[{id:'e1', source:'n2', target:'n1', relation:'参考'}] }
+    expect(await submit()).toEqual({ mode: 'traverse', seed_ids: ['n1','n2'], target_id: 'n2', direction: 'both',
+      relation_types:['SETTLED_BY'], max_depth: 7, business_context: null })
+    const path = root.querySelector('.retrieved-paths')!
+    expect(path.querySelector('h3')?.textContent).toBe('关联路径')
+    expect(path.textContent).toContain('已连接指定节点')
+    expect(path.textContent).toContain('← 参考')
+
   })
 
 })

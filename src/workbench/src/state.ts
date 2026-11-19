@@ -1,4 +1,4 @@
-import type { Run } from './types'
+import type { Run, WorkflowFailureDetail } from './types'
 
 export const isActive = (run?: Run | null): boolean => !!run && ['queued', 'running'].includes(run.status)
 export const splitLines = (value: string): string[] => value.split('\n').map(line => line.trim()).filter(Boolean)
@@ -12,6 +12,24 @@ export function assertNoCredentials(value: unknown): void {
   }
 }
 export const runLabels: Record<Run['status'], string> = { queued: '等待启动', running: '运行中', completed: '已完成', completed_with_gaps: '已完成，有未决项', partial: '执行未完成', failed: '失败', cancelled: '已取消', interrupted: '运行中断' }
+const workflowStages: Record<string, string> = {
+  access_context_register: '登记访问范围', checkpoint_directory: '准备检查点目录', checkpoint_lock: '获取检查点写锁',
+  checkpoint_digest: '计算检查点摘要', checkpoint_grants: '读取上游授权', checkpoint_verify: '核对已有检查点',
+  checkpoint_graph_write: '写入图谱文件', checkpoint_graph_install: '移入已写好的图谱文件',
+  checkpoint_marker_read: '读取提交记录', checkpoint_evidence_write: '保存来源证据', checkpoint_marker_write: '写入提交记录',
+  state_history_write: '保存本次运行状态', state_current_write: '更新当前运行状态', run_record_write: '保存运行结果',
+  merge_inputs: '读取合并输入', merge_upstream: '合并上游图谱', merge_worker_prepare: '准备合并抽取',
+  merge_worker: '执行合并抽取', merge_delta: '合并新增内容', merge_checkpoint_prepare: '准备合并检查点',
+  extract_node: '处理抽取结果', merge_delta_load: '读取合并新增内容', extract_contributor_load: '读取抽取结果',
+  workflow_coordinator: '执行工作流',
+}
+export function workflowFailureLabel(detail: WorkflowFailureDetail): string {
+  const parts = [workflowStages[detail.stage] || detail.stage, detail.exception_type]
+  if (detail.errno !== undefined) parts.push(`errno ${detail.errno}`)
+  if (detail.winerror !== undefined) parts.push(`WinError ${detail.winerror}`)
+  parts.push(`共尝试 ${detail.attempts} 次`)
+  return parts.join(' · ')
+}
 export function graphOutcome(report: unknown): string {
   if (!report || typeof report !== 'object') return ''
   const data = report as { validation?: { business_graph?: string; construction_target?: string }; counts?: Record<string, number> }

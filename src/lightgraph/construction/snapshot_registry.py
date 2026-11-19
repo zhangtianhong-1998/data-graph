@@ -12,6 +12,7 @@ import re
 from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
 from .access import access_fingerprint
+from .artifact_io import artifact_step
 from .workspace import read_internal_yaml, write_yaml
 
 
@@ -56,6 +57,10 @@ def _context_path(root, fingerprint, policy_id):
 
 def register_access_context(root, config, *, legacy=False):
     """Bind the original strict fingerprint to its portable result permissions."""
+    return artifact_step('access_context_register', _register_access_context, root, config, legacy)
+
+
+def _register_access_context(root, config, legacy):
     fingerprint = access_fingerprint(config)
     policy = result_access_policy(config)
     policy_id = digest(policy)

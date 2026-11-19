@@ -79,6 +79,13 @@ export interface WorkflowConfig {
   output_position?: WorkflowPosition | null
   merge_policy?: MergePolicyConfig
 }
+export interface WorkflowFailureDetail {
+  stage: string
+  exception_type: string
+  attempts: number
+  errno?: number
+  winerror?: number
+}
 export interface WorkflowMergeNodeState {
   node_id: string
   label?: string
@@ -86,6 +93,7 @@ export interface WorkflowMergeNodeState {
   status: string
   run_id?: string | null
   error_code?: string | null
+  failure_detail?: WorkflowFailureDetail
   nodes?: number
   edges?: number
   updated_at?: string
@@ -127,6 +135,7 @@ export interface WorkflowUnitState {
   status: string
   run_id?: string | null
   error_code?: string | null
+  failure_detail?: WorkflowFailureDetail
   nodes?: number
   edges?: number
   updated_at?: string
@@ -229,6 +238,7 @@ export interface Run {
   workflow?: boolean
   workflow_units?: string[]
   workflow_state?: WorkflowState | null
+  failure_detail?: WorkflowFailureDetail
   output_path?: string
   progress?: RunProgressSnapshot | null
   cleanup_status: 'pending' | 'completed' | 'unknown'

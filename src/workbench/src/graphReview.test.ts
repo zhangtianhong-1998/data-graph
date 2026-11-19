@@ -41,12 +41,12 @@ describe('业务图来源与归并裁决', () => {
     const propertyTables = [...root.querySelectorAll('.graph-detail .property-table')].map(n => n.textContent).join(' ')
     expect(propertyTables).toContain('物理字段'); expect(propertyTables).toContain('字段注释')
     expect(propertyTables).not.toContain('physical_column（未提供中文名）')
-    expect(root.querySelector('.support-detail')?.textContent).toContain('不是经营数值的查询结果')
-    expect(root.querySelectorAll('.support-detail')[1]?.textContent).toContain('不代表已独立确认业务解释')
+    expect(root.querySelector('.support-detail')?.textContent).toContain('授权数据目录中的列定义')
+    expect(root.querySelectorAll('.support-detail')[1]?.textContent).toContain('仍需独立核实')
   })
   it.each([
-    ['schema_applies_to_rows', '声明适用于实际行对象', '未声明已观察到非空值', '不证明经营数值非空'],
-    ['observed_non_null', '实际行中该字段非空', '已观察到非空值；未保留经营数值', '空值不代表该定义不适用'],
+    ['schema_applies_to_rows', '声明适用于实际行对象', '未声明已观察到非空值', '该字段是否非空尚未验证'],
+    ['observed_non_null', '实际行中该字段非空', '已观察到非空值，未保留字段值', '空值的适用性尚未验证'],
   ])('行到列定义关系单独展示依据 %s', async (basis, title, observation, note) => {
     const column = { source_id: 'facts', schema: 'public', table: 'observations', column: 'comparison_total', evidence_refs: ['e-column'] }
     api.request.mockResolvedValue({ facts: [{ id: 'edge1', fact_kind: 'Edge', status: 'accepted', payload: { source: 'a', target: 'b', relation: 'uses_measure' } }],
@@ -100,7 +100,7 @@ describe('业务图来源与归并裁决', () => {
     expect(node.querySelector('title')?.textContent).toContain('经营主体：鲜果连锁')
     node.dispatchEvent(new MouseEvent('click', { bubbles: true })); await nextTick()
     const detail = root.querySelector('.graph-detail')!
-    expect(detail.textContent).toContain('业务身份')
+    expect(detail.textContent).toContain('实体身份')
     expect(detail.textContent).toContain('可见范围：public')
     const tables = [...detail.querySelectorAll('.property-table')].map(table => table.textContent).join(' ')
     expect(tables).toContain('RTL_PNL_1410')

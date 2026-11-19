@@ -1,6 +1,7 @@
 """Compose scoped retrieval primitives according to the grounded user request."""
 from .dimensional import empty_answer, retrieve_dimensional
 from .drilldown import retrieve_drilldown
+from .traversal import retrieve_traversal
 from .intent import build_plan, _parent_roles, _residuals
 
 
@@ -69,7 +70,8 @@ def _available_context(retriever, request, scopes, plan, answer=None):
     context['nodes'] = [{'id': nid, 'display_name': label} for nid, label in labels.items()]
     # A verified intersection of a subset has its own witnesses. Keep its
     # graph outside the main nodes/edges even when it fits all output budgets.
-    if len({s['role'] for s in bound}) > 1 and not answer.get('dimensional'):
+    co_observation = not (plan.get('operation') == 'traverse' or request.mode == 'traverse')
+    if co_observation and len({s['role'] for s in bound}) > 1 and not answer.get('dimensional'):
         subset = {**plan, 'conditions': bound, 'requested_level': None, 'drill_role': None}
         verified = retrieve_dimensional(retriever, request.query, scopes, subset,
                                         max_nodes=request.max_nodes, max_edges=request.max_edges)
@@ -81,7 +83,7 @@ def _available_context(retriever, request, scopes, plan, answer=None):
         [i['text'] for i in gaps], scopes=cohorts, limit=min(8, request.max_nodes))
     if context['nodes']:
         context['status'] = 'partial'
-        candidate = _candidate_path(retriever, request, scopes, cohorts, plan, context)
+        candidate = _candidate_path(retriever, request, scopes, cohorts, plan, context) if co_observation else None
         if candidate:
             context['candidate_path'] = candidate
     elif context['passages']:
@@ -91,15 +93,58 @@ def _available_context(retriever, request, scopes, plan, answer=None):
     return answer
 
 
+def _planned_traversal(retriever, request, scopes, plan):
+    query = request.query
+    limits = {'max_nodes': request.max_nodes, 'max_edges': request.max_edges}
+    slots = plan['conditions']
+    if (not slots or plan['candidate_limit'] or any(len(s['candidates']) != 1 for s in slots)):
+        plan.update(intent='clarify')
+        plan['unresolved'].append('请明确路径要经过的节点。')
+        return _available_context(retriever, request, scopes, plan)
+    filters = set(plan.get('relation_types') or ())
+    if filters and request.relation_types:
+        filters &= set(request.relation_types)
+        if not filters:
+            plan.update(intent='clarify')
+            plan['unresolved'].append('指定的关系类型与问题中的路径要求没有交集。')
+            return _available_context(retriever, request, scopes, plan)
+    else:
+        filters.update(request.relation_types)
+    direction = plan.get('direction') or 'both'
+    if request.mode == 'traverse' and request.direction != 'both':
+        if direction not in {'both', request.direction}:
+            plan.update(intent='clarify')
+            plan['unresolved'].append('指定的方向与问题中的路径要求不一致。')
+            return _available_context(retriever, request, scopes, plan)
+        direction = request.direction
+    targets = ((request.target_id, plan.get('target_id')), (request.target_kind, plan.get('requested_level')))
+    if any(explicit and parsed and explicit != parsed for explicit, parsed in targets):
+        plan.update(intent='clarify')
+        plan['unresolved'].append('指定的终点与问题中的路径要求不一致。')
+        return _available_context(retriever, request, scopes, plan)
+    answer = retrieve_traversal(retriever, query, scopes, business_context=plan['business_context'],
+        seed_ids=[s['candidates'][0]['node_id'] for s in slots], start_id=plan.get('start_id'),
+        via_ids=plan.get('via_ids', ()), target_kind=request.target_kind or plan.get('requested_level'),
+        target_id=request.target_id or plan.get('target_id'), direction=direction, relation_types=sorted(filters),
+        max_depth=request.max_depth, slots=[{'surface': s['text'], 'role_hint': s['role'],
+            'candidates': s['candidates'], 'source': s.get('match', 'exact')} for s in slots], **limits)
+    answer['plan'] = plan
+    if not answer['traverse']['paths']:
+        return _available_context(retriever, request, scopes, plan, answer)
+    return answer
+
+
 def retrieve_planned(retriever, request, scopes):
     query = request.query
     plan = build_plan(retriever, scopes, query, request.business_context,
                       [c.model_dump(exclude_none=True) for c in request.conditions],
-                      request.drill_role, force_joint=request.mode == 'dimensional')
+                      request.drill_role, force_joint=request.mode == 'dimensional', force_traverse=request.mode == 'traverse')
     intent = plan['intent']
     limits = {'max_nodes': request.max_nodes, 'max_edges': request.max_edges}
     if intent == 'clarify':
         return _available_context(retriever, request, scopes, plan)
+    if intent == 'traverse':
+        return _planned_traversal(retriever, request, scopes, plan)
     if intent == 'overview':
         from .overview import retrieve_overview
         return retrieve_overview(retriever, query, scopes, plan, **limits)

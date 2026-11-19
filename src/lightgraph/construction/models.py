@@ -2,15 +2,15 @@
 from __future__ import annotations
 
 from typing import Any, Literal
-from pydantic import Field, field_validator, model_serializer, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_serializer, model_validator
 from lightgraph.contracts import StrictModel, canonical
 
 
-class BusinessContextMapping(StrictModel):
-    """Declared applicability of a fact, independent of access and provenance."""
+class ApplicabilityMapping(StrictModel):
+    """Where a statement holds, when supported by source evidence. Dimensions are open-ended."""
     status: Literal['unknown', 'global', 'scoped'] = 'unknown'
     columns: dict[str, str] = Field(default_factory=dict, max_length=32,
-        description='Semantic dimension/role to authorized physical column, e.g. owning_project: PROJECT_ID. Never infer from a column name.')
+        description='Map a dimension named by the source to an authorized column. No particular dimension is required.')
     values: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=32,
         description='Explicitly declared constant applicability dimensions; these are not observed source values.')
 
@@ -28,6 +28,10 @@ class BusinessContextMapping(StrictModel):
         return self
 
 
+# Older Python integrations use this class name.
+BusinessContextMapping = ApplicabilityMapping
+
+
 class SourceMapping(StrictModel):
     source_id: str = Field(min_length=1)
     table: str = Field(min_length=1)
@@ -39,8 +43,10 @@ class SourceMapping(StrictModel):
         description='Agent-declared mapping annotations, such as the observed slot or endpoint positions. Not identity keys or source-verified values.')
     context_columns: list[str] = Field(default_factory=list, max_length=32,
         description='Authorized columns that identify a source-row context shared across mappings. Retained on each support, never added to entity identity. Use the same column set for related mappings.')
-    business_context: BusinessContextMapping = Field(default_factory=BusinessContextMapping,
-        description='Business applicability of each observed fact, separate from context_columns (row provenance) and access scopes. Omission means unknown, never global.')
+    # Existing snapshots and draft fingerprints use business_context on output.
+    business_context: ApplicabilityMapping = Field(default_factory=ApplicabilityMapping,
+        validation_alias=AliasChoices('applicability', 'business_context'),
+        description='Optional applicability of this observation. Omit when no scope is documented; omitted scope is unknown. Row provenance and read permissions have separate fields.')
 
     @model_validator(mode='after')
     def unambiguous_property_sources(self):
@@ -104,13 +110,13 @@ class EntityDefinition(StrictModel):
     description: str = Field(default="", max_length=4000)
     key_names: list[str] = Field(min_length=1, max_length=32)
     identity_scope: Literal['unknown', 'global', 'scoped'] = Field(default='unknown',
-        description='Whether the complete key identifies a globally shared object or an object within explicit business dimensions. Global requires an evidence-backed identity_domain, never same-name or same-code guessing. Unknown preserves legacy identities without asserting global uniqueness.')
+        description='Whether the complete key identifies an object throughout its identifier system or only within declared dimensions. A global key requires a documented identity domain and evidence.')
     identity_domain: str | None = Field(default=None, min_length=1, max_length=200,
-        description='Evidence-backed code system or shared identity authority. A source table or matching spelling alone does not prove a shared business domain.')
+        description='Documented identifier system or shared identity authority. A matching label alone does not establish a shared identifier.')
     identity_evidence_refs: list[str] = Field(default_factory=list, max_length=128,
         description='Issued evidence supporting the declared identity domain and grain; global identity requires at least one reference.')
     identity_context_keys: list[str] = Field(default_factory=list, max_length=32,
-        description='For scoped identities, the subset of key_names defining the business identity boundary, e.g. project in [project, code]. These must already be present in every mapping key_columns and relation endpoint key.')
+        description='For scoped identities, the subset of key_names within which the rest of the key is unique. Include these parts in mapping keys and relation endpoint keys.')
     mappings: list[EntityMapping | MetadataColumnMapping] = Field(min_length=1, max_length=128)
     display_mode: Literal['auto', 'identity', 'relations'] = Field(default='auto',
         description='For objects without a source label: derive from visible relations or the complete identity. Explicit source labels always take precedence.')

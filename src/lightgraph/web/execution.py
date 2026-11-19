@@ -20,6 +20,7 @@ import uuid
 from functools import lru_cache
 
 from ..contracts import RunReport, digest
+from ..construction.artifact_io import artifact_step, failure_detail
 from ..errors import LightGraphError
 from ..runtime.locking import FileLock
 from ..runtime.retention import atomic_text
@@ -641,7 +642,7 @@ class RunManager:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from ..construction.access import access_fingerprint
         from ..construction.inheritance import authorize_frozen_inheritance, freeze_inherited_graphs, frozen_contributors
-        from ..construction.merger import merge_construction_graphs
+        from ..construction.merger import merge_accounting, merge_construction_graphs
         from ..construction.workflow import (
             archive_workflow_state, build_merge_node_config, build_unit_config, committed_unit_output,
             copy_frozen_inheritance, effective_merge_policy, upstream_binding_inventory,
@@ -843,8 +844,10 @@ class RunManager:
             rep = res.get("report") or {}
             counts = rep.get("counts") or {}
             with entry["state_lock"]:
+                worker_status = res.get('status', 'failed')
                 state_bucket[node_key].update(
-                    status=res.get("status", "failed"),
+                    status='running' if usable_result(res) else worker_status,
+                    worker_status=worker_status,
                     error_code=res.get("error_code"),
                     issue_codes=sorted({issue["code"] for issue in rep.get("issues", []) if isinstance(issue.get("code"), str)}),
                     nodes=counts.get("delta_nodes", counts.get("business_nodes", 0)),
@@ -914,13 +917,16 @@ class RunManager:
                                 attempts[uid] = rid
                                 with entry['state_lock']:
                                     wf_state['artifacts'][uid] = checkpoint
+                                    units_state[uid].update(status=result['status'], artifact_status='committed', updated_at=_now())
                                     wf_state['ready_unit_attempts'] = dict(attempts)
                                     save_workflow_state(config.output_dir, wf_state)
                             unit_results.append(result)
                         except Exception as exc:
                             code = _safe_code(getattr(exc, "code", None), "workflow_unit_failed")
                             with entry["state_lock"]:
-                                units_state[uid].update(status="failed", error_code=code, updated_at=_now())
+                                units_state[uid].update(status="failed", error_code=code, updated_at=_now(),
+                                                        artifact_status='committed' if uid in wf_state['artifacts'] else 'uncommitted',
+                                                        failure_detail=failure_detail(exc, 'extract_node'))
                                 save_workflow_state(config.output_dir, wf_state)
                             unit_results.append({"unit_id": uid, "status": "failed", "error_code": code})
                 if cancel_event.is_set():
@@ -969,6 +975,7 @@ class RunManager:
                             # downstream merges have not run and are skipped.
                             code = _safe_code(getattr(exc, 'code', None), 'graph_workspace_record_unavailable')
                             units_state[uid].update(status='failed', error_code=code, updated_at=_now())
+                            units_state[uid]['failure_detail'] = failure_detail(exc, 'extract_contributor_load')
                             attempts.pop(uid, None)
                             skipped_units.append(uid)
                             save_workflow_state(config.output_dir, wf_state)
@@ -991,6 +998,7 @@ class RunManager:
                         for mid in plan.merge_order:
                             if cancel_event.is_set():
                                 raise LightGraphError("run_cancelled")
+                            stage = 'merge_inputs'
                             try:
                                 if resume_state is not None and mid not in resume_nodes and mid not in reused_artifacts:
                                     continue
@@ -1020,6 +1028,7 @@ class RunManager:
                                     elif iid in merge_node_contribs:
                                         node_inputs.append(merge_node_contribs[iid])
 
+                                stage = 'merge_upstream'
                                 merged_upstream = merge_construction_graphs(
                                     node_inputs,
                                     target_access_fingerprint=access_fingerprint(config),
@@ -1027,6 +1036,7 @@ class RunManager:
                                 )
 
                                 if mnode.merge_mode == "merge_and_extract":
+                                    stage = 'merge_worker_prepare'
                                     m_out = unit_output_path(config.output_dir, mid, rid)
                                     m_out.mkdir(parents=True, exist_ok=True)
                                     base = commit_checkpoint(config.output_dir, rid, mid,
@@ -1049,6 +1059,7 @@ class RunManager:
                                     if inventory:
                                         m_cfg.goal_markdown += '\n\n' + inventory
                                     del frozen
+                                    stage = 'merge_worker'
                                     m_res = run_worker_config(mid, merge_nodes_state, m_cfg)
                                     unit_results.append(m_res)
                                     if cancel_event.is_set():
@@ -1065,11 +1076,13 @@ class RunManager:
                                             raise LightGraphError('graph_access_context_changed')
                                     except (LightGraphError, OSError, ValueError) as exc:
                                         code = _safe_code(getattr(exc, 'code', None), 'graph_workspace_record_unavailable')
-                                        merge_nodes_state[mid].update(status='failed', error_code=code, updated_at=_now())
+                                        merge_nodes_state[mid].update(status='failed', error_code=code, updated_at=_now(),
+                                            failure_detail=failure_detail(exc, 'merge_delta_load'), artifact_status='uncommitted')
                                         save_workflow_state(config.output_dir, wf_state)
                                         continue
                                     combined = merged_upstream
                                     if m_delta is not None:
+                                        stage = 'merge_delta'
                                         combined = merge_construction_graphs(
                                             [{"contributor_id": f"upstream_{mid}", "kind": "base",
                                               "local_source_namespace": True, "graph": merged_upstream}, m_delta],
@@ -1083,14 +1096,10 @@ class RunManager:
                                         "graph": combined,
                                         "evidence_records": m_delta["evidence_records"] if m_delta else {},
                                     }
-                                    merge_nodes_state[mid].update(
-                                        nodes=len(combined.get("nodes", [])),
-                                        edges=len(combined.get("edges", [])),
-                                        updated_at=_now(),
-                                    )
-                                    save_workflow_state(config.output_dir, wf_state)
+                                    merged_status = m_res['status']
 
                                 else:
+                                    merge_nodes_state[mid]['merge_counts'] = merge_accounting(node_inputs, merged_upstream)
                                     merge_outputs[mid] = merged_upstream
                                     merge_node_contribs[mid] = {
                                         "contributor_id": mid,
@@ -1098,27 +1107,30 @@ class RunManager:
                                         "graph": merged_upstream,
                                         "evidence_records": {},
                                     }
-                                    merge_nodes_state[mid].update(
-                                        status="completed",
-                                        nodes=len(merged_upstream.get("nodes", [])),
-                                        edges=len(merged_upstream.get("edges", [])),
-                                        updated_at=_now(),
-                                    )
-                                    save_workflow_state(config.output_dir, wf_state)
+                                    merged_status = 'completed'
 
+                                stage = 'merge_checkpoint_prepare'
+                                merged_graph = merge_outputs[mid]
+                                merge_nodes_state[mid].update(status='running', artifact_status='committing',
+                                    nodes=len(merged_graph.get('nodes', [])), edges=len(merged_graph.get('edges', [])),
+                                    updated_at=_now())
+                                save_workflow_state(config.output_dir, wf_state)
                                 wf_state['artifacts'][mid] = commit_checkpoint(
                                     config.output_dir, rid, mid, merge_node_contribs[mid],
-                                    input_digest=input_digests[mid], status=merge_nodes_state[mid]['status'],
+                                    input_digest=input_digests[mid], status=merged_status,
                                     result_policy_id=register_access_context(root_construction, config),
                                     upstream_artifacts=[wf_state['artifacts'][iid]['artifact_id'] for iid in in_ids])
+                                merge_nodes_state[mid].update(status=merged_status, artifact_status='committed', updated_at=_now())
                                 save_workflow_state(config.output_dir, wf_state)
-                            except (LightGraphError, OSError, ValueError) as exc:
+                            except (LightGraphError, OSError, ValueError, TypeError, KeyError) as exc:
                                 code = _safe_code(getattr(exc, 'code', None), 'workflow_merge_failed')
                                 if code in {'run_cancelled', 'input_dependency_changed'}:
                                     raise
                                 merge_node_contribs.pop(mid, None)
                                 merge_outputs.pop(mid, None)
-                                merge_nodes_state[mid].update(status='failed', error_code=code, updated_at=_now())
+                                merge_nodes_state[mid].update(status='failed', error_code=code, updated_at=_now(),
+                                    failure_detail=failure_detail(exc, stage),
+                                    artifact_status='committed' if mid in wf_state['artifacts'] else 'uncommitted')
                                 save_workflow_state(config.output_dir, wf_state)
 
                         # Publish terminal outputs
@@ -1191,6 +1203,9 @@ class RunManager:
 
                 if cancel_event.is_set() and merge_summary is None:
                     final_status, error_code = "cancelled", "run_cancelled"
+                    for node in [*units_state.values(), *merge_nodes_state.values()]:
+                        if node['status'] in ACTIVE_STATUSES:
+                            node.update(status='cancelled', error_code=error_code, updated_at=_now())
                 else:
                     active_statuses = [units_state[uid]["status"] for uid in plan.extract_ids if uid in units_state]
                     active_statuses.extend(merge_nodes_state[mid]["status"] for mid in plan.merge_order if mid in merge_nodes_state)
@@ -1251,12 +1266,20 @@ class RunManager:
                         node.update(status=terminal_status, error_code=code, updated_at=_now())
                 wf_state.update(status=terminal_status, finished_at=_now(), merge={
                     "status": terminal_status, "error_code": code, "publication_status": publication_status()})
-                save_workflow_state(config.output_dir, wf_state)
+                detail = failure_detail(exc, 'workflow_coordinator')
+                try:
+                    save_workflow_state(config.output_dir, wf_state)
+                except (LightGraphError, OSError, ValueError) as state_exc:
+                    # The per-project run record lives outside output_dir and
+                    # may still be writable when its workflow state is not.
+                    record['state_write_failure'] = failure_detail(state_exc, 'state_write')
                 with self.workspace.lock(pid), self._guard:
                     record.update(status=terminal_status, stage="finished", finished_at=_now(),
-                                  cleanup_status="unknown", error_code=code)
-                    _save(runs / (rid + ".json"), record)
-                    self._processes.pop(pid, None)
+                                  cleanup_status="unknown", error_code=code, failure_detail=detail)
+                    try:
+                        artifact_step('run_record_write', _save, runs / (rid + ".json"), record)
+                    finally:
+                        self._processes.pop(pid, None)
             finally:
                 done_event.set()
 

@@ -8,7 +8,7 @@ const pathLabels = computed(() => new Map(props.context.candidate_path?.nodes.ma
 const statusText = {
   source_text_only: '当前只找到相关原文，尚未确认对应实体。',
   no_confirmed_match: '当前可见范围内未能确认匹配的实体或事实。',
-  scope_unresolved: '请明确要查询的业务范围。',
+  scope_unresolved: '尚未确认问题所指的适用范围。',
   search_unavailable: '语义检索当前不可用，未能核实本次问题。',
 }
 </script>

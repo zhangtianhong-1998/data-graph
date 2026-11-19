@@ -5,11 +5,15 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+from tempfile import TemporaryDirectory
 
 from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.retention import atomic_text
+from lightgraph.runtime.locking import FileLock
+from .artifact_io import artifact_step
 from .graph_storage import read_graph_record, write_graph_record, _graph_digest
+from .paths import io_path
 
 
 class WorkflowCheckpointError(LightGraphError):
@@ -67,12 +71,12 @@ def _directory(output, run_id, node_id, graph_kind):
 def commit_checkpoint(output_dir, run_id, node_id, contributor, *, input_digest,
                       upstream_artifacts=(), status='completed', graph_kind='node_full', result_policy_id=None, source_attempt=None, recomposed_from=None):
     from .snapshot_registry import inherited_grants
-    directory = _directory(output_dir, run_id, node_id, graph_kind)
-    directory.mkdir(parents=True, exist_ok=True)
+    directory = artifact_step('checkpoint_directory', _directory, output_dir, run_id, node_id, graph_kind)
+    artifact_step('checkpoint_directory', directory.mkdir, parents=True, exist_ok=True)
     graph = contributor['graph']
     evidence = contributor.get('evidence_records') or {}
-    checksum = _graph_digest(graph)
-    evidence_checksum = digest(evidence)
+    checksum = artifact_step('checkpoint_digest', _graph_digest, graph)
+    evidence_checksum = artifact_step('checkpoint_digest', digest, evidence)
     record = {
         'format_version': 1, 'run_id': run_id, 'node_id': node_id, 'source_attempt': source_attempt or run_id,
         'artifact_id': 'artifact_' + digest(run_id, node_id, graph_kind, checksum, evidence_checksum)[:32],
@@ -82,26 +86,52 @@ def commit_checkpoint(output_dir, run_id, node_id, contributor, *, input_digest,
         'status': status, 'artifact_status': 'committed', 'graph_kind': graph_kind,
         'contributor_kind': contributor.get('kind', 'unit'),
         'access_fingerprint': graph.get('access_fingerprint'), 'result_policy_id': result_policy_id,
-        'inherited_grants': inherited_grants(Path(output_dir) / 'construction'),
+        'inherited_grants': artifact_step('checkpoint_grants', inherited_grants, Path(output_dir) / 'construction'),
         'coverage': (graph.get('conflict_isolation') or {}).get('coverage', 'unknown'),
         'read_window_digest': digest(graph['read_window']) if graph.get('read_window') else None,
         'source_key_semantics': graph.get('source_key_semantics', 'unknown'),
     }
     if recomposed_from is not None:
         record['recomposed_from'] = recomposed_from
+    lock = FileLock(directory / '.writer.lock', busy_code='workflow_checkpoint_busy',
+                    invalid_code='workflow_checkpoint_lock_invalid')
+    artifact_step('checkpoint_lock', lock.acquire)
+    try:
+        return _commit(output_dir, directory, record, graph, evidence)
+    finally:
+        lock.close()
+
+
+def _write_graph(directory, graph, checksum):
+    directory = io_path(directory)
+    destination = directory / 'graph.graph'
+    if destination.exists():
+        # A prior attempt installed the graph but failed before the marker.
+        if _graph_digest(read_graph_record(destination)) != checksum:
+            raise LightGraphError('workflow_checkpoint_immutable')
+        return
+    with TemporaryDirectory(prefix='.checkpoint-', dir=directory, ignore_cleanup_errors=True) as scratch:
+        staged = Path(scratch) / 'graph.graph'
+        write_graph_record(staged, graph)
+        # Sharing violations on the destination must not re-encode Parquet.
+        artifact_step('checkpoint_graph_install', staged.rename, destination)
+
+
+def _commit(output_dir, directory, record, graph, evidence):
     commit = directory / 'checkpoint.json'
     if commit.exists():
-        existing = json.loads(commit.read_text(encoding='utf-8'))
-        if {k: v for k, v in existing.items() if k != 'created_at'} != record:
+        existing = artifact_step('checkpoint_marker_read', lambda: json.loads(commit.read_text(encoding='utf-8')))
+        if not isinstance(existing, dict) or {k: v for k, v in existing.items() if k != 'created_at'} != record:
             raise LightGraphError('workflow_checkpoint_immutable')
+        artifact_step('checkpoint_verify', load_checkpoint, output_dir, existing)
         return existing
     # Evidence is separate from Parquet metadata so a large evidence map cannot
     # hit the workspace YAML limit. The final JSON marker commits both files.
-    write_graph_record(directory / 'graph.graph', graph)
+    artifact_step('checkpoint_graph_write', _write_graph, directory, graph, record['graph_digest'])
     if evidence:
-        atomic_text(directory / 'evidence.json', json.dumps(evidence, ensure_ascii=False))
+        artifact_step('checkpoint_evidence_write', atomic_text, directory / 'evidence.json', json.dumps(evidence, ensure_ascii=False))
     record['created_at'] = datetime.now(timezone.utc).isoformat()
-    atomic_text(commit, json.dumps(record, ensure_ascii=False, sort_keys=True))
+    artifact_step('checkpoint_marker_write', atomic_text, commit, json.dumps(record, ensure_ascii=False, sort_keys=True))
     return record
 
 

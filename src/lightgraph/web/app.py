@@ -1038,7 +1038,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         def read(_workspace, _pid, *, config):
             emb_key = resolve_api_key(pid, x_workbench_session, config)
             model_key = None
-            if (data.mode in {'auto', 'dimensional'} and not data.conditions
+            if (data.mode in {'auto', 'dimensional', 'traverse'} and not data.conditions and not data.seed_ids
                     and config.resolved_model.mode in {'in_environment', 'approved_external'}):
                 model_key = resolve_api_key(pid, x_workbench_session, config, model=True)
             retriever, _ = project_retriever(config, embedding_api_key=emb_key, model_api_key=model_key)

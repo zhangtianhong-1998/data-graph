@@ -6,17 +6,19 @@
 
 草稿是带目的、解释、证据引用和未决内容的 YAML 文档，`entities` 描述对象身份与属性来源，`relations` 描述关系端点及有效配对。只声明目标和证据支持的含义，不能将所有对象兜底为指标或报表项。
 
+实体和关系的类型名由当前资料决定。两种映射都支持可选的 `applicability`（旧名 `business_context`），用于记录这条描述成立的条件。省略后按范围未知处理。
+
 使用当前 `draft_schema` 定义的新映射，不提交旧 RuleSpec。数据源、列选择、对象类型、作用域和关系名称由当前分析产生；用户无需手写这些内容。
 
 实体定义含 `type`、`description`、`key_names` 和 `mappings`。每个物理映射指定 `source_id`、`schema`、`table`、`key_columns`，可指定 `label_column`、`english_name_column`、`description_column`、`alias_columns`、`properties` 和 `predicate`。`key_names` 表达身份键角色，`key_columns` 按相同次序指向实际字段；不同位置或表可以提供同一类型的多份映射。
 
-名称、描述与身份分开定义。确认的英文名列绑定到 `english_name_column`，行级描述文本绑定到 `description_column`；未知或没有独立列时保持为 `null`，不要从别名强猜英文名，也不要把物理表列注释当成具体实例的业务描述。没有单独名称列的关联对象，可以声明 `display_columns`（显示项名到来源列的映射），或使用实体的 `display_mode` 按可见关联对象生成显示名称。具体字段以 schema 为准。不要拿复合身份键的最后一列当作整个对象名称，也不要为显示而改变身份键。
+名称、描述与身份分开定义。确认的英文名列绑定到 `english_name_column`，行级描述文本绑定到 `description_column`；未知或没有独立列时保持为 `null`，不要从别名强猜英文名，也不要把物理表列注释当成具体实例的描述。没有单独名称列的关联对象，可以声明 `display_columns`（显示项名到来源列的映射），或使用实体的 `display_mode` 按可见关联对象生成显示名称。具体字段以 schema 为准。不要拿复合身份键的最后一列当作整个对象名称，也不要为显示而改变身份键。
 
 有可靠名称列时明确设置 `label_column`，经确认的其他名称设置 `alias_columns`。未指定主名称时，展示组件会拼成“类型（字段：值）”，再缺少组件才使用关系或身份兜底。组件不会自动成为主名称或别名。校验返回的名称质量提示供修订使用，不要求无名称对象编造名称；同一身份出现矛盾名称应修正身份范围或来源解释，不能把名称改成展示组件掩盖冲突。
 
 关系定义含 `type`、`description`、`source_type`、`target_type`、`mappings`，并按语义选择 `allow_self_links`、`acyclic`。物理映射通过 `source_key_columns`、`target_key_columns` 指向端点键，可含属性与筛选。`equal_endpoints` 明确同一行两端身份相等时应报错、忽略该配对还是保留；选择应有数据或文档依据，不能为通过验证随意忽略关系。
 
-有材料或字段映射支持层级关系时，在关系定义里记录 `hierarchy_orientation`。起点是父级时填 `parent_to_child`，起点是子级时填 `child_to_parent`，普通关联填 `none`。保留业务自己的关系名。自动下钻按这个方向遍历。
+有材料或字段映射支持层级关系时，在关系定义里记录 `hierarchy_orientation`。起点是父级时填 `parent_to_child`，起点是子级时填 `child_to_parent`，普通关联填 `none`。沿用来源材料能支持的关系名。一条多跳路径可以包含多种普通关系；沿层级查找子节点时，才使用父子方向。
 
 若端点身份需要查找，增加 `source_lookup` 或 `target_lookup`，包含 `source_id`、`schema`、`table`、`match_columns` 和 `key_columns`。关系本行对应端的键列提供匹配值，查找表的 `match_columns` 按顺序匹配，再用匹配行的 `key_columns` 形成端点身份。可指定 `predicate`、`cardinality: one|many` 和 `on_missing: error|omit`；默认缺失和多身份匹配都报错。`many` 只用于业务允许的多匹配，`omit` 必须有目标或材料依据，省略数量会报告。相同表也可作为查找表，用于等值自连接。
 

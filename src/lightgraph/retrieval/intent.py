@@ -15,15 +15,21 @@ _OVERVIEW = re.compile(
     r'(?:核心|关键)节点|(?:哪些节点的?)?(?:入度|出度|中心度)最高(?:的节点)?|'
     r'(?:有哪些社区|社区(?:分布|概览|划分))|\bpagerank\b', re.I)
 _EXPLORE = re.compile(r'相关|有哪些关联|邻居|探索|附近|周边|关联关系|explore', re.I)
+_PATH_OPERATION = re.compile(r'多跳|(?:多层(?:级)?|逐层)关联|路径|(?:关联|关系)链|如何(?:关联|连接|连通)|之间(?:的|有何|有什么)?(?:关系|联系)|'
+                             r'\b(?:path|paths|chain|multi[- ]hop|connected)\b', re.I)
+# Offline grammar for graph operations only. Apply it to entire gaps after
+# matching the actual graph vocabulary. It does not define entities or relations.
+_PATH_SYNTAX = (r'之间|经过|通过|经由|之间有|之间的|如何|怎样|有何|关联|关系|连接|联系|查找|寻找|到达|通往|沿着|只沿|仅沿|'
+                r'\b(?:find|show|the|a|an|between|from|to|via|and|of|are|how|connected|follow|using|only|edges?)\b')
+_EDGE_DIRECTIONS = {'incoming': re.compile(r'入边|\bincoming\b', re.I),
+                    'outgoing': re.compile(r'出边|\boutgoing\b', re.I),
+                    'both': re.compile(r'双向|\bbidirectional\b', re.I)}
 _NEG = re.compile(r'不要(?:再)?(?:看|分析|查)?|不看|排除|忽略|不考虑|不包括|不包含|不含|不关注|无需考虑|不关心|除外')
 _HISTORY = re.compile(r'^(?:(?:背景|例如|举例)\s*[:：]|(?:上次|此前|之前)(?:讨论|查询|看过))')
 _FOCUS = re.compile(r'(?:本次|这次|现在)(?:请|要|只)')
 _PROJECT_NAMES = {'project', 'project_id', 'project_name', '项目', '项目名', '项目名称'}
 _RESTRICT = re.compile(r'限定|过滤|要求|约束|须为|必须|条件|只要|只统计|只看|仅看|'
                        r'大于|小于|超过|至多|至少|低于|高于|不超过|不少于|[<>≥≤=]|且|尚未|已经')
-_SCOPE_HINT = re.compile(
-    r'[a-z\d_-]+\s*项目|[\w-]+\s*项目(?=的|中|里|\s|[，,。]|$)|项目\s*(?:[=:：]\s*\S|[a-z\d_-]+)|'
-    r'\bproject\s*[:=]\s*\S|\bproject\s+[a-z\d_-]+', re.I)
 
 
 def _clauses(query):
@@ -43,14 +49,17 @@ def _clauses(query):
     return active, exclusions
 
 
+def _dimension_pattern(name):
+    names = _PROJECT_NAMES if name.casefold() in _PROJECT_NAMES else {name}
+    return '(?:' + '|'.join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + ')'
+
+
 def _scope_matches(text, authorized):
     for name, value in authorized:
         escaped = re.escape(str(value))
-        key = re.escape(name)
-        if name.casefold() in _PROJECT_NAMES:
-            key = '(?:project(?:_id|_name)?|项目(?:名称|名)?)'
+        key = _dimension_pattern(name)
         # Include a boundary for Latin identifiers so "M" cannot select "AM".
-        pattern = rf'(?P<value_first>(?<![a-zA-Z0-9_]){escaped}\s*{key}(?![a-zA-Z0-9_]))|{key}\s*[=:：]?\s*{escaped}(?![a-zA-Z0-9_])'
+        pattern = rf'(?P<value_first>(?<![a-zA-Z0-9_]){escaped}\s*{key}(?![a-zA-Z0-9_]))|(?<![a-zA-Z0-9_]){key}\s*[=:：]?\s*{escaped}(?![a-zA-Z0-9_])'
         for match in re.finditer(pattern, text, re.I):
             # A registered short value can be the suffix or prefix of an
             # unrelated name (e.g. 京 and 南京). An unsegmented value needs
@@ -75,22 +84,59 @@ def _mask_scopes(text, matches):
     return ''.join(chars)
 
 
-def _resolve_scope(retriever, scopes, requested, clauses, excluded):
+def _endpoint_role(prefix):
+    prefix = prefix.rstrip()
+    if re.search(r'(?:从|\bfrom)$', prefix, re.I):
+        return 'start'
+    if re.search(r'(?:到|至|通往|\bto)$', prefix, re.I):
+        return 'end'
+    if re.search(r'(?:经过|经由|\bvia)$', prefix, re.I):
+        return 'via'
+    return None
+
+
+def _scope_scan_text(retriever, scopes, selection, text, dimensions, is_path):
+    """Hide indexed endpoints from the scope parser, preserving source offsets."""
+    if not dimensions or not (is_path or _PATH_OPERATION.search(text)):
+        return text
+    keys = {_dimension_pattern(name) for name, _ in dimensions}
+    if not any(re.search(key, text, re.I) for key in keys):
+        return text
+    cohorts = retriever.authorized_cohorts(scopes, selection)
+    terms = retriever.index.authorized_terms(cohorts)
+    result = list(text)
+    for term in decompose_query(text, known_terms=terms):
+        if term.source != 'exact_term' or not any(re.search(key, term.surface, re.I) for key in keys):
+            continue
+        for m in re.finditer(re.escape(term.surface), text, re.I):
+            if is_literal_span(text, *m.span()) and _endpoint_role(text[:m.start()]):
+                result[m.start():m.end()] = ['，'] * len(m.group())
+    return ''.join(result)
+
+
+def _resolve_scope(retriever, scopes, requested, clauses, excluded, *, is_path=False):
     selection = normalize_context_selection(requested)
     dimensions = set()
     for token in retriever.authorized_cohorts(scopes, None):
         dimensions.update(retriever.cohort_contexts[token]['dimensions'].items())
     text = '，'.join(clauses)
     unresolved = []
-    matches = list(_scope_matches(text, dimensions))
+    scan = _scope_scan_text(retriever, scopes, selection, text, dimensions, is_path)
+    matches = list(_scope_matches(scan, dimensions))
     for name, value, _ in matches:
         selection = dict(selection or {})
         if name in selection and selection[name] != value:
-            unresolved.append('出现互不一致的业务范围。')
+            unresolved.append('出现互不一致的适用范围。')
         selection[name] = value
     text = _mask_scopes(text, matches)
-    if _SCOPE_HINT.search(text):
-        unresolved.append('所提项目无法在当前可见范围内确认。')
+    scan = _mask_scopes(scan, matches)
+    names = {normalize_term(name) for name, _ in dimensions}
+    # Detect an unmatched qualifier using dimension names actually present
+    # in this index. Bare words in another domain are not scope declarations.
+    if any(re.search(rf'(?<![a-zA-Z0-9_]){key}\s*(?:[=:：]\s*\S|\s+[a-z\d_-]+)|'
+                     rf'[\w-]+\s*{key}(?=的|中|里|查|看|\s|[，,。]|$)', scan, re.I)
+           for key in {_dimension_pattern(name) for name in names}):
+        unresolved.append('所提范围无法在当前可见资料中确认。')
     for clause in excluded:
         matches = list(_scope_matches(clause, dimensions))
         residual = _mask_scopes(clause, matches)
@@ -128,7 +174,7 @@ _PREDICATE = re.compile(
     r'\b(?:before|after|without|except|excluding|greater than|less than|at least|at most)\b', re.I)
 
 
-def _residuals(text, slots, level, framing=()):
+def _residuals(text, slots, level, framing=(), *, path=False):
     text = normalize_term(text)
     anchors = {normalize_term(s['text']) for s in slots} | {normalize_term(f) for f in framing}
     anchors.discard('')
@@ -143,6 +189,9 @@ def _residuals(text, slots, level, framing=()):
     if level:
         kinds.add(normalize_term(level))
     words = [_GAP_SYNTAX, _ACTION.pattern, _EXPLORE.pattern, _POINT_ONLY.pattern]
+    if path:
+        words.extend((_PATH_OPERATION.pattern, _PATH_SYNTAX))
+        words.extend(pattern.pattern for pattern in _EDGE_DIRECTIONS.values())
     words.extend(re.escape(k) for k in kinds if k)
     grammar = re.compile(r'(?:' + '|'.join(words) + r')+', re.I)
     fragments = []
@@ -257,14 +306,14 @@ def _link_open_terms(retriever, cohorts, plan, phrases, equivalents=None):
         plan['unresolved'].append('当前可见图谱中未能确认“' + surface + '”对应的实体。')
 
 
-def _ground_index_query(retriever, cohorts, focus, terms, plan):
+def _ground_index_query(retriever, cohorts, focus, terms, plan, *, path=False):
     """Limited fallback for installations without a working question parser."""
     literal = [s.surface for s in decompose_query(focus, known_terms=terms) if s.source == 'exact_term']
     if len(literal) > 12:
         plan['candidate_limit'] = True
         plan['unresolved'].append('条件数量超出本次联合查询范围。')
     _bind_exact(retriever, cohorts, plan, literal[:12])
-    residual = _residuals(_OVERVIEW.sub(' ', focus), plan['conditions'], plan['requested_level'])
+    residual = _residuals(_OVERVIEW.sub(' ', focus), plan['conditions'], plan['requested_level'], path=path)
     eligible = [s for s in residual if len(s) > 1 and not _PREDICATE.search(s)
                 and not _RESTRICT.search(s) and not _NEG.search(s) and not s.isnumeric()]
     _link_open_terms(retriever, cohorts, plan, eligible)
@@ -277,7 +326,7 @@ def _new_plan(selection, focus, parser):
             'parser': parser}
 
 
-def _model_scope(retriever, scopes, requested, query, parsed):
+def _model_scope(retriever, scopes, requested, query, parsed, *, is_path=False):
     selection = normalize_context_selection(requested)
     available = set()
     for token in retriever.authorized_cohorts(scopes, None):
@@ -299,26 +348,35 @@ def _model_scope(retriever, scopes, requested, query, parsed):
         masked[start:end] = ['\n'] * (end - start)
 
     focus = ''.join(masked)
+    scan = _scope_scan_text(retriever, scopes, selection, focus, available, is_path)
     for scope in parsed.get('scopes', ()):
         phrase = scope['text']
         dimension, value = scope['dimension'], scope['value']
         if not phrase or not dimension or not value or dimension not in phrase or value not in phrase:
             return selection, '', ['范围名称、维度与原文不一致。']
+        occurrences = list(re.finditer(re.escape(phrase), focus))
+        if occurrences:
+            slices = {scan[m.start():m.end()] for m in occurrences}
+            if slices == {'，' * len(phrase)}:
+                # The quoted scope is itself a named, authorized path operand.
+                continue
+            if slices - {phrase, '，' * len(phrase)}:
+                return selection, '', ['范围限定与路径中的对象重叠，无法分别确认。']
         keys = [(key, v) for key, v in available if normalize_term(v) == normalize_term(value) and
                 (normalize_term(key) == normalize_term(dimension) or
                  normalize_term(key) in _PROJECT_NAMES and normalize_term(dimension) in _PROJECT_NAMES)]
         if len(keys) != 1:
-            return selection, '', ['所提范围无法与当前可见的业务范围唯一对应。']
+            return selection, '', ['所提范围无法与当前可见的适用范围唯一对应。']
         key, v = keys[0]
         if key in (selection or {}) and selection[key] != v:
-            return selection, '', ['出现互不一致的业务范围。']
+            return selection, '', ['出现互不一致的适用范围。']
         # Align against active text, not just the quoted fragment. "京项目" is
         # well formed in isolation even when copied from inside "南京项目".
-        phrases = list(re.finditer(re.escape(phrase), focus))
+        phrases = list(re.finditer(re.escape(phrase), scan))
         if not phrases:
             return selection, '', ['所提范围只出现在背景、排除条件中或未在原文找到。']
         adjacent = list(_scope_matches(phrase, keys))
-        full = [hit for _, _, hit in _scope_matches(focus, keys)]
+        full = [hit for _, _, hit in _scope_matches(scan, keys)]
         for occurrence in phrases:
             start, end = occurrence.span()
             if not is_literal_span(focus, start, end):
@@ -351,7 +409,7 @@ def _model_scope(retriever, scopes, requested, query, parsed):
     # project references and keep unsupported exclusions unresolved.
     # A removed span is a boundary. Two operands on opposite sides cannot
     # become a new value + dimension simply because whitespace separates them.
-    return _resolve_scope(retriever, scopes, selection, re.split(r'\n+', ''.join(masked)), excluded)
+    return _resolve_scope(retriever, scopes, selection, re.split(r'\n+', ''.join(masked)), excluded, is_path=is_path)
 
 
 def _unexplained_spans(text, classified):
@@ -387,8 +445,49 @@ def _ground_target(phrases, kinds):
     return found.pop() if len(found) == 1 else None
 
 
-def _compile_interpretation(retriever, scopes, requested, query, parsed, *, force_joint, drill_role):
-    selection, focus, issues = _model_scope(retriever, scopes, requested, query, parsed)
+def _finish_traversal(plan, path=None):
+    """Carry only unambiguous, grounded endpoints into path search."""
+    literal = _offline_path_endpoints(plan['focus'], plan['conditions'])
+    if path and any(path.get(k) and literal.get(k) and path[k] != literal[k] for k in ('start', 'end')):
+        plan['unresolved'].append('路径起点或终点与问句中的原文顺序不一致。')
+    path = {**literal, **{k: v for k, v in (path or {}).items() if v}}
+    plan['operation'] = 'traverse'
+    ids = {s['text']: s['candidates'][0]['node_id'] for s in plan['conditions'] if len(s['candidates']) == 1}
+    if not ids or plan['candidate_limit'] or len(ids) != len(plan['conditions']):
+        plan['unresolved'].append('需要确认关联路径上的对象。')
+    for role in ('start', 'end', 'via'):
+        terms = path.get(role) or []
+        if isinstance(terms, str):
+            terms = [terms]
+        if not terms:
+            continue
+        if any(term not in ids for term in terms):
+            plan['unresolved'].append('无法确认路径中指定的起点、终点或经过的对象。')
+        elif role == 'via':
+            plan['via_ids'] = [ids[t] for t in terms]
+        else:
+            plan['start_id' if role == 'start' else 'target_id'] = ids[terms[0]]
+    free = _unexplained_spans(plan['focus'], [s['text'] for s in plan['conditions']])
+    directions = {key for key, pattern in _EDGE_DIRECTIONS.items() if any(pattern.search(span) for span in free)}
+    # A model can quote a direction expressed in another language. Inspect
+    # the literal evidence for contradictory instructions where recognized.
+    if path.get('direction'):
+        quote = path.get('direction_text')
+        if quote and quote in plan['focus'] and (directions or _residuals(quote, [], None, path=True)):
+            directions.add(path['direction'])
+        elif path['direction'] != 'both':
+            plan['unresolved'].append('未在当前问句中核实路径方向。')
+    if len(directions) > 1:
+        plan['unresolved'].append('路径方向存在多种解释。')
+    elif directions:
+        plan['direction'] = directions.pop()
+    plan['intent'] = 'clarify' if plan['unresolved'] else 'traverse'
+    return plan
+
+
+def _compile_interpretation(retriever, scopes, requested, query, parsed, *, force_joint, force_traverse, drill_role):
+    selection, focus, issues = _model_scope(retriever, scopes, requested, query, parsed,
+                                           is_path=force_traverse or parsed.get('intent') == 'traverse')
     plan = _new_plan(selection, focus, 'model')
     if issues:
         plan.update(intent='clarify', scope_unresolved=True, unresolved=issues, focus='')
@@ -399,9 +498,23 @@ def _compile_interpretation(retriever, scopes, requested, query, parsed, *, forc
     proposed = [text for text in parsed['mentions'] if text in focus]
     target = parsed.get('target')
     intent = parsed.get('intent') or 'search'
+    intent = {'hierarchy': 'drilldown', 'cooccurrence': 'dimensional'}.get(intent, intent)
+    if force_traverse:
+        intent = 'traverse'
+    if force_joint:
+        intent = 'dimensional'
+    elif target and intent in {'search', 'explore'}:
+        # A requested endpoint category does not imply a taxonomy. Only
+        # explicit hierarchy intent should demand parent/child edges.
+        intent = 'traverse'
+    path = parsed.get('traversal') or {}
+    traverse = intent == 'traverse'
     target_phrases = [target] if target else parsed.get('framing', ()) if intent == 'drilldown' else ()
     plan['requested_level'] = _ground_target(target_phrases, kinds)
-    if target and not plan['requested_level']:
+    if target and traverse and not plan['requested_level'] and _resolve_text(retriever.index, target, cohorts)[0]:
+        proposed.append(target)
+        path = {**path, 'end': path.get('end') or target}
+    elif target and not plan['requested_level']:
         plan['unresolved'].append('当前可见图谱中未确认目标类型“' + target + '”。')
         plan['unbound_mentions'].append({'text': target, 'reason': 'unverified_type'})
 
@@ -409,9 +522,17 @@ def _compile_interpretation(retriever, scopes, requested, query, parsed, *, forc
     # with its qualifier. Recover the actual operands, leaving every other
     # part of the filter to be checked below.
     known = retriever.index.authorized_terms(cohorts)
-    literal = [s.surface for s in decompose_query(focus, known_terms=known) if s.source == 'exact_term'
-               and (any(s.normalized in normalize_term(m) or normalize_term(m) in s.normalized for m in proposed)
-                    or any(s.normalized in normalize_term(clause) for clause in clauses))]
+    exact_terms = [s for s in decompose_query(focus, known_terms=known) if s.source == 'exact_term']
+    if traverse:
+        # An explicit, exact endpoint can be recovered even if the model
+        # mistakenly put that occurrence in scopes instead of mentions.
+        for term in exact_terms:
+            if any(_endpoint_role(focus[:m.start()]) for m in re.finditer(re.escape(term.surface), focus, re.I)):
+                if term.surface not in proposed:
+                    proposed.append(term.surface)
+    literal = [s.surface for s in exact_terms
+               if any(s.normalized in normalize_term(m) or normalize_term(m) in s.normalized for m in proposed)
+               or any(s.normalized in normalize_term(clause) for clause in clauses)]
     surfaces = _combine_mentions(focus, literal, proposed)
     if len(surfaces) > 12:
         plan['candidate_limit'] = True
@@ -454,16 +575,42 @@ def _compile_interpretation(retriever, scopes, requested, query, parsed, *, forc
             plan['unbound_mentions'].append({'text': text, 'reason': 'unverified_condition'})
             plan['unresolved'].append('尚无法验证限定条件：' + text)
 
+    relation = path.get('relation') if traverse else None
+    if relation:
+        # A parser may copy the verb in "X [connects to] Y" into the
+        # relation-type field. Names inside a relation filter stay requirements.
+        anchors = [s['text'] for s in slots]
+        generic_link = (focus.count(relation) == 1 and not _residuals(relation, [], None, path=True) and
+                        any(re.search(re.escape(a) + r'\s*' + re.escape(relation) + r'\s*(?:到|至)?\s*'
+                                      + re.escape(b), focus, re.I) for a, b in zip(anchors, anchors[1:])))
+        if not generic_link:
+            matches = [r for r in retriever.index.authorized_relations(cohorts) if normalize_term(r) == normalize_term(relation)]
+            if relation in focus and len(matches) == 1:
+                plan['relation_types'] = matches
+                # A bare subject-predicate-object question asks about that
+                # particular edge. A potentially reversed, multihop walk
+                # cannot verify the asserted predicate.
+                bare_predicate = any(re.search(re.escape(a) + r'\s*' + re.escape(relation)
+                                               + r'(?:了)?\s*' + re.escape(b), focus, re.I)
+                                     for a, b in zip(anchors, anchors[1:]))
+                if bare_predicate and not _PATH_OPERATION.search(focus):
+                    unverified(relation)
+            else:
+                unverified(relation)
     operands = sorted({s['text'] for s in slots}, key=len, reverse=True)
+    if plan.get('relation_types'):
+        operands.append(relation)
     for clause in clauses:
         active = _mask_scopes(clause, _scope_matches(clause, (selection or {}).items()))
         remainder = _unexplained_spans(active, operands)
-        if any(_residuals(part, [], None) for part in remainder):
+        if any(_residuals(part, [], None, path=traverse) for part in remainder):
             unverified(clause)
 
     # Inspect the *unexplained spans* for omitted restrictions. They are
     # language to interpret, never extra entities to substitute into the graph.
     classified = [*proposed, *clauses]
+    if relation:
+        classified.append(relation)
     if plan['requested_level']:
         classified.append(plan['requested_level'])
     elif target:
@@ -480,8 +627,8 @@ def _compile_interpretation(retriever, scopes, requested, query, parsed, *, forc
                    for m in re.finditer(re.escape(gap), focus))
 
     gaps = [gap for gap in gaps if _PREDICATE.search(gap) or _NEG.search(gap)
-            or _residuals(gap, [], None)
-            or not (between_operands(gap) or any(gap in phrase for phrase in output_wording))]
+            or _residuals(gap, [], None, path=traverse)
+            or not (traverse or between_operands(gap) or any(gap in phrase for phrase in output_wording))]
     reviewer = getattr(retriever.mention_extractor, 'review_coverage', None)
     omit = reviewer(query, gaps) if reviewer and gaps else None
     for gap in gaps:
@@ -491,17 +638,19 @@ def _compile_interpretation(retriever, scopes, requested, query, parsed, *, forc
         elif omit is not None:
             if gap not in omit:
                 unverified(gap)
-        elif _residuals(gap, [], None):
+        elif _residuals(gap, [], None, path=traverse):
             unverified(gap)
 
+    if traverse:
+        return _finish_traversal(plan, path)
     roles = {s['role'] for s in slots if s['role']}
     if intent == 'overview':
         if slots or proposed or parsed.get('constraints'):
             plan['unresolved'].append('图谱统计需要与问题中的筛选条件使用同一范围。')
         plan['overview_metric'] = parsed.get('overview_metric') or 'community'
-    elif force_joint or len(slots) >= 2 and (intent in {'drilldown', 'dimensional'} or len(roles) > 1):
+    elif force_joint or len(slots) >= 2 and intent in {'drilldown', 'dimensional'}:
         intent = 'dimensional'
-    if target or plan['requested_level'] or intent == 'drilldown' or drill_role:
+    if intent == 'drilldown' or intent == 'dimensional' and (target or plan['requested_level'] or drill_role):
         parents = _parent_roles(retriever.index, cohorts, slots, plan['requested_level']) if plan['requested_level'] else set()
         if drill_role:
             parents = {drill_role} & roles
@@ -510,7 +659,7 @@ def _compile_interpretation(retriever, scopes, requested, query, parsed, *, forc
         if len(parents) == 1:
             plan['drill_role'] = next(iter(parents))
         elif slots:
-            plan['unresolved'].append('未确认应沿哪个维度下钻。')
+            plan['unresolved'].append('未确认要展开哪一类对象的子级。')
         if not force_joint and len(slots) == 1:
             intent = 'drilldown'
     if intent == 'dimensional' and len(slots) < 2 and not plan['unresolved']:
@@ -524,15 +673,33 @@ def _compile_interpretation(retriever, scopes, requested, query, parsed, *, forc
     return plan
 
 
-def build_plan(retriever, scopes, query, business_context, conditions=(), drill_role=None, force_joint=False):
+def _offline_path_endpoints(focus, slots):
+    """Read explicit from/via/to labels; mention order alone does not set direction."""
+    path = {'via': []}
+    for slot in slots:
+        text = slot['text']
+        for match in re.finditer(re.escape(text), focus, re.I):
+            role = _endpoint_role(focus[:match.start()])
+            if role == 'via':
+                path['via'].append(text)
+            elif role:
+                path[role] = text
+    return path
+
+
+def build_plan(retriever, scopes, query, business_context, conditions=(), drill_role=None, force_joint=False,
+               force_traverse=False):
     """Roles come from the visible type of each grounded candidate, never from word order."""
-    if query.strip() and not conditions and not force_joint:
-        selection, text, issues = _resolve_scope(retriever, scopes, business_context, [query], ())
-        if not issues and normalize_term(text) == normalize_term(query):
-            cohorts = retriever.authorized_cohorts(scopes, selection)
-            names = retriever.index.exact_names([query], scopes=cohorts, limit_per_term=6)
-            hits = names.get(normalize_term(query), [])
-            if hits:
+    if query.strip() and not conditions and not force_joint and not force_traverse:
+        selection = normalize_context_selection(business_context)
+        cohorts = retriever.authorized_cohorts(scopes, selection)
+        hits = retriever.index.exact_names([query], scopes=cohorts, limit_per_term=6)
+        if hits.get(normalize_term(query)):
+            _, remainder, issues = _resolve_scope(retriever, scopes, selection, [query], ())
+            # An exact object name may itself be the whole value + dimension.
+            # A composite question with additional scoped terms still needs
+            # the regular planner, even if someone stored it as a label.
+            if not issues and (not remainder.strip() or normalize_term(remainder) == normalize_term(query)):
                 plan = _new_plan(selection, query, 'exact_name')
                 _bind_exact(retriever, cohorts, plan, [query])
                 return plan
@@ -540,9 +707,10 @@ def build_plan(retriever, scopes, query, business_context, conditions=(), drill_
         parsed = retriever.mention_extractor(query)
         if parsed is not None:
             return _compile_interpretation(retriever, scopes, business_context, query, parsed,
-                                           force_joint=force_joint, drill_role=drill_role)
+                                           force_joint=force_joint, force_traverse=force_traverse, drill_role=drill_role)
     clauses, excluded = _clauses(query)
-    selection, focus, unresolved = _resolve_scope(retriever, scopes, business_context, clauses, excluded)
+    selection, focus, unresolved = _resolve_scope(retriever, scopes, business_context, clauses, excluded,
+                                                 is_path=force_traverse)
     cohorts = retriever.authorized_cohorts(scopes, selection)
     plan = _new_plan(selection, focus, 'structured' if conditions else 'index')
     plan.update(drill_role=drill_role, unresolved=unresolved, point_only=bool(_POINT_ONLY.search(focus)))
@@ -553,8 +721,9 @@ def build_plan(retriever, scopes, query, business_context, conditions=(), drill_
     structured = bool(conditions)
     kinds = retriever.index.authorized_kinds(cohorts)
     plan['requested_level'] = _target_kind(focus, kinds) if not structured else None
+    path_requested = force_traverse or not force_joint and not structured and bool(_PATH_OPERATION.search(focus))
     if not structured and focus.strip():
-        _ground_index_query(retriever, cohorts, focus, terms, plan)
+        _ground_index_query(retriever, cohorts, focus, terms, plan, path=path_requested)
     level = _LEVEL.search(focus) if not structured else None
     if level and not plan['requested_level'] and level.group(1) not in {'底', '最底层', '最后一级', '叶子节点', '叶节点'}:
         unresolved.append('目标层级尚未对应到当前图谱的节点类型。')
@@ -575,6 +744,15 @@ def build_plan(retriever, scopes, query, business_context, conditions=(), drill_
         unresolved.append('条件数量超出本次联合查询范围。')
     slots = plan['conditions']
     roles = {s['role'] for s in slots if s['role']}
+    associated_type = (plan['requested_level'] and slots and not _ACTION.search(focus) and not unresolved
+                       and not _parent_roles(retriever.index, cohorts, slots, plan['requested_level']))
+    if ((path_requested and (force_traverse or any(_PATH_OPERATION.search(part) for part in
+            _unexplained_spans(focus, [s['text'] for s in slots]))))
+            or associated_type and not force_joint and not structured):
+        residual = _residuals(focus, slots, plan['requested_level'], path=True)
+        if residual:
+            unresolved.append('关联路径还有未确认的条件：' + '、'.join(residual))
+        return _finish_traversal(plan)
     if _OVERVIEW.search(focus) and not force_joint and not structured and not _ACTION.search(focus):
         if unresolved or slots or re.search('相关|有关|限定|过滤|只统计|仅统计|大于|小于|超过|只针对|只考虑', focus):
             plan['intent'] = 'clarify'
@@ -609,21 +787,26 @@ def build_plan(retriever, scopes, query, business_context, conditions=(), drill_
         elif len(roles) == 1:
             plan['drill_role'] = next(iter(roles))
         elif len(slots) > 1:
-            unresolved.append('请说明沿哪个已匹配的维度向下查看。')
+            unresolved.append('请说明要查看哪个已匹配对象的子级。')
     if drill_role and drill_role not in roles:
-        unresolved.append('下钻维度没有对应到已确认的条件。')
-    if force_joint or len(slots) >= 2 and (len(roles) > 1 or drill or re.search('同时满足|交集|同时出现', focus)):
+        unresolved.append('要展开的对象类型与已确认的条件不符。')
+    # Compact noun phrases can express intersecting qualifiers. A list
+    # of entities of different kinds by itself only asks for those objects.
+    joint_wording = re.search('同时满足|交集|同时出现|共同记录', focus)
+    adjacent = any(re.search(re.escape(a['text']) + '的?' + re.escape(b['text']), focus, re.I)
+                   for a, b in zip(slots, slots[1:]))
+    if force_joint or len(slots) >= 2 and (drill or joint_wording or len(roles) > 1 and adjacent):
         plan['intent'] = 'dimensional'
     elif drill:
         plan['intent'] = 'drilldown'
     elif _EXPLORE.search(focus):
         plan['intent'] = 'explore'
     if re.search('或者|还是|二选一|对比|相比|比较', focus) and plan['intent'] in {'dimensional','drilldown'}:
-        unresolved.append('问题包含比较或备选条件，需要分别确认分析范围。')
+        unresolved.append('问题包含比较或备选条件，需要分别确认查询范围。')
     if any(len({c['kind'] for c in s['candidates']}) > 1 for s in slots) and plan['intent'] in {'dimensional','drilldown'}:
         unresolved.append('同名对象属于不同类型，请明确所指类型。')
     if drill and not slots:
-        unresolved.append('未找到可确认的下钻起点。')
+        unresolved.append('未找到可确认的层级展开起点。')
     if (not structured and plan['intent'] == 'dimensional' and len(roles) < len(slots)
             and all(s['role'] for s in slots) and not re.search('同时|共同|一起', focus)):
         unresolved.append('同一维度出现多个取值，请说明要分别查询还是求交集。')

@@ -128,6 +128,77 @@ def test_partial_promotion_and_pinned_recovery(workflow):
     assert len(list(project.glob('started-*'))) == len(workers)
 
 
+@pytest.mark.parametrize('transient', [True, False])
+def test_merge_registration_failure_and_pinned_rerun(workflow, monkeypatch, transient):
+    import errno
+    from lightgraph.construction import snapshot_registry
+
+    manager, project, config = workflow
+    config.workflow.merge_nodes[0].merge_mode = 'deterministic'
+    register = snapshot_registry._register_access_context
+    attempts = []
+
+    def fail(root, cfg, legacy):
+        if cfg.workflow is not None and not attempts:
+            attempts.append(True)
+            # Check what another client could see BEFORE the checkpoint exists.
+            running = load_workflow_state(config.output_dir)
+            node = running['merge_nodes']['merge']
+            assert node['status'] == 'running' and node['artifact_status'] == 'committing'
+            assert node['nodes'] == 2 and node['merge_counts']['input_nodes'] == 2
+            assert 'merge' not in running['artifacts']
+            if transient:
+                error = PermissionError(errno.EACCES, 'SECRET-PATH')
+                error.winerror = 32
+                raise error
+            raise OSError(errno.ENOSPC, 'SECRET-PATH')
+        return register(root, cfg, legacy)
+
+    monkeypatch.setattr(snapshot_registry, '_register_access_context', fail)
+    original = wait_run(manager, 'alpha', manager.start('alpha')['run_id'])
+    state = original['workflow_state']
+    assert attempts == [True]
+    if transient:
+        assert original['status'] == 'completed'
+        assert state['merge_nodes']['merge']['artifact_status'] == 'committed'
+        assert state['merge']['publication_status'] == 'published'
+        return
+    node = state['merge_nodes']['merge']
+    assert node['status'] == 'failed' and node['error_code'] == 'workflow_access_context_register_failed'
+    assert node['artifact_status'] == 'uncommitted' and 'SECRET-PATH' not in str(state)
+    assert node['failure_detail'] == {'stage': 'access_context_register', 'exception_type': 'OSError',
+                                     'errno': errno.ENOSPC, 'attempts': 1}
+    assert node['merge_counts']['output_nodes'] == 2
+    assert set(state['artifacts']) == {'a', 'b'} and state['merge']['status'] == 'skipped'
+    before = set(project.glob('started-*'))
+    rerun = wait_run(manager, 'alpha', manager.resume('alpha', original['run_id'], from_node_id='merge')['run_id'])
+    assert rerun['status'] == 'completed' and set(project.glob('started-*')) == before
+    assert rerun['workflow_state']['merge']['publication_status'] == 'published'
+    for nid in ('a', 'b'):
+        assert rerun['workflow_state']['artifacts'][nid] == state['artifacts'][nid]
+
+
+def test_unwritable_workflow_state_does_not_strand_parent_run(workflow, monkeypatch):
+    import errno
+    from lightgraph.construction import workflow as workflow_module
+
+    manager, _, config = workflow
+    config.workflow.merge_nodes[0].merge_mode = 'deterministic'
+    write = workflow_module.atomic_text
+
+    def reject_commit_state(path, payload):
+        if path.parent.name == 'workflow-runs' and json.loads(payload).get('merge_nodes', {}).get('merge', {}).get('artifact_status'):
+            raise OSError(errno.ENOSPC, 'SECRET-PATH')
+        return write(path, payload)
+
+    monkeypatch.setattr(workflow_module, 'atomic_text', reject_commit_state)
+    result = wait_run(manager, 'alpha', manager.start('alpha')['run_id'])
+    assert result['status'] == 'failed' and result['stage'] == 'finished'
+    assert result['failure_detail']['stage'] == result['state_write_failure']['stage'] == 'state_history_write'
+    assert result['failure_detail']['errno'] == errno.ENOSPC and not manager.active('alpha')
+    assert 'SECRET-PATH' not in str(result)
+
+
 def test_legacy_current_run_can_reuse_extracts_but_cannot_promote_delta(workflow):
     manager, project, config = workflow
     run = wait_run(manager, 'alpha', manager.start('alpha')['run_id'])

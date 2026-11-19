@@ -6,7 +6,7 @@ from itertools import product
 
 from lightgraph.contracts import canonical
 from lightgraph.source_values import scalar_kind
-from .drilldown import _evidence_preview, _path_node
+from .path_evidence import evidence_preview, path_node
 from .retriever import _join_contexts, _observation_groups, _row_witnesses
 
 _LIMIT = 4096
@@ -210,17 +210,17 @@ def retrieve_dimensional(retriever, query, scopes, plan, *, direction='outgoing'
 
     def emit_node(nid, witness, matches=()):
         if nid not in node_output:
-            node_output[nid] = _path_node(nodes[nid], _evidence_preview(witness), list(matches), bool(matches))
+            node_output[nid] = path_node(nodes[nid], evidence_preview(witness), list(matches), bool(matches))
         else:
             row = node_output[nid]
             row['matched_slots'] = sorted(set(row['matched_slots']).union(matches))
             row['is_seed'] = bool(row['matched_slots'])
-            preview = _evidence_preview(witness)
+            preview = evidence_preview(witness)
             if preview not in row['observations']:
                 row['observations'].append(preview)
 
     def emit_edge(edge, observation):
-        preview = _evidence_preview(observation)
+        preview = evidence_preview(observation)
         if edge['id'] not in edge_output:
             edge_output[edge['id']] = {**{k: edge[k] for k in ('id', 'source', 'target', 'relation')},
                                        'observations': [], 'evidence_refs': [], 'source_tables': []}

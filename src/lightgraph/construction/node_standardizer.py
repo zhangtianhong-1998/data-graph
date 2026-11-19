@@ -184,7 +184,7 @@ def standardize_node_details(
             })
 
         for kcol in prov.get('key_columns') or []:
-            add_field('identity', '业务编码/键', kcol)
+            add_field('identity', '身份键', kcol)
         if support.get('label') is not None:
             add_field('chinese_name', '主名称', prov.get('label_column'))
         if support.get('english_name') is not None:
