@@ -1,5 +1,6 @@
 """Exercise the actual CSV -> two workers -> merge -> history -> resume HTTP path."""
 import subprocess
+import time
 
 from lightgraph.tests.construction_worker_fixture import install_scripted_worker
 from lightgraph.tests.test_web_api import client, create, upload
@@ -33,6 +34,13 @@ def test_apply_merge_rule_to_committed_extracts_via_http(client, monkeypatch):
     graph = client.get(base + '/graph').json()
     assert len(graph['nodes']) == 2
     version = graph['version_id']
+    # No manual analytics request or embedding service is needed after root publication.
+    for _ in range(200):
+        analysis = client.get(base + '/graph/analytics', params={'version': version}).json()
+        if analysis['status'] not in {'running', 'queued'}:
+            break
+        time.sleep(.01)
+    assert analysis['status'] == 'completed' and analysis['counts']['nodes'] == 2
 
     # Adjust only the merge: neither branch, its source file, nor its successful rules changed.
     cfg = client.get(base + '/config').json()

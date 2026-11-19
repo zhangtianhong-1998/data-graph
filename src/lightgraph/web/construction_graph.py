@@ -244,9 +244,10 @@ def retrieval_status(config, *, embedding_api_key=None) -> dict:
     }
 
 
-def project_retriever(config, *, refresh=False, embedding_api_key=None):
+def project_retriever(config, *, refresh=False, embedding_api_key=None, model_api_key=None, expected_version=None):
     """Bind both indexes to the active publication and its current access scope."""
     from lightgraph.retrieval import SubgraphRetriever, resolve_embedder, sync_graph_to_retrieval
+    from lightgraph.retrieval.mentions import resolve_mention_extractor
     root = Path(config.output_dir) / 'construction'
     manifest = root / 'manifest.yaml'
     if root.is_symlink() or manifest.is_symlink():
@@ -257,15 +258,29 @@ def project_retriever(config, *, refresh=False, embedding_api_key=None):
         ensure_supported_access(config)
         graph = {'nodes': [], 'edges': []}
         generation = digest('no-construction-publication', access_fingerprint(config), _scope_key(config))
+    if expected_version is not None and (graph.get('version_id') or '') != expected_version:
+        raise LightGraphError('graph_read_conflict')
     embedder = resolve_embedder(config, api_key=embedding_api_key)
     directory = Path(config.output_dir) / 'retrieval'
-    if not refresh:
-        # Queries never start a potentially expensive index build implicitly.
-        return SubgraphRetriever(directory, embedder=embedder, expected_generation=generation), None
-    if not graph.get('nodes'):
-        raise LightGraphError('retrieval_graph_required')
-    result = sync_graph_to_retrieval(graph, directory, generation=generation, embedder=embedder)
-    return SubgraphRetriever(directory, embedder=embedder, expected_generation=generation), result
+    # Both the vector index and the optional offline statistics are pinned
+    # to this exact authorized publication. A query never starts either build.
+    version = graph.get('version_id')
+    def analytics_loader(scopes, selection):
+        from lightgraph.construction.analytics_store import read_analysis
+        if version is None or set(scopes) != set(config.scopes):
+            return None
+        return read_analysis(root, config, version, selection)
+
+    result = None
+    if refresh:
+        if not graph.get('nodes'):
+            raise LightGraphError('retrieval_graph_required')
+        result = sync_graph_to_retrieval(graph, directory, generation=generation, embedder=embedder)
+    retriever = SubgraphRetriever(directory, embedder=embedder, expected_generation=generation,
+                                  analytics_loader=analytics_loader,
+                                  mention_extractor=resolve_mention_extractor(config, api_key=model_api_key))
+    retriever.version_id = version
+    return retriever, result
 
 
 def vocabulary(graph):
@@ -416,6 +431,7 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
             "include_candidates": include_candidates, "candidate_view_available": True,
             "alignment_candidates": graph.get('candidate_identity_merges', [])[:200] if include_candidates else [],
             "definition_conflicts": graph.get('definition_conflicts', [])[:200] if include_candidates else [],
+            "merged_observation_nodes": graph.get("merged_observation_nodes", 0),
             "pending_alignment_count": len(graph.get('candidate_identity_merges', [])),
             "pending_definition_count": len(graph.get('definition_conflicts', [])),
             "unresolved_relations": [_listed(item) for item in graph.get('unresolved_relations', [])[:200]] if include_candidates else [],

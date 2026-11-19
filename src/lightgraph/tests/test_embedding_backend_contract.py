@@ -140,6 +140,8 @@ def test_manual_rebuild_replaces_vectors_after_service_changes_in_place(tmp_path
     new_root, manifest = active_index(tmp_path)
     assert old['generation'] == new['generation']
     assert old['build'] != new['build']
-    assert np.load(old_root / 'vectors/vectors.npy').shape == (1, 2)
-    assert np.load(new_root / 'vectors/vectors.npy').shape == (1, 3)
+    # This node contributes a combined card and a name vector.
+    assert old['vector_rows'] == new['vector_rows'] == 2
+    assert np.load(old_root / 'vectors/vectors.npy').shape == (2, 2)
+    assert np.load(new_root / 'vectors/vectors.npy').shape == (2, 3)
     assert manifest['vector_dim'] == 3

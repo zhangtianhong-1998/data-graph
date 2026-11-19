@@ -16,6 +16,8 @@
 
 关系定义含 `type`、`description`、`source_type`、`target_type`、`mappings`，并按语义选择 `allow_self_links`、`acyclic`。物理映射通过 `source_key_columns`、`target_key_columns` 指向端点键，可含属性与筛选。`equal_endpoints` 明确同一行两端身份相等时应报错、忽略该配对还是保留；选择应有数据或文档依据，不能为通过验证随意忽略关系。
 
+有材料或字段映射支持层级关系时，在关系定义里记录 `hierarchy_orientation`。起点是父级时填 `parent_to_child`，起点是子级时填 `child_to_parent`，普通关联填 `none`。保留业务自己的关系名。自动下钻按这个方向遍历。
+
 若端点身份需要查找，增加 `source_lookup` 或 `target_lookup`，包含 `source_id`、`schema`、`table`、`match_columns` 和 `key_columns`。关系本行对应端的键列提供匹配值，查找表的 `match_columns` 按顺序匹配，再用匹配行的 `key_columns` 形成端点身份。可指定 `predicate`、`cardinality: one|many` 和 `on_missing: error|omit`；默认缺失和多身份匹配都报错。`many` 只用于业务允许的多匹配，`omit` 必须有目标或材料依据，省略数量会报告。相同表也可作为查找表，用于等值自连接。
 
 例如订单只含客户邮箱，客户表才有客户编号：订单映射的 `target_key_columns` 选择邮箱，`target_lookup.match_columns` 选择客户表邮箱，`target_lookup.key_columns` 选择客户编号。客户身份仍用客户编号，不为了套用映射而改用邮箱。指定目标来源后，必须找到该来源的实际匹配行，全图已有同编码节点不能替代这个检查。

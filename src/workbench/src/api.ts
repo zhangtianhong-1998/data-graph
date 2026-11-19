@@ -126,7 +126,8 @@ const messages: Record<string, string> = {
   retrieval_build_failed: '向量化失败，已有索引保留，请检查向量服务后重试。',
   workflow_not_enabled: '当前项目尚未启用并保存并行工作流配置。',
   workflow_unit_not_found: '指定的并行抽取链路不存在，请刷新工作流配置。',
-  workflow_units_not_ready: '尚无已完成的并行链路结果可供融合，请先运行至少一条链路。',
+  workflow_units_not_ready: '合并所需的上游结果尚未就绪，请查看对应节点的运行记录。',
+  workflow_unit_publication_missing: '节点已结束，但缺少已发布的图谱。请查看该节点的记录并从该节点重新运行。',
   workflow_input_changed: '并行工作流配置或输入已变化，无法仅重跑单条链路，请先执行一次完整并行抽取。',
   workflow_merge_input_required: '合并节点缺少上游输入，请在画布中连接抽取或合并节点。',
   workflow_dag_requires_run: '请重新运行工作流以更新合并节点的结果。',
@@ -170,9 +171,9 @@ const responseRevisions = new WeakMap<object, string>()
 export function responseRevision(value: unknown): string | undefined {
   return value !== null && typeof value === 'object' ? responseRevisions.get(value) : undefined
 }
-export type RequestOptions = RequestInit & { timeoutMs?: number }
+export type RequestOptions = RequestInit & { timeoutMs?: number; responseType?: 'json' | 'blob' }
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { timeoutMs = 60000, signal, ...init } = options
+  const { timeoutMs = 60000, responseType = 'json', signal, ...init } = options
   const controller = new AbortController()
   let timedOut = false
   const abort = () => controller.abort()
@@ -183,6 +184,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   try {
     const response = await fetch(`/api${path}`, { ...init, signal: controller.signal, credentials: 'same-origin', cache: 'no-store',
       headers: { ...sessionHeader(path), ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...options.headers } })
+    if (response.ok && responseType === 'blob') return await response.blob() as T
     let data: unknown
     try { data = await response.json() } catch { throw new ApiError('invalid_response', response.status) }
     if (!response.ok) {

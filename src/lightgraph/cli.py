@@ -49,10 +49,33 @@ def parser():
     c=sub.add_parser('report');c.add_argument('path')
     c=sub.add_parser('import-graph');c.add_argument('snapshot');c.add_argument('store')
     c=sub.add_parser('validate',help='校验新图谱 YAML 草稿格式，不查询数据');c.add_argument('drafts',nargs='+')
-    c=sub.add_parser('export-graph',help='导出当前授权范围内已发布的图谱 YAML');c.add_argument('config');c.add_argument('output')
+    c=sub.add_parser('export-graph',help='导出授权范围内已发布的图谱')
+    c.add_argument('config');c.add_argument('output')
+    c.add_argument('--format', choices=('yaml', 'semantica-json', 'graphml'), default='yaml')
+    c.add_argument('--business-context', type=json.loads, metavar='JSON', help='业务范围，如 {"project":"M"}')
     c=sub.add_parser('export-structure',help='导出已发布的结构与映射 YAML，不连接数据源');c.add_argument('config');c.add_argument('output')
+    c = sub.add_parser('analyze-graph', help='计算或读取已发布全图的社区与中心度')
+    c.add_argument('config')
     c=sub.add_parser('merge-graphs',help='确定性合并多单元/继承图谱为标准化终态图谱');c.add_argument('config');c.add_argument('--unit',action='append',default=[])
-    c=sub.add_parser('retrieve-subgraph',help='基于本地向量库与SQLite关系索引检索并叠加子图');c.add_argument('config');c.add_argument('query');c.add_argument('--sync',action='store_true')
+    c = sub.add_parser('retrieve-subgraph', help='按文本或节点 ID 查询已发布图谱')
+    c.add_argument('config')
+    c.add_argument('query', nargs='?')
+    c.add_argument('--sync', action='store_true', help='先更新当前图谱的检索索引')
+    c.add_argument('--mode', choices=('search', 'drilldown', 'auto', 'dimensional'))
+    c.add_argument('--field', choices=('all', 'name', 'description'))
+    c.add_argument('--method', choices=('hybrid', 'keyword', 'vector'))
+    c.add_argument('--node-id', help='精确查找节点，配合 --hops 可展开邻域')
+    c.add_argument('--business-context', type=json.loads, metavar='JSON', help='业务范围，如 {"project":"M"}')
+    c.add_argument('--condition', dest='conditions', action='append', type=json.loads,
+                   help='联合检索的条件 JSON，可重复')
+    c.add_argument('--drill-role', help='在已满足条件的事实中下钻的维度')
+    c.add_argument('--seed-id', dest='seed_ids', action='append', help='下钻起点，可重复')
+    c.add_argument('--relation-type', dest='relation_types', action='append', help='下钻关系类型，可重复')
+    c.add_argument('--direction', choices=('incoming', 'outgoing'))
+    c.add_argument('--target-id')
+    for option in ('hops', 'top-n', 'top-p-seeds', 'max-depth', 'max-nodes', 'max-edges',
+                   'max-per-rel', 'hub-degree-limit'):
+        c.add_argument('--' + option, type=int)
     c=sub.add_parser('embed-server',help='启动可替换的本地 OpenAI 兼容向量嵌入服务（支持 Qwen3-Embedding-0.6B）')
     c.add_argument('--model',default='Qwen/Qwen3-Embedding-0.6B',help='本地目录或 HuggingFace 模型名')
     c.add_argument('--served-model-name', help='API 对外使用的模型名，适用于从本地目录加载权重')
@@ -64,6 +87,44 @@ def parser():
     c=sub.add_parser('schema');c.add_argument('output')
     c=sub.add_parser('retain-check');c.add_argument('paths',nargs='+');c.add_argument('--marker',action='append',required=True)
     return p
+
+
+def _read_published(config_path, read, *, built_config=None):
+    """Apply the workbench's live grants and payload revision checks to CLI reads."""
+    path = Path(config_path).resolve()
+    if path.name != 'config.yaml' or not (path.parent / 'project.yaml').is_file():
+        config = built_config if built_config is not None else load_config(config_path)
+        if any(ref.source_project_id for ref in getattr(config, 'inherited_graphs', ())):
+            raise LightGraphError('inherited_graph_workspace_required')
+        return read(config, None)
+
+    from .construction.analytics_store import current_version
+    from .web import graph_history
+    from .web.workspace import Workspace
+    workspace = Workspace(path.parent.parent)
+
+    def pinned(ws, pid, *, config):
+        # A CLI build writes its configured output. The workbench may currently
+        # be showing a different generation; authorize the version just built.
+        target = config
+        if built_config is not None:
+            target = config.model_copy(update={'output_dir': built_config.output_dir})
+        version = current_version(target)
+        if version:
+            entry = graph_history.resolve_version(ws, pid, config, version)
+            target = graph_history._authorize_entry(ws, entry, config)
+        return {'version_id': version, 'result': read(target, version or '')}
+
+    return graph_history.read_consistently(workspace, path.parent.name, pinned)['result']
+
+
+def _analyze_after_build(config_path, config):
+    import logging
+    from .construction.analytics_store import analyze_current
+    try:
+        _read_published(config_path, analyze_current, built_config=config)
+    except Exception:
+        logging.getLogger(__name__).warning('Graph published; offline graph analytics require a retry with analyze-graph')
 
 
 def run(args):
@@ -115,6 +176,8 @@ def run(args):
                 if args.output:atomic_text(args.output,json.dumps(manifests,ensure_ascii=False,indent=2))
                 emit(manifests);return 0
             report=run_pipeline(config,sources,discover_only=args.command=='discover')
+            if args.command != 'discover' and report.status in {'COMPLETED', 'COMPLETED_WITH_GAPS', 'PARTIAL'}:
+                _analyze_after_build(args.config, config)
             emit(report);return 2 if report.status=='PARTIAL' else (1 if report.status=='FAILED' else 0)
         finally:
             for source in sources:source.close()
@@ -129,14 +192,27 @@ def run(args):
             raise LightGraphError('invalid_graph_draft') from None
         emit({'status':'schema_valid','drafts':[d.draft_id for d in drafts],
               'data_validation':'not_run','semantic_assessment':'not_run'});return 0
+    if args.command == 'analyze-graph':
+        from .construction.analytics_store import analyze_current
+        emit(_read_published(args.config, analyze_current))
+        return 0
     if args.command=='export-graph':
-        from .web.construction_graph import load_graph
-        from .construction.workspace import write_yaml
-        config=load_config(args.config)
-        graph=load_graph(config)
-        write_yaml(Path(args.output), graph)
-        emit({'status':'exported','nodes':len(graph['nodes']),'edges':len(graph['edges']),
-              'output':str(Path(args.output).resolve()),'format':'yaml'});return 0
+        from .web.construction_graph import load_graph, select_business_context
+        from .construction.graph_export import serialize_graph
+        from .construction.contexts import normalize_context_selection
+        selection = normalize_context_selection(args.business_context) if args.business_context is not None else None
+        def export(config, version):
+            graph = load_graph(config)
+            if version is not None and not version:
+                raise LightGraphError('graph_version_not_found')
+            if version is not None and graph.get('version_id') != version:
+                raise LightGraphError('graph_read_conflict')
+            graph = select_business_context(graph, config, selection)
+            return serialize_graph(graph, args.format), {'nodes': len(graph['nodes']), 'edges': len(graph['edges'])}
+        payload, counts = _read_published(args.config, export)
+        atomic_text(args.output, payload)
+        emit({'status':'exported', **counts, 'output':str(Path(args.output).resolve()),'format':args.format})
+        return 0
     if args.command=='export-structure':
         from .construction.structure_export import load_published_structures
         from .construction.workspace import write_yaml
@@ -154,13 +230,20 @@ def run(args):
         mode = {'direct_single': 'direct_output', 'direct_multi': 'direct_multi_output'}.get(plan.mode, 'merged') if plan else 'merged'
         units = args.unit or (plan.extract_ids if plan else None)
         summary = merge_project_workflow(config.output_dir, config, unit_ids=units, mode=mode)
+        _analyze_after_build(args.config, config)
         emit({'status':'merged', **summary});return 0
     if args.command=='retrieve-subgraph':
         from .web.construction_graph import project_retriever
-        config = load_config(args.config)
-        retriever, _ = project_retriever(config, refresh=args.sync)
-        result = retriever.retrieve(args.query, scopes=config.scopes)
-        emit(result);return 0
+        from .retrieval.query import RetrieveSubgraphRequest
+        params = {key: value for key, value in vars(args).items()
+                  if key in RetrieveSubgraphRequest.model_fields and value is not None}
+        request = RetrieveSubgraphRequest.model_validate(params)
+        def query(config, version):
+            options = {} if version is None else {'expected_version': version}
+            retriever, _ = project_retriever(config, refresh=args.sync, **options)
+            return request.run(retriever, config.scopes)
+        emit(_read_published(args.config, query))
+        return 0
     if args.command=='embed-server':
         from .retrieval.local_embed_server import load_local_backend, create_embedding_app
         import uvicorn

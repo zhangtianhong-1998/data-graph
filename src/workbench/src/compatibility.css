@@ -94,12 +94,16 @@ body:has(.modal-backdrop) { overflow: hidden; }
 .topbar { height: 44px; }
 .project-head { padding-top: 14px; }
 .phase-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.phase-bar #run-mode { width: auto; max-width: 100%; }
 .phase-tabs { display: flex; align-items: center; gap: 4px; padding: 4px; background: #f0f3f8; border-radius: 8px; }
 .phase-tabs button { display: flex; align-items: center; gap: 8px; padding: 9px 18px; font-size: 14px; color: #687b96; border-radius: 6px; }
 .phase-tabs button.active { background: white; color: var(--blue); font-weight: 600; box-shadow: 0 1px 4px #25385a18; }
 .phase-tabs .status-dot { margin: 0; }
 .project-head .tabs { margin-top: 18px; }
 .content { flex: 1; min-height: 0; width: 100%; overflow: auto; overscroll-behavior: contain; }
+.content.workflow-content { display: flex; flex-direction: column; }
+.workflow-content > .workflow-page { flex: 1; min-height: 0; }
+.workflow-content .wf-toolbar-panel, .workflow-content > .run-banner { flex-shrink: 0; }
 .content.inputs-content { display: flex; flex-direction: column; overflow: hidden; padding-bottom: 24px; }
 .inputs-content > .run-banner { flex-shrink: 0; }
 .input-workspace { flex: 1; min-height: 0; grid-template-rows: minmax(0, 1fr); align-items: stretch; }

@@ -11,8 +11,10 @@ from lightgraph.tests.test_web_execution import ProjectWorkspace, wait_run
 from lightgraph.web.execution import RunManager
 
 
-@pytest.mark.parametrize('first_status', ['partial', 'completed'])
-def test_unreadable_or_partial_extract_skips_unstarted_merge(tmp_path, monkeypatch, first_status):
+@pytest.mark.parametrize(('first_status', 'artifact_error'), [
+    ('partial', None), ('completed', 'yaml_document_too_large'), ('completed', 'workflow_unit_publication_missing'),
+])
+def test_unreadable_or_partial_extract_skips_unstarted_merge(tmp_path, monkeypatch, first_status, artifact_error):
     workspace = ProjectWorkspace(tmp_path / 'workspace')
     project = workspace.add('alpha')
     config = RunConfig.model_validate({
@@ -45,7 +47,9 @@ Path(sys.argv[1]).write_text(json.dumps({'status': status, 'cleanup_status': 'co
     def load(out, uid):
         loaded.append(uid)
         if uid == 'u1':
-            raise LightGraphError('yaml_document_too_large')
+            if artifact_error == 'workflow_unit_publication_missing':
+                return None
+            raise LightGraphError(artifact_error)
         unit = next(unit for unit in config.workflow.units if unit.unit_id == uid)
         scoped = build_unit_config(config, unit, unit_output_dir=out)
         return {'kind': 'unit', 'contributor_id': uid,
@@ -64,8 +68,23 @@ Path(sys.argv[1]).write_text(json.dumps({'status': status, 'cleanup_status': 'co
         assert ('u1' in loaded) == (first_status == 'completed')
         if first_status == 'completed':
             assert state['units']['u1']['status'] == 'failed'
-            assert state['units']['u1']['error_code'] == 'yaml_document_too_large'
+            assert state['units']['u1']['error_code'] == artifact_error
+            assert 'u2' in state['artifacts']
         else:
             assert state['units']['u1']['status'] == 'partial'
     finally:
         manager.shutdown()
+
+
+
+def test_supplemental_worker_catalog_describes_bindings_without_row_values():
+    from lightgraph.construction.workflow import upstream_binding_inventory
+    from lightgraph.tests.test_observed_identity import projection
+
+    graph = projection()
+    node = graph['nodes'][0]
+    node['supports'] += node['supports']  # Two supports for one projection still count as one node.
+    inventory = upstream_binding_inventory(graph)
+    assert '指标 ← db.dm.catalog (REPORT_CODE) · 2 个节点' in inventory
+    assert node['label'] not in inventory
+    assert not any(str(value) in inventory for value in node['identity'].values())

@@ -77,7 +77,7 @@ export interface WorkflowConfig {
   merge_nodes?: WorkflowMergeNodeConfig[]
   edges?: WorkflowEdgeConfig[]
   output_position?: WorkflowPosition | null
-  merge_policy: MergePolicyConfig
+  merge_policy?: MergePolicyConfig
 }
 export interface WorkflowMergeNodeState {
   node_id: string
@@ -168,6 +168,25 @@ export interface Table { source_id: string; schema: string; name: string; column
 export interface GraphNode { id: string; label?: string; name?: string; kind?: string; layer?: string; status?: string; [key: string]: unknown }
 export interface StandardNodeAttributeOrigin { source_id: string; qualified_table: string; column: string | null; data_type: string }
 export interface FactContext { version?: number; status: 'global' | 'scoped' | 'unknown'; dimensions: BusinessContext }
+export interface AvailableRetrievalContext {
+  status: 'partial' | 'source_text_only' | 'no_confirmed_match' | 'scope_unresolved' | 'search_unavailable'
+  nodes: Array<{id: string; display_name?: string}>
+  edges: Array<{id: string; source: string; target: string; relation: string}>
+  witnesses: Array<{fact_id: string; row_id: string; conditions: Array<{text: string; node_id: string}>;
+    source?: {source_id?: string; schema?: string; table?: string}}>
+  passages: Array<{text: string; node_id: string; display_name?: string; excerpt: string;
+    observation_id?: string | null; evidence_refs: string[]; source_tables: string[]}>
+  candidate_path?: {
+    assumptions: Array<{text: string; node_id: string; display_name: string; kind: string}>
+    unverified_terms: string[]
+    nodes: AvailableRetrievalContext['nodes']
+    edges: AvailableRetrievalContext['edges']
+    witnesses: AvailableRetrievalContext['witnesses']
+    requested_level: string | null
+    level_node_ids: string[]
+  }
+  truncated?: boolean
+}
 export interface AttributeObservation { business_context?: FactContext; row_context?: { values?: Record<string, unknown> } | null; value: unknown; raw_value?: unknown; original_property?: string; source_id: string; qualified_table: string; column?: string | null; scope_ref?: string; evidence_refs?: string[]; observation_id?: string }
 export interface StandardNodeAttribute { observations?: AttributeObservation[]; key: string; label: string; values: unknown[]; data_type: string; origin_tables: StandardNodeAttributeOrigin[] }
 export interface StandardNodeSourceEvidenceField { role: string; field: string; column: string; data_type: string }

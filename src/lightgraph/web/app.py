@@ -25,6 +25,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.staticfiles import StaticFiles
 
 from lightgraph.errors import LightGraphError
+from lightgraph.retrieval.query import RetrieveSubgraphRequest
 from .workspace import Workspace
 from . import graph_history
 from .execution import RunManager, read_graph, read_graph_details, read_graph_consistently, read_metadata, identity_review, resolve_identity
@@ -121,18 +122,6 @@ class ResumeRun(InputModel):
     artifact_id: str | None = Field(default=None, pattern=r'^artifact_[a-f0-9]{32}$')
 
 
-class RetrieveSubgraphRequest(InputModel):
-    query: str = Field(min_length=1, max_length=4000)
-    business_context: dict | None = None
-    top_n: int = Field(default=20, ge=1, le=100)
-    top_p_seeds: int = Field(default=4, ge=1, le=20)
-    hops: int = Field(default=2, ge=1, le=2)
-    max_per_rel: int = Field(default=30, ge=1, le=200)
-    hub_degree_limit: int = Field(default=150, ge=10, le=5000)
-    max_nodes: int = Field(default=80, ge=5, le=500)
-    max_edges: int = Field(default=150, ge=5, le=1000)
-
-
 class NewProject(InputModel):
     name: str=Field(min_length=1,max_length=120)
     project_id: str|None=None
@@ -226,15 +215,21 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     saved_connections=SavedConnections(workspace.root)
     from .retrieval_jobs import RetrievalJobs
     retrieval_jobs = RetrievalJobs(workspace)
+    from .analytics_jobs import AnalyticsJobs
+    analytics = AnalyticsJobs(workspace)
+    if isinstance(manager, RunManager):
+        manager.after_publication = analytics.published
 
     @asynccontextmanager
     async def lifespan(app):
+        await run_in_threadpool(analytics.recover)
         try:
             yield
         finally:
             credentials.clear()
             await run_in_threadpool(retrieval_jobs.shutdown)
             await run_in_threadpool(manager.shutdown)
+            await run_in_threadpool(analytics.shutdown)
 
     app=FastAPI(title='Data Graph Workbench',version='1.1.0',lifespan=lifespan)
     app.state.workspace=workspace
@@ -242,6 +237,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     app.state.credentials=credentials
     app.state.saved_connections=saved_connections
     app.state.retrieval_jobs=retrieval_jobs
+    app.state.analytics_jobs=analytics
     app.add_middleware(CORSMiddleware,allow_origins=sorted(ALLOWED_ORIGINS),
         allow_methods=['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
         allow_headers=['Content-Type','X-Workbench-Session','If-Match'],expose_headers=['ETag'],allow_credentials=False)
@@ -341,12 +337,13 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             result['embedding_environment'] = True
         return result
 
-    def resolve_embedding_api_key(pid, token, config):
+    def resolve_api_key(pid, token, config, *, model=False):
         if not token:
             return None
         credentials.require(pid, token)
         try:
-            return saved_connections.load_embedding(pid, config)
+            load = saved_connections.load_model if model else saved_connections.load_embedding
+            return load(pid, config)
         except LightGraphError as exc:
             if exc.code.startswith('saved_connection_'):
                 return None
@@ -383,6 +380,8 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             workspace.require_config_revision(pid, if_match)
             if retrieval_jobs.active(pid):
                 raise LightGraphError('retrieval_job_active')
+            if analytics.active(pid):
+                raise LightGraphError('analytics_job_active')
             result = delete_project(workspace, pid)
             credentials.clear_project(pid)
             return result
@@ -789,6 +788,19 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         except (ValueError, TypeError):
             raise LightGraphError('business_context_invalid') from None
 
+    @app.get('/api/projects/{pid}/graph/analytics')
+    def graph_analytics_status(pid: str, version: str | None = None, business_context: str | None = None,
+                               offset: int = 0, limit: int = 20):
+        if offset < 0 or not 0 <= limit <= 1000:
+            raise LightGraphError('graph_page_invalid')
+        return graph_history.read_consistently(workspace, pid, analytics.status, version=version,
+            selection=parse_business_context(business_context), offset=offset, limit=limit)
+
+    @app.post('/api/projects/{pid}/graph/analytics', status_code=202)
+    def run_graph_analytics(pid: str, version: str | None = None, business_context: str | None = None, force: bool = False):
+        return graph_history.read_consistently(workspace, pid, analytics.start, version=version,
+            selection=parse_business_context(business_context), force=force)
+
     @app.get('/api/projects/{pid}/graph/contexts')
     def graph_contexts(pid: str, version: str | None = None, offset: int = 0, limit: int = 200):
         return graph_history.read_consistently(workspace, pid, graph_history.read_contexts,
@@ -805,6 +817,18 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return graph_history.read_consistently(workspace, pid, graph_history.read_page, version=version, **selection)
         reader = graph_history.read_consistently if layer == 'business' else read_graph_consistently
         return reader(workspace, pid, read_graph, **selection)
+
+    @app.get('/api/projects/{pid}/graph/export')
+    def export_graph(pid: str, format: Literal['semantica-json', 'graphml'] = 'semantica-json',
+                     version: str | None = None, business_context: str | None = None):
+        from lightgraph.construction.graph_export import FORMATS
+        exported = graph_history.read_consistently(workspace, pid, graph_history.read_export, version=version,
+            format_name=format, business_context=parse_business_context(business_context))
+        media_type, extension = FORMATS[format]
+        return Response(exported['payload'], media_type=media_type, headers={
+            'Content-Disposition': f'attachment; filename="graph-{exported["version_id"]}.{extension}"',
+            'Cache-Control': 'no-store',
+        })
 
     @app.get('/api/projects/{pid}/graph/batches')
     def graph_batches(pid:str,layer:str='business',part:str='nodes',offset:int=0,limit:int=1000,
@@ -963,7 +987,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
                 raise LightGraphError('invalid_embedding_config') from None
         # Test edits must not forward the saved credential to a new endpoint.
         binding = (config.embedding.base_url, config.embedding.model, config.embedding.api_key_env)
-        saved_key = resolve_embedding_api_key(pid, x_workbench_session, config) if binding == saved_binding else None
+        saved_key = resolve_api_key(pid, x_workbench_session, config) if binding == saved_binding else None
         explicit_key = data.api_key.get_secret_value() if data is not None and data.api_key is not None else (saved_key if binding == saved_binding else '')
         return await run_in_threadpool(test_embedding_service, config, api_key=explicit_key)
 
@@ -973,7 +997,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             mutable(pid)
             revision = workspace.get(pid)['config_revision']
             frozen = workspace.resolved_config(pid).model_copy(deep=True)
-            key = resolve_embedding_api_key(pid, token, frozen)
+            key = resolve_api_key(pid, token, frozen)
 
             def build(_workspace, _pid, *, config):
                 if config != frozen:
@@ -1004,7 +1028,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     def get_retrieval_status(pid: str, x_workbench_session: str | None = Header(default=None)):
         from .construction_graph import retrieval_status
         def read(_workspace, _pid, *, config):
-            emb_key = resolve_embedding_api_key(pid, x_workbench_session, config)
+            emb_key = resolve_api_key(pid, x_workbench_session, config)
             return retrieval_status(config, embedding_api_key=emb_key)
         return read_graph_consistently(workspace, pid, read)
 
@@ -1012,20 +1036,24 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     async def query_retrieval(pid: str, data: RetrieveSubgraphRequest, x_workbench_session: str | None = Header(default=None)):
         from .construction_graph import project_retriever
         def read(_workspace, _pid, *, config):
-            emb_key = resolve_embedding_api_key(pid, x_workbench_session, config)
-            retriever, _ = project_retriever(config, embedding_api_key=emb_key)
-            return retriever.retrieve(
-                data.query,
-                business_context=data.business_context,
-                scopes=list(config.scopes),
-                top_n=data.top_n,
-                top_p_seeds=data.top_p_seeds,
-                hops=data.hops,
-                max_per_rel=data.max_per_rel,
-                hub_degree_limit=data.hub_degree_limit,
-                max_nodes=data.max_nodes,
-                max_edges=data.max_edges,
-            )
+            emb_key = resolve_api_key(pid, x_workbench_session, config)
+            model_key = None
+            if (data.mode in {'auto', 'dimensional'} and not data.conditions
+                    and config.resolved_model.mode in {'in_environment', 'approved_external'}):
+                model_key = resolve_api_key(pid, x_workbench_session, config, model=True)
+            retriever, _ = project_retriever(config, embedding_api_key=emb_key, model_api_key=model_key)
+            # The source project can revoke a grant without changing this
+            # project's config revision while a multi-condition query runs.
+            entry = None
+            if any(ref.source_project_id for ref in config.inherited_graphs):
+                version = retriever.version_id
+                if version:
+                    entry = graph_history.resolve_version(workspace, pid, config, version)
+                    graph_history._authorize_entry(workspace, entry, config)
+            answer = data.run(retriever, config.scopes)
+            if entry:
+                graph_history._authorize_entry(workspace, entry, config)
+            return answer
         return await run_in_threadpool(read_graph_consistently, workspace, pid, read)
 
     @app.post('/api/projects/{pid}/runs/{rid}/cancel')

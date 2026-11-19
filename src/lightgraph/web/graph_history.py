@@ -232,6 +232,19 @@ def _prepared(workspace, pid, config, version):
     return effective, graph, generation
 
 
+def read_export(workspace, pid, *, config, format_name, version=None, business_context=None):
+    from lightgraph.construction.graph_export import serialize_graph
+    if version is not None:
+        config, graph, _ = _prepared(workspace, pid, config, version)
+    else:
+        if not construction_graph.available(config):
+            raise LightGraphError('graph_version_not_found')
+        graph = construction_graph.load_graph(config)
+    selected = construction_graph.select_business_context(graph, config, business_context)
+    return {'version_id': graph.get('version_id'), 'payload': serialize_graph(selected, format_name),
+            'nodes': len(selected['nodes']), 'edges': len(selected['edges'])}
+
+
 def read_contexts(workspace, pid, *, config, version=None, **options):
     if version is not None:
         effective, graph, _ = _prepared(workspace, pid, config, version)

@@ -12,12 +12,13 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from lightgraph.source_values import scalar_kind
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.retention import atomic_text
 from lightgraph.construction.access import filter_graph_scopes
 from lightgraph.construction.contexts import business_context_identity
-from .store_sqlite import SQLiteGraphIndex, normalize_term
+from .store_sqlite import SQLiteGraphIndex, normalize_term, observed_text_properties
 from .vector_local import Embedder, LocalHashEmbedder, LocalNumpyVectorStore, embedder_fingerprint
 
 
@@ -82,7 +83,8 @@ def _observations(item):
         result.append({'business_context': business_context_identity(support),
                        'properties': support.get('properties', {}),
                        'evidence_refs': refs, 'source_tables': tables, 'scopes': scopes,
-                       **{key: support[key] for key in ('observation_id', 'label', 'row_context', 'provenance',
+                       **{key: support[key] for key in ('observation_id', 'label', 'description', 'english_name', 'property_observations',
+                           'aliases', 'row_context', 'provenance',
                            'execution_origins', 'lookup_matches', 'endpoint_origins', 'identity_origins',
                            'inherited_from', 'contributor_id', 'required_scope_refs') if key in support}})
     return result
@@ -98,7 +100,7 @@ def active_index(root: Path, expected_generation: str | None = None) -> tuple[Pa
         path = root / 'builds' / build
         if not isinstance(manifest['cohorts'], dict) or not isinstance(manifest['embedder'], str):
             raise ValueError
-        if manifest['format'] != 3 or (expected_generation is not None and manifest['generation'] != expected_generation):
+        if manifest['format'] != 5 or (expected_generation is not None and manifest['generation'] != expected_generation):
             raise ValueError
         if not isinstance(manifest['cohort_contexts'], dict) or set(manifest['cohort_contexts']) != set(manifest['cohorts']):
             raise ValueError
@@ -179,7 +181,9 @@ def sync_graph_to_retrieval(
         for node in scoped_graph['nodes']:
             nid = node['id']
             kind = node.get('type') or node.get('kind') or 'Entity'
-            node_rows[nid] = {'node_id': nid, 'kind': kind, 'identity': node.get('identity') or {}}
+            identity = node.get('identity') or {}
+            node_rows[nid] = {'node_id': nid, 'kind': kind, 'identity': identity,
+                              'identity_types': node.get('identity_types') or {k: scalar_kind(v) for k, v in identity.items()}}
             cn_names = sorted({
                 str(s['label']).strip() for s in node.get('supports', [])
                 if isinstance(s.get('label'), str) and s['label'].strip()
@@ -234,10 +238,15 @@ def sync_graph_to_retrieval(
 
             for val in (node.get('identity') or {}).values():
                 add_term(val, 'identity_code', True)
-            if chinese_name:
-                add_term(chinese_name, 'chinese_name', False)
-            if english_name:
-                add_term(english_name, 'english_name', False)
+            for name in cn_names:
+                add_term(name, 'chinese_name')
+            for name in en_names:
+                add_term(name, 'english_name')
+            for desc in descs:
+                add_term(desc, 'description')
+            for support in node.get('supports', []):
+                for _, raw in observed_text_properties(support):
+                    add_term(raw, 'source_property')
             add_term(disp, 'display_name', False)
             for alias in aliases:
                 add_term(alias, 'alias', False)
@@ -254,12 +263,11 @@ def sync_graph_to_retrieval(
                 f'关联:{nbr_str}' if nbr_str else '',
             ]
             card_text = ' | '.join(part for part in card_parts if part)
-            vector_items.append({
-                'node_id': nid,
-                'kind': kind,
-                'scope_ref': scope_ref,
-                'card_text': card_text,
-            })
+            names = dict.fromkeys([disp, *cn_names, *en_names, *aliases])
+            for field, content in [('all', card_text), ('name', ' | '.join(names)), ('description', description)]:
+                if content:
+                    vector_items.append({'node_id': nid, 'kind': kind, 'scope_ref': scope_ref,
+                                         'field': field, 'card_text': content})
 
     # A failed embedding or an overlapping sync cannot expose a partially
     # replaced matrix or pair it with another generation's SQLite row indices.
@@ -274,9 +282,23 @@ def sync_graph_to_retrieval(
     staging = Path(tempfile.mkdtemp(prefix='.building-', dir=builds))
     try:
         index = SQLiteGraphIndex(staging / 'retrieval.sqlite')
-        index.replace_index(nodes=list(node_rows.values()), scope_views=scope_views, terms=terms, edges=edge_rows)
+        index.replace_index(nodes=list(node_rows.values()), scope_views=scope_views, terms=terms, edges=edge_rows,
+                            relation_definitions=graph.get('definitions', {}).get('relations', []))
         vec_store = LocalNumpyVectorStore(staging / 'vectors')
-        vectors = embedder.embed([item['card_text'] for item in vector_items])
+        # Identical names and descriptions often recur across support slices.
+        # Reuse their model output while retaining every slice's own permissions.
+        positions = {}
+        row_positions = []
+        for item in vector_items:
+            content = item['card_text']
+            if content not in positions:
+                positions[content] = len(positions)
+            row_positions.append(positions[content])
+        vectors = embedder.embed(list(positions))
+        if vectors.ndim != 2 or vectors.shape[0] != len(positions):
+            raise ValueError('vector_count_mismatch')
+        if len(positions) != len(vector_items):
+            vectors = vectors[row_positions]
         vec_store.replace_all(vector_items, vectors)
         resolved_dim = int(vectors.shape[1]) if vectors.ndim == 2 and vectors.shape[0] else int(embedder.dim or 0)
         _publish_staging(staging, builds / build_id)
@@ -286,7 +308,7 @@ def sync_graph_to_retrieval(
         nodes_indexed = len(node_rows)
         edges_indexed = len({row['edge_id'] for row in edge_rows})
         manifest = {
-            'format': 3,
+            'format': 5,
             'generation': gen_token,
             'build': build_id,
             'cohorts': cohorts,
@@ -297,7 +319,8 @@ def sync_graph_to_retrieval(
             'vector_dim': resolved_dim,
             'nodes_indexed': nodes_indexed,
             'edges_indexed': edges_indexed,
-            'vector_cards': len(vector_items),
+            'vector_cards': len(scope_views),
+            'vector_rows': len(vector_items),
             'synced_at': synced_at,
         }
         atomic_text(root / 'current.json', canonical(manifest))
@@ -315,7 +338,8 @@ def sync_graph_to_retrieval(
         'nodes_indexed': nodes_indexed,
         'edges_indexed': edges_indexed,
         'scope_views': len(scope_views),
-        'vector_cards': len(vector_items),
+        'vector_cards': len(scope_views),
+        'vector_rows': len(vector_items),
         'vector_dim': resolved_dim,
         'embedder_model': embedder_model,
         'embedder_provider': embedder_provider,

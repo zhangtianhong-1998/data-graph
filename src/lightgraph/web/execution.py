@@ -277,6 +277,7 @@ class RunManager:
     def __init__(self, workspace, *, cancel_timeout=5.0):
         self.workspace = workspace
         self.cancel_timeout = cancel_timeout
+        self.after_publication = None
         self._processes = {}
         self._guard = threading.RLock()
         self._closed = False
@@ -643,7 +644,7 @@ class RunManager:
         from ..construction.merger import merge_construction_graphs
         from ..construction.workflow import (
             archive_workflow_state, build_merge_node_config, build_unit_config, committed_unit_output,
-            copy_frozen_inheritance, effective_merge_policy,
+            copy_frozen_inheritance, effective_merge_policy, upstream_binding_inventory,
             load_unit_contributor, load_workflow_state, publish_merged_contributors, publish_premerged_graph,
             published_unit_attempts, resolve_workflow_plan, run_output_path, save_workflow_state, unit_output_path,
         )
@@ -899,21 +900,22 @@ class RunManager:
                             if usable_result(result) and not cancel_event.is_set():
                                 out = unit_output_path(config.output_dir, uid, rid)
                                 contributor = load_unit_contributor(out, uid)
-                                if contributor:
-                                    scoped = build_unit_config(config, units_by_id[uid], unit_output_dir=out)
-                                    if contributor['graph'].get('access_fingerprint') != access_fingerprint(scoped):
-                                        raise LightGraphError('graph_access_context_changed')
-                                    require_partial_isolation(result, contributor['graph'])
-                                    check_publication_inputs()
-                                    checkpoint = commit_checkpoint(config.output_dir, rid, uid, contributor,
-                                        input_digest=input_digests[uid], status=result['status'], graph_kind='node_delta',
-                                        result_policy_id=register_access_context(root_construction, scoped))
-                                    fresh_contributors[uid] = contributor
-                                    attempts[uid] = rid
-                                    with entry['state_lock']:
-                                        wf_state['artifacts'][uid] = checkpoint
-                                        wf_state['ready_unit_attempts'] = dict(attempts)
-                                        save_workflow_state(config.output_dir, wf_state)
+                                if contributor is None:
+                                    raise LightGraphError('workflow_unit_publication_missing')
+                                scoped = build_unit_config(config, units_by_id[uid], unit_output_dir=out)
+                                if contributor['graph'].get('access_fingerprint') != access_fingerprint(scoped):
+                                    raise LightGraphError('graph_access_context_changed')
+                                require_partial_isolation(result, contributor['graph'])
+                                check_publication_inputs()
+                                checkpoint = commit_checkpoint(config.output_dir, rid, uid, contributor,
+                                    input_digest=input_digests[uid], status=result['status'], graph_kind='node_delta',
+                                    result_policy_id=register_access_context(root_construction, scoped))
+                                fresh_contributors[uid] = contributor
+                                attempts[uid] = rid
+                                with entry['state_lock']:
+                                    wf_state['artifacts'][uid] = checkpoint
+                                    wf_state['ready_unit_attempts'] = dict(attempts)
+                                    save_workflow_state(config.output_dir, wf_state)
                             unit_results.append(result)
                         except Exception as exc:
                             code = _safe_code(getattr(exc, "code", None), "workflow_unit_failed")
@@ -1042,7 +1044,11 @@ class RunManager:
                                         upstream_summary=up_summary,
                                         node_output_dir=m_out,
                                     )
-                                    freeze_inherited_graphs(m_cfg, m_out / "construction", workspace=self.workspace)
+                                    frozen = freeze_inherited_graphs(m_cfg, m_out / "construction", workspace=self.workspace)
+                                    inventory = upstream_binding_inventory(frozen['base_graph'] or {})
+                                    if inventory:
+                                        m_cfg.goal_markdown += '\n\n' + inventory
+                                    del frozen
                                     m_res = run_worker_config(mid, merge_nodes_state, m_cfg)
                                     unit_results.append(m_res)
                                     if cancel_event.is_set():
@@ -1051,6 +1057,9 @@ class RunManager:
                                         continue
                                     try:
                                         m_delta = load_unit_contributor(m_out, mid)
+                                        counts = (m_res.get('report') or {}).get('counts') or {}
+                                        if m_delta is None and any(counts.get(key, 0) for key in ('delta_nodes', 'delta_edges')):
+                                            raise LightGraphError('workflow_unit_publication_missing')
                                         require_partial_isolation(m_res, (m_delta or {}).get('graph', {}))
                                         if m_delta is not None and m_delta['graph'].get('access_fingerprint') != access_fingerprint(m_cfg):
                                             raise LightGraphError('graph_access_context_changed')
@@ -1059,14 +1068,14 @@ class RunManager:
                                         merge_nodes_state[mid].update(status='failed', error_code=code, updated_at=_now())
                                         save_workflow_state(config.output_dir, wf_state)
                                         continue
-                                    combine_list = [{"contributor_id": f"upstream_{mid}", "kind": "base", "graph": merged_upstream}]
+                                    combined = merged_upstream
                                     if m_delta is not None:
-                                        combine_list.append(m_delta)
-                                    combined = merge_construction_graphs(
-                                        combine_list,
-                                        target_access_fingerprint=access_fingerprint(config),
-                                        merge_policy=eff_policy,
-                                    )
+                                        combined = merge_construction_graphs(
+                                            [{"contributor_id": f"upstream_{mid}", "kind": "base",
+                                              "local_source_namespace": True, "graph": merged_upstream}, m_delta],
+                                            target_access_fingerprint=access_fingerprint(config),
+                                            merge_policy=eff_policy,
+                                        )
                                     merge_outputs[mid] = combined
                                     merge_node_contribs[mid] = {
                                         "contributor_id": mid,
@@ -1230,6 +1239,8 @@ class RunManager:
                         report=_safe_report(report_obj),
                     )
                     _save(runs / (rid + ".json"), record)
+                    if merge_summary is not None and self.after_publication:
+                        self.after_publication(pid, config)
                     self._processes.pop(pid, None)
             except Exception as exc:
                 cancelled = cancel_event.is_set()
@@ -1363,6 +1374,8 @@ class RunManager:
             if isinstance(state, dict):
                 state["merge"] = {"status": merge_status, **summary}
                 save_workflow_state(config.output_dir, state, current_only=True)
+            if self.after_publication:
+                self.after_publication(pid, config)
             return summary
 
     def _watch(self, pid, proc):
@@ -1410,6 +1423,8 @@ class RunManager:
         record_path = self._paths(pid, record["run_id"])[1]
         finish_progress(progress_path(record_path), record["run_id"], record["status"])
         _save(record_path, record)
+        if record['status'] in {'completed', 'completed_with_gaps', 'partial'} and self.after_publication:
+            self.after_publication(pid, entry['config'])
         try:
             # Preserve worker results and trace artifacts until explicit user
             # cleanup. Only the obsolete cancellation control signal is removed.

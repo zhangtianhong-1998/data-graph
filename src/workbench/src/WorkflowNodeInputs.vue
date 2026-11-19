@@ -92,20 +92,23 @@ function projectionValue(event: Event) { const value = inputValue(event); return
     <label :for="`${prefix}-goal`">本节点补充抽取目标</label>
     <textarea :id="`${prefix}-goal`" :value="node.goal_markdown || ''" maxlength="32000" :disabled="locked" @input="emit('update', { goal_markdown: inputValue($event) })" />
   </div>
-  <div class="field">
-    <label :for="`${prefix}-filter`">数据筛选提示</label>
-    <textarea :id="`${prefix}-filter`" :value="node.probe_filter_hint || ''" maxlength="2000" :disabled="locked" @input="emit('update', { probe_filter_hint: inputValue($event) })" />
-  </div>
-  <div class="field">
-    <label :for="`${prefix}-projection`">联合投影</label>
-    <select :id="`${prefix}-projection`" :value="node.enable_co_projection == null ? 'inherit' : String(node.enable_co_projection)" :disabled="locked" @change="emit('update', { enable_co_projection: projectionValue($event) })">
-      <option value="inherit">继承全局配置</option><option value="true">启用</option><option value="false">关闭</option>
-    </select>
-  </div>
-  <div class="two-fields">
-    <div class="field"><label :for="`${prefix}-calls`">调用上限</label><input :id="`${prefix}-calls`" type="number" min="0" step="1" :value="node.max_calls ?? ''" :disabled="locked" placeholder="继承全局" @input="emit('update', { max_calls: numberValue($event) })" /></div>
-    <div class="field"><label :for="`${prefix}-seconds`">时限（秒）</label><input :id="`${prefix}-seconds`" type="number" min="0.1" step="any" :value="node.max_run_seconds ?? ''" :disabled="locked" placeholder="继承全局" @input="emit('update', { max_run_seconds: numberValue($event) })" /></div>
-  </div>
+  <details class="inspector-advanced">
+    <summary>高级抽取选项</summary>
+    <div class="field">
+      <label :for="`${prefix}-filter`">数据筛选提示</label>
+      <textarea :id="`${prefix}-filter`" :value="node.probe_filter_hint || ''" maxlength="2000" :disabled="locked" @input="emit('update', { probe_filter_hint: inputValue($event) })" />
+    </div>
+    <div class="field">
+      <label :for="`${prefix}-projection`">联合投影</label>
+      <select :id="`${prefix}-projection`" :value="node.enable_co_projection == null ? 'inherit' : String(node.enable_co_projection)" :disabled="locked" @change="emit('update', { enable_co_projection: projectionValue($event) })">
+        <option value="inherit">继承全局配置</option><option value="true">启用</option><option value="false">关闭</option>
+      </select>
+    </div>
+    <div class="two-fields">
+      <div class="field"><label :for="`${prefix}-calls`">调用上限</label><input :id="`${prefix}-calls`" type="number" min="0" step="1" :value="node.max_calls ?? ''" :disabled="locked" placeholder="继承全局" @input="emit('update', { max_calls: numberValue($event) })" /></div>
+      <div class="field"><label :for="`${prefix}-seconds`">时限（秒）</label><input :id="`${prefix}-seconds`" type="number" min="0.1" step="any" :value="node.max_run_seconds ?? ''" :disabled="locked" placeholder="继承全局" @input="emit('update', { max_run_seconds: numberValue($event) })" /></div>
+    </div>
+  </details>
 </template>
 
 <style scoped>

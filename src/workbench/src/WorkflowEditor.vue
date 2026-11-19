@@ -1,11 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import WorkflowNodeInputs from './WorkflowNodeInputs.vue'
-import FusionEditor from './FusionEditor.vue'
 import type {
-  FusionPolicy,
   InheritedGraphRef,
-  MergePolicyConfig,
   Metadata,
   Project,
   ProjectFile,
@@ -25,7 +22,6 @@ const props = defineProps<{
   documents: ProjectFile[]
   scopes: string[]
   workflow: WorkflowConfig | null
-  projectFusion?: FusionPolicy
   inheritedGraphs: InheritedGraphRef[]
   locked: boolean
   dirty: boolean
@@ -40,15 +36,6 @@ const emit = defineEmits<{
   refreshTables: []
 }>()
 
-function defaultMergePolicy(): MergePolicyConfig {
-  return {
-    shared_entity_types: [],
-    authority_sources: [],
-    conflict_mode: 'quarantine',
-    emit_alignment_candidates: true,
-  }
-}
-
 function normalizeWorkflow(raw: WorkflowConfig | null): WorkflowConfig {
   if (!raw) {
     return {
@@ -59,7 +46,6 @@ function normalizeWorkflow(raw: WorkflowConfig | null): WorkflowConfig {
       merge_nodes: [],
       edges: [],
       output_position: { x: 640, y: 180 },
-      merge_policy: defaultMergePolicy(),
     }
   }
   const units = (raw.units || []).map((u, idx) => ({
@@ -86,7 +72,6 @@ function normalizeWorkflow(raw: WorkflowConfig | null): WorkflowConfig {
     merge_nodes: mergeNodes,
     edges: (raw.edges || []).map(e => ({ ...e })),
     output_position: raw.output_position ? { ...raw.output_position } : { x: 640, y: 170 },
-    merge_policy: { ...defaultMergePolicy(), ...(raw.merge_policy || {}) },
   }
 }
 
@@ -183,7 +168,6 @@ function makeMergeNode(
     max_calls: null,
     max_run_seconds: null,
     enable_co_projection: null,
-    merge_policy: null,
     position: { x: Math.max(16, Math.round(pos.x)), y: Math.max(16, Math.round(pos.y)) },
   }
 }
@@ -699,16 +683,6 @@ function updateWorkers(raw: string) {
   commit(next)
 }
 
-const selectedMergePolicy = computed(() =>
-  current.value.merge_nodes?.[selectedMergeIndex.value]?.merge_policy || current.value.merge_policy,
-)
-const selectedFusion = computed<FusionPolicy>(() => {
-  const policy = selectedMergePolicy.value
-  const explicit = policy.fusion_policy || current.value.merge_policy.fusion_policy
-  const project = props.projectFusion || { version: 1 as const, label_conflict_policy: 'retain_variants' as const, entity_rules: [] }
-  return explicit || (policy.conflict_mode === 'strict' ? { ...project, label_conflict_policy: 'strict' } : project)
-})
-
 // --- Inherited Base Graphs ---
 const selectedInheritProject = ref('')
 const customInheritId = ref('')
@@ -798,20 +772,8 @@ const topologySummary = computed(() => {
 
 <template>
   <div class="workflow-page">
-    <div class="intro">
-      <div>
-        <h2>可视化并行工作流编排</h2>
-        <p>像搭积木一样编排图谱抽取流程：拖入或添加多个<strong>抽取节点</strong>（各选数据表与知识文档），可单独直出，也可连线汇入<strong>合并节点</strong>执行跨分支合并抽取。</p>
-      </div>
-      <div class="actions">
-        <button class="btn" :disabled="locked || !sources.length" @click="emit('refreshTables')">读取数据表</button>
-        <button class="btn" :disabled="locked || !sources.length" @click="buildPresetSplit(false)">按表拆分直出</button>
-        <button class="btn" :disabled="locked || !sources.length" @click="buildPresetSplit(true)">按表拆分并合并</button>
-      </div>
-    </div>
-
     <!-- 顶部控制条 -->
-    <section class="panel wf-toolbar-panel">
+    <section class="panel wf-toolbar-panel" aria-label="工作流设置">
       <div class="wf-toolbar">
         <label class="checkbox-line">
           <input
@@ -820,8 +782,16 @@ const topologySummary = computed(() => {
             :disabled="locked"
             @change="setEnabled(($event.target as HTMLInputElement).checked)"
           />
-          <span><strong>启用工作流编排模式</strong></span>
+          <span><strong>启用并行工作流</strong></span>
         </label>
+        <details class="wf-presets">
+          <summary>按表编排</summary>
+          <div class="actions">
+            <button class="btn small" :disabled="locked || !sources.length" @click="emit('refreshTables')">读取数据表</button>
+            <button class="btn small" :disabled="locked || !sources.length" @click="buildPresetSplit(false)">按表拆分直出</button>
+            <button class="btn small" :disabled="locked || !sources.length" @click="buildPresetSplit(true)">按表拆分并合并</button>
+          </div>
+        </details>
         <div class="wf-toolbar-right">
           <label class="wf-inline-field">
             <span>最大并行数</span>
@@ -837,7 +807,6 @@ const topologySummary = computed(() => {
             />
           </label>
           <label class="checkbox-line"><input type="checkbox" :checked="current.enable_co_projection" :disabled="locked" @change="commit({ ...current, enable_co_projection: ($event.target as HTMLInputElement).checked })" /><span>全局联合投影</span></label>
-          <span class="badge" :class="current.enabled ? 'green' : ''">{{ current.enabled ? '已启用编排' : '未启用' }}</span>
           <button class="btn" :disabled="locked" @click="emit('save')">保存工作流配置</button>
           <button class="btn primary" :disabled="locked || runDisabled || (current.enabled && !!outputRoute.problem)" :title="current.enabled ? outputRoute.problem : undefined" @click="emit('startRun')">保存并开始运行</button>
         </div>
@@ -846,54 +815,19 @@ const topologySummary = computed(() => {
 
     <p v-if="editorError" class="note amber" role="alert">{{ editorError }}</p>
     <div class="wf-studio">
-      <!-- 左侧节点组件库 -->
-      <aside class="panel wf-palette">
-        <div class="panel-head">
-          <h2>节点组件库</h2>
-        </div>
-        <div class="panel-body wf-palette-body">
-          <p class="field-hint">拖拽节点到右侧画布，或直接点击快速添加：</p>
-          <div
-            class="palette-item extract"
-            :draggable="!locked"
-            @dragstart="onPaletteDragStart('extract', $event)"
-          >
-            <div>
-              <strong>抽取节点</strong>
-              <p class="field-hint">分节点独立抽取，可单独指定表与知识文档</p>
-            </div>
-            <button class="btn small primary" type="button" :disabled="locked" @click="addExtractNode()">＋ 添加</button>
-          </div>
-          <div
-            class="palette-item merge"
-            :draggable="!locked"
-            @dragstart="onPaletteDragStart('merge', $event)"
-          >
-            <div>
-              <strong>合并节点</strong>
-              <p class="field-hint">汇总上游分支结果，支持确定性合并或全节点合并抽取</p>
-            </div>
-            <button class="btn small" type="button" :disabled="locked" @click="addMergeNode()">＋ 添加</button>
-          </div>
-          <div class="wf-palette-help">
-            <h3>连线说明</h3>
-            <p class="field-hint">1. 拖动节点标题栏可自由调整画布位置。</p>
-            <p class="field-hint">2. 从右侧<strong>输出端口 ●</strong>拖到目标节点的左侧<strong>输入端口 ○</strong>连线，也可依次点击两个端口。</p>
-            <p class="field-hint">3. 若不添加合并节点，抽取节点直接连至「最终输出」即自动作为最终结果。</p>
-          </div>
-        </div>
-      </aside>
-
       <!-- 中央可拖拉拽编排画布 -->
       <section class="panel wf-canvas-panel">
         <div class="panel-head">
           <div>
-            <h2>编排画布</h2>
-            <small class="muted">{{ pendingWireFrom ? `正在从「${pendingWireFrom}」连线…请点击目标输入端口 ○` : '点击节点配置表、知识文档与抽取策略' }}</small>
+            <h2>画布</h2>
           </div>
-          <div class="actions">
-            <button v-if="pendingWireFrom" class="btn small" type="button" @click="cancelWire">取消连线</button>
-            <span class="badge blue">抽取 {{ current.units.length }} · 合并 {{ (current.merge_nodes || []).length }}</span>
+          <div class="actions wf-palette-body">
+            <span class="palette-item extract" :draggable="!locked" @dragstart="onPaletteDragStart('extract', $event)">
+              <button class="btn small" type="button" :disabled="locked" @click="addExtractNode()">＋ 抽取节点</button>
+            </span>
+            <span class="palette-item merge" :draggable="!locked" @dragstart="onPaletteDragStart('merge', $event)">
+              <button class="btn small" type="button" :disabled="locked" @click="addMergeNode()">＋ 合并节点</button>
+            </span>
           </div>
         </div>
 
@@ -904,7 +838,8 @@ const topologySummary = computed(() => {
             <button class="btn small" type="button" aria-label="放大画布" :disabled="zoom >= MAX_ZOOM" @click="setZoom(zoom * 1.2)">＋</button>
             <button class="btn small" type="button" :aria-pressed="fitMode" @click="fitCanvas">适应画布</button>
           </div>
-          <small class="muted">Ctrl / ⌘ + 滚轮缩放，拖动空白处平移</small>
+          <button v-if="pendingWireFrom" type="button" class="text-button" @click="cancelWire">取消从 {{ pendingWireFrom }} 连线</button>
+          <details v-else class="wf-help"><summary>操作说明</summary><p>拖动节点标题可移动。依次点击输出端口和输入端口可连线。拖动画布可平移，按住 Ctrl 或 ⌘ 滚动滚轮可缩放。</p></details>
         </div>
         <div
           ref="canvasRef"
@@ -988,7 +923,7 @@ const topologySummary = computed(() => {
                   <strong>{{ mnode.label || mnode.node_id }}</strong>
                 </div>
                 <div class="wf-node-body">
-                  <span class="wf-chip">{{ mnode.merge_mode === 'merge_and_extract' ? '全局联合抽取 + 归并' : '确定性安全归并' }}</span>
+                  <span class="wf-chip">{{ mnode.merge_mode === 'merge_and_extract' ? '补充跨分支关系' : '自动合并已有结果' }}</span>
                 </div>
                 <button
                   type="button"
@@ -1101,7 +1036,7 @@ const topologySummary = computed(() => {
                 :id="`inspector-merge-label-${selectedMergeIndex}`"
                 :value="current.merge_nodes[selectedMergeIndex]!.label || ''"
                 :disabled="locked"
-                placeholder="全节点合并抽取"
+                placeholder="合并各分支结果"
                 @input="updateMergeNodeField(selectedMergeIndex, 'label', ($event.target as HTMLInputElement).value)"
               />
             </div>
@@ -1114,8 +1049,8 @@ const topologySummary = computed(() => {
                 :disabled="locked"
                 @change="updateMergeNodeField(selectedMergeIndex, 'merge_mode', ($event.target as HTMLSelectElement).value as 'deterministic' | 'merge_and_extract')"
               >
-                <option value="deterministic">合并已有结果（不查询数据库，不调用模型）</option>
-                <option value="merge_and_extract">全节点合并抽取（另外启动模型，补充跨分支关系）</option>
+                <option value="deterministic">自动合并已有结果</option>
+                <option value="merge_and_extract">合并后用模型补充跨分支关系</option>
               </select>
             </div>
 
@@ -1126,10 +1061,7 @@ const topologySummary = computed(() => {
               @update="editNodeInputs('merge', selectedMergeIndex, $event)" />
             </template>
 
-            <div class="unit-section">
-              <FusionEditor :key="projectId + '/' + selectedId" :model-value="selectedFusion" :locked="locked"/>
-              <p v-if="current.merge_nodes[selectedMergeIndex]!.merge_policy" class="field-hint">此节点保留已有自定义策略。</p>
-            </div>
+
           </div>
         </template>
 

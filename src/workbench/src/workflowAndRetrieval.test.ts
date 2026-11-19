@@ -11,6 +11,7 @@ let root: HTMLDivElement
 let config: RunConfig
 let revision: number
 let vectorizedState: RetrievalStatusResponse
+let retrievalFixture: Record<string, unknown> | undefined
 const requests: Array<{ url: string; method: string; body?: string; headers: Headers }> = []
 
 const project: Project = {
@@ -67,6 +68,7 @@ async function mountReady() {
 
 beforeEach(() => {
   clearSessions()
+  retrievalFixture = undefined
   sessionStorage.clear()
   requests.length = 0
   revision = 1
@@ -250,14 +252,29 @@ beforeEach(() => {
       })
     }
     if (url.endsWith('/retrieval/query')) {
+      const payload = JSON.parse(body || '{}')
+      if (retrievalFixture) return response({
+        query: payload.query, scopes: ['public'], slots: [], nodes: [], edges: [], bridge_nodes: [],
+        connected_components: [], truncated: false, truncation_reasons: [], ...retrievalFixture,
+      })
+      const drilldown = payload.mode === 'drilldown' ? {
+        status: 'found', equally_ranked_paths: 2, uncovered_seed_ids: [],
+        paths: [{ node_ids: ['n1', 'n2'], edge_ids: ['e1'], business_context: { status: 'scoped', dimensions: { project: 'M' } }, stop_reason: 'target_reached' }],
+      } : undefined
       return response({
+        drilldown,
+        ...(payload.query === '华东收入' ? {
+          plan: {intent: 'dimensional', conditions: [{text: '华东', role: '地区'},
+            {text: '收入', role: '指标', match: 'semantic', candidates: [{display_name: '营业收入'}]}], excluded_terms: [], unresolved: []},
+          dimensional: {status: 'no_common_fact', children: [], fact_ids: [], witnesses: [], matched_conditions: []},
+        } : {}),
         query: '采购合同 结算单',
         scopes: ['public'],
         slots: [
           {
             surface: '采购合同',
             source: 'chunk',
-            candidates: [{ node_id: 'n1', kind: 'Contract', vec_score: 0.91, vec_rank: 1, lex_rank: 1, rrf_score: 0.032, match_type: 'exact_name' }],
+            candidates: payload.node_id ? [{ node_id: 'n1', kind: 'Contract', vec_score: null, vec_rank: null, lex_rank: null, rrf_score: null, match_type: 'exact_id' }] : [{ node_id: 'n1', kind: 'Contract', vec_score: 0.91, vec_rank: 1, lex_rank: 1, rrf_score: 0.032, match_type: 'exact_name' }],
           },
         ],
         bridge_nodes: [{ node_id: 'n_mid', display_name: '结算中心', kind: 'Org', bridge_role: 'intermediate_bridge', matched_slots: ['采购合同', '结算单'] }],
@@ -337,7 +354,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     modeSelect.value = 'merge_and_extract'
     modeSelect.dispatchEvent(new Event('change', { bubbles: true }))
     await nextTick()
-    expect(root.textContent).toContain('全节点合并抽取')
+    expect(root.textContent).toContain('合并后用模型补充跨分支关系')
 
     root.querySelectorAll<HTMLInputElement>('.wf-inspector input[type=radio]')[1]!.click()
     await nextTick()
@@ -364,9 +381,9 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(config.workflow?.merge_nodes?.[0]?.merge_mode).toBe('merge_and_extract')
     expect(config.workflow?.merge_nodes?.[0]).toMatchObject({
       max_calls: 17, document_ids: ['files/f_1_doc_ab.md'], source_table_overrides: { db1: ['dm.table_b', 'dm.table_c'] },
-      merge_policy: null,
     })
-    expect(config.workflow?.merge_policy.conflict_mode).toBe('quarantine')
+    expect(config.workflow?.merge_policy).toBeUndefined()
+    expect(config.workflow?.merge_nodes?.[0]?.merge_policy).toBeUndefined()
     expect(config.workflow?.edges?.map(e => [e.source, e.target])).toEqual([
       ['extract_1', 'merge_1'], ['extract_2', 'merge_1'], ['merge_1', 'output'],
     ])
@@ -466,7 +483,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
 
     // 切换到子图召回页：初始状态是「未向量化」，点击「立即向量化」后变成「已完成向量化」
     button('子图召回').click()
-    await vi.waitFor(() => expect(root.textContent).toContain('未向量化（抽取已完成，待用户确认执行）'))
+    await vi.waitFor(() => expect(root.textContent).toContain('未向量化'))
     button('立即向量化').click()
     await vi.waitFor(() => expect(root.textContent).toContain('已完成向量化'))
     expect(root.textContent).toContain('Qwen/Qwen3-Embedding-0.6B')
@@ -477,10 +494,129 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     queryInput.dispatchEvent(new Event('input', { bubbles: true }))
     await nextTick()
 
-    button('执行子图召回').click()
-    await vi.waitFor(() => expect(root.textContent).toContain('召回结果总览'))
+    button('检索').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('检索结果'))
     expect(root.textContent).toContain('华东设备采购合同')
     expect(root.textContent).toContain('结算中心')
     expect(root.textContent).toContain('SETTLED_BY')
   })
+  it('分别展示部分条件的依据、来源原文和未确认的实体候选', async () => {
+    vectorizedState = { ...vectorizedState, vectorized: true, status: 'vectorized' }
+    await mountReady()
+    button('运行与结果').click()
+    await nextTick()
+    button('子图召回').click()
+    await vi.waitFor(() => expect(root.querySelector('#retrieval-query')).not.toBeNull())
+    const query = root.querySelector<HTMLTextAreaElement>('#retrieval-query')!
+    const emptyContext = { nodes: [], edges: [], witnesses: [], passages: [] }
+    const passage = { node_id: 'one', text: '故障代号', display_name: '检修报告', excerpt: '设备报告中提到故障代号。',
+      evidence_refs: ['ref-2'], source_tables: ['检修表'] }
+    async function search(fixture: Record<string, unknown>, expectedText: string) {
+      retrievalFixture = fixture
+      query.value = '查找故障代号对应的检修记录'
+      query.dispatchEvent(new Event('input', { bubbles: true }))
+      await nextTick()
+      button('检索').click()
+      await vi.waitFor(() => expect(root.querySelector('[aria-label="可用依据"]')?.textContent).toContain(expectedText))
+    }
+    await search({
+      plan: { intent: 'clarify', conditions: [], unresolved: [], excluded_terms: [],
+        suggestions: [{ text: '故障代号', reason: 'related', candidates: [{node_id: 'c', display_name: '相似故障'}] }] },
+      available_context: { status: 'partial', nodes: [{id: 'a', display_name: '生产车间'}, {id: 'b', display_name: '检修记录'}],
+        edges: [{ id: 'e', source: 'b', relation: '发生于', target: 'a' }], passages: [passage],
+        witnesses: [{ fact_id: 'b', row_id: 'repair-91', conditions: [{text: '生产车间', node_id: 'a'}] }],
+        candidate_path: {assumptions: [{text: '空气压缩机', display_name: '空压机', node_id: 'c', kind: '设备'}],
+          unverified_terms: ['空气压缩机'], requested_level: '零件', level_node_ids: ['bearing'],
+          nodes: [{id: 'c', display_name: '空压机'}, {id: 'bearing', display_name: '止推轴承'}],
+          edges: [{id: 'ce', source: 'c', relation: '包含', target: 'bearing'}],
+          witnesses: [{fact_id: 'b', row_id: 'candidate-row', conditions: []}]} },
+    }, '只符合部分条件')
+    const context = root.querySelector('[aria-label="可用依据"]')!
+    expect(context.textContent).toContain('检修记录 → 发生于 → 生产车间')
+    expect(context.textContent).toContain('来源行 repair-91')
+    expect(context.querySelector('blockquote')?.textContent).toBe(passage.excerpt)
+    expect(context.textContent).toContain('来源表 检修表')
+    expect(context.textContent).toContain('引用 ref-2')
+    const path = context.querySelector('[aria-label="候选路径"]')!
+    expect(path.textContent).toContain('“空气压缩机”指“空压机”')
+    expect(path.textContent).toContain('假设成立时')
+    expect(path.textContent).toContain('空压机 → 包含 → 止推轴承')
+    expect(path.textContent).toContain('来源行 candidate-row')
+    expect(root.textContent).toContain('相关候选（尚未确认） · 相似故障')
+    expect(context.textContent).not.toContain('相似故障')
+    expect(root.querySelector('.retrieval-detail-grid')).toBeNull()
+    expect(root.querySelector('.retrieval-summary-panel .report-summary')).toBeNull()
+
+    await search({
+      nodes: [{id: 'verified', kind: '设备', display_name: '已核实设备'}],
+      available_context: { ...emptyContext, status: 'partial', nodes: [{id: 'p', display_name: '部分匹配的设备'}] },
+    }, '部分匹配的设备')
+    expect(root.querySelector('.retrieval-detail-grid')?.textContent).toContain('已核实设备')
+    expect(root.querySelector('.retrieval-detail-grid')?.textContent).not.toContain('部分匹配的设备')
+    await search({ available_context: { ...emptyContext, status: 'source_text_only', passages: [passage] } }, '尚未确认对应实体')
+    expect(root.querySelector('[aria-label="来源原文"]')?.textContent).toContain(passage.excerpt)
+    expect(root.textContent).not.toContain('只符合部分条件')
+    await search({ available_context: { ...emptyContext, status: 'no_confirmed_match' } }, '当前可见范围内未能确认匹配')
+    expect(root.querySelector('[aria-label="来源原文"]')).toBeNull()
+    await search({ available_context: { ...emptyContext, status: 'scope_unresolved' } }, '请明确要查询的业务范围')
+    await search({ available_context: { ...emptyContext, status: 'search_unavailable' } }, '语义检索当前不可用')
+  })
+  it('按字段检索、精确 ID 及下钻分别传递对应参数，切换时清除旧结果', async () => {
+    vectorizedState = { ...vectorizedState, vectorized: true, status: 'vectorized' }
+    await mountReady()
+    button('运行与结果').click()
+    await nextTick()
+    button('子图召回').click()
+    await vi.waitFor(() => expect(root.querySelector('#retrieval-query')).not.toBeNull())
+    async function setValue(selector: string, value: string) {
+      const el = root.querySelector<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(selector)!
+      el.value = value
+      el.dispatchEvent(new Event(el.tagName === 'SELECT' ? 'change' : 'input', { bubbles: true }))
+      await nextTick()
+    }
+    async function submit() {
+      const count = requests.filter(r => r.url.endsWith('/retrieval/query')).length
+      button('检索').click()
+      await vi.waitFor(() => expect(requests.filter(r => r.url.endsWith('/retrieval/query'))).toHaveLength(count + 1))
+      return JSON.parse(requests.filter(r => r.url.endsWith('/retrieval/query')).at(-1)!.body!)
+    }
+    expect(root.querySelector('#retrieval-field')).toBeNull()
+    expect(root.querySelector('#retrieval-query')?.tagName).toBe('TEXTAREA')
+    await setValue('#retrieval-query', '华东收入')
+    expect(await submit()).toEqual({ query: '华东收入' })
+    expect(root.textContent).toContain('当前范围内未找到能同时支持这些条件的事实')
+    expect(root.textContent).toContain('收入 → 营业收入（语义匹配）')
+    button('调试检索算子').click()
+    await nextTick()
+    await setValue('#retrieval-query', '采购')
+    await setValue('#retrieval-field', 'description')
+    await setValue('#retrieval-method', 'keyword')
+    await setValue('#retrieval-hops', '0')
+    expect(await submit()).toMatchObject({ query: '采购', field: 'description', method: 'keyword', hops: 0 })
+
+    button('按节点 ID').click()
+    await nextTick()
+    expect(root.textContent).not.toContain('检索结果')
+    await setValue('#retrieval-node-id', ' n1 ')
+    expect(await submit()).toEqual({ node_id: 'n1', hops: 0, business_context: null })
+    expect(root.textContent).toContain('精确 ID')
+    await setValue('#retrieval-id-hops', '2')
+    expect(await submit()).toMatchObject({ node_id: 'n1', hops: 2 })
+
+    button('路径下钻').click()
+    await nextTick()
+    expect(await submit()).toEqual({ query: '采购', mode: 'drilldown', field: 'description', method: 'keyword',
+      direction: 'outgoing', max_depth: 12, business_context: null })
+    await setValue('#drilldown-start', 'ids')
+    await setValue('#drilldown-seeds', 'n1，n2,n1')
+    await setValue('#drilldown-target', 'n2')
+    await setValue('#drilldown-relations', 'SETTLED_BY')
+    await setValue('#drilldown-depth', '7')
+    expect(await submit()).toEqual({ mode: 'drilldown', seed_ids: ['n1', 'n2'], target_id: 'n2', direction: 'outgoing',
+      relation_types: ['SETTLED_BY'], max_depth: 7, business_context: null })
+    expect(root.textContent).toContain('已到指定终点')
+    expect(root.textContent).toContain('2 条并列路径，当前展示其中一条')
+    expect(root.textContent).toContain('project：M')
+  })
+
 })

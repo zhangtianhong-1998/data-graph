@@ -43,6 +43,7 @@ def recompose_legacy_merge(config, old_output, source_run_id, node, outcome, wor
         raise LightGraphError('workflow_legacy_upstream_unverified')
     policy = (node.merge_policy or config.workflow.merge_policy).model_copy(update={'fusion_policy': None})
     rebuilt = merge_construction_graphs(leaf_contributors, target_access_fingerprint=project_access,
+                                        recognize_source_replays=False,
                                         merge_policy=policy.model_copy(update={'emit_alignment_candidates': False}))
     # Alignment diagnostics have evolved across releases. Compare the emitted facts
     # themselves, including each support, before accepting the original snapshot.
@@ -95,7 +96,7 @@ def recompose_legacy_merge(config, old_output, source_run_id, node, outcome, wor
     # project defaults may guide future extraction but cannot reinterpret this run.
     combined = merge_construction_graphs([
         {'kind': 'base', 'contributor_id': f'upstream_{node.node_id}', 'graph': upstream}, delta
-    ], target_access_fingerprint=project_access, merge_policy=policy)
+    ], target_access_fingerprint=project_access, merge_policy=policy, recognize_source_replays=False)
     proof = {'run_id': source_run_id, 'worker_run_id': worker_id,
              'upstream_graph_digest': _graph_digest(upstream), 'frozen_graph_digest': inherited['frozen_digest'],
              'delta_path': delta_path, 'delta_graph_digest': _graph_digest(graph),

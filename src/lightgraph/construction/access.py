@@ -103,10 +103,15 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
         return properties, sorted(provenance, key=canonical)
 
     nodes = []
+    merged_observation_nodes = 0
     for node in graph.get('nodes', []):
         supports = supports_for(node)
         if not supports:
             continue
+        if len({origin['contributor_id']
+                for support in supports if support.get('identity_basis') == 'observed_source_key_v1'
+                for origin in support.get('execution_origins') or [support] if origin.get('contributor_id')}) > 1:
+            merged_observation_nodes += 1
         labels = sorted({support['label'] for support in supports if support.get('label') is not None})
         aliases = sorted({alias for support in supports for alias in support.get('aliases', [])})
         english_names = sorted({support['english_name'] for support in supports
@@ -193,6 +198,7 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
         view['unresolved_relations'] = unresolved
     if selection is not None:
         view['business_context'] = selection
+    view['merged_observation_nodes'] = merged_observation_nodes
     view['nodes'] = nodes
     view['edges'] = edges
     view['definitions'] = {'entities': [deepcopy(item) for item in definitions.get('entities', []) if item['type'] in entity_types],

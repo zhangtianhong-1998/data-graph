@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_serializer, model_validator
 from lightgraph.contracts import StrictModel, canonical
 
 
@@ -205,9 +205,21 @@ class RelationDefinition(StrictModel):
     description: str = Field(default="", max_length=4000)
     source_type: str = Field(min_length=1, max_length=100)
     target_type: str = Field(min_length=1, max_length=100)
+    hierarchy_orientation: Literal['parent_to_child', 'child_to_parent', 'none'] | None = Field(
+        default=None,
+        description='Direction of a documented parent/child relationship relative to source_type and target_type. '
+                    'Use none for ordinary associations. Directedness or acyclicity alone does not establish a hierarchy.')
     allow_self_links: bool = False
     acyclic: bool = False
     mappings: list[RelationMapping] = Field(min_length=1, max_length=128)
+
+    @model_serializer(mode='wrap')
+    def omit_undeclared_orientation(self, handler):
+        # Historical draft fingerprints and definition equality use the original payload.
+        definition = handler(self)
+        if self.hierarchy_orientation is None:
+            definition.pop('hierarchy_orientation', None)
+        return definition
 
 
 class GraphDraft(StrictModel):

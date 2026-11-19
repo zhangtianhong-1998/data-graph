@@ -15,8 +15,7 @@ from .sync import active_index
 from .store_sqlite import SQLiteGraphIndex, normalize_term
 from .vector_local import Embedder, LocalHashEmbedder, LocalNumpyVectorStore, embedder_fingerprint
 
-_SPLIT_RE = re.compile(r'[，,。；;、\s\?\!？！/\\|]+|(?:以及|并且|还有|或者|与|和|跟|及)')
-_NOISE_TOKENS = frozenset({'请问', '帮我', '查询', '看一下', '看看', '什么', '怎么', '如何', '有哪些', '为什么', '的', '了', '吗', '呢', '里', '中'})
+_SPLIT_RE = re.compile(r'[，,。；;、?!？！\n]+')
 _PATH_STATE_LIMIT = 4096
 _PATH_STATE_BYTES = 2 * 1024 * 1024
 _PATH_OUTPUT_BYTES = 512 * 1024
@@ -26,20 +25,22 @@ _PATH_WITNESS_ATTEMPTS = 4096
 def _join_contexts(left, right):
     """A path must satisfy every observed qualifier, never just graph adjacency."""
     dimensions = dict(left['dimensions'])
+    types = dict(left['value_types'])
     for name, value in right['dimensions'].items():
-        if name in dimensions and canonical(dimensions[name]) != canonical(value):
+        if name in dimensions and (types[name] != right['value_types'][name] or canonical(dimensions[name]) != canonical(value)):
             return None
         dimensions[name] = value
+        types[name] = right['value_types'][name]
     status = ('unknown' if 'unknown' in (left['status'], right['status']) else
               'scoped' if dimensions else 'global')
-    return {'status': status, 'dimensions': dict(sorted(dimensions.items()))}
+    return {'status': status, 'dimensions': dict(sorted(dimensions.items())), 'value_types': types}
 
 
 def _observation_groups(item):
     groups = {}
     for observation in item.get('observations') or [{}]:
         context = support_business_context(observation)
-        context = {key: context[key] for key in ('status', 'dimensions')}
+        context = {key: context[key] for key in ('status', 'dimensions', 'value_types')}
         # Row witnesses are alternatives, not interchangeable votes for a
         # business context. Keep them separate even when project/month agree.
         key = canonical([context, observation.get('row_context'),
@@ -164,6 +165,15 @@ class QuerySlot:
     source: str = 'chunk'
 
 
+def is_literal_span(text: str, start: int, end: int) -> bool:
+    """Keep a Latin identifier whole, including when it touches Chinese text."""
+    def word(char):
+        return char.isascii() and (char.isalnum() or char == '_')
+
+    return (end > start and not (start and word(text[start - 1]) and word(text[start]))
+            and not (end < len(text) and word(text[end - 1]) and word(text[end])))
+
+
 def decompose_query(
     query: str,
     *,
@@ -202,11 +212,13 @@ def decompose_query(
             if idx < 0:
                 break
             end = idx + len(tnorm)
-            if not any(occupied[idx:end]):
+            if is_literal_span(norm_query, idx, end) and not any(occupied[idx:end]):
                 for pos in range(idx, end):
                     occupied[pos] = True
                 found.append((idx, end, traw, 'exact_term'))
-            start = end
+                start = end
+            else:
+                start = idx + 1
 
     # Capture remaining unmatched text chunks so semantic vector retrieval covers OOV phrases.
     residual_parts: list[str] = []
@@ -229,8 +241,6 @@ def decompose_query(
     for part in residual_parts:
         for chunk in _SPLIT_RE.split(part):
             cleaned = chunk.strip()
-            for noise in _NOISE_TOKENS:
-                cleaned = cleaned.replace(noise, ' ').strip()
             norm = normalize_term(cleaned)
             if len(norm) >= 2 and norm not in seen_norms:
                 seen_norms.add(norm)
@@ -247,45 +257,103 @@ def decompose_query(
     return list(unique.values())
 
 
+def _rank_hits(slot, vec_hits, lex_hits, limit):
+    """Fuse the requested channels and select the seeds for one text slot."""
+    vec_ranks = {h['node_id']: (rank + 1, h) for rank, h in enumerate(vec_hits)}
+    lex_ranks = {h['node_id']: (rank + 1, h) for rank, h in enumerate(lex_hits)}
+    all_ids = sorted(set(vec_ranks) | set(lex_ranks))
+
+    scored = []
+    for nid in all_ids:
+        vr, vh = vec_ranks.get(nid, (None, None))
+        lr, lh = lex_ranks.get(nid, (None, None))
+        rrf = (1.0 / (60 + vr) if vr is not None else 0.0) + (1.2 / (60 + lr) if lr is not None else 0.0)
+        if lh and lh.get('is_exact_code'):
+            rrf += 0.03
+        elif lh and lh.get('is_exact_name'):
+            rrf += 0.015
+        kind = (lh or vh or {}).get('kind')
+        if slot.role_hint and kind == slot.role_hint:
+            rrf += 0.015
+        scored.append({
+            'node_id': nid,
+            'kind': kind,
+            'rrf_score': round(rrf, 6),
+            'vec_rank': vr,
+            'vec_score': round(vh['score'], 4) if vh else None,
+            'lex_rank': lr,
+            'match_type': lh['match_type'] if lh else None,
+        })
+    scored.sort(key=lambda x: (-x['rrf_score'], x['node_id']))
+    return scored[:limit]
+
+
 class SubgraphRetriever:
     """Draft v1 hybrid retriever: scoped vector+lexical parallel slots, RRF, bounded expansion, faithful bridges."""
 
     def __init__(self, retrieval_dir: str | Path, *, embedder: Embedder | None = None,
-                 expected_generation: str | None = None):
+                 expected_generation: str | None = None, analytics_loader=None, mention_extractor=None):
         self.root, manifest = active_index(Path(retrieval_dir), expected_generation)
         self.cohorts = manifest['cohorts']
         self.cohort_contexts = manifest['cohort_contexts']
         self.generation = manifest['generation']
         self.vector_dim = int(manifest.get('vector_dim') or 0)
+        self.analytics_loader = analytics_loader
+        self.mention_extractor = mention_extractor
         self.index = SQLiteGraphIndex(self.root / 'retrieval.sqlite')
         self.vectors = LocalNumpyVectorStore(self.root / 'vectors')
         self.embedder = embedder or LocalHashEmbedder()
         if manifest['embedder'] != embedder_fingerprint(self.embedder):
             raise LightGraphError('retrieval_index_stale')
 
+    def authorized_cohorts(self, scopes, business_context=None):
+        """Restrict all candidate scoring and traversal to permitted support slices."""
+        selection = normalize_context_selection(business_context)
+        allowed = set(scopes)
+        return [token for token, required in self.cohorts.items()
+                if allowed.issuperset(required) and business_context_matches(
+                    {'business_context': self.cohort_contexts[token]}, selection)]
+
     def retrieve(
         self,
-        query: str,
+        query: str = '',
         *,
+        node_id: str | None = None,
+        field: str = 'all',
+        method: str = 'hybrid',
         scopes: Sequence[str] | set[str] = ('public',),
         business_context: dict[str, Any] | None = None,
         top_n: int = 20,
         top_p_seeds: int = 4,
-        hops: int = 2,
+        hops: int | None = None,
         max_per_rel: int = 30,
         hub_degree_limit: int = 150,
         max_nodes: int = 80,
         max_edges: int = 150,
         extractor: Callable[[str], list[dict[str, Any]]] | None = None,
+        resolved_conditions: Sequence[dict[str, Any]] = (),
     ) -> dict[str, Any]:
         scope_list = sorted({str(s) for s in scopes})
         selection = normalize_context_selection(business_context)
-        allowed = set(scope_list)
-        cohorts = [token for token, required in self.cohorts.items()
-                   if allowed.issuperset(required) and business_context_matches(
-                       {'business_context': self.cohort_contexts[token]}, selection)]
-        known_terms = self.index.authorized_terms(cohorts)
-        slots = decompose_query(query, known_terms=known_terms, extractor=extractor)
+        cohorts = self.authorized_cohorts(scope_list, selection)
+        if field not in {'all', 'name', 'description'} or method not in {'keyword', 'vector', 'hybrid'}:
+            raise ValueError('invalid_retrieval_mode')
+        if hops is None:
+            hops = 0 if node_id is not None else 2
+        resolved = {c['text']: [hit['node_id'] for hit in c['candidates']] for c in resolved_conditions}
+        if node_id is not None:
+            resolved = {node_id: [node_id]}
+            slots = [QuerySlot(node_id, node_id, source='node_id')]
+        elif resolved:
+            slots = [QuerySlot(c['text'], normalize_term(c['text']), c['role'], c.get('match', 'exact'))
+                     for c in resolved_conditions]
+        elif field == 'description' or method == 'vector':
+            # Semantic sentences and description phrases are scored as supplied.
+            # Splitting them on names found in another field changes their meaning.
+            slots = [QuerySlot(query.strip(), normalize_term(query), source='full_query')] if query.strip() else []
+        else:
+            terms = self.index.authorized_terms(cohorts, field=field)
+            slots = decompose_query(query, known_terms=terms, extractor=extractor)
         if not slots:
             return {
                 'query': query,
@@ -305,50 +373,35 @@ class SubgraphRetriever:
         max_slots = 32
         truncated_slots = len(slots) > max_slots
         slots = slots[:max_slots]
-        slot_surfaces = [slot.surface for slot in slots]
-        q_vectors = (
-            self.embedder.embed_queries(slot_surfaces)
-            if hasattr(self.embedder, 'embed_queries')
-            else self.embedder.embed(slot_surfaces)
-        )
-        if self.vector_dim > 0 and q_vectors.ndim == 2 and q_vectors.shape[1] != self.vector_dim:
-            raise LightGraphError('retrieval_index_stale')
-        vec_batches = self.vectors.search_batch(q_vectors, scopes=cohorts, top_k=top_n)
+        vec_batches = [[] for slot in slots]
+        if not resolved and method in {'hybrid', 'vector'} and cohorts:
+            slot_surfaces = [slot.surface for slot in slots]
+            q_vectors = (
+                self.embedder.embed_queries(slot_surfaces)
+                if hasattr(self.embedder, 'embed_queries')
+                else self.embedder.embed(slot_surfaces)
+            )
+            if self.vector_dim > 0 and q_vectors.ndim == 2 and q_vectors.shape[1] != self.vector_dim:
+                raise LightGraphError('retrieval_index_stale')
+            vec_batches = self.vectors.search_batch(q_vectors, scopes=cohorts, top_k=top_n, field=field)
 
         slot_results = []
         seed_pool: list[str] = []
         seed_set: set[str] = set()
         seeds_by_slot: dict[str, list[str]] = {}
 
+        authorized = self.index.load_authorized_nodes(
+            {nid for ids in resolved.values() for nid in ids}, scopes=cohorts) if resolved else {}
         for slot, vec_hits in zip(slots, vec_batches):
-            lex_hits = self.index.search_lexical(slot.surface, scopes=cohorts, limit=top_n)
-            vec_ranks = {h['node_id']: (rank + 1, h) for rank, h in enumerate(vec_hits)}
-            lex_ranks = {h['node_id']: (rank + 1, h) for rank, h in enumerate(lex_hits)}
-            all_ids = sorted(set(vec_ranks) | set(lex_ranks))
-
-            scored = []
-            for nid in all_ids:
-                vr, vh = vec_ranks.get(nid, (None, None))
-                lr, lh = lex_ranks.get(nid, (None, None))
-                rrf = (1.0 / (60 + vr) if vr is not None else 0.0) + (1.2 / (60 + lr) if lr is not None else 0.0)
-                if lh and lh.get('is_exact_code'):
-                    rrf += 0.03
-                elif lh and lh.get('is_exact_name'):
-                    rrf += 0.015
-                kind = (lh or vh or {}).get('kind')
-                if slot.role_hint and kind == slot.role_hint:
-                    rrf += 0.015
-                scored.append({
-                    'node_id': nid,
-                    'kind': kind,
-                    'rrf_score': round(rrf, 6),
-                    'vec_rank': vr,
-                    'vec_score': round(vh['score'], 4) if vh else None,
-                    'lex_rank': lr,
-                    'match_type': lh['match_type'] if lh else None,
-                })
-            scored.sort(key=lambda x: (-x['rrf_score'], x['node_id']))
-            chosen = scored[:top_p_seeds]
+            if resolved:
+                chosen = [{'node_id': nid, 'kind': authorized[nid]['kind'],
+                           'match_type': 'exact_id' if node_id is not None else slot.source,
+                           'rrf_score': None, 'lex_rank': None, 'vec_rank': None, 'vec_score': None}
+                          for nid in resolved[slot.surface] if nid in authorized]
+            else:
+                lex_hits = (self.index.search_lexical(slot.surface, scopes=cohorts, limit=top_n, field=field)
+                            if method in {'hybrid', 'keyword'} else [])
+                chosen = _rank_hits(slot, vec_hits, lex_hits, top_p_seeds)
             seeds_by_slot[slot.surface] = [c['node_id'] for c in chosen]
             for item in chosen:
                 if item['node_id'] not in seed_set:

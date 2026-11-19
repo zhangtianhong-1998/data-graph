@@ -256,9 +256,10 @@ class LocalNumpyVectorStore:
                     node_id TEXT NOT NULL,
                     kind TEXT NOT NULL,
                     scope_ref TEXT NOT NULL,
+                    field TEXT NOT NULL,
                     card_text TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_vec_scope ON vec_items(scope_ref, row_idx);
+                CREATE INDEX IF NOT EXISTS idx_vec_scope ON vec_items(scope_ref, field, row_idx);
                 CREATE INDEX IF NOT EXISTS idx_vec_node ON vec_items(node_id);
                 """
             )
@@ -279,9 +280,10 @@ class LocalNumpyVectorStore:
             try:
                 conn.execute('DELETE FROM vec_items')
                 conn.executemany(
-                    'INSERT INTO vec_items (row_idx, node_id, kind, scope_ref, card_text) VALUES (?, ?, ?, ?, ?)',
+                    'INSERT INTO vec_items (row_idx, node_id, kind, scope_ref, field, card_text) VALUES (?, ?, ?, ?, ?, ?)',
                     [
-                        (idx, str(item['node_id']), str(item['kind']), str(item['scope_ref']), str(item['card_text']))
+                        (idx, str(item['node_id']), str(item['kind']), str(item['scope_ref']),
+                         item.get('field', 'all'), str(item['card_text']))
                         for idx, item in enumerate(items)
                     ],
                 )
@@ -296,6 +298,9 @@ class LocalNumpyVectorStore:
         *,
         scopes: Sequence[str] | set[str],
         top_k: int = 20,
+        field: str = 'all',
+        positive_only: bool = True,
+        with_peer_reference: bool = False,
     ) -> list[list[dict]]:
         scope_list = sorted(set(scopes))
         q = np.asarray(query_vectors, dtype=np.float32)
@@ -316,8 +321,9 @@ class LocalNumpyVectorStore:
         hits = [{} for _ in q]
         with closing(self._connect()) as conn:
             cursor = conn.execute(
-                f'SELECT row_idx, node_id, kind, scope_ref FROM vec_items WHERE scope_ref IN ({placeholders}) ORDER BY row_idx',
-                scope_list,
+                f'SELECT row_idx, node_id, kind, scope_ref FROM vec_items '
+                f'WHERE scope_ref IN ({placeholders}) AND field = ? ORDER BY row_idx',
+                [*scope_list, field],
             )
             # Exact scoring, bounded dense working set. Reduce by node before
             # choosing top K so multiple authorized cards cannot crowd out peers.
@@ -328,10 +334,25 @@ class LocalNumpyVectorStore:
                     for pos, row in enumerate(rows):
                         nid = row['node_id']
                         score = float(scores[pos, col])
-                        if score > 0 and (nid not in best or score > best[nid]['score']):
+                        if (not positive_only or score > 0) and (nid not in best or score > best[nid]['score']):
                             best[nid] = {'node_id': nid, 'kind': row['kind'], 'score': score,
                                          'scope_ref': row['scope_ref']}
+                            if with_peer_reference:
+                                best[nid]['row_idx'] = row['row_idx']
                     if len(best) > top_k:
                         ranked = sorted(best, key=lambda nid: (-best[nid]['score'], nid))[:top_k]
                         hits[col] = {nid: best[nid] for nid in ranked}
-        return [sorted(best.values(), key=lambda hit: (-hit['score'], hit['node_id'])) for best in hits]
+        batches = [sorted(best.values(), key=lambda hit: (-hit['score'], hit['node_id'])) for best in hits]
+        if with_peer_reference:
+            # Measure how close the same field of *another permitted node*
+            # normally gets to each candidate. Batch only the returned cards.
+            cards = {hit['row_idx']: hit['node_id'] for batch in batches for hit in batch}
+            if cards:
+                peers = self.search_batch(matrix[list(cards)], scopes=scope_list, top_k=2,
+                                          field=field, positive_only=False)
+                references = {row: next((h['score'] for h in group if h['node_id'] != node_id), None)
+                              for (row, node_id), group in zip(cards.items(), peers)}
+                for batch in batches:
+                    for hit in batch:
+                        hit['peer_score'] = references[hit.pop('row_idx')]
+        return batches

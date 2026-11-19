@@ -297,6 +297,35 @@ def build_unit_config(
     return cloned
 
 
+def upstream_binding_inventory(graph: dict[str, Any]) -> str:
+    """Summarize an authorized base by physical binding, without sending row values."""
+    bindings = {}
+    for node in graph.get('nodes', []):
+        node_bindings = set()
+        for support in node.get('supports', []):
+            origin = support.get('provenance') or {}
+            source = origin.get('source') or {}
+            table, columns = source.get('table'), origin.get('key_columns')
+            if table and isinstance(columns, list) and columns:
+                node_bindings.add((str(node.get('type', '')), str(source.get('source_id', '')),
+                                   str(source.get('schema') or ''), str(table), tuple(map(str, columns))))
+        for key in node_bindings:
+            bindings[key] = bindings.get(key, 0) + 1
+    if not bindings:
+        return ''
+    rows = []
+    size = 0
+    for (kind, source, schema, table, cols), count in sorted(bindings.items(), key=lambda x: (-x[1], x[0])):
+        row = f"- {kind} ← {'.'.join(filter(None, (source, schema, table)))} ({', '.join(cols)}) · {count} 个节点"
+        if len(rows) >= 32 or size + len(row) > 3200:
+            break
+        rows.append(row)
+        size += len(row) + 1
+    if len(rows) < len(bindings):
+        rows.append(f'另有 {len(bindings) - len(rows)} 项绑定未列出。')
+    return '### 上游已投影的来源和实体键\n\n' + '\n'.join(rows)
+
+
 def build_merge_node_config(
     project_config: RunConfig,
     merge_node: WorkflowMergeNodeConfig,
@@ -328,15 +357,16 @@ def build_merge_node_config(
     ]
 
     base_goal = effective_goal_markdown(project_config)
-    extra_parts = [base_goal] if base_goal.strip() else []
     heading = f'{merge_node.label} ({merge_node.node_id})' if merge_node.label else merge_node.node_id
-    extra_parts.append(
-        f'## 全节点合并抽取上下文 ({heading})\n\n'
-        f'本节点已汇总并只读继承上游分节点抽取成果（{upstream_summary}）。\n'
-        '请重点检查跨分支、跨表之间尚未打通的关联关系与全局语义补全，使用 `__base_graph__` 复用已抽取实体，避免无意义重复全表扫表。'
-        '已提交的上游图由编排器归并，本节点只保存有新证据的补充映射。先检查补充目标涉及的实体和端点；'
-        '已有规则足以覆盖目标时即可结束，无需重建或重新验证原抽取草稿。'
-    )
+    extra_parts = [
+        f'## 跨分支补充任务（{heading}）\n\n'
+        f'上游已发布 {upstream_summary}。编排器会保留这些成果。'
+        '先核对继承类型、实体键和已有关系，只提交上游缺少且有证据的关系、属性或实体。'
+        '关系已有端点时，使用 `__base_graph__` 和继承类型的有序键查找端点。'
+        '同一绑定的类型别名或另一份规则不构成新实体。已有结果覆盖任务时可以结束。'
+    ]
+    if base_goal.strip():
+        extra_parts.append('### 项目背景（供核对已有覆盖范围）\n\n' + base_goal.strip())
     if merge_node.goal_markdown and merge_node.goal_markdown.strip():
         extra_parts.append(merge_node.goal_markdown.strip())
     if merge_node.probe_filter_hint and merge_node.probe_filter_hint.strip():

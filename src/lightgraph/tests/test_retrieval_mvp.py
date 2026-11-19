@@ -147,7 +147,7 @@ def test_retrieval_enforces_per_relation_and_hub_caps(tmp_path):
     assert len(res['edges']) == 3
 
 
-def test_retrieval_web_endpoints_and_cli(tmp_path):
+def test_retrieval_web_endpoints_and_cli(tmp_path, monkeypatch):
     app = create_app(tmp_path / 'workspace')
     with TestClient(app) as client:
         client.post('/api/projects', json={'name': 'RetProj', 'project_id': 'ret_p'})
@@ -180,6 +180,35 @@ def test_retrieval_web_endpoints_and_cli(tmp_path):
         assert q_resp.status_code == 200
         body = q_resp.json()
         assert {n['display_name'] for n in body['nodes']} == {'营业收入', '净利润'}
+        route = '/api/projects/ret_p/retrieval/query'
+        revenue = client.post(route, json={'query': '营业收入', 'field': 'name', 'method': 'keyword', 'hops': 0})
+        assert revenue.status_code == 200
+        nid, = [n['id'] for n in revenue.json()['nodes']]
+        exact = client.post(route, json={'node_id': nid, 'hops': 0})
+        assert exact.status_code == 200 and exact.json()['nodes'][0]['display_name'] == '营业收入'
+        assert not client.post(route, json={'query': '营业收入', 'field': 'description', 'hops': 0}).json()['nodes']
+        assert client.post(route, json={}).status_code == 422
+
+        # A key is needed only when contacting an embedding service. After an
+        # authorized build, local index reads work even if the key is removed.
+        import httpx
+        def embeddings(url, *, headers, json, **kwargs):
+            assert headers['Authorization'] == 'Bearer build-only'
+            data = [{'index': i, 'embedding': [1.0, 0.0]} for i, _ in enumerate(json['input'])]
+            return httpx.Response(200, request=httpx.Request('POST', url), json={'data': data})
+        monkeypatch.setenv('TEST_INDEX_EMBED_KEY', 'build-only')
+        monkeypatch.setattr(httpx, 'post', embeddings)
+        app.state.workspace.save_config('ret_p', {**app.state.workspace.get_config('ret_p'), 'embedding': {
+            'provider': 'openai_compatible', 'base_url': 'https://example.invalid/v1', 'model': 'test',
+            'api_key_env': 'TEST_INDEX_EMBED_KEY'}})
+        client.post('/api/projects/ret_p/retrieval/sync').raise_for_status()
+        monkeypatch.delenv('TEST_INDEX_EMBED_KEY')
+        def offline(*args, **kwargs):
+            raise AssertionError('unexpected embedding request')
+        monkeypatch.setattr(httpx, 'post', offline)
+        for lookup in ({'node_id': nid}, {'query': '营业收入', 'method': 'keyword', 'hops': 0}):
+            response = client.post(route, json=lookup)
+            assert response.status_code == 200 and [n['id'] for n in response.json()['nodes']] == [nid]
 
 
 def test_edge_supports_require_every_scope_and_degree_uses_visible_edges(tmp_path):
@@ -233,8 +262,9 @@ def test_web_query_requires_manual_build_after_publication_and_scope_change(tmp_
         config.update(scopes=['A', 'B'], scope_bindings=bindings, embedding={'provider': 'local_hash'})
         workspace.save_config(pid, config)
         def assert_manual_build_required():
-            denied = client.post(endpoint, json={'query': 'A名称'})
-            assert denied.json()['error']['code'] == 'retrieval_index_stale'
+            for request in [{'query': 'A名称'}, {'query': 'A名称', 'method': 'keyword'}, {'node_id': 'old-id'}]:
+                denied = client.post(endpoint, json=request)
+                assert denied.status_code == 409 and denied.json()['error']['code'] == 'retrieval_index_stale'
 
         def build():
             client.post(f'/api/projects/{pid}/retrieval/sync').raise_for_status()
