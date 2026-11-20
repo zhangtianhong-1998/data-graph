@@ -50,7 +50,7 @@ onUnmounted(() => { epoch++; controller?.abort() })
 </script>
 
 <template>
-  <section class="panel graph-history" aria-label="图谱版本">
+  <section class="graph-history" aria-label="图谱版本">
     <label for="graph-version">查看版本</label>
     <select id="graph-version" :value="modelValue" @change="emit('update:modelValue', ($event.target as HTMLSelectElement).value)">
       <option value="">当前项目输出</option>
@@ -58,7 +58,7 @@ onUnmounted(() => { epoch++; controller?.abort() })
       <option v-for="item in versions" :key="item.version_id" :value="item.version_id">{{ caption(item) }}</option>
     </select>
     <button class="btn small" :disabled="loading" @click="refresh">{{ loading ? '读取中…' : '刷新版本' }}</button>
-    <p v-if="modelValue" class="field-hint">正在查看历史快照。切换版本不会改变当前发布结果或运行输入。{{ selected?.graph_kind === 'node_delta' ? '此版本只包含节点增量，可能不包含全部上游实体。' : '' }}</p>
+    <p v-if="selected?.graph_kind === 'node_delta'" class="field-hint">此快照只包含节点增量。</p>
     <p v-if="selected?.run_id" class="field-hint">所属运行：{{ selected.run_id }}</p>
     <template v-if="selected?.error_code === 'graph_access_context_changed'">
       <p class="field-hint">如果这是搬迁前生成的旧图，请填写搬迁前存放 project.yaml 的目录绝对路径。系统按原路径复算旧指纹，并核对当前访问权限。</p>
@@ -71,7 +71,8 @@ onUnmounted(() => { epoch++; controller?.abort() })
 </template>
 
 <style scoped>
-.graph-history { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 14px 18px; margin-bottom: 16px; }
-select { flex: 1; min-width: 200px; max-width: 700px; }
-p { flex-basis: 100%; margin: 0; overflow-wrap: anywhere; }
+.graph-history { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 5px 8px; }
+.graph-history > label { grid-column: 1 / -1; font-size: 12px; }
+select { width: 100%; min-width: 0; }
+p { grid-column: 1 / -1; margin: 0; overflow-wrap: anywhere; }
 </style>

@@ -1,5 +1,6 @@
 """Compose scoped retrieval primitives according to the grounded user request."""
 from .dimensional import empty_answer, retrieve_dimensional
+from .grouping import retrieve_grouping
 from .drilldown import retrieve_drilldown
 from .traversal import retrieve_traversal
 from .intent import build_plan, _parent_roles, _residuals
@@ -141,6 +142,10 @@ def retrieve_planned(retriever, request, scopes):
                       request.drill_role, force_joint=request.mode == 'dimensional', force_traverse=request.mode == 'traverse')
     intent = plan['intent']
     limits = {'max_nodes': request.max_nodes, 'max_edges': request.max_edges}
+    if request.mode == 'auto' and (plan.get('grouping_spans') or intent in {'clarify', 'search', 'dimensional'}):
+        grouped = retrieve_grouping(retriever, request, scopes, plan)
+        if grouped is not None:
+            return grouped
     if intent == 'clarify':
         return _available_context(retriever, request, scopes, plan)
     if intent == 'traverse':

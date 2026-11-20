@@ -9,7 +9,7 @@ from openpyxl import Workbook
 
 from lightgraph.web.database_access import (
     ConnectionSpec, DatabaseAccessError, build_dsn, discover_tables,
-    normalize_selected_tables, parse_table_list_excel, safe_connection_details,
+    normalize_selected_tables, parse_table_list_excel, parse_table_list_yaml, safe_connection_details,
     test_connection as check_connection,
 )
 
@@ -545,3 +545,27 @@ def test_gauss_lock_timeout_failure_recovers_only_unsupported_setting(monkeypatc
     assert ("ROLLBACK TO SAVEPOINT lightgraph_lock_timeout" in commands) is success
     assert db.rollback_calls == 1 and db.closed
     assert SECRET not in caplog.text
+
+@pytest.mark.parametrize("kind,schema", [("mysql", "analytics"), ("gauss", "public")])
+def test_exact_table_selection_keeps_case_and_suffix(monkeypatch, kind, schema):
+    db = Connection(schema=schema)
+    db.rows.extend([(schema, "items_archive", "BASE TABLE"), (schema, "ITEMS", "BASE TABLE")])
+    install_driver(monkeypatch, kind, db)
+    requested = parse_table_list_yaml(f"tables: [{schema}.items_archive, items, absent, items]".encode())
+    found = discover_tables(spec(kind, schema=schema), requested)
+    assert [item["name"] for item in found["tables"]] == ["items_archive", "items"]
+    assert found["missing"] == [schema + ".absent"]
+    query, params = db.executed[-1]
+    assert params == (schema, "items_archive", "items", "absent", 1001)
+    assert "IN (%s, %s, %s)" in query
+    assert "items_archive" not in query
+
+
+@pytest.mark.parametrize("invalid", [
+    "tables: []", "tables: one", "tables: [1]", "tables: [null]", "tables: [pub.*]",
+    "tables: [db.schema.table]", "tables: [pg_catalog.tables]", "tables: [a]\ntables: [b]",
+    "tables: [a]\nunknown: ignored", "tables: &a [a]",
+])
+def test_yaml_import_rejects_malformed_table_lists(invalid):
+    with pytest.raises(DatabaseAccessError):
+        parse_table_list_yaml(invalid.encode())

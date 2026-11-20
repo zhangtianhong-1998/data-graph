@@ -33,7 +33,7 @@ from .credentials import SessionCredentials
 from .saved_connections import SavedConnections
 from .connection_drafts import SaveConnectionDraft
 from .database_access import (ConnectionSpec, build_dsn, test_connection,
-                              discover_tables, parse_table_list_excel, normalize_selected_tables)
+                              discover_tables, parse_table_list_excel, parse_table_list_yaml, normalize_selected_tables)
 
 ROOT=Path(__file__).resolve().parents[3]
 MAX_REQUEST_BYTES=21*1024*1024
@@ -196,6 +196,10 @@ class DiscoveryDecision(IdentityRevision):
 
 class DatabaseRequest(InputModel):
     connection: ConnectionSpec
+
+
+class TableDiscoveryRequest(DatabaseRequest):
+    exact_names: list[str] | None = Field(default=None, min_length=1, max_length=1000)
 
 
 class ConnectDatabase(DatabaseRequest):
@@ -482,22 +486,24 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return test_connection(data.connection)
 
     @app.post('/api/projects/{pid}/database/tables')
-    def database_tables(pid:str,data:DatabaseRequest):
+    def database_tables(pid:str,data:TableDiscoveryRequest):
         with workspace.lock(pid):
             mutable(pid)
-            return discover_tables(data.connection)
+            return discover_tables(data.connection) if data.exact_names is None else discover_tables(data.connection, data.exact_names)
 
     @app.post('/api/projects/{pid}/database/table-list')
     async def database_table_list(pid:str,file:UploadFile=File(...)):
-        from .database_access import MAX_EXCEL_BYTES
+        from .database_access import MAX_EXCEL_BYTES, MAX_TABLE_YAML_BYTES
+        is_yaml = Path(file.filename or "").suffix.lower() in {".yaml", ".yml"}
+        limit = MAX_TABLE_YAML_BYTES if is_yaml else MAX_EXCEL_BYTES
         try:
-            content=await file.read(MAX_EXCEL_BYTES+1)
-            if len(content)>MAX_EXCEL_BYTES:
+            content=await file.read(limit+1)
+            if len(content)>limit:
                 raise LightGraphError('database_table_list_too_large')
             def parse():
                 with workspace.lock(pid):
                     mutable(pid)
-                    return {'tables':parse_table_list_excel(content)}
+                    return {'tables':parse_table_list_yaml(content) if is_yaml else parse_table_list_excel(content)}
             return await run_in_threadpool(parse)
         finally:
             await file.close()
@@ -915,6 +921,12 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         workspace.get(pid)
         return manager.get(pid,rid)
 
+    @app.delete('/api/projects/{pid}/runs/{rid}')
+    def delete_run_record(pid: str, rid: str, if_match: str | None = Header(default=None)):
+        with workspace.lock(pid):
+            workspace.require_config_revision(pid, if_match)
+            return manager.delete_record(pid, rid)
+
     @app.get('/api/projects/{pid}/workflow')
     def workflow_status(pid: str):
         workspace.get(pid)
@@ -1002,7 +1014,8 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             def build(_workspace, _pid, *, config):
                 if config != frozen:
                     raise LightGraphError('graph_read_conflict')
-                _, result = project_retriever(config, refresh=True, embedding_api_key=key)
+                _, result = project_retriever(config, refresh=True, embedding_api_key=key,
+                    progress=lambda stage, done, total: retrieval_jobs.progress(pid, stage, done, total))
                 return result
 
             return retrieval_jobs.start(pid, revision, lambda: read_graph_consistently(workspace, pid, build))

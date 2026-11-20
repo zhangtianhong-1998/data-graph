@@ -25,6 +25,7 @@ from lightgraph.sources.gauss_compat import catalog_value, safe_database_cause, 
 
 TABLE_LIMIT = 1000
 CONNECTION_TIMEOUT_SECONDS = 5
+MAX_TABLE_YAML_BYTES = 512 * 1024
 MAX_EXCEL_BYTES = 5 * 1024 * 1024
 MAX_EXCEL_EXPANDED_BYTES = 20 * 1024 * 1024
 _IDENTIFIER = re.compile(r"[^\x00-\x1f\x7f./\\]{1,128}\Z", re.UNICODE)
@@ -305,18 +306,22 @@ def test_connection(spec: ConnectionSpec) -> dict:
     return {"status": "ok"}
 
 
-def discover_tables(spec: ConnectionSpec) -> dict:
+def discover_tables(spec: ConnectionSpec, names: list[str] | None = None) -> dict:
+    """Read one schema's catalogue; exact imports also work beyond the listing limit."""
+    requested = normalize_selected_tables(spec, names) if names is not None else []
     with _read_only_cursor(spec) as (cursor, schema):
-        if spec.kind == "mysql_database":
-            cursor.execute(
-                "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES "
-                "WHERE TABLE_SCHEMA = %s AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') "
-                "ORDER BY TABLE_NAME LIMIT %s", (schema, TABLE_LIMIT + 1))
-        else:
-            cursor.execute(
-                "SELECT table_schema, table_name, table_type FROM information_schema.tables "
-                "WHERE table_schema = %s AND table_type IN ('BASE TABLE', 'VIEW') "
-                "ORDER BY table_name LIMIT %s", (schema, TABLE_LIMIT + 1))
+        mysql = spec.kind == "mysql_database"
+        catalog = "information_schema.TABLES" if mysql else "information_schema.tables"
+        query = (f"SELECT table_schema, table_name, table_type FROM {catalog} "
+                 "WHERE table_schema = %s AND table_type IN ('BASE TABLE', 'VIEW') ")
+        parameters = [schema]
+        if requested:
+            parameters.extend(name.split(".", 1)[1] for name in requested)
+            placeholders = ", ".join("%s" for _ in requested)
+            # MySQL's catalogue collation can fold case or accents.
+            column = "BINARY table_name" if mysql else "table_name"
+            query += f"AND {column} IN ({placeholders}) "
+        cursor.execute(query + "ORDER BY table_name LIMIT %s", (*parameters, TABLE_LIMIT + 1))
         rows = cursor.fetchmany(TABLE_LIMIT + 1)
         tables = []
         skipped_count = 0
@@ -334,7 +339,40 @@ def discover_tables(spec: ConnectionSpec) -> dict:
             tables.append({"schema": schema, "name": name, "qualified_name": schema + "." + name,
                            "table_type": row[2]})
         truncated = len(rows) > TABLE_LIMIT
+    if requested:
+        by_name = {table["qualified_name"]: table for table in tables}
+        return {"tables": [by_name[name] for name in requested if name in by_name],
+                "missing": [name for name in requested if name not in by_name]}
     return {"tables": tables, "truncated": truncated, "skipped_count": skipped_count}
+
+
+def parse_table_list_yaml(content: bytes) -> list[str]:
+    """Accept a single tables list. Names stay case-sensitive and literal."""
+    from .workspace import safe_yaml
+
+    if len(content) > MAX_TABLE_YAML_BYTES:
+        raise DatabaseAccessError("table_list_size_limit")
+    try:
+        document = safe_yaml(content.decode("utf-8-sig"))
+    except (UnicodeError, RecursionError, LightGraphError):
+        raise DatabaseAccessError("table_list_yaml_invalid") from None
+    if not isinstance(document, dict) or set(document) != {"tables"}:
+        raise DatabaseAccessError("table_list_yaml_invalid")
+    names = document["tables"]
+    if not isinstance(names, list) or not names:
+        raise DatabaseAccessError("table_list_yaml_invalid")
+    if len(names) > TABLE_LIMIT:
+        raise DatabaseAccessError("table_list_size_limit")
+    for name in names:
+        if not isinstance(name, str) or name != name.strip() or "*" in name:
+            raise DatabaseAccessError("database_identifier_invalid")
+        parts = name.split(".")
+        if len(parts) == 2:
+            _schema(parts[0])
+        elif len(parts) != 1:
+            raise DatabaseAccessError("database_identifier_invalid")
+        _identifier(parts[-1])
+    return list(dict.fromkeys(names))
 
 
 def parse_table_list_excel(content: bytes) -> list[str]:

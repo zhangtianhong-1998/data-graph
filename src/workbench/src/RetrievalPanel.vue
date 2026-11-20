@@ -18,8 +18,10 @@ interface PathResult {
 
 interface RetrievalQueryResponse {
   available_context?: AvailableRetrievalContext
+  grouping?: { axis: string; paths: PathResult['paths'] }
   plan?: {
     intent: string
+    parser_fallback?: string
     conditions: Array<{text: string; role: string | null; match?: string; candidates?: Array<{display_name?: string}>}>
     suggestions?: Array<{text: string; reason?: string; candidates: Array<{node_id: string; display_name?: string}>}>
     drill_role?: string | null
@@ -151,7 +153,13 @@ watch(() => props.projectId, () => {
   businessContext.value = null
   queryText.value = nodeId.value = seedIds.value = pathHint.value = targetId.value = relationTypes.value = ''
 })
-const pathResult = computed(() => result.value?.traverse || result.value?.drilldown)
+const pathResult = computed(() => result.value?.traverse || result.value?.drilldown ||
+  (result.value?.grouping ? { status: 'found', paths: result.value.grouping.paths, uncovered_seed_ids: [], equally_ranked_paths: 0 } : null))
+const fallbackLabels: Record<string, string> = {
+  model_parser_not_configured: '当前项目没有可用的模型解析器',
+  model_interpretation_unavailable: '模型未返回可用的解析结果',
+  no_visible_context: '当前范围没有可见对象',
+}
 const activeStatus = computed(() => props.status)
 const showMainGraph = computed(() => result.value && (
   !result.value.available_context || result.value.nodes.length > 0 || result.value.edges.length > 0
@@ -168,9 +176,12 @@ const nodeMap = computed(() => {
   return map
 })
 const edgeMap = computed(() => new Map((result.value?.edges || []).map(edge => [edge.id, edge])))
+const pathEdges = computed(() => new Map([...(result.value?.available_context?.edges || []),
+  ...(result.value?.edges || [])].map(edge => [edge.id, edge])))
 const contextLabel = (context?: FactContext) => !context || context.status === 'unknown' ? '适用范围尚未确认'
   : context.status === 'global' ? '通用知识' : Object.entries(context.dimensions).map(([key, value]) => `${key}：${String(value)}`).join(' · ')
-const nodeLabel = (id: string) => nodeMap.value.get(id)?.display_name || id
+const nodeLabel = (id: string) => nodeMap.value.get(id)?.display_name ||
+  result.value?.available_context?.nodes.find(n => n.id === id)?.display_name || id
 
 async function runQuery() {
   if (!hasInput.value || working.value || props.syncing || !props.status?.vectorized) return
@@ -308,6 +319,10 @@ async function runQuery() {
             <p v-if="result.plan.drill_role">下钻维度 · {{ result.plan.drill_role }}<template v-if="result.plan.requested_level">，目标层级 · {{ result.plan.requested_level }}</template></p>
             <p v-if="result.plan.excluded_terms?.length">排除 {{ result.plan.excluded_terms.join('、') }}</p>
             <p v-for="reason in result.plan.unresolved" :key="reason">{{ reason }}</p>
+            <details v-if="result.plan.parser_fallback && result.plan.intent === 'clarify'">
+              <summary>问句解析方式</summary>
+              <p>已使用索引解析。{{ fallbackLabels[result.plan.parser_fallback] }}</p>
+            </details>
             <template v-if="result.plan.suggestions?.length && result.available_context?.status !== 'scope_unresolved'">
               <p v-for="item in result.plan.suggestions?.filter(s => s.candidates.some(c => c.display_name))" :key="item.text">
                 “{{ item.text }}”{{ item.reason === 'related' ? '的相关候选（尚未确认）' : '的待确认候选' }} · {{ item.candidates.map(c => c.display_name).filter(Boolean).join('、') }}
@@ -334,7 +349,7 @@ async function runQuery() {
             </template>
           </section>
           <div v-if="pathResult" class="retrieved-paths">
-            <h3>{{ result.traverse ? '关联路径' : '下钻路径' }}</h3>
+            <h3>{{ result.grouping ? '分组候选路径' : result.traverse ? '关联路径' : '下钻路径' }}</h3>
             <p v-if="(pathResult.equally_ranked_paths || 0) > 1" class="field-hint">本次搜索发现 {{ pathResult.equally_ranked_paths }} 条并列路径，当前展示其中一条。</p>
             <p v-if="!pathResult.paths.length">{{ pathResult.status === 'no_visible_seed' ? '当前范围内没有匹配的起点。' : '在本次搜索范围内未找到满足全部要求的路径。' }}</p>
             <p v-if="pathResult.uncovered_seed_ids.length" class="field-hint">未进入此路径的起点：{{ pathResult.uncovered_seed_ids.map(nodeLabel).join('、') }}</p>
@@ -342,8 +357,8 @@ async function runQuery() {
               <ol>
                 <li v-for="(id, position) in path.node_ids" :key="position">
                   <span v-if="position" class="path-relation">
-                    {{ edgeMap.get(path.edge_ids[position - 1]!)?.target === id ? '→' : '←' }}
-                    {{ edgeMap.get(path.edge_ids[position - 1]!)?.relation }}
+                    {{ pathEdges.get(path.edge_ids[position - 1]!)?.target === id ? '→' : '←' }}
+                    {{ pathEdges.get(path.edge_ids[position - 1]!)?.relation }}
                   </span>
                   {{ nodeLabel(id) }}
                 </li>

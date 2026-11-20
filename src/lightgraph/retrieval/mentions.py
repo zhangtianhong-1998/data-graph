@@ -56,7 +56,7 @@ class QueryMentions(StrictModel):
     constraints: list[str]
     framing: list[str]
     intent: Literal['search', 'point', 'explore', 'traverse', 'hierarchy', 'cooccurrence',
-                    'drilldown', 'dimensional', 'overview'] | None
+                    'drilldown', 'dimensional', 'grouping', 'overview'] | None
     traversal: TraversalSpans | None
     overview_metric: Literal['community', 'in_degree', 'out_degree', 'degree_centrality', 'pagerank'] | None
     scopes: list[ScopeSpan]
@@ -128,9 +128,12 @@ class QueryMentions(StrictModel):
             result['mentions'] = [s for s in result['mentions'] if s != self.target]
         # Proposed equivalent names are not spans and carry no graph identity.
         # Keep only bounded proposals attributable to a live verbatim mention.
+        name_operands = set(result['mentions'])
+        if self.intent == 'grouping' and result['target']:
+            name_operands.add(result['target'])
         names_by_mention = {}
         for entry in self.equivalents:
-            if entry.text not in result['mentions']:
+            if entry.text not in name_operands:
                 continue
             names = names_by_mention.setdefault(entry.text, [])
             for name in entry.names:
@@ -179,7 +182,9 @@ Read the whole question before classifying its parts:
   the requested result. Include the connective request phrases around mentions and target.
   Never treat an unknown substantive term, attribute or a relationship predicate as framing.
 - intent: point (only the entity), search (find named objects), explore (immediate
-  neighbors), traverse (trace a chain of associations), hierarchy (follow a parent/child
+  neighbors), grouping (organize one subject by a category; quote the subject in mentions,
+  the grouping category in target, and all further filters in constraints),
+  traverse (trace a chain of associations), hierarchy (follow a parent/child
   hierarchy), cooccurrence (verify all conditions in one observation), overview
   (statistics of the graph), or null. A path across successive relationships can be
   supported by different observations. Multiple mentions alone imply neither a
@@ -195,7 +200,7 @@ Read the whole question before classifying its parts:
   or mixed predicates in constraints. A chain of associations cannot establish them.
   For overview only, overview_metric may be community, in_degree, out_degree,
   degree_centrality, pagerank, or null when unspecified.
-- equivalents: check every mention for an established, interchangeable alternate name. When
+- equivalents: check every mention and grouping target for an established, interchangeable alternate name. When
   one is known, include it even if the user did not give that alternate spelling. Return
   {"text":"<exact mention>","names":["<strict equivalent>"]}. Return at most three.
   Propose only contextually interchangeable names, accepted abbreviations or translations.
@@ -203,6 +208,13 @@ Read the whole question before classifying its parts:
   For a novel concept with no known equivalent use no entry. These names are lookup hints.
 Use the language of the question for text that must be copied. Copy every requested span
 in its original spelling. Do not output angle-bracket placeholders.
+For a distribution of one subject by a category choose grouping. The complete
+result for "A按B分组" is:
+{"mentions":["A"],"target":"B","constraints":[],"framing":["按","分组"],"intent":"grouping",
+"overview_metric":null,"scopes":[],"background":[],"exclusions":[],"equivalents":[],"traversal":null}
+A and B stand for question spans. For "A在不同B的分布" the meaning is the same;
+copy the actual surrounding request words. Reserve overview for graph structure,
+communities and centrality.
 Use overview_metric for an overview ranking operation. Rank wording does not specify a
 target type or an additional filter. Do not repeat a mention as its own target."""
 

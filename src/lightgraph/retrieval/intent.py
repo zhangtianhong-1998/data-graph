@@ -507,6 +507,14 @@ def _compile_interpretation(retriever, scopes, requested, query, parsed, *, forc
         # A requested endpoint category does not imply a taxonomy. Only
         # explicit hierarchy intent should demand parent/child edges.
         intent = 'traverse'
+    if intent == 'grouping':
+        # Preserve the full remainder for the normal constraint/coverage checks.
+        # Supplying a grouping target does not establish a scope or a value.
+        if target and len(proposed) == 1:
+            plan['grouping_spans'] = (proposed[0], target, list(clauses))
+            plan['grouping_names'] = next((p['names'] for p in parsed.get('equivalents', ())
+                                          if p['text'] == target), [])
+        intent = 'search'
     path = parsed.get('traversal') or {}
     traverse = intent == 'traverse'
     target_phrases = [target] if target else parsed.get('framing', ()) if intent == 'drilldown' else ()
@@ -703,7 +711,9 @@ def build_plan(retriever, scopes, query, business_context, conditions=(), drill_
                 plan = _new_plan(selection, query, 'exact_name')
                 _bind_exact(retriever, cohorts, plan, [query])
                 return plan
+    model_attempted = False
     if not conditions and retriever.mention_extractor and retriever.authorized_cohorts(scopes, business_context):
+        model_attempted = True
         parsed = retriever.mention_extractor(query)
         if parsed is not None:
             return _compile_interpretation(retriever, scopes, business_context, query, parsed,
@@ -713,6 +723,13 @@ def build_plan(retriever, scopes, query, business_context, conditions=(), drill_
                                                  is_path=force_traverse)
     cohorts = retriever.authorized_cohorts(scopes, selection)
     plan = _new_plan(selection, focus, 'structured' if conditions else 'index')
+    if not conditions:
+        if model_attempted:
+            plan['parser_fallback'] = 'model_interpretation_unavailable'
+        elif retriever.mention_extractor is None:
+            plan['parser_fallback'] = 'model_parser_not_configured'
+        else:
+            plan['parser_fallback'] = 'no_visible_context'
     plan.update(drill_role=drill_role, unresolved=unresolved, point_only=bool(_POINT_ONLY.search(focus)))
     if unresolved:
         plan.update(intent='clarify', scope_unresolved=True, focus='')

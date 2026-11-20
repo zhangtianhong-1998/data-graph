@@ -178,3 +178,12 @@ def test_static_frontend_and_api_share_service(tmp_path):
         assert 'build-marker' in client.get('/').text
         assert client.get('/api/health').json()['status'] == 'ok'
         assert client.get('/api/unknown').status_code == 404
+
+def test_yaml_table_list_upload_parses_without_adding_files(client):
+    create(client)
+    url = '/api/projects/alpha/database/table-list'
+    content = 'tables:\n  - public.sample\n  - public.sample_old\n'.encode()
+    result = client.post(url, files={'file': ('选择.YML', content)})
+    assert result.status_code == 200
+    assert result.json() == {'tables': ['public.sample', 'public.sample_old']}
+    assert client.get('/api/projects/alpha').json()['files'] == []

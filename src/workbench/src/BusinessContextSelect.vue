@@ -39,7 +39,7 @@ watch([() => props.projectId, () => props.version, () => props.refreshKey], () =
       </select>
     </label>
     <button v-if="nextOffset !== null" type="button" class="text-button" @click="load(true)">加载更多范围</button>
-    <p class="field-hint">指定范围时同时包含适用的通用知识。{{ unknown ? '部分内容尚未声明适用范围，只在“全部内容”中显示。' : '' }}</p>
+    <p v-if="unknown || modelValue !== null" class="field-hint">{{ modelValue !== null ? '含适用的通用知识。' : '' }}{{ unknown ? '部分内容尚未声明适用范围，仅在“全部内容”中可见。' : '' }}</p>
     <p v-if="error" role="alert" class="note amber">{{ error }} <button type="button" class="text-button" @click="load()">重试</button></p>
   </div>
 </template>

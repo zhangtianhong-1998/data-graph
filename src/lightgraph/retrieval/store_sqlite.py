@@ -517,6 +517,45 @@ class SQLiteGraphIndex:
             AND EXISTS (SELECT 1 FROM kg_node_scope_views v WHERE v.node_id=e.dst_id AND v.scope_ref IN ({sc_ph}))
         """
 
+    def grouping_routes(self, seed, surface, *, scopes, suggested_ids=(), limit=16, max_depth=2):
+        """Rank visible matching names within two edges of the question's subject.
+
+        Physical adjacency proposes paths. The caller rechecks applicability and
+        observations before presenting a route as a published relationship.
+        """
+        tokens = sorted(set(scopes))
+        if not tokens or not surface:
+            return []
+        marks = ','.join('?' for _ in tokens)
+        names = ','.join('?' for _ in _NAME_ROLES)
+        norm = normalize_term(surface)
+        # Project only the endpoints here; observation bodies can be large.
+        sql = f"""
+            WITH visible AS (
+                SELECT DISTINCT src_id, dst_id FROM ({self._authorized_edges_sql(marks)})
+            ), adjacency(src,dst) AS (
+                SELECT src_id,dst_id FROM visible UNION ALL SELECT dst_id,src_id FROM visible
+            ), adjacent AS (SELECT DISTINCT dst FROM adjacency WHERE src=? AND dst!=?),
+            routes(target,bridge) AS (
+                SELECT dst,NULL FROM adjacent
+                UNION ALL SELECT a.dst,i.dst FROM adjacent i JOIN adjacency a ON a.src=i.dst
+                          WHERE ? >= 2 AND a.dst!=? AND a.dst!=i.dst
+            ), matches AS (
+                SELECT node_id, MIN(CASE WHEN term_norm=? THEN 0 ELSE 1 END) AS rank
+                FROM kg_node_terms WHERE scope_ref IN ({marks}) AND role IN ({names}) AND instr(term_norm,?)>0
+                GROUP BY node_id
+                UNION ALL SELECT value,2 FROM json_each(?)
+            )
+            SELECT r.target,r.bridge,MIN(m.rank) AS rank FROM routes r JOIN matches m ON r.target=m.node_id
+            GROUP BY r.target,r.bridge
+            ORDER BY rank, r.bridge IS NOT NULL, r.target,r.bridge LIMIT ?
+        """
+        with closing(self._connect()) as conn:
+            return [dict(row) for row in conn.execute(sql, [
+                *tokens, *tokens, *tokens, seed, seed, max_depth, seed, norm,
+                *tokens, *_NAME_ROLES, norm, json.dumps(list(suggested_ids)), limit,
+            ])]
+
     def expand_neighborhood(
         self,
         seed_ids: Sequence[str],

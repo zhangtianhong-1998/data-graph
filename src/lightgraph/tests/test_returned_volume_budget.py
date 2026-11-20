@@ -152,7 +152,8 @@ def test_workbench_volume_save_reload_and_worker_payload(tmp_path):
     with RevisionClient(create_app(tmp_path/'work', frontend_dir=tmp_path/'absent')) as client:
         assert client.post('/api/projects', json={'name':'volume','project_id':'volume'}).status_code == 201
         saved = client.get('/api/projects/volume/config').json()
-        assert saved['max_returned_bytes'] == 64*1024**2
+        assert saved['max_returned_rows'] is None and saved['max_returned_bytes'] is None
+        assert saved['max_working_bytes'] == 2048 * 1024**2
         for rows, size in [(1000000, 1024**3), (None, None)]:
             saved.update(max_returned_rows=rows, max_returned_bytes=size)
             response = client.put('/api/projects/volume/config', json=saved)

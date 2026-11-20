@@ -42,3 +42,22 @@ def test_refresh_rejoins_build_and_an_interrupted_or_failed_build_can_be_retried
     finally:
         release.set()
         jobs.shutdown()
+
+
+def test_sync_reports_real_batches_before_publication(tmp_path):
+    from lightgraph.retrieval import sync_graph_to_retrieval
+    from lightgraph.retrieval.vector_local import LocalHashEmbedder
+    from lightgraph.tests.test_retrieval_fields import _scoped_graph
+
+    embedder = LocalHashEmbedder()
+    embedder.batch_size = 2
+    seen = []
+
+    def progress(stage, completed, total):
+        assert not (tmp_path / 'current.json').exists()
+        seen.append((stage, completed, total))
+
+    result = sync_graph_to_retrieval(_scoped_graph(), tmp_path, embedder=embedder, progress=progress)
+    stage, total, _ = seen[-1]
+    assert stage == 'publishing' and 2 < total <= result['vector_rows']
+    assert seen[:-1] == [('embedding', done, total) for done in [*range(0, total, 2), total]]

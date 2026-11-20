@@ -17,6 +17,28 @@ beforeEach(() => { api.request.mockReset(); vi.stubGlobal('ResizeObserver', clas
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('业务图来源与归并裁决', () => {
+  it('缩小全图后保留可点击且互不覆盖的节点名称，查看详情后可关闭侧栏', async () => {
+    const nodes = Array.from({ length: 160 }, (_, index) => ({ id: String(index), label: `观测资料 ${index}` }))
+    const edges = nodes.slice(1).map(node => ({ source: '0', target: node.id }))
+    mount(GraphCanvas, { graph: { nodes, edges }, layer: 'business' })
+    await nextTick(); await nextTick()
+    button('适配画布').click()
+    await vi.waitFor(() => expect(root.querySelector('.overview-label')).not.toBeNull())
+    const labels = [...root.querySelectorAll<HTMLButtonElement>('.overview-label')]
+    expect(labels.length).toBeGreaterThan(0)
+    expect(labels.length).toBeLessThan(nodes.length)
+    expect(root.querySelector('.graph-detail')).toBeNull()
+    const bounds = labels.map(label => ({ x: parseFloat(label.style.left), y: parseFloat(label.style.top), width: parseFloat(label.style.width) }))
+    for (const [index, a] of bounds.entries()) {
+      expect(bounds.slice(index + 1).every(b => Math.abs(a.x - b.x) >= (a.width + b.width) / 2 || Math.abs(a.y - b.y) >= 22)).toBe(true)
+    }
+    labels[0]!.click()
+    await nextTick()
+    expect(root.querySelector('.detail-name')?.textContent).toBe(labels[0]!.title)
+    root.querySelector<HTMLButtonElement>('[aria-label="关闭详情"]')!.click()
+    await nextTick()
+    expect(root.querySelector('.graph-detail')).toBeNull()
+  })
   it('列定义展示元数据与声明来源，证据引用无需展开JSON', async () => {
     const definition = { id: 'measure', label: '去年同期季度完成', label_origin: 'metadata_declared',
       identity_origin: 'physical_column', kind: '度量定义', status: 'accepted',

@@ -244,7 +244,8 @@ def retrieval_status(config, *, embedding_api_key=None) -> dict:
     }
 
 
-def project_retriever(config, *, refresh=False, embedding_api_key=None, model_api_key=None, expected_version=None):
+def project_retriever(config, *, refresh=False, embedding_api_key=None, model_api_key=None, expected_version=None,
+                      progress=None):
     """Bind both indexes to the active publication and its current access scope."""
     from lightgraph.retrieval import SubgraphRetriever, resolve_embedder, sync_graph_to_retrieval
     from lightgraph.retrieval.mentions import resolve_mention_extractor
@@ -275,7 +276,7 @@ def project_retriever(config, *, refresh=False, embedding_api_key=None, model_ap
     if refresh:
         if not graph.get('nodes'):
             raise LightGraphError('retrieval_graph_required')
-        result = sync_graph_to_retrieval(graph, directory, generation=generation, embedder=embedder)
+        result = sync_graph_to_retrieval(graph, directory, generation=generation, embedder=embedder, progress=progress)
     retriever = SubgraphRetriever(directory, embedder=embedder, expected_generation=generation,
                                   analytics_loader=analytics_loader,
                                   mention_extractor=resolve_mention_extractor(config, api_key=model_api_key))

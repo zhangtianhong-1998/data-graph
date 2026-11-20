@@ -97,6 +97,37 @@ beforeEach(async () => {
 afterEach(() => { app?.unmount(); app = undefined; root.remove() })
 
 describe('数据库连接弹窗', () => {
+  it('按 YAML 全名原子替换选表，忽略当前搜索且保留先前选择直到全部匹配', async () => {
+    await fillConnection()
+    const rows = ['events', 'events_daily', 'events_old'].map(name => ({
+      name, schema: 'public', qualified_name: `public.${name}`, table_type: 'BASE TABLE',
+    }))
+    api.request.mockResolvedValueOnce({ tables: rows, truncated: false })
+    button('读取表清单').click()
+    await vi.waitFor(() => expect(root.querySelectorAll('.table-choice')).toHaveLength(3))
+    element<HTMLInputElement>('.table-choice input').click()
+    await inputValue('[aria-label="筛选数据库表"]', 'events_old')
+    await inputValue('#database-tables', 'public.manual')
+    const picker = element<HTMLInputElement>('[aria-label="导入 YAML 表清单"]')
+    Object.defineProperty(picker, 'files', { value: [new File(['tables: [events_daily]'], 'tables.yml')] })
+    const change = () => picker.dispatchEvent(new Event('change', { bubbles: true }))
+    api.request.mockResolvedValueOnce({ tables: ['events_daily', 'absent'] })
+      .mockResolvedValueOnce({ tables: [rows[1]], missing: ['public.absent'] })
+    change()
+    await vi.waitFor(() => expect(root.textContent).toContain('public.absent'))
+    expect(element<HTMLTextAreaElement>('#database-tables').value).toBe('public.manual')
+    expect(root.textContent).toContain('已选 2 张表')
+    api.request.mockResolvedValueOnce({ tables: ['events_daily'] }).mockResolvedValueOnce({ tables: [rows[1]], missing: [] })
+    change()
+    await vi.waitFor(() => expect(root.textContent).toContain('已按 YAML 精确选中 1 张表'))
+    expect([...root.querySelectorAll<HTMLInputElement>('.table-choice input:checked')].map(i => i.value)).toEqual(['public.events_daily'])
+    api.request.mockResolvedValueOnce({ config: {}, metadata: {} })
+    element('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await vi.waitFor(() => expect(onConnected).toHaveBeenCalledOnce())
+    const connect = api.request.mock.calls.find(call => call[0].endsWith('/database/connect'))!
+    expect(JSON.parse(connect[1].body).allowed_tables).toEqual(['public.events_daily'])
+  })
+
   it('普通配置直接提供事实数据开关，默认只读元数据', () => {
     const checkbox = element<HTMLInputElement>('#database-allow-fact-data')
     expect(checkbox.checked).toBe(false)

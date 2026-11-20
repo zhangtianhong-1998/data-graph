@@ -53,6 +53,11 @@ class RetrievalJobs:
         with self._lock:
             return pid in self._active
 
+    def progress(self, pid, stage, completed, total):
+        with self._lock:
+            job = self._active[pid][0]
+            job['progress'] = {'stage': stage, 'completed': completed, 'total': total}
+
     def start(self, pid, revision, work):
         with self._lock:
             if pid in self._active:
@@ -62,7 +67,8 @@ class RetrievalJobs:
                 return job.copy(), future
             if len(self._active) >= 2:
                 raise LightGraphError('retrieval_jobs_busy')
-            job = {'job_id': uuid4().hex, 'status': 'running', 'started_at': _now()}
+            job = {'job_id': uuid4().hex, 'status': 'running', 'started_at': _now(),
+                   'progress': {'stage': 'preparing', 'completed': 0, 'total': None}}
             path = self._path(pid)
             atomic_text(path, json.dumps(job))
             future = self._pool.submit(self._run, pid, path, job, work)
@@ -83,6 +89,7 @@ class RetrievalJobs:
             final['finished_at'] = _now()
             with self._lock:
                 try:
+                    final['progress'] = job['progress']
                     atomic_text(path, json.dumps(final))
                 finally:
                     self._active.pop(pid, None)

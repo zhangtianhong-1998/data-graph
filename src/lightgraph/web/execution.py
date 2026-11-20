@@ -1498,6 +1498,25 @@ class RunManager:
                     records.append(self._with_progress(_json_file(path), path))
             return sorted(records, key=lambda r: r["created_at"], reverse=True)
 
+    def delete_record(self, pid, rid):
+        """Remove the history entry and its run-local logs. Output snapshots have their own lifecycle."""
+        from .run_traces import clear_run_trace
+        with self.workspace.lock(pid), self._guard:
+            _, path = self._paths(pid, rid)
+            if not path.is_file():
+                raise LightGraphError('run_not_found')
+            record = _json_file(path)
+            if record.get('project_id') != pid or record.get('run_id') != rid:
+                raise LightGraphError('run_record_invalid')
+            active = self._processes.get(pid)
+            if record.get('status') not in TERMINAL_STATUSES or (active and active['record']['run_id'] == rid):
+                raise LightGraphError('project_run_active')
+            clear_run_trace(self, pid, rid)
+            for suffix in ('.progress.json', '.result.json', '.trace.cleared.json'):
+                path.with_suffix(suffix).unlink(missing_ok=True)
+            path.unlink()
+            return {'deleted': True, 'run_id': rid}
+
     def cancel(self, pid, rid):
         with self.workspace.lock(pid), self._guard:
             record = self.get(pid, rid)

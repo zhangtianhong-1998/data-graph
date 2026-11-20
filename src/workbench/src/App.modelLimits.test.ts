@@ -50,6 +50,18 @@ beforeEach(() => {
 })
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); clearSessions(); sessionStorage.clear() })
 describe('visible model limits', () => {
+  it('renders persisted new-project defaults without showing a numeric ceiling for unlimited budgets', async () => {
+    config = { ...config, model: { ...config.model, mode: 'in_environment' }, max_returned_rows: null,
+      max_returned_bytes: null, max_working_bytes: 2048 * 1024 ** 2 }
+    await mount()
+    expect(root.querySelector<HTMLSelectElement>('#model-mode')!.value).toBe('in_environment')
+    for (const id of ['max-returned-rows', 'max-returned-mib']) {
+      expect(root.querySelector<HTMLInputElement>(`#${id}-unlimited`)!.checked).toBe(true)
+      expect(root.querySelector<HTMLInputElement>(`#${id}`)!.value).toBe('')
+    }
+    expect(root.querySelector<HTMLInputElement>('#max-working-mib')!.value).toBe('2048')
+  })
+
   it.each([false, true])('saves cumulative data budgets and working memory, then restores after reload (%s)', async separate => {
     if (separate) { delete config.model; config.agent_config = 'files/agent-original.yaml' }
     await mount()

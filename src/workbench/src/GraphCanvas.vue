@@ -265,6 +265,66 @@ const bounds = computed(() => sceneBounds(points.value))
 const largeScene = computed(() => visible.value.length > 300)
 const bitmap = ref<HTMLCanvasElement | null>(null)
 const edges = computed(() => graph.value.edges.filter(edge => points.value.has(edge.source) && points.value.has(edge.target)))
+const degree = computed(() => {
+  const counts = new Map<string, number>()
+  for (const { source, target } of edges.value) {
+    counts.set(source, (counts.get(source) || 0) + 1)
+    counts.set(target, (counts.get(target) || 0) + 1)
+  }
+  return counts
+})
+// Keep dots selectable when fitting a large graph; avoid filling the viewport at high density.
+const minimumDot = computed(() => Math.min(3.8, Math.max(1, Math.sqrt(viewport.value.width * viewport.value.height / Math.max(1, visible.value.length)) / 12)))
+function radius(id: string) {
+  const weight = Math.min(1, Math.log2(1 + (degree.value.get(id) || 0)) / 6)
+  return Math.max(9 + 12 * weight, minimumDot.value * (1 + .65 * weight) / zoom.value)
+}
+const focusedIds = computed(() => {
+  const ids = new Set<string>()
+  if (selected.value) ids.add(selected.value.id)
+  for (const edge of edges.value) {
+    if (edge === selectedEdge.value || edge.source === selected.value?.id || edge.target === selected.value?.id) {
+      ids.add(edge.source); ids.add(edge.target)
+    }
+  }
+  return ids
+})
+// At overview scale reserve screen space for a few readable names, independent of zoom.
+const rankedNodes = computed(() => [...visible.value].sort((a, b) =>
+  (degree.value.get(b.id) || 0) - (degree.value.get(a.id) || 0)))
+const overviewLabels = computed(() => {
+  if (zoom.value >= .65) return []
+  const labels: Array<{ node: GraphNode; x: number; y: number; width: number }> = []
+  const limit = Math.max(1, Math.min(10, Math.floor(viewport.value.width / 140) * 2))
+  const nodes = selected.value ? [selected.value, ...rankedNodes.value] : rankedNodes.value
+  for (const node of nodes) {
+    const point = points.value.get(node.id)
+    if (!point || labels.some(label => label.node.id === node.id)) continue
+    const x = point.x * zoom.value + offset.value.x
+    const y = point.y * zoom.value + offset.value.y + radius(node.id) * zoom.value + 3
+    const width = Math.min(126, Math.ceil(measureCaption?.(display(node)) ?? Array.from(display(node)).length * 13) + 15)
+    if (x - width / 2 < 0 || x + width / 2 > viewport.value.width || y < 0 || y + 22 > viewport.value.height) continue
+    if (labels.some(label => Math.abs(label.y - y) < 32 && Math.abs(label.x - x) < (label.width + width) / 2 + 12)) continue
+    labels.push({ node, x, y, width })
+    if (labels.length === limit) break
+  }
+  return labels
+})
+function edgeGeometry(edge: GraphEdge) {
+  const a = points.value.get(edge.source)!, b = points.value.get(edge.target)!
+  const dx = b.x - a.x, dy = b.y - a.y
+  const distance = Math.hypot(dx, dy) || 1
+  const inset = radius(edge.target) + 2
+  return { a, b, endX: b.x - dx / distance * inset, endY: b.y - dy / distance * inset }
+}
+function edgePath(edge: GraphEdge) {
+  const { a, endX, endY } = edgeGeometry(edge)
+  if (edge.source === edge.target) {
+    const r = radius(edge.source)
+    return `M ${a.x - r} ${a.y} C ${a.x-r*3} ${a.y-r*3}, ${a.x+r*3} ${a.y-r*3}, ${a.x+r} ${a.y}`
+  }
+  return `M ${a.x} ${a.y} L ${endX} ${endY}`
+}
 const accessibleNodes = computed(() => (search.value || selectedKind.value ? filtered.value : visible.value).slice(0, 40))
 watch(() => graph.value, value => { positions.value = placeNodes({ ...value, nodes: value.nodes }, positions.value) }, { immediate: true, flush: 'sync' })
 const adjacent = computed(() => {
@@ -339,7 +399,7 @@ function bitmapNode(event: MouseEvent) {
   // Canvas text is painted without DOM hit targets; make visible labels clickable too.
   const ctx = bitmap.value.getContext('2d')
   return [...visible.value].reverse().find(node => {
-    if (zoom.value < .4 && selected.value?.id !== node.id) return false
+    if (zoom.value < .65) return false
     const p = points.value.get(node.id)!
     const labels: Array<[string, number, number]> = labelLines(node).map((line, index) => [line, 43 + index * 16, 13])
     labels.push([`${kindName(node.kind || node.layer)} · ${statusName(node.status)}`, metadataY(node), 11])
@@ -378,24 +438,37 @@ function paint() {
   ctx.translate(offset.value.x, offset.value.y); ctx.scale(zoom.value, zoom.value)
   const left = -offset.value.x / zoom.value, top = -offset.value.y / zoom.value
   const right = left + viewport.value.width / zoom.value, bottom = top + viewport.value.height / zoom.value
+  // Preserve all edges at overview scale without turning dense crossings into an opaque block.
+  const backgroundOpacity = zoom.value < .45 ? Math.max(.008, Math.min(.45, 2 / Math.sqrt(edges.value.length || 1))) : .6
   for (const edge of edges.value) {
-    const a = points.value.get(edge.source)!, b = points.value.get(edge.target)!
+    const { a, b, endX, endY } = edgeGeometry(edge)
     if (Math.max(a.x, b.x) < left || Math.min(a.x, b.x) > right || Math.max(a.y, b.y) < top || Math.min(a.y, b.y) > bottom) continue
-    ctx.strokeStyle = (selectedEdge.value === edge || (selected.value && [edge.source, edge.target].includes(selected.value.id))) ? '#407ff2' : '#b6c4da'
-    ctx.lineWidth = 1 / zoom.value; ctx.setLineDash(edge.status === 'candidate' ? [6, 4] : edge.status === 'unresolved' ? [2, 4] : [])
-    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke()
-    const angle = Math.atan2(b.y-a.y, b.x-a.x), tx=b.x-23*Math.cos(angle), ty=b.y-23*Math.sin(angle)
+    const emphasized = selectedEdge.value === edge || selected.value?.id === edge.source || selected.value?.id === edge.target
+    ctx.strokeStyle = emphasized ? '#306cc8' : '#99adb9'
+    ctx.globalAlpha = emphasized ? 1 : selected.value || selectedEdge.value ? Math.min(.15, backgroundOpacity) : backgroundOpacity
+    ctx.lineWidth = (emphasized ? 1.7 : .8) / zoom.value
+    ctx.setLineDash(edge.status === 'candidate' ? [6, 4] : edge.status === 'unresolved' ? [2, 4] : [])
+    let tx = endX, ty = endY, angle = Math.atan2(b.y - a.y, b.x - a.x)
+    ctx.beginPath()
+    if (edge.source === edge.target) {
+      const r = radius(edge.source)
+      tx = a.x + r; ty = a.y; angle = Math.atan2(3, -2)
+      ctx.moveTo(a.x-r, a.y); ctx.bezierCurveTo(a.x-r*3, a.y-r*3, a.x+r*3, a.y-r*3, tx, ty)
+    } else { ctx.moveTo(a.x, a.y); ctx.lineTo(tx, ty) }
+    ctx.stroke()
+    if (zoom.value < .2 && !emphasized) continue
     ctx.beginPath(); ctx.moveTo(tx,ty); ctx.lineTo(tx-8*Math.cos(angle-.5),ty-8*Math.sin(angle-.5)); ctx.moveTo(tx,ty); ctx.lineTo(tx-8*Math.cos(angle+.5),ty-8*Math.sin(angle+.5)); ctx.stroke()
   }
   const matches = new Set(filtered.value.map(n => n.id))
   for (const node of visible.value) {
     const p = points.value.get(node.id)!
     if (p.x < left-110 || p.x > right+110 || p.y < top-90 || p.y > bottom+90) continue
-    ctx.globalAlpha = (search.value || selectedKind.value) && !matches.has(node.id) ? .25 : 1
+    ctx.globalAlpha = ((search.value || selectedKind.value) && !matches.has(node.id)) || (focusedIds.value.size > 0 && !focusedIds.value.has(node.id)) ? .25 : 1
     ctx.fillStyle = kindColor(node); ctx.strokeStyle = selected.value?.id === node.id ? '#172744' : kindColor(node)
     ctx.setLineDash(node.status === 'candidate' ? [6,4] : node.status === 'unresolved' ? [2,4] : [])
-    ctx.beginPath(); ctx.arc(p.x,p.y,zoom.value < .3 ? 12 : 22,0,Math.PI*2); ctx.fill(); ctx.stroke()
-    if (zoom.value >= .4 || selected.value?.id === node.id) {
+    ctx.lineWidth = selected.value?.id === node.id ? 3 : 1
+    ctx.beginPath(); ctx.arc(p.x, p.y, radius(node.id), 0, Math.PI * 2); ctx.fill(); ctx.stroke()
+    if (zoom.value >= .65) {
       ctx.fillStyle = '#26364f'; ctx.textAlign = 'center'; ctx.font = '13px sans-serif'
       labelLines(node).forEach((line, index) => ctx.fillText(line, p.x, p.y + 43 + index * 16))
       ctx.fillStyle = '#7888a2'; ctx.font = '11px sans-serif'; ctx.fillText(`${kindName(node.kind || node.layer)} · ${statusName(node.status)}`,p.x,p.y+metadataY(node))
@@ -440,7 +513,10 @@ watch(canvas, element => {
   let initialSize = true
   observer = new ResizeObserver(entries => {
     const rect = entries[0]?.contentRect
-    if (rect?.width && rect.height) { viewport.value = { width: Math.max(180, rect.width), height: rect.height }; if (initialSize) { initialSize = false; fit() } }
+    if (!rect?.width || !rect.height) return
+    viewport.value = { width: Math.max(180, rect.width), height: rect.height }
+    if (initialSize || (!cameraTouched && !selected.value && !selectedEdge.value)) fit()
+    initialSize = false
   })
   observer.observe(element); void nextTick(fit)
 }, { flush: 'post' })
@@ -451,22 +527,22 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="graph-layout">
+  <div class="graph-layout" :class="{ inspecting: selected || selectedEdge }">
     <section class="panel graph-panel">
       <div class="graph-toolbar">
-        <div class="actions"><input v-model="search" class="graph-search" aria-label="搜索图节点" placeholder="搜索名称或编号"/><select v-model="selectedKind" aria-label="筛选节点类型"><option value="">全部类型</option><option v-for="kind in kinds" :key="kind" :value="kind">{{ kindName(kind) }}</option></select></div>
+        <div class="actions"><input v-model="search" class="graph-search" aria-label="搜索图节点" placeholder="搜索名称或编号"/><select v-model="selectedKind" aria-label="筛选节点类型" title="颜色表示节点类型，大小表示已加载的关联数量"><option value="">全部类型</option><option v-for="kind in kinds" :key="kind" :value="kind">{{ kindName(kind) }}{{ overview?.[kind] != null ? ' · ' + overview[kind] : '' }}</option></select></div>
         <div class="actions"><button class="btn small" aria-label="缩小图谱" @click="setZoom(zoom / 1.2)">−</button><span class="muted">{{ Math.round(zoom * 100) }}%</span><button class="btn small" aria-label="放大图谱" @click="setZoom(zoom * 1.2)">+</button><button class="btn small" @click="fit">适配画布</button><button class="btn small" @click="reset">原始大小</button></div>
       </div>
-      <div v-if="overview && !neighborhood" class="kind-overview" aria-label="全图类型概览"><button v-for="(count, kind) in overview" :key="kind" class="btn small" @click="selectedKind = String(kind)">{{ kindName(kind) }} · {{ count }}</button></div>
+
       <div v-if="neighborhood" class="neighborhood-toolbar" aria-label="两跳关联范围">
         <span>两跳关联 · {{ display(neighborhood.center) }}</span>
         <select aria-label="两跳查看方式" :value="neighborhood.traversal" @change="showTwoHops(neighborhood.center, ($event.target as HTMLSelectElement).value as NeighborhoodTraversal)"><option value="chains">上游、下游各两跳</option><option value="all">所有方向两跳</option></select>
         <span class="muted small-text">当前 {{ visible.length }} 个节点 / 全图 {{ graph.total_nodes ?? baseGraph.nodes.length }} 个</span>
         <button class="btn small" @click="returnToGraph">返回全图</button>
-        <span class="muted small-text neighborhood-explanation">{{ neighborhood.traversal === 'chains' ? '沿箭头向前、向后各查两步，不在途中换向；不会仅因归属同一中心而展开其他指标。' : '可在途中换向：会包含经共同父节点、归属中心等连接的其他对象。' }}</span>
+        <span class="muted small-text neighborhood-explanation">{{ neighborhood.traversal === 'chains' ? '沿关系向前、向后各查两步。' : '包含经共同邻居连接的对象。' }}</span>
       </div>
       <p v-if="neighborhood?.preview" class="note" aria-label="两跳范围补全状态">当前仅显示已加载数据中的关联节点，{{ pageLoading ? '正在读取完整两跳范围。' : '完整两跳范围尚未读取。' }}<button v-if="!pageLoading" class="btn small" @click="showTwoHops(neighborhood.center)">重试读取两跳关联</button></p>
-      <p v-if="!neighborhood && (search || selectedKind)" class="note" aria-label="检索局部视图">搜索用于定位和突出显示已加载的节点，名称和类型筛选不会移除周围节点。全图加载完成前，搜索范围仍在补充；双击节点可单独查看完整两跳范围。</p>
+      <p v-if="!neighborhood && (search || selectedKind)" class="note" aria-label="检索局部视图">已突出显示已加载的匹配节点，周边节点作为参照。</p>
       <p v-if="graph.edges_truncated" class="note amber" aria-label="关系截断提示">当前返回的关系有数量上限，画布并未显示此范围内的全部边。请聚焦具体节点，查看来源详情中的完整关系计数。</p>
       <div v-if="fullTransport" class="graph-load-progress" aria-label="全图加载进度">
         <progress :value="fullComplete ? 100 : fullProgress" max="100" :aria-label="fullComplete ? '全图加载完成' : '全图加载进度'"/>
@@ -479,31 +555,33 @@ onUnmounted(() => {
       <p v-if="pageLoading" role="status">正在读取图谱关联…</p>
       <p v-if="pageError" role="alert">{{ pageError }}</p>
       <div v-if="loading" class="empty-state"><div class="spinner"></div>正在读取图谱</div>
-      <div v-else-if="!graph.nodes.length && !search && !selectedKind" class="empty-state graph-empty"><div class="empty-graphic">◇</div><h3>{{ layer === 'metadata' ? '还没有元数据图' : '还没有业务图谱' }}</h3><p>{{ layer === 'metadata' ? '上传数据并读取元数据后，这里会展示真实的表、列及其关系。' : '完成抽取后，这里会展示已发布的实体与关系。现有图谱会在后续运行中保留并更新。' }}</p></div>
+      <div v-else-if="!graph.nodes.length && !search && !selectedKind" class="empty-state graph-empty"><div class="empty-graphic">◇</div><h3>{{ layer === 'metadata' ? '还没有元数据图' : '还没有业务图谱' }}</h3><p>{{ layer === 'metadata' ? '上传数据并读取元数据后，这里会展示真实的表、列及其关系。' : '完成抽取并发布后即可查看。' }}</p></div>
       <div v-else-if="!visible.length" class="empty-state">没有匹配的节点，请调整搜索或类型。</div>
-      <div v-else ref="canvas" class="graph-canvas" @wheel.prevent="wheel">
+      <div v-else ref="canvas" class="graph-canvas" :class="{ overview: zoom < .65 }" @wheel.prevent="wheel">
         <canvas v-if="largeScene" ref="bitmap" class="graph-bitmap" role="img" :aria-label="`连续图谱画布，${visible.length} 个节点；使用节点列表选择对象`" @click="bitmapClick" @dblclick.stop="bitmapDoubleClick" @pointerdown="bitmapDown" @pointermove="move" @pointerup="bitmapUp" @pointercancel="cancelBitmapGesture" @lostpointercapture="drag = null"/>
         <svg v-else :viewBox="`0 0 ${viewport.width} ${viewport.height}`" role="group" :aria-label="layer === 'metadata' ? '元数据关联图' : '业务知识图谱'" @pointerdown="start" @pointermove="move" @pointerup="drag = null" @pointercancel="drag = null" @lostpointercapture="drag = null">
           <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#b6c4da"/></marker></defs>
           <g :transform="`translate(${offset.x} ${offset.y}) scale(${zoom})`">
-            <g v-for="(edge, index) in edges" :key="`${edge.source}-${edge.target}-${index}`" class="graph-edge" :class="{ emphasized: selected && (edge.source === selected.id || edge.target === selected.id), candidate: edge.status === 'candidate', unresolved: edge.status === 'unresolved' }" tabindex="0" role="button" :aria-label="`${endpointName(edge.source)} → ${endpointName(edge.target)} · ${relationName(edge.relation)} · ${statusName(edge.status)}`" @click="selectEdge(edge)" @keydown.enter="selectEdge(edge)" @keydown.space.prevent="selectEdge(edge)">
-              <path :d="`M ${points.get(edge.source)!.x} ${points.get(edge.source)!.y} L ${points.get(edge.target)!.x} ${points.get(edge.target)!.y}`" marker-end="url(#arrow)"/><title>{{ relationName(edge.relation) }} · {{ statusName(edge.status) }}</title>
+            <g v-for="(edge, index) in edges" :key="`${edge.source}-${edge.target}-${index}`" class="graph-edge" :class="{ emphasized: selectedEdge === edge || (selected && (edge.source === selected.id || edge.target === selected.id)), subdued: focusedIds.size && edge !== selectedEdge && edge.source !== selected?.id && edge.target !== selected?.id, candidate: edge.status === 'candidate', unresolved: edge.status === 'unresolved' }" tabindex="0" role="button" :aria-label="`${endpointName(edge.source)} → ${endpointName(edge.target)} · ${relationName(edge.relation)} · ${statusName(edge.status)}`" @click="selectEdge(edge)" @keydown.enter="selectEdge(edge)" @keydown.space.prevent="selectEdge(edge)">
+              <path :d="edgePath(edge)" marker-end="url(#arrow)"/><title>{{ relationName(edge.relation) }} · {{ statusName(edge.status) }}</title>
               <text v-if="selected && (edge.source === selected.id || edge.target === selected.id)" :x="(points.get(edge.source)!.x + points.get(edge.target)!.x) / 2" :y="(points.get(edge.source)!.y + points.get(edge.target)!.y) / 2 - 7">{{ relationName(edge.relation) }}</text>
             </g>
-            <g v-for="node in visible" :key="node.id" class="graph-node" :class="{ dimmed: (search || selectedKind) && !filtered.includes(node), selected: selected?.id === node.id, candidate: node.status === 'candidate', unresolved: node.status === 'unresolved' }" :transform="`translate(${points.get(node.id)!.x} ${points.get(node.id)!.y})`" tabindex="0" role="button" :aria-label="display(node)" @click="nodeClick(node, $event)" @dblclick.stop="nodeDoubleClick(node)" @keydown.enter="selectNode(node)" @keydown.space.prevent="selectNode(node)">
-              <circle r="22" :fill="kindColor(node) + '18'" :stroke="kindColor(node)"/><circle r="5" :fill="kindColor(node)"/>
+            <g v-for="node in visible" :key="node.id" class="graph-node" :class="{ dimmed: ((search || selectedKind) && !filtered.includes(node)) || (focusedIds.size && !focusedIds.has(node.id)), selected: selected?.id === node.id, candidate: node.status === 'candidate', unresolved: node.status === 'unresolved' }" :transform="`translate(${points.get(node.id)!.x} ${points.get(node.id)!.y})`" tabindex="0" role="button" :aria-label="display(node)" @click="nodeClick(node, $event)" @dblclick.stop="nodeDoubleClick(node)" @keydown.enter="selectNode(node)" @keydown.space.prevent="selectNode(node)">
+              <circle :r="radius(node.id)" :fill="kindColor(node)" :stroke="kindColor(node)"/><circle :r="radius(node.id) * .55" fill="#fff" fill-opacity=".16"/>
               <text class="node-label" y="43"><tspan v-for="(line, index) in labelLines(node)" :key="index" x="0" :dy="index ? 16 : 0">{{ line }}</tspan></text><text class="node-kind" :y="metadataY(node)">{{ kindName(node.kind || node.layer) }} · {{ statusName(node.status) }}</text><text v-if="scopeLabel(node)" class="node-kind node-scope" :y="metadataY(node) + 16">{{ shortScope(node) }}</text><title>{{ display(node) }} · {{ statusName(node.status) }} · {{ scopeLabel(node) }}</title>
             </g>
           </g>
         </svg>
+        <button v-for="label in overviewLabels" :key="label.node.id" type="button" class="overview-label"
+          :class="{ active: selected?.id === label.node.id }" :style="{ left: label.x + 'px', top: label.y + 'px', width: label.width + 'px' }"
+          :title="display(label.node)" @click="nodeClick(label.node, $event)" @dblclick.stop="nodeDoubleClick(label.node)">{{ display(label.node) }}</button>
       </div>
-      <div class="panel-footer"><span v-if="!neighborhood">画布已加载 {{ visible.length }} / 全图 {{ graph.total_nodes ?? graph.nodes.length }} 个节点 · 已加载 {{ edges.length }} / 全图 {{ graph.total_edges ?? graph.edges.length }} 条关系</span><span v-else-if="neighborhood.preview">两跳关联当前显示 {{ visible.length }} 个节点 · {{ edges.length }} 条关系，完整范围待补全</span><span v-else>两跳范围已加载 {{ visible.length }} / {{ neighborhoodCount }} 个节点 · {{ edges.length }} 条关系</span><span v-if="search || selectedKind">匹配 {{ matchedCount }} 个节点（已加载范围）</span><span v-if="neighborhoodIncomplete">部分关联尚未完整显示，可继续读取或重试两跳关联。<span v-if="!fullTransport">兼容接口单次最多 1000 个节点。</span></span><span v-else-if="graph.truncated">当前为部分图谱，尚未加载的节点和边不表示不存在</span><span v-else>拖动平移 · 滚轮缩放 · 单击查看来源 · 双击查看两跳关联</span></div>
+      <div class="panel-footer"><span v-if="!neighborhood">画布已加载 {{ visible.length }} / 全图 {{ graph.total_nodes ?? graph.nodes.length }} 个节点 · 已加载 {{ edges.length }} / 全图 {{ graph.total_edges ?? graph.edges.length }} 条关系</span><span v-else-if="neighborhood.preview">两跳关联当前显示 {{ visible.length }} 个节点 · {{ edges.length }} 条关系，完整范围待补全</span><span v-else>两跳范围已加载 {{ visible.length }} / {{ neighborhoodCount }} 个节点 · {{ edges.length }} 条关系</span><span v-if="search || selectedKind">匹配 {{ matchedCount }} 个节点（已加载范围）</span><span v-if="neighborhoodIncomplete">部分关联尚未完整显示，可继续读取或重试两跳关联。<span v-if="!fullTransport">兼容接口单次最多 1000 个节点。</span></span><span v-else-if="graph.truncated">当前为部分图谱，尚未加载的节点和边不表示不存在</span><span v-else>单击查看详情 · 双击查看两跳关联</span></div>
       <details v-if="largeScene || search || selectedKind" class="scene-node-list"><summary>定位节点 · {{ filtered.length }} 个匹配</summary><button v-for="node in accessibleNodes" :key="node.id" class="btn small" @click="nodeClick(node, $event, true)" @dblclick.stop="nodeDoubleClick(node)">{{ display(node) }} · {{ statusName(node.status) }} · {{ scopeLabel(node) }}</button><p v-if="filtered.length > 40">列表展示前 40 个匹配，请搜索缩小范围；画布仍保留已加载节点。</p></details>
     </section>
-    <aside class="panel graph-detail">
-      <div class="panel-head"><h2>{{ selectedEdge ? '关系详情' : '节点详情' }}</h2></div>
-      <div v-if="!selected && !selectedEdge" class="empty-state">选择节点或关系，查看属性和来源支持。</div>
-      <div v-else class="panel-body">
+    <aside v-if="selected || selectedEdge" class="panel graph-detail">
+      <div class="panel-head"><h2>{{ selectedEdge ? '关系详情' : '节点详情' }}</h2><button class="close" type="button" aria-label="关闭详情" @click="clearSelection">×</button></div>
+      <div class="panel-body">
         <template v-if="selectedEdge">
           <span class="badge" :class="selectedEdge.status === 'accepted' ? 'green' : 'amber'">{{ statusName(selectedEdge.status) }}</span>
           <h2 :title="relationDescription(selectedEdge.relation)">{{ relationName(selectedEdge.relation) }}</h2>
@@ -576,6 +654,20 @@ onUnmounted(() => {
 
 <style scoped>
 .graph-bitmap { user-select: none; display: block; width: 100%; height: 480px; touch-action: none; }
+.graph-layout:not(.inspecting) { grid-template-columns: minmax(0, 1fr); }
+.graph-panel { min-width: 0; }
+.graph-canvas { position: relative; isolation: isolate; overflow: hidden; background-color: #f8fbfa; background-image: radial-gradient(#dce7e5 .8px, transparent .8px); background-size: 20px 20px; }
+.graph-canvas, .graph-canvas svg, .graph-bitmap { height: clamp(380px, 58vh, 740px); min-height: 0; }
+.graph-canvas.overview .graph-node text { visibility: hidden; }
+.graph-node .node-label { font-size: 13px; font-weight: 620; fill: #253c4c; }
+.graph-edge path { stroke: #99adb9; opacity: .78; stroke-width: 1px; vector-effect: non-scaling-stroke; }
+.graph-edge.emphasized path { stroke-width: 1.8px; }
+.graph-edge.emphasized path { stroke: #306cc8; opacity: 1; }
+.graph-edge.subdued path { opacity: .2; }
+.graph-node.selected circle:first-child, .graph-node:focus-visible circle:first-child { stroke: #243e63; }
+.overview-label { position: absolute; transform: translateX(-50%); max-width: 126px; height: 22px; padding: 1px 5px; text-overflow: ellipsis; white-space: nowrap; overflow: hidden; line-height: 18px; border: 1px solid #cdd9dc; border-radius: 5px; font-size: 12px; font-weight: 570; color: #263e4a; background: #fff; cursor: pointer; }
+.overview-label.active, .overview-label:focus-visible { border-color: #306cc8; }
+.graph-detail .panel-head { position: sticky; z-index: 1; top: 0; background: #fff; }
 .graph-node.dimmed { opacity: .25; }
 .neighborhood-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 8px 16px; }
 .neighborhood-explanation { flex-basis: 100%; }

@@ -8,6 +8,7 @@ import errno
 import shutil
 import tempfile
 import time
+import numpy as np
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -111,12 +112,34 @@ def active_index(root: Path, expected_generation: str | None = None) -> tuple[Pa
         raise LightGraphError('retrieval_index_stale') from None
 
 
+def _embed_cards(embedder, texts, progress):
+    if progress is None or not texts:
+        return embedder.embed(texts)
+    total = len(texts)
+    batch_size = getattr(embedder, 'batch_size', 128)
+    matrix = None
+    progress('embedding', 0, total)
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        batch = embedder.embed(texts[start:end])
+        if batch.ndim != 2 or len(batch) != end - start:
+            raise ValueError('vector_count_mismatch')
+        if matrix is None:
+            matrix = np.empty((total, batch.shape[1]), dtype=batch.dtype)
+        if matrix.shape[1] != batch.shape[1]:
+            raise ValueError('vector_dimension_mismatch')
+        matrix[start:end] = batch
+        progress('embedding', end, total)
+    return matrix
+
+
 def sync_graph_to_retrieval(
     graph: dict[str, Any],
     retrieval_dir: str | Path,
     *,
     embedder: Embedder | None = None,
     generation: str | None = None,
+    progress=None,
 ) -> dict[str, Any]:
     """Index each permission/context slice before producing terms or embeddings.
 
@@ -294,11 +317,13 @@ def sync_graph_to_retrieval(
             if content not in positions:
                 positions[content] = len(positions)
             row_positions.append(positions[content])
-        vectors = embedder.embed(list(positions))
+        vectors = _embed_cards(embedder, list(positions), progress)
         if vectors.ndim != 2 or vectors.shape[0] != len(positions):
             raise ValueError('vector_count_mismatch')
         if len(positions) != len(vector_items):
             vectors = vectors[row_positions]
+        if progress:
+            progress('publishing', len(positions), len(positions))
         vec_store.replace_all(vector_items, vectors)
         resolved_dim = int(vectors.shape[1]) if vectors.ndim == 2 and vectors.shape[0] else int(embedder.dim or 0)
         _publish_staging(staging, builds / build_id)

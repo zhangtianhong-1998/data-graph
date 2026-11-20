@@ -65,6 +65,11 @@ def test_fresh_run_preserves_history_and_continue_uses_new_lineage(workspace, mo
         assert manager.get('alpha', first['run_id'])['report'] == first['report']
         assert read_run_trace(manager, 'alpha', first['run_id'])['status'] == 'available'
         assert len(manager.list('alpha')) == 3
+        manager.delete_record('alpha', second['run_id'])
+        with pytest.raises(LightGraphError, match='run_not_found'):
+            manager.get('alpha', second['run_id'])
+        assert {r['run_id'] for r in manager.list('alpha')} == {first['run_id'], third['run_id']}
+        assert {node['label'] for node in read_graph(workspace, 'alpha')['nodes']} == {'Revenue', 'Cost'}
     finally:
         manager.shutdown()
 

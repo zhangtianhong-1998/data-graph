@@ -40,6 +40,9 @@ def test_project_isolation_restart_and_default_folders(workspace):
     assert Path(resolved.sources[0].path) == fresh.file_path("project_a", a["file_id"])
     assert resolved.output_dir == str(fresh.root / "project_a" / "output")
     assert resolved.isolation_domain == "project_a"
+    assert resolved.resolved_model.mode == "in_environment"
+    assert resolved.max_working_bytes == 2048 * 1024**2
+    assert resolved.max_returned_rows is None and resolved.max_returned_bytes is None
 
 
 @pytest.mark.parametrize("project_id", ["../bad", "/tmp/bad", "x/y", "x\\y", "", ".", "..", "x" * 65])

@@ -18,6 +18,8 @@ const progress = ref(''), notice = ref(''), rememberConnection = ref(true), save
 const controller = new AbortController()
 const retention = ref(props.retentionVerified), localError = ref(''), pending = ref(false), tested = ref(false), tableLoaded = ref(false), truncated = ref(false)
 const tables = ref<DatabaseTable[]>([]), checked = ref<string[]>([]), filter = ref(''), listFileInput = ref<HTMLInputElement | null>(null)
+const yamlTableInput = ref<HTMLInputElement | null>(null)
+const importedOnly = ref(false)
 const uploadedManifests = ref<ProjectFile[]>([])
 const manifestInput = ref<HTMLInputElement | null>(null)
 const configRevision = ref(props.configRevision)
@@ -55,7 +57,7 @@ function saveDraft() {
 watch(() => form.value.kind, kind => { if (!restoring) { connection.value.kind = kind; connection.value.port = kind === 'mysql_database' ? '3306' : '5432' } }, { flush: 'sync' })
 watch(connection, () => {
   if (restoring) return
-  tested.value = false; tableLoaded.value = false; tables.value = []; checked.value = []; truncated.value = false; skippedCount.value = 0
+  tested.value = false; tableLoaded.value = false; tables.value = []; checked.value = []; truncated.value = false; skippedCount.value = 0; importedOnly.value = false
 }, { deep: true, flush: 'sync' })
 watch([form, connection, mode, retention, checked], saveDraft, { deep: true })
 watch(rememberConnection, async enabled => {
@@ -176,7 +178,10 @@ async function loadTables() {
     checked.value = [...new Set([...checked.value, ...matched.map(table => table.qualified_name)])]
     form.value.tables = manual.filter(name => !matched.some(table => table.name === name || table.qualified_name === name)).join('\n')
   }
-  tables.value = result.tables; truncated.value = result.truncated; skippedCount.value = result.skipped_count || 0; tableLoaded.value = true
+  const listed = new Set(result.tables.map(table => table.qualified_name))
+  const extraSelections = tables.value.filter(table => checked.value.includes(table.qualified_name) && !listed.has(table.qualified_name))
+  tables.value = result.truncated ? [...result.tables, ...extraSelections] : result.tables
+  importedOnly.value = false; truncated.value = result.truncated; skippedCount.value = result.skipped_count || 0; tableLoaded.value = true
 }
 async function discoverTables() {
   await perform(loadTables, '正在读取表清单…', () => { connectionPayload(connection.value) })
@@ -199,6 +204,46 @@ async function importTableList(event: Event) {
   const input = event.target as HTMLInputElement, file = input.files?.[0]
   if (!file) return
   await perform(async () => { const body = new FormData(); body.append('file', file); const result = await request<{ tables: string[] }>(`${path.value}/database/table-list`, { method: 'POST', body }); form.value.tables = [...new Set([...form.value.tables.split('\n').filter(Boolean), ...result.tables])].join('\n') })
+  input.value = ''
+}
+async function importYamlSelection(event: Event) {
+  const input = event.target as HTMLInputElement, file = input.files?.[0]
+  if (!file) return
+  await perform(async () => {
+    if (!/\.ya?ml$/i.test(file.name)) throw new Error('请选择 .yaml 或 .yml 表清单。')
+    const direct = mode.value === 'direct'
+    const payload = direct ? connectionPayload(connection.value) : null
+    const body = new FormData()
+    body.append('file', file)
+    const parsed = await request<{ tables: string[] }>(`${path.value}/database/table-list`, {
+      method: 'POST', body, signal: controller.signal,
+    })
+    if (controller.signal.aborted) return
+    if (direct) {
+      const result = await request<{ tables: DatabaseTable[]; missing: string[] }>(`${path.value}/database/tables`, {
+        method: 'POST', body: json({ connection: payload, exact_names: parsed.tables }),
+        signal: controller.signal, timeoutMs: 45000,
+      })
+      if (controller.signal.aborted) return
+      if (result.missing.length) {
+        const shown = result.missing.slice(0, 8).join('、')
+        throw new Error(`未找到 ${result.missing.length} 张表：${shown}${result.missing.length > 8 ? '…' : ''}。已保留原选择。`)
+      }
+      const catalog = new Map(tables.value.map(table => [table.qualified_name, table]))
+      result.tables.forEach(table => catalog.set(table.qualified_name, table))
+      tables.value = [...catalog.values()]
+      checked.value = result.tables.map(table => table.qualified_name)
+      filter.value = ''; form.value.tables = ''
+      if (!tableLoaded.value) importedOnly.value = true
+      tableLoaded.value = true
+      notice.value = `已按 YAML 精确选中 ${checked.value.length} 张表。`
+    } else {
+      if (parsed.tables.some(name => !name.includes('.'))) throw new Error('环境变量连接请使用完整的 schema.table 名称。')
+      form.value.tables = parsed.tables.join('\n')
+      checked.value = []
+      notice.value = `已导入 ${parsed.tables.length} 张表，读取元数据时核实。`
+    }
+  }, '正在导入 YAML 表清单…')
   input.value = ''
 }
 function toggleVisible() {
@@ -259,11 +304,20 @@ async function submit() {
               </div>
               <div class="actions"><button type="button" class="btn" :disabled="locked" @click="testConnection">测试连接</button><span v-if="tested" class="badge green" role="status">连接成功</span></div><div class="field"><label class="checkbox-line"><input id="remember-connection" v-model="rememberConnection" type="checkbox" :disabled="locked"/>保存连接信息到本机</label><p class="field-hint">{{ rememberConnection ? '填写后自动加密保存，刷新后继续填写。' : '仅用于本次会话，此前保存的连接和草稿会被删除。' }}</p><button v-if="savedConnection" type="button" class="btn small" :disabled="locked" @click="deleteSavedConnection">删除已保存连接</button></div>
             </section>
-            <section class="connection-step"><div class="selection-head"><h3><span>2</span>选择要分析的表</h3><button type="button" class="btn small" :disabled="locked" @click="discoverTables">{{ tableLoaded ? '刷新表清单' : '读取表清单' }}</button></div><div v-if="tableLoaded" class="table-picker"><input v-model="filter" aria-label="筛选数据库表" placeholder="按表名筛选" :disabled="locked"/><div class="table-picker-head"><span>{{ visibleTables.length }} 张表</span><button type="button" :disabled="locked || !visibleTables.length" @click="toggleVisible">选择 / 取消当前筛选</button></div><div class="table-picker-items"><label v-for="table in visibleTables" :key="table.qualified_name" class="table-choice"><input v-model="checked" type="checkbox" :value="table.qualified_name" :disabled="locked"/><span>{{ table.qualified_name }}</span><small>{{ table.table_type }}</small></label><p v-if="!visibleTables.length" class="empty-state">没有匹配的表</p></div><p v-if="skippedCount" class="field-hint">已跳过 {{ skippedCount }} 张不支持表名的表。</p><p v-if="truncated" class="note amber">表清单已达到服务端限制，可缩小 Schema 范围后重试，或补充手动表名。</p></div>
+            <section class="connection-step"><div class="selection-head"><h3><span>2</span>选择要分析的表</h3><button type="button" class="btn small" :disabled="locked" @click="discoverTables">{{ importedOnly ? '读取完整表清单' : tableLoaded ? '刷新表清单' : '读取表清单' }}</button></div><div v-if="tableLoaded" class="table-picker"><input v-model="filter" aria-label="筛选数据库表" placeholder="按表名筛选" :disabled="locked"/><div class="table-picker-head"><span>{{ visibleTables.length }} 张表</span><button type="button" :disabled="locked || !visibleTables.length" @click="toggleVisible">选择 / 取消当前筛选</button></div><div class="table-picker-items"><label v-for="table in visibleTables" :key="table.qualified_name" class="table-choice"><input v-model="checked" type="checkbox" :value="table.qualified_name" :disabled="locked"/><span>{{ table.qualified_name }}</span><small>{{ table.table_type }}</small></label><p v-if="!visibleTables.length" class="empty-state">没有匹配的表</p></div><p v-if="skippedCount" class="field-hint">已跳过 {{ skippedCount }} 张不支持表名的表。</p><p v-if="truncated" class="note amber">表清单已达到服务端限制，可缩小 Schema 范围后重试，或补充手动表名。</p></div>
               <div class="field manual-tables"><div class="selection-head"><label for="database-tables">补充表名</label><button type="button" class="btn small" :disabled="locked" @click="listFileInput?.click()">从 Excel 导入表清单</button><input ref="listFileInput" type="file" hidden accept=".xlsx" @change="importTableList"/></div><textarea id="database-tables" v-model="form.tables" :disabled="locked" :placeholder="form.kind === 'mysql_database' ? '每行一张表，例如：\nanalytics.metrics\nanalytics.organizations' : '每行一张表，例如：\npublic.metrics\npublic.organizations'"/><p class="field-hint">已选 {{ tableCount }} 张表</p></div>
             </section>
           </template>
           <template v-else><div class="field"><label for="database-env">数据库连接环境变量名</label><input id="database-env" v-model="form.dsnEnv" :disabled="locked" required placeholder="LIGHTGRAPH_MYSQL_DSN" autocomplete="off"/></div><div class="field"><label for="environment-tables">允许查询的表</label><textarea id="environment-tables" v-model="form.tables" :disabled="locked" required placeholder="每行一张表，包含 Schema；不使用通配符。"/></div></template>
+          <div class="field">
+            <div class="actions">
+              <button type="button" class="btn small" :disabled="locked" @click="yamlTableInput?.click()">用 YAML 替换已选表</button>
+              <input ref="yamlTableInput" type="file" hidden accept=".yaml,.yml" aria-label="导入 YAML 表清单" @change="importYamlSelection"/>
+              <details><summary>YAML 示例</summary><pre>tables:
+  - public.metrics
+  - public.metrics_archive</pre><small>请替换为实际 Schema 和表名。直接连接时可省略当前 Schema。</small></details>
+            </div>
+          </div>
           <section class="connection-step database-read-access" aria-labelledby="database-access-title">
             <h3 id="database-access-title">数据读取范围</h3>
             <label class="checkbox-line"><input id="database-allow-fact-data" v-model="form.allowFactData" type="checkbox" :disabled="locked" aria-describedby="database-access-hint"/>允许读取事实数据</label>

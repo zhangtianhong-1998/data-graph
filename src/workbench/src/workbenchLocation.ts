@@ -2,7 +2,7 @@ import { isDatabaseSource } from './database'
 import type { SourceConfig } from './types'
 
 export const workbenchLocationKey = 'data-graph.workbench-location'
-type Location = { projectId: string; databaseSourceId?: string | null }
+type Location = { projectId: string; databaseSourceId?: string | null; runId?: string }
 type LocationStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
 const identifier = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value)
 
@@ -17,7 +17,8 @@ export class WorkbenchLocation {
       const value: unknown = JSON.parse(raw)
       if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_location')
       const location = value as Record<string, unknown>
-      if (!identifier(location.projectId) || Object.keys(location).some(key => !['projectId', 'databaseSourceId'].includes(key))) throw new Error('invalid_location')
+      if (!identifier(location.projectId) || Object.keys(location).some(key => !['projectId', 'databaseSourceId', 'runId'].includes(key))) throw new Error('invalid_location')
+      if ('runId' in location && !identifier(location.runId)) throw new Error('invalid_location')
       if ('databaseSourceId' in location && location.databaseSourceId !== null && !identifier(location.databaseSourceId)) throw new Error('invalid_location')
       return location as Location
     } catch {
@@ -30,6 +31,7 @@ export class WorkbenchLocation {
     // Construct the payload explicitly: never serialize source objects or connection forms.
     const location: Location = { projectId: value.projectId }
     if ('databaseSourceId' in value) location.databaseSourceId = value.databaseSourceId
+    if (value.runId) location.runId = value.runId
     try { this.storage().setItem(workbenchLocationKey, JSON.stringify(location)) } catch { /* Storage can be disabled. */ }
   }
 
@@ -53,11 +55,21 @@ export class WorkbenchLocation {
   }
 
   openDatabase(projectId: string, sourceId: string | null) {
-    this.write({ projectId, databaseSourceId: sourceId })
+    this.write({ projectId, runId: this.lastRun(projectId), databaseSourceId: sourceId })
   }
 
   closeDatabase(projectId: string) {
-    if (this.read()?.projectId === projectId) this.write({ projectId })
+    if (this.read()?.projectId === projectId) this.write({ projectId, runId: this.lastRun(projectId) })
+  }
+
+  selectRun(projectId: string, runId: string) {
+    const location = this.read()
+    if (location?.projectId === projectId && location.runId !== runId) this.write({ ...location, runId })
+  }
+
+  lastRun(projectId: string) {
+    const location = this.read()
+    return location?.projectId === projectId ? location.runId : undefined
   }
 
   restoreDatabase(projectId: string, sources: readonly SourceConfig[]): { source: SourceConfig | null } | null {

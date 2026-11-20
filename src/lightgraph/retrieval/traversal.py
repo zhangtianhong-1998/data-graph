@@ -34,7 +34,7 @@ def _context_witnesses(item):
 
 def retrieve_traversal(retriever, query, scopes, *, seed_ids, business_context=None, direction='both',
                        relation_types=(), start_id=None, target_id=None, target_kind=None, via_ids=(),
-                       max_depth=12, max_nodes=80, max_edges=150, slots=()):
+                       max_depth=12, max_nodes=80, max_edges=150, slots=(), route_node_ids=None):
     """Visit every required anchor on one simple path, preserving each edge's own source.
 
     A traversal may cross distinct records of the same source. Their contexts
@@ -115,7 +115,8 @@ def retrieve_traversal(retriever, query, scopes, *, seed_ids, business_context=N
                 continue
             page = retriever.index.expand_neighborhood(
                 [current], scopes=cohorts, hops=1, direction=direction, relation_types=relation_types,
-                max_nodes=FANOUT + 1, max_edges=FANOUT, max_per_rel=FANOUT, preferred_neighbor_ids=sorted(endpoints))
+                max_nodes=FANOUT + 1, max_edges=FANOUT, max_per_rel=FANOUT, preferred_neighbor_ids=sorted(endpoints),
+                allowed_neighbor_ids=route_node_ids)
             pages[current] = page['edges']
             nodes.update(page['nodes'])
             reasons.update(page['truncation_reasons'])

@@ -76,6 +76,8 @@ const messages: Record<string, string> = {
   source_id_conflict: '来源编号已被其他来源使用，请更换编号。',
   source_id_invalid: '来源编号只能包含字母、数字、短横线和下划线。',
   read_only_transaction_unverified: '无法确认数据库只读事务，连接已停止。请检查账号和数据库设置。',
+  table_list_yaml_invalid: 'YAML 表清单格式错误。请在 tables 下逐行列出表名。',
+  database_table_list_too_large: '表清单文件过大，请减少表名后重试。',
   table_list_empty: 'Excel 中没有找到表名，请使用表名列或 Schema 与表名两列。',
   table_list_invalid: '表清单无法解析，请使用 XLSX 文件。',
   table_list_formula_forbidden: '表清单不能包含公式，请先粘贴为纯文本值。',

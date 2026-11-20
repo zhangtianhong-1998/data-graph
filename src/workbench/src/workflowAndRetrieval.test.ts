@@ -553,6 +553,16 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     }, '部分匹配的设备')
     expect(root.querySelector('.retrieval-detail-grid')?.textContent).toContain('已核实设备')
     expect(root.querySelector('.retrieval-detail-grid')?.textContent).not.toContain('部分匹配的设备')
+    await search({
+      plan: { intent: 'clarify', conditions: [], unresolved: [], excluded_terms: [], parser_fallback: 'model_interpretation_unavailable' },
+      grouping: { axis: '年代', paths: [{ node_ids: ['work', 'era'], edge_ids: ['catalog'], stop_reason: 'target_reached' }] },
+      available_context: { ...emptyContext, status: 'partial',
+        nodes: [{ id: 'work', display_name: '馆藏' }, { id: 'era', display_name: '馆藏年代' }],
+        edges: [{ id: 'catalog', source: 'era', target: 'work', relation: '分类适用于' }] },
+    }, '馆藏年代')
+    expect(root.querySelector('.retrieved-paths')?.textContent).toContain('分组候选路径')
+    expect(root.querySelector('.path-relation')?.textContent).toContain('← 分类适用于')
+    expect(root.textContent).toContain('模型未返回可用的解析结果')
     await search({ available_context: { ...emptyContext, status: 'source_text_only', passages: [passage] } }, '尚未确认对应实体')
     expect(root.querySelector('[aria-label="来源原文"]')?.textContent).toContain(passage.excerpt)
     expect(root.textContent).not.toContain('只符合部分条件')

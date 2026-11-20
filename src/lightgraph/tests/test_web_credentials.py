@@ -503,9 +503,11 @@ def test_private_worker_payload_carries_credentials_without_serializing_them_in_
     scan_no_secrets(client,'SECRET_DSN_PIPE','SECRET_KEY_PIPE')
 
 
-def test_worker_opens_sources_with_pipe_credentials_and_clears_payload(client,monkeypatch,tmp_path):
+@pytest.mark.parametrize("model_mode,metadata_only", [("in_environment", False), ("disabled", True)])
+def test_worker_opens_sources_with_pipe_credentials_and_clears_payload(client,monkeypatch,tmp_path,model_mode,metadata_only):
     from lightgraph.web.worker import execute
     config=client.app.state.workspace.resolved_config('alpha')
+    config.model.mode = model_mode
     path=client.app.state.workspace.project_path('alpha')/'runs'/'private.result.json'
     path.parent.mkdir(exist_ok=True)
     payload=_resolved_payload(config,client.app.state.workspace.project_path('alpha'),source_credentials={'db':'SECRET_PIPE_SOURCE'})
@@ -515,7 +517,7 @@ def test_worker_opens_sources_with_pipe_credentials_and_clears_payload(client,mo
         raise LightGraphError('source_scope_missing')
     monkeypatch.setattr('lightgraph.runtime.config.open_sources',opened)
     execute(payload,path)
-    assert observed==[{'metadata_only': True, 'isolate_database_failures': True,
+    assert observed==[{'metadata_only': metadata_only, 'isolate_database_failures': True,
                       'source_credentials':{'db':'SECRET_PIPE_SOURCE'}}]
     assert not payload
     assert 'SECRET_PIPE_SOURCE' not in path.read_text()

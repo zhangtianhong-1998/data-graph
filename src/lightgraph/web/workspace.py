@@ -314,9 +314,11 @@ class Workspace:
             # New workbench projects offer the local semantic service. Older
             # saved projects without embedding settings keep their existing index.
             config = RunConfig(sources=[], isolation_domain=project_id, output_dir="output",
+                               model={"mode": "in_environment"}, max_working_bytes=2048 * 1024**2,
+                               max_returned_rows=None, max_returned_bytes=None,
                                embedding={"provider": "openai_compatible", "base_url": "http://127.0.0.1:8002/v1",
                                           "model": "Qwen/Qwen3-Embedding-0.6B",
-                                          "query_instruction": "Given a business question, retrieve relevant graph entities."},
+                                          "query_instruction": "Given a question, retrieve graph entities relevant to its objects, constraints and requested relationships."},
                                goal={"purpose": "", "entity_kinds": [], "relation_kinds": []}).model_dump(mode="json")
             self._write_config(project_id, config)
             return self.get(project_id)
