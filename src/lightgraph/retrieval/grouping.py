@@ -6,6 +6,7 @@ import re
 from .dimensional import empty_answer
 from .intent import _ACTION, _EDGE_DIRECTIONS, _NEG, _PATH_OPERATION, _PREDICATE
 from .retriever import is_literal_span
+from .path_evidence import PathCollection, witness_names, matches_operand
 from .semantic_grounding import link_mentions
 from .store_sqlite import normalize_term
 from .traversal import retrieve_traversal
@@ -56,31 +57,10 @@ def grouping_spans(focus, slots):
     return None
 
 
-def _witness_names(node):
-    for obs in node['observations']:
-        for value in (obs.get('label'), obs.get('english_name'), *(obs.get('aliases') or [])):
-            if isinstance(value, str):
-                yield normalize_term(value)
-
-
-def _contains_axis(node, axis):
+def _contains_axis(names, axis):
     word = normalize_term(axis)
-    return any(is_literal_span(name, *match.span()) for name in _witness_names(node)
+    return any(is_literal_span(name, *match.span()) for name in names
                for match in re.finditer(re.escape(word), name))
-
-
-def _merge_proofs(collection, incoming):
-    for identity, item in incoming.items():
-        existing = collection.get(identity)
-        if existing is None:
-            collection[identity] = item
-        else:
-            for field in ('source_tables', 'evidence_refs'):
-                if field in item:
-                    existing[field] = sorted(set(existing[field]) | set(item[field]))
-            for obs in item['observations']:
-                if obs not in existing['observations']:
-                    existing['observations'].append(obs)
 
 
 def retrieve_grouping(retriever, request, scopes, plan):
@@ -107,27 +87,29 @@ def retrieve_grouping(retriever, request, scopes, plan):
     if grammar != (subject, axis, []):
         filters = list(dict.fromkeys([*filters, *plan.get('unverified_predicates', [])]))
     bound = next((s for s in slots if normalize_term(s['text']) == normalize_term(subject)), None)
-    if not bound or len(bound['candidates']) != 1 or len(axis) > 120:
+    if not bound or not bound['candidates'] or len(axis) > 120:
         return None
-    seed = bound['candidates'][0]['node_id']
+    seeds = [c['node_id'] for c in bound['candidates']]
     cohorts = retriever.authorized_cohorts(scopes, plan['business_context'])
     # Filter by adjacency before limiting candidates: the exact label may
     # belong to a separate catalog while nearby axes use more specific labels.
+    collection = PathCollection(request)
+    reasons = collection.truncation
     limit = 16
-    search = dict(scopes=cohorts, limit=limit + 1, max_depth=request.max_depth)
-    routes = retriever.index.grouping_routes(seed, axis, **search)
-    if not routes:
+    search = dict(scopes=cohorts, limit=limit + 1, max_depth=request.max_depth,
+                  subject_term=subject if bound.get('match') == 'exact' else None, truncation=reasons)
+    routes = retriever.index.grouping_routes(seeds, axis, **search)
+    if not routes and not reasons:
         suggestions, = link_mentions(retriever, [axis], cohorts,
                                      paraphrases={axis: plan.get('grouping_names', [])})
         related = [item['node_id'] for item in suggestions['candidates']]
         if related:
-            routes = retriever.index.grouping_routes(seed, axis, suggested_ids=related, **search)
-    nodes, edges, choices = {}, {}, []
-    reasons = set()
+            routes = retriever.index.grouping_routes(seeds, axis, suggested_ids=related, **search)
+    choices = []
     if len(routes) > limit:
         reasons.add('grouping_candidate_limit')
     for route in routes[:limit]:
-        target, bridge = route['target'], route['bridge']
+        seed, target, bridge = route['seed'], route['target'], route['bridge']
         chain = [seed, *([bridge] if bridge else []), target]
         proof = retrieve_traversal(retriever, request.query, scopes, seed_ids=[seed], start_id=seed,
             business_context=plan['business_context'], via_ids=chain[1:-1], target_id=target,
@@ -139,26 +121,26 @@ def retrieve_grouping(retriever, request, scopes, plan):
             continue
         # Preserve complete alternatives under the caller's total output budget.
         route_nodes = {n['id']: n for n in proof['nodes']}
-        if route['rank'] != 2 and not _contains_axis(route_nodes[target], axis):
+        target_node = route_nodes[target]
+        axis_names = [normalize_term(target_node['kind'])] if route['rank'] == 2 else witness_names(target_node)
+        if route['rank'] < 3 and not _contains_axis(axis_names, axis):
             continue
-        if bound.get('match') == 'exact' and normalize_term(subject) not in set(_witness_names(route_nodes[seed])):
+        if bound.get('match') == 'exact' and not matches_operand(route_nodes[seed], normalize_term(subject)):
             continue
-        route_edges = {e['id']: e for e in proof['edges']}
-        if len(nodes.keys() | route_nodes.keys()) > request.max_nodes or len(edges.keys() | route_edges.keys()) > request.max_edges:
-            reasons.add('output_limit')
+        if not collection.add(proof):
             continue
-        _merge_proofs(nodes, route_nodes)
-        _merge_proofs(edges, route_edges)
-        choices.append({**paths[0], 'target_id': target,
-                        'match': 'semantic_candidate' if route['rank'] == 2 else 'published_name'})
+        choices.append({**paths[0], 'subject_id': seed, 'target_id': target,
+                        'match': ('published_name', 'published_name', 'published_type', 'semantic_candidate')[route['rank']]})
     # A weak bare prefix can be the first syllable of a noun. If nothing in
     # the visible graph supports that reading, keep the original interpretation.
-    if (not choices and not plan.get('grouping_spans') and plan['focus'].startswith('分' + axis + '的')
+    if (not choices and not reasons and not plan.get('grouping_spans') and plan['focus'].startswith('分' + axis + '的')
             and not _VALUE_REQUEST.search(plan['focus']) and not any(s['text'] == axis for s in slots)):
         return None
     # Unbound terms from the original planner may include the grouping syntax
     # itself. Preserve every residual filter verbatim, even when it names a node.
     message = f'请确认“{axis}”采用哪种分组口径。以下是图中已有的关联，分组适用性仍待核实。'
+    if choices and len(seeds) > 1:
+        message = f'“{subject}”对应多个对象。请根据下列路径确认所指对象和“{axis}”的分组口径。'
     if not choices:
         message = f'识别到分组条件“{axis}”，在当前范围和查询上限内没有核实相应路径。'
     issues = [message, *[f'尚未核实限定条件“{text}”。' for text in filters]]
@@ -169,14 +151,15 @@ def retrieve_grouping(retriever, request, scopes, plan):
     answer = empty_answer(request.query, scopes, plan)
     detail = {'subject': subject, 'axis': axis, 'paths': choices, 'filters': filters,
               'searched_depth': min(2, request.max_depth), 'value_status': 'not_computed', 'grouping_applicability': 'unverified', 'path_semantics': 'published_associations'}
-    visible_nodes, visible_edges = list(nodes.values()), list(edges.values())
+    visible_nodes, visible_edges = list(collection.nodes.values()), list(collection.edges.values())
     answer.update(grouping=detail, truncated=bool(reasons), truncation_reasons=sorted(reasons))
     if filters or not choices:
         # A region or other independent filter can be a confirmed object even
         # when no visible record jointly supports it and the grouping path.
-        ids = [seed, *[slot['candidates'][0]['node_id'] for slot in filter_slots if len(slot['candidates']) == 1]]
+        ids = list(seeds) if len(seeds) == 1 else []
+        ids.extend(slot['candidates'][0]['node_id'] for slot in filter_slots if len(slot['candidates']) == 1)
         for nid, label in retriever.index.authorized_labels(ids, scopes=cohorts).items():
-            if nid not in nodes:
+            if nid not in collection.nodes:
                 if len(visible_nodes) >= request.max_nodes:
                     reasons.add('output_limit')
                     break
@@ -185,5 +168,5 @@ def retrieve_grouping(retriever, request, scopes, plan):
         answer['available_context'] = {'status': 'partial', 'nodes': visible_nodes, 'edges': visible_edges,
                                        'witnesses': [], 'passages': [], 'truncated': bool(reasons)}
     else:
-        answer.update(nodes=visible_nodes, edges=visible_edges, connected_components=[list(nodes)])
+        answer.update(nodes=visible_nodes, edges=visible_edges, connected_components=[sorted(c) for c in collection.components])
     return answer

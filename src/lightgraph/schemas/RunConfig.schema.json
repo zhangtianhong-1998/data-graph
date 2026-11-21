@@ -48,7 +48,7 @@
           "type": "boolean"
         },
         "timeout_seconds": {
-          "default": 30.0,
+          "default": 120.0,
           "exclusiveMinimum": 0,
           "title": "Timeout Seconds",
           "type": "number"

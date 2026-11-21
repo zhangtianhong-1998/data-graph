@@ -4,6 +4,21 @@ import { clearSessions, ensureSession, request } from './api'
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); clearSessions() })
 
 describe('request feedback', () => {
+  it('keeps one long retrieval request open until the caller stops waiting', async () => {
+    vi.useFakeTimers()
+    const caller = new AbortController()
+    const fetcher = vi.fn((_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')))
+    }))
+    vi.stubGlobal('fetch', fetcher)
+    const result = expect(request('/projects/test/retrieval/query', { method: 'POST', signal: caller.signal, timeoutMs: null }))
+      .rejects.toMatchObject({ code: 'request_cancelled' })
+    await vi.advanceTimersByTimeAsync(180000)
+    expect(fetcher.mock.calls[0]![1].signal.aborted).toBe(false)
+    caller.abort()
+    await result
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  })
   it('stops waiting on a stalled request and reports a timeout', async () => {
     vi.useFakeTimers()
     let signal: AbortSignal | undefined

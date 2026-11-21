@@ -1,4 +1,5 @@
 """Compose scoped retrieval primitives according to the grounded user request."""
+from .association import retrieve_associations
 from .dimensional import empty_answer, retrieve_dimensional
 from .grouping import retrieve_grouping
 from .drilldown import retrieve_drilldown
@@ -176,6 +177,11 @@ def retrieve_planned(retriever, request, scopes):
         candidates = [c['node_id'] for s in slots for c in s['candidates']]
         residual = _residuals(plan['focus'], slots, plan['requested_level']) if plan['parser'] == 'index' else []
         if slots and not residual:
+            association_limits = set()
+            if request.mode == 'auto' and not plan.get('scope_unresolved') and not plan['unresolved']:
+                linked = retrieve_associations(retriever, request, scopes, plan, association_limits)
+                if linked is not None:
+                    return linked
             single_anchor = len(slots) == len(candidates) == 1
             hops = int(single_anchor and not plan['point_only'])
             if single_anchor:
@@ -188,6 +194,9 @@ def retrieve_planned(retriever, request, scopes):
                                         hops=hops, max_per_rel=3,
                                         max_nodes=min(12, request.max_nodes) if hops else request.max_nodes,
                                         max_edges=min(16, request.max_edges) if hops else request.max_edges)
+            if association_limits:
+                answer['truncated'] = True
+                answer['truncation_reasons'] = sorted(set(answer['truncation_reasons']) | association_limits)
         else:
             plan['unbound_mentions'].extend({'text': text, 'reason': 'unparsed'} for text in (residual or [plan['focus']]))
             return _available_context(retriever, request, scopes, plan)

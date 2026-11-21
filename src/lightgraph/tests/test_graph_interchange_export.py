@@ -28,6 +28,10 @@ def test_json_and_graphml_preserve_parallel_edge_identity_and_witnesses():
     entities = {node['id']: node for node in kg['entities']}
     assert set(entities) == {'m', 'common', 'global2'}
     assert entities['common']['properties']['observed'] == ['common', 'm_fact']
+    node = entities['common']
+    assert node['metadata']['type_family'] == node['type']
+    assert {(c['status'], c['dimensions'].get('project')) for c in node['metadata']['applicability']} == {
+        ('scoped', 'M'), ('global', None)}
     edges = {edge['id']: edge for edge in kg['relationships']}
     assert edges['观察 2']['source'] == edges['m_common']['source'] == 'm'
     assert edges['观察 2']['target'] == edges['m_common']['target'] == 'common'
@@ -81,3 +85,16 @@ def test_export_api_pins_version_and_applies_project_and_access_scopes(tmp_path)
         current_config['scopes'] = []
         workspace._write_config('p', current_config)
         assert client.get(path, params={'version':old}).json()['entities'] == []
+
+
+def test_export_and_detail_share_a_language_neutral_name_and_preserve_source_spelling():
+    from lightgraph.construction.node_standardizer import standardize_node_details
+
+    node = {'id': '0003', 'type': 'Object_variant', 'original_type': 'Object', 'display_label': '   ',
+            'label': ' North hall  ', 'supports': [{'scope_ref': 'public', 'label': ' North hall  '}]}
+    kg = json.loads(serialize_graph({'nodes': [node], 'edges': []}, 'semantica-json'))
+    entity, = kg['entities']
+    assert entity['name'] == standardize_node_details(node)['name'] == 'North hall'
+    assert entity['metadata']['type_family'] == 'Object'
+    assert entity['metadata']['supports'][0]['label'] == ' North hall  '
+    assert entity['id'] == '0003'

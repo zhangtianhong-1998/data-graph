@@ -7,6 +7,7 @@ from typing import Any
 
 from lightgraph.contracts import canonical
 from .contexts import support_business_context, normalize_business_context
+from .display import entity_name
 
 _SOURCE_KIND_LABELS = {
     'gauss_database': 'GaussDB',
@@ -76,8 +77,8 @@ def standardize_node_details(
     })
     if not source_labels and label_origin == 'source' and isinstance(node.get('label'), str) and node['label'].strip():
         source_labels = [node['label'].strip()]
-    display_source = node.get('display_label')
-    chinese_name = display_source if display_source in source_labels else next(iter(source_labels), None)
+    display_name = entity_name(node)
+    source_name = display_name if display_name in source_labels else next(iter(source_labels), None)
 
     explicit_english = sorted({
         str(s['english_name']).strip()
@@ -87,8 +88,6 @@ def standardize_node_details(
     # Never guess English names from legacy aliases when english_name_column was not mapped.
     english_name = explicit_english[0] if explicit_english else None
     english_name_status = 'mapped' if english_name is not None else 'unknown'
-
-    display_name = str(node.get('display_label') or node.get('label') or node.get('name') or node.get('id') or '')
 
     # Separate node business description from physical catalog table/column comments.
     row_descriptions = sorted({
@@ -263,8 +262,11 @@ def standardize_node_details(
     return {
         'id': node.get('id'),
         'kind': entity_type,
+        'type_family': node.get('original_type') or entity_def.get('original_type') or entity_type,
+        'name': display_name,
         'status': node.get('status', 'accepted'),
-        'chinese_name': chinese_name,
+        'source_name': source_name,
+        'chinese_name': source_name,  # Legacy API name for the mapped primary label.
         'english_name': english_name,
         'english_name_status': english_name_status,
         'display_name': display_name,

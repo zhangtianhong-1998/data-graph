@@ -181,6 +181,9 @@ def test_retrieval_web_endpoints_and_cli(tmp_path, monkeypatch):
         body = q_resp.json()
         assert {n['display_name'] for n in body['nodes']} == {'营业收入', '净利润'}
         route = '/api/projects/ret_p/retrieval/query'
+        assert 'sql_preview' not in body and body['agent_context']['question'] == '营业收入和净利润'
+        preview = client.post(route + '?sql_preview=true', json={'query': '营业收入'}).json()
+        assert preview['agent_context']['nodes'] and preview['sql_preview']['status'] in {'unavailable', 'insufficient_context'}
         revenue = client.post(route, json={'query': '营业收入', 'field': 'name', 'method': 'keyword', 'hops': 0})
         assert revenue.status_code == 200
         nid, = [n['id'] for n in revenue.json()['nodes']]

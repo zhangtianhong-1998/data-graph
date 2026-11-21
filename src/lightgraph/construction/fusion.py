@@ -50,6 +50,33 @@ def relation_identity(edge):
     return 'r_' + digest(*parts)
 
 
+def remap_graph_endpoints(graph, remap, *, self_contained):
+    """Rewrite only local references; inherited lookup IDs belong to the base graph."""
+    if not remap:
+        return
+    for pending in graph.get('unresolved_relations', []):
+        pending['candidate_endpoints'] = {
+            end: sorted({remap.get(nid, nid) for nid in ids})
+            for end, ids in pending.get('candidate_endpoints', {}).items()}
+        pending['node_ids'] = sorted({remap.get(nid, nid) for nid in pending.get('node_ids', [])})
+    for edge in graph.get('edges', []):
+        changed = False
+        for end in ('source', 'target'):
+            old = edge[end]
+            if old not in remap or remap[old] == old:
+                continue
+            inherited = [match for support in edge.get('supports', []) for match in support.get('lookup_matches', [])
+                         if match.get('endpoint') == end and match.get('inherited_node_id') == old]
+            if inherited and not self_contained:
+                continue
+            edge[end] = remap[old]
+            for match in inherited:
+                match['inherited_node_id'] = edge[end]
+            changed = True
+        if changed:
+            edge['id'] = relation_identity(edge)
+
+
 def retain_definition_variants(graphs, *, self_contained=None):
     """Keep incompatible contracts as stable local variants, preserving all facts.
 
@@ -120,37 +147,17 @@ def retain_definition_variants(graphs, *, self_contained=None):
                     remaps[index][previous_id] = item['id']
                 elif category == 'relations' and previous_type != variant_type:
                     item['id'] = relation_identity(item)
-            for pending in graph.get('unresolved_relations', []):
-                if category == 'relations' and pending.get('type') in aliases:
-                    variant_type, family, variant = aliases[pending['type']]
-                    pending.update(type=variant_type, original_type=family, definition_variant=deepcopy(variant))
-                if category == 'entities':
-                    pending['candidate_endpoints'] = {
-                        key: sorted({remaps[index].get(nid, nid) for nid in values})
-                        for key, values in pending.get('candidate_endpoints', {}).items()}
-                    pending['node_ids'] = sorted({remaps[index].get(nid, nid) for nid in pending.get('node_ids', [])})
-            if category == 'entities':
+            if category == 'relations':
+                for pending in graph.get('unresolved_relations', []):
+                    if pending.get('type') in aliases:
+                        variant_type, family, variant = aliases[pending['type']]
+                        pending.update(type=variant_type, original_type=family, definition_variant=deepcopy(variant))
+            else:
                 for definition in graph.get('definitions', {}).get('relations', []):
                     for endpoint in ('source_type', 'target_type'):
                         if definition.get(endpoint) in aliases:
                             definition[endpoint] = aliases[definition[endpoint]][0]
-                for edge in graph.get('edges', []):
-                    changed = False
-                    for endpoint in ('source', 'target'):
-                        previous = edge[endpoint]
-                        inherited = any(match.get('endpoint') == endpoint
-                                        and match.get('inherited_node_id') == previous
-                                        for support in edge.get('supports', [])
-                                        for match in support.get('lookup_matches', []))
-                        if previous in remaps[index] and (self_contained[index] or not inherited):
-                            edge[endpoint] = remaps[index][previous]
-                            changed = True
-                            for support in edge.get('supports', []):
-                                for match in support.get('lookup_matches', []):
-                                    if match.get('endpoint') == endpoint and match.get('inherited_node_id') == previous:
-                                        match['inherited_node_id'] = edge[endpoint]
-                    if changed:
-                        edge['id'] = relation_identity(edge)
+                remap_graph_endpoints(graph, remaps[index], self_contained=self_contained[index])
     for graph in graphs:
         for edge in graph.get('edges', []):
             if edge.get('business_context'):

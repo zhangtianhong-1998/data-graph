@@ -45,7 +45,8 @@ if mode != 'missing':
     manifest = ws._manifest()
     manifest['current_graph'] = {'context_fingerprint': 'ctx', 'path': ws._append_record('published', graph)}
     ws._save_manifest(manifest)
-result.write_text(json.dumps({'status': status, 'error_code': code, 'report': {'issues': issues}, 'cleanup_status': 'completed'}))
+result.write_text(json.dumps({'status': status, 'error_code': code, 'report': {'issues': issues,
+    'counts': {'llm_calls': 7 if node == 'merge' else 3}}, 'cleanup_status': 'completed'}))
 """
 
 
@@ -78,6 +79,8 @@ def test_partial_promotion_and_pinned_recovery(workflow):
     assert origin['status'] == 'partial', state
     assert state['merge']['nodes'] == 3 and state['merge']['conflict_isolation']['coverage'] == 'incomplete'
     assert state['merge']['publication_status'] == 'published'
+    assert [state['units'][node]['model_calls'] for node in ('a', 'b')] == [3, 3]
+    assert state['merge_nodes']['merge']['model_calls'] == 7
     full = state['artifacts']['merge']
     assert full['graph_kind'] == 'node_full'
     out = Path(config.output_dir)
@@ -88,6 +91,8 @@ def test_partial_promotion_and_pinned_recovery(workflow):
     second = manager.resume('alpha', origin['run_id'], action='publish_artifact', artifact_id=full['artifact_id'])
     published = wait_run(manager, 'alpha', second['run_id'])
     assert published['status'] == 'partial'
+    assert all(node['model_calls'] == 0 for node in published['workflow_state']['units'].values())
+    assert published['workflow_state']['merge_nodes']['merge']['model_calls'] == 0
     assert published['workflow_state']['merge']['published_artifact_id'] == full['artifact_id']
     assert set(project.glob('started-*')) == before
     assert (out / 'workflow-runs' / (origin['run_id'] + '.json')).read_bytes() == original
@@ -105,6 +110,7 @@ def test_partial_promotion_and_pinned_recovery(workflow):
         assert run['workflow_state']['merge']['status'] == 'skipped'
         assert run['workflow_state']['merge']['publication_status'] == 'retained_previous'
         assert read_internal_yaml(out / 'construction' / 'manifest.yaml')['current_graph'] == previous_head
+
 
     # Node-level compatibility allows switching only the merge mode/budget or
     # rearranging the canvas, even after activating another output generation.
@@ -126,6 +132,31 @@ def test_partial_promotion_and_pinned_recovery(workflow):
     with pytest.raises(LightGraphError, match='workflow_resume_input_changed'):
         manager.resume('alpha', origin['run_id'], from_node_id='merge')
     assert len(list(project.glob('started-*'))) == len(workers)
+
+
+def test_live_workflow_worker_counts_use_each_child_snapshot(workflow):
+    from lightgraph.construction.workflow import save_workflow_state
+    from lightgraph.runtime.progress import RunProgress
+
+    manager, project, config = workflow
+    runs = project / 'runs'
+    runs.mkdir(exist_ok=True)
+    parent, first, second = ['run_' + char * 24 for char in 'abc']
+    state = {'parent_run_id': parent, 'units': {
+        'a': {'run_id': first, 'status': 'running'},
+        'b': {'run_id': second, 'status': 'running'}},
+        'merge_nodes': {'merge': {'merge_mode': 'deterministic', 'status': 'queued'}}}
+    save_workflow_state(config.output_dir, state)
+    (runs / (parent + '.json')).write_text(json.dumps({
+        'run_id': parent, 'workflow': True, 'status': 'running', 'output_path': 'output'}))
+    for child, calls in ((first, 21), (second, 5)):
+        RunProgress(runs / (child + '.progress.json'))({
+            'stage': 'discovery', 'code': 'model_call_started', 'counters': {'model_calls': calls}})
+
+    for result in [manager.get('alpha', parent)['workflow_state'], manager.workflow_status('alpha')['state']]:
+        assert [node['model_calls'] for node in result['units'].values()] == [21, 5]
+        assert result['merge_nodes']['merge']['model_calls'] == 0
+    assert 'model_calls' not in load_workflow_state(config.output_dir)['units']['a']
 
 
 @pytest.mark.parametrize('transient', [True, False])

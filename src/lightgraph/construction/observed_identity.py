@@ -20,6 +20,7 @@ class _Projection:
     definition: dict
     family: str
     roles: set
+    endpoint_roles: set
     entries: list
     bindings: set
     complete: bool
@@ -33,7 +34,7 @@ def _physical_source(provenance):
 
 def _relation_roles(graph):
     """A coincident key/name projection can describe separate roles, e.g. buyer and seller."""
-    roles = defaultdict(set)
+    roles, endpoint_roles = defaultdict(set), defaultdict(set)
     definitions = {item['type']: item for item in graph.get('definitions', {}).get('relations', [])}
     for edge in graph.get('edges', []):
         relation = definitions.get(edge['type'], {})
@@ -48,8 +49,13 @@ def _relation_roles(graph):
                          prov.get('predicate'), prov.get('constant_properties'),
                          prov.get('source_lookup'), prov.get('target_lookup')]
             for end in ('source', 'target'):
-                roles[relation.get(end + '_type')].add(digest(end, signature))
-    return roles
+                entity_type = relation.get(end + '_type')
+                roles[entity_type].add(digest(end, signature))
+                # A draft can attach a new relation to the very same object.
+                # Only this end's binding identifies its role in such a relation.
+                endpoint_roles[entity_type].add(digest(end, source, prov[end + '_key_columns'],
+                                                       prov.get(end + '_lookup')))
+    return roles, endpoint_roles
 
 
 def _node_evidence(node, definition):
@@ -69,11 +75,12 @@ def _node_evidence(node, definition):
         source = _physical_source(prov)
         columns = prov.get('key_columns') or []
         context = support.get('business_context') or {}
-        if (support.get('inherited_from') or not source or not prov.get('label_column')
+        label_column = prov.get('label_column')
+        if (support.get('inherited_from') or not source or (support.get('label') is not None and not label_column)
                 or len(columns) != len(names) or len(set(columns)) != len(columns)
                 or not support.get('scope_ref') or context.get('conflicts') or context.get('missing_dimensions')):
             return None
-        binding = digest(source, columns, prov['label_column'], prov.get('predicate'),
+        binding = digest(source, columns, label_column, prov.get('predicate'),
                          prov.get('constant_properties'), prov.get('scope_columns', []))
         facts = business_context_identity(support)
         if definition.get('identity_scope') == 'scoped':
@@ -105,6 +112,26 @@ def _node_evidence(node, definition):
         # facts belong to M, K, or a globally reusable business entity.
         applicability.add(canonical({'unknown_bindings': sorted({binding for binding, _ in observations})}))
     return tuple(sorted(observations)), canonical(values), tuple(sorted(applicability))
+
+
+def align_draft_nodes(graphs, excluded_types):
+    """Recognize additional source-backed aliases in an existing local namespace.
+
+    Keep established IDs when several drafts already use the same local
+    identity contract. Each support still carries its independent ACL and
+    applicability; cross-draft topology checks must see the shared endpoint.
+    """
+    inputs = [(graph.get('draft_id', ''), 'draft', graph) for graph in graphs]
+    overrides, _ = align_observed_nodes(inputs, local_bases=set(), excluded_types=excluded_types, emit_candidates=False)
+    origins_by_target = defaultdict(set)
+    for remap in overrides:
+        for original, target in remap.items():
+            origins_by_target[target].add(original)
+    for remap in overrides:
+        for original, target in remap.items():
+            if origins_by_target[target] == {original}:
+                remap[original] = original
+    return overrides
 
 
 def _overlapping_types(by_contract):
@@ -149,7 +176,7 @@ def align_observed_nodes(prepared, *, local_bases, excluded_types, emit_candidat
         nodes_by_type = defaultdict(list)
         for node in graph.get('nodes', []):
             nodes_by_type[node['type']].append(node)
-        roles = _relation_roles(graph)
+        roles, endpoint_roles = _relation_roles(graph)
         for definition in graph.get('definitions', {}).get('entities', []):
             name = definition['type']
             type_owners[name].add(index)
@@ -174,7 +201,8 @@ def align_observed_nodes(prepared, *, local_bases, excluded_types, emit_candidat
             shape['context_positions'] = [key_names.index(key) for key in shape['identity_context_keys']]
             bindings = {binding for _, (facts, _, _) in entries for binding, _ in facts}
             groups[canonical(shape)].append(
-                _Projection(index, definition, family, roles[name], entries, bindings, len(entries) == len(nodes)))
+                _Projection(index, definition, family, roles[name], endpoint_roles[name], entries, bindings,
+                            len(entries) == len(nodes)))
 
     for contract, members in _overlapping_types(groups):
         for peers in _compatible_roles(members):
@@ -186,7 +214,13 @@ def align_observed_nodes(prepared, *, local_bases, excluded_types, emit_candidat
 def _compatible_roles(members):
     """Different logical names need corroboration from the same directed relationship role."""
     known = [entry.roles for entry in members if entry.roles]
-    if len({entry.family for entry in members}) == 1 and (not known or set.intersection(*known)):
+    if len({entry.family for entry in members}) == 1:
+        endpoints = [entry.endpoint_roles for entry in members if entry.endpoint_roles]
+        if not endpoints or set.intersection(*endpoints):
+            return [members]
+    elif len(known) == len(members) and set.intersection(*known):
+        # A shared directed role is positive alias evidence even if a branch
+        # contributes additional relationships that were absent in its peers.
         return [members]
     partitions = defaultdict(list)
     for entry in members:

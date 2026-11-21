@@ -84,6 +84,7 @@ const internalHttpEndpoint = computed(() => {
     return url.protocol === 'http:' && !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(url.hostname)
   } catch { return false }
 })
+const defaultEmbeddingTimeout = 120
 const embedding = ref<EmbeddingConfig>({})
 const embeddingKey = ref('')
 const embeddingCredStatus = ref<{ embedding: boolean; embedding_error?: string; embedding_environment?: boolean }>({ embedding: false })
@@ -309,6 +310,7 @@ async function loadProject(id: string) {
   workbenchLocation.selectProject(id)
   const epoch = ++generation
   graphController?.abort()
+  embeddingTesting.value = false
   clearTimeout(pollTimer); loading.value = true; error.value = ''; selectedRun.value = null; runPollError.value = null; preview.value = null; bindingFile.value = null; databaseOpen.value = false; modelKey.value = ''; embeddingKey.value = ''; embeddingCredStatus.value = { embedding: false }; embeddingTestResult.value = null; workflowRunStatus.value = null; retrievalStatus.value = null; credentials.value = { database_sources: [], model: false }
   const p = projectPath(id)
   try {
@@ -481,31 +483,37 @@ async function clearEmbeddingCredential() {
   })
 }
 async function testEmbeddingEndpoint() {
+  if (embeddingTesting.value || !project.value) return
+  const epoch = generation
+  const pid = project.value.project_id
   embeddingTesting.value = true
   error.value = ''
   embeddingTestResult.value = null
   try {
-    const pid = project.value!.project_id
     await ensureSession(pid)
+    if (generation !== epoch) return
+    const timeout = embedding.value.timeout_seconds ?? defaultEmbeddingTimeout
     const payload: Record<string, unknown> = {
       provider: embedding.value.provider || 'local_hash',
       base_url: embedding.value.base_url || '',
       model: embedding.value.model || '',
       api_key_env: embedding.value.api_key_env || 'LIGHTGRAPH_EMBEDDING_API_KEY',
       allow_insecure_http: !!embedding.value.allow_insecure_http,
-      timeout_seconds: embedding.value.timeout_seconds || 30,
+      timeout_seconds: timeout,
       dimensions: embedding.value.dimensions ?? null,
       query_instruction: embedding.value.query_instruction || '',
     }
     if (embeddingKey.value) payload.api_key = embeddingKey.value
-    embeddingTestResult.value = await request(`${path.value}/retrieval/embedding/test`, {
+    const result = await request<NonNullable<typeof embeddingTestResult.value>>(`${projectPath(pid)}/retrieval/embedding/test`, {
+      timeoutMs: Math.min(2 ** 31 - 1, (timeout + 10) * 1000),
       method: 'POST',
       body: json(payload),
     })
+    if (generation === epoch) embeddingTestResult.value = result
   } catch (exception) {
-    report(exception)
+    if (generation === epoch) report(exception)
   } finally {
-    embeddingTesting.value = false
+    if (generation === epoch) embeddingTesting.value = false
   }
 }
 function fillQwenEmbeddingPreset() {
@@ -517,7 +525,7 @@ function fillQwenEmbeddingPreset() {
     dimensions: null,
     allow_insecure_http: false,
     batch_size: embedding.value.batch_size || 32,
-    timeout_seconds: embedding.value.timeout_seconds || 30,
+    timeout_seconds: embedding.value.timeout_seconds ?? defaultEmbeddingTimeout,
     query_instruction: 'Given a question, retrieve graph entities relevant to its objects, constraints and requested relationships.',
   }
 }
@@ -915,7 +923,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
               <div class="panel-body">
                 <div class="table-scroll">
                   <table>
-                    <thead><tr><th>节点</th><th>类型</th><th>状态</th><th>节点数</th><th>关系数</th><th>子运行编号</th><th>说明</th><th>操作</th></tr></thead>
+                    <thead><tr><th>节点</th><th>类型</th><th>状态</th><th>节点数</th><th>关系数</th><th>本轮 LLM 调用</th><th>子运行编号</th><th>说明</th><th>操作</th></tr></thead>
                     <tbody>
                       <tr v-for="u in Object.values(visibleWorkflowState?.units || {})" :key="u.unit_id">
                         <td><strong>{{ u.label || u.unit_id }}</strong> <span class="mono muted">{{ u.unit_id }}</span></td>
@@ -923,6 +931,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
                         <td><span class="badge" :class="u.status === 'completed' ? 'green' : u.status === 'failed' ? 'red' : 'blue'">{{ u.status }}</span></td>
                         <td>{{ u.nodes ?? 0 }}</td>
                         <td>{{ u.edges ?? 0 }}</td>
+                        <td>{{ u.model_calls ?? '—' }}</td>
                         <td class="mono">{{ u.run_id || '—' }}</td>
                         <td>{{ u.error_code ? new ApiError(u.error_code).message : '正常' }}
                           <div v-if="u.failure_detail" class="field-hint">{{ workflowFailureLabel(u.failure_detail) }}</div>
@@ -935,6 +944,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
                         <td><span class="badge" :class="m.status === 'completed' ? 'green' : m.status === 'failed' ? 'red' : 'blue'">{{ m.status }}</span></td>
                         <td>{{ m.nodes ?? 0 }}</td>
                         <td>{{ m.edges ?? 0 }}</td>
+                        <td>{{ m.model_calls ?? '—' }}</td>
                         <td class="mono">{{ m.run_id || '—' }}</td>
                         <td>{{ m.error_code ? new ApiError(m.error_code).message : '正常' }}
                           <div v-if="m.failure_detail" class="field-hint">{{ workflowFailureLabel(m.failure_detail) }}</div>
@@ -1025,7 +1035,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
       </div>
       <div class="field">
         <label for="embedding-timeout">单批请求超时（秒）</label>
-        <input id="embedding-timeout" type="number" min="1" step="any" :value="embedding.timeout_seconds ?? 30" :disabled="locked" @input="embedding.timeout_seconds = ($event.target as HTMLInputElement).value === '' ? 30 : Number(($event.target as HTMLInputElement).value)"/>
+        <input id="embedding-timeout" type="number" min="1" step="any" :value="embedding.timeout_seconds ?? defaultEmbeddingTimeout" :disabled="locked" @input="embedding.timeout_seconds = ($event.target as HTMLInputElement).value === '' ? defaultEmbeddingTimeout : Number(($event.target as HTMLInputElement).value)"/>
       </div>
     </div>
     <label v-if="internalEmbeddingHttp" class="checkbox-line">

@@ -77,7 +77,11 @@ lightgraph embed-server --model Qwen/Qwen3-Embedding-0.6B --port 8002
 {"query":"从山行札记到天象录有哪些关联路径？"}
 ```
 
-系统先识别原文提到的对象和限制，再到用户有权查看的图中核对。问句没有限定项目、版本或其他范围时，系统沿用当前授权视图。节点和关系都可以用 `applicability` 声明适用范围，例如按版本区分同一部作品的引用。已有映射的 `business_context` 写法仍可使用。启用有权处理问句的对话模型后，模型只收到问题和待核对的原文片段。没有可用的对话模型时，仍可按名称、别名、编码和简短的查询指令检索，复杂条件可能需要确认。
+系统先识别原文提到的对象和限制，再到用户有权查看的图中核对。问句没有限定项目、版本或其他范围时，系统沿用当前授权视图。节点和关系都可以用 `applicability` 声明适用范围，例如按版本区分同一部作品的引用。已有映射的 `business_context` 写法仍可使用。解析问句时，对话模型只收到问题和待核对的原文片段。没有可用的对话模型时，仍可按名称、别名、编码和简短的查询指令检索，复杂条件可能需要确认。
+
+自然语言检索结果包含 `agent_context`。展开「查看 Agent 上下文」可核对本次使用的节点、关系方向、适用范围、来源表列、待确认条件和截断标记。关联路径与共同事实记录分别列出，方便下游 Agent 判断每段证据能支持什么。
+
+在「子图召回」输入问题，点击「召回并试写 SQL」，工作台会把同一次召回的上下文交给独立的 DSH 会话。接口为 `POST /api/projects/{pid}/retrieval/query?sql_preview=true`，请求体使用原有的 `{"query":"原始问题"}`。DSH 使用项目抽取模型，工具列表为空。工作台只在本地检查 SQL 语法和召回到的 Gauss/MySQL 表列，返回草稿，不连接业务数据库。缺少物理表列或存在影响 SQL 的未决口径时，可返回缺失依据。普通检索不会触发 SQL 试写。
 
 “这两部作品怎样联系”会查找有逐条来源依据的多跳路径，一条路径可以经过多条记录。问“哪些作品在同一份目录中同时出现”则需要一条共同记录或可核验的关联键。问“沿哪些层级找到子项”使用关系定义声明的父子方向。这三类问题所需的证据不同。HTTP 接口也接受 `mode: "traverse"` 显式查询关联路径，可指定起点、终点、方向或关系类型。
 
@@ -121,7 +125,7 @@ tables:
 
 构建结果可选“生成实例图谱”或“仅生成结构与映射”（`construction_target: structure`）。结构检查不查询事实数据，也不证明实例关系或业务语义成立。结构方案可用 `lightgraph export-structure CONFIG OUTPUT.yaml` 单独导出。实例模式按映射的必要列和明确筛选范围生成节点及关系；跨表、跨来源和同表其他行的端点支持等值查找，必须实际找到目标记录。
 
-业务图谱可按当前版本和业务范围下载。Semantica JSON 用 `entities` 表示实体（`id`、`name`、`type`），用 `relationships` 表示关系（`id`、`source`、`target`、`type`）。两者都有 `properties`，对应的逐条来源、属性值和适用范围保存在 `metadata.supports`。GraphML 使用有向边及独立边 ID，复合属性和元数据保存在 `properties`、`metadata` 两个 JSON 字符串中。可用 NetworkX 的 `read_graphml(path, force_multigraph=True, edge_key_type=str)` 保留同一对节点之间的多条关系。带空格等特殊字符的 ID 在 GraphML 中使用安全编码，原值见 `original_id` 的 JSON 字符串。
+业务图谱可按当前版本和业务范围下载。Semantica JSON 用 `entities` 表示实体（`id`、`name`、`type`），用 `relationships` 表示关系（`id`、`source`、`target`、`type`）。两者都有 `properties`，对应的逐条来源、属性值和适用范围保存在 `metadata.supports`。 `metadata.type_family` 给出类型的原名，`metadata.applicability` 汇总当前权限下可见的适用范围。实体名称会去除首尾空白；身份编码保留原值，原始名称可在对应的来源记录中查到。GraphML 使用有向边及独立边 ID，复合属性和元数据保存在 `properties`、`metadata` 两个 JSON 字符串中。可用 NetworkX 的 `read_graphml(path, force_multigraph=True, edge_key_type=str)` 保留同一对节点之间的多条关系。带空格等特殊字符的 ID 在 GraphML 中使用安全编码，原值见 `original_id` 的 JSON 字符串。
 
 ```bash
 lightgraph export-graph CONFIG graph.json --format semantica-json --business-context '{"project":"M"}'

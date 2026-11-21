@@ -5,7 +5,10 @@ import json
 import re
 from xml.etree import ElementTree as ET
 
+from lightgraph.contracts import canonical
 from lightgraph.errors import LightGraphError
+from .contexts import business_context_identity
+from .display import entity_name
 
 
 FORMATS = {
@@ -24,6 +27,20 @@ def _record(item, *, relationship=False):
     fields = ('scopes', 'supports', 'identity', 'identity_types', 'aliases', 'label_variants',
               'english_names', 'descriptions')
     metadata = {key: item[key] for key in fields if key in item}
+    metadata['type_family'] = item.get('original_type') or item['type']
+    supports = item.get('supports', [])
+    contexts = {canonical(context): context for context in map(business_context_identity, supports)}
+    metadata['applicability'] = [contexts[key] for key in sorted(contexts)]
+    if not relationship:
+        for field in ('identity_domain', 'identity_context', 'identity_origin', 'label_origin'):
+            if field in item:
+                metadata[field] = item[field]
+        # Old IDs can belong to different objects in different input graphs.
+        # Keep them inside visible lineage, never offer unqualified aliases
+        # that a consumer could use to rewrite current relationship endpoints.
+        origins = {canonical(origin): origin for support in supports for origin in support.get('identity_origins', [])}
+        if origins:
+            metadata['identity_origins'] = [origins[key] for key in sorted(origins)]
     # Semantica accepts these fields directly in KGBuilder. Supports stay
     # separate so each project/period-specific value keeps its own witness.
     rec = {'id': item['id'], 'type': item['type'], 'properties': item.get('properties', {}),
@@ -31,7 +48,7 @@ def _record(item, *, relationship=False):
     if relationship:
         rec.update(source=item['source'], target=item['target'])
     else:
-        rec['name'] = item.get('display_label') or item.get('label') or item['id']
+        rec['name'] = entity_name(item)
     return rec
 
 

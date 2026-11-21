@@ -12,6 +12,10 @@ from typing import Any, Sequence
 import unicodedata
 from lightgraph.contracts import canonical
 
+# LIMIT caps returned routes, but sorting a dense two-hop join can take
+# quadratic work before LIMIT is applied. Bound SQLite VM work as well.
+_ROUTE_SQL_STEPS = 40_000_000
+
 _NAME_ROLES = ('chinese_name', 'english_name', 'display_name', 'alias')
 _TERM_ROLES = {
     'name': _NAME_ROLES,
@@ -517,44 +521,94 @@ class SQLiteGraphIndex:
             AND EXISTS (SELECT 1 FROM kg_node_scope_views v WHERE v.node_id=e.dst_id AND v.scope_ref IN ({sc_ph}))
         """
 
-    def grouping_routes(self, seed, surface, *, scopes, suggested_ids=(), limit=16, max_depth=2):
-        """Rank visible matching names within two edges of the question's subject.
+    def _route_rows(self, sql, params, truncation):
+        with closing(self._connect()) as conn:
+            conn.set_progress_handler(lambda: 1, _ROUTE_SQL_STEPS)
+            try:
+                return [dict(row) for row in conn.execute(sql, params)]
+            except sqlite3.OperationalError as error:
+                if getattr(error, 'sqlite_errorcode', None) != sqlite3.SQLITE_INTERRUPT or truncation is None:
+                    raise
+                truncation.add('association_sql_work_limit')
+                return []
 
-        Physical adjacency proposes paths. The caller rechecks applicability and
-        observations before presenting a route as a published relationship.
-        """
+    def grouping_routes(self, seed, surface, *, scopes, subject_term=None, suggested_ids=(), limit=16, max_depth=2,
+                        truncation=None):
+        """Find nearby axis names for every visible interpretation before limiting routes."""
+        seeds = [seed] if isinstance(seed, str) else list(seed)
         tokens = sorted(set(scopes))
         if not tokens or not surface:
             return []
         marks = ','.join('?' for _ in tokens)
         names = ','.join('?' for _ in _NAME_ROLES)
         norm = normalize_term(surface)
-        # Project only the endpoints here; observation bodies can be large.
+        # Compute adjacency from small endpoint records; observations are verified later.
+        # When a subject has many exact matches, its output shortlist is not its search space.
         sql = f"""
-            WITH visible AS (
+            WITH subjects(seed) AS (
+                SELECT value FROM json_each(?)
+                UNION SELECT node_id FROM kg_node_terms WHERE term_norm=? AND scope_ref IN ({marks})
+                      AND role IN ({names},'identity_code')
+            ), visible AS (
                 SELECT DISTINCT src_id, dst_id FROM ({self._authorized_edges_sql(marks)})
             ), adjacency(src,dst) AS (
                 SELECT src_id,dst_id FROM visible UNION ALL SELECT dst_id,src_id FROM visible
-            ), adjacent AS (SELECT DISTINCT dst FROM adjacency WHERE src=? AND dst!=?),
-            routes(target,bridge) AS (
-                SELECT dst,NULL FROM adjacent
-                UNION ALL SELECT a.dst,i.dst FROM adjacent i JOIN adjacency a ON a.src=i.dst
-                          WHERE ? >= 2 AND a.dst!=? AND a.dst!=i.dst
-            ), matches AS (
+            ), adjacent AS (SELECT DISTINCT seed,dst FROM subjects JOIN adjacency ON src=seed AND dst!=seed),
+            matches AS (
                 SELECT node_id, MIN(CASE WHEN term_norm=? THEN 0 ELSE 1 END) AS rank
                 FROM kg_node_terms WHERE scope_ref IN ({marks}) AND role IN ({names}) AND instr(term_norm,?)>0
                 GROUP BY node_id
-                UNION ALL SELECT value,2 FROM json_each(?)
+                UNION ALL SELECT DISTINCT node_id,2 FROM kg_node_terms
+                          WHERE scope_ref IN ({marks}) AND instr(lower(kind),?)>0
+                UNION ALL SELECT value,3 FROM json_each(?)
+            ), routes(seed,target,bridge,rank) AS (
+                SELECT i.seed,i.dst,NULL,m.rank FROM adjacent i JOIN matches m ON m.node_id=i.dst
+                UNION ALL SELECT i.seed,m.node_id,i.dst,m.rank FROM adjacent i
+                    JOIN adjacency a ON a.src=i.dst JOIN matches m ON m.node_id=a.dst
+                    WHERE ? >= 2 AND a.dst!=i.seed AND a.dst!=i.dst
+            ), ranked AS (
+                SELECT seed,target,bridge,MIN(rank) AS rank,
+                       ROW_NUMBER() OVER (PARTITION BY seed ORDER BY MIN(rank),bridge IS NOT NULL,target,bridge) AS n
+                FROM routes GROUP BY seed,target,bridge
             )
-            SELECT r.target,r.bridge,MIN(m.rank) AS rank FROM routes r JOIN matches m ON r.target=m.node_id
-            GROUP BY r.target,r.bridge
-            ORDER BY rank, r.bridge IS NOT NULL, r.target,r.bridge LIMIT ?
+            SELECT seed,target,bridge,rank FROM ranked ORDER BY rank,n,bridge IS NOT NULL,seed,target,bridge LIMIT ?
         """
-        with closing(self._connect()) as conn:
-            return [dict(row) for row in conn.execute(sql, [
-                *tokens, *tokens, *tokens, seed, seed, max_depth, seed, norm,
-                *tokens, *_NAME_ROLES, norm, json.dumps(list(suggested_ids)), limit,
-            ])]
+        return self._route_rows(sql, [
+            json.dumps(seeds), normalize_term(subject_term) if subject_term else None,
+            *tokens, *_NAME_ROLES, *tokens, *tokens, *tokens, norm,
+            *tokens, *_NAME_ROLES, norm, *tokens, norm, json.dumps(list(suggested_ids)), max_depth, limit,
+        ], truncation)
+
+    def exact_association_links(self, terms, *, scopes, limit, truncation=None):
+        """Rank links between exact operands using their authorized adjacency before the display cutoff."""
+        tokens = sorted(set(scopes))
+        terms = sorted({normalize_term(term) for term in terms})
+        if not tokens or len(terms) < 2:
+            return []
+        marks = ','.join('?' for _ in tokens)
+        sql = f"""
+            WITH matches(term,id,kind) AS (
+                SELECT DISTINCT term_norm,node_id,kind FROM kg_node_terms
+                WHERE term_norm IN (SELECT value FROM json_each(?))
+                  AND scope_ref IN ({marks}) AND role IN (SELECT value FROM json_each(?))
+            ), pairs AS (
+                SELECT DISTINCT l.term lt,l.id src,l.kind sk,r.term rt,r.id dst,r.kind dk
+                FROM matches l JOIN kg_edges e ON e.src_id=l.id JOIN matches r ON r.id=e.dst_id
+                WHERE l.term!=r.term AND l.id!=r.id AND e.scope_ref IN ({marks})
+            ), links AS (
+                SELECT * FROM pairs UNION SELECT rt,dst,dk,lt,src,sk FROM pairs
+            ), coverage AS (
+                SELECT src,lt,COUNT(DISTINCT rt) AS terms FROM links GROUP BY src,lt
+            ), ranked AS (
+                SELECT l.*,c.terms,ROW_NUMBER() OVER (
+                    PARTITION BY lt,sk,rt,dk ORDER BY c.terms DESC,src,dst
+                ) AS n FROM links l JOIN coverage c USING (src,lt)
+            )
+            SELECT src,lt,sk,dst,rt,dk FROM ranked ORDER BY terms DESC,n,lt,rt,src,dst LIMIT ?
+        """
+        return self._route_rows(sql, [
+            json.dumps(terms), *tokens, json.dumps([*_NAME_ROLES, 'identity_code']), *tokens, limit,
+        ], truncation)
 
     def expand_neighborhood(
         self,

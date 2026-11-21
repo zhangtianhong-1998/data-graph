@@ -105,7 +105,7 @@ class OpenAIEmbedder:
         base_url: str,
         model: str,
         api_key: str = '',
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = 120.0,
         dim: int | None = None,
         batch_size: int = 32,
         query_instruction: str = '',
@@ -144,6 +144,8 @@ class OpenAIEmbedder:
             )
             resp.raise_for_status()
             body = resp.json()
+        except httpx.TimeoutException:
+            raise LightGraphError('embedding_timeout') from None
         except httpx.HTTPError:
             raise LightGraphError('embedding_service_unavailable') from None
         except Exception:

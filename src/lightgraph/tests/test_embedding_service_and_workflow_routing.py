@@ -178,6 +178,22 @@ def test_openai_embedder_auto_dim_batching_query_instruction_and_safety():
     assert insecure_exc.value.code == "embedding_insecure_endpoint"
 
 
+def test_embedding_timeout_is_applied_to_each_request(monkeypatch):
+    import httpx
+
+    timeouts = []
+    def slow_service(_url, **kwargs):
+        timeouts.append(kwargs['timeout'])
+        raise httpx.ReadTimeout('read timed out')
+
+    monkeypatch.setattr(httpx, 'post', slow_service)
+    for settings in ({}, {'timeout_seconds': 37}):
+        embedder = OpenAIEmbedder(base_url='http://127.0.0.1/v1', model='test', **settings)
+        with pytest.raises(LightGraphError, match='embedding_timeout'):
+            embedder.embed(['test'])
+    assert timeouts == [EmbeddingConfig().timeout_seconds, 37] == [120, 37]
+
+
 def test_web_embedding_config_credentials_test_and_retrieval_sync_query(tmp_path):
     backend_a = _FakeSemanticBackend(dim=1024, model_name="Qwen/Qwen3-Embedding-0.6B")
     srv_a = _LiveEmbedHTTPServer(backend_a)

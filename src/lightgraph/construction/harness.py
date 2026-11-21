@@ -111,12 +111,36 @@ def resolved_options(options: HarnessOptions) -> HarnessOptions:
     return replace(options, sdk_source=source, dsh_bin=binary)
 
 
+SDK_CORE_IDS = frozenset({"sdk-app-startup", "sdk-jsonrpc-server", "deepseek-llm-api-extensions",
+        "session-log-deepseek", "plugin-package-inventory-deepseek", "sandbox",
+        "session-projection", "sandbox-policy", "subprocess", "timer", "llm", "session",
+        "session-title", "system-prompt", "tools", "agent", "llm-retry",
+        "jobs", "agent-loop", "sessions", "working-directory", "filesystem", "attachment-local"})
+
+
+def model_provider(options: HarnessOptions) -> dict:
+    """Stock DSH adapter shared by construction and tool-free SQL drafting."""
+    from lightgraph.runtime.model_endpoint import output_token_field
+    capacity = (options.max_input_tokens or 1048576) + options.max_output_tokens
+    route = {
+        "api": "openai-completions", "apiKeyEnv": options.api_key_env, "baseURL": options.base_url,
+        "compat": {"maxTokensField": output_token_field(options.model), "supportsStore": False,
+                   "supportsUsageInStreaming": options.include_stream_usage},
+        "timeoutMs": int(options.timeout_seconds * 1000),
+        "streamIdleTimeoutMs": int(options.timeout_seconds * 1000),
+        "retryPolicy": {"mode": "normal", "maxRetries": options.retries},
+        "models": [{"id": options.model, "name": options.model, "input": ["text"],
+                    "contextWindow": capacity, "maxTokens": options.max_output_tokens}],
+    }
+    return {"id": "graph-provider", "name": "@deepseek-ai/dsh-llm-pi-ai",
+            "config": {"providers": {"graph-model": route}}}
+
+
 def profile_patch(config_path: Path, workspace: Path, options: HarnessOptions,
                   base_ids: tuple[str, ...] = (), *, mcp_url: str | None = None,
                   mcp_token_env: str | None = None, goal: str = "") -> list[dict]:
     """Build an sdk-minimal overlay containing no shell or unrestricted file tools."""
     home = workspace / "harness"
-    from lightgraph.runtime.model_endpoint import output_token_field
     assets = Path(__file__).parent / "runtime"
     def row(identifier, package, config=None):
         value = {"id": identifier, "name": "@deepseek-ai/dsh-" + package}
@@ -146,19 +170,7 @@ def profile_patch(config_path: Path, workspace: Path, options: HarnessOptions,
             "toolCallTimeoutMs": min(2147483647, int((options.max_run_seconds + 30) * 1000)),
             "failOnStartupError": True, "reconnect": {"enabled": False}}
     plugins = [
-        row("graph-provider", "llm-pi-ai", {"providers": {"graph-model": {
-            "api": "openai-completions", "apiKeyEnv": options.api_key_env,
-            "baseURL": options.base_url,
-            "compat": {"maxTokensField": output_token_field(options.model),
-                       "supportsStore": False,
-                       "supportsUsageInStreaming": options.include_stream_usage},
-            "timeoutMs": int(options.timeout_seconds * 1000),
-            "streamIdleTimeoutMs": int(options.timeout_seconds * 1000),
-            "retryPolicy": {"mode": "normal", "maxRetries": options.retries},
-            "models": [{"id": options.model, "name": options.model,
-                        "contextWindow": capacity, "maxTokens": options.max_output_tokens,
-                        "input": ["text"]}],
-        }}}),
+        model_provider(options),
         row("graph-skills", "skill"),
         row("graph-skill-filesystem", "skill-filesystem", {
             "includeDefaultRoots": False, "watch": False,
@@ -195,12 +207,7 @@ def profile_patch(config_path: Path, workspace: Path, options: HarnessOptions,
                     "usageLog": str(home / "model-usage.jsonl"),
                     "output": str(home / "budget.yaml")}},
     ]
-    safe_base = {"sdk-app-startup", "sdk-jsonrpc-server", "deepseek-llm-api-extensions",
-        "session-log-deepseek", "plugin-package-inventory-deepseek", "sandbox",
-        "session-projection", "sandbox-policy", "subprocess", "timer", "llm", "session",
-        "session-title", "system-prompt", "tools", "agent", "llm-retry",
-        "jobs", "agent-loop", "sessions", "working-directory", "filesystem", "attachment-local"}
-    disabled = sorted(set(base_ids) - safe_base) if base_ids else (
+    disabled = sorted(set(base_ids) - SDK_CORE_IDS) if base_ids else (
             "persistent-bash", "persistent-pwsh", "terminal-bash", "terminal-pwsh",
             "llm-deepseek")
     return [

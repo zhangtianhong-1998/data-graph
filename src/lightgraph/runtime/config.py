@@ -188,7 +188,7 @@ class EmbeddingConfig(StrictModel):
     api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
     api_key_env: str = "LIGHTGRAPH_EMBEDDING_API_KEY"
     allow_insecure_http: bool = False
-    timeout_seconds: float = Field(default=30.0, gt=0)
+    timeout_seconds: float = Field(default=120.0, gt=0)
     batch_size: int = Field(default=32, ge=1, le=512)
     dimensions: int | None = Field(default=None, gt=0,
         description="Optional vector dimension; auto-detected when null (e.g. 1024 for Qwen3-Embedding-0.6B).")

@@ -251,7 +251,7 @@ beforeEach(() => {
         synced_at: '2026-11-15T01:05:00Z',
       })
     }
-    if (url.endsWith('/retrieval/query')) {
+    if (url.split('?')[0]?.endsWith('/retrieval/query')) {
       const payload = JSON.parse(body || '{}')
       if (retrievalFixture) return response({
         query: payload.query, scopes: ['public'], slots: [], nodes: [], edges: [], bridge_nodes: [],
@@ -453,9 +453,11 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(root.querySelector<HTMLSelectElement>('#embedding-provider')!.value).toBe('openai_compatible')
     expect(root.querySelector<HTMLInputElement>('#embedding-base-url')!.value).toBe('http://127.0.0.1:8002/v1')
     expect(root.querySelector<HTMLInputElement>('#embedding-model')!.value).toBe('Qwen/Qwen3-Embedding-0.6B')
+    expect(root.querySelector<HTMLInputElement>('#embedding-timeout')!.value).toBe('120')
 
     button('测试向量服务连通性').click()
     await vi.waitFor(() => expect(root.textContent).toContain('向量维度：1024'))
+    expect(JSON.parse(requests.find(r => r.url.endsWith('/retrieval/embedding/test'))!.body!).timeout_seconds).toBe(120)
 
     const embKeyInput = root.querySelector<HTMLInputElement>('#embedding-key')!
     embKeyInput.value = 'local-emb-key'
@@ -570,6 +572,27 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(root.querySelector('[aria-label="来源原文"]')).toBeNull()
     await search({ available_context: { ...emptyContext, status: 'scope_unresolved' } }, '尚未确认问题所指的适用范围')
     await search({ available_context: { ...emptyContext, status: 'search_unavailable' } }, '语义检索当前不可用')
+  })
+  it('以原始问题试写 SQL，显示本次子图上下文与未执行的草稿', async () => {
+    vectorizedState = { ...vectorizedState, vectorized: true, status: 'vectorized' }
+    retrievalFixture = { agent_context: { graph_version: 'archive-v2', nodes: [], edges: [] },
+      sql_preview: { status: 'generated', sql: 'SELECT SUM(weight) FROM archive.finds' } }
+    await mountReady()
+    button('运行与结果').click()
+    await nextTick()
+    button('子图召回').click()
+    await vi.waitFor(() => expect(root.querySelector('#retrieval-query')).not.toBeNull())
+    const question = root.querySelector<HTMLTextAreaElement>('#retrieval-query')!
+    question.value = '馆藏总重量'
+    question.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    button('召回并试写 SQL').click()
+    await vi.waitFor(() => expect(root.querySelector('.sql-preview code')?.textContent).toContain('SUM(weight)'))
+    expect(root.querySelector('.agent-context')?.textContent).toContain('archive-v2')
+    const posts = requests.filter(r => r.url.includes('/retrieval/query'))
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.url).toContain('sql_preview=true')
+    expect(JSON.parse(posts[0]!.body!)).toEqual({ query: question.value })
   })
   it('按字段检索、精确 ID 及下钻分别传递对应参数，切换时清除旧结果', async () => {
     vectorizedState = { ...vectorizedState, vectorized: true, status: 'vectorized' }

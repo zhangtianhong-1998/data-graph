@@ -11,6 +11,15 @@ from lightgraph.contracts import canonical
 from lightgraph.source_values import identity_cell
 
 
+def entity_name(node):
+    """Choose a readable public name and preserve raw spellings in source observations."""
+    for field in ('display_label', 'label', 'name'):
+        text = node.get(field)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return node.get('id', '')
+
+
 def _value(value):
     return value if isinstance(value, str) else canonical(value)
 

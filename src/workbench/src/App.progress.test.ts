@@ -67,7 +67,7 @@ describe('运行页面实时更新', () => {
     live = Object.assign(run('alpha', 2), {
       status: 'partial', workflow: true,
       workflow_state: {
-        units: { a: { unit_id: 'a', status: 'failed', error_code: 'workflow_unit_failed' } },
+        units: { a: { unit_id: 'a', status: 'failed', model_calls: 37, error_code: 'workflow_unit_failed' } },
         merge_nodes: { m: { node_id: 'm', status: 'failed', error_code: 'workflow_access_context_register_failed',
           failure_detail: { stage: 'access_context_register', exception_type: 'PermissionError', errno: 13, winerror: 32, attempts: 4 } } },
       },
@@ -79,6 +79,8 @@ describe('运行页面实时更新', () => {
     expect(merge?.textContent).toContain('登记访问范围 · PermissionError · errno 13 · WinError 32 · 共尝试 4 次')
     const extract = rows.find(row => row.textContent?.includes('workflow_unit_failed'))
     expect(extract).toBeDefined()
+    expect(extract?.cells[5]?.textContent).toBe('37')
+    expect(merge?.cells[5]?.textContent).toBe('—')
     expect(extract?.textContent).not.toContain('共尝试')
   })
   it('通过真实轮询入口更新阶段进度和新日志，避免重复追加旧快照', async () => {

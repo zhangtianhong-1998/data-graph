@@ -1046,8 +1046,11 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return read_graph_consistently(workspace, pid, read)
 
     @app.post('/api/projects/{pid}/retrieval/query')
-    async def query_retrieval(pid: str, data: RetrieveSubgraphRequest, x_workbench_session: str | None = Header(default=None)):
+    async def query_retrieval(pid: str, data: RetrieveSubgraphRequest, sql_preview: bool = False,
+                              x_workbench_session: str | None = Header(default=None)):
         from .construction_graph import project_retriever
+        if sql_preview and data.mode != 'auto':
+            raise LightGraphError('sql_preview_requires_question')
         def read(_workspace, _pid, *, config):
             emb_key = resolve_api_key(pid, x_workbench_session, config)
             model_key = None
@@ -1066,6 +1069,25 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             answer = data.run(retriever, config.scopes)
             if entry:
                 graph_history._authorize_entry(workspace, entry, config)
+            if data.mode == 'auto':
+                from lightgraph.retrieval.agent_context import agent_context
+                context = agent_context(answer, version=getattr(retriever, 'version_id', None), sources=config.sources)
+                answer['agent_context'] = context
+                if sql_preview:
+                    from .sql_preview import draft_sql
+                    # Retrieval can outlive a change to grants or to the outbound model.
+                    # Recheck before transmitting evidence as well as before returning it.
+                    with workspace.lock(pid):
+                        if workspace.resolved_config(pid) != config:
+                            raise LightGraphError('graph_read_conflict')
+                    if entry:
+                        graph_history._authorize_entry(workspace, entry, config)
+                    try:
+                        answer['sql_preview'] = draft_sql(config, context, model_key)
+                    except LightGraphError as error:
+                        answer['sql_preview'] = {'status': 'unavailable', 'code': error.code}
+                    if entry:
+                        graph_history._authorize_entry(workspace, entry, config)
             return answer
         return await run_in_threadpool(read_graph_consistently, workspace, pid, read)
 

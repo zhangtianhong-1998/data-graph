@@ -606,10 +606,11 @@ class ConstructionTools:
                 merged = self.workspace.read_published_graph()
                 if merged.get('access_fingerprint') != access_fingerprint(self.config):
                     raise LightGraphError('validated_graph_access_mismatch')
-                diagnostics = [{'code': 'same_identity_conflicting_label', 'node_id': node_id}
-                    for node_id in merged.get('conflict_isolation', {}).get('node_ids', [])]
+                isolation = merged.get('conflict_isolation', {})
                 contributors = []
                 for graph in self.workspace.read_publication_contributors():
+                    ids = isolation.get('draft_node_ids', {}).get(graph.get('draft_id'), isolation.get('node_ids', []))
+                    diagnostics = [{'code': 'same_identity_conflicting_label', 'node_id': node_id} for node_id in ids]
                     detail = conflict_details(graph, diagnostics, self.config.scopes)
                     if detail['nodes']:
                         contributors.append({'draft_id': graph.get('draft_id'),

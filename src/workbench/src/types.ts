@@ -95,6 +95,7 @@ export interface WorkflowMergeNodeState {
   error_code?: string | null
   failure_detail?: WorkflowFailureDetail
   nodes?: number
+  model_calls?: number | null
   edges?: number
   updated_at?: string
 }
@@ -137,6 +138,7 @@ export interface WorkflowUnitState {
   error_code?: string | null
   failure_detail?: WorkflowFailureDetail
   nodes?: number
+  model_calls?: number | null
   edges?: number
   updated_at?: string
 }

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
-import { ensureSession, projectPath, request } from './api'
+import { computed, onUnmounted, ref, watch } from 'vue'
+import { ApiError, ensureSession, projectPath, request } from './api'
 import BusinessContextSelect from './BusinessContextSelect.vue'
 import PropertyTable from './PropertyTable.vue'
 import AvailableContext from './AvailableRetrievalContext.vue'
@@ -17,6 +17,9 @@ interface PathResult {
 }
 
 interface RetrievalQueryResponse {
+  agent_context?: Record<string, unknown>
+  sql_preview?: { status: 'generated' | 'insufficient_context' | 'unavailable'; sql?: string; reason?: string; code?: string }
+
   available_context?: AvailableRetrievalContext
   grouping?: { axis: string; paths: PathResult['paths'] }
   plan?: {
@@ -45,6 +48,7 @@ interface RetrievalQueryResponse {
     stop_reason: string
     witnesses: Array<{fact_id: string; conditions: Array<{text: string; node_id: string}>; row_id: string; edge_ids: string[]}>
   }
+  association_paths?: PathResult['paths']
   drilldown?: PathResult
   traverse?: PathResult
   query: string
@@ -140,13 +144,17 @@ const working = ref(false)
 const panelError = ref('')
 const result = ref<RetrievalQueryResponse | null>(null)
 let queryEpoch = 0
+let queryController: AbortController | undefined
 
 function clearResult() {
   queryEpoch++
+  queryController?.abort()
+  queryController = undefined
   working.value = false
   panelError.value = ''
   result.value = null
 }
+onUnmounted(clearResult)
 watch([businessContext, atomicOpen, mode, seedInput, () => props.status?.generation, () => props.status?.vectorized], clearResult)
 watch(() => props.projectId, () => {
   clearResult()
@@ -154,7 +162,7 @@ watch(() => props.projectId, () => {
   queryText.value = nodeId.value = seedIds.value = pathHint.value = targetId.value = relationTypes.value = ''
 })
 const pathResult = computed(() => result.value?.traverse || result.value?.drilldown ||
-  (result.value?.grouping ? { status: 'found', paths: result.value.grouping.paths, uncovered_seed_ids: [], equally_ranked_paths: 0 } : null))
+  (result.value?.grouping || result.value?.association_paths ? { status: 'found', paths: result.value.grouping?.paths || result.value.association_paths || [], uncovered_seed_ids: [], equally_ranked_paths: 0 } : null))
 const fallbackLabels: Record<string, string> = {
   model_parser_not_configured: '当前项目没有可用的模型解析器',
   model_interpretation_unavailable: '模型未返回可用的解析结果',
@@ -183,9 +191,13 @@ const contextLabel = (context?: FactContext) => !context || context.status === '
 const nodeLabel = (id: string) => nodeMap.value.get(id)?.display_name ||
   result.value?.available_context?.nodes.find(n => n.id === id)?.display_name || id
 
-async function runQuery() {
+const generatingSQL = ref(false)
+async function runQuery(withSQL = false) {
   if (!hasInput.value || working.value || props.syncing || !props.status?.vectorized) return
+  generatingSQL.value = withSQL
   const epoch = ++queryEpoch
+  const controller = new AbortController()
+  queryController = controller
   result.value = null
   working.value = true
   panelError.value = ''
@@ -213,15 +225,20 @@ async function runQuery() {
   try {
     await ensureSession(project)
     if (epoch !== queryEpoch) return
-    const value = await request<RetrievalQueryResponse>(`${projectPath(project)}/retrieval/query`, {
+    const value = await request<RetrievalQueryResponse>(`${projectPath(project)}/retrieval/query${withSQL ? '?sql_preview=true' : ''}`, {
       method: 'POST',
+      signal: controller.signal,
+      timeoutMs: null,
       body: JSON.stringify(body),
     })
     if (epoch === queryEpoch) result.value = value
   } catch (err) {
     if (epoch === queryEpoch) panelError.value = err instanceof Error ? err.message : '子图召回失败，请重试。'
   } finally {
-    if (epoch === queryEpoch) working.value = false
+    if (epoch === queryEpoch) {
+      working.value = false
+      queryController = undefined
+    }
   }
 }
 </script>
@@ -238,7 +255,7 @@ async function runQuery() {
         </div>
       </div>
       <div class="panel-body">
-        <form class="retrieval-form" @submit.prevent="runQuery">
+        <form class="retrieval-form" @submit.prevent="runQuery()">
           <div v-if="!atomicOpen" class="field">
             <label for="retrieval-query">问题</label>
             <textarea id="retrieval-query" v-model="queryText" maxlength="4000" rows="3" required :disabled="working" placeholder="输入想查的问题，或粘贴一段文字"/>
@@ -294,7 +311,9 @@ async function runQuery() {
           <BusinessContextSelect v-model="businessContext" :project-id="projectId" :refresh-key="status?.generation" :disabled="working || syncing"/>
           </details>
           <div class="actions">
-            <button class="btn primary" type="submit" :disabled="working || syncing || !activeStatus?.vectorized || !hasInput">{{ working ? '正在检索…' : '检索' }}</button>
+            <button class="btn primary" type="submit" :disabled="working || syncing || !activeStatus?.vectorized || !hasInput">{{ (working && !generatingSQL) ? '正在检索…' : '检索' }}</button>
+            <button v-if="!atomicOpen" class="btn" type="button" :disabled="working || syncing || !activeStatus?.vectorized || !hasInput" @click="runQuery(true)">{{ working && generatingSQL ? '正在召回并生成 SQL…' : '召回并试写 SQL' }}</button>
+            <button v-if="working" class="btn small" type="button" @click="clearResult">停止等待</button>
             <span v-if="activeStatus?.has_graph && !activeStatus.vectorized" class="field-hint">请先为当前图谱建立索引。</span>
           </div>
         </form>
@@ -309,6 +328,16 @@ async function runQuery() {
           <span v-if="atomicOpen" class="badge blue">连通分量 {{ result.connected_components.length }}</span>
         </div>
         <div class="panel-body">
+          <section v-if="result.sql_preview" class="sql-preview" aria-label="SQL 草稿">
+            <h3>SQL 草稿</h3>
+            <small v-if="result.sql_preview.sql">由项目模型生成，未执行。</small>
+            <pre v-if="result.sql_preview.sql"><code>{{ result.sql_preview.sql }}</code></pre>
+            <p v-else role="status">{{ result.sql_preview.reason || new ApiError(result.sql_preview.code || 'sql_preview_model_failed').message }}</p>
+          </section>
+          <details v-if="result.agent_context" class="agent-context">
+            <summary>查看 Agent 上下文</summary>
+            <pre>{{ JSON.stringify(result.agent_context, null, 2) }}</pre>
+          </details>
           <p v-if="result.truncated" class="note amber">结果达到读取或路径分析上限，当前展示部分内容。</p>
           <section v-if="result.plan" class="plan-summary" aria-label="分析条件">
             <div class="chips">
@@ -349,7 +378,7 @@ async function runQuery() {
             </template>
           </section>
           <div v-if="pathResult" class="retrieved-paths">
-            <h3>{{ result.grouping ? '分组候选路径' : result.traverse ? '关联路径' : '下钻路径' }}</h3>
+            <h3>{{ result.grouping ? '分组候选路径' : (result.traverse || result.association_paths) ? '关联路径' : '下钻路径' }}</h3>
             <p v-if="(pathResult.equally_ranked_paths || 0) > 1" class="field-hint">本次搜索发现 {{ pathResult.equally_ranked_paths }} 条并列路径，当前展示其中一条。</p>
             <p v-if="!pathResult.paths.length">{{ pathResult.status === 'no_visible_seed' ? '当前范围内没有匹配的起点。' : '在本次搜索范围内未找到满足全部要求的路径。' }}</p>
             <p v-if="pathResult.uncovered_seed_ids.length" class="field-hint">未进入此路径的起点：{{ pathResult.uncovered_seed_ids.map(nodeLabel).join('、') }}</p>
@@ -486,4 +515,8 @@ async function runQuery() {
 .retrieved-paths ol { display: flex; flex-wrap: wrap; gap: .5em; padding: 0; list-style: none }
 .path-relation { font-size: 12px; color: #52637a; margin-right: .4em }
 .result-node-id { display: block; color: #52637a; user-select: all; overflow-wrap: anywhere }
+</style>
+
+<style scoped>
+.sql-preview pre, .agent-context pre { max-height: 24rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 </style>

@@ -61,6 +61,41 @@ def _save(path, value):
     atomic_text(path, json.dumps(value, ensure_ascii=False, sort_keys=True))
 
 
+def _worker_calls(runs, child, status):
+    """A saved terminal report takes precedence over the last live observation."""
+    if not isinstance(child, str) or not _RUN_ID.fullmatch(child):
+        return None
+    result_path = runs / (child + ".result.json")
+    if status not in ACTIVE_STATUSES:
+        try:
+            result = _json_file(result_path)
+        except LightGraphError:
+            result = None
+        report = result.get("report") if isinstance(result, dict) else None
+        counts = report.get("counts") if isinstance(report, dict) else None
+        calls = counts.get("llm_calls") if isinstance(counts, dict) else None
+        if type(calls) is int and calls >= 0:
+            return calls
+    progress = read_progress(progress_path(result_path), child)
+    return progress["counters"].get("model_calls") if progress else None
+
+
+def _with_node_calls(state, runs):
+    """Attach per-worker telemetry to a freshly loaded workflow snapshot."""
+    if not state:
+        return state
+    for bucket in ("units", "merge_nodes"):
+        for key, node in state.get(bucket, {}).items():
+            child = node.get("run_id")
+            if node.get("reused") or key in state.get("recomposed_nodes", []) or node.get("merge_mode") == "deterministic":
+                node["model_calls"] = 0
+            elif not child and node.get("status") in {"queued", "skipped"}:
+                node["model_calls"] = 0
+            elif node.get("model_calls") is None:
+                node["model_calls"] = _worker_calls(runs, child, node.get("status"))
+    return state
+
+
 def _cancel_path(result_path):
     # Only a cancellation request is persisted, never a query or source value.
     return result_path.with_suffix(".cancel")
@@ -692,8 +727,10 @@ class RunManager:
                     "edges": 0,
                     "updated_at": _now(),
                 }
-            elif unit.label:
-                units_state[unit.unit_id]["label"] = unit.label
+            else:
+                units_state[unit.unit_id]["model_calls"] = 0  # No new worker on this branch.
+                if unit.label:
+                    units_state[unit.unit_id]["label"] = unit.label
 
         merge_nodes_map = {m.node_id: m for m in wf.merge_nodes}
         merge_nodes_state = {
@@ -723,7 +760,7 @@ class RunManager:
                 if mid not in resume_nodes:
                     previous = resume_state.get('merge_nodes', {}).get(mid)
                     if previous:
-                        merge_nodes_state[mid] = dict(previous, reused=mid in reused_artifacts and mid not in resume_state.get('recomposed_nodes', []))
+                        merge_nodes_state[mid] = dict(previous, model_calls=0, reused=mid in reused_artifacts and mid not in resume_state.get('recomposed_nodes', []))
                     else:
                         merge_nodes_state[mid].update(status='skipped', error_code='workflow_units_not_ready')
         wf_state = {
@@ -845,6 +882,8 @@ class RunManager:
             counts = rep.get("counts") or {}
             with entry["state_lock"]:
                 worker_status = res.get('status', 'failed')
+                if type(counts.get("llm_calls")) is int and counts["llm_calls"] >= 0:
+                    state_bucket[node_key]["model_calls"] = counts["llm_calls"]
                 state_bucket[node_key].update(
                     status='running' if usable_result(res) else worker_status,
                     worker_status=worker_status,
@@ -1348,7 +1387,7 @@ class RunManager:
                     for m in (config.workflow.merge_nodes if config.workflow else [])
                 ],
                 "edges": [e.model_dump(mode="json") for e in (config.workflow.edges if config.workflow else [])],
-                "state": state,
+                "state": _with_node_calls(state, self._paths(pid)[1]),
                 "merge_summary": merge_summary,
             }
 
@@ -1486,7 +1525,7 @@ class RunManager:
             out_dir = run_output_path(path.parent.parent, record['output_path'])
             wf_state = load_workflow_state(out_dir, record["run_id"])
             if wf_state is not None and wf_state.get("parent_run_id") == record.get("run_id"):
-                record["workflow_state"] = wf_state
+                record["workflow_state"] = _with_node_calls(wf_state, path.parent)
         return record
 
     def list(self, pid):

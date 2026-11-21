@@ -242,3 +242,103 @@ def test_matching_source_keys_without_alias_role_remain_candidates_when_names_di
     assert len(merged['nodes']) == 4
     assert len(merged['candidate_identity_merges']) == 2
     assert {candidate['reason'] for candidate in merged['candidate_identity_merges']} == {'source_key_requires_role_review'}
+
+
+def test_draft_replay_reuses_endpoint_across_independent_relationship_projections():
+    from lightgraph.construction.workspace import _merge_graphs
+    from lightgraph.runtime.config import FusionPolicyConfig
+
+    drafts = []
+    for key, link in [('artifact_id', 'catalog_ref'), ('object_id', 'box_ref'), ('registration', 'epoch_ref')]:
+        graph = projection('Artifact', key, table='collection')
+        edge = graph['edges'][0]
+        graph['definitions']['relations'][0]['type'] = edge['type'] = link
+        edge['id'] = link + '_edge'
+        if key == 'registration':
+            graph['nodes'][0]['id'] = edge['source'] = 'alternate-local-id'
+        # Each new relation attaches to the same physical source end.
+        edge['supports'][0]['provenance'].update(source_key_columns=['CATALOG_ID'], target_key_columns=[link])
+        graph['draft_id'] = link
+        drafts.append(graph)
+    originals = deepcopy(drafts)
+    result = _merge_graphs(drafts, fusion_policy=FusionPolicyConfig())
+    assert drafts == originals
+    assert len(result['nodes']) == 2 and len(result['edges']) == 3
+    nodes = {n['id']: n for n in result['nodes']}
+    assert all(e['source'] in nodes and e['target'] in nodes for e in result['edges'])
+    assert len({e['source'] for e in result['edges']}) == len({e['target'] for e in result['edges']}) == 1
+    assert len(result['definitions']['entities']) == 1
+    assert len({e['type'] for e in result['edges']}) == 3
+    node = nodes[result['edges'][0]['source']]
+    keys = {tuple(origin['identity']) for s in node['supports'] for origin in s['identity_origins']}
+    assert keys == {('artifact_id',), ('object_id',), ('registration',)}
+    assert len(filter_graph_scopes(result, ['public'], business_context={'project': 'K'})['nodes']) == 0
+
+
+@pytest.mark.parametrize('boundary', ['table', 'project', 'scope', 'predicate', 'role'])
+def test_distinct_draft_identities_do_not_widen_observed_scope(boundary):
+    from lightgraph.construction.workspace import _merge_graphs
+
+    a = projection('Artifact', 'key', table='specimens')
+    b = projection('CollectionObject', 'registry_key', table='specimens')
+    for node, end in zip(b['nodes'], ('source', 'target'), strict=True):
+        node['id'] = b['edges'][0][end] = 'other_' + node['id']
+    b['edges'][0]['id'] = 'other_edge'
+    for n in b['nodes']:
+        s = n['supports'][0]
+        if boundary == 'table':
+            s['provenance']['source']['table'] = 'unrelated'
+        elif boundary == 'project':
+            s['business_context']['dimensions']['project'] = 'K'
+        elif boundary == 'scope':
+            s['scope_ref'] = 'restricted'
+        elif boundary == 'predicate':
+            s['provenance']['predicate'] = {'op': 'ne', 'column': 'era', 'value': 'archived'}
+    if boundary == 'role':
+        b['edges'][0]['supports'][0]['provenance'].update(source_key_columns=['FROM_B'], target_key_columns=['TO_B'])
+    result = _merge_graphs([a, b])
+    assert len(result['nodes']) == 4
+    assert len(result['edges']) == 2
+    assert len({e[end] for e in result['edges'] for end in ('source', 'target')}) == 4
+    reverse = _merge_graphs([b, a])
+    assert {n['id'] for n in reverse['nodes']} == {n['id'] for n in result['nodes']}
+
+
+def test_independent_drafts_reuse_the_validated_source_key_at_publication(tmp_path):
+    from lightgraph.construction.tools import ConstructionTools
+    from lightgraph.construction.workspace import dump_yaml
+    from lightgraph.tests.test_construction_tools import config_for, draft
+
+    tools = ConstructionTools(config_for(tmp_path), tmp_path / 'publication')
+    try:
+        source = tools.describe_sources()['tables'][0]
+        for key in ['accession_number', 'record_code', 'specimen_key']:
+            proposal = draft(source, draft_id=key, kind='Specimen')
+            proposal['entities'][0]['key_names'] = [key]
+            assert tools.call('save_graph_draft', yaml_text=dump_yaml(proposal))['status'] == 'ok'
+            assert tools.call('validate_graph_draft', draft_id=key)['passed']
+            assert tools.call('publish_graph_draft', draft_id=key)['status'] == 'ok'
+        published = tools.workspace.read_published_graph()
+        assert len(published['definitions']['entities']) == 1
+        assert len(published['nodes']) == 2
+        for node in published['nodes']:
+            support, = node['supports']
+            assert {r['draft_id'] for r in support['execution_origins']} == {'accession_number', 'record_code', 'specimen_key'}
+            assert len(support['identity_origins']) == 3
+    finally:
+        tools.close()
+
+
+def test_quarantine_follows_rewritten_id_and_keeps_draft_counterexamples():
+    from lightgraph.construction.workspace import _merge_graphs
+
+    a = projection('Specimen', 'accession')
+    b = projection('Specimen', 'other_code')
+    a['draft_id'], b['draft_id'] = 'one', 'two'
+    # Authored logical IDs can differ while the typed physical key and role agree.
+    b['nodes'][0]['id'] = b['edges'][0]['source'] = 'new-source'
+    b['nodes'][0]['supports'][0]['label'] = 'Disputed label'
+    result = _merge_graphs([a, b], isolate_conflicts=True)
+    assert len(result['nodes']) == 1 and not result['edges']
+    assert result['conflict_isolation']['nodes'] == 1
+    assert result['conflict_isolation']['draft_node_ids'] == {'one': ['db_1'], 'two': ['new-source']}

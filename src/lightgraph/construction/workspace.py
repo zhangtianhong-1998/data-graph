@@ -412,7 +412,7 @@ class GraphWorkspace:
             raise LightGraphError('graph_draft_revision_conflict')
         if validation.graph_digest is None or digest(graph) != validation.graph_digest:
             raise LightGraphError('validated_graph_mismatch')
-        from .conflicts import isolate_validation, isolate_publications
+        from .conflicts import isolate_validation
         isolated = not validation.passed
         if isolated:
             graph = isolate_validation(graph, validation.diagnostics)
@@ -457,12 +457,7 @@ class GraphWorkspace:
         if fusion_policy and fusion_policy.entity_rules:
             from .fusion import prepare_graph
             contributors = [prepare_graph(g, fusion_policy) for g in contributors]
-        if isolate_conflicts:
-            contributors, isolation = isolate_publications(contributors)
-            merged = _merge_graphs(contributors, fusion_policy=fusion_policy)
-            merged['conflict_isolation'] = isolation
-        else:
-            merged = _merge_graphs(contributors, fusion_policy=fusion_policy)
+        merged = _merge_graphs(contributors, fusion_policy=fusion_policy, isolate_conflicts=isolate_conflicts)
         entry['graph'] = self._append_record('published', published)
         manifest.setdefault('publication_history', []).append(entry)
         publications[draft_id] = entry
@@ -553,19 +548,51 @@ class GraphWorkspace:
                                  if p['context_fingerprint'] == self.context_fingerprint]}
 
 
-def _merge_graphs(graphs, *, fusion_policy=None):
+def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False):
     """Combine independently checked subgraphs without silently replacing facts."""
     from lightgraph.source_values import persisted_identity_key
     from .fusion import (merge_definition, deduplicate_supports, stamp_execution,
-                         retain_definition_variants, definition_conflict_diagnostics)
+                         retain_definition_variants, definition_conflict_diagnostics, remap_graph_endpoints)
+    from .observed_identity import align_draft_nodes
     # A noisy independent draft keeps its own definition and facts. Never mutate
     # the validated publication, whose digest remains part of the audit trail.
     graphs = [deepcopy(graph) for graph in graphs]
+    if isolate_conflicts:
+        from .conflicts import exclude_nodes, isolate_publications
+        # A previous failed validation may have removed its counterexamples.
+        # Keep their raw IDs blocked even if another draft rekeys the object.
+        blocked = {nid for graph in graphs for nid in graph.get('conflict_isolation', {}).get('node_ids', [])}
+        removed_edges = {edge['id'] for graph in graphs for edge in graph.get('edges', [])
+                         if edge['source'] in blocked or edge['target'] in blocked}
+        graphs = [exclude_nodes(graph, blocked) for graph in graphs]
+        raw_ids = [[node['id'] for node in graph.get('nodes', [])] for graph in graphs]
+    if len(graphs) > 1:
+        # Drafts refer to the same local source namespace. Align before
+        # qualifying incompatible definitions, just as the DAG merger does.
+        excluded = {rule.canonical_type for rule in fusion_policy.entity_rules} if fusion_policy else set()
+        observed = align_draft_nodes(graphs, excluded)
+        for graph, remap in zip(graphs, observed, strict=True):
+            for node in graph.get('nodes', []):
+                node['id'] = remap.get(node['id'], node['id'])
+            remap_graph_endpoints(graph, remap, self_contained=False)
     retain_definition_variants(graphs, self_contained=[False] * len(graphs))
     result = {'format_version': 1, 'target': 'graph', 'status': 'published',
               **({'extends_base_graph': True} if any(g.get('extends_base_graph') for g in graphs) else {}),
               'semantic_origin': 'agent_authored', 'definitions': {'entities': [], 'relations': []},
               'nodes': [], 'edges': [], 'evidence_refs': []}
+    if isolate_conflicts:
+        cleaned, isolation = isolate_publications(graphs)
+        blocked = set(isolation['node_ids'])
+        # Detail readers resolve each isolated observation in its immutable
+        # draft snapshot, whose original IDs can differ from the merged IDs.
+        isolation['draft_node_ids'] = {
+            graph['draft_id']: sorted(raw for raw, node in zip(originals, graph.get('nodes', []), strict=True)
+                                      if node['id'] in blocked)
+            for graph, originals in zip(graphs, raw_ids, strict=True) if graph.get('draft_id')}
+        isolation['edge_ids'] = sorted(removed_edges.union(isolation['edge_ids']))
+        isolation['edges'] = len(isolation['edge_ids'])
+        result['conflict_isolation'] = isolation
+        graphs = cleaned
     definitions = {category: {} for category in ('entities', 'relations')}
     items = {category: {} for category in ('nodes', 'edges')}
     retained_global_labels = not fusion_policy and any(

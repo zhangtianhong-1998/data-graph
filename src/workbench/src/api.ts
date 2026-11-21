@@ -1,4 +1,9 @@
 const messages: Record<string, string> = {
+  sql_preview_model_unavailable: '请先配置抽取模型和 API 密钥，再试写 SQL。子图上下文可在下方查看。',
+  sql_preview_timeout: 'SQL 试写超时。可以先查看已召回的子图。',
+  sql_preview_model_failed: 'DSH 未能完成本次生成。请检查项目模型连接。',
+  sql_preview_invalid_output: '模型草稿未通过 SQL 语法或来源字段检查。',
+  sql_preview_context_too_large: '子图上下文超出模型输入上限，请缩小问题范围。',
   graph_generation_changed: '图谱版本或访问配置已变化，已停止合并旧数据，请重新加载。',
   graph_batch_invalid: '图谱批次不一致，加载已停止，请重新加载。',
   graph_batch_incomplete: '返回的图谱数量不完整，加载已停止，请重新加载。',
@@ -109,6 +114,7 @@ const messages: Record<string, string> = {
   scope_invalid: '文档绑定无效，请重新选择表。', invalid_document_table_binding: '文档绑定的表不在当前数据源中。',
   source_scope_missing: '数据库来源需要填写允许查询的表。', credentials_not_allowed: '配置中不能包含明文密钥，请使用服务器环境变量。',
   embedding_service_unavailable: '无法连接配置的向量嵌入服务，请确认服务地址和端口已启动。',
+  embedding_timeout: '向量服务未在单批请求时限内响应。请查看服务负载或调整单批超时。',
   embedding_endpoint_required: '请填写并保存向量服务的 Base URL 和模型名称。',
   embedding_response_invalid: '向量服务返回格式或向量维度无效，请检查是否兼容 /v1/embeddings 接口。',
   embedding_insecure_endpoint: '非本机的 HTTP 向量服务需勾选“允许使用此内部 HTTP 服务”后才可调用。',
@@ -173,7 +179,7 @@ const responseRevisions = new WeakMap<object, string>()
 export function responseRevision(value: unknown): string | undefined {
   return value !== null && typeof value === 'object' ? responseRevisions.get(value) : undefined
 }
-export type RequestOptions = RequestInit & { timeoutMs?: number; responseType?: 'json' | 'blob' }
+export type RequestOptions = RequestInit & { timeoutMs?: number | null; responseType?: 'json' | 'blob' }
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { timeoutMs = 60000, responseType = 'json', signal, ...init } = options
   const controller = new AbortController()
@@ -182,7 +188,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   signal?.addEventListener('abort', abort, { once: true })
   if (signal?.aborted) abort()
   // Bound both waiting for headers and reading the response body. Never retry writes automatically.
-  const timer = setTimeout(() => { timedOut = true; controller.abort() }, timeoutMs)
+  const timer = timeoutMs === null ? undefined : setTimeout(() => { timedOut = true; controller.abort() }, timeoutMs)
   try {
     const response = await fetch(`/api${path}`, { ...init, signal: controller.signal, credentials: 'same-origin', cache: 'no-store',
       headers: { ...sessionHeader(path), ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...options.headers } })
