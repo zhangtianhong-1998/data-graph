@@ -34,13 +34,22 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
         return {p.relative_to(checkpoint): p.stat().st_mtime_ns for p in checkpoint.rglob('*') if p.is_file()}
     before = snapshot()
     script = Path(__file__).resolve().parents[3] / 'scripts/audit_checkpoint_merge.py'
-    report = runpy.run_path(str(script))['audit'](project / 'runs' / (rid + '.json'), 'merged')
+    audit = runpy.run_path(str(script))['audit']
+    run_file = project / 'runs' / (rid + '.json')
+    report = audit(run_file, 'merged')
     assert report['historical_input_totals_verified'] and report['explicit_entity_rules'] == 0
     assert report['without_source_replay']['output_nodes'] == 6
     assert report['with_source_replay']['output_nodes'] == report['committed']['nodes'] == 4
     assert report['with_source_replay']['source_replay_collapsed_nodes'] == 2
     assert report['committed']['integrity'] == report['with_source_replay']['integrity'] == {
         'duplicate_node_ids': 0, 'duplicate_edge_ids': 0, 'edges_with_missing_endpoints': 0}
+    def unexpected_merge(*args, **kwargs):
+        raise AssertionError("observations-only must not replay the merge")
+    monkeypatch.setattr('lightgraph.construction.merger.merge_construction_graphs', unexpected_merge)
+    observations = audit(run_file, 'merged', observations_only=True)
+    assert observations['typed_row_identity'] == report['committed']['typed_row_identity']
+    assert observations['typed_row_identity']['multiple_contributor_groups'] == 2
+    assert observations['typed_row_identity']['comparison_counts']['physical_tables'] == {'disjoint': 2}
     assert snapshot() == before
 
 

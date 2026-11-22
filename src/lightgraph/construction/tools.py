@@ -65,6 +65,7 @@ def _drop_unbound_documents(corpus: DocumentCorpus, tables) -> DocumentCorpus:
     except LightGraphError as exc:
         if exc.code not in missing:
             raise
+    from lightgraph.documents.core import project_document_to_unit
     retained = []
     for document in corpus.documents:
         try:
@@ -72,6 +73,9 @@ def _drop_unbound_documents(corpus: DocumentCorpus, tables) -> DocumentCorpus:
         except LightGraphError as exc:
             if exc.code not in missing:
                 raise
+            projected = project_document_to_unit(document, tables)
+            if projected is not None:
+                retained.append(projected)
         else:
             retained.append(document)
     return DocumentCorpus(retained).bind_catalog(tables)
@@ -427,7 +431,51 @@ class ConstructionTools:
                                     'source_id': column.source_id, 'table': column.table, 'column': column.column})
         return issues
 
-    def _metadata_evidence_error(self, draft):
+    def _document_identity_issues(self, draft):
+        """Check the applicability of document-only global identity declarations.
+
+        The caller still has to interpret what the cited text actually says. A
+        section may cover the entire source table or individual key components.
+        Other identity evidence (e.g. source probes) keeps its existing semantics.
+        """
+        issues = []
+        catalog = {(t.source_id, t.schema_name, t.name): t for t in self.tables.values()}
+        applicable = {}
+        for index, entity in enumerate(draft.entities):
+            if entity.identity_scope != 'global':
+                continue
+            refs = [self.workspace.read_evidence(ref) for ref in entity.identity_evidence_refs]
+            if any(r.kind not in {'document_section', 'document_version'} for r in refs):
+                continue
+            sections = {r.ref for r in refs if r.kind == 'document_section' and r.details.get('complete')}
+            for number, mapping in enumerate(entity.mappings):
+                key = (mapping.source_id, mapping.schema_name, mapping.table)
+                table = catalog.get(key)
+                if table is None or not set(mapping.key_columns) <= set(table.column_names):
+                    continue  # The mapping validator reports unauthorized or unknown columns.
+                missing = []
+                for column in mapping.key_columns:
+                    if (key, column) not in applicable:
+                        applicable[key, column] = {f"{s['doc_id']}@{s['revision']}:{s['section_id']}"
+                            for s in self.documents.context_for(table, [column])
+                            if s['evidence_role'] == 'definition_evidence'}
+                    if not sections.intersection(applicable[key, column]):
+                        missing.append(column)
+                if missing:
+                    issues.append({'code': 'identity_document_not_applicable',
+                        'path': ['entities', index, 'mappings', number, 'key_columns'],
+                        'source_id': mapping.source_id, 'schema': mapping.schema_name,
+                        'table': mapping.table, 'columns': missing})
+        return issues
+
+    def _evidence_error(self, draft):
+        identity_issues = self._document_identity_issues(draft)
+        if identity_issues:
+            return {'status': 'error', 'code': 'identity_document_not_applicable',
+                    'diagnostics': identity_issues,
+                    'next_action': 'Read the applicable field definition sections covering the full key and '
+                        'its identifier system. If identity is not documented, retain the local mapping '
+                        'with unknown identity scope and continue extracting its supported relations.'}
         issues = self._metadata_evidence_issues(draft)
         if issues:
             return {'status': 'error', 'code': 'metadata_evidence_not_applicable', 'diagnostics': issues,
@@ -741,7 +789,7 @@ class ConstructionTools:
             self._check_metadata_catalog(draft)
         else:
             draft = parse_graph_draft(yaml_text)
-        error = self._metadata_evidence_error(draft)
+        error = self._evidence_error(draft)
         if error:
             return error
         inherit_err = self._inheritance_error(draft)
@@ -800,7 +848,7 @@ class ConstructionTools:
         if mode == 'structure':
             self._check_current_inputs()
             record = self.workspace.get_draft(draft_id)
-            error = self._metadata_evidence_error(record.draft)
+            error = self._evidence_error(record.draft)
             if error:
                 return error
             inherit_err = self._inheritance_error(record.draft)
@@ -818,7 +866,7 @@ class ConstructionTools:
         self._check_current_inputs()
         record = self.workspace.get_draft(draft_id)
         self._check_metadata_catalog(record.draft)
-        error = self._metadata_evidence_error(record.draft)
+        error = self._evidence_error(record.draft)
         if error:
             return error
         inherit_err = self._inheritance_error(record.draft)

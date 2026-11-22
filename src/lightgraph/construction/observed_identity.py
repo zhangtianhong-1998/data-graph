@@ -58,7 +58,20 @@ def _relation_roles(graph):
     return roles, endpoint_roles
 
 
-def _node_evidence(node, definition, *, dictionary=None):
+def _observed_name_pair(support, provenance):
+    """One declared alternate column gives its observed value an unambiguous address."""
+    primary = provenance.get('label_column')
+    columns = provenance.get('alias_columns')
+    aliases = support.get('aliases')
+    if (not isinstance(primary, str) or not primary or not isinstance(columns, list) or len(columns) != 1
+            or not isinstance(columns[0], str) or not columns[0] or columns[0] == primary
+            or not isinstance(aliases, list) or len(aliases) != 1
+            or not all(isinstance(value, str) and value.strip() for value in (support.get('label'), aliases[0]))):
+        return None
+    return sorted(((primary, support['label']), (columns[0], aliases[0])))
+
+
+def _node_evidence(node, definition, *, dictionary=None, reciprocal_names=False):
     names = definition.get('key_names', [])
     if (not names or set(node.get('identity', {})) != set(names)
             or node.get('identity_domain') != definition.get('identity_domain')
@@ -83,6 +96,11 @@ def _node_evidence(node, definition, *, dictionary=None):
         # Dictionary membership is checked separately against an observed
         # unique-key row. Its address can then stand in for the local binding.
         binding_parts = [source, columns, label_column] if dictionary is None else ['catalog_key', dictionary]
+        if reciprocal_names:
+            name_values = _observed_name_pair(support, prov)
+            if name_values is None:
+                return None
+            binding_parts = [source, columns, [name for name, _ in name_values]]
         binding = digest(*binding_parts, prov.get('predicate'), prov.get('constant_properties'),
                          prov.get('scope_columns', []))
         facts = business_context_identity(support)
@@ -111,7 +129,8 @@ def _node_evidence(node, definition, *, dictionary=None):
                 unscoped_properties[column] = sorted(property_values, key=canonical)
         boundary = canonical([support['scope_ref'], sorted(support.get('required_scope_refs', [])),
                               facts, row.get('values'), row.get('value_types'), unscoped_properties])
-        observations.add((binding, boundary))
+        observation = canonical([boundary, name_values]) if reciprocal_names else boundary
+        observations.add((binding, observation))
         applicability.add(boundary)
     identity_context = business_context_identity({'business_context': node.get('identity_context')})
     applicability.add(canonical({'identity_context': identity_context}))
@@ -120,6 +139,40 @@ def _node_evidence(node, definition, *, dictionary=None):
         # facts belong to M, K, or a globally reusable business entity.
         applicability.add(canonical({'unknown_bindings': sorted({binding for binding, _ in observations})}))
     return tuple(sorted(observations)), canonical(values), tuple(sorted(applicability))
+
+
+def _align_name_pairs(groups, prepared, overrides):
+    """Adopt an existing ID only when its entire replay group witnesses the same pair."""
+    confirmed = []
+    if not groups:
+        return confirmed
+    previous_sizes = Counter(target for remap in overrides for target in remap.values())
+    for index, (_, kind, graph) in enumerate(prepared):
+        if kind in {'merged', 'base'}:
+            previous_sizes.update(n['id'] for n in graph.get('nodes', []) if overrides[index].get(n['id']) != n['id'])
+    for key, entries in groups.items():
+        if len(entries) < 2 or len({index for index, _, _ in entries}) != len(entries):
+            continue
+        primary_columns = {s['provenance']['label_column'] for _, n, _ in entries for s in n['supports']}
+        if len(primary_columns) != 2:
+            continue
+        # The standard replay pass may already have adopted a different type
+        # or key namespace for some members. Never rewrite that decision.
+        if len({(n['type'], canonical(n['identity']), canonical(n['identity_types'])) for _, n, _ in entries}) != 1:
+            continue
+        previous = Counter(overrides[i][n['id']] for i, n, _ in entries if n['id'] in overrides[i])
+        frozen = {n['id'] for i, n, _ in entries if prepared[i][1] in {'merged', 'base'}}
+        previous.update(n['id'] for i, n, _ in entries if prepared[i][1] in {'merged', 'base'}
+                        and overrides[i].get(n['id']) != n['id'])
+        if len(frozen) > 1 or any(previous_sizes[nid] != size for nid, size in previous.items()):
+            continue
+        established = frozen or previous
+        target = min(established) if established else 'n_' + digest('observed_name_pair_v1', key)
+        for i, node, definition in entries:
+            overrides[i][node['id']] = target
+            _record_origin(node, definition['type'], definition['key_names'], matched=True)
+        confirmed.append({(i, node['id']) for i, node, _ in entries})
+    return confirmed
 
 
 def _dictionary_binding(node, definition):
@@ -295,6 +348,7 @@ def align_observed_nodes(prepared, *, local_bases, excluded_types, emit_candidat
     groups = defaultdict(list)
     type_owners = defaultdict(set)
     witnesses = defaultdict(set)
+    name_pairs = defaultdict(list)
     considered_nodes = eligible_nodes = 0
     for index, (cid, kind, graph) in enumerate(prepared):
         nodes_by_type = defaultdict(list)
@@ -315,6 +369,18 @@ def align_observed_nodes(prepared, *, local_bases, excluded_types, emit_candidat
             eligible_nodes += len(entries)
             if not entries:
                 continue
+            # Supports record the alternate values as a list, not a column/value
+            # map. Multiple aliases cannot establish which column supplied which name.
+            pair_contract = None
+            for node, _ in entries:
+                if not node['supports'][0]['provenance'].get('alias_columns'):
+                    continue
+                pair = _node_evidence(node, definition, reciprocal_names=True)
+                if pair is None or len({binding for binding, _ in pair[0]}) != 1:
+                    continue
+                if pair_contract is None:
+                    pair_contract = (name, canonical(definition_contract(definition)), tuple(sorted(roles[name])))
+                name_pairs[pair_contract, pair].append((index, node, definition))
             if emit_candidates:
                 for node, (observations, values, contexts) in entries:
                     for observation in observations:
@@ -335,6 +401,9 @@ def align_observed_nodes(prepared, *, local_bases, excluded_types, emit_candidat
         for peers in _compatible_roles(members):
             _align_roles(peers, contract, prepared, type_owners, overrides, component_inputs)
     review = [group for group in witnesses.values() if len({index for index, _ in group}) > 1]
+    confirmed_pairs = _align_name_pairs(name_pairs, prepared, overrides)
+    if emit_candidates:
+        review.extend(confirmed_pairs)
     if diagnostics is not None:
         diagnostics.update(considered_row_nodes=considered_nodes, eligible_row_nodes=eligible_nodes)
         if emit_candidates:
@@ -416,6 +485,18 @@ def _align_roles(peers, contract, prepared, type_owners, overrides, component_in
         _adopt_definition(entry, target, prepared[entry.index][2], overrides[entry.index])
 
 
+def _record_origin(node, old_type, old_keys, *, matched):
+    origin = {'id': node['id'], 'type': old_type,
+              'identity': deepcopy(node['identity']), 'identity_types': deepcopy(node.get('identity_types', {}))}
+    for support in node['supports']:
+        if matched:
+            support['identity_basis'] = 'observed_source_key_v1'
+        if 'identity_origins' not in support:
+            support['identity_origins'] = [deepcopy(origin)]
+        columns = support['provenance']['key_columns']
+        support.setdefault('original_key_values', dict(zip(columns, (node['identity'][n] for n in old_keys))))
+
+
 def _adopt_definition(entry, target, graph, matched_ids):
     """Preserve the original identity on its support when applying a verified logical alias."""
     definition = entry.definition
@@ -424,15 +505,7 @@ def _adopt_definition(entry, target, graph, matched_ids):
     for node, _ in entry.entries:
         if node['id'] not in matched_ids and old_type == new_type and old_keys == new_keys:
             continue
-        origin = {'id': node['id'], 'type': old_type,
-                  'identity': deepcopy(node['identity']), 'identity_types': deepcopy(node.get('identity_types', {}))}
-        for support in node['supports']:
-            if node['id'] in matched_ids:
-                support['identity_basis'] = 'observed_source_key_v1'
-            if 'identity_origins' not in support:
-                support['identity_origins'] = [deepcopy(origin)]
-            columns = support['provenance']['key_columns']
-            support.setdefault('original_key_values', dict(zip(columns, (node['identity'][n] for n in old_keys))))
+        _record_origin(node, old_type, old_keys, matched=node['id'] in matched_ids)
         node.update(type=new_type, identity=dict(zip(new_keys, (node['identity'][n] for n in old_keys))))
         if 'identity_types' in node:
             node['identity_types'] = {new: node['identity_types'][old] for new, old in

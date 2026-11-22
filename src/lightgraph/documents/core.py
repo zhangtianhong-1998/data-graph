@@ -343,6 +343,54 @@ def _column_matches(selector, table, column_names):
                for name in column_names)
 
 
+def project_document_to_unit(document, tables):
+    """Intersect a partially available document with this worker's physical catalog.
+
+    A short selector cannot be resolved for the first time in a partial catalog:
+    another source or schema may contain the same table. The workbench already
+    writes source-qualified table bindings when it assigns a document.
+    """
+    def visible_scope(scope):
+        available = [t for t in tables if not scope.source_ids or t.source_id in scope.source_ids]
+        selected = []
+        for selector in scope.tables:
+            matches = [t for t in available if selector in _table_names(t)]
+            if len(matches) > 1:
+                raise LightGraphError('ambiguous_document_table_binding')
+            if matches:
+                table = matches[0]
+                qualified = table.qualified_name
+                if (selector in {f'{table.source_id}.{qualified}', f'{table.source_id}:{qualified}'}
+                        or (scope.source_ids == [table.source_id] and selector == qualified)):
+                    selected.append(table)
+        if not scope.tables:
+            selected = available
+        if scope.columns:
+            selected = [t for t in selected if any(_column_matches(c, t, t.column_names) for c in scope.columns)]
+        if not selected:
+            return None
+        return DocumentScope(tables=sorted({f'{t.source_id}:{t.qualified_name}' for t in selected}),
+            columns=[c for c in scope.columns if any(_column_matches(c, t, t.column_names) for t in selected)])
+
+    scope = visible_scope(document.scope)
+    if scope is None:
+        return None
+    sections = []
+    excluded_paths = set()
+    for section in document.sections:
+        selected = visible_scope(section.scope) if section.scope is not None else scope
+        path = tuple(section.heading_path)
+        if selected is None:
+            excluded_paths.add(path)
+            continue
+        if any(path[:i] in excluded_paths for i in range(1, len(path))):
+            raise LightGraphError('document_section_scope_expansion')
+        sections.append(section.model_copy(update={'scope': selected}))
+    if sections:
+        return document.model_copy(update={'scope': scope, 'sections': sections})
+    return None
+
+
 def _minimum_modality(text: str) -> str:
     if re.search(r'可能|或许|may\b|might\b|could\b',text,re.I): return 'possible'
     if re.search(r'建议|应(?:当|该|先)|可以考虑|recommend|should\b',text,re.I): return 'recommended'
