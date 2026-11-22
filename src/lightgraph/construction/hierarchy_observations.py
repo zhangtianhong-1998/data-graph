@@ -105,7 +105,24 @@ def _matches_position(name, value, columns, positions, prov, column_ordinals):
     return False
 
 
-def observation_properties(support, key_columns, positions, *, column_ordinals=None):
+def edge_observation_properties(support, columns, positions, orientation):
+    """Bind structural annotations to their specific endpoint before comparing edges."""
+    src, dst = columns
+    roles = None
+    if support['provenance'].get('constant_properties'):
+        roles = {'source': src, 'target': dst, 'parent': (), 'child': ()}
+        if orientation == 'parent_to_child':
+            roles['parent'], roles['child'] = src, dst
+        elif orientation == 'child_to_parent':
+            roles['parent'], roles['child'] = dst, src
+        elif len(src) == len(dst) == 1 and src[0] in positions and dst[0] in positions:
+            # Layout can decode an annotation. A separate observation still
+            # has to establish a direction for this exact edge and scope.
+            roles['parent'], roles['child'] = sorted(columns, key=lambda c: positions[c[0]])
+    return observation_properties(support, src + dst, positions, endpoint_roles=roles)
+
+
+def observation_properties(support, key_columns, positions, *, column_ordinals=None, endpoint_roles=None):
     """Omit a materialized position annotation only when its physical role is verified.
 
     Optional source ordinals are 1-based physical positions in the full original
@@ -116,8 +133,20 @@ def observation_properties(support, key_columns, positions, *, column_ordinals=N
         column_ordinals = prov.get('source_column_ordinals')
     constants = prov.get('constant_properties') or {}
     observed = support.get('properties') or {}
-    positions_only = {k for k, v in constants.items() if canonical(observed.get(k)) == canonical([v])
-                      and _matches_position(k, v, key_columns, positions, prov, column_ordinals)}
+    positions_only = set()
+    for name, value in constants.items():
+        columns = key_columns
+        if endpoint_roles is not None:
+            # On a relationship a position annotation must name its endpoint.
+            # A parent annotation citing the child column is not redundant.
+            roles = set(name.lower().split('_')).intersection(endpoint_roles)
+            resolved = {endpoint_roles[role] for role in roles}
+            columns = next(iter(resolved)) if len(resolved) == 1 else ()
+            if len(columns) != 1:
+                continue
+        if (canonical(observed.get(name)) == canonical([value]) and
+                _matches_position(name, value, columns, positions, prov, column_ordinals)):
+            positions_only.add(name)
     # One directly projected source cell can also have been recorded as a
     # typed value on this very row. Compare it once through the row boundary.
     # Properties alone carry no driver type in historical checkpoints.

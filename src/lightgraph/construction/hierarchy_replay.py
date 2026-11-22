@@ -8,7 +8,9 @@ from lightgraph.contracts import canonical, digest
 from lightgraph.source_values import identity_cell
 from .fusion import definition_contract, relation_identity, remap_graph_endpoints
 from .hierarchy_captions import HierarchyCaptions
-from .hierarchy_observations import observation_boundary, observation_properties
+from .hierarchy_neighborhood import neighborhood_difference_counts
+from .hierarchy_observations import edge_observation_properties, observation_boundary, observation_properties
+from .hierarchy_role_witnesses import IsolatedRoleIndex
 
 
 def _address(prov):
@@ -207,7 +209,7 @@ def _neighborhoods(graph, nodes, members, relations, layouts, captions):
                 continue
             if endpoints[0] == endpoints[1]:
                 continue
-            fact = (boundary, observation_properties(support, all_keys, level_index))
+            fact = (boundary, edge_observation_properties(support, columns, level_index, orientation))
             # A declared direction only corroborates projections of this exact
             # physical edge and applicability, never unrelated rows in the table.
             positions = [(col, member.value, member.bindings[col])
@@ -218,8 +220,8 @@ def _neighborhoods(graph, nodes, members, relations, layouts, captions):
             observations.append((pair, columns, endpoints, fact))
             if row.get('values') and level_index:
                 for index, neighbor in enumerate((right, left)):
-                    edge_rows[endpoints[index]].append((columns[index], (columns[1 - index], neighbor.value), row,
-                                                         level_index))
+                    edge_rows[endpoints[index]].append(
+                        (columns[index], (columns[1 - index], neighbor.value), row, level_index, fact))
     missing_orientation = set()
     for pair, columns, endpoints, boundary in observations:
         if len(known[pair]) != 1:
@@ -234,8 +236,33 @@ def _neighborhoods(graph, nodes, members, relations, layouts, captions):
     return incidents, blocked, missing_orientation, edge_rows
 
 
-def _ancestor_paths_agree(batch, nodes, layouts, edge_rows):
-    """Compare the joint ancestor coordinates actually recorded by both projections."""
+def _complementary_paths_agree(left, right):
+    """Node-only and edge-only witnesses can conflict even when no carrier matches.
+
+    An incident edge can cover a subset of a member's paths. Only veto when
+    the two sets have no compatible tuple on their jointly recorded columns.
+    """
+    for scope in left.keys() & right.keys():
+        if left[scope].keys() & right[scope].keys():
+            continue
+        windows = [next(iter(side[scope].values())) for side in (left, right)]
+        common = set.intersection(*(set(cols) for side in windows for cols, _ in side))
+        if not common:
+            continue
+        projected = []
+        for side in windows:
+            values = set()
+            for cols, rows in side:
+                indices = [i for i, c in enumerate(cols) if c in common]
+                values.update(tuple(row[i] for i in indices) for row in rows)
+            projected.append(values)
+        if projected[0].isdisjoint(projected[1]):
+            return False
+    return True
+
+
+def _ancestor_paths_agree(batch, nodes, layouts, edge_rows, *, members=None, captions=None):
+    """Compare observed ancestor tuples within the same applicability and row context."""
     views = []
     for nid in batch:
         node = nodes[nid]
@@ -244,17 +271,36 @@ def _ancestor_paths_agree(batch, nodes, layouts, edge_rows):
         for support in node['supports']:
             prov = support['provenance']
             keys = tuple(prov['key_columns'])
-            rows_to_compare.append((keys, None, support.get('row_context') or {},
-                                    layouts.get((node['type'], _address(prov), keys))))
-        for keys, neighbor, row, layout in rows_to_compare:
+            address = _address(prov)
+            layout = layouts.get((node['type'], address, keys))
+            row = support.get('row_context') or {}
+            if not layout or not row.get('values'):
+                continue
+            display = (captions.witnessed(support, node['type'], address, layout,
+                                          dict(zip(keys, members[nid].raw_key)))
+                       if captions is not None else ())
+            observation = (observation_boundary(support, keys, layout, witnessed_captions=display),
+                           observation_properties(support, keys, layout))
+            rows_to_compare.append((keys, None, row, layout, observation))
+        for keys, neighbor, row, layout, observation in rows_to_compare:
             if not layout or not row.get('values'):
                 continue
             columns = tuple(sorted(c for c in row['values'] if c in layout and layout[c] < layout[keys[0]]))
             if columns:
                 types = row.get('value_types') or {}
-                view[keys, neighbor][columns].add(tuple(canonical([types.get(c), row['values'][c]]) for c in columns))
-        views.append(view)
-    for left, right in combinations(views, 2):
+                path = tuple(canonical([types.get(c), row['values'][c]]) for c in columns)
+                # Keep the unpartitioned check even when the projections
+                # recorded ancestry for disjoint subsets of their observations.
+                view[keys, neighbor, None][columns].add(path)
+                view[keys, neighbor, observation][columns].add(path)
+        carriers = defaultdict(lambda: defaultdict(list))
+        for (keys, neighbor, observation), windows in view.items():
+            if observation is not None:
+                carriers[keys, observation][neighbor is None].extend(windows.items())
+        views.append((view, carriers))
+    for (left, left_carriers), (right, right_carriers) in combinations(views, 2):
+        if not _complementary_paths_agree(left_carriers, right_carriers):
+            return False
         for keys in left.keys() & right.keys():
             for cols, rows in left[keys].items():
                 for other_cols, other_rows in right[keys].items():
@@ -355,6 +401,8 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
     rejected_sets, observation_differences = Counter(), Counter()
     partial_sets = retained_members = 0
     equal_node_pairs = Counter()
+    neighborhood_differences = Counter()
+    role_index = None
     for ids in sets:
         first = members[next(iter(ids))]
         labels = {label for i in ids for _, _, label, _, _ in members[i].observations}
@@ -389,26 +437,40 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
                         count = _cross_unit_pairs(peers, members)
                         equal_node_pairs[reason] += remaining - count
                         remaining = count
-                peers = {i for i in peers if incidents[i]}
-                count = _cross_unit_pairs(peers, members)
-                equal_node_pairs['no_witnessed_relationship'] += remaining - count
+                connected = {i for i in peers if incidents[i]}
+                isolated = peers - connected
+                count = _cross_unit_pairs(connected, members)
+                isolated_pairs = _cross_unit_pairs(isolated, members)
+                equal_node_pairs['relationship_on_one_side_only'] += remaining - count - isolated_pairs
                 matches = defaultdict(set)
-                for i in peers:
+                for i in connected:
                     matches[frozenset(incidents[i])].add(i)
-                for batch in matches.values():
+                batches = [(batch, 'direct_neighbors') for batch in matches.values()]
+                if isolated_pairs:
+                    if role_index is None:
+                        role_index = IsolatedRoleIndex(nodes, members, layouts, incidents,
+                                                       blocked | invalid_roles | missing_orientation)
+                    batches.extend((batch, 'isolated_member_role') for batch in role_index.batches(isolated))
+                for batch, basis in batches:
                     joint = _cross_unit_pairs(batch, members)
                     if not joint:
                         continue
-                    count -= joint
-                    if not _ancestor_paths_agree(batch, nodes, layouts, edge_rows):
+                    if basis == 'direct_neighbors':
+                        count -= joint
+                    else:
+                        isolated_pairs -= joint
+                    if not _ancestor_paths_agree(batch, nodes, layouts, edge_rows, members=members, captions=captions):
                         inconsistent_path = True
                         equal_node_pairs['ancestor_path'] += joint
                         continue
                     matched += len(batch)
                     matching_batches += 1
                     equal_node_pairs['passed_before_endpoint_remap'] += joint
-                    yield batch
+                    yield batch, basis
                 equal_node_pairs['different_neighborhood'] += count
+                equal_node_pairs['no_witnessed_relationship'] += isolated_pairs
+                if count:
+                    neighborhood_differences.update(neighborhood_difference_counts(matches, members))
             if matched:
                 if matching_batches > 1 or matched < len(ids):
                     partial_sets += 1
@@ -434,6 +496,9 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
     stats['rejected_physical_sets'] = dict(sorted(rejected_sets.items()))
     stats['sets_by_observation_difference'] = dict(sorted(observation_differences.items()))
     stats['equal_node_pairs_by_result'] = {key: n for key, n in sorted(equal_node_pairs.items()) if n}
+    stats['different_neighborhood_pairs_by_first_difference'] = dict(sorted(neighborhood_differences.items()))
+    if role_index is not None:
+        stats['isolated_members_by_role_result'] = role_index.diagnostics
 
 
 def _compatible_remaps(graph, batches, nodes):
@@ -564,8 +629,11 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
     nodes = {n['id']: n for n in graph['nodes']}
     stats = {} if diagnostics is None else diagnostics
     physical_sets = []
-    batches = {min(ids, key=lambda i: (nodes[i]['type'], i)): ids
-               for ids in _verified_groups(graph, excluded_types, stats, physical_sets)}
+    batches, bases = {}, {}
+    for ids, basis in _verified_groups(graph, excluded_types, stats, physical_sets):
+        winner = min(ids, key=lambda i: (nodes[i]['type'], i))
+        batches[winner] = ids
+        bases[winner] = basis
     stats['groups_with_matching_roles_and_scope'] = len(batches)
     owners = _compatible_remaps(graph, batches, nodes)
     remap = {nid: winner for nid, winner in owners.items() if nid != winner}
@@ -573,6 +641,7 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
     stats['physical_set_outcomes'] = [{'input_nodes': before, 'output_nodes': after, 'sets': count}
                                      for (before, after), count in sorted(outcomes.items())]
     stats['accepted_groups'] = len(set(remap.values()))
+    stats['collapsed_nodes_by_role_evidence'] = dict(sorted(Counter(bases[w] for w in remap.values()).items()))
     stats['groups_rejected_during_endpoint_remap'] = len(batches) - stats['accepted_groups']
     if not remap:
         return 0

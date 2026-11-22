@@ -36,11 +36,14 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
     script = Path(__file__).resolve().parents[3] / 'scripts/audit_checkpoint_merge.py'
     audit = runpy.run_path(str(script))['audit']
     run_file = project / 'runs' / (rid + '.json')
-    report = audit(run_file, 'merged')
+    report = audit(run_file, 'merged', include_hierarchy_membership=True)
     assert report['historical_input_totals_verified'] and report['explicit_entity_rules'] == 0
     assert report['without_source_replay']['output_nodes'] == 6
     assert report['with_source_replay']['output_nodes'] == report['committed']['nodes'] == 4
     assert report['with_source_replay']['source_replay_collapsed_nodes'] == 2
+    membership = report['with_source_replay']['hierarchy_membership']
+    assert membership['groups_by_output_id'] == {} and membership['represented_collapsed_nodes'] == 0
+    assert membership['agrees_with_recorded_count']  # These copies folded through the row-identity channel.
     assert report['committed']['integrity'] == report['with_source_replay']['integrity'] == {
         'duplicate_node_ids': 0, 'duplicate_edge_ids': 0, 'edges_with_missing_endpoints': 0,
         'edges_with_missing_definition': 0, 'edges_with_wrong_endpoint_types': 0, 'self_links': 0}

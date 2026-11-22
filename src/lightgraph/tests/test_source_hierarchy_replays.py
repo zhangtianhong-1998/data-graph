@@ -12,7 +12,8 @@ from lightgraph.sources import MemorySource
 
 
 def draft_graph(number, kind, *, inverse=False, source_id='file', project=None, alternate_role=False,
-                declare_direction=True, self_policy=None, collection=None, positions=None, code_prefix=''):
+                declare_direction=True, self_policy=None, collection=None, positions=None, code_prefix='',
+                edge_constants=None):
     logical_key = 'accession' if number % 2 else 'item_code'
     columns = ['section', 'caption', 'leaf', 'heading', 'cross_reference']
     table = TableSpec(source_id=source_id, name='vocabulary', columns=[ColumnSpec(name=c) for c in columns])
@@ -43,6 +44,7 @@ def draft_graph(number, kind, *, inverse=False, source_id='file', project=None, 
                           if declare_direction else {}),
                        'allow_self_links': self_policy == 'include',
                        'mappings': [{**binding, 'source_key_columns': [endpoints[0]],
+                                     'constant_properties': edge_constants or {},
                                      'equal_endpoints': self_policy or 'error',
                                      'target_key_columns': [endpoints[1]]}]}],
     }

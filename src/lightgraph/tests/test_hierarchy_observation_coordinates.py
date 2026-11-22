@@ -82,5 +82,5 @@ def test_shared_ancestor_columns_must_agree_as_paths_not_individual_values():
 
     # Some projections record all paths on edges and no row on the member.
     edge_rows = {nid: [(('leaf',), (('middle',), 'X'), {'values': {'root': value},
-                        'value_types': {'root': 'text'}}, positions)] for nid, value in [('a', 'A'), ('b', 'B')]}
+                        'value_types': {'root': 'text'}}, positions, None)] for nid, value in [('a', 'A'), ('b', 'B')]}
     assert not _ancestor_paths_agree(['a', 'b'], dict.fromkeys(['a', 'b'], projection([])), {}, edge_rows)

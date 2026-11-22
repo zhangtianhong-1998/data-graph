@@ -277,7 +277,27 @@ def inspect_observations(graph):
             "global_definitions_by_evidence_kind": dict(kinds), "relation_definitions_by_hierarchy_orientation": dict(directions)}
 
 
-def audit(run_file, node_id, *, observations_only=False):
+def hierarchy_membership(graph, control_ids):
+    """Report original replay IDs, so a later audit can check the same members pair by pair."""
+    output_ids = {node["id"] for node in graph["nodes"]}
+    groups = {}
+    for node in graph["nodes"]:
+        winner = node["id"]
+        if winner not in control_ids:
+            continue
+        originals = {origin["id"] for s in node.get("supports", [])
+                     if s.get("identity_basis") == "observed_hierarchy_projection_v1"
+                     for origin in s.get("identity_origins", []) if origin.get("id") in control_ids}
+        if winner in originals and len(originals) > 1 and (originals & output_ids) == {winner}:
+            groups[winner] = sorted(originals)
+    removed = [original for winner, originals in groups.items() for original in originals if original != winner]
+    represented = len(set(removed))
+    recorded = graph.get("fusion_diagnostics", {}).get("hierarchy_replay_collapsed_nodes")
+    return {"groups_by_output_id": groups, "represented_collapsed_nodes": represented,
+            "agrees_with_recorded_count": len(removed) == represented == recorded if recorded is not None else None}
+
+
+def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False):
     """Use the run's committed inputs and policy, even when the current project has been edited."""
     run_file = Path(run_file)
     run = json.loads(run_file.read_text(encoding="utf-8"))
@@ -338,23 +358,31 @@ def audit(run_file, node_id, *, observations_only=False):
     modules = [merger, observed_identity, executor, fusion, metadata_columns, workspace]
     # A standalone copy of this script can also audit checkpoints using the
     # older backend, which did not retain catalog identity references.
-    for name in ('catalog_identity', 'hierarchy_replay', 'hierarchy_observations', 'hierarchy_captions'):
+    for name in ('catalog_identity', 'hierarchy_replay', 'hierarchy_observations', 'hierarchy_captions',
+                 'hierarchy_role_witnesses', 'hierarchy_neighborhood'):
         module = sys.modules.get('lightgraph.construction.' + name)
         if module is not None:
             modules.append(module)
     report = {
         "run_id": run["run_id"], "node_id": node_id,
+        "artifact_id": target["artifact_id"], "upstream_artifacts": target["upstream_artifacts"],
         "explicit_entity_rules": len(fused.get("entity_rules", [])),
         "source_sha256": {m.__name__: hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest()
                           for m in modules}, "merger_path": str(Path(merger.__file__).resolve()),
         "inputs": {c["contributor_id"]: graph_counts(c["graph"]) for c in inputs}, "committed": counts,
         "historical_input_totals_verified": totals.keys() <= saved_counts.keys(),
     }
+    control_ids = set()
     for enabled, label in [(False, "without_source_replay"), (True, "with_source_replay")]:
         graph = merger.merge_construction_graphs(inputs, target_access_fingerprint=target["access_fingerprint"],
                                                 merge_policy=policy, recognize_source_replays=enabled)
         report[label] = {**merger.merge_accounting(inputs, graph), **alignment_counts(graph),
                          "integrity": output_checks(graph)}
+        if include_hierarchy_membership:
+            if enabled:
+                report[label]["hierarchy_membership"] = hierarchy_membership(graph, control_ids)
+            else:
+                control_ids = {n["id"] for n in graph["nodes"]}
         del graph
     return report
 
@@ -363,10 +391,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_file", type=Path, help="原项目 runs/run_….json")
     parser.add_argument("--node", default="merge_1", help="要核对的确定性合并节点 ID")
-    parser.add_argument("--observations-only", action="store_true", help="只核查已提交图的实际观测，跳过合并重放")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--observations-only", action="store_true", help="只核查已提交图的实际观测，跳过合并重放")
+    mode.add_argument("--include-hierarchy-membership", action="store_true", help="在重放报告中列出层级归并前后的节点 ID")
     args = parser.parse_args()
     try:
-        report = audit(args.run_file, args.node, observations_only=args.observations_only)
+        report = audit(args.run_file, args.node, observations_only=args.observations_only,
+                       include_hierarchy_membership=args.include_hierarchy_membership)
     except LightGraphError as exc:
         parser.exit(1, f"检查点或合并未通过校验：{exc.code}\n")
     except (KeyError, OSError, ValueError) as exc:
