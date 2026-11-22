@@ -509,7 +509,7 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             return item.get('provenance', [])
         return [{**support.get('provenance', {}), 'scope_ref': support['scope_ref'],
                  **{key: support[key] for key in ('row_context', 'business_context', 'lookup_matches', 'required_scope_refs', 'inherited_from',
-                     'observation_id', 'execution_origins', 'endpoint_origins')
+                     'observation_id', 'execution_origins', 'endpoint_origins', 'identity_origins', 'identity_basis')
                     if support.get(key) is not None}}
                 for support in item['supports']]
 

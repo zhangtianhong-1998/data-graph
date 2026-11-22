@@ -53,12 +53,19 @@ def alignment_counts(graph):
 
 def output_checks(graph):
     """Check the complete output's references. Matching labels do not establish identity."""
-    node_ids = {node["id"] for node in graph["nodes"]}
+    node_types = {node["id"]: node["type"] for node in graph["nodes"]}
+    relation_types = {r["type"]: (r.get("source_type"), r.get("target_type"))
+                      for r in graph.get("definitions", {}).get("relations", [])}
+    edges = graph["edges"]
     return {
-        "duplicate_node_ids": len(graph["nodes"]) - len(node_ids),
-        "duplicate_edge_ids": len(graph["edges"]) - len({e["id"] for e in graph["edges"]}),
-        "edges_with_missing_endpoints": sum(e["source"] not in node_ids or e["target"] not in node_ids
-                                            for e in graph["edges"]),
+        "duplicate_node_ids": len(graph["nodes"]) - len(node_types),
+        "duplicate_edge_ids": len(edges) - len({e["id"] for e in edges}),
+        "edges_with_missing_endpoints": sum(e["source"] not in node_types or e["target"] not in node_types for e in edges),
+        "edges_with_missing_definition": sum(e["type"] not in relation_types for e in edges),
+        "edges_with_wrong_endpoint_types": sum(
+            (node_types[e["source"]], node_types[e["target"]]) != relation_types[e["type"]]
+            for e in edges if e["source"] in node_types and e["target"] in node_types and e["type"] in relation_types),
+        "self_links": sum(e["source"] == e["target"] for e in edges),
     }
 
 
@@ -257,7 +264,17 @@ def physical_key_overlap(graph):
 
 
 def inspect_observations(graph):
-    return {"typed_row_identity": typed_row_identity_review(graph), "physical_key_overlap": physical_key_overlap(graph)}
+    definitions = graph.get("definitions", {})
+    catalog = graph.get("evidence_catalog", {})
+    kinds = Counter()
+    for definition in definitions.get("entities", []):
+        if definition.get("identity_scope") == "global":
+            refs = definition.get("identity_evidence_refs") or []
+            evidence = sorted({catalog.get(ref, {}).get("kind", "unknown") for ref in refs})
+            kinds[",".join(evidence) or "no_reference"] += 1
+    directions = Counter(rel.get("hierarchy_orientation") or "undeclared" for rel in definitions.get("relations", []))
+    return {"typed_row_identity": typed_row_identity_review(graph), "physical_key_overlap": physical_key_overlap(graph),
+            "global_definitions_by_evidence_kind": dict(kinds), "relation_definitions_by_hierarchy_orientation": dict(directions)}
 
 
 def audit(run_file, node_id, *, observations_only=False):
@@ -321,9 +338,10 @@ def audit(run_file, node_id, *, observations_only=False):
     modules = [merger, observed_identity, executor, fusion, metadata_columns, workspace]
     # A standalone copy of this script can also audit checkpoints using the
     # older backend, which did not retain catalog identity references.
-    catalog_module = sys.modules.get('lightgraph.construction.catalog_identity')
-    if catalog_module is not None:
-        modules.append(catalog_module)
+    for name in ('catalog_identity', 'hierarchy_replay'):
+        module = sys.modules.get('lightgraph.construction.' + name)
+        if module is not None:
+            modules.append(module)
     report = {
         "run_id": run["run_id"], "node_id": node_id,
         "explicit_entity_rules": len(fused.get("entity_rules", [])),

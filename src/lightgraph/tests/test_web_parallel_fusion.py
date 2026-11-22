@@ -42,7 +42,8 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
     assert report['with_source_replay']['output_nodes'] == report['committed']['nodes'] == 4
     assert report['with_source_replay']['source_replay_collapsed_nodes'] == 2
     assert report['committed']['integrity'] == report['with_source_replay']['integrity'] == {
-        'duplicate_node_ids': 0, 'duplicate_edge_ids': 0, 'edges_with_missing_endpoints': 0}
+        'duplicate_node_ids': 0, 'duplicate_edge_ids': 0, 'edges_with_missing_endpoints': 0,
+        'edges_with_missing_definition': 0, 'edges_with_wrong_endpoint_types': 0, 'self_links': 0}
     def unexpected_merge(*args, **kwargs):
         raise AssertionError("observations-only must not replay the merge")
     monkeypatch.setattr('lightgraph.construction.merger.merge_construction_graphs', unexpected_merge)

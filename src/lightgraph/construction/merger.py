@@ -17,6 +17,7 @@ from .display import derive_display_graph
 from .fusion import (deduplicate_supports, definition_conflict_diagnostics, label_priority,
                      merge_definition, prepare_graph, relation_identity, retain_definition_variants)
 from .context_topology import detect_context_cycles
+from .hierarchy_replay import reconcile_hierarchy_projections
 from .models import COLUMN_IDENTITY_NAMES
 from .observed_identity import align_dictionary_nodes, align_observed_nodes
 from .workspace import read_internal_yaml, write_yaml
@@ -553,8 +554,9 @@ def _merge_contributor_nodes_and_edges(
                           and contract.get('identity_evidence_refs'))
         default_replay = (not fusion and 'conflict_mode' not in policy.model_fields_set
                           and (node_id in aligned_targets or node_id in dictionary_targets
-                               or any(s.get('identity_basis') in {'observed_source_key_v1', 'observed_dictionary_key_v1'}
-                                                                 for s in node.get('supports', []))))
+                               or any(s.get('identity_basis') in {'observed_source_key_v1', 'observed_dictionary_key_v1',
+                                                                 'observed_hierarchy_projection_v1'}
+                                      for s in node.get('supports', []))))
         if fusion and fusion.label_conflict_policy == 'retain_variants' or default_global or default_replay:
             retained_labels = retained_labels or bool(default_global or default_replay)
             for support in node.get('supports', []):
@@ -727,6 +729,15 @@ def _merge_contributor_nodes_and_edges(
             'coverage': 'incomplete' if (quarantined_nodes or quarantined_edges or upstream_isolations) else 'complete',
         },
     }
+    # A physical table address is local to one project. Frozen base graphs
+    # and downstream merges retain the identities from their publication.
+    hierarchy_collapsed = None
+    hierarchy_diagnostics = {}
+    if replay_status == 'ran' and all(
+        kind == 'unit' and not graph.get('extends_base_graph') for _, kind, graph in prepared_contributors
+    ):
+        hierarchy_collapsed = reconcile_hierarchy_projections(
+            result, excluded_types=excluded_types, diagnostics=hierarchy_diagnostics)
     result['definition_conflicts'] = definition_conflict_diagnostics(result)
     if fusion:
         result['fusion_policy'] = fusion.model_dump(mode='json')
@@ -762,6 +773,10 @@ def _merge_contributor_nodes_and_edges(
         'output_physical_column_nodes': sum(n.get('identity_origin') == 'physical_column' for n in merged_nodes.values()),
         **{f'source_replay_{name}': value for name, value in source_replay_counts.items()},
     })
+    if hierarchy_collapsed is not None:
+        counts['hierarchy_replay_collapsed_nodes'] = hierarchy_collapsed
+    if hierarchy_diagnostics.get('global_node_inputs'):
+        counts['hierarchy_replay_diagnostics'] = hierarchy_diagnostics
     result['fusion_diagnostics'] = counts
     return derive_display_graph(result, copy=False)
 

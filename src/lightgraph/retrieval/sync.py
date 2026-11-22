@@ -86,7 +86,7 @@ def _observations(item):
                        'evidence_refs': refs, 'source_tables': tables, 'scopes': scopes,
                        **{key: support[key] for key in ('observation_id', 'label', 'description', 'english_name', 'property_observations',
                            'aliases', 'row_context', 'provenance',
-                           'execution_origins', 'lookup_matches', 'endpoint_origins', 'identity_origins',
+                           'execution_origins', 'lookup_matches', 'endpoint_origins', 'identity_origins', 'identity_basis',
                            'inherited_from', 'contributor_id', 'required_scope_refs') if key in support}})
     return result
 

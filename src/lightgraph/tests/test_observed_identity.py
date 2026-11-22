@@ -77,7 +77,7 @@ def test_alias_replay_combines_typed_source_facts_and_rewires_edges():
         'source_replay_status': 'ran', 'explicit_entity_rules': 0, 'explicit_rule_preparation_ran': False,
         'source_replay_matched_inputs': 4, 'source_replay_groups': 2, 'source_replay_collapsed_nodes': 2,
         'dictionary_eligible_inputs': 0, 'dictionary_groups_without_observed_member': 0,
-        'observed_dictionary_collapsed_nodes': 0,
+        'observed_dictionary_collapsed_nodes': 0, 'hierarchy_replay_collapsed_nodes': 0,
         'collapsed_nodes_before_quarantine': 2, 'input_physical_column_nodes': 0,
         'output_physical_column_nodes': 0, 'source_replay_considered_row_nodes': 4,
         'source_replay_eligible_row_nodes': 4, 'source_replay_cross_contributor_source_witness_groups': 2,

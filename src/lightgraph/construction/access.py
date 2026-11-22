@@ -109,7 +109,8 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
         if not supports:
             continue
         if len({origin['contributor_id']
-                for support in supports if support.get('identity_basis') in {'observed_source_key_v1', 'observed_dictionary_key_v1'}
+                for support in supports if support.get('identity_basis') in {
+                    'observed_source_key_v1', 'observed_dictionary_key_v1', 'observed_hierarchy_projection_v1'}
                 for origin in support.get('execution_origins') or [support] if origin.get('contributor_id')}) > 1:
             merged_observation_nodes += 1
         labels = sorted({support['label'] for support in supports if support.get('label') is not None})

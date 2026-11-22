@@ -97,8 +97,8 @@ export interface WorkflowMergeNodeState {
   run_id?: string | null
   error_code?: string | null
   failure_detail?: WorkflowFailureDetail
-  merge_counts?: { input_nodes: number; output_nodes: number; source_replay_status?: string; source_replay_collapsed_nodes?: number; observed_dictionary_collapsed_nodes?: number }
-  delta_merge_counts?: { source_replay_status?: string; source_replay_collapsed_nodes?: number; observed_dictionary_collapsed_nodes?: number }
+  merge_counts?: { input_nodes: number; output_nodes: number; source_replay_status?: string; source_replay_collapsed_nodes?: number; observed_dictionary_collapsed_nodes?: number; hierarchy_replay_collapsed_nodes?: number }
+  delta_merge_counts?: { source_replay_status?: string; source_replay_collapsed_nodes?: number; observed_dictionary_collapsed_nodes?: number; hierarchy_replay_collapsed_nodes?: number }
   nodes?: number
   model_calls?: number | null
   edges?: number
