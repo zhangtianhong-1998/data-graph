@@ -37,6 +37,10 @@ def definition_contract(definition):
         result.setdefault('identity_scope', 'unknown')
         result.setdefault('identity_context_keys', [])
         result.setdefault('identity_domain', None)
+    elif 'source_type' in result and 'target_type' in result:
+        parent = (definition.get('definition_variant') or {}).get('endpoint_projection')
+        if parent and parent != digest(result):
+            result['endpoint_projection'] = parent
     return result
 
 
@@ -80,7 +84,7 @@ def remap_graph_endpoints(graph, remap, *, self_contained, record_fusion=False):
                 raise LightGraphError('self_link_forbidden')
             for support in edge.get('supports', []):
                 support.setdefault('endpoint_origins', []).append({
-                    'edge_id': edge['id'], 'source': old[0], 'target': old[1]})
+                    'edge_id': edge['id'], 'type': edge['type'], 'source': old[0], 'target': old[1]})
         edge['id'] = relation_identity(edge)
 
 
@@ -132,6 +136,9 @@ def retain_definition_variants(graphs, *, self_contained=None):
                 old_type = definition['type']
                 variant_type = variant_names[(family, signature)]
                 variant = {'version': 1, 'contract_digest': signature}
+                parent = (definition.get('definition_variant') or {}).get('endpoint_projection')
+                if category == 'relations' and parent:
+                    variant['endpoint_projection'] = parent
                 aliases[old_type] = (variant_type, family, variant)
                 definition.update(type=variant_type, original_type=family, definition_variant=variant)
             for item in graph.get(item_key, []):
@@ -177,11 +184,15 @@ def definition_conflict_diagnostics(graph):
     result = []
     for category, item_key in (('entities', 'nodes'), ('relations', 'edges')):
         families = defaultdict(set)
+        contracts = defaultdict(set)
         for definition in graph.get('definitions', {}).get(category, []):
             if definition.get('definition_variant'):
-                families[definition['original_type']].add(definition['type'])
+                family = definition['original_type']
+                families[family].add(definition['type'])
+                parent = definition['definition_variant'].get('endpoint_projection') if category == 'relations' else None
+                contracts[family].add(parent or digest(definition_contract(definition)))
         for family, variants in sorted(families.items()):
-            if len(variants) < 2:
+            if len(variants) < 2 or len(contracts[family]) < 2:
                 continue
             affected = [item for item in graph.get(item_key, []) if item['type'] in variants]
             node_ids = ({item['id'] for item in affected} if category == 'entities'

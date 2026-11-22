@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from typing import Annotated, Any, Literal
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from .semantic_schema import SemanticSchema
 
 Scalar = str | int | float | bool | None
@@ -35,6 +35,8 @@ class ForeignKeySpec(StrictModel):
     target_columns: list[str] = Field(min_length=1)
 
 class TableSpec(StrictModel):
+    # Known only when the live adapter read the original workbook header.
+    _workbook_ordinals: dict[str, int] = PrivateAttr(default_factory=dict)
     source_id: str
     schema_name: str = Field(default="public", alias="schema")
     name: str

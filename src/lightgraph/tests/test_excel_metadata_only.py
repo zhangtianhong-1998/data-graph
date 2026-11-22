@@ -5,6 +5,7 @@ import pytest
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import RunConfig, open_sources
 from lightgraph.sources import ExcelSource
+from lightgraph.construction.executor import execute_draft
 
 
 def workbook(tmp_path):
@@ -67,3 +68,25 @@ def test_open_sources_passes_metadata_only_to_excel(tmp_path):
 def test_metadata_only_preserves_explicit_hidden_column_choice(tmp_path):
     with ExcelSource(workbook(tmp_path), metadata_only=True, include_hidden=True) as source:
         assert source.describe()[0].column_names == ["id", "label", "hidden"]
+
+
+def test_projection_records_original_excel_ordinals_after_hidden_and_unselected_columns(tmp_path):
+    path = tmp_path / 'positions.xlsx'
+    book = openpyxl.Workbook()
+    sheet = book.active
+    sheet.title = 'items'
+    sheet.append(['private', 'code', 'unselected', 'caption'])
+    sheet.append(['x', '001', 'y', 'One'])
+    sheet.column_dimensions['A'].hidden = True
+    book.save(path)
+    book.close()
+    with ExcelSource(path, source_id='book', allowed_columns={'public.items': ['code', 'caption']}) as source:
+        tables = source.describe()
+        assert tables[0].column_names == ['code', 'caption']
+        draft = {'draft_id': 'items', 'entities': [{'type': 'Item', 'key_names': ['id'], 'mappings': [
+            {'source_id': 'book', 'table': 'items', 'key_columns': ['code'], 'label_column': 'caption'}]}]}
+        result = execute_draft(draft, [source], tables)
+        assert result['passed'], result['diagnostics']
+        node, = result['graph']['nodes']
+        support, = node['supports']
+        assert support['provenance']['source_column_ordinals'] == {'code': 2, 'caption': 4}

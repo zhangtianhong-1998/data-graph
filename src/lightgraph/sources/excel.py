@@ -84,8 +84,7 @@ class ExcelSource(MemorySource):
                 names = [str(c.value) if c.value is not None else "" for c in header[:last+1]]
                 if any(not n for n in names): raise LightGraphError("excel_merged_or_missing_header_requires_schema")
                 if len(names) != len(set(names)): raise LightGraphError("excel_duplicate_header")
-                table = TableSpec(source_id=source_id, schema="public", name=ws.title, columns=[ColumnSpec(
-                    name=n, data_type="unknown" if metadata_only else "text", comment="Uploaded Excel header") for n in names])
+                table = TableSpec(source_id=source_id, schema="public", name=ws.title, columns=[ColumnSpec(name=n, data_type="unknown" if metadata_only else "text", comment="Uploaded Excel header") for n in names])
                 hidden_rows, hidden_columns = self._hidden_positions(path, ws, include_hidden, columns_only=metadata_only)
                 visible = [i for i in range(len(names)) if i + 1 not in hidden_columns]
                 physical_columns[table.qualified_name] = list(names)
@@ -95,6 +94,7 @@ class ExcelSource(MemorySource):
                     raise LightGraphError("authorized_column_unavailable")
                 kept = [i for i in visible if requested_columns is None or names[i] in requested_columns]
                 table.columns = [table.columns[i] for i in kept]
+                table._workbook_ordinals = {names[i]: i + 1 for i in kept}
                 if not kept: continue
                 tables.append(table)
                 if metadata_only:

@@ -69,7 +69,12 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     draft = GraphDraft.model_validate(draft.model_dump(mode='python', by_alias=True)
                                      if isinstance(draft, GraphDraft) else draft)
     allowed = {(t.source_id, t.schema_name, t.name): t for t in tables}
-    by_source = {t.source_id: adapter for adapter in adapters for t in adapter.describe()}
+    by_source, workbook_ordinals = {}, {}
+    for adapter in adapters:
+        for table in adapter.describe():
+            by_source[table.source_id] = adapter
+            if table._workbook_ordinals:
+                workbook_ordinals[table.source_id, table.schema_name, table.name] = table._workbook_ordinals
     inherited = InheritedEndpoints(base_graph if draft.extends_base_graph else None)
     local_definitions = {definition.type: definition for definition in draft.entities}
     local_types = set(local_definitions)
@@ -573,6 +578,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                 **({'constant_properties': mapping.constant_properties} if mapping.constant_properties else {}),
                 **({'context_columns': mapping.context_columns} if mapping.context_columns else {}),
                 'business_context_mapping': mapping.business_context.model_dump(mode='json')}
+        header = workbook_ordinals.get((mapping.source_id, mapping.schema_name, mapping.table), {})
+        ordinals = {c: header[c] for c in info['columns'] if c in header}
+        if ordinals:
+            info['source_column_ordinals'] = ordinals
         if getattr(mapping, 'alias_columns', None):
             info['alias_columns'] = list(mapping.alias_columns)
         if getattr(mapping, 'english_name_column', None):
