@@ -102,7 +102,15 @@ def _facts(graph):
                                        'label', 'properties', 'provenance') if k in s}
             origins = s.get('execution_origins') or [s]
             for o in origins:
-                witnesses[binding, canonical(facts), o.get('contributor_id', s.get('contributor_id'))] += 1
+                # Identical physical observations may be stored once with a
+                # distinct execution record for each original draft mapping.
+                prov = dict(facts.get('provenance', {}))
+                for field in ('definition', 'mapping'):
+                    if field in o:
+                        prov[field] = o[field]
+                witnesses[binding, canonical({**facts, 'provenance': prov}), canonical({
+                    k: o[k] for k in ('contributor_id', 'draft_id', 'draft_revision', 'validation_id', 'evidence_refs')
+                    if k in o})] += 1
     return witnesses
 
 

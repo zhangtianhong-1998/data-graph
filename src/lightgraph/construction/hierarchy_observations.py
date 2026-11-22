@@ -3,6 +3,7 @@ import re
 from typing import NamedTuple
 
 from lightgraph.contracts import canonical
+from lightgraph.source_values import scalar_kind
 
 from .contexts import business_context_identity
 
@@ -28,7 +29,12 @@ def _predicate_terms(predicate, nonnull):
     return (canonical(predicate),)
 
 
-def observation_boundary(support, key_columns, positions):
+def observation_scope(support):
+    return canonical([support['scope_ref'], sorted(support.get('required_scope_refs') or []),
+                      sorted(support['provenance'].get('scope_columns') or []), business_context_identity(support)])
+
+
+def observation_boundary(support, key_columns, positions, *, witnessed_captions=()):
     """Compare access, applicability, filters and the non-hierarchy part of row context.
 
     Positions are physical columns verified on the same source hierarchy. Values
@@ -43,15 +49,17 @@ def observation_boundary(support, key_columns, positions):
     row = support.get('row_context') or {}
     mapping = prov.get('business_context_mapping') or {}
     protected = set(prov.get('scope_columns') or []) | set((mapping.get('columns') or {}).values())
-    path = positions.keys() - protected
+    # A mapped physical attribute may be compared through its typed row cell
+    # below. Keep that cell in the boundary even if it doubles as a path slot.
+    protected.update((prov.get('property_columns') or {}).values())
+    path = (positions.keys() | set(witnessed_captions)) - protected
     values = {k: v for k, v in (row.get('values') or {}).items() if k not in path}
     types = {k: v for k, v in (row.get('value_types') or {}).items() if k not in path}
     nonnull = set(key_columns)
     if prov.get('label_column') and (support.get('observed_label') or support.get('label')):
         nonnull.add(prov['label_column'])
     return ObservationBoundary(
-        canonical([support['scope_ref'], sorted(support.get('required_scope_refs') or []),
-                   sorted(prov.get('scope_columns') or []), business_context_identity(support)]),
+        observation_scope(support),
         canonical([values, types]), _predicate_terms(prov.get('predicate'), nonnull))
 
 
@@ -110,9 +118,25 @@ def observation_properties(support, key_columns, positions, *, column_ordinals=N
     observed = support.get('properties') or {}
     positions_only = {k for k, v in constants.items() if canonical(observed.get(k)) == canonical([v])
                       and _matches_position(k, v, key_columns, positions, prov, column_ordinals)}
-    # Preserve physical property observations as pairs: two names can denote
-    # the same column without one overwriting the other's observed values.
-    properties = {((prov.get('property_columns') or {}).get(k, k), canonical(values))
-                  for k, values in observed.items() if k not in positions_only}
+    # One directly projected source cell can also have been recorded as a
+    # typed value on this very row. Compare it once through the row boundary.
+    # Properties alone carry no driver type in historical checkpoints.
+    bindings = prov.get('property_columns') or {}
+    row = support.get('row_context') or {}
+    row_values, row_types = row.get('values') or {}, row.get('value_types') or {}
+    projected = set(prov.get('context_columns') or ()) & set(prov.get('columns') or ())
+    properties = set()
+    for name, values in observed.items():
+        if name in positions_only:
+            continue
+        column = bindings.get(name)
+        if name not in constants and column in projected and column in row_values and column in row_types:
+            value, kind = row_values[column], row_types[column]
+            if isinstance(value, (str, bool, int, float)) and canonical(values) == canonical([value]):
+                # These driver types are serialized as strings on disk. The
+                # type comes from the row witness, not from the string's spelling.
+                if scalar_kind(value) == kind or (isinstance(value, str) and kind in {'date', 'time', 'datetime', 'decimal'}):
+                    continue
+        properties.add((column or name, canonical(values)))
     remaining = {k: v for k, v in constants.items() if k not in positions_only}
     return canonical([sorted(properties), remaining])

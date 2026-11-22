@@ -338,7 +338,7 @@ def audit(run_file, node_id, *, observations_only=False):
     modules = [merger, observed_identity, executor, fusion, metadata_columns, workspace]
     # A standalone copy of this script can also audit checkpoints using the
     # older backend, which did not retain catalog identity references.
-    for name in ('catalog_identity', 'hierarchy_replay', 'hierarchy_observations'):
+    for name in ('catalog_identity', 'hierarchy_replay', 'hierarchy_observations', 'hierarchy_captions'):
         module = sys.modules.get('lightgraph.construction.' + name)
         if module is not None:
             modules.append(module)
