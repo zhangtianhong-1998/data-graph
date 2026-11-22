@@ -54,6 +54,10 @@ Windows 使用 `.venv\Scripts\python.exe` 和 `.venv\Scripts\lightgraph.exe`。�
 
 确定性合并记录和发布摘要 `construction/workflow-merge-summary.yaml` 会同时给出身份候选组数、涉及的不同节点数（`candidate_identity_nodes`），以及出现在多组中的节点数（`candidate_identity_nodes_in_multiple_groups`）。一个对象可以同时出现在同名组和同码组。实际能归并多少个节点，取决于各组的身份依据。
 
+运行记录中，合并节点的「说明」显示上游输入、输出和同源去重数量。有跨表节点按字典成员合并时，另列这一步消除的副本数。按字典合并要求对象类型和角色相容，各来源引用同一个完整的字典唯一键，并在适用范围一致的观察中找到对应成员。
+
+对于直接合并抽取单元的确定性节点，可用 `python scripts/audit_checkpoint_merge.py "<项目目录>/runs/<原运行ID>.json" --node merge_1` 核查。`committed` 来自原检查点。`without_source_replay` 和 `with_source_replay` 使用同一批检查点、原运行的策略和当前 Python 环境的代码，分别关闭和开启基于来源证据的自动合并。`source_replay_collapsed_nodes` 计入同源重复投影消除的副本，`observed_dictionary_collapsed_nodes` 计入随后按字典成员额外消除的副本。旧检查点可使用其中已保存的证据。脚本还会分别统计行实体、物理列节点、未决关系和缺少端点的已发布边。核查期间只读项目文件，无需数据库和模型。
+
 对于旧版「两个抽取 → 一个合并抽取」运行，如果已经隔离名称冲突并提交增量，却没生成项目输出，可在原运行的合并节点点「从原合并产物恢复发布」。系统核对原抽取结果、上游图、冻结记录、节点报告和已提交增量，再按当时的策略重新组合发布，不读源库也不调用模型。此操作限直接连接抽取节点、无项目级继承的唯一终端合并节点。已隔离的实体不会凭空恢复；如要改变隔离结论，需用保留的证据重新验证。
 
 实例图谱的验证预览、发布、合并和继承快照使用不可变目录，内含 `nodes.parquet`、`edges.parquet` 和 `metadata.yaml`。Parquet 按批次压缩写入，保留身份、属性、来源、范围和证据；全部写完后才更新发布指针。旧 YAML 和证据分片仍可读取，内部旧 YAML 上限为 512 MiB；Agent 提交的映射 YAML 仍限制为 8 MiB。升级时安装新的 PyArrow 依赖并重启服务。历史文件不会自动改写。
@@ -154,7 +158,22 @@ lightgraph export-graph CONFIG graph.graphml --format graphml
 
 构图启动时，数据库的连接或可隔离预检故障也会保留为失败来源，健康来源可继续工作；依赖失败来源的草稿不能发布，整轮报告保留缺口。凭据、授权配置及全局预算错误仍按原约束退出。跨源引用检查与实例匹配保留驱动值类型，不将 Decimal、日期等值与同形文本自动合并；新类型语义下的发布需要重新验证旧草稿，历史产物保留。修复及兼容边界见[2026-11-06 修订](design/lightweight_graph/P1_CORRECTNESS_REPAIRS_20261106.md)。
 
-数据接入方式保持不变。抽取目标与知识材料统一使用 Markdown：目标在页面直接编辑，知识文档继续通过现有 Markdown 上传、用途与范围设置管理。目标随项目配置修订保存，运行时写入 `construction/goal.md`；文档按需读取，初始上下文只有目标与材料目录。文字说明不能改变表列授权或程序约束。
+抽取目标与知识材料均支持 Markdown。目标在页面直接编辑，随项目配置修订保存，运行时写入 `construction/goal.md`。知识文档按需读取，初始上下文只包含目标与材料目录。
+
+在「项目配置 → 知识文档」上传普通 Markdown，默认用途为「数据关联」。例如，上传 `orders.md` 时，项目里只有一张名为 `orders` 的表就会自动绑定。多个来源或 Schema 下有同名表、或项目中尚无匹配表时，文档显示「待分配」，暂不参与抽取。可直接在卡片上改用途、选择一张或多张表；通用于整个项目的材料可以显式设为全局。
+
+批量配置时选择「导入 YAML」。`path` 可用项目中已上传文档的唯一文件名或登记路径。新文档可放在一个目录里，按清单写相对路径，在浏览器中选择该根目录。下面将一份说明同时关联到两张表，另一份分析知识供整个项目使用。将示例的 `来源.Schema.表名` 替换为卡片上显示的完整表名。
+
+```yaml
+documents:
+  - path: docs/orders.md
+    type: data_description
+    tables:
+      - warehouse.public.orders
+      - warehouse.public.order_lines
+  - path: docs/methods.md
+    type: analysis_knowledge
+```
 
 运行配置仍使用 YAML，`goal_markdown` 承载目标原文。省略它时，旧 `goal.purpose` 和相关说明会转换为 Markdown。以下是结构示例，来源路径、模型与构建目的需要按实际任务填写：
 

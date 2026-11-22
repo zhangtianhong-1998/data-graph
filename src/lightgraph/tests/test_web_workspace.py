@@ -146,9 +146,13 @@ def test_document_binding_is_read_by_real_loader_and_changes_revision(workspace)
     original = "---\ntitle: 字段说明\nauthor: 维护人员\n---\n# 使用说明\n\n此处为正文。\n"
     doc = workspace.add_file("project_a", "说明.md", original.encode())
     assert doc["scope"] == {"source_ids": [], "tables": [], "columns": []}
-    assert doc["purpose"] == "unresolved"
-    config = workspace.resolved_config("project_a")
-    before = load_documents(config.documents)[0]
+    assert doc["purpose"] == "data_description"
+    assert doc["inactive_reason"] == "pending_assignment"
+    assert workspace.resolved_config("project_a").documents == []
+    before = load_documents([workspace.file_path("project_a", doc["file_id"])])[0]
+    config = workspace.get_config("project_a")
+    config["sources"] = [{"id": "sales", "kind": "gauss_database", "allowed_tables": ["public.items"]}]
+    workspace.save_config("project_a", config)
     scope = {"source_ids": ["sales"], "tables": ["sales.public.items"], "columns": []}
     record = workspace.document_binding("project_a", doc["file_id"], "data_description", scope)
     after = load_documents(workspace.resolved_config("project_a").documents)[0]
@@ -255,3 +259,105 @@ def test_get_config_rejects_secret_from_manually_edited_project_config(workspace
         workspace.get_config("project_a")
     assert caught.value.code == "use_credential_environment_variable"
     assert "SECRET_FROM_DISK" not in str(caught.value)
+
+
+def test_filename_bindings_reconcile_in_both_upload_orders_and_manual_selection_wins(workspace):
+    pid = "project_a"
+    doc = workspace.add_file(pid, "records.markdown", b"# Dictionary")
+    config = workspace.get_config(pid)
+    config["documents"] = [doc["relative_path"]]
+    assert workspace.save_config(pid, config)["documents"] == []
+
+    first = workspace.add_file(pid, "records.csv", b"id\n01\n")
+    expected = f"s_{first['file_id'][2:]}.public.records"
+    resolved = load_documents(workspace.resolved_config(pid).documents)
+    assert len(resolved) == 1 and resolved[0].scope.tables == [expected]
+    assert resolved[0].purpose == "data_description"
+
+    second = workspace.add_file(pid, "records.csv", b"id\n02\n")
+    assert workspace.resolved_config(pid).documents == []
+    def current():
+        return next(f for f in workspace.get(pid)["files"] if f["file_id"] == doc["file_id"])
+    assert current()["inactive_reason"] == "pending_assignment"
+    for selector, error in [("records", "ambiguous_document_table_binding"),
+                            ("missing.public.records", "invalid_document_table_binding")]:
+        with pytest.raises(LightGraphError, match=error):
+            workspace.document_binding(pid, doc["file_id"], "data_description", {"tables": [selector]})
+        assert current()["inactive_reason"] == "pending_assignment"
+    scope = {"tables": [expected, f"s_{second['file_id'][2:]}.public.records"]}
+    workspace.document_binding(pid, doc["file_id"], "data_description", scope)
+    workspace.add_file(pid, "records.csv", b"id\n03\n")
+    assert current()["binding_origin"] == "explicit"
+    assert load_documents(workspace.resolved_config(pid).documents)[0].scope.tables == scope["tables"]
+
+
+def test_filename_match_uses_exact_visible_sheet_and_table_names(workspace):
+    from io import BytesIO
+    from openpyxl import Workbook
+    pid = "project_a"
+    book = Workbook()
+    book.active.title = "object.v2"
+    book.active.append(["key"])
+    book.create_sheet("hidden").sheet_state = "hidden"
+    book["hidden"].append(["key"])
+    book.create_sheet("empty")
+    stream = BytesIO()
+    book.save(stream)
+    workbook = workspace.add_file(pid, "inventory.xlsx", stream.getvalue())
+    source_id = f"s_{workbook['file_id'][2:]}"
+    matching = workspace.add_file(pid, "object.v2.MD", b"# Valid")
+    assert matching["scope"]["tables"] == [f"{source_id}.public.object.v2"]
+    for name in ("OBJECT.V2.md", "object.md", "hidden.md", "empty.md", "inventory.md"):
+        file = workspace.add_file(pid, name, b"# Pending")
+        assert file["inactive_reason"] == "pending_assignment"
+    assert workspace.get_config(pid)["documents"] == [matching["relative_path"]]
+
+
+def test_explicit_and_legacy_bindings_survive_new_homonymous_source(workspace):
+    pid = "project_a"
+    file = workspace.add_file(pid, "archive.md", b"---\npurpose: analysis_knowledge\n---\n# Guide")
+    project = workspace.get(pid)
+    del project["files"][0]["binding_origin"]
+    workspace._save(project)  # A project persisted before per-file binding provenance.
+    workspace.add_file(pid, "archive.csv", b"code\nX\n")
+    [doc] = load_documents(workspace.resolved_config(pid).documents)
+    assert doc.purpose == "analysis_knowledge" and not doc.scope.tables
+    assert workspace.get_config(pid)["documents"] == [file["relative_path"]]
+
+
+def test_reverting_temporary_source_connection_restores_automatic_assignment(workspace):
+    pid = "project_a"
+    workspace.add_file(pid, "items.md", b"# Dictionary")
+    previous = workspace.get_config(pid)
+    source = {"id": "temp", "kind": "gauss_database", "allowed_tables": ["public.items"]}
+    connected = workspace.save_config(pid, {**previous, "sources": [source]})
+    assert connected["documents"]
+    assert workspace.save_config(pid, previous)["documents"] == []
+    doc = workspace.get(pid)["files"][0]
+    assert doc["inactive_reason"] == "pending_assignment" and doc["binding_origin"] == "filename"
+    assert workspace.save_config(pid, {**previous, "sources": [source]})["documents"] == connected["documents"]
+
+
+def test_save_valid_replacement_can_repair_broken_existing_config(workspace):
+    pid = "project_a"
+    missing = workspace.add_file(pid, "missing.csv", b"id\n1\n")
+    valid = workspace.get_config(pid)
+    valid["sources"] = []
+    workspace.file_path(pid, missing["file_id"]).unlink()
+    assert workspace.save_config(pid, valid)["sources"] == []
+    config_path = workspace.project_path(pid) / "config.yaml"
+    config_path.write_bytes(b"invalid: [")
+    assert workspace.save_config(pid, valid)["sources"] == []
+    config_path.unlink()
+    assert workspace.save_config(pid, valid)["sources"] == []
+
+
+def test_literal_dotted_name_cannot_collide_with_an_automatic_qualified_selector(workspace):
+    pid = "project_a"
+    config = workspace.get_config(pid)
+    config["sources"] = [{"id": "db", "kind": "mysql_database", "allowed_tables": ["s.object"]}]
+    workspace.save_config(pid, config)
+    workspace.add_file(pid, "db.s.object.csv", b"key\nA\n")
+    file = workspace.add_file(pid, "object.md", b"# Dictionary")
+    assert file["inactive_reason"] == "pending_assignment"
+    assert not workspace.resolved_config(pid).documents

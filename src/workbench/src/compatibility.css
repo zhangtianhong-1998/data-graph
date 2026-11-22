@@ -101,6 +101,8 @@ body:has(.modal-backdrop) { overflow: hidden; }
 .phase-tabs .status-dot { margin: 0; }
 .project-head .tabs { margin-top: 18px; }
 .content { flex: 1; min-height: 0; width: 100%; overflow: auto; overscroll-behavior: contain; }
+.content.documents-content { display: flex; flex-direction: column; overflow: hidden; padding-bottom: 12px; }
+.documents-content > .run-banner { flex-shrink: 0; }
 .content.workflow-content { display: flex; flex-direction: column; }
 .workflow-content > .workflow-page { flex: 1; min-height: 0; }
 .workflow-content .wf-toolbar-panel, .workflow-content > .run-banner { flex-shrink: 0; }

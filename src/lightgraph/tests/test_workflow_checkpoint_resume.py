@@ -81,6 +81,10 @@ def test_partial_promotion_and_pinned_recovery(workflow):
     assert state['merge']['publication_status'] == 'published'
     assert [state['units'][node]['model_calls'] for node in ('a', 'b')] == [3, 3]
     assert state['merge_nodes']['merge']['model_calls'] == 7
+    upstream_counts = state['merge_nodes']['merge']['merge_counts']
+    assert upstream_counts['source_replay_status'] == 'ran' and upstream_counts['input_nodes'] == 2
+    assert state['merge']['merge_counts'] == state['merge_nodes']['merge']['delta_merge_counts']
+    assert state['merge']['merge_counts']['input_nodes'] == 3
     full = state['artifacts']['merge']
     assert full['graph_kind'] == 'node_full'
     out = Path(config.output_dir)
@@ -94,6 +98,7 @@ def test_partial_promotion_and_pinned_recovery(workflow):
     assert all(node['model_calls'] == 0 for node in published['workflow_state']['units'].values())
     assert published['workflow_state']['merge_nodes']['merge']['model_calls'] == 0
     assert published['workflow_state']['merge']['published_artifact_id'] == full['artifact_id']
+    assert published['workflow_state']['merge']['merge_counts'] == state['merge']['merge_counts']
     assert set(project.glob('started-*')) == before
     assert (out / 'workflow-runs' / (origin['run_id'] + '.json')).read_bytes() == original
 

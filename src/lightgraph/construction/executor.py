@@ -21,6 +21,7 @@ from .models import GraphDraft, draft_evidence_refs
 from .access import scope_binding_map, support_scope
 from .display import derive_display_graph
 from .accumulation import GraphAccumulator
+from .catalog_identity import catalog_identity_reference
 from .contexts import (materialize_business_context, identity_business_context, business_context_identity,
                        intersect_business_contexts)
 from .context_topology import detect_context_cycles
@@ -674,6 +675,9 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                     projected_rows += len(rows)
                     support = provenance(entity.type, index, mapping)
                     support['key_columns'] = mapping.key_columns
+                    reference = catalog_identity_reference(mapping, allowed, goal)
+                    if reference is not None:
+                        support['catalog_identity_reference'] = reference
                     if mapping.label_column:
                         support['label_column'] = mapping.label_column
                     if getattr(mapping, 'english_name_column', None):

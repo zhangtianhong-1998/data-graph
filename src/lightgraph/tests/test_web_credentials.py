@@ -375,10 +375,10 @@ def test_partial_catalog_defers_documents_for_unread_source(client,monkeypatch):
     monkeypatch.setattr('lightgraph.runtime.config.open_sources',fake_open(calls))
     upload=client.post('/api/projects/alpha/files',files={'file':('bound.md',b'# Descriptions')}).json()
     binding={'purpose':'data_description','scope':{'tables':['unavailable.other.table']}}
-    assert client.patch(f"/api/projects/alpha/files/{upload['file_id']}/binding",json=binding).status_code==200
     config=client.get('/api/projects/alpha/config').json()
     config['sources']=[{'id':'unavailable','kind':'mysql_database','dsn_env':'UNSET_DB_ENV','allowed_tables':['other.table']}]
     client.put('/api/projects/alpha/config',json=config)
+    assert client.patch(f"/api/projects/alpha/files/{upload['file_id']}/binding",json=binding).status_code==200
     result=client.post('/api/projects/alpha/database/connect',headers=headers,json=db_body())
     assert result.status_code==200,result.text
     assert result.json()['metadata']['document_context_deferred'] is True
@@ -558,3 +558,22 @@ def test_corrupt_profile_does_not_block_other_sources_or_model_configuration(cli
     assert client.delete(path,headers=headers).status_code==200
     assert client.get(path,headers=headers).json()=={'saved':False}
     scan_no_secrets(client, 'SECRET_DB_BROWSER_382', 'SECRET_UNRELATED_MODEL')
+
+
+def test_failed_connection_restores_staged_document_bytes_and_pending_binding(client, monkeypatch):
+    pid = "alpha"
+    headers = session(client)
+    text = b"# Exact body\r\n"
+    response = client.post(f"/api/projects/{pid}/files", files={"file": ("metrics.md", text)})
+    pending = response.json()
+    workspace = client.app.state.workspace
+    tentative = []
+    def unavailable(*args, **kwargs):
+        tentative.extend(workspace.resolved_config(pid).documents)
+        raise LightGraphError("database_connection_failed")
+    monkeypatch.setattr("lightgraph.runtime.config.open_sources", unavailable)
+    response = client.post(f"/api/projects/{pid}/database/connect", headers=headers, json=db_body())
+    assert response.status_code != 200 and len(tentative) == 1
+    assert workspace.get_config(pid)["documents"] == []
+    assert workspace.get(pid)["files"] == [pending]
+    assert workspace.file_path(pid, pending["file_id"]).read_bytes() == text

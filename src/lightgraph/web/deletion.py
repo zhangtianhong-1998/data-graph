@@ -315,8 +315,10 @@ def delete_input(workspace, pid, *, fid=None, sid=None, table=None):
             if file['relative_path'] in config['documents']:
                 config['documents'].remove(file['relative_path'])
             inactive_ids.append(file['file_id'])
+    binding_writes = workspace.filename_binding_writes(pid, project, config)
     clean = workspace._normalize_config(pid, config, project)
     writes = _metadata_update(workspace, pid, clean, declared, trusted, targets)
+    writes.update(binding_writes)
     deletions = [workspace._path(pid, f['relative_path']) for f in removed_files]
     deletions.extend(workspace._path(pid, f"metadata/{f['file_id']}.yaml") for f in removed_files)
     deletions.extend(_obsolete_catalogs(workspace, pid, targets))

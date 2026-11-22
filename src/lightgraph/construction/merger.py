@@ -17,7 +17,8 @@ from .display import derive_display_graph
 from .fusion import (deduplicate_supports, definition_conflict_diagnostics, label_priority,
                      merge_definition, prepare_graph, relation_identity, retain_definition_variants)
 from .context_topology import detect_context_cycles
-from .observed_identity import align_observed_nodes
+from .models import COLUMN_IDENTITY_NAMES
+from .observed_identity import align_dictionary_nodes, align_observed_nodes
 from .workspace import read_internal_yaml, write_yaml
 
 SHARD_COUNT = 32
@@ -111,6 +112,81 @@ def _node_shared_allowed(
     return node.get('original_type', node.get('type')) in shared_types
 
 
+def _local_catalog_targets(prepared, local_bases):
+    """Resolve local catalog addresses after type qualification, preserving frozen lookup IDs."""
+    targets = [{} for _ in prepared]
+    pinned_ids = set()
+    by_address = defaultdict(list)
+    for index, (cid, kind, graph) in enumerate(prepared):
+        for node in graph.get('nodes', []):
+            if node.get('identity_origin') != 'physical_column':
+                continue
+            identity = node['identity']
+            supports = node.get('supports', [])
+            inherited = (kind == 'base' and cid not in local_bases) or any(
+                s.get('inherited_from') for s in supports)
+            if (inherited or set(identity) != set(COLUMN_IDENTITY_NAMES)
+                    or not all(isinstance(v, str) and v for v in identity.values())
+                    or not supports):
+                pinned_ids.add(node['id'])
+                continue
+            address = (node['type'], *(identity[key] for key in COLUMN_IDENTITY_NAMES))
+            by_address[address].append((index, kind, node['id']))
+    for address, entries in by_address.items():
+        if len(entries) == 1 and entries[0][2] not in pinned_ids:
+            continue
+        usable = [(kind not in {'base', 'merged'}, nid) for _, kind, nid in entries if nid not in pinned_ids]
+        # Keep an existing local endpoint if possible. If a foreign publication
+        # owns its ID, every local branch must choose the same replacement.
+        target_id = min(usable)[1] if usable else 'n_' + digest('local_catalog_column_v1', address)
+        for index, _, nid in entries:
+            targets[index][nid] = target_id
+    return targets
+
+
+def _source_key_comparison(nodes, foreign_base_ids):
+    """Compare recorded table addresses and ordered physical keys, not logical entity identity."""
+    if any(node['id'] in foreign_base_ids for node in nodes):
+        return 'unverified_source_namespace'
+    tables, bindings = Counter(), Counter()
+    incomplete_keys = False
+    for node in nodes:
+        supports = node.get('supports') or []
+        if not supports:
+            return 'incomplete_source_provenance'
+        observed_tables, observed_bindings = set(), set()
+        for support in supports:
+            if support.get('inherited_from'):
+                return 'unverified_source_namespace'
+            provenance = support.get('provenance') or {}
+            source = provenance.get('source') or {}
+            table = tuple(source.get(field) for field in ('source_id', 'schema', 'table'))
+            if not all(isinstance(value, str) and value for value in table):
+                return 'incomplete_source_provenance'
+            observed_tables.add(table)
+            columns = provenance.get('key_columns')
+            if (isinstance(columns, list) and columns and len(columns) == len(node['identity'])
+                    and all(isinstance(c, str) and c for c in columns) and len(set(columns)) == len(columns)):
+                observed_bindings.add((table, tuple(columns)))
+            else:
+                incomplete_keys = True
+        # Repeated supports on a single node count as one witness for that node.
+        tables.update(observed_tables)
+        bindings.update(observed_bindings)
+    common_to = max(tables.values())
+    if common_to == 1:
+        return 'disjoint_tables'
+    if common_to < len(nodes):
+        return 'partial_table_overlap'
+    if len(nodes) in bindings.values():
+        return 'shared_table_and_key_columns'
+    if incomplete_keys:
+        return 'incomplete_key_provenance'
+    if max(bindings.values(), default=0) > 1:
+        return 'partial_key_binding_overlap'
+    return 'no_shared_key_binding'
+
+
 def _same_name_candidates(nodes, seen_groups):
     """Explain cross-contributor homonyms without forming quadratic node pairs."""
     groups = defaultdict(set)
@@ -136,7 +212,8 @@ def _same_name_candidates(nodes, seen_groups):
             reason = 'same_label_different_key_types'
         else:
             reason = 'same_label_different_identities'
-        yield {'status': 'candidate_only', 'reason': reason, 'normalized_label': name, 'entity_types': types,
+        yield {'status': 'candidate_only', 'reason': reason, 'match_basis': 'normalized_label',
+               'normalized_label': name, 'entity_types': types,
                'node_ids': list(node_ids), 'contributors': contributors}
         seen_groups.add(node_ids)
 
@@ -186,7 +263,7 @@ def _merge_contributor_nodes_and_edges(
             evidence_records=item.get('evidence_records'),
         )
         if fusion and fusion.entity_rules and not independent_outputs:
-            rewritten = prepare_graph(rewritten, fusion, copy=False)
+            rewritten = prepare_graph(rewritten, fusion, copy=False, self_contained=ckind in {'base', 'merged'})
         evidence_catalog.update(cat)
         for ref in rewritten.get('evidence_refs', []):
             if ref not in evidence_refs:
@@ -207,12 +284,20 @@ def _merge_contributor_nodes_and_edges(
 
     observed_ids = [{} for _ in prepared_contributors]
     observation_witnesses = []
-    if recognize_source_replays and not independent_outputs and len(prepared_contributors) > 1:
-        local_bases = {str(item['contributor_id']) for item in contributors if item.get('local_source_namespace') is True}
+    source_replay_counts = {}
+    local_bases = {str(item['contributor_id']) for item in contributors if item.get('local_source_namespace') is True}
+    if independent_outputs:
+        replay_status = 'independent_outputs'
+    elif not recognize_source_replays:
+        replay_status = 'disabled'
+    elif len(prepared_contributors) < 2:
+        replay_status = 'insufficient_contributors'
+    else:
+        replay_status = 'ran'
         excluded_types = shared_types | ({rule.canonical_type for rule in fusion.entity_rules} if fusion else set())
         observed_ids, observation_witnesses = align_observed_nodes(
             prepared_contributors, local_bases=local_bases, excluded_types=excluded_types,
-            emit_candidates=policy.emit_alignment_candidates)
+            emit_candidates=policy.emit_alignment_candidates, diagnostics=source_replay_counts)
 
     variant_remaps = [{} for _ in prepared_contributors]
     if independent_outputs:
@@ -224,11 +309,21 @@ def _merge_contributor_nodes_and_edges(
 
     observed_ids = [{variants.get(original, original): target for original, target in observed.items()}
                     for observed, variants in zip(observed_ids, variant_remaps, strict=True)]
+    node_targets = observed_ids
+    dictionary_targets = set()
+    dictionary_counts = {}
+    if replay_status == 'ran':
+        catalog_targets = _local_catalog_targets(prepared_contributors, local_bases)
+        dictionary_ids, dictionary_counts = align_dictionary_nodes(
+            prepared_contributors, observed_ids, local_bases=local_bases, excluded_types=excluded_types)
+        dictionary_targets = {target for mapping in dictionary_ids for target in mapping.values()}
+        node_targets = [rows | dictionary | columns for rows, dictionary, columns
+                        in zip(observed_ids, dictionary_ids, catalog_targets, strict=True)]
     originals = {(str(item.get('kind', 'unit')), str(item['contributor_id'])): item['graph']
                  for item in contributors}
-    for (cid, ckind, rewritten), observed in zip(prepared_contributors, observed_ids, strict=True):
+    for (cid, ckind, rewritten), targets in zip(prepared_contributors, node_targets, strict=True):
         if ckind == 'base':
-            ids = {observed.get(n['id'], n['id']) for n in rewritten.get('nodes', [])}
+            ids = {targets.get(n['id'], n['id']) for n in rewritten.get('nodes', [])}
             # Base lookups resolve by node id. Ambiguous projects cannot be used as a single endpoint.
             declared = {definition['type']: definition
                         for definition in rewritten.get('definitions', {}).get('entities', [])}
@@ -241,7 +336,7 @@ def _merge_contributor_nodes_and_edges(
                 raise LightGraphError('ambiguous_inherited_identity')
             base_node_ids.update(ids)
             for old, new in zip(originals[(ckind, cid)].get('nodes', []), rewritten.get('nodes', []), strict=True):
-                new_id = observed.get(new['id'], new['id'])
+                new_id = targets.get(new['id'], new['id'])
                 base_candidates[old['id']].add(new_id)
                 if base_remap.setdefault(old['id'], new_id) != new_id:
                     # Both incompatible base variants remain visible. An actual
@@ -255,7 +350,9 @@ def _merge_contributor_nodes_and_edges(
     conflict_details: list[dict[str, Any]] = []
     unresolved_relations: list[dict[str, Any]] = []
     context_cycle_diagnostics: list[dict[str, Any]] = []
-    retained_global_labels = False
+    retained_labels = False
+    retain_column_variants = (fusion.label_conflict_policy == 'retain_variants' if fusion
+                              else recognize_source_replays and 'conflict_mode' not in policy.model_fields_set)
 
     # Index unshared/candidate nodes for alignment candidate generation (never auto-merged!).
     same_code_buckets: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -263,7 +360,7 @@ def _merge_contributor_nodes_and_edges(
 
     # Pass 1: collect definitions & all nodes from all contributors, retaining per-contributor id_remap.
     contributor_remaps: list[tuple[str, str, dict[str, Any], dict[str, str]]] = []
-    for (cid, ckind, graph), variant_remap, observed in zip(prepared_contributors, variant_remaps, observed_ids, strict=True):
+    for (cid, ckind, graph), variant_remap, targets in zip(prepared_contributors, variant_remaps, node_targets, strict=True):
         for category in ('entities', 'relations'):
             for defn in graph.get('definitions', {}).get(category, []):
                 copied = deepcopy(defn)
@@ -291,8 +388,8 @@ def _merge_contributor_nodes_and_edges(
                     and contract.get('identity_domain') == node.get('identity_domain')
                     and contract.get('identity_evidence_refs')):
                 can_share = True
-            if orig_id in observed:
-                node['id'] = observed[orig_id]
+            if orig_id in targets:
+                node['id'] = targets[orig_id]
                 id_remap[orig_id] = node['id']
             elif not can_share:
                 # Isolate cross-unit entities without declared shared identity domain.
@@ -315,7 +412,8 @@ def _merge_contributor_nodes_and_edges(
                     raise LightGraphError('published_graph_identity_conflict')
                 if existing.get('identity_origin') == 'physical_column':
                     from .metadata_columns import merge_column_supports
-                    merge_column_supports(existing, node)
+                    merge_column_supports(existing, node, retain_variants=retain_column_variants)
+                    retained_labels |= retain_column_variants
                 else:
                     for key in ('aliases', 'provenance', 'supports', 'english_names', 'descriptions'):
                         if key in node:
@@ -454,10 +552,11 @@ def _merge_contributor_nodes_and_edges(
                           and contract.get('identity_domain') == node['identity_domain']
                           and contract.get('identity_evidence_refs'))
         default_replay = (not fusion and 'conflict_mode' not in policy.model_fields_set
-                          and (node_id in aligned_targets or any(s.get('identity_basis') == 'observed_source_key_v1'
+                          and (node_id in aligned_targets or node_id in dictionary_targets
+                               or any(s.get('identity_basis') in {'observed_source_key_v1', 'observed_dictionary_key_v1'}
                                                                  for s in node.get('supports', []))))
         if fusion and fusion.label_conflict_policy == 'retain_variants' or default_global or default_replay:
-            retained_global_labels = retained_global_labels or bool(default_global or default_replay)
+            retained_labels = retained_labels or bool(default_global or default_replay)
             for support in node.get('supports', []):
                 if support.get('observed_label') and not support.get('label'):
                     support['label'] = support['observed_label']
@@ -560,16 +659,22 @@ def _merge_contributor_nodes_and_edges(
     candidate_identity_merges: list[dict[str, Any]] = []
     candidate_column_alignments: list[dict[str, Any]] = []
     if policy.emit_alignment_candidates:
+        foreign_base_ids = {target for cid, kind, _, remap in contributor_remaps
+                            if kind == 'base' and cid not in local_bases for target in remap.values()}
         for (etype, _), items in sorted(same_code_buckets.items()):
-            distinct_nodes = sorted({i['node_id'] for i in items if i['node_id'] in merged_nodes})
+            retained_items = [item for item in items if item['node_id'] in merged_nodes]
+            distinct_nodes = sorted({item['node_id'] for item in retained_items})
             if len(distinct_nodes) > 1:
                 candidate_identity_merges.append({
                     'status': 'candidate_only',
                     'reason': 'cross_unit_unverified_identity_domain',
+                    'match_basis': 'same_typed_identity',
+                    'source_key_comparison': _source_key_comparison(
+                        [merged_nodes[nid] for nid in distinct_nodes], foreign_base_ids),
                     'entity_type': etype,
                     'node_ids': distinct_nodes,
-                    'contributors': sorted({i['contributor_id'] for i in items}),
-                    'identity': items[0]['identity'],
+                    'contributors': sorted({item['contributor_id'] for item in retained_items}),
+                    'identity': retained_items[0]['identity'],
                 })
         seen_groups = {tuple(candidate['node_ids']) for candidate in candidate_identity_merges}
         physical_candidates = {}
@@ -578,7 +683,8 @@ def _merge_contributor_nodes_and_edges(
             if len(ids) < 2 or ids in seen_groups or not all(nid in merged_nodes for nid in ids):
                 continue
             physical_candidates[ids] = {
-                'status': 'candidate_only', 'reason': 'source_key_requires_role_review', 'node_ids': list(ids),
+                'status': 'candidate_only', 'reason': 'source_key_requires_role_review',
+                'match_basis': 'same_source_observation', 'node_ids': list(ids),
                 'contributors': sorted({contributor_remaps[index][0] for index, _ in witnesses}),
                 'entity_types': sorted({merged_nodes[nid]['type'] for nid in ids})}
             seen_groups.add(ids)
@@ -626,9 +732,9 @@ def _merge_contributor_nodes_and_edges(
         result['fusion_policy'] = fusion.model_dump(mode='json')
         result['fusion_policy_digest'] = digest(result['fusion_policy'])
         result['label_conflict_policy'] = fusion.label_conflict_policy
-    elif retained_global_labels:
+    elif retained_labels:
         result['label_conflict_policy'] = 'retain_variants'
-    if fusion or retained_global_labels:
+    if fusion or retained_labels:
         for item in result['nodes'] + result['edges']:
             if 'supports' in item:
                 deduplicate_supports(item)
@@ -638,6 +744,25 @@ def _merge_contributor_nodes_and_edges(
         result['source_key_semantics'] = next(iter(key_versions))
     if target_access_fingerprint:
         result['access_fingerprint'] = target_access_fingerprint
+    # These counts belong to this exact merge pass, including hidden inputs.
+    # filter_graph_scopes drops fusion_diagnostics from partial views.
+    counts = merge_accounting(contributors, result)
+    replay_inputs = sum(len(ids) for ids in observed_ids)
+    counts.update({
+        'source_replay_status': replay_status,
+        'explicit_entity_rules': len(fusion.entity_rules) if fusion else 0,
+        'explicit_rule_preparation_ran': bool(fusion and fusion.entity_rules and contributors and not independent_outputs),
+        'source_replay_matched_inputs': replay_inputs,
+        'source_replay_groups': len(aligned_targets),
+        'source_replay_collapsed_nodes': replay_inputs - len(aligned_targets),
+        **dictionary_counts,
+        'collapsed_nodes_before_quarantine': counts['input_nodes'] - counts['output_nodes'] - len(quarantined_nodes),
+        'input_physical_column_nodes': sum(n.get('identity_origin') == 'physical_column'
+            for c in contributors for n in c['graph'].get('nodes', ())),
+        'output_physical_column_nodes': sum(n.get('identity_origin') == 'physical_column' for n in merged_nodes.values()),
+        **{f'source_replay_{name}': value for name, value in source_replay_counts.items()},
+    })
+    result['fusion_diagnostics'] = counts
     return derive_display_graph(result, copy=False)
 
 
@@ -698,6 +823,8 @@ def identity_candidate_node_counts(graph):
 
 def merge_accounting(contributors, graph):
     """Counts for this merge attempt, including inherited inputs; candidates may overlap."""
+    if 'fusion_diagnostics' in graph:
+        return dict(graph['fusion_diagnostics'])
     isolation = graph.get('conflict_isolation') or {}
     return {
         'input_nodes': sum(len(c['graph'].get('nodes', ())) for c in contributors),

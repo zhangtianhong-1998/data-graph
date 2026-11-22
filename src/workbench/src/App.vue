@@ -18,6 +18,7 @@ import IdentityCandidates from './IdentityCandidates.vue'
 import DiscoveryCandidates from './DiscoveryCandidates.vue'
 import DatabaseSourceDialog from './DatabaseSourceDialog.vue'
 import DataInputs from './DataInputs.vue'
+import DocumentLibrary from './DocumentLibrary.vue'
 import WorkflowEditor from './WorkflowEditor.vue'
 import BusinessContextSelect from './BusinessContextSelect.vue'
 import GraphAlignmentReview from './GraphAlignmentReview.vue'
@@ -27,6 +28,7 @@ import VectorizationProgress from './VectorizationProgress.vue'
 import { useVectorization } from './useVectorization'
 import ConfirmDelete from './ConfirmDelete.vue'
 import { goalMarkdown } from './goalMarkdown'
+import { documentManifestBody } from './documentManifest'
 import { configurationTabs, resultTabs, isResultTab } from './onboarding'
 import type { ConfigurationTab, ResultTab, WorkbenchTab } from './onboarding'
 import { ApiError, ensureSession, clearSessions, clearSession, json, projectPath, request, responseRevision } from './api'
@@ -204,16 +206,9 @@ const databaseOpen = ref(false), databaseSource = ref<SourceConfig | null>(null)
 const databaseDialog = ref<{ completeDraft: () => Promise<void> } | null>(null)
 const workbenchLocation = new WorkbenchLocation()
 const uploadInput = ref<HTMLInputElement | null>(null)
-const documentInput = ref<HTMLInputElement | null>(null)
-const bindingFile = ref<ProjectFile | null>(null)
-const bindingPurpose = ref('unresolved')
-const bindingMode = ref('global')
-const bindingTables = ref<string[]>([])
-const bindingScope = ref<DocumentScope>({ source_ids: [], tables: [], columns: [] })
 type DeletionTarget = { kind: 'run'; run: Run } | { kind: 'project'; id: string; name: string } | { kind: 'file'; file: ProjectFile } | { kind: 'source'; source: SourceConfig } | { kind: 'table'; source: SourceConfig; table: string }
 const deletion = ref<DeletionTarget | null>(null), deletionError = ref('')
 const preview = ref<{ name: string; content: string } | null>(null)
-const purposeLabels: Record<string, string> = { data_description: '数据说明', analysis_knowledge: '分析知识', mixed: '混合文档', unresolved: '待分类' }
 let generation = 0
 let pollTimer: ReturnType<typeof setTimeout> | undefined
 let toastTimer: ReturnType<typeof setTimeout> | undefined
@@ -258,8 +253,19 @@ const deletionDescription = computed(() => {
 const deletionDetail = computed(() => deletion.value?.kind === 'project' && (dirty.value || advancedDirty.value) ? '此项目尚未保存的修改也会被删除。' : deletion.value?.kind === 'source' || deletion.value?.kind === 'table' || deletion.value?.kind === 'file' && ['excel', 'csv'].includes(deletion.value.file.kind) ? '失去绑定范围的文档会暂停参与抽取，可重新绑定。' : '')
 const documentFiles = computed(() => project.value?.files.filter(f => f.kind === 'markdown') || [])
 const time = (value?: string) => value ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value)) : '—'
-const size = (value: number) => value < 1024 ? `${value} B` : value < 1024 * 1024 ? `${(value / 1024).toFixed(1)} KB` : `${(value / 1024 / 1024).toFixed(1)} MB`
 const tableKey = (table: Metadata['tables'][number]) => `${table.source_id}.${table.schema}.${table.name}`
+const documentTableKeys = computed(() => {
+  const keys = new Set<string>()
+  for (const source of config.value.sources || []) {
+    if (Array.isArray(source.allowed_tables) && source.allowed_tables.length) {
+      for (const name of source.allowed_tables) keys.add(`${source.id}.${name}`)
+    } else {
+      for (const table of metadata.value.tables) if (table.source_id === source.id) keys.add(tableKey(table))
+      if (source.kind === 'csv_file' && source.table_name) keys.add(`${source.id}.${source.schema_name || 'public'}.${source.table_name}`)
+    }
+  }
+  return [...keys].sort()
+})
 function notify(message: string) { toast.value = message; clearTimeout(toastTimer); toastTimer = setTimeout(() => { toast.value = '' }, 4500) }
 function report(exception: unknown) { if (exception instanceof ApiError && ['config_revision_conflict', 'model_credential_binding_conflict'].includes(exception.code)) configurationConflict.value = true; error.value = exception instanceof Error ? exception.message : '操作未完成，请重试。' }
 function fillForms(value: RunConfig) {
@@ -311,7 +317,7 @@ async function loadProject(id: string) {
   const epoch = ++generation
   graphController?.abort()
   embeddingTesting.value = false
-  clearTimeout(pollTimer); loading.value = true; error.value = ''; selectedRun.value = null; runPollError.value = null; preview.value = null; bindingFile.value = null; databaseOpen.value = false; modelKey.value = ''; embeddingKey.value = ''; embeddingCredStatus.value = { embedding: false }; embeddingTestResult.value = null; workflowRunStatus.value = null; retrievalStatus.value = null; credentials.value = { database_sources: [], model: false }
+  clearTimeout(pollTimer); loading.value = true; error.value = ''; selectedRun.value = null; runPollError.value = null; preview.value = null; databaseOpen.value = false; modelKey.value = ''; embeddingKey.value = ''; embeddingCredStatus.value = { embedding: false }; embeddingTestResult.value = null; workflowRunStatus.value = null; retrievalStatus.value = null; credentials.value = { database_sources: [], model: false }
   const p = projectPath(id)
   try {
     const values = await Promise.all([request<Project>(p), request<RunConfig>(`${p}/config`)])
@@ -440,17 +446,30 @@ function advancedConfig(): RunConfig {
 type SavedModelBinding = { path: string; revision?: string; expectedModel: { base_url: string; model: string }; expectedEmbedding: { base_url: string; model: string } }
 async function persistConfiguration(value: RunConfig): Promise<SavedModelBinding> {
   const projectPath = path.value
-  const saved = await request<RunConfig>(`${projectPath}/config`, { method: 'PUT', headers: revisionHeaders(), body: json(value) })
-  // Capture the write response before applying reactive state. A later refresh
-  // must not retarget the key that belongs to this configuration write.
-  const binding = {
+  const endpoint = `${projectPath}/config`
+  const options = { method: 'PUT', headers: revisionHeaders(), body: json(value) }
+  // Changing the selected tables can bind or suspend existing Markdown in the same write.
+  const rebindsFiles = documentFiles.value.some(file => file.binding_origin === 'filename') &&
+    JSON.stringify(config.value.sources) !== JSON.stringify(value.sources)
+  let saved: RunConfig, revision: string | undefined
+  if (rebindsFiles) {
+    const result = await request<{ project: Project; config: RunConfig }>(`${endpoint}?include_project=true`, options)
+    saved = result.config
+    revision = responseRevision(result)
+    configRevision.value = revision || configRevision.value
+    applyProjectConfig(result.project, saved)
+  } else {
+    saved = await request<RunConfig>(endpoint, options)
+    revision = responseRevision(saved)
+    fillForms(saved)
+  }
+  // Credential writes must use this write's exact endpoint and revision.
+  return {
     path: projectPath,
-    revision: responseRevision(saved),
+    revision,
     expectedModel: { base_url: saved.model?.base_url || '', model: saved.model?.model || '' },
     expectedEmbedding: { base_url: saved.embedding?.base_url || '', model: saved.embedding?.model || '' },
   }
-  fillForms(saved)
-  return binding
 }
 async function saveForms() {
   const value = advancedDirty.value ? mergeConfigDraft(JSON.parse(advancedBaseline.value), previewConfig(), advancedConfig()) : formConfig()
@@ -680,11 +699,11 @@ async function confirmDeletion() {
       projects.value = projects.value.filter(item => item.project_id !== id)
       project.value = null; fillForms({}); modelKey.value = ''; credentials.value = { database_sources: [], model: false }
       metadata.value = { tables: [], nodes: [], edges: [] }; business.value = { nodes: [], edges: [] }; runs.value = []; selectedRun.value = null
-      databaseOpen.value = false; databaseSource.value = null; bindingFile.value = null; preview.value = null
+      databaseOpen.value = false; databaseSource.value = null; preview.value = null
       tab.value = 'inputs'; configurationTab.value = 'inputs'; resultTab.value = 'runs'
       await reloadProjects()
     } else {
-      if (target.kind === 'file') { if (bindingFile.value?.file_id === target.file.file_id) bindingFile.value = null; preview.value = null }
+      if (target.kind === 'file') preview.value = null
       workbenchLocation.closeDatabase(id)
       // Do not show deleted metadata if the follow-up refresh fails.
       metadata.value = { tables: [], nodes: [], edges: [] }
@@ -725,18 +744,34 @@ async function upload(event: Event) {
 async function showContent(file: ProjectFile) {
   await action(async () => { const result = await request<{ content: string }>(`${path.value}/files/${encodeURIComponent(file.file_id)}/content`); preview.value = { name: file.name, content: result.content } })
 }
-function openBinding(file: ProjectFile) {
-  bindingFile.value = file; bindingPurpose.value = file.purpose || 'unresolved'; bindingScope.value = JSON.parse(JSON.stringify(file.scope || { source_ids: [], tables: [], columns: [] }))
-  bindingTables.value = [...bindingScope.value.tables]; bindingMode.value = Object.values(bindingScope.value).some(values => values.length) ? 'tables' : 'global'
-}
-async function saveBinding() {
+async function saveDocumentBinding(file: ProjectFile, purpose: string, scope: DocumentScope) {
+  if (locked.value) return
   await action(async () => {
-    if (!bindingFile.value) return
     if (dirty.value || advancedDirty.value) await saveDraft()
-    if (bindingMode.value === 'tables' && !bindingTables.value.length) throw new Error('请至少选择一张表，或改为全局使用。')
-    const scope = bindingMode.value === 'global' ? { source_ids: [], tables: [], columns: [] } : { ...bindingScope.value, source_ids: [], tables: [...bindingTables.value] }
-    await request<ProjectFile>(`${path.value}/files/${encodeURIComponent(bindingFile.value.file_id)}/binding`, { method: 'PATCH', headers: revisionHeaders(), body: json({ purpose: bindingPurpose.value, scope }) })
-    bindingFile.value = null; await refreshProjectConfig(); notify('文档用途和使用范围已保存')
+    const saved = await request<ProjectFile>(`${path.value}/files/${encodeURIComponent(file.file_id)}/binding`, {
+      method: 'PATCH', headers: revisionHeaders(), body: json({ purpose, scope }),
+    })
+    configRevision.value = responseRevision(saved) || configRevision.value
+    await refreshProjectConfig()
+    notify('文档用途和使用范围已保存')
+  })
+}
+async function importDocumentManifest(manifest: File, documents: File[], done?: () => void) {
+  if (locked.value) return
+  await action(async () => {
+    const endpoint = `${path.value}/documents/manifest`
+    const form = new FormData()
+    form.append('manifest', manifest)
+    const selection = await request<{ paths: string[]; missing_paths: string[] }>(`${endpoint}/paths`, { method: 'POST', body: form })
+    const body = documentManifestBody(manifest, selection, documents)
+    if (dirty.value || advancedDirty.value) await saveDraft()
+    const result = await request<{ files: ProjectFile[]; imported: number }>(endpoint, {
+      method: 'POST', headers: revisionHeaders(), body,
+    })
+    configRevision.value = responseRevision(result) || configRevision.value
+    done?.()
+    await refreshProjectConfig()
+    notify(`已按清单配置 ${result.imported} 份知识文档`)
   })
 }
 async function refreshMetadata(saveEdits = true) {
@@ -808,7 +843,7 @@ async function databaseConnected(value: RunConfig, result: Metadata, revision?: 
 async function saveDatabaseSources(sources: SourceConfig[], retentionVerified: boolean) {
   await action(async () => {
     const value = { ...formConfig(), sources, deployment_retention_verified: retentionVerified }
-    fillForms(await request<RunConfig>(`${path.value}/config`, { method: 'PUT', headers: revisionHeaders(), body: json(value) }))
+    await persistConfiguration(value)
     await databaseDialog.value?.completeDraft()
     closeDatabaseSource(); await refreshCredentials(); notify('数据库来源已保存，点击读取元数据可连接服务器。')
   })
@@ -856,11 +891,11 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
               <button id="configuration-phase" role="tab" aria-controls="phase-content" :aria-selected="!inResults" :tabindex="!inResults ? 0 : -1" :class="{ active: !inResults }" @click="tab = configurationTab">项目配置</button>
               <button id="results-phase" role="tab" aria-controls="phase-content" :aria-selected="inResults" :tabindex="inResults ? 0 : -1" :class="{ active: inResults }" @click="tab = resultTab">运行与结果<span v-if="activeRun" class="status-dot" aria-label="正在运行"></span></button>
             </div>
-            <div class="actions"><label for="run-mode" class="sr-only">运行方式</label><select id="run-mode" v-model="runMode" :disabled="locked" :title="runMode === 'fresh' ? '使用空白工作区，保留历史图谱、草稿和轨迹；当前画布切换为本轮结果' : '复用当前工作区中的草稿、证据和会话记录'"><option value="continue">继续上次工作</option><option value="fresh">从零开始（保留历史）</option></select><span v-if="dirty || advancedDirty" class="badge amber">有未保存修改</span><button class="btn primary" :disabled="locked || agentLimitsLoading || !!limitsError || (!config.sources?.length && !documentFiles.length && !advancedDirty) || (!purpose.trim() && !advancedDirty)" :title="!purpose.trim() ? '请先填写抽取目的' : '保存配置后启动抽取'" @click="startRun">{{ activeRun ? '正在抽取' : dirty || advancedDirty ? '保存并开始抽取' : '开始抽取' }}</button></div>
+            <div class="actions"><label for="run-mode" class="sr-only">运行方式</label><select id="run-mode" v-model="runMode" :disabled="locked" :title="runMode === 'fresh' ? '使用空白工作区，保留历史图谱、草稿和轨迹；当前画布切换为本轮结果' : '复用当前工作区中的草稿、证据和会话记录'"><option value="continue">继续上次工作</option><option value="fresh">从零开始（保留历史）</option></select><span v-if="dirty || advancedDirty" class="badge amber">有未保存修改</span><button class="btn primary" :disabled="locked || agentLimitsLoading || !!limitsError || (!config.sources?.length && !config.documents?.length && !inheritedGraphs.length && !advancedDirty) || (!purpose.trim() && !advancedDirty)" :title="!purpose.trim() ? '请先填写抽取目的' : '保存配置后启动抽取'" @click="startRun">{{ activeRun ? '正在抽取' : dirty || advancedDirty ? '保存并开始抽取' : '开始抽取' }}</button></div>
           </div>
           <nav class="tabs" :aria-label="inResults ? '运行与结果' : '项目配置'"><button v-for="item in tabs" :key="item.id" class="tab" :class="{ active: tab === item.id }" @click="tab = item.id">{{ item.label }}<span v-if="item.id === 'runs' && runs.length" class="count">{{ runs.length }}</span></button></nav>
         </section>
-        <div id="phase-content" class="content" :class="{ 'inputs-content': tab === 'inputs', 'workflow-content': tab === 'workflow' }" role="tabpanel" :aria-labelledby="inResults ? 'results-phase' : 'configuration-phase'">
+        <div id="phase-content" class="content" :class="{ 'inputs-content': tab === 'inputs', 'documents-content': tab === 'documents', 'workflow-content': tab === 'workflow' }" role="tabpanel" :aria-labelledby="inResults ? 'results-phase' : 'configuration-phase'">
           <div v-if="activeRun" class="run-banner"><span class="spinner tiny"></span><div><strong>{{ runLabels[activeRun.status] }}</strong><span>{{ stageLabel(activeRun.progress?.stage || activeRun.stage) }} · {{ activeRun.run_id }}</span></div><div class="actions"><button class="btn small" @click="showRunProgress(activeRun)">查看进度与日志</button><button class="btn small" :disabled="busy" @click="cancelRun(activeRun)">取消运行</button></div></div>
           <template v-if="tab === 'goal'">
             <div class="intro"><div><h2>这次希望发现什么？</h2></div></div>
@@ -878,7 +913,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
               :inherited-graphs="inheritedGraphs"
               :locked="locked"
               :dirty="dirty || advancedDirty"
-              :run-disabled="agentLimitsLoading || !!limitsError || (!config.sources?.length && !documentFiles.length && !advancedDirty) || (!purpose.trim() && !advancedDirty)"
+              :run-disabled="agentLimitsLoading || !!limitsError || (!config.sources?.length && !config.documents?.length && !inheritedGraphs.length && !advancedDirty) || (!purpose.trim() && !advancedDirty)"
               @update:workflow="val => workflowConfig = val"
               @update:inherited-graphs="val => inheritedGraphs = val"
               @save="action(async () => { await saveDraft(); notify('并行工作流配置已保存') })"
@@ -890,10 +925,10 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
             <input ref="uploadInput" type="file" hidden multiple accept=".xlsx,.csv" @change="upload"/>
             <DataInputs :key="project.project_id" :project-id="project.project_id" :sources="config.sources || []" :files="project.files" :metadata="metadata" :credential-sources="credentials.database_sources" :credential-errors="credentials.database_errors" :locked="locked" :retention-verified="config.deployment_retention_verified === true" @connect="openDatabaseSource" @upload="uploadInput?.click()" @refresh="refreshMetadata" @delete-file="file => askDeletion({ kind: 'file', file })" @delete-source="source => askDeletion({ kind: 'source', source })" @delete-table="(source, table) => askDeletion({ kind: 'table', source, table })"/>
           </template>
-          <template v-if="tab === 'documents'">
-            <div class="intro"><div><h2>知识文档</h2></div><button class="btn primary" :disabled="locked" @click="documentInput?.click()">＋ 上传 Markdown</button><input ref="documentInput" type="file" hidden multiple accept=".md,.markdown" @change="upload"/></div>
-            <div class="document-layout"><section class="panel"><div class="panel-head"><h2>Markdown 知识材料</h2><span class="badge">{{ documentFiles.length }} 个文档</span></div><div v-if="!documentFiles.length" class="empty-state"><h3>添加知识材料</h3><p>支持 Markdown 数据说明、业务定义和分析经验；运行时按需要读取，不会一次性塞入全部原文。</p></div><div v-for="file in documentFiles" :key="file.file_id" class="doc-row"><span class="file-icon">MD</span><div class="file-info"><h3>{{ file.name }}</h3><div class="chips"><span v-if="!Array.isArray(config.documents) || !config.documents.includes(file.relative_path)" class="badge amber">未参与抽取</span><span class="badge blue">{{ purposeLabels[file.purpose] || '待分类' }}</span><span class="badge">{{ file.scope?.tables?.length ? `绑定 ${file.scope.tables.length} 张表` : file.scope?.source_ids?.length || file.scope?.columns?.length ? '限定范围' : '全局使用' }}</span></div><p v-if="file.scope?.tables?.length" class="break">{{ file.scope.tables.join('、') }}</p><p>{{ size(file.size) }}</p><div class="actions"><button class="btn small" :disabled="busy" @click="showContent(file)">查看原文</button><button class="btn small" :disabled="locked" @click="openBinding(file)">设置用途与范围</button><button class="btn small danger-text" :disabled="locked" :aria-label="`删除文档 ${file.name}`" @click="askDeletion({ kind: 'file', file })">删除</button></div></div></div></section></div>
-          </template>
+          <DocumentLibrary v-if="tab === 'documents'" :key="project.project_id"
+            :files="documentFiles" :active-documents="config.documents || []" :table-keys="documentTableKeys"
+            :locked="locked" :busy="busy" @upload="upload" @import-manifest="importDocumentManifest" @save-binding="saveDocumentBinding"
+            @preview="showContent" @delete-file="file => askDeletion({ kind: 'file', file })"/>
           <VectorizationProgress v-if="vectorizing && (tab === 'retrieval' || (tab === 'business' && !selectedGraphVersion))" :progress="vectorJob.progress"/>
           <template v-if="tab === 'metadata' || tab === 'business'"><div class="intro"><div><div class="graph-heading"><h2>{{ tab === 'metadata' ? '元数据关联图' : '业务知识图谱' }}</h2><span v-if="tab === 'business' && typeof business.merged_observation_nodes === 'number'" class="badge" title="当前范围内，合并后保留了多个抽取单元同源证据的节点数">已归并 {{ business.merged_observation_nodes }} 个节点</span></div></div><div class="actions"><template v-if="tab === 'business' && !selectedGraphVersion && (business.nodes.length > 0 || retrievalStatus?.has_graph)"><span class="badge" :class="retrievalStatus?.status === 'vectorized' ? 'green' : 'amber'">{{ retrievalStatus?.status === 'vectorized' ? `已完成向量化 · ${retrievalStatus.embedder_model || 'local_hash'} (${retrievalStatus.vector_dim ?? '—'}维)` : retrievalStatus?.status === 'stale' ? '图谱或模型已变更 · 待重新向量化' : '未向量化' }}</span><button class="btn" :class="{ primary: !retrievalStatus?.vectorized }" :disabled="vectorizing || busy" @click="vectorizeGraph">{{ vectorizing ? '正在向量化…' : retrievalStatus?.vectorized ? '重新向量化' : '立即向量化' }}</button></template><button v-if="tab === 'business' && !selectedGraphVersion" class="btn" :aria-expanded="structurePreviewOpen" @click="structurePreviewOpen = !structurePreviewOpen">{{ structurePreviewOpen ? '收起结构方案' : '查看结构方案' }}</button><button class="btn" :disabled="busy" @click="action(refreshGraphs)">刷新图谱</button></div></div><p v-if="tab === 'metadata' && metadata.requires_refresh" class="note graph-notice">{{ metadata.tables.length ? '目前仅显示已读取来源的元数据；其他来源仍需连接并读取。' : '尚未读取元数据。请在「项目配置 → 数据接入」连接来源并读取元数据。' }}</p><p v-if="tab === 'metadata' && metadata.stale_engine_metadata" class="note amber graph-notice">元数据声明已更新。重新运行抽取后，会刷新与新声明对应的关系。</p>
             <details v-if="tab === 'business'" class="graph-view-options">
@@ -947,6 +982,8 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
                         <td>{{ m.model_calls ?? '—' }}</td>
                         <td class="mono">{{ m.run_id || '—' }}</td>
                         <td>{{ m.error_code ? new ApiError(m.error_code).message : '正常' }}
+                          <div v-if="m.merge_counts" class="field-hint">上游合并 {{ m.merge_counts.input_nodes }} → {{ m.merge_counts.output_nodes }} 个节点<template v-if="m.merge_counts.source_replay_status === 'ran'">，同源去重 {{ m.merge_counts.source_replay_collapsed_nodes }} 个</template><template v-if="m.merge_counts.observed_dictionary_collapsed_nodes">，按字典成员合并 {{ m.merge_counts.observed_dictionary_collapsed_nodes }} 个</template></div>
+                          <div v-if="m.delta_merge_counts?.source_replay_status === 'ran'" class="field-hint">补充抽取后同源去重 {{ m.delta_merge_counts.source_replay_collapsed_nodes }} 个<template v-if="m.delta_merge_counts.observed_dictionary_collapsed_nodes">，按字典成员合并 {{ m.delta_merge_counts.observed_dictionary_collapsed_nodes }} 个</template></div>
                           <div v-if="m.failure_detail" class="field-hint">{{ workflowFailureLabel(m.failure_detail) }}</div>
                         </td>
                         <td><button class="btn small" :disabled="locked || !config.workflow?.enabled" @click="resumeWorkflow({ from_node_id: m.node_id })">从此节点重新运行</button>
@@ -1057,7 +1094,6 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
     </main>
     <DatabaseSourceDialog v-if="databaseOpen" ref="databaseDialog" :project-id="project?.project_id || ''" :source="databaseSource" :sources="config.sources || []" :files="project?.files || []" :retention-verified="config.deployment_retention_verified === true" :config-revision="configRevision" :busy="busy" :error="error" @close="closeDatabaseSource" @save="saveDatabaseSources" @connected="databaseConnected" @capability-uploaded="capabilityUploaded"/>
     <div v-if="newProjectOpen" class="modal-backdrop" @click.self="!busy && (newProjectOpen = false)"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="new-project-title"><form @submit.prevent="createProject"><div class="panel-head"><h2 id="new-project-title">新建项目</h2><button type="button" class="close" aria-label="关闭" :disabled="busy" @click="newProjectOpen = false">×</button></div><div class="panel-body"><p v-if="error" class="note amber" role="alert">{{ error }}</p><div class="field"><label for="new-name">项目名称</label><input id="new-name" v-model="newName" required maxlength="120" autofocus placeholder="例如：数据关系图谱"/></div><div class="field"><label for="new-id">项目编号（可选）</label><input id="new-id" v-model="newId" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_-]*" placeholder="留空由服务端生成"/><p class="field-hint">用于 workspace 下的隔离文件夹，创建后保持不变。</p></div></div><div class="panel-footer"><span>文件夹不存在时会自动创建</span><button class="btn primary" :disabled="busy || !newName.trim()">创建项目</button></div></form></section></div>
-    <div v-if="bindingFile" class="modal-backdrop" @click.self="!busy && (bindingFile = null)"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="binding-title"><div class="panel-head"><h2 id="binding-title">文档用途与使用范围</h2><button class="close" aria-label="关闭" :disabled="busy" @click="bindingFile = null">×</button></div><div class="panel-body"><p class="document-name">{{ bindingFile.name }}</p><p v-if="error" class="note amber" role="alert">{{ error }}</p><div class="field"><label for="doc-purpose">文档用途</label><select id="doc-purpose" v-model="bindingPurpose"><option v-for="(label, key) in purposeLabels" :key="key" :value="key">{{ label }}</option></select></div><div class="field"><label>使用范围</label><div class="radio-line"><label><input v-model="bindingMode" type="radio" value="global"/>全局使用</label><label><input v-model="bindingMode" type="radio" value="tables"/>绑定具体表</label></div></div><div v-if="bindingMode === 'tables'" class="binding-options"><p v-if="!metadata.tables.length" class="note amber">请先关闭此窗口并读取元数据，再选择表。</p><label v-for="table in metadata.tables" :key="tableKey(table)" class="check-option"><input v-model="bindingTables" type="checkbox" :value="tableKey(table)"/><span>{{ tableKey(table) }}</span></label><p v-if="bindingScope.columns.length" class="field-hint">已有列限制将保留：{{ bindingScope.columns.join('、') }} <button class="text-button" :disabled="busy" @click="bindingScope.columns = []">清除列限制</button></p></div><p v-else class="note">所有相关分析都可使用此文档；设置为全局会移除原有表和列限制。</p></div><div class="panel-footer"><span>只影响上下文使用范围，不授予数据访问权限</span><button class="btn primary" :disabled="busy || (bindingMode === 'tables' && !bindingTables.length)" @click="saveBinding">保存绑定</button></div></section></div>
     <div v-if="preview" class="modal-backdrop" @click.self="preview = null"><section class="modal wide" role="dialog" aria-modal="true" aria-labelledby="preview-title"><div class="panel-head"><h2 id="preview-title">{{ preview.name }}</h2><button class="close" aria-label="关闭" @click="preview = null">×</button></div><div class="panel-body"><pre class="code file-preview">{{ preview.content }}</pre></div></section></div>
     <ConfirmDelete v-if="deletion" :title="deletionTitle" :description="deletionDescription" :detail="deletionDetail" :busy="busy" :locked="deletion.kind === 'run' ? busy : locked" :error="deletionError" @cancel="deletion = null" @confirm="confirmDeletion"/>
     <div v-if="toast" class="toast" role="status">{{ toast }}</div>

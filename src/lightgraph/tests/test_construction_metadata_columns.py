@@ -262,6 +262,30 @@ def test_guide_example_parses_and_schema_exposes_new_operator():
     assert 'MetadataColumnMapping' in GraphDraft.model_json_schema()['$defs']
 
 
+def test_cross_draft_physical_column_keeps_both_declarations_under_retain_policy():
+    from lightgraph.construction.workspace import _merge_graphs
+    from lightgraph.runtime.config import FusionPolicyConfig
+
+    table = physical_table()
+    graphs = []
+    with TrackedSource([table], {table.qualified_name: []}) as source:
+        for name in ['Reference', 'Comparison']:
+            draft = column_draft()
+            draft['draft_id'] = name
+            draft['entities'][0]['mappings'][0].update(label=name, semantic_annotations={'usage': name})
+            result = execute_draft(draft, [source], [table])
+            assert result['passed']
+            graphs.append(result['graph'])
+    retained = _merge_graphs(graphs, fusion_policy=FusionPolicyConfig(label_conflict_policy='retain_variants'))
+    node, = retained['nodes']
+    assert node['label_variants'] == ['Comparison', 'Reference']
+    assert node['properties']['usage'] == ['Comparison', 'Reference']
+    assert {(s['label'], tuple(s['properties']['usage'])) for s in node['supports']
+            if s['source_kind'] == 'declared'} == {('Comparison', ('Comparison',)), ('Reference', ('Reference',))}
+    with pytest.raises(LightGraphError, match='metadata_column_mapping_conflict'):
+        _merge_graphs(graphs, fusion_policy=FusionPolicyConfig(label_conflict_policy='strict'))
+
+
 def test_frontend_details_distinguish_catalog_declaration_and_row_relation_basis(monkeypatch):
     from lightgraph.web import construction_graph as views
     table = physical_table()

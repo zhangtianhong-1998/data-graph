@@ -105,6 +105,14 @@ const messages: Record<string, string> = {
   file_in_use: '此文件仍被来源配置引用，请先移除相关来源或修改配置。',
   database_source_required: '仅数据库来源支持单独移除数据表。',
   document_binding_requires_metadata: '请先读取元数据，再重新绑定文档。',
+  ambiguous_document_table_binding: '存在多张同名表，请按来源和 Schema 选择具体表。',
+  invalid_document_source_binding: '限定的来源已不可用，请重新选择文档范围。',
+  invalid_document_column_binding: '文档中的列限制与所选表不匹配，请核对列名和表名。',
+  document_section_scope_expansion: '章节引用的表或列超出了文档范围，请核对章节设置和关联表。',
+  invalid_document_manifest: '知识文档清单校验失败，请核对以下条目。',
+  upload_utf8_required: '请用 UTF-8 编码保存文档和清单。',
+  upload_too_large: '文件超过上传大小限制，请缩小文件后再导入。',
+  request_too_large: '本次导入超过请求大小限制，请拆分清单后再导入。',
   project_file_in_use: '此文件仍被来源配置引用，请先移除相关来源或修改配置。',
   source_not_found: '数据来源不存在，请刷新项目。',
   source_table_not_found: '数据表不在当前来源中，请刷新项目。',
@@ -199,7 +207,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       const code = (data as { error?: { code?: unknown } })?.error?.code
       // Render only the short public error code; never reflect raw server errors or HTML.
       throw new ApiError(typeof code === 'string' && /^[a-zA-Z0-9_.:-]{1,100}$/.test(code) ? code : `http_${response.status}`, response.status,
-        ['invalid_project_config', 'invalid_model_limits'].includes(String(code)) ? (data as { error?: { diagnostics?: unknown } })?.error?.diagnostics : [], (data as { error?: { node_id?: unknown } })?.error?.node_id)
+        ['invalid_project_config', 'invalid_model_limits', 'invalid_document_manifest'].includes(String(code)) ? (data as { error?: { diagnostics?: unknown } })?.error?.diagnostics : [], (data as { error?: { node_id?: unknown } })?.error?.node_id)
     }
     if (data !== null && typeof data === 'object' && response.headers.get('etag')) responseRevisions.set(data, response.headers.get('etag')!)
     return data as T

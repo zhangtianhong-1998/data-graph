@@ -52,6 +52,7 @@ def test_overlapping_identity_candidates_count_members_once_in_run_and_publicati
     summary = read_internal_yaml(output / 'construction' / 'workflow-merge-summary.yaml')
     assert summary['nodes'] == 3 and summary['candidate_identity_merges'] == 2
     assert summary['semantic_status'] == 'pending_alignment'
+    assert summary['merge_counts'] == merged['fusion_diagnostics']
     for record in (summary, merge_accounting(contributors, merged)):
         assert record['candidate_identity_nodes'] == 3
         assert record['candidate_identity_nodes_in_multiple_groups'] == 2
@@ -73,7 +74,16 @@ def test_alias_replay_combines_typed_source_facts_and_rewires_edges():
         'candidate_identity_groups': 0, 'quarantined_nodes': 0, 'quarantined_edges': 0,
         'candidate_identity_nodes': 0, 'candidate_identity_nodes_in_multiple_groups': 0,
         'unresolved_relations': 0,
+        'source_replay_status': 'ran', 'explicit_entity_rules': 0, 'explicit_rule_preparation_ran': False,
+        'source_replay_matched_inputs': 4, 'source_replay_groups': 2, 'source_replay_collapsed_nodes': 2,
+        'dictionary_eligible_inputs': 0, 'dictionary_groups_without_observed_member': 0,
+        'observed_dictionary_collapsed_nodes': 0,
+        'collapsed_nodes_before_quarantine': 2, 'input_physical_column_nodes': 0,
+        'output_physical_column_nodes': 0, 'source_replay_considered_row_nodes': 4,
+        'source_replay_eligible_row_nodes': 4, 'source_replay_cross_contributor_source_witness_groups': 2,
     }
+    assert 'fusion_diagnostics' not in filter_graph_scopes(result, [])
+    assert merge_construction_graphs(graphs, independent_outputs=True)['fusion_diagnostics']['source_replay_status'] == 'independent_outputs'
     edge, = result['edges']
     node = next(n for n in result['nodes'] if n['id'] == edge['source'])
     assert node['type'] == result['definitions']['relations'][0]['source_type']
@@ -95,6 +105,8 @@ def test_alias_replay_combines_typed_source_facts_and_rewires_edges():
     assert replay['nodes'] == staged['nodes']
     assert replay['edges'] == staged['edges']
     republished = merge_construction_graphs([unit('final', staged, 'merged')])
+    assert republished['fusion_diagnostics']['source_replay_status'] == 'insufficient_contributors'
+    assert 'source_replay_eligible_row_nodes' not in republished['fusion_diagnostics']
     assert len(republished['nodes']) == 2 and len(republished['edges']) == 1
     assert republished['conflict_isolation']['nodes'] == 0
 

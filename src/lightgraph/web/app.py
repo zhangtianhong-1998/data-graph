@@ -5,7 +5,7 @@ There is no raw-query endpoint; the discovery Agent keeps its internal SQL guard
 """
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from pathlib import Path
 import os
 import json
@@ -27,6 +27,7 @@ from starlette.staticfiles import StaticFiles
 from lightgraph.errors import LightGraphError
 from lightgraph.retrieval.query import RetrieveSubgraphRequest
 from .workspace import Workspace
+from .document_manifest import DocumentManifestError, import_manifest, manifest_paths, parse_manifest
 from . import graph_history
 from .execution import RunManager, read_graph, read_graph_details, read_graph_consistently, read_metadata, identity_review, resolve_identity
 from .credentials import SessionCredentials
@@ -255,7 +256,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         if isinstance(exc, WorkflowCheckpointError) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', exc.node_id):
             return JSONResponse({'error': {'code': exc.code, 'node_id': exc.node_id}},
                                 status_code=error_status(exc.code), headers={'Cache-Control': 'no-store'})
-        if isinstance(exc, ConfigValidationError):
+        if isinstance(exc, (ConfigValidationError, DocumentManifestError)):
             return JSONResponse({'error': {'code': exc.code, 'diagnostics': exc.diagnostics}},
                                 status_code=400, headers={'Cache-Control': 'no-store'})
         return error_response(exc.code,error_status(exc.code))
@@ -543,26 +544,27 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             config['sources'].append(source_config)
             if data.deployment_retention_verified is not None:
                 config['deployment_retention_verified']=data.deployment_retention_verified
-            workspace.save_config(pid,config)
-            source=next(s for s in workspace.resolved_config(pid).sources if s.id==data.source_id)
-            credentials.set_source(pid,x_workbench_session,source,dsn)
-            try:
-                secrets_by_source,_=resolved_credentials(pid,x_workbench_session,source_ids={data.source_id},include_model=False)
-                metadata=read_metadata(workspace,pid,refresh=True,source_credentials=secrets_by_source,
-                                       source_ids=[data.source_id])
-                # Commit the profile only after metadata succeeds. A failed
-                # replacement must keep the previously saved connection usable.
-                if data.remember_connection:
-                    saved_connections.save(pid,source,data.connection,dsn)
-                else:
-                    saved_connections.delete(pid,source.id)
-            except Exception:
-                workspace.save_config(pid,old_config)
-                credentials.clear_source(pid,x_workbench_session,data.source_id)
-                old_source=next((s for s in old_resolved.sources if s.id==data.source_id),None)
-                if old_source and data.source_id in old_secrets:
-                    credentials.set_source(pid,x_workbench_session,old_source,old_secrets[data.source_id])
-                raise
+            with ExitStack() as staged:
+                workspace.save_config(pid,config,rollback=staged)
+                source=next(s for s in workspace.resolved_config(pid).sources if s.id==data.source_id)
+                credentials.set_source(pid,x_workbench_session,source,dsn)
+                try:
+                    secrets_by_source,_=resolved_credentials(pid,x_workbench_session,source_ids={data.source_id},include_model=False)
+                    metadata=read_metadata(workspace,pid,refresh=True,source_credentials=secrets_by_source,
+                                           source_ids=[data.source_id])
+                    # Commit the profile only after metadata succeeds. A failed
+                    # replacement must keep the previously saved connection usable.
+                    if data.remember_connection:
+                        saved_connections.save(pid,source,data.connection,dsn)
+                    else:
+                        saved_connections.delete(pid,source.id)
+                except Exception:
+                    credentials.clear_source(pid,x_workbench_session,data.source_id)
+                    old_source=next((s for s in old_resolved.sources if s.id==data.source_id),None)
+                    if old_source and data.source_id in old_secrets:
+                        credentials.set_source(pid,x_workbench_session,old_source,old_secrets[data.source_id])
+                    raise
+                staged.pop_all()
             from .metadata_views import _yaml_files
             metadata['files']=_yaml_files(metadata['tables'],metadata.get('sources'))
             return versioned(pid, {'config':workspace.get_config(pid),'metadata':metadata,
@@ -695,6 +697,45 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     def text_file(pid:str,fid:str):
         return {'content':workspace.text_content(pid,fid)}
 
+    async def read_document_part(file: UploadFile):
+        from .workspace import MAX_TEXT_BYTES
+        content = await file.read(MAX_TEXT_BYTES + 1)
+        if len(content) > MAX_TEXT_BYTES:
+            raise LightGraphError('upload_too_large')
+        return content
+
+    @app.post('/api/projects/{pid}/documents/manifest/paths')
+    async def inspect_document_manifest(pid: str, manifest: UploadFile = File(...)):
+        try:
+            content = await read_document_part(manifest)
+            def inspect():
+                return manifest_paths(parse_manifest(content), workspace.get(pid))
+            return await run_in_threadpool(inspect)
+        finally:
+            await manifest.close()
+
+    @app.post('/api/projects/{pid}/documents/manifest')
+    async def save_document_manifest(pid: str, manifest: UploadFile = File(...), files: list[UploadFile] = File(default=[]),
+                                     if_match: str | None = Header(default=None)):
+        try:
+            content = await read_document_part(manifest)
+            uploads = {}
+            for file in files:
+                if file.filename in uploads:
+                    raise DocumentManifestError('documents', '同一路径收到多个附件，请检查选择的文件。')
+                uploads[file.filename] = await read_document_part(file)
+            def save():
+                with workspace.lock(pid):
+                    mutable(pid)
+                    workspace.require_config_revision(pid, if_match)
+                    result = import_manifest(workspace, pid, parse_manifest(content), uploads)
+                    return versioned(pid, result)
+            return await run_in_threadpool(save)
+        finally:
+            await manifest.close()
+            for file in files:
+                await file.close()
+
     @app.get('/api/projects/{pid}/files/{fid}/metadata')
     def preview_file(pid:str,fid:str):
         from .metadata_views import preview_file_metadata
@@ -715,11 +756,12 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return versioned(pid,workspace.get_config(pid, offline=True))
 
     @app.put('/api/projects/{pid}/config')
-    def save_config(pid:str,data:dict,if_match:str|None=Header(default=None)):
+    def save_config(pid:str,data:dict,if_match:str|None=Header(default=None),include_project:bool=False):
         with workspace.lock(pid):
             mutable(pid)
             workspace.require_config_revision(pid,if_match)
-            return versioned(pid,workspace.save_config(pid,data))
+            config = workspace.save_config(pid, data)
+            return versioned(pid, {'project': workspace.get(pid), 'config': config} if include_project else config)
 
     @app.post('/api/projects/{pid}/config/import')
     def import_config(pid:str,data:ImportConfig,if_match:str|None=Header(default=None)):

@@ -169,7 +169,10 @@ beforeEach(() => {
                 unit_2: { unit_id: 'unit_2', label: 'A+C 链路', status: 'failed', run_id: 'run_u2', error_code: 'run_time_budget_exhausted', nodes: 0, edges: 0 },
               },
               merge_nodes: {
-                merge_1: { node_id: 'merge_1', label: '全节点合并抽取', merge_mode: 'merge_and_extract', status: 'completed', nodes: 20, edges: 14 },
+                merge_1: { node_id: 'merge_1', label: '全节点合并抽取', merge_mode: 'merge_and_extract', status: 'completed',
+                  nodes: 20, edges: 14, merge_counts: { input_nodes: 12, output_nodes: 10,
+                    source_replay_status: 'ran', source_replay_collapsed_nodes: 0, observed_dictionary_collapsed_nodes: 2 },
+                  delta_merge_counts: { source_replay_status: 'ran', source_replay_collapsed_nodes: 2 } },
               },
               merge: { status: 'completed', nodes: 12, edges: 8, candidate_identity_merges: 1, candidate_column_alignments: 2 },
             },
@@ -477,6 +480,8 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
 
     expect(root.textContent).toContain('A+B 链路')
     expect(root.textContent).toContain('全节点合并抽取')
+    expect(root.textContent).toContain('上游合并 12 → 10 个节点，同源去重 0 个，按字典成员合并 2 个')
+    expect(root.textContent).toContain('补充抽取后同源去重 2 个')
 
     // 业务图谱页显示「未向量化」，不主动触发 /retrieval/sync
     button('业务图谱').click()

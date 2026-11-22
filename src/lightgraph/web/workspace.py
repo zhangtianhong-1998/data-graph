@@ -6,7 +6,7 @@ distributed lock or an authorization boundary between users of a shared server.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 import os
@@ -41,8 +41,10 @@ class FileRecord(StrictModel):
     name: str
     kind: Literal["excel", "csv", "markdown", "yaml"]
     relative_path: str
+    manifest_path: str | None = None
     size: int = Field(ge=0, le=MAX_UPLOAD_BYTES)
     purpose: str = "unresolved"
+    binding_origin: Literal["filename", "explicit"] | None = None
     scope: DocumentScope = Field(default_factory=DocumentScope)
     inactive_reason: str | None = None
     inactive_targets: list[dict[str, str]] = Field(default_factory=list)
@@ -168,6 +170,15 @@ def _frontmatter(text: str) -> tuple[dict, str]:
     if not isinstance(meta, dict):
         raise LightGraphError("invalid_document_front_matter")
     return meta, "".join(lines[end + 1:])
+
+
+def _bound_markdown(name, text, purpose, scope) -> bytes:
+    meta, body = _frontmatter(text)
+    meta.pop("applies_to", None)
+    meta.update(purpose=purpose, scope=scope)
+    updated = "---\n" + yaml.safe_dump(meta, allow_unicode=True, sort_keys=False) + "---\n" + body
+    load_document(name, text=updated)
+    return updated.encode()
 
 
 class Workspace:
@@ -356,25 +367,36 @@ class Workspace:
         meta = {}
         if kind in {"yaml", "markdown"}:
             try:
-                text = content.decode("utf-8")
+                text = content.decode("utf-8-sig")
             except UnicodeError:
                 raise LightGraphError("upload_utf8_required") from None
             if kind == "yaml":
                 _no_credentials(safe_yaml(text))
             else:
+                content = text.encode("utf-8")
                 meta, _ = _frontmatter(text)
                 load_document(name, text=text)
         with self.lock(project_id):
             project = self._load(project_id)
             config = self.get_config(project_id)
-            original_config = deepcopy(config)
             fid = "f_" + uuid4().hex[:16]
             scope = meta.get("scope", {})
             if "applies_to" in meta:
                 scope = {**scope, "tables": meta["applies_to"]}
+            purpose = meta.get("purpose", "data_description" if kind == "markdown" else "unresolved")
+            explicit = bool({"scope", "applies_to", "sections"} & meta.keys() or purpose != "data_description")
+            origin = ("explicit" if explicit else "filename") if kind == "markdown" else None
             record = FileRecord(file_id=fid, name=name, kind=kind,
                                 relative_path=f"files/{fid}_{name}", size=len(content),
-                                purpose=meta.get("purpose", "unresolved"), scope=scope).model_dump(mode="json")
+                                purpose=purpose, scope=scope, binding_origin=origin,
+                                inactive_reason="pending_assignment" if origin == "filename" else None).model_dump(mode="json")
+            if kind == "markdown" and origin == "explicit" and "purpose" not in meta:
+                # Preserve section-specific purposes, including mixed/unresolved documents.
+                if "sections" in meta:
+                    record["purpose"] = load_document(name, text=text).purpose
+                else:
+                    content = _bound_markdown(name, text, purpose, record["scope"])
+                    record["size"] = len(content)
             path = self._path(project_id, record["relative_path"])
             self._atomic(path, content)
             project["files"].append(record)
@@ -387,17 +409,12 @@ class Workspace:
                     source.update(encoding="utf-8", delimiter=",", header=True,
                                   null_values=[""], type_inference="text", table_name=Path(name).stem)
                 config["sources"].append(source)
-            elif kind == "markdown":
+            elif kind == "markdown" and origin == "explicit":
                 config["documents"].append(record["relative_path"])
             try:
-                clean = self._normalize_config(project_id, config, project)
-                self._write_config(project_id, clean)
-                self._save(project)
+                self._commit_inputs(project_id, project, config)
             except Exception:
                 path.unlink(missing_ok=True)
-                # Restore the previous valid config if registration failed after
-                # its atomic file replacement; never leave a missing source path.
-                self._write_config(project_id, original_config)
                 raise
             return record
 
@@ -455,33 +472,30 @@ class Workspace:
                 raise LightGraphError("markdown_file_required")
             path = self.file_path(project_id, file_id)
             try:
-                text = path.read_text(encoding="utf-8")
+                text = path.read_bytes().decode("utf-8")
             except (OSError, UnicodeError):
                 raise LightGraphError("workspace_file_read_failed") from None
-            meta, body = _frontmatter(text)
-            meta.pop("applies_to", None)
-            meta.update(purpose=purpose, scope=binding)
-            updated = "---\n" + yaml.safe_dump(meta, allow_unicode=True, sort_keys=False) + "---\n" + body
-            # Validate the full section-scope inheritance before changing the file.
-            document = load_document(path, text=updated)
-            if len(updated.encode()) > MAX_TEXT_BYTES:
-                raise LightGraphError("upload_too_large")
+            updated = _bound_markdown(path, text, purpose, binding)
             original_project = deepcopy(project)
             original_config = self.get_config(project_id)
             config = deepcopy(original_config)
-            reactivate = False
-            if file.get("inactive_reason"):
+            reactivate = file.get("inactive_reason") == "pending_assignment"
+            if reactivate:
+                from .document_tables import validate_assignment
+                validate_assignment(self, project_id, config, load_document(path, text=updated.decode()))
+            elif file.get("inactive_reason"):
                 from .deletion import document_targets, validate_rebinding
+                document = load_document(path, text=updated.decode())
                 if not document_targets(document, file.get("inactive_targets", [])):
                     validate_rebinding(self, project_id, document)
                     reactivate = True
-            file.update(purpose=purpose, scope=binding, size=len(updated.encode()))
+            file.update(purpose=purpose, scope=binding, size=len(updated), binding_origin="explicit")
             if reactivate:
                 if file["relative_path"] not in config["documents"]:
                     config["documents"].append(file["relative_path"])
                 file.update(inactive_reason=None, inactive_targets=[])
             try:
-                self._atomic(path, updated.encode())
+                self._atomic(path, updated)
                 self._write_config(project_id, config)
                 self._save(project)
             except Exception:
@@ -525,6 +539,9 @@ class Workspace:
                     source["capability_manifest"] = registered(source["capability_manifest"], {"yaml"})
             for field, kind in (("documents", "markdown"), ("rules", "yaml")):
                 data[field] = [registered(raw, {kind}) for raw in data.get(field, [])]
+            pending = {file["relative_path"] for file in project["files"]
+                       if file.get("inactive_reason") == "pending_assignment"}
+            data["documents"] = [path for path in data["documents"] if path not in pending]
             for inherited in data.get("inherited_graphs", []) if isinstance(data.get("inherited_graphs"), list) else []:
                 if isinstance(inherited, dict) and inherited.get("snapshot_path"):
                     inherited["snapshot_path"] = registered(inherited["snapshot_path"], {"yaml"})
@@ -547,13 +564,78 @@ class Workspace:
         with self.lock(project_id):
             return self._normalize_config(project_id, self._read(self._path(project_id, "config.yaml")), offline=offline)
 
-    def save_config(self, project_id: str, value: dict) -> dict:
+    def save_config(self, project_id: str, value: dict, *, rollback: ExitStack | None = None) -> dict:
+        """A caller staging a connection may keep rollback open under the same project lock."""
         with self.lock(project_id):
             project = self._load(project_id)
             clean = self._normalize_config(project_id, value, project)
-            self._write_config(project_id, clean)
+            return self._commit_inputs(project_id, project, clean, rollback=rollback)
+
+    def filename_binding_writes(self, pid, project, config):
+        """Prepare scope changes before publishing either the files or the active input list."""
+        from .document_tables import project_tables, table_lookup
+        files = [file for file in project["files"] if file.get("binding_origin") == "filename"
+                 and file.get("inactive_reason") in (None, "pending_assignment")]
+        if not files:
+            return {}
+        lookup = table_lookup(project_tables(self, pid, config))
+        writes = {}
+        for file in files:
+            matches = lookup.get(Path(file["name"]).stem, [])
+            # The serialized selector must also resolve uniquely when a literal table name contains dots.
+            match = matches[0] if len(matches) == 1 and len(lookup[matches[0]]) == 1 else None
+            scope = DocumentScope(tables=[match] if match else []).model_dump(mode="json")
+            path = file["relative_path"]
+            if match and file.get("inactive_reason") and path not in config["documents"]:
+                config["documents"].append(path)
+            if not match and path in config["documents"]:
+                config["documents"].remove(path)
+            file["inactive_reason"] = None if match else "pending_assignment"
+            if file["scope"] != scope:
+                target = self._path(pid, path)
+                updated = _bound_markdown(target, target.read_bytes().decode("utf-8"), file["purpose"], scope)
+                file.update(scope=scope, size=len(updated))
+                writes[target] = updated
+        return writes
+
+    def _commit_inputs(self, pid, project, config, *, rollback=None):
+        writes = self.filename_binding_writes(pid, project, config)
+        for file in project["files"]:
+            if (file.get("binding_origin") == "filename" and not file.get("inactive_reason")
+                    and file["relative_path"] not in config["documents"]):
+                # The user removed this assigned document through the full configuration.
+                file["binding_origin"] = "explicit"
+        clean = self._normalize_config(pid, config, project)
+        original_project = self._load(pid)
+        config_path = self._path(pid, "config.yaml")
+        # A valid replacement may repair a malformed or missing old config.
+        previous_config = config_path.read_bytes() if config_path.exists() else None
+        originals = {target: target.read_bytes() for target in writes}
+        written = []
+        config_written = False
+        def restore():
+            for target in reversed(written):
+                self._atomic(target, originals[target])
+            if config_written:
+                if previous_config is None:
+                    config_path.unlink(missing_ok=True)
+                else:
+                    self._atomic(config_path, previous_config)
+                self._save(original_project)
+
+        try:
+            for target, content in writes.items():
+                self._atomic(target, content)
+                written.append(target)
+            self._write_config(pid, clean)
+            config_written = True
             self._save(project)
-            return clean
+        except Exception:
+            restore()
+            raise
+        if rollback is not None:
+            rollback.callback(restore)
+        return clean
 
     def output_generation(self, project_id: str) -> str | None:
         """Read the active construction lineage, independently of user settings."""

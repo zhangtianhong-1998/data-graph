@@ -1073,6 +1073,7 @@ class RunManager:
                                     target_access_fingerprint=access_fingerprint(config),
                                     merge_policy=eff_policy,
                                 )
+                                merge_nodes_state[mid]['merge_counts'] = merge_accounting(node_inputs, merged_upstream)
 
                                 if mnode.merge_mode == "merge_and_extract":
                                     stage = 'merge_worker_prepare'
@@ -1128,6 +1129,7 @@ class RunManager:
                                             target_access_fingerprint=access_fingerprint(config),
                                             merge_policy=eff_policy,
                                         )
+                                        merge_nodes_state[mid]['delta_merge_counts'] = combined['fusion_diagnostics']
                                     merge_outputs[mid] = combined
                                     merge_node_contribs[mid] = {
                                         "contributor_id": mid,
@@ -1138,7 +1140,6 @@ class RunManager:
                                     merged_status = m_res['status']
 
                                 else:
-                                    merge_nodes_state[mid]['merge_counts'] = merge_accounting(node_inputs, merged_upstream)
                                     merge_outputs[mid] = merged_upstream
                                     merge_node_contribs[mid] = {
                                         "contributor_id": mid,

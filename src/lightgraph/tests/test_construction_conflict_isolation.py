@@ -136,6 +136,62 @@ def test_scope_filtered_counterexamples_do_not_reveal_hidden_names(tmp_path):
         tools.close()
 
 
+def test_quarantine_follows_definition_variant_and_leaves_unrelated_raw_id_visible(tmp_path):
+    from lightgraph.tests.test_definition_variant_retention import branch
+
+    store = GraphWorkspace(tmp_path, 'ctx')
+    first = branch()
+    first['draft_id'] = 'first'
+    first['nodes'][0]['supports'].append({'scope_ref': 'public', 'label': 'alternate'})
+    store.save_draft(payload('first'))
+    store.record_validation('first', revision=1, passed=False, graph=first,
+        diagnostics=[{'code': 'same_identity_conflicting_label', 'node_id': 'item'}])
+    store.publish('first', revision=1, graph=first, isolate_conflicts=True)
+    assert [n['id'] for n in store.read_published_graph()['nodes']] == ['shared']
+
+    # Even a newer unvalidated revision cannot erase the published counterexample.
+    store.save_draft({**payload('first'), 'purpose': 'Latest revision'})
+    second = branch(label_kind='derived')
+    second['draft_id'] = 'second'
+    store.save_draft(payload('second'))
+    store.record_validation('second', revision=1, passed=True, graph=second)
+    store.publish('second', revision=1, graph=second, isolate_conflicts=True)
+    merged = store.read_published_graph()
+    variant, = [n for n in merged['nodes'] if n.get('original_type') == 'Item']
+    edge, = merged['edges']
+    assert (edge['source'], edge['target']) == (variant['id'], 'shared')
+    isolation = merged['conflict_isolation']
+    assert isolation['nodes'] == isolation['edges'] == 1
+    assert variant['id'] not in isolation['node_ids'] and edge['id'] not in isolation['edge_ids']
+    assert isolation['draft_node_ids'] == {'first': ['item'], 'second': []}
+    assert all(s.get('label') != 'alternate' for n in merged['nodes'] for s in n['supports'])
+
+
+def test_quarantine_is_preserved_across_a_confirmed_alias_with_a_different_raw_id(tmp_path):
+    from lightgraph.runtime.config import FusionPolicyConfig
+    from lightgraph.tests.test_cross_source_fusion import source_graph
+
+    store = GraphWorkspace(tmp_path, 'ctx')
+    # Both bindings were explicitly assigned the same typed identity domain.
+    policy = FusionPolicyConfig(label_conflict_policy='quarantine', entity_rules=[
+        {'entity_type': kind, 'canonical_type': 'Object', 'key_mapping': {'code': key},
+         'key_normalizers': {'code': ['trim']}, 'identity_domain': 'collection'}
+        for kind, key in [('Specimen', 'accession'), ('Record', 'code')]])
+    first = source_graph('Specimen', 'accession', ' A ', 'catalog', 'name', 'note', 'value')
+    second = source_graph('Record', 'code', 'A', 'register', 'name', 'note', 'value')
+    first['nodes'][0]['supports'].append({**first['nodes'][0]['supports'][0], 'label': 'alternate'})
+    for name, candidate in [('first', first), ('second', second)]:
+        candidate['draft_id'] = name
+        store.save_draft(payload(name))
+        store.record_validation(name, revision=1, passed=name == 'second', graph=candidate, diagnostics=(
+            [{'code': 'same_identity_conflicting_label', 'node_id': 'catalog_1'}] if name == 'first' else []))
+        store.publish(name, revision=1, graph=candidate, isolate_conflicts=True, fusion_policy=policy)
+    merged = store.read_published_graph()
+    assert [node['identity'] for node in merged['nodes']] == [{'code': 'B'}]
+    assert not merged['edges']
+    assert merged['conflict_isolation']['draft_node_ids'] == {'first': ['catalog_1'], 'second': ['register_1']}
+
+
 from lightgraph.tests.test_construction_runner import configuration, scripted_bridge, save_object, completed
 from lightgraph.construction.runner import run_construction
 

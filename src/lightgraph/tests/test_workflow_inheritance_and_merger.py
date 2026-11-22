@@ -237,7 +237,7 @@ sys.exit(0)
     with TestClient(app) as client:
         client.post('/api/projects', json={'name': 'WorkflowProj', 'project_id': 'wf_p'})
         doc = tmp_path / 'notes.md'
-        doc.write_text('# 说明\n测试并行工作流。', encoding='utf-8')
+        doc.write_text('---\nscope: {}\n---\n# 说明\n测试并行工作流。', encoding='utf-8')
         etag = client.get('/api/projects/wf_p/config').headers['etag']
         with doc.open('rb') as f:
             up = client.post('/api/projects/wf_p/files', headers={'If-Match': etag}, files={'file': ('notes.md', f, 'text/markdown')})
@@ -403,7 +403,7 @@ sys.exit(0)
     with TestClient(app) as client:
         client.post('/api/projects', json={'name': 'SixUnits', 'project_id': 'six_p'})
         doc = tmp_path / 'doc.md'
-        doc.write_text('# 六并行扩展目标', encoding='utf-8')
+        doc.write_text('---\nscope: {}\n---\n# 六并行扩展目标', encoding='utf-8')
         etag = client.get('/api/projects/six_p/config').headers['etag']
         with doc.open('rb') as f:
             up = client.post('/api/projects/six_p/files', headers={'If-Match': etag}, files={'file': ('doc.md', f, 'text/markdown')})

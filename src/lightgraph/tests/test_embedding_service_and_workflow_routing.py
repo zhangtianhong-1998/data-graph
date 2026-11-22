@@ -420,19 +420,19 @@ def test_workflow_unit_routing_matches_tables_and_workspace_documents_precisely(
     etag = client.get(f"/api/projects/{pid}/config").headers["ETag"]
     doc1 = client.post(
         f"/api/projects/{pid}/files",
-        files={"file": ("guide.md", b"# Guide A\n", "text/markdown")},
+        files={"file": ("guide.md", b"---\nscope: {}\n---\n# Guide A\n", "text/markdown")},
         headers={"If-Match": etag},
     ).json()
     etag = client.get(f"/api/projects/{pid}/config").headers["ETag"]
     doc2 = client.post(
         f"/api/projects/{pid}/files",
-        files={"file": ("sub_guide.md", b"# Sub Guide\n", "text/markdown")},
+        files={"file": ("sub_guide.md", b"---\nscope: {}\n---\n# Sub Guide\n", "text/markdown")},
         headers={"If-Match": etag},
     ).json()
     etag = client.get(f"/api/projects/{pid}/config").headers["ETag"]
     doc3 = client.post(
         f"/api/projects/{pid}/files",
-        files={"file": ("rules.md", b"# Rules B\n", "text/markdown")},
+        files={"file": ("rules.md", b"---\nscope: {}\n---\n# Rules B\n", "text/markdown")},
         headers={"If-Match": etag},
     ).json()
 
@@ -597,7 +597,7 @@ result_path.write_text(json.dumps({'status': 'completed', 'cleanup_status': 'com
         etag = client.get("/api/projects/dag_direct/config").headers["ETag"]
         client.post(
             "/api/projects/dag_direct/files",
-            files={"file": ("notes.md", b"# Direct\n", "text/markdown")},
+            files={"file": ("notes.md", b"---\nscope: {}\n---\n# Direct\n", "text/markdown")},
             headers={"If-Match": etag},
         )
         cfg_res = client.get("/api/projects/dag_direct/config")
@@ -663,7 +663,7 @@ result_path.write_text(json.dumps({'status': 'completed', 'cleanup_status': 'com
         etag = client.get("/api/projects/dag_merge/config").headers["ETag"]
         client.post(
             "/api/projects/dag_merge/files",
-            files={"file": ("notes.md", b"# MergeExtract\n", "text/markdown")},
+            files={"file": ("notes.md", b"---\nscope: {}\n---\n# MergeExtract\n", "text/markdown")},
             headers={"If-Match": etag},
         )
         cfg_res_b = client.get("/api/projects/dag_merge/config")

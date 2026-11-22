@@ -1,10 +1,47 @@
 """Exercise the actual CSV -> two workers -> merge -> history -> resume HTTP path."""
 import subprocess
 import time
+from pathlib import Path
+import runpy
 
 from lightgraph.tests.construction_worker_fixture import install_scripted_worker
 from lightgraph.tests.test_web_api import client, create, upload
 from lightgraph.tests.test_web_execution import wait_run
+
+
+def test_audit_replays_the_same_three_committed_workers_without_writing(client, monkeypatch):
+    install_scripted_worker(monkeypatch)
+    create(client)
+    base = '/api/projects/alpha'
+    for name in ('collection', 'other'):
+        upload(client, name + '.csv', b'metric_code,metric_name\nA,First\nB,Second\n')
+    cfg = client.get(base + '/config').json()
+    cfg['goal']['purpose'] = '归并重复采集的对象'
+    cfg['model'].update(mode='in_environment', model='scripted-test', base_url='http://127.0.0.1:9999/v1')
+    first, other = [s['id'] for s in cfg['sources']]
+    units = [{'unit_id': f'u{i}', 'source_ids': [sid]} for i, sid in enumerate([first, first, other])]
+    cfg['workflow'] = {'enabled': True, 'units': units, 'merge_nodes': [{'node_id': 'merged'}],
+                       'edges': [{'edge_id': u['unit_id'], 'source': u['unit_id'], 'target': 'merged'} for u in units]}
+    assert client.put(base + '/config', json=cfg).is_success
+    started = client.post(base + '/runs')
+    assert started.is_success
+    rid = started.json()['run_id']
+    run = wait_run(client.app.state.manager, 'alpha', rid)
+    assert run['workflow_state']['merge']['nodes'] == 4
+    project = client.app.state.workspace.project_path('alpha')
+    checkpoint = project / run['output_path'] / 'checkpoints'
+    def snapshot():
+        return {p.relative_to(checkpoint): p.stat().st_mtime_ns for p in checkpoint.rglob('*') if p.is_file()}
+    before = snapshot()
+    script = Path(__file__).resolve().parents[3] / 'scripts/audit_checkpoint_merge.py'
+    report = runpy.run_path(str(script))['audit'](project / 'runs' / (rid + '.json'), 'merged')
+    assert report['historical_input_totals_verified'] and report['explicit_entity_rules'] == 0
+    assert report['without_source_replay']['output_nodes'] == 6
+    assert report['with_source_replay']['output_nodes'] == report['committed']['nodes'] == 4
+    assert report['with_source_replay']['source_replay_collapsed_nodes'] == 2
+    assert report['committed']['integrity'] == report['with_source_replay']['integrity'] == {
+        'duplicate_node_ids': 0, 'duplicate_edge_ids': 0, 'edges_with_missing_endpoints': 0}
+    assert snapshot() == before
 
 
 def test_apply_merge_rule_to_committed_extracts_via_http(client, monkeypatch):

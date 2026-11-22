@@ -5,6 +5,9 @@ export interface DocumentScope { source_ids: string[]; tables: string[]; columns
 export interface ProjectFile {
   file_id: string; name: string; kind: 'excel' | 'csv' | 'markdown' | 'yaml'
   relative_path: string; size: number; purpose: string; scope: DocumentScope
+  inactive_reason?: string | null
+  binding_origin?: 'filename' | 'explicit' | null
+  manifest_path?: string | null
 }
 export interface Project { project_id: string; name: string; created_at: string; updated_at: string; files: ProjectFile[] }
 export interface SourceConfig { id: string; kind: string; [key: string]: unknown }
@@ -94,6 +97,8 @@ export interface WorkflowMergeNodeState {
   run_id?: string | null
   error_code?: string | null
   failure_detail?: WorkflowFailureDetail
+  merge_counts?: { input_nodes: number; output_nodes: number; source_replay_status?: string; source_replay_collapsed_nodes?: number; observed_dictionary_collapsed_nodes?: number }
+  delta_merge_counts?: { source_replay_status?: string; source_replay_collapsed_nodes?: number; observed_dictionary_collapsed_nodes?: number }
   nodes?: number
   model_calls?: number | null
   edges?: number

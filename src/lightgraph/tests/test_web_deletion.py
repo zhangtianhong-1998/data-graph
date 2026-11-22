@@ -149,7 +149,7 @@ def test_table_deletion_deactivates_top_section_and_short_column_bindings(client
     top = upload(client, 'top.md', b'---\npurpose: data_description\nscope: {tables: [public.items]}\n---\n# schema')
     section = upload(client, 'section.md', b'---\npurpose: data_description\nsections:\n  Notes:\n    scope: {tables: [db.public.items]}\n---\n# Notes\ncolumn guidance')
     column = upload(client, 'column.md', b'---\npurpose: data_description\nscope: {source_ids: [db], columns: [code]}\n---\n# code')
-    global_doc = upload(client, 'global.md', b'# Global guidance')
+    global_doc = upload(client, 'global.md', b'---\nscope: {}\n---\n# Global guidance')
     result = client.request('DELETE', '/api/projects/alpha/sources/db/tables', json={'table': 'public.items'})
     assert result.status_code == 200, result.text
     value = result.json()

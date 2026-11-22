@@ -414,6 +414,7 @@ class GraphWorkspace:
             raise LightGraphError('validated_graph_mismatch')
         from .conflicts import isolate_validation
         isolated = not validation.passed
+        validated_graph = graph
         if isolated:
             graph = isolate_validation(graph, validation.diagnostics)
         publication_status = 'needs_revision' if isolated else 'published'
@@ -451,12 +452,9 @@ class GraphWorkspace:
         entry['published_graph_digest'] = digest(published)
         # Check conflicts against every still-current independent publication
         # before advancing either the publication set or the merged graph head.
-        graphs = [self._read_record(value['graph']) for key, value in publications.items()
+        graphs = [self._merge_contribution(value, manifest, isolate_conflicts) for key, value in publications.items()
                   if key != draft_id and value['context_fingerprint'] == self.context_fingerprint]
-        contributors = graphs + [published]
-        if fusion_policy and fusion_policy.entity_rules:
-            from .fusion import prepare_graph
-            contributors = [prepare_graph(g, fusion_policy) for g in contributors]
+        contributors = graphs + [_with_quarantine_witnesses(published, validated_graph) if isolated else published]
         merged = _merge_graphs(contributors, fusion_policy=fusion_policy, isolate_conflicts=isolate_conflicts)
         entry['graph'] = self._append_record('published', published)
         manifest.setdefault('publication_history', []).append(entry)
@@ -478,6 +476,21 @@ class GraphWorkspace:
         manifest['drafts'][draft_id]['current'] = relative
         self._save_manifest(manifest)
         return entry
+
+    def _merge_contribution(self, entry, manifest, isolate_conflicts):
+        published = self._read_record(entry['graph'])
+        if not isolate_conflicts or entry.get('coverage') != 'conflict_isolated':
+            return published
+        # Use the exact validation selected at publication, even after another
+        # validation or revision. Its full node witnesses survive in the preview.
+        for path in reversed(manifest['drafts'][entry['draft_id']]['history']):
+            validation = self._read_record(path).get('validation')
+            if validation and validation.get('validation_id') == entry['validation_id']:
+                if validation.get('graph_digest') != entry.get('graph_digest'):
+                    raise LightGraphError('validated_graph_mismatch')
+                candidate = self.read_validation_graph(entry['draft_id'], DataValidation.model_validate(validation))
+                return _with_quarantine_witnesses(published, candidate)
+        raise LightGraphError('validated_graph_mismatch')
 
     def read_published_graph(self) -> dict:
         head = self._manifest().get('current_graph')
@@ -548,6 +561,13 @@ class GraphWorkspace:
                                  if p['context_fingerprint'] == self.context_fingerprint]}
 
 
+def _with_quarantine_witnesses(published, candidate):
+    # Full observations are private merge inputs. Quarantine acts on their
+    # final identities, and only the clean subset is ever committed.
+    return {**published, 'nodes': candidate['nodes'], 'edges': candidate['edges'],
+            'conflict_isolation': {**published['conflict_isolation'], 'edge_ids': []}}
+
+
 def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False):
     """Combine independently checked subgraphs without silently replacing facts."""
     from lightgraph.source_values import persisted_identity_key
@@ -559,13 +579,20 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False):
     graphs = [deepcopy(graph) for graph in graphs]
     if isolate_conflicts:
         from .conflicts import exclude_nodes, isolate_publications
-        # A previous failed validation may have removed its counterexamples.
-        # Keep their raw IDs blocked even if another draft rekeys the object.
-        blocked = {nid for graph in graphs for nid in graph.get('conflict_isolation', {}).get('node_ids', [])}
+        # An older standalone subset may lack the original validation. Where
+        # its removed identities cannot be resolved, preserve its raw blocks.
+        blocked = set()
+        for graph in graphs:
+            isolated = set(graph.get('conflict_isolation', {}).get('node_ids', []))
+            if isolated:
+                blocked.update(isolated.difference(n['id'] for n in graph.get('nodes', [])))
         removed_edges = {edge['id'] for graph in graphs for edge in graph.get('edges', [])
                          if edge['source'] in blocked or edge['target'] in blocked}
         graphs = [exclude_nodes(graph, blocked) for graph in graphs]
         raw_ids = [[node['id'] for node in graph.get('nodes', [])] for graph in graphs]
+    if fusion_policy and fusion_policy.entity_rules:
+        from .fusion import prepare_graph
+        graphs = [prepare_graph(graph, fusion_policy, copy=False) for graph in graphs]
     if len(graphs) > 1:
         # Drafts refer to the same local source namespace. Align before
         # qualifying incompatible definitions, just as the DAG merger does.
@@ -581,6 +608,11 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False):
               'semantic_origin': 'agent_authored', 'definitions': {'entities': [], 'relations': []},
               'nodes': [], 'edges': [], 'evidence_refs': []}
     if isolate_conflicts:
+        for graph, originals in zip(graphs, raw_ids, strict=True):
+            isolation = graph.get('conflict_isolation')
+            if isolation and isolation.get('node_ids'):
+                final_ids = {old: node['id'] for old, node in zip(originals, graph['nodes'], strict=True)}
+                isolation['node_ids'] = sorted({final_ids.get(nid, nid) for nid in isolation['node_ids']})
         cleaned, isolation = isolate_publications(graphs)
         blocked = set(isolation['node_ids'])
         # Detail readers resolve each isolated observation in its immutable
@@ -648,7 +680,8 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False):
                         raise LightGraphError('published_graph_identity_conflict')
                     if previous.get('identity_origin') == 'physical_column':
                         from .metadata_columns import merge_column_supports
-                        merge_column_supports(previous, deepcopy(item))
+                        merge_column_supports(previous, deepcopy(item), retain_variants=bool(
+                            fusion_policy and fusion_policy.label_conflict_policy == 'retain_variants'))
                         continue
                     if 'supports' not in previous or 'supports' not in item:
                         if previous.get('label') != item.get('label'):

@@ -498,6 +498,9 @@ def publish_premerged_graph(
         'nodes': persisted['nodes'],
         'edges': persisted['edges'],
         'shard_count': persisted['shard_count'],
+        # A promoted checkpoint retains the producing pass. Historical artifacts
+        # without counters cannot say which matching paths were executed.
+        **({'merge_counts': merged['fusion_diagnostics']} if 'fusion_diagnostics' in merged else {}),
         'candidate_identity_merges': len(merged.get('candidate_identity_merges', [])),
         **identity_candidate_node_counts(merged),
         'candidate_column_alignments': len(merged.get('candidate_column_alignments', [])),

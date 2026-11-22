@@ -50,8 +50,8 @@ def relation_identity(edge):
     return 'r_' + digest(*parts)
 
 
-def remap_graph_endpoints(graph, remap, *, self_contained):
-    """Rewrite only local references; inherited lookup IDs belong to the base graph."""
+def remap_graph_endpoints(graph, remap, *, self_contained, record_fusion=False):
+    """Rewrite local references and keep inherited lookups in their base namespace."""
     if not remap:
         return
     for pending in graph.get('unresolved_relations', []):
@@ -59,22 +59,29 @@ def remap_graph_endpoints(graph, remap, *, self_contained):
             end: sorted({remap.get(nid, nid) for nid in ids})
             for end, ids in pending.get('candidate_endpoints', {}).items()}
         pending['node_ids'] = sorted({remap.get(nid, nid) for nid in pending.get('node_ids', [])})
+    relations = {rel['type']: rel for rel in graph.get('definitions', {}).get('relations', [])}
     for edge in graph.get('edges', []):
-        changed = False
+        old = (edge['source'], edge['target'])
         for end in ('source', 'target'):
-            old = edge[end]
-            if old not in remap or remap[old] == old:
+            nid = edge[end]
+            if nid not in remap or remap[nid] == nid:
                 continue
             inherited = [match for support in edge.get('supports', []) for match in support.get('lookup_matches', [])
-                         if match.get('endpoint') == end and match.get('inherited_node_id') == old]
+                         if match.get('endpoint') == end and match.get('inherited_node_id') == nid]
             if inherited and not self_contained:
                 continue
-            edge[end] = remap[old]
+            edge[end] = remap[nid]
             for match in inherited:
                 match['inherited_node_id'] = edge[end]
-            changed = True
-        if changed:
-            edge['id'] = relation_identity(edge)
+        if old == (edge['source'], edge['target']):
+            continue
+        if record_fusion:
+            if old[0] != old[1] and edge['source'] == edge['target'] and not relations.get(edge['type'], {}).get('allow_self_links'):
+                raise LightGraphError('self_link_forbidden')
+            for support in edge.get('supports', []):
+                support.setdefault('endpoint_origins', []).append({
+                    'edge_id': edge['id'], 'source': old[0], 'target': old[1]})
+        edge['id'] = relation_identity(edge)
 
 
 def retain_definition_variants(graphs, *, self_contained=None):
@@ -231,7 +238,29 @@ def _property_values(observations):
     return {name: [bucket[key] for key in sorted(bucket)] for name, bucket in sorted(result.items())}
 
 
-def prepare_graph(graph, policy, *, copy=True):
+def _check_unrecorded_fusion(graph, rules, target_types, previous_targets):
+    """Require raw contributions when a new rule would reinterpret an old fused key."""
+    if not (graph.get('fusion_policy_digest') or graph.get('fusion_policy_version')):
+        return
+    for node in graph.get('nodes', []):
+        family = node.get('original_type', node['type'])
+        domain = node.get('identity_domain')
+        if not domain or family in previous_targets:
+            continue
+        origins = (origin for support in node.get('supports', []) for origin in support.get('identity_origins', []))
+        if node['type'] not in target_types and family not in target_types and not any(
+                (origin.get('type'), frozenset(origin.get('identity', {}))) in rules for origin in origins):
+            continue
+        # A declared identity domain alone does not mean this node was fused.
+        # The generated ID distinguishes explicit fusion from source-backed aliases.
+        fused_id = 'n_' + digest('fusion_v1', domain, family, persisted_identity_key(node))
+        stored_id = node.get('unit_original_id', node['id'])
+        signature = node.get('definition_variant', {}).get('contract_digest')
+        if stored_id == fused_id or (signature and stored_id == 'n_' + digest('definition_variant_v1', signature, fused_id)):
+            raise LightGraphError('fusion_policy_requires_original_contributions')
+
+
+def prepare_graph(graph, policy, *, copy=True, self_contained=None):
     """Return a new graph with explicit type/key mapping and rewritten endpoints.
 
     No key may be dropped, and physical-column identities remain source-specific.
@@ -239,9 +268,16 @@ def prepare_graph(graph, policy, *, copy=True):
     """
     policy = policy if isinstance(policy, FusionPolicyConfig) else FusionPolicyConfig.model_validate(policy)
     result = deepcopy(graph) if copy else graph
+    policy_snapshot = policy.model_dump(mode='json')
+    policy_digest = digest(policy_snapshot)
     rules = {(r.entity_type, frozenset(r.key_mapping.values())): r for r in policy.entity_rules}
     target_types = {r.entity_type: r.canonical_type for r in policy.entity_rules}
     previous = result.get('fusion_policy', {})
+    # Older prepare_graph outputs stored only the digest of the applied policy.
+    if not previous and result.get('fusion_policy_digest') == policy_digest:
+        previous = policy_snapshot
+    previous_targets = {rule['canonical_type'] for rule in previous.get('entity_rules', [])}
+    _check_unrecorded_fusion(result, rules, target_types, previous_targets)
     for old in previous.get('entity_rules', []):
         new = rules.get((old['entity_type'], frozenset(old['key_mapping'].values())))
         if new and new.model_dump(mode='json') != old:
@@ -260,9 +296,11 @@ def prepare_graph(graph, policy, *, copy=True):
     original_key_names = {d['type']: list(d['key_names']) for d in result.get('definitions', {}).get('entities', [])}
 
     def prepared(item, keys):
-        if not item.get('identity_domain') or not (result.get('fusion_policy_version') or previous):
+        if not item.get('identity_domain') or item['type'] not in previous_targets:
             return False
         expected = canonical_rules.get(item['type'])
+        if expected is None and item['type'] in target_types:
+            raise LightGraphError('fusion_policy_requires_original_contributions')
         if expected is not None and (item['identity_domain'] != expected.identity_domain
                                      or set(keys) != set(expected.key_mapping)):
             raise LightGraphError('fusion_identity_keys_mismatch')
@@ -328,26 +366,13 @@ def prepare_graph(graph, policy, *, copy=True):
             if not node.get('supports'):
                 observations = _property_observations(node.get('properties', {}), rule, {})
             node['properties'] = _property_values(observations)
-    relations = {rel['type']: rel for rel in result.get('definitions', {}).get('relations', [])}
-    for edge in result.get('edges', []):
-        old_edge_id = edge['id']
-        old = (edge['source'], edge['target'])
-        edge['source'] = remap.get(edge['source'], edge['source'])
-        edge['target'] = remap.get(edge['target'], edge['target'])
-        if old[0] != old[1] and edge['source'] == edge['target'] and not relations.get(edge['type'], {}).get('allow_self_links'):
-            raise LightGraphError('self_link_forbidden')
-        if old != (edge['source'], edge['target']):
-            edge['id'] = relation_identity(edge)
-        for support in edge.get('supports', []):
-            if old != (edge['source'], edge['target']):
-                support.setdefault('endpoint_origins', []).append({'edge_id': old_edge_id,
-                    'source': old[0], 'target': old[1]})
-            for match in support.get('lookup_matches', []):
-                if match.get('inherited_node_id') in remap:
-                    match['inherited_node_id'] = remap[match['inherited_node_id']]
+    if self_contained is None:
+        self_contained = not result.get('extends_base_graph')
+    remap_graph_endpoints(result, remap, self_contained=self_contained, record_fusion=True)
     result['label_conflict_policy'] = policy.label_conflict_policy
     result['fusion_policy_version'] = policy.version
-    result['fusion_policy_digest'] = digest(policy.model_dump(mode='json'))
+    result['fusion_policy'] = policy_snapshot
+    result['fusion_policy_digest'] = policy_digest
     return result
 
 

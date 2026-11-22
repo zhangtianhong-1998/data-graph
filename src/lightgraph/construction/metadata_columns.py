@@ -3,7 +3,7 @@
 This operator never enumerates a column's fact values. The catalog is observed;
 names and meaning supplied by the Agent remain separately declared evidence.
 """
-from lightgraph.contracts import digest
+from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
 from lightgraph.query.predicate import combine_scope_predicates
 from .models import COLUMN_IDENTITY_NAMES, MetadataColumnMapping
@@ -87,24 +87,39 @@ def is_metadata_mapping(mapping):
     return isinstance(mapping, MetadataColumnMapping)
 
 
-def merge_column_supports(existing, incoming):
-    """Repeated column bindings add evidence, not a second identity.
+def merge_column_supports(existing, incoming, *, retain_variants=False):
+    """Keep independent observations of one column, including divergent declarations.
 
-    A declared name may refine a catalog fallback. Two different declared
-    primary names or conflicting annotations still require Agent revision.
+    Within an authored draft, inconsistent mappings still require revision.
+    Across publications the column address is stable even when claims differ.
     """
     supports = existing['supports'] + incoming['supports']
     labels = {s['label'] for s in supports if s.get('source_kind') == 'declared' and s.get('label')}
-    if len(labels) > 1 or any(existing['properties'][name] != values
-            for name, values in incoming['properties'].items() if name in existing['properties']):
+    if not retain_variants and (len(labels) > 1 or any(canonical(existing['properties'][name]) != canonical(values)
+            for name, values in incoming['properties'].items() if name in existing['properties'])):
         raise LightGraphError('metadata_column_mapping_conflict')
     for name in ('supports', 'provenance', 'aliases'):
+        seen = {canonical(value) for value in existing[name]}
         for item in incoming[name]:
-            if item not in existing[name]:
+            marker = canonical(item)
+            if marker not in seen:
                 existing[name].append(item)
-    existing['properties'].update(incoming['properties'])
+                seen.add(marker)
+    # Legacy in-memory publications can share a properties dict with a support.
+    # Aggregate into a fresh dict so no observation inherits another's values.
+    properties = dict(existing['properties'])
+    for name, values in incoming['properties'].items():
+        combined = {canonical(value): value for value in properties.get(name, []) + values}
+        properties[name] = [combined[key] for key in sorted(combined)]
+    existing['properties'] = properties
     if labels:
-        existing['label'] = next(iter(labels))
+        existing['label'] = min(labels)
+        # A private or context-specific declaration cannot suppress the fallback
+        # name visible on the independent catalog observation.
+        def visibility(support):
+            return (support.get('scope_ref'), tuple(sorted(support.get('required_scope_refs', []))),
+                    canonical(support.get('business_context')))
+        declared_scopes = {visibility(s) for s in supports if s.get('source_kind') == 'declared' and s.get('label')}
         for support in existing['supports']:
-            if support.get('source_kind') == 'catalog':
+            if support.get('source_kind') == 'catalog' and visibility(support) in declared_scopes:
                 support['label'] = None

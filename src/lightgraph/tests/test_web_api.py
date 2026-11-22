@@ -45,6 +45,9 @@ def test_projects_persist_and_uploads_are_project_scoped(client):
 def test_binding_changes_real_document_and_config_roundtrip(client):
     create(client)
     file = upload(client, '说明.md', '# 经营指标\n排除业务观测值。'.encode())
+    config = client.get('/api/projects/alpha/config').json()
+    config['sources'] = [{'id': 'input', 'kind': 'gauss_database', 'allowed_tables': ['public.metrics']}]
+    assert client.put('/api/projects/alpha/config', json=config).status_code == 200
     binding = {'purpose': 'data_description', 'scope': {'tables': ['input.public.metrics']}}
     response = client.patch(f"/api/projects/alpha/files/{file['file_id']}/binding", json=binding)
     assert response.status_code == 200
