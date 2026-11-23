@@ -148,6 +148,7 @@ export interface WorkflowUnitState {
   updated_at?: string
 }
 export interface WorkflowState {
+  recomposed_nodes?: string[]
   artifacts?: Record<string, { artifact_id: string; graph_kind: string; coverage?: string }>
   terminal_ids?: string[]
   resumed_from_run_id?: string

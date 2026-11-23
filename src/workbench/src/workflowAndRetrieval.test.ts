@@ -172,11 +172,14 @@ beforeEach(() => {
             unit_2: { unit_id: 'unit_2', label: 'A+C 链路', status: 'failed', run_id: 'run_u2', error_code: 'run_time_budget_exhausted', nodes: 0, edges: 0 },
           },
           merge_nodes: {
-            merge_1: { node_id: 'merge_1', label: '全节点合并抽取', merge_mode: 'merge_and_extract', status: 'completed',
+            merge_1: { node_id: 'merge_1', label: '全节点合并抽取', merge_mode: 'merge_and_extract', status: 'completed', run_id: 'run_m1',
               nodes: 20, edges: 14, merge_counts: { input_nodes: 16, output_nodes: 10,
                 source_replay_status: 'ran', source_replay_collapsed_nodes: 0, hierarchy_replay_collapsed_nodes: 4, observed_dictionary_collapsed_nodes: 2 },
               delta_merge_counts: { source_replay_status: 'ran', source_replay_collapsed_nodes: 2 } },
+            merge_2: { node_id: 'merge_2', label: '确定性合并', merge_mode: 'deterministic', status: 'completed', run_id: null },
+            merge_3: { node_id: 'merge_3', label: '从产物恢复', merge_mode: 'merge_and_extract', status: 'completed', run_id: 'run_old' },
           },
+          recomposed_nodes: ['merge_3'],
           merge: { status: 'completed', nodes: 12, edges: 8, candidate_identity_merges: 1, candidate_column_alignments: 2 },
         }
       })
@@ -472,6 +475,45 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     await vi.waitFor(() => expect(requests.some(r => r.method === 'PUT' && r.url.endsWith('/credentials/embedding'))).toBe(true))
     expect(config.embedding?.provider).toBe('openai_compatible')
     expect(JSON.stringify(config)).not.toContain('local-emb-key')
+  })
+
+  it('从父报告按需读取节点轨迹，切换时取消旧请求', async () => {
+    let finishFirst!: (response: Response) => void
+    let firstSignal: AbortSignal | null | undefined
+    const fetchBase = globalThis.fetch
+    vi.stubGlobal('fetch', vi.fn(async (url: string, options: RequestInit = {}) => {
+      if (url.includes('/runs/run_parent_1/nodes/unit_1/trace?')) {
+        firstSignal = options.signal
+        return new Promise<Response>(resolve => { finishFirst = resolve })
+      }
+      if (url.includes('/runs/run_parent_1/nodes/merge_1/trace?')) {
+        return response({ parent_run_id: 'run_parent_1', node_id: 'merge_1', run_id: 'run_m1', reused: true,
+          status: 'available', active: false, total_events: 1, next_offset: null,
+          events: [{ seq: 53, time: '', kind: 'model_request', data: {} }] })
+      }
+      return fetchBase(url, options)
+    }))
+    await mountReady()
+    button('运行与结果').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('全节点合并抽取'))
+    expect(vi.mocked(fetch).mock.calls.every(([url]) => !String(url).includes('/trace?'))).toBe(true)
+    const traceButtons = [...root.querySelectorAll('button')].filter(b => b.textContent === '查看节点轨迹')
+    expect(traceButtons).toHaveLength(3)
+    traceButtons[0]!.click()
+    await vi.waitFor(() => expect(firstSignal).toBeDefined())
+    traceButtons[2]!.click()
+    const panel = () => root.querySelector('[aria-label="节点轨迹"]')
+    await vi.waitFor(() => expect(panel()?.textContent).toContain('记录 #53'))
+    expect(firstSignal?.aborted).toBe(true)
+    finishFirst(response({ parent_run_id: 'run_parent_1', node_id: 'unit_1', run_id: 'run_u1', status: 'available',
+      events: [{ seq: 99, kind: 'tool_call', data: {} }], total_events: 1 }))
+    await nextTick()
+    expect(panel()?.textContent).toContain('本次复用的子运行 run_m1')
+    expect(panel()?.textContent).not.toContain('记录 #99')
+    expect(panel()?.textContent).not.toMatch(/清理轨迹|导出|进程诊断/)
+    expect(button('查看运行轨迹')).toBeDefined()
+    button('关闭节点轨迹').click(); await nextTick()
+    expect(panel()).toBeNull()
   })
 
   it('抽取完成后默认未向量化，用户点击立即向量化后显示已完成向量化并可执行子图召回', async () => {

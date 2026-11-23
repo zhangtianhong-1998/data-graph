@@ -28,6 +28,7 @@ from ..runtime.locking import FileLock
 from ..runtime.retention import atomic_text
 from ..runtime.progress import finish_progress, progress_path, read_progress
 from .worker_diagnostics import WorkerDiagnostics, StderrCollector, read_worker_log
+from .workspace import _no_symlinks
 
 ACTIVE_STATUSES = frozenset({"queued", "running"})
 TERMINAL_STATUSES = frozenset({"completed", "completed_with_gaps", "partial", "failed", "cancelled", "interrupted"})
@@ -65,6 +66,7 @@ def _save(path, value):
 
 _RUN_SUMMARY_FIELDS = ('project_id', 'run_id', 'status', 'stage', 'created_at', 'finished_at', 'cleanup_status',
                        'run_mode', 'config_revision', 'workflow', 'output_path', 'error_code')
+_RUN_HEADER_FIELDS = (*_RUN_SUMMARY_FIELDS, 'workflow_units')
 
 
 def _fields(record, names):
@@ -114,6 +116,7 @@ def _workflow_table(output, rid, stamp):
 def _workbench_workflow(output, rid=None):
     from ..construction.workflow import _state_path
     path = _state_path(output, rid)
+    _no_symlinks(path)
     try:
         stamp = _file_stamp(path)
     except FileNotFoundError:
@@ -418,7 +421,7 @@ class RunManager:
                 try:
                     stamp = _file_stamp(path)
                     record = _json_file(path)
-                    self._run_summaries.setdefault(project.name, {})[path.stem] = (stamp, _fields(record, _RUN_SUMMARY_FIELDS))
+                    self._run_summaries.setdefault(project.name, {})[path.stem] = (stamp, _fields(record, _RUN_HEADER_FIELDS))
                     if record.get("status") in ACTIVE_STATUSES:
                         record.update(status="interrupted", stage="finished", finished_at=_now(),
                                       cleanup_status="unknown", error_code="service_restarted")
@@ -1585,12 +1588,12 @@ class RunManager:
             # The run JSON was committed successfully. The next read can
             # rebuild the optional summary if a concurrent restore moved it.
             return
-        self._run_summaries.setdefault(path.parent.parent.name, {})[path.stem] = (stamp, _fields(record, _RUN_SUMMARY_FIELDS))
+        self._run_summaries.setdefault(path.parent.parent.name, {})[path.stem] = (stamp, _fields(record, _RUN_HEADER_FIELDS))
 
     def forget_run_summaries(self, pid):
         self._run_summaries.pop(pid, None)
 
-    def _summary(self, path):
+    def _header(self, path):
         # The service writes run records atomically. Also detect histories restored
         # or replaced on disk while this process was running.
         try:
@@ -1600,17 +1603,57 @@ class RunManager:
         summaries = self._run_summaries.setdefault(path.parent.parent.name, {})
         cached = summaries.get(path.stem)
         if cached is None or cached[0] != stamp:
-            row = _fields(_json_file(path), _RUN_SUMMARY_FIELDS)
+            row = _fields(_json_file(path), _RUN_HEADER_FIELDS)
             summaries[path.stem] = (stamp, row)
         else:
             row = cached[1]
         if row.get('run_id') != path.stem or row.get('project_id') != path.parent.parent.name:
             raise LightGraphError('run_record_invalid')
+        return row
+
+    def _summary(self, path):
+        row = _fields(self._header(path), _RUN_SUMMARY_FIELDS)
         if row.get('status') in ACTIVE_STATUSES:
             progress = read_progress(progress_path(path), row['run_id'])
             if progress:
                 return dict(row, stage=progress['stage'])
-        return dict(row)
+        return row
+
+    def node_trace_binding(self, pid, rid, node_id):
+        """Resolve a worker from the selected run's historical workflow state."""
+        from ..construction.workflow import run_output_path
+        project, path = self._paths(pid, rid)
+        _no_symlinks(path)
+        if not path.exists():
+            raise LightGraphError('run_not_found')
+        record = self._header(path)
+        if not record.get('workflow') or not record.get('output_path'):
+            raise LightGraphError('run_trace_not_found')
+        state = _workbench_workflow(run_output_path(project, record['output_path']), rid)
+        if not state or state.get('parent_run_id') != rid or node_id in state.get('recomposed_nodes', ()):
+            raise LightGraphError('run_trace_not_found')
+        unit = state.get('units', {}).get(node_id)
+        merge = state.get('merge_nodes', {}).get(node_id)
+        if (unit is None) == (merge is None):
+            raise LightGraphError('run_trace_not_found')
+        if unit is not None:
+            node = unit
+            selected = record.get('workflow_units')
+            # Earlier partial runs copied the previous unit without a reused flag.
+            reused = node.get('reused') is True or (isinstance(selected, list) and node_id not in selected)
+            id_field = 'unit_id'
+        else:
+            node = merge
+            if node.get('merge_mode') != 'merge_and_extract':
+                raise LightGraphError('run_trace_not_found')
+            reused = node.get('reused') is True
+            id_field = 'node_id'
+        child = node.get('run_id')
+        if (node.get(id_field, node_id) != node_id or not isinstance(child, str)
+                or not _RUN_ID.fullmatch(child) or child == rid):
+            raise LightGraphError('run_trace_not_found')
+        active = not reused and record.get('status') in ACTIVE_STATUSES and node.get('status') in ACTIVE_STATUSES
+        return {'parent_run_id': rid, 'node_id': node_id, 'run_id': child, 'reused': reused}, active
 
     def get(self, pid, rid, *, view='full'):
         with self.workspace.lock(pid):

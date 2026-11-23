@@ -72,6 +72,31 @@ async function showRuns() {
 }
 
 describe('运行页面实时更新', () => {
+  it('元数据与会话尚未返回时可打开报告，在运行页切换项目仅加载新项目的运行数据', async () => {
+    let finishMetadata!: (value: unknown) => void, finishSession!: () => void
+    const metadata = new Promise(resolve => { finishMetadata = resolve })
+    api.ensureSession.mockImplementationOnce(() => new Promise<void>(resolve => { finishSession = resolve }))
+    const original = api.request.getMockImplementation()!
+    api.request.mockImplementation(url => url === '/projects/alpha/metadata' ? metadata : original(url))
+    app = createApp(App); app.mount(root); await flush()
+    expect(root.textContent).toContain('正在读取元数据')
+    expect(api.ensureSession).toHaveBeenCalledWith('alpha')
+    root.querySelector<HTMLButtonElement>('#results-phase')!.click(); await flush()
+    expect(root.textContent).toContain('alpha.public.table_1')
+    expect(api.request.mock.calls.find(([url]) => url === '/projects/alpha/metadata')![1].signal.aborted).toBe(true)
+    root.querySelectorAll<HTMLButtonElement>('.project')[1].click(); await flush()
+    expect(root.textContent).toContain('beta.public.table_1')
+    expect(api.ensureSession).not.toHaveBeenCalledWith('beta')
+    expect(api.request.mock.calls.some(([url]) => url === '/projects/beta/metadata')).toBe(false)
+    root.querySelector<HTMLButtonElement>('#configuration-phase')!.click(); await flush()
+    expect(root.querySelector('.input-workspace')).not.toBeNull()
+    expect(api.request.mock.calls.some(([url]) => url === '/projects/beta/metadata')).toBe(true)
+    expect(api.request.mock.calls.some(([url]) => url === '/projects/beta/credentials')).toBe(true)
+    finishSession(); finishMetadata({ tables: [], nodes: [], edges: [], refresh_failed: true }); await flush()
+    expect(api.request.mock.calls.some(([url]) => url === '/projects/alpha/credentials')).toBe(false)
+    expect(root.querySelector('.error-strip')).toBeNull()
+    expect(root.textContent).not.toContain('上次刷新元数据未完成')
+  })
   it('连续切换时立即选中最新运行，取消旧详情并独立轮询后台运行摘要', async () => {
     historicalRuns = 2
     app = createApp(App); app.mount(root); await flush()

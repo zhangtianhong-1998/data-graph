@@ -1,6 +1,12 @@
 /** Display only recorded messages and calls; never reconstruct missing agent reasoning. */
 export type TraceEvent = { seq: number; time: string; kind: string; data: unknown }
 export type TraceBlock = { title: string; value: unknown }
+export type NodeTraceIdentity = { parent_run_id: string; node_id: string; run_id: string }
+export function requireNodeTrace(page: Partial<NodeTraceIdentity>, expected?: NodeTraceIdentity) {
+  if (expected && (page.parent_run_id !== expected.parent_run_id || page.node_id !== expected.node_id || page.run_id !== expected.run_id)) {
+    throw new Error('节点的子运行已变更，请刷新工作流节点状态。')
+  }
+}
 export function record(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }

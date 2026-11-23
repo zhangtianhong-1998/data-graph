@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { request } from './api'
-import { formatTraceValue, traceBlocks } from './tracePresentation'
-import type { TraceEvent } from './tracePresentation'
-const props = defineProps<{ seq: number; url: string }>()
+import { formatTraceValue, requireNodeTrace, traceBlocks } from './tracePresentation'
+import type { NodeTraceIdentity, TraceEvent } from './tracePresentation'
+const props = defineProps<{ seq: number; url: string; identity?: NodeTraceIdentity }>()
 const event = shallowRef<TraceEvent | null>(null)
 const error = ref('')
 let controller: AbortController | undefined
@@ -13,8 +13,9 @@ async function load() {
   controller = current
   event.value = null; error.value = ''; open.value.clear()
   try {
-    const page = await request<{ events: TraceEvent[] }>(props.url, { signal: current.signal })
+    const page = await request<{ events: TraceEvent[] } & Partial<NodeTraceIdentity>>(props.url, { signal: current.signal })
     if (current.signal.aborted) return
+    requireNodeTrace(page, props.identity)
     if (page.events[0]?.seq !== props.seq) throw new Error('轨迹记录已变更，请刷新轨迹。')
     event.value = page.events[0]
   } catch (exception) {

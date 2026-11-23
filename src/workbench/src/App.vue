@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
+import type { Ref } from 'vue'
 import GraphCanvas from './GraphCanvas.vue'
 import GraphAnalysis from './GraphAnalysis.vue'
 import GraphHistory from './GraphHistory.vue'
@@ -162,7 +163,7 @@ const advancedBaseline = ref('')
 const modelKey = ref('')
 type CredentialStatus = { database_sources: string[]; database_errors?: Record<string, string>; model: boolean; model_error?: string; model_environment?: boolean }
 const credentials = ref<CredentialStatus>({ database_sources: [], model: false })
-const metadata = ref<Metadata>({ tables: [], nodes: [], edges: [] })
+const metadata = shallowRef<Metadata>({ tables: [], nodes: [], edges: [] })
 const business = shallowRef<Graph>({ nodes: [], edges: [] })
 const selectedGraphVersion = ref('')
 const graphBusinessContext = ref<BusinessContext | null>(null)
@@ -196,6 +197,20 @@ watch(selectedRunId, id => {
 })
 watch(historyPages, count => { historyPage.value = Math.max(0, Math.min(historyPage.value, count - 1)) })
 const visibleWorkflowState = computed(() => selectedRun.value?.workflow_state)
+const traceNodeId = ref('')
+function nodeTraceTarget(nodeId: string) {
+  const state = visibleWorkflowState.value
+  if (!state || state.recomposed_nodes?.includes(nodeId)) return null
+  const unit = state.units?.[nodeId], merge = state.merge_nodes?.[nodeId]
+  if (unit && merge || merge && merge.merge_mode !== 'merge_and_extract') return null
+  const row = unit ?? merge
+  if (!row?.run_id || row.run_id === selectedRun.value?.run_id || (unit?.unit_id ?? merge?.node_id ?? nodeId) !== nodeId) return null
+  return { nodeId, runId: row.run_id, status: row.status }
+}
+const traceNode = computed(() => nodeTraceTarget(traceNodeId.value))
+function toggleNodeTrace(nodeId: string) {
+  traceNodeId.value = traceNodeId.value === nodeId ? '' : nodeId
+}
 const canEditWorkflowRun = computed(() => Boolean(config.value.workflow?.enabled && selectedRun.value &&
   selectedRun.value.current_workflow_run_id === selectedRun.value.run_id))
 const workflowOutputLabel = computed(() => {
@@ -318,6 +333,37 @@ async function reloadProjects(select?: string) {
   if (next) await loadProject(next)
   else { project.value = null; databaseOpen.value = false; loading.value = false }
 }
+// Load each tab's inputs on demand. Keep project navigation and run reports usable
+// while an input view is waiting for its metadata or saved connection status.
+function useProjectInput<T>(tabs: WorkbenchTab[], target: Ref<T>, read: (id: string, signal: AbortSignal) => Promise<T>) {
+  const pending = ref(false)
+  let loadedGeneration: number | undefined
+  watch([() => !loading.value && tabs.includes(tab.value) ? project.value?.project_id : undefined, configRevision], async ([id], _, onCleanup) => {
+    pending.value = false
+    if (!id || loadedGeneration === generation) return
+    const epoch = generation, controller = new AbortController()
+    onCleanup(() => controller.abort())
+    pending.value = true
+    const previous = target.value
+    try {
+      const value = await read(id, controller.signal)
+      if (!controller.signal.aborted && epoch === generation) {
+        if (target.value === previous) target.value = value
+        loadedGeneration = epoch
+      }
+    } catch (exception) {
+      if (!controller.signal.aborted && epoch === generation) report(exception)
+    } finally { if (!controller.signal.aborted && epoch === generation) pending.value = false }
+  })
+  return pending
+}
+const metadataPending = useProjectInput(['inputs', 'documents', 'goal', 'workflow', 'metadata'], metadata,
+  (id, signal) => request<Metadata>(`${projectPath(id)}/metadata`, { signal }))
+const credentialsPending = useProjectInput(['inputs', 'settings'], credentials, async (id, signal) => {
+  await ensureSession(id)
+  signal.throwIfAborted()
+  return request<CredentialStatus>(`${projectPath(id)}/credentials`, { signal })
+})
 async function loadProject(id: string) {
   if (project.value?.project_id === id && !loading.value) return
   if (project.value && project.value.project_id !== id && (dirty.value || advancedDirty.value) && !window.confirm('当前项目有未保存的配置修改。切换项目会放弃这些修改，继续吗？')) return
@@ -333,14 +379,12 @@ async function loadProject(id: string) {
     if (epoch !== generation) return
     configRevision.value = undefined; project.value = values[0]; fillForms(values[1]); metadata.value = { tables: [], nodes: [], edges: [] }; business.value = { nodes: [], edges: [] }; runs.value = []
     if (tab.value === 'business') void loadBusinessGraph(p, epoch)
-    const details = await Promise.allSettled([request<Metadata>(`${p}/metadata`), request<{ runs: Run[] }>(`${p}/runs?view=summary`),
-      ensureSession(id).then(() => request<CredentialStatus>(`${p}/credentials`))])
+    try {
+      const list = await request<{ runs: Run[] }>(`${p}/runs?view=summary`)
+      if (epoch !== generation) return
+      runs.value = list.runs.map(historyRow)
+    } catch (exception) { if (epoch === generation) report(exception) }
     if (epoch !== generation) return
-    if (details[0].status === 'fulfilled') { metadata.value = details[0].value }
-    if (details[1].status === 'fulfilled') runs.value = details[1].value.runs.map(historyRow)
-    if (details[2].status === 'fulfilled') credentials.value = details[2].value
-    const failed = details.find(result => result.status === 'rejected')
-    if (failed?.status === 'rejected') report(failed.reason)
     const previousRun = workbenchLocation.lastRun(id)
     selectedRunId.value = (runs.value.find(run => run.run_id === previousRun) || runs.value[0])?.run_id || ''
     schedulePoll(epoch)
@@ -489,12 +533,17 @@ watch([() => tab.value === 'runs' && selectedRunId.value, () => project.value?.p
   detailController?.abort()
   detailController = undefined
   selectedRun.value = null
+  traceNodeId.value = ''
   runDetailError.value = ''
   void readSelectedRun()
   schedulePoll(generation)
 })
 async function refreshCredentials() {
-  credentials.value = await request<CredentialStatus>(`${path.value}/credentials`)
+  const id = project.value!.project_id, epoch = generation
+  await ensureSession(id)
+  if (epoch !== generation) return
+  const status = await request<CredentialStatus>(`${projectPath(id)}/credentials`)
+  if (epoch === generation) credentials.value = status
 }
 function revisionHeaders(): Record<string, string> { return configRevision.value ? { 'If-Match': configRevision.value } : {} }
 function advancedConfig(): RunConfig {
@@ -615,6 +664,8 @@ async function refreshRetrievalStatus() {
   if (!pid) return
   const epoch = generation
   try {
+    await ensureSession(pid)
+    if (epoch !== generation) return
     const value = await request<RetrievalStatusResponse>(`${projectPath(pid)}/retrieval/status`)
     if (epoch === generation) retrievalStatus.value = value
   } catch (exception) {
@@ -678,6 +729,7 @@ async function saveModelCredential(saved: SavedModelBinding) {
   if (modelKey.value) {
     const key = modelKey.value
     try {
+      await ensureSession(project.value!.project_id)
       credentials.value = await request<CredentialStatus>(`${saved.path}/credentials/model`, { method: 'PUT', headers: saved.revision ? { 'If-Match': saved.revision } : {}, body: json({ api_key: key, expected_model: saved.expectedModel }) })
       modelKey.value = ''
     } catch (exception) {
@@ -828,6 +880,7 @@ async function refreshMetadata(saveEdits = true) {
   await action(async () => {
     if (saveEdits && (dirty.value || advancedDirty.value)) await saveDraft()
     const epoch = generation
+    await ensureSession(project.value!.project_id)
     const refreshed = await request<Metadata>(`${path.value}/metadata/refresh`, { method: 'POST', body: '{}' })
     if (epoch !== generation) return
     metadata.value = refreshed
@@ -836,6 +889,7 @@ async function refreshMetadata(saveEdits = true) {
 }
 async function startRun() {
   await action(async () => {
+    await ensureSession(project.value!.project_id)
     await saveDraft()
     const run = await request<Run>(`${path.value}/runs`, { method: 'POST', headers: revisionHeaders(), body: JSON.stringify({ run_mode: runMode.value }) })
     if (run.run_mode === 'fresh' && run.status !== 'failed') {
@@ -907,15 +961,24 @@ function capabilityUploaded(file: ProjectFile, revision?: string) {
   configRevision.value = revision || configRevision.value
   if (project.value) project.value.files = [...project.value.files.filter(item => item.file_id !== file.file_id), file]
 }
-watch(tab, async (value, previous) => {
+watch(tab, (value, previous) => {
   if (value === 'business') void loadBusinessGraph()
   if (previous === 'business') {
     graphRequestEpoch++; graphController?.abort(); graphLoading.value = false; graphOptionsOpen.value = false
     business.value = { nodes: [], edges: [] }
   }
-  if (value === 'settings' && project.value && 'embedding' in config.value) {
-    try { embeddingCredStatus.value = await request(`${path.value}/credentials/embedding`) } catch { /* optional */ }
-  }
+})
+watch([() => !loading.value && tab.value === 'settings' && 'embedding' in config.value ? project.value?.project_id : undefined, configRevision], async ([id], _, onCleanup) => {
+  if (!id) return
+  const controller = new AbortController(), epoch = generation
+  onCleanup(() => controller.abort())
+  const previous = embeddingCredStatus.value
+  try {
+    await ensureSession(id)
+    if (controller.signal.aborted) return
+    const status = await request<typeof embeddingCredStatus.value>(`${projectPath(id)}/credentials/embedding`, { signal: controller.signal })
+    if (!controller.signal.aborted && generation === epoch && embeddingCredStatus.value === previous) embeddingCredStatus.value = status
+  } catch { /* optional */ }
 })
 watch([tab, () => project.value?.project_id], () => {
   if (['business', 'retrieval'].includes(tab.value)) void refreshRetrievalStatus()
@@ -951,7 +1014,8 @@ onUnmounted(() => { generation++; detailController?.abort(); pollController?.abo
           </div>
           <nav class="tabs" :aria-label="inResults ? '运行与结果' : '项目配置'"><button v-for="item in tabs" :key="item.id" class="tab" :class="{ active: tab === item.id }" @click="tab = item.id">{{ item.label }}<span v-if="item.id === 'runs' && runs.length" class="count">{{ runs.length }}</span></button></nav>
         </section>
-        <div id="phase-content" class="content" :class="{ 'inputs-content': tab === 'inputs', 'documents-content': tab === 'documents', 'workflow-content': tab === 'workflow' }" role="tabpanel" :aria-labelledby="inResults ? 'results-phase' : 'configuration-phase'">
+        <div v-if="metadataPending || credentialsPending" id="phase-content" class="page-empty" role="tabpanel" :aria-labelledby="inResults ? 'results-phase' : 'configuration-phase'"><div class="spinner"></div><p>{{ metadataPending ? '正在读取元数据' : '正在读取连接状态' }}</p></div>
+        <div v-else id="phase-content" class="content" :class="{ 'inputs-content': tab === 'inputs', 'documents-content': tab === 'documents', 'workflow-content': tab === 'workflow' }" role="tabpanel" :aria-labelledby="inResults ? 'results-phase' : 'configuration-phase'">
           <div v-if="activeRun" class="run-banner"><span class="spinner tiny"></span><div><strong>{{ runLabels[activeRun.status] }}</strong><span>{{ stageLabel(activeRun.progress?.stage || activeRun.stage) }} · {{ activeRun.run_id }}</span></div><div class="actions"><button class="btn small" @click="showRunProgress(activeRun)">查看进度与日志</button><button class="btn small" :disabled="busy" @click="cancelRun(activeRun)">取消运行</button></div></div>
           <template v-if="tab === 'goal'">
             <div class="intro"><div><h2>这次希望发现什么？</h2></div></div>
@@ -1024,8 +1088,8 @@ onUnmounted(() => { generation++; detailController?.abort(); pollController?.abo
                   <table>
                     <thead><tr><th>节点</th><th>类型</th><th>状态</th><th>节点数</th><th>关系数</th><th>本轮 LLM 调用</th><th>子运行编号</th><th>说明</th><th>操作</th></tr></thead>
                     <tbody>
-                      <tr v-for="u in Object.values(visibleWorkflowState?.units || {})" :key="u.unit_id">
-                        <td><strong>{{ u.label || u.unit_id }}</strong> <span class="mono muted">{{ u.unit_id }}</span></td>
+                      <tr v-for="(u, unitId) in visibleWorkflowState.units" :key="unitId">
+                        <td><strong>{{ u.label || unitId }}</strong> <span class="mono muted">{{ unitId }}</span></td>
                         <td><span class="badge blue">抽取节点</span></td>
                         <td><span class="badge" :class="u.status === 'completed' ? 'green' : u.status === 'failed' ? 'red' : 'blue'">{{ u.status }}</span></td>
                         <td>{{ u.nodes ?? 0 }}</td>
@@ -1035,10 +1099,11 @@ onUnmounted(() => { generation++; detailController?.abort(); pollController?.abo
                         <td>{{ u.error_code ? new ApiError(u.error_code).message : '正常' }}
                           <div v-if="u.failure_detail" class="field-hint">{{ workflowFailureLabel(u.failure_detail) }}</div>
                         </td>
-                        <td><button v-if="!visibleWorkflowState?.artifacts" class="btn small" :disabled="locked || !canEditWorkflowRun || u.status === 'skipped'" @click="retryWorkflowUnit(u.unit_id)">单独重跑</button><button v-if="visibleWorkflowState?.artifacts" class="btn small" :disabled="locked || !config.workflow?.enabled" @click="resumeWorkflow({ from_node_id: u.unit_id })">从此节点重新运行</button></td>
+                        <td><button v-if="nodeTraceTarget(unitId)" class="btn small" :aria-expanded="traceNodeId === unitId" @click="toggleNodeTrace(unitId)">{{ traceNodeId === unitId ? '收起节点轨迹' : '查看节点轨迹' }}</button>
+                          <button v-if="!visibleWorkflowState?.artifacts" class="btn small" :disabled="locked || !canEditWorkflowRun || u.status === 'skipped'" @click="retryWorkflowUnit(u.unit_id)">单独重跑</button><button v-if="visibleWorkflowState?.artifacts" class="btn small" :disabled="locked || !config.workflow?.enabled" @click="resumeWorkflow({ from_node_id: u.unit_id })">从此节点重新运行</button></td>
                       </tr>
-                      <tr v-for="m in Object.values(visibleWorkflowState?.merge_nodes || {})" :key="m.node_id">
-                        <td><strong>{{ m.label || m.node_id }}</strong> <span class="mono muted">{{ m.node_id }}</span></td>
+                      <tr v-for="(m, mergeId) in visibleWorkflowState.merge_nodes" :key="mergeId">
+                        <td><strong>{{ m.label || mergeId }}</strong> <span class="mono muted">{{ mergeId }}</span></td>
                         <td><span class="badge amber">{{ m.merge_mode === 'merge_and_extract' ? '合并抽取节点' : '合并节点' }}</span></td>
                         <td><span class="badge" :class="m.status === 'completed' ? 'green' : m.status === 'failed' ? 'red' : 'blue'">{{ m.status }}</span></td>
                         <td>{{ m.nodes ?? 0 }}</td>
@@ -1050,7 +1115,8 @@ onUnmounted(() => { generation++; detailController?.abort(); pollController?.abo
                           <div v-if="m.delta_merge_counts?.source_replay_status === 'ran'" class="field-hint">补充抽取后同源去重 {{ m.delta_merge_counts.source_replay_collapsed_nodes }} 个<template v-if="m.delta_merge_counts.hierarchy_replay_collapsed_nodes">，同源层级归并 {{ m.delta_merge_counts.hierarchy_replay_collapsed_nodes }} 个</template><template v-if="m.delta_merge_counts.observed_dictionary_collapsed_nodes">，按字典成员合并 {{ m.delta_merge_counts.observed_dictionary_collapsed_nodes }} 个</template></div>
                           <div v-if="m.failure_detail" class="field-hint">{{ workflowFailureLabel(m.failure_detail) }}</div>
                         </td>
-                        <td><button class="btn small" :disabled="locked || !config.workflow?.enabled" @click="resumeWorkflow({ from_node_id: m.node_id, verify_checkpoints_in_background: true })">从此节点重新运行</button>
+                        <td><button v-if="nodeTraceTarget(mergeId)" class="btn small" :aria-expanded="traceNodeId === mergeId" @click="toggleNodeTrace(mergeId)">{{ traceNodeId === mergeId ? '收起节点轨迹' : '查看节点轨迹' }}</button>
+                          <button class="btn small" :disabled="locked || !config.workflow?.enabled" @click="resumeWorkflow({ from_node_id: m.node_id, verify_checkpoints_in_background: true })">从此节点重新运行</button>
                           <button v-if="!visibleWorkflowState?.artifacts && m.merge_mode === 'merge_and_extract' && ['partial', 'completed', 'completed_with_gaps'].includes(m.status)" class="btn small" :disabled="locked || dirty || advancedDirty" @click="resumeWorkflow({ from_node_id: m.node_id, action: 'recompose_legacy_merge' })">从原合并产物恢复发布</button>
                           <button v-if="visibleWorkflowState?.terminal_ids?.length === 1 && visibleWorkflowState.terminal_ids[0] === m.node_id && visibleWorkflowState.artifacts?.[m.node_id]?.graph_kind === 'node_full'" class="btn small" :disabled="locked" @click="resumeWorkflow({ artifact_id: visibleWorkflowState.artifacts[m.node_id]!.artifact_id })">仅发布此结果</button></td>
                       </tr>
@@ -1067,6 +1133,8 @@ onUnmounted(() => { generation++; detailController?.abort(); pollController?.abo
                     · 待审对齐候选 {{ (visibleWorkflowState?.merge?.candidate_identity_merges as number || 0) + (visibleWorkflowState?.merge?.candidate_column_alignments as number || 0) }} 条
                   </template>
                 </p>
+                <RunTrace v-if="selectedRun && traceNode" :key="`${selectedRun.project_id}:${selectedRun.run_id}:${traceNode.nodeId}:${traceNode.runId}`"
+                  :run="selectedRun" :node-trace="traceNode" @close="traceNodeId = ''"/>
               </div>
             </section>
             <RunProgress v-if="selectedRun" :key="`${selectedRun.project_id}:${selectedRun.run_id}`" :run="selectedRun" :refresh-error="runPollError === selectedRun.run_id"/><section v-if="selectedRun" :key="selectedRun.run_id" class="panel run-report"><div class="panel-head"><h2>运行详情</h2><span class="badge">{{ selectedRun.run_id }}</span></div><div class="panel-body"><div class="report-summary"><div><small>执行状态</small><strong>{{ runLabels[selectedRun.status] }}</strong></div><div><small>当前阶段</small><strong>{{ stageLabel(selectedRun.progress?.stage || selectedRun.stage) }}</strong></div><div><small>运行方式</small><strong>{{ selectedRun.run_mode === 'fresh' ? '从零开始' : '继续上次工作' }}</strong></div><div><small>配置修订</small><strong>{{ selectedRun.config_revision ?? '历史记录未提供' }}</strong></div><div><small>结束时间</small><strong>{{ time(selectedRun.finished_at) }}</strong></div></div><p v-if="graphOutcome(selectedRun.report)" class="note">{{ graphOutcome(selectedRun.report) }}</p><p v-if="selectedRun.error_code" class="note amber">{{ new ApiError(selectedRun.error_code).message }}<span v-if="selectedRun.failure_detail"> · {{ workflowFailureLabel(selectedRun.failure_detail) }}</span></p><p v-if="selectedRun.output_path" class="field-hint">本轮成果目录：{{ selectedRun.output_path }}</p><ConstructionReport :report="selectedRun.report"/><RunIssues :report="selectedRun.report"/><TechnicalDetails v-if="selectedRun.report" :value="selectedRun.report" title="报告原始结构"/><p v-else class="note">{{ isActive(selectedRun) ? '运行尚未结束，报告会在后端生成后显示。' : '此运行没有可读取的报告，请结合状态和错误码判断。' }}</p></div></section><RunTrace v-if="selectedRun" :key="`${selectedRun.project_id}:${selectedRun.run_id}`" :run="selectedRun" :config-revision="configRevision"/></template>

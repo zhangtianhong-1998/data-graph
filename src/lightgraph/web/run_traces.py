@@ -8,20 +8,27 @@ from fastapi.responses import StreamingResponse
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.retention import atomic_text
 from lightgraph.construction.trace import reclassify_trace_event
+from .workspace import _no_symlinks
 
 _readers = {}
 _reader_lock = threading.RLock()
 
 
-def _paths(manager, pid, rid):
-    record = manager.get(pid, rid, view='summary')
+def _trace_files(manager, pid, rid):
     _, record_path = manager._paths(pid, rid)
     trace = record_path.with_name(rid + '.trace.jsonl')
     paths = (trace, trace.with_suffix('.index.jsonl'), trace.with_suffix('.status.json'),
              trace.with_suffix('.cleared.json'))
-    if any(path.is_symlink() for path in paths):
-        raise LightGraphError('workspace_path_invalid')
-    return record, paths
+    try:
+        for path in paths:
+            _no_symlinks(path)
+    except LightGraphError:
+        raise LightGraphError('workspace_path_invalid') from None
+    return paths
+
+
+def _paths(manager, pid, rid):
+    return manager.get(pid, rid, view='summary'), _trace_files(manager, pid, rid)
 
 
 # The archive remains complete; filtering is a read-time presentation choice.
@@ -169,10 +176,17 @@ def _event_summary(event):
     return {key: event.get(key) for key in ('seq', 'kind', 'time')} | {'data': summary}
 
 
-def read_run_trace(manager, pid, rid, *, offset=0, limit=10, view='all', summary=False):
+def read_run_trace(manager, pid, rid, *, offset=0, limit=10, view='all', summary=False, node_id=None):
     if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 50 or view not in {'all','agent','runtime'}:
         raise LightGraphError('run_trace_page_invalid')
-    record, (trace, index, status_path, cleared) = _paths(manager, pid, rid)
+    binding = {}
+    if node_id is None:
+        record, files = _paths(manager, pid, rid)
+        active = record['status'] in {'queued', 'running'}
+    else:
+        binding, active = manager.node_trace_binding(pid, rid, node_id)
+        files = _trace_files(manager, pid, binding['run_id'])
+    trace, index, status_path, cleared = files
     entries,total,committed_end,recorded_total = _index(trace, index,offset=offset,limit=limit,view=view)
     status = 'available' if trace.exists() else 'cleared' if cleared.exists() else 'not_recorded'
     error_code = None
@@ -183,7 +197,6 @@ def read_run_trace(manager, pid, rid, *, offset=0, limit=10, view='all', summary
             if state.get('error_code'): error_code = 'trace_write_failed'
         except (OSError, ValueError, TypeError):
             error_code = 'run_trace_invalid'
-    active = record['status'] in {'queued','running'}
     if trace.exists() and not active and trace.stat().st_size != committed_end:
         error_code = error_code or 'run_trace_incomplete'
     events = []
@@ -192,7 +205,7 @@ def read_run_trace(manager, pid, rid, *, offset=0, limit=10, view='all', summary
             for item in entries:
                 event = _read_event(stream, item)
                 events.append(_event_summary(event) if summary else event)
-    return {'events': events, 'next_offset': offset+limit if offset+limit<total else None,
+    return {**binding, 'events': events, 'next_offset': offset+limit if offset+limit<total else None,
         'total_events':total, 'recorded_events':recorded_total, 'view':view, 'status':status, 'active':active,
         'incomplete': bool(error_code), 'error_code':error_code}
 

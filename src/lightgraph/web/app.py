@@ -1159,6 +1159,14 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         with workspace.lock(pid):
             return read_run_trace(manager,pid,rid,offset=offset,limit=limit,view=view,summary=summary)
 
+    @app.get('/api/projects/{pid}/runs/{rid}/nodes/{node_id}/trace')
+    def workflow_node_trace(pid: str, rid: str, node_id: str, offset: int = 0, limit: int = 10,
+                            view: str = 'all', summary: bool = False):
+        from .run_traces import read_run_trace
+        with workspace.lock(pid):
+            return read_run_trace(manager, pid, rid, node_id=node_id, offset=offset, limit=limit,
+                                  view=view, summary=summary)
+
     @app.get('/api/projects/{pid}/runs/{rid}/worker-diagnostics')
     def worker_diagnostics(pid:str,rid:str):
         from .worker_diagnostics import read_worker_diagnostics

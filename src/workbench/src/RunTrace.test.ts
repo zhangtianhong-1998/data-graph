@@ -22,6 +22,32 @@ async function mount(value = run()) {
 beforeEach(() => { api.request.mockReset().mockResolvedValue(page()) })
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.useRealTimers() })
 describe('persistent run trace viewer', () => {
+  it('pages a child trace and checks its binding again before showing an event body', async () => {
+    const identity = { parent_run_id: 'run_a', node_id: 'extract_1', run_id: 'run_child' }
+    let bodyRun = 'another_child'
+    api.request.mockImplementation(async (path: string) => ({
+      ...page(path.includes('offset=1') ? 2 : 1), ...identity,
+      run_id: path.includes('summary=true') ? identity.run_id : bodyRun,
+    }))
+    root = document.createElement('div'); document.body.append(root)
+    app = createApp(RunTrace, { run: run(), nodeTrace: { nodeId: 'extract_1', runId: 'run_child', status: 'running' } })
+    app.mount(root)
+    await vi.waitFor(() => expect(root.textContent).toContain('记录 #1'))
+    expect(root.textContent).not.toContain('每 3 秒刷新')
+    button('下一页轨迹').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('记录 #2'))
+    const details = root.querySelector<HTMLDetailsElement>('.trace-step')!
+    details.open = true; details.dispatchEvent(new Event('toggle'))
+    await vi.waitFor(() => expect(root.textContent).toContain('子运行已变更'))
+    expect(root.querySelector('.trace-message')).toBeNull()
+    bodyRun = 'run_child'
+    button('重试').click()
+    await vi.waitFor(() => expect(root.querySelector('.trace-message')).not.toBeNull())
+    expect(api.request.mock.calls.at(-1)![0]).toBe('/projects/p/runs/run_a/nodes/extract_1/trace?offset=1&limit=1&view=agent')
+    button('上一页轨迹').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('记录 #1'))
+    expect(api.request.mock.calls.at(-1)![0]).toBe('/projects/p/runs/run_a/nodes/extract_1/trace?offset=0&limit=10&view=agent&summary=true')
+  })
   it('shows exact recorded inputs on demand and exposes unpaged native export', async () => {
     await mount()
     expect(api.request.mock.calls[0][0]).toBe('/projects/p/runs/run_a/trace?offset=0&limit=10&view=agent&summary=true')
