@@ -64,6 +64,15 @@ def observation_boundary(support, key_columns, positions, *, witnessed_captions=
         canonical([values, types]), _predicate_terms(prov.get('predicate'), nonnull))
 
 
+def _worksheet_cell(kind, value):
+    if value is not None and not isinstance(value, (bool, str, float, int)):
+        raise ValueError('invalid worksheet cell')
+    if not (kind == scalar_kind(value) or
+            (isinstance(value, str) and kind in ('date', 'datetime', 'time', 'decimal'))):
+        raise ValueError('invalid worksheet cell type')
+    return canonical([kind, value])
+
+
 def _worksheet_projection(support):
     witness = support.get('source_row_witness')
     if witness is None:
@@ -81,8 +90,8 @@ def _worksheet_projection(support):
                 or not previous < span[0] <= span[1] <= 1_048_576):
             raise ValueError('invalid worksheet rows')
         previous = span[1]
-    context = support.get('row_context') or {}
-    values, types = context.get('values', {}), context.get('value_types', {})
+    row = support.get('row_context') or {}
+    values, types = row.get('values', {}), row.get('value_types', {})
     columns = set(support['provenance'].get('context_columns') or ())
     if (not isinstance(values, dict) or not isinstance(types, dict)
             or set(values) != columns or set(types) != columns
@@ -91,24 +100,43 @@ def _worksheet_projection(support):
     # Two imports can select different header rows from the same workbook.
     # Bind every shared column name to its original physical position, including
     # endpoints not requested as row context. A projected column index is insufficient.
-    projected = set(support['provenance'].get('columns') or ())
-    ordinals = support['provenance'].get('source_column_ordinals') or {}
+    prov = support['provenance']
+    projected = set(prov.get('columns') or ())
+    endpoints = set(prov.get('source_key_columns') or ()) | set(prov.get('target_key_columns') or ())
+    ordinals = prov.get('source_column_ordinals') or {}
     if (not isinstance(ordinals, dict)
             or any(type(n) is not int or not 1 <= n <= 16_384 for n in ordinals.values())
             or len(set(ordinals.values())) != len(ordinals)):
         raise ValueError('invalid worksheet column coordinates')
     cells = {('ordinal', c): n for c, n in ordinals.items() if c in projected}
     cells.update({('column', n): c for c, n in ordinals.items() if c in projected})
-    complete_header = bool(projected) and projected <= ordinals.keys()
+    complete_header = bool(projected) and endpoints <= projected <= ordinals.keys()
     for col, value in values.items():
-        kind = types[col]
-        if value is not None and not isinstance(value, (bool, str, float, int)):
-            raise ValueError('invalid worksheet cell')
-        if not (kind == scalar_kind(value) or
-                (isinstance(value, str) and kind in ('date', 'datetime', 'time', 'decimal'))):
-            raise ValueError('invalid worksheet cell type')
-        cells[col] = canonical([kind, value])
-    return witness['snapshot'], tuple(map(tuple, ranges)), cells, complete_header
+        cells[col] = _worksheet_cell(types[col], value)
+
+    # The executor records the typed value of a mapped business dimension
+    # even when the draft did not repeat this column in its row context.
+    # Only the support that actually read that physical column can attest it.
+    context = support.get('business_context') or {}
+    mapping = prov.get('business_context_mapping') or {}
+    dimension_bindings = []
+    if (mapping.get('status') == 'scoped'
+            and context.get('version') == 1 and context.get('status') == 'scoped'
+            and context.get('origin') == 'declared_mapping' and not context.get('identity_context')):
+        observed = context.get('observed_columns') or {}
+        dimensions = context.get('dimensions') or {}
+        value_types = context.get('value_types') or {}
+        if not all(isinstance(fields, dict) for fields in (observed, dimensions, value_types)):
+            raise ValueError('invalid worksheet dimension observation')
+        for name, col in (mapping.get('columns') or {}).items():
+            if (observed.get(name) != col or col not in projected or name not in value_types
+                    or dimensions.get(name) in (None, '') or name in (mapping.get('values') or {})):
+                continue
+            cell = _worksheet_cell(value_types[name], dimensions[name])
+            if cells.setdefault(col, cell) != cell:
+                raise ValueError('conflicting worksheet dimension and row context')
+            dimension_bindings.append(('business_dimension', name, col))
+    return witness['snapshot'], tuple(map(tuple, ranges)), cells, complete_header, tuple(sorted(dimension_bindings))
 
 
 # A pathological set of staggered projections can otherwise expand quadratically
@@ -122,15 +150,21 @@ def worksheet_edge_boundaries(entries, diagnostics):
     entries contains (projection owner, support, original boundary/property pair). Row intervals are
     split only at a recorded endpoint. Each piece keeps its own predicate and scope.
     A legacy support keeps its original row comparison and cannot bridge different
-    witnessed rows. None marks contradictory or malformed evidence.
+    witnessed rows. None marks contradictory or malformed evidence. Count each
+    incoming support once, even when it covers several disjoint row intervals.
     """
     result = [[boundary] for _, _, (boundary, _) in entries]
+    counts = diagnostics.setdefault('worksheet_edge_supports_by_row_result', {})
     if not any('source_row_witness' in support for _, support, _ in entries):
+        counts['no_row_witness'] = counts.get('no_row_witness', 0) + len(entries)
         return result
+    outcomes = ['no_row_witness'] * len(entries)
     events = defaultdict(lambda: defaultdict(list))
     owner_facts = defaultdict(set)
     cells_by_index = {}
     protected_by_index = {}
+    dimension_bindings_by_index = {}
+    uses_dimension_cell = set()
     legacy_facts = set()
     located_facts = defaultdict(lambda: defaultdict(set))
     incomplete_headers = set()
@@ -140,24 +174,32 @@ def worksheet_edge_boundaries(entries, diagnostics):
             witness = _worksheet_projection(support)
         except ValueError:
             result[i] = None
+            outcomes[i] = 'invalid_row_witness'
             continue
         if witness is None:
             legacy_facts.add(fact)
             continue
-        snapshot, ranges, cells, complete_header = witness
+        snapshot, ranges, cells, complete_header, dimension_bindings = witness
         if not complete_header:
             incomplete_headers.add(i)
             legacy_facts.add(fact)
         cells_by_index[i] = cells
         prov = support['provenance']
+        dimension_bindings_by_index[i] = dimension_bindings
+        if any(col not in (prov.get('context_columns') or ()) for _, _, col in dimension_bindings):
+            uses_dimension_cell.add(i)
         mapping = prov.get('business_context_mapping') or {}
         protected_by_index[i] = (set((prov.get('property_columns') or {}).values())
                                  | set(prov.get('scope_columns') or ())
                                  | set((mapping.get('columns') or {}).values()))
-        physical_fact = (snapshot, ranges, frozenset(cells.items()))
+        physical_fact = (snapshot, ranges, frozenset(cells.items()), dimension_bindings)
         owner_facts[owner].add((fact, physical_fact))
         raw_cells = frozenset((col, cell) for col, cell in cells.items() if isinstance(col, str))
-        located_facts[fact][owner].add((snapshot, ranges, raw_cells))
+        # Original typed row cells can corroborate a legacy exact match
+        # without the newer dimension metadata. A value supplied only by a
+        # dimension must also agree on its physical source column.
+        located_facts[fact][owner].add((snapshot, ranges, raw_cells,
+                                        dimension_bindings if i in uses_dimension_cell else ()))
         for first, last in ranges:
             events[snapshot][first].append((i, True))
             events[snapshot][last + 1].append((i, False))
@@ -167,8 +209,20 @@ def worksheet_edge_boundaries(entries, diagnostics):
     keep_exact = {fact for fact in legacy_facts
                   if len({frozenset(rows) for rows in located_facts[fact].values()}) == 1}
     normalize = {i for i in cells_by_index if changed and entries[i][2] not in keep_exact}
-    for i in normalize:
-        result[i] = None if i in incomplete_headers else []
+    for i in cells_by_index:
+        if i in normalize:
+            if i in incomplete_headers:
+                result[i] = None
+                outcomes[i] = 'incomplete_column_ordinals'
+            else:
+                result[i] = []
+                outcomes[i] = 'normalized_to_physical_rows'
+        elif len(owner_facts) == 1:
+            outcomes[i] = 'single_witnessed_projection'
+        elif changed:
+            outcomes[i] = 'kept_exact_for_legacy_or_partial_header'
+        else:
+            outcomes[i] = 'identical_witnessed_projections'
     # Charge a support once per active interval piece, without expanding a
     # single range to individual worksheet rows. Most merges have one active
     # support per projection. On exhaustion no located support from this edge
@@ -190,10 +244,14 @@ def worksheet_edge_boundaries(entries, diagnostics):
             if remaining < 0:
                 field = 'worksheet_edges_exceeding_row_comparison_budget'
                 diagnostics[field] = diagnostics.get(field, 0) + 1
-                return [None if i in cells_by_index else boundaries for i, boundaries in enumerate(result)]
+                for i in cells_by_index:
+                    result[i] = None
+                    outcomes[i] = 'comparison_budget_exceeded'
+                break
             common = {}
             protected = set()
             conflict = False
+            compare_dimension_bindings = not active.isdisjoint(uses_dimension_cell)
             for i in active:
                 protected.update(protected_by_index[i])
                 for col, cell in cells_by_index[i].items():
@@ -202,11 +260,20 @@ def worksheet_edge_boundaries(entries, diagnostics):
             for i in active:
                 if conflict:
                     result[i] = None
+                    outcomes[i] = 'conflicting_cells_or_columns'
                 elif i in normalize and result[i] is not None:
                     boundary, _ = entries[i][2]
                     binding = tuple(sorted((c, cells_by_index[i][c]) for c in protected & cells_by_index[i].keys()))
+                    if compare_dimension_bindings:
+                        # Equal cell values do not make two different columns
+                        # interchangeable as the source of a scoped dimension.
+                        binding += dimension_bindings_by_index[i]
                     section = ('excel_rows_v1', snapshot, first, following - 1, binding)
                     result[i].append(boundary._replace(row_context=section))
+        if remaining < 0:
+            break
+    for outcome in outcomes:
+        counts[outcome] = counts.get(outcome, 0) + 1
     return result
 
 

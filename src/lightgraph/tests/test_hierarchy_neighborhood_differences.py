@@ -7,6 +7,7 @@ from lightgraph.construction.hierarchy_neighborhood import neighborhood_differen
 from lightgraph.construction.hierarchy_observations import ObservationBoundary
 from lightgraph.construction.merger import merge_construction_graphs
 from lightgraph.tests.test_hierarchy_projection_variants import _facts
+from lightgraph.tests.test_hierarchy_worksheet_rows import _copies
 from lightgraph.tests.test_source_hierarchy_replays import contributor, draft_graph
 
 
@@ -60,6 +61,43 @@ def test_correlated_edge_observations_are_compared_on_the_matching_physical_neig
     matches = {first: {'x'}, second: {'y'}}
     members = {nid: SimpleNamespace(unit=nid) for nid in ('x', 'y')}
     assert neighborhood_difference_counts(matches, members) == {'edge_applicability': 1}
+
+
+def test_row_context_first_differences_partition_cross_unit_pairs_without_exposing_values():
+    def located(snapshot='private-workbook', row=4, bindings=()):
+        return ('excel_rows_v1', snapshot, row, row, bindings)
+
+    contexts = ['private-cell-A', 'private-cell-B', located(), located('another-workbook'), located(row=8),
+                located(bindings=(('private-column', 'private-value'),))]
+    matches = {_signature(context=context): {i} for i, context in enumerate(contexts)}
+    members = {i: SimpleNamespace(unit=i) for i in range(len(contexts))}
+    details = Counter()
+    differences = neighborhood_difference_counts(matches, members, row_context_differences=details)
+    assert differences == {'edge_row_context': 15}
+    assert details == {'boundary_representation': 8, 'worksheet_snapshot': 3, 'worksheet_row_intervals': 2,
+                       'worksheet_protected_bindings': 1, 'original_row_context': 1}
+    assert sum(details.values()) == differences['edge_row_context']
+
+
+def test_same_worksheet_rows_assigned_to_different_neighbors_are_reported_per_member_pair():
+    left = ('excel_rows_v1', 'sheet', 17, 17, ())
+    right = ('excel_rows_v1', 'sheet', 19, 19, ())
+    first = _signature(value='A', context=left) | _signature(value='B', context=right)
+    second = _signature(value='A', context=right) | _signature(value='B', context=left)
+    matches = {first: {'x', 'y'}, second: {'z'}}
+    members = {n: SimpleNamespace(unit=unit) for n, unit in [('x', 1), ('y', 2), ('z', 1)]}
+    details = Counter()
+    assert neighborhood_difference_counts(matches, members, row_context_differences=details) == {'edge_row_context': 1}
+    assert details == {'worksheet_row_intervals': 1}
+
+
+def test_merge_reports_which_row_context_subfield_prevented_a_fold():
+    first, second = _copies()
+    # The second projection no longer covers one of the two rows recorded by the first.
+    second['graph']['edges'][0]['supports'].pop()
+    stats = merge_construction_graphs([first, second])['fusion_diagnostics']['hierarchy_replay_diagnostics']
+    assert stats['different_neighborhood_pairs_by_first_difference'] == {'edge_row_context': 2}
+    assert stats['edge_row_context_pairs_by_first_difference'] == {'worksheet_row_intervals': 2}
 
 
 def test_a_proper_subset_of_observed_neighbors_cannot_stand_in_for_the_whole_hierarchy():

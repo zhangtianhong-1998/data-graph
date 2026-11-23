@@ -435,6 +435,7 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
     partial_sets = retained_members = 0
     equal_node_pairs = Counter()
     neighborhood_differences = Counter()
+    row_context_differences = Counter()
     role_index = None
     for ids in sets:
         first = members[next(iter(ids))]
@@ -504,7 +505,8 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
                 equal_node_pairs['different_neighborhood'] += count
                 equal_node_pairs['no_witnessed_relationship'] += isolated_pairs
                 if count:
-                    neighborhood_differences.update(neighborhood_difference_counts(matches, members))
+                    neighborhood_differences.update(neighborhood_difference_counts(
+                        matches, members, row_context_differences=row_context_differences))
             if matched:
                 if matching_batches > 1 or matched < len(ids):
                     partial_sets += 1
@@ -531,6 +533,7 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
     stats['sets_by_observation_difference'] = dict(sorted(observation_differences.items()))
     stats['equal_node_pairs_by_result'] = {key: n for key, n in sorted(equal_node_pairs.items()) if n}
     stats['different_neighborhood_pairs_by_first_difference'] = dict(sorted(neighborhood_differences.items()))
+    stats['edge_row_context_pairs_by_first_difference'] = dict(sorted(row_context_differences.items()))
     if role_index is not None:
         stats['isolated_members_by_role_result'] = role_index.diagnostics
 

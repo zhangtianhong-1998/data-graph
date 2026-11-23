@@ -7,7 +7,45 @@ def _cross_unit_count(counts):
     return (total * total - sum(n * n for n in counts.values())) // 2
 
 
-def neighborhood_difference_counts(matches, members):
+def _matching_pairs(records, unit_counts, length):
+    groups = defaultdict(Counter)
+    for rows, counts in zip(records, unit_counts, strict=True):
+        groups[frozenset(row[:length] for row in rows)].update(counts)
+    return sum(_cross_unit_count(counts) for counts in groups.values())
+
+
+def _row_context_differences(records, unit_counts, previous, current, counts):
+    """Refine just the pairs lost at row context, retaining the preceding edge fields."""
+    if all(isinstance(row[-2], str) for rows in records for row in rows):
+        counts['original_row_context'] += previous - current
+        return
+    expanded = []
+    for rows in records:
+        projected = []
+        for *prefix, context, _properties in rows:
+            if isinstance(context, tuple) and len(context) == 5 and context[0] == 'excel_rows_v1':
+                _, snapshot, first, last, bindings = context
+                parts = ('worksheet', snapshot, (first, last), bindings)
+            else:
+                # An original boundary can also be retained for witnessed supports.
+                parts = ('original', None, None, None)
+            projected.append((*prefix, *parts))
+        expanded.append(projected)
+    details = ('boundary_representation', 'worksheet_snapshot', 'worksheet_row_intervals',
+               'worksheet_protected_bindings')
+    for length, detail in enumerate(details, 7):
+        matching = _matching_pairs(expanded, unit_counts, length)
+        if previous != matching:
+            counts[detail] += previous - matching
+        previous = matching
+        if previous == current:
+            return
+    # Normalized worksheet contexts are fully represented above. Any remaining
+    # pairs differ on the original context associated with an incident edge.
+    counts['original_row_context'] += previous - current
+
+
+def neighborhood_difference_counts(matches, members, *, row_context_differences=None):
     """Partition unequal-signature, cross-unit pairs without enumerating individual pairs.
 
     Successive projections retain everything checked at the previous stage,
@@ -34,11 +72,10 @@ def neighborhood_difference_counts(matches, members):
     for length, level in enumerate(levels, 1):
         if previous == identical:
             break
-        groups = defaultdict(Counter)
-        for rows, counts in zip(records, unit_counts, strict=True):
-            groups[frozenset(row[:length] for row in rows)].update(counts)
-        current = sum(_cross_unit_count(counts) for counts in groups.values())
+        current = _matching_pairs(records, unit_counts, length)
         if previous != current:
             differences[level] = previous - current
+            if level == 'edge_row_context' and row_context_differences is not None:
+                _row_context_differences(records, unit_counts, previous, current, row_context_differences)
         previous = current
     return differences
