@@ -146,7 +146,14 @@ def retrieve_planned(retriever, request, scopes):
     query = request.query
     plan = build_plan(retriever, scopes, query, request.business_context,
                       [c.model_dump(exclude_none=True) for c in request.conditions],
-                      request.drill_role, force_joint=request.mode == 'dimensional', force_traverse=request.mode == 'traverse')
+                      request.drill_role, force_joint=request.mode == 'dimensional', force_traverse=request.mode == 'traverse',
+                      include_endpoint_variants=request.include_endpoint_variants)
+    if request.include_endpoint_variants and not plan.get('scope_unresolved'):
+        cohorts = retriever.authorized_cohorts(scopes, plan['business_context'])
+        expanded = retriever.index.expand_endpoint_relation_types(request.relation_types, cohorts)
+        request = request.model_copy(update={'relation_types': expanded})
+        if plan.get('relation_types'):
+            plan['relation_types'] = retriever.index.expand_endpoint_relation_types(plan['relation_types'], cohorts)
     intent = plan['intent']
     limits = {'max_nodes': request.max_nodes, 'max_edges': request.max_edges}
     if request.mode == 'auto' and (plan.get('grouping_spans') or intent in {'clarify', 'search', 'dimensional'}):

@@ -485,7 +485,8 @@ def _finish_traversal(plan, path=None):
     return plan
 
 
-def _compile_interpretation(retriever, scopes, requested, query, parsed, *, force_joint, force_traverse, drill_role):
+def _compile_interpretation(retriever, scopes, requested, query, parsed, *, force_joint, force_traverse, drill_role,
+                            include_endpoint_variants=False):
     selection, focus, issues = _model_scope(retriever, scopes, requested, query, parsed,
                                            is_path=force_traverse or parsed.get('intent') == 'traverse')
     plan = _new_plan(selection, focus, 'model')
@@ -592,7 +593,12 @@ def _compile_interpretation(retriever, scopes, requested, query, parsed, *, forc
                         any(re.search(re.escape(a) + r'\s*' + re.escape(relation) + r'\s*(?:到|至)?\s*'
                                       + re.escape(b), focus, re.I) for a, b in zip(anchors, anchors[1:])))
         if not generic_link:
-            matches = [r for r in retriever.index.authorized_relations(cohorts) if normalize_term(r) == normalize_term(relation)]
+            visible_relations = retriever.index.authorized_relations(cohorts)
+            matches = [r for r in visible_relations if normalize_term(r) == normalize_term(relation)]
+            if include_endpoint_variants and not matches and relation in focus:
+                expanded = retriever.index.expand_endpoint_relation_types([relation], cohorts)
+                if set(visible_relations).intersection(expanded):
+                    matches = [relation]
             if relation in focus and len(matches) == 1:
                 plan['relation_types'] = matches
                 # A bare subject-predicate-object question asks about that
@@ -696,7 +702,7 @@ def _offline_path_endpoints(focus, slots):
 
 
 def build_plan(retriever, scopes, query, business_context, conditions=(), drill_role=None, force_joint=False,
-               force_traverse=False):
+               force_traverse=False, include_endpoint_variants=False):
     """Roles come from the visible type of each grounded candidate, never from word order."""
     if query.strip() and not conditions and not force_joint and not force_traverse:
         selection = normalize_context_selection(business_context)
@@ -717,7 +723,8 @@ def build_plan(retriever, scopes, query, business_context, conditions=(), drill_
         parsed = retriever.mention_extractor(query)
         if parsed is not None:
             return _compile_interpretation(retriever, scopes, business_context, query, parsed,
-                                           force_joint=force_joint, force_traverse=force_traverse, drill_role=drill_role)
+                                           force_joint=force_joint, force_traverse=force_traverse, drill_role=drill_role,
+                                           include_endpoint_variants=include_endpoint_variants)
     clauses, excluded = _clauses(query)
     selection, focus, unresolved = _resolve_scope(retriever, scopes, business_context, clauses, excluded,
                                                  is_path=force_traverse)

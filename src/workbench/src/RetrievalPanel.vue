@@ -131,10 +131,13 @@ const nodeId = ref('')
 const seedIds = ref('')
 const pathHint = ref('')
 const relationTypes = ref('')
+const includeEndpointVariants = ref(false)
 const direction = ref<'outgoing' | 'incoming' | 'both'>('outgoing')
 const targetId = ref('')
 const maxDepth = ref(12)
 const listValues = (value: string) => [...new Set(value.split(/[，,\n]/).map(item => item.trim()).filter(Boolean))]
+const selectedRelations = computed(() => listValues(relationTypes.value))
+watch(selectedRelations, names => { if (!names.length) includeEndpointVariants.value = false })
 const pathMode = computed(() => mode.value === 'drilldown' || mode.value === 'traverse')
 const bySeedIds = computed(() => pathMode.value && seedInput.value === 'ids')
 watch(mode, value => { direction.value = value === 'traverse' ? 'both' : 'outgoing' })
@@ -217,7 +220,10 @@ async function runQuery(withSQL = false) {
       body.query = queryText.value.trim()
       if (mode.value === 'drilldown') Object.assign(body, { field: field.value, method: method.value })
     }
-    if (relationTypes.value.trim()) body.relation_types = listValues(relationTypes.value)
+    if (selectedRelations.value.length) {
+      body.relation_types = selectedRelations.value
+      if (includeEndpointVariants.value) body.include_endpoint_variants = true
+    }
     if (targetId.value.trim()) body.target_id = targetId.value.trim()
   } else {
     Object.assign(body, { mode: 'search', query: queryText.value.trim(), field: field.value, method: method.value, top_p_seeds: topPSeeds.value, hops: hops.value })
@@ -301,7 +307,11 @@ async function runQuery(withSQL = false) {
                 <div v-if="bySeedIds && mode === 'drilldown'" class="field"><label for="drilldown-hint">关注的内容</label><input id="drilldown-hint" v-model="pathHint" maxlength="4000" placeholder="可选，用于选择路径" :disabled="working"/></div>
                 <div class="field"><label for="drilldown-direction">方向</label><select id="drilldown-direction" v-model="direction" :disabled="working"><option v-if="mode === 'traverse'" value="both">双向查找</option><option value="outgoing">沿出边</option><option value="incoming">沿入边</option></select></div>
                 <div class="field"><label for="drilldown-depth">最大深度</label><input id="drilldown-depth" v-model.number="maxDepth" type="number" min="1" max="64" required :disabled="working"/></div>
-                <div class="field"><label for="drilldown-relations">关系类型</label><input id="drilldown-relations" v-model="relationTypes" placeholder="可选，多个类型用逗号分隔" :disabled="working"/></div>
+                <div class="field">
+                  <label for="drilldown-relations">关系类型</label>
+                  <input id="drilldown-relations" v-model="relationTypes" placeholder="可选，多个类型用逗号分隔" :disabled="working"/>
+                  <label v-if="selectedRelations.length"><input id="include-endpoint-variants" v-model="includeEndpointVariants" type="checkbox" :disabled="working"/> 同时查询因端点类型变化而分出的同一关系</label>
+                </div>
                 <div class="field"><label for="drilldown-target">终点 ID</label><input id="drilldown-target" maxlength="512" v-model="targetId" placeholder="可选" :disabled="working"/></div>
               </template>
             </div>

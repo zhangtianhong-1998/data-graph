@@ -10,7 +10,9 @@ import re
 import sqlite3
 from typing import Any, Sequence
 import unicodedata
-from lightgraph.contracts import canonical
+from lightgraph.construction.fusion import definition_contract
+from lightgraph.contracts import canonical, digest
+from lightgraph.errors import LightGraphError
 
 # LIMIT caps returned routes, but sorting a dense two-hop join can take
 # quadratic work before LIMIT is applied. Bound SQLite VM work as well.
@@ -26,6 +28,38 @@ _TERM_ROLES = {
 
 def normalize_term(value: Any) -> str:
     return ' '.join(unicodedata.normalize('NFKC', str(value or '')).casefold().split())
+
+
+def _endpoint_specializations(definitions):
+    """Only a named primary and its verified endpoint partitions share this filter."""
+    by_name = defaultdict(list)
+    for definition in definitions:
+        if definition.get('type'):
+            by_name[definition['type']].append(definition)
+    projected = {}
+    for name, declarations in by_name.items():
+        if len(declarations) != 1:
+            continue
+        definition, = declarations
+        family = definition.get('original_type')
+        marker = definition.get('definition_variant')
+        if not family or not isinstance(marker, dict) or marker.get('version') != 1:
+            continue
+        parent = marker.get('endpoint_projection')
+        if (not isinstance(parent, str) or not re.fullmatch('[0-9a-f]{64}', parent)
+                or not definition.get('source_type') or not definition.get('target_type')):
+            continue
+        contract = definition_contract(definition)
+        if marker.get('contract_digest') != digest(contract):
+            continue
+        for field in ('source_type', 'target_type', 'endpoint_projection'):
+            contract.pop(field, None)
+        description = ' '.join((definition.get('description') or '').split())
+        projected[name] = (family, parent, digest(contract, description))
+    for name, signature in projected.items():
+        family = signature[0]
+        if name != family and projected.get(family) == signature:
+            yield family, name
 
 
 def observed_text_properties(observation):
@@ -152,8 +186,15 @@ class SQLiteGraphIndex:
                     rel_type TEXT NOT NULL, src_kind TEXT NOT NULL, dst_kind TEXT NOT NULL,
                     orientation TEXT NOT NULL, PRIMARY KEY (rel_type, src_kind, dst_kind, orientation)
                 )""")
-                for table in ('kg_relation_semantics', 'kg_edges', 'kg_node_terms', 'kg_node_scope_views', 'kg_nodes'):
+                conn.execute("""CREATE TABLE IF NOT EXISTS kg_endpoint_specializations (
+                    base_type TEXT NOT NULL, rel_type TEXT NOT NULL, PRIMARY KEY (base_type, rel_type)
+                )""")
+                for table in ('kg_endpoint_specializations', 'kg_relation_semantics', 'kg_edges', 'kg_node_terms',
+                              'kg_node_scope_views', 'kg_nodes'):
                     conn.execute(f'DELETE FROM {table}')
+                relation_definitions = tuple(relation_definitions)
+                conn.executemany('INSERT INTO kg_endpoint_specializations VALUES (?,?)',
+                                 _endpoint_specializations(relation_definitions))
                 conn.executemany('INSERT OR IGNORE INTO kg_relation_semantics VALUES (?,?,?,?)', (
                     (d['type'], d['source_type'], d['target_type'], d.get('hierarchy_orientation') or 'undeclared')
                     for d in relation_definitions if all(d.get(k) for k in ('type', 'source_type', 'target_type'))))
@@ -270,6 +311,27 @@ class SQLiteGraphIndex:
             return [row[0] for row in conn.execute(
                 f'SELECT DISTINCT rel_type FROM ({self._authorized_edges_sql(marks)}) ORDER BY rel_type',
                 tokens * 3)]
+
+    def expand_endpoint_relation_types(self, names, scopes):
+        """Keep exact filters; add endpoint specializations backed by a visible edge and endpoints."""
+        requested = sorted(set(names))
+        if not requested:
+            return []
+        tokens = sorted(set(scopes))
+        with closing(self._connect()) as conn:
+            has_specializations = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kg_endpoint_specializations'").fetchone()
+            if not has_specializations:
+                raise LightGraphError('retrieval_index_stale')
+            if not tokens:
+                return requested
+            scopes_sql = ','.join('?' for _ in tokens)
+            names_sql = ','.join('?' for _ in requested)
+            matches = conn.execute(
+                f'SELECT DISTINCT e.rel_type FROM ({self._authorized_edges_sql(scopes_sql)}) e '
+                f'JOIN kg_endpoint_specializations s ON s.rel_type=e.rel_type WHERE s.base_type IN ({names_sql})',
+                [*tokens, *tokens, *tokens, *requested])
+            return sorted(set(requested).union(row[0] for row in matches))
 
     def authorized_terms(self, scopes: Sequence[str] | set[str], *, field: str = 'all') -> list[str]:
         scope_list = sorted({str(s) for s in scopes})

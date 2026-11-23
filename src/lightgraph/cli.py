@@ -71,6 +71,8 @@ def parser():
     c.add_argument('--drill-role', help='在已满足条件的事实中下钻的维度')
     c.add_argument('--seed-id', dest='seed_ids', action='append', help='路径节点，可重复')
     c.add_argument('--relation-type', dest='relation_types', action='append', help='路径允许经过的关系类型，可重复')
+    c.add_argument('--include-endpoint-variants', action='store_true', default=None,
+                   help='按原关系名查询时，包含因端点类型改变而生成的同一关系的分支')
     c.add_argument('--direction', choices=('incoming', 'outgoing', 'both'))
     c.add_argument('--target-id')
     c.add_argument('--target-kind', help='多层关联路径的目标节点类型')

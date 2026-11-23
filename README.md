@@ -133,6 +133,8 @@ lightgraph retrieve-subgraph config.yaml --mode drilldown --seed-id NODE_ID --re
 
 将 `NODE_ID` 和 `HAS_CHILD` 换成图中实际的节点 ID 和关系类型。第二条命令展开一跳邻域，省略 `--hops` 时只取指定节点。第三条沿指定关系下钻，返回一条路径和停止原因。M 项目的检索范围包括允许访问的 M 项目事实和通用知识。HTTP 接口为 `POST /api/projects/{pid}/retrieval/query`，例如 `{"query":"销售收入","field":"description","method":"hybrid","business_context":{"project":"M"},"hops":0}`。
 
+身份裁决可能改变关系两端的节点类型。例如，同一父子关系的一部分边会使用带 `__def_` 的类型名。`--relation-type` 默认精确匹配发布的类型名。要用原名查同一关系的可见端点分支，可加 `--include-endpoint-variants`，或在 HTTP 请求中设置 `include_endpoint_variants: true`。索引通过原名对应的关系定义核对分支。缺少这份定义时仍按输入的类型名精确匹配。返回的每条边都使用实际类型名。旧索引需要基于原发布图重新同步一次，才能使用此选项。
+
 ## 输入与配置
 
 数据库接入窗口支持按 YAML 精确选表。在「用 YAML 替换已选表」中上传以下格式的清单。

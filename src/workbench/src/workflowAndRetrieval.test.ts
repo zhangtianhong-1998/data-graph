@@ -643,6 +643,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
 
     button('路径下钻').click()
     await nextTick()
+    expect(root.querySelector('#include-endpoint-variants')).toBeNull()
     expect(await submit()).toEqual({ query: '采购', mode: 'drilldown', field: 'description', method: 'keyword',
       direction: 'outgoing', max_depth: 12, business_context: null })
     await setValue('#drilldown-start', 'ids')
@@ -655,6 +656,11 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(root.textContent).toContain('已到指定终点')
     expect(root.textContent).toContain('2 条并列路径，当前展示其中一条')
     expect(root.textContent).toContain('project：M')
+    const variants = root.querySelector<HTMLInputElement>('#include-endpoint-variants')!
+    expect(variants.checked).toBe(false)
+    variants.click()
+    await nextTick()
+    expect(await submit()).toMatchObject({ mode: 'drilldown', relation_types: ['SETTLED_BY'], include_endpoint_variants: true })
 
     button('多层关联').click()
     await nextTick()
@@ -663,12 +669,25 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
       nodes:[{id:'n1', kind:'文献', display_name:'海图'}, {id:'n2', kind:'展品', display_name:'罗盘'}],
       edges:[{id:'e1', source:'n2', target:'n1', relation:'参考'}] }
     expect(await submit()).toEqual({ mode: 'traverse', seed_ids: ['n1','n2'], target_id: 'n2', direction: 'both',
-      relation_types:['SETTLED_BY'], max_depth: 7, business_context: null })
+      relation_types:['SETTLED_BY'], include_endpoint_variants: true, max_depth: 7, business_context: null })
     const path = root.querySelector('.retrieved-paths')!
     expect(path.querySelector('h3')?.textContent).toBe('关联路径')
     expect(path.textContent).toContain('已连接指定节点')
     expect(path.textContent).toContain('← 参考')
 
+    button('按节点 ID').click()
+    await nextTick()
+    expect(root.querySelector('#include-endpoint-variants')).toBeNull()
+    expect(await submit()).toEqual({ node_id: 'n1', hops: 2, business_context: null })
+    button('多层关联').click()
+    await nextTick()
+    await setValue('#drilldown-relations', ' ， ')
+    expect(root.querySelector('#include-endpoint-variants')).toBeNull()
+    const unfiltered = await submit()
+    expect(unfiltered).not.toHaveProperty('relation_types')
+    expect(unfiltered).not.toHaveProperty('include_endpoint_variants')
+    await setValue('#drilldown-relations', 'SETTLED_BY')
+    expect(root.querySelector<HTMLInputElement>('#include-endpoint-variants')!.checked).toBe(false)
   })
 
 })

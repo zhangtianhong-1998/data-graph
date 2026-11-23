@@ -41,6 +41,8 @@ class RetrieveSubgraphRequest(BaseModel):
     target_kind: str | None = Field(default=None, min_length=1, max_length=256)
     direction: Literal['outgoing', 'incoming', 'both'] = 'outgoing'
     relation_types: list[Annotated[str, Field(min_length=1, max_length=512)]] = Field(default_factory=list, max_length=64)
+    include_endpoint_variants: bool = Field(default=False,
+        description='Include visible endpoint specializations of a requested original relation. Exact type filtering is the default.')
     max_depth: int = Field(default=12, ge=1, le=64)
 
     conditions: list[Condition] = Field(default_factory=list, max_length=12)
@@ -58,7 +60,7 @@ class RetrieveSubgraphRequest(BaseModel):
             values['business_context'] = selector
         if isinstance(values, dict) and values.get('mode') == 'traverse' and 'direction' not in values:
             values = {**values, 'direction': 'both'}
-        query_options = {'query', 'business_context', 'max_nodes', 'max_edges', 'max_depth'}
+        query_options = {'query', 'business_context', 'max_nodes', 'max_edges', 'max_depth', 'include_endpoint_variants'}
         if isinstance(values, dict) and 'query' in values and set(values) <= query_options:
             return {**values, 'mode': 'auto'}
         return values
@@ -66,6 +68,8 @@ class RetrieveSubgraphRequest(BaseModel):
     @model_validator(mode='after')
     def validate_lookup(self):
         options = self.model_fields_set
+        if self.include_endpoint_variants and not self.relation_types:
+            raise ValueError('endpoint_variants_require_relation_types')
         ranking = {'field', 'method', 'top_n'}
         if self.mode == 'traverse':
             if bool(self.query.strip()) == bool(self.seed_ids):
@@ -76,7 +80,8 @@ class RetrieveSubgraphRequest(BaseModel):
         if self.direction == 'both' or 'target_kind' in options:
             raise ValueError('general_path_options_require_traverse')
         if self.mode == 'auto':
-            if not self.query.strip() or options - {'mode', 'query', 'business_context', 'max_depth', 'max_nodes', 'max_edges'}:
+            if not self.query.strip() or options - {'mode', 'query', 'business_context', 'max_depth', 'max_nodes', 'max_edges',
+                                                     'include_endpoint_variants'}:
                 raise ValueError('auto_requires_natural_language_query')
             return self
         if self.mode == 'dimensional':
@@ -106,18 +111,22 @@ class RetrieveSubgraphRequest(BaseModel):
         return self
 
     def run(self, retriever, scopes):
+        if self.mode in {'auto', 'dimensional'} or (self.mode == 'traverse' and not self.seed_ids):
+            from .planned import retrieve_planned
+            return retrieve_planned(retriever, self, scopes)
+        relations = self.relation_types
+        if self.include_endpoint_variants:
+            cohorts = retriever.authorized_cohorts(scopes, self.business_context)
+            relations = retriever.index.expand_endpoint_relation_types(relations, cohorts)
         if self.mode == 'traverse' and self.seed_ids:
             from .traversal import retrieve_traversal
             return retrieve_traversal(retriever, self.query, scopes, business_context=self.business_context,
-                seed_ids=self.seed_ids, direction=self.direction, relation_types=self.relation_types,
+                seed_ids=self.seed_ids, direction=self.direction, relation_types=relations,
                 target_id=self.target_id, target_kind=self.target_kind, max_depth=self.max_depth,
                 max_nodes=self.max_nodes, max_edges=self.max_edges)
-        if self.mode in {'auto', 'dimensional', 'traverse'}:
-            from .planned import retrieve_planned
-            return retrieve_planned(retriever, self, scopes)
         if self.mode == 'drilldown':
             from .drilldown import retrieve_drilldown
-            options = self.model_dump(exclude={'mode', 'target_kind', 'node_id', 'hops', 'top_p_seeds', 'max_per_rel', 'hub_degree_limit', 'conditions', 'drill_role'})
-            return retrieve_drilldown(retriever, scopes=scopes, **options)
-        options = self.model_dump(exclude={'mode', 'target_kind', 'seed_ids', 'target_id', 'direction', 'relation_types', 'max_depth', 'conditions', 'drill_role'})
+            options = self.model_dump(exclude={'mode', 'target_kind', 'node_id', 'hops', 'top_p_seeds', 'max_per_rel', 'hub_degree_limit', 'conditions', 'drill_role', 'relation_types', 'include_endpoint_variants'})
+            return retrieve_drilldown(retriever, scopes=scopes, relation_types=relations, **options)
+        options = self.model_dump(exclude={'mode', 'target_kind', 'seed_ids', 'target_id', 'direction', 'relation_types', 'max_depth', 'conditions', 'drill_role', 'include_endpoint_variants'})
         return retriever.retrieve(scopes=scopes, **options)
