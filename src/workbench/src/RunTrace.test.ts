@@ -14,7 +14,9 @@ const button = (name: string) => [...root.querySelectorAll('button')].find(b => 
 async function mount(value = run()) {
   const props = reactive({ run: value, configRevision: '"7"' })
   root = document.createElement('div'); document.body.append(root); app = createApp(RunTrace, props); app.mount(root)
-  await vi.waitFor(() => expect(button('刷新轨迹').disabled).toBe(false))
+  expect(api.request).not.toHaveBeenCalled()
+  button('查看运行轨迹').click()
+  await vi.waitFor(() => expect(button('刷新轨迹')?.disabled).toBe(false))
   return props
 }
 beforeEach(() => { api.request.mockReset().mockResolvedValue(page()) })
@@ -22,11 +24,13 @@ afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.useRe
 describe('persistent run trace viewer', () => {
   it('shows exact recorded inputs on demand and exposes unpaged native export', async () => {
     await mount()
-    expect(api.request.mock.calls[0][0]).toBe('/projects/p/runs/run_a/trace?offset=0&limit=10&view=agent')
+    expect(api.request.mock.calls[0][0]).toBe('/projects/p/runs/run_a/trace?offset=0&limit=10&view=agent&summary=true')
     expect(root.querySelector('pre')).toBeNull()
     const details = root.querySelector<HTMLDetailsElement>('.trace-step')!
     details.open = true; details.dispatchEvent(new Event('toggle')); await nextTick()
-    expect(root.textContent).toContain('消息 1 · 用户输入')
+    await vi.waitFor(() => expect(root.textContent).toContain('消息 1 · 用户输入'))
+    expect(api.request.mock.calls.at(-1)![0]).toContain('offset=0&limit=1&view=agent')
+    await vi.waitFor(() => expect(root.querySelector('.trace-message')).not.toBeNull())
     const message = root.querySelector<HTMLDetailsElement>('.trace-message')!
     message.open = true; message.dispatchEvent(new Event('toggle')); await nextTick()
     expect(root.querySelector('pre')!.textContent).toContain('input_1')
@@ -60,6 +64,7 @@ describe('persistent run trace viewer', () => {
     await vi.waitFor(() => expect(root.textContent).toContain('记录 #2'))
     const details = root.querySelector<HTMLDetailsElement>('.trace-step')!
     details.open = true; details.dispatchEvent(new Event('toggle')); await nextTick()
+    await vi.waitFor(() => expect(root.querySelector('.trace-message')).not.toBeNull())
     const message = root.querySelector<HTMLDetailsElement>('.trace-message')!
     message.open = true; message.dispatchEvent(new Event('toggle')); await nextTick()
     const payload = root.querySelector<HTMLPreElement>('.trace-payload')!
@@ -107,6 +112,20 @@ describe('persistent run trace viewer', () => {
     expect(root.textContent).toContain('历史输入无法从汇总报告中恢复')
     expect(button('清理轨迹').disabled).toBe(true)
     expect(root.querySelector('a')).toBeNull()
+  })
+  it('aborts a pending event body on collapse and releases the previous page', async () => {
+    await mount()
+    let signal: AbortSignal | undefined
+    api.request.mockImplementation(async (_path, options) => {
+      signal = options.signal
+      return new Promise(() => {})
+    })
+    const details = root.querySelector<HTMLDetailsElement>('.trace-step')!
+    details.open = true; details.dispatchEvent(new Event('toggle')); await nextTick()
+    await vi.waitFor(() => expect(signal).toBeDefined())
+    button('收起轨迹').click(); await nextTick()
+    expect(signal?.aborted).toBe(true)
+    expect(root.querySelector('.trace-step')).toBeNull()
   })
   it('marks trace write failures and exports only what was recorded', async () => {
     api.request.mockResolvedValue({ ...page(), incomplete: true, error_code: 'trace_write_failed' })

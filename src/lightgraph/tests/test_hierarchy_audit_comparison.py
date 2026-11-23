@@ -1,10 +1,45 @@
 from pathlib import Path
+import json
 import runpy
 
 import pytest
 
 
 compare = runpy.run_path(str(Path(__file__).resolve().parents[3] / "scripts/audit_checkpoint_merge.py"))["compare_hierarchy_audits"]
+
+
+def test_run_summary_reads_only_the_requested_generation_and_parquet_footers(tmp_path, monkeypatch):
+    from lightgraph.construction.checkpoints import commit_checkpoint
+    from lightgraph.construction.workflow import save_workflow_state
+
+    old, new = "run_" + "a" * 24, "run_" + "b" * 24
+    original = tmp_path / "output"
+    current = original / "generations" / new
+    parent = commit_checkpoint(original, old, "extract_1", {"graph": {"nodes": [{"id": "a"}, {"id": "b"}]}},
+                               input_digest="p")
+    result = commit_checkpoint(current, new, "merge_1", {"graph": {"nodes": [{"id": "a"}]}},
+                               input_digest="m", upstream_artifacts=[parent["artifact_id"]])
+    state = {"parent_run_id": new, "resumed_from_run_id": old, "rerun_nodes": ["merge_1"], "reused_nodes": ["extract_1"],
+             "merge_nodes": {"merge_1": {"status": "completed", "merge_mode": "deterministic", "nodes": 1, "edges": 0}},
+             "artifacts": {"extract_1": parent, "merge_1": result}, "artifact_outputs": {"extract_1": "output"}}
+    save_workflow_state(current, state)
+    (tmp_path / "runs").mkdir()
+    path = tmp_path / "runs" / (new + ".json")
+    path.write_text(json.dumps({"run_id": new, "output_path": current.relative_to(tmp_path).as_posix()}))
+    audit = runpy.run_path(str(Path(__file__).resolve().parents[3] / "scripts/audit_checkpoint_merge.py"))["audit"]
+    monkeypatch.setitem(audit.__globals__, "load_checkpoint", lambda *_: pytest.fail("decoded checkpoint graph"))
+    summary = audit(path, "merge_1", run_summary=True)
+    assert summary["inputs"][0]["run_id"] == old and summary["inputs"][0]["nodes"] == 2
+    assert summary["output"]["run_id"] == new and summary["output"]["artifact_id"] == result["artifact_id"]
+    assert summary["reported_nodes"] == summary["output"]["nodes"] == 1
+    (original / parent["relative_path"] / "nodes.parquet").unlink()
+    damaged = audit(path, "merge_1", run_summary=True)
+    assert damaged["inputs"][0]["read_error"] == "workflow_checkpoint_invalid" and damaged["output"]["nodes"] == 1
+    del state["artifacts"]["merge_1"]
+    state["merge_nodes"]["merge_1"] = {"status": "failed", "error_code": "workflow_checkpoint_invalid"}
+    save_workflow_state(current, state)
+    failed = audit(path, "merge_1", run_summary=True)
+    assert failed["output"] is None and failed["error_code"] == "workflow_checkpoint_invalid"
 
 
 def report(groups, nodes):

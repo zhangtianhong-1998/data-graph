@@ -26,12 +26,13 @@ let root: HTMLDivElement
 let live = run('alpha')
 let failPoll = false
 let delayedPoll: Promise<unknown> | undefined
+let historicalRuns = 0
 const flush = async () => { for (let n = 0; n < 12; n++) await Promise.resolve(); await nextTick() }
 
 beforeEach(() => {
   vi.useFakeTimers()
   sessionStorage.clear()
-  live = run('alpha'); failPoll = false; delayedPoll = undefined
+  live = run('alpha'); failPoll = false; delayedPoll = undefined; historicalRuns = 0
   api.ensureSession.mockReset().mockResolvedValue(undefined)
   api.clearSessions.mockReset()
   api.request.mockReset().mockImplementation(async (url: string) => {
@@ -42,26 +43,74 @@ beforeEach(() => {
     if (url.endsWith('/credentials')) return { database_sources: [], model: false }
     const project = projects.find(item => url === `/projects/${item.project_id}`)
     if (project) return project
-    if (url.endsWith('/runs')) return { runs: [structuredClone(url.includes('/alpha/') ? live : run('beta'))] }
-    if (url.endsWith('/runs/run_alpha')) {
+    if (url.endsWith('/runs?view=summary')) {
+      const current = url.includes('/alpha/') ? live : run('beta')
+      return { runs: [{...current, progress: undefined}, ...Array.from({length: historicalRuns}, (_, i) =>
+        ({...current, progress: undefined, run_id: 'old_' + i, status: 'completed'}))] }
+    }
+    if (url.endsWith('/runs/run_alpha?view=summary')) return { ...live, progress: undefined }
+    if (url.includes('/runs/old_') && url.endsWith('?view=workbench')) {
+      const id = url.split('/').at(-1)!.split('?')[0]
+      return { ...live, status: 'completed', run_id: id, progress: undefined, output_path: 'details/' + id }
+    }
+    if (url.endsWith('/runs/run_alpha?view=workbench')) {
       if (failPoll) throw new Error('temporary_network_failure')
       return delayedPoll ?? structuredClone(live)
     }
-    if (url.endsWith('/runs/run_beta')) return run('beta')
+    if (url.endsWith('/runs/run_beta?view=workbench')) return run('beta')
     throw new Error(`Unexpected request ${url}`)
   })
   root = document.createElement('div'); document.body.append(root)
-  app = createApp(App); app.mount(root)
 })
-afterEach(() => { app?.unmount(); root.remove(); vi.useRealTimers(); sessionStorage.clear() })
+afterEach(() => { app?.unmount(); app = undefined; root.remove(); vi.useRealTimers(); sessionStorage.clear() })
 
 async function showRuns() {
+  if (!app) { app = createApp(App); app.mount(root) }
   await flush()
   root.querySelector<HTMLButtonElement>('#results-phase')!.click()
   await flush()
 }
 
 describe('运行页面实时更新', () => {
+  it('连续切换时立即选中最新运行，取消旧详情并独立轮询后台运行摘要', async () => {
+    historicalRuns = 2
+    app = createApp(App); app.mount(root); await flush()
+    expect(api.request.mock.calls.some(([url]) => String(url).includes('?view=workbench'))).toBe(false)
+    let finish!: (value: unknown) => void
+    delayedPoll = new Promise(resolve => { finish = resolve })
+    await showRuns()
+    const oldSignal = api.request.mock.calls.find(([url]) => url.endsWith('/runs/run_alpha?view=workbench'))![1].signal
+    const choose = (id: string) => [...root.querySelectorAll('tr')].find(row => row.cells[0].textContent === id)!.querySelector('button')!
+    choose('old_0').click(); await flush()
+    choose('old_1').click(); await flush()
+    expect(oldSignal.aborted).toBe(true)
+    expect(root.querySelector('.chosen')?.textContent).toContain('old_1')
+    expect(root.textContent).toContain('details/old_1')
+    finish(run('alpha', 5)); await flush()
+    expect(root.textContent).not.toContain('alpha.public.table_5')
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(api.request.mock.calls.some(([url]) => url.endsWith('/runs/run_alpha?view=summary'))).toBe(true)
+    expect(api.request.mock.calls.filter(([url]) => url.endsWith('/runs/run_alpha?view=workbench'))).toHaveLength(1)
+    expect(api.request.mock.calls.some(([url]) => url.endsWith('/workflow'))).toBe(false)
+    expect(root.textContent).toContain('details/old_1')
+  })
+  it('较长运行列表分页保留全部历史记录，离开运行页后释放详情并在返回时重读', async () => {
+    historicalRuns = 51
+    await showRuns()
+    const rows = () => root.querySelectorAll('.run-history-table tbody tr')
+    expect(rows()).toHaveLength(50)
+    root.querySelector<HTMLButtonElement>('nav[aria-label="运行记录分页"] button:last-child')!.click()
+    await flush()
+    expect(rows()).toHaveLength(2)
+    rows()[1].querySelector('button')!.click()
+    await flush()
+    expect(root.textContent).toContain('details/old_50')
+    root.querySelector<HTMLButtonElement>('[role="tab"][aria-controls="phase-content"]:not(#results-phase)')!.click()
+    await flush()
+    await showRuns()
+    expect(api.request.mock.calls.filter(([url]) => url.endsWith('/runs/old_50?view=workbench'))).toHaveLength(2)
+    expect(root.textContent).toContain('details/old_50')
+  })
   it('节点说明显示失败阶段、系统错误号及实际尝试次数，旧运行只显示错误码', async () => {
     await showRuns()
     live = Object.assign(run('alpha', 2), {

@@ -21,6 +21,7 @@ _FORMAT = "parquet_v1"
 _FIELDS = ("id", "type", "source", "target", "label")
 _BATCH_ROWS = 4096
 _BATCH_BYTES = 8 * 1024 * 1024
+_READ_BATCH_ROWS = 512
 
 
 def _arrow():
@@ -56,13 +57,39 @@ def _json_value(value: Any, depth: int = 0) -> None:
     raise LightGraphError("invalid_graph_parquet_record")
 
 
-def _graph_digest(graph: dict) -> str:
-    """Match contracts.digest(graph) without building another graph-sized string."""
+def _graph_digest(graph: dict, *prefix: str) -> str:
+    """Match contracts.digest(*prefix, graph) without a graph-sized string."""
     checksum = hashlib.sha256()
     encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True,
                                separators=(",", ":"), allow_nan=False)
-    for part in encoder.iterencode([graph]):
-        checksum.update(part.encode("utf-8"))
+    # Rows are independent JSON values. Use the native encoder for each one
+    # instead of handing every separator and scalar to hashlib individually.
+    if not all(isinstance(key, str) for key in graph):
+        for part in encoder.iterencode([*prefix, graph]):
+            checksum.update(part.encode('utf-8'))
+        return checksum.hexdigest()
+    checksum.update(b'[')
+    for value in prefix:
+        checksum.update(encoder.encode(value).encode('utf-8'))
+        checksum.update(b',')
+    checksum.update(b'{')
+    for index, name in enumerate(sorted(graph)):
+        if index:
+            checksum.update(b',')
+        checksum.update(encoder.encode(name).encode('utf-8'))
+        checksum.update(b':')
+        value = graph[name]
+        if name in ('nodes', 'edges') and isinstance(value, list):
+            checksum.update(b'[')
+            for offset, row in enumerate(value):
+                if offset:
+                    checksum.update(b',')
+                checksum.update(encoder.encode(row).encode('utf-8'))
+            checksum.update(b']')
+        else:
+            for part in encoder.iterencode(value):
+                checksum.update(part.encode('utf-8'))
+    checksum.update(b'}]')
     return checksum.hexdigest()
 
 
@@ -172,21 +199,24 @@ def _read_rows(path: Path, expected_rows: int) -> list[dict]:
         if (not parquet.schema_arrow.equals(_schema(pa))
                 or parquet.metadata.num_rows != expected_rows):
             raise LightGraphError("invalid_graph_parquet_record")
-        for batch in parquet.iter_batches(batch_size=_BATCH_ROWS):
-            for projected in batch.to_pylist():
-                row = json.loads(projected.pop("payload"), object_pairs_hook=_unique_object)
-                if not isinstance(row, dict):
-                    raise LightGraphError("invalid_graph_parquet_record")
-                _json_value(row)
-                if _projection(row) != projected:
-                    raise LightGraphError("invalid_graph_parquet_record")
-                result.append(row)
+        # The writer also bounds row groups by bytes. Combining many groups in
+        # a row-count-only batch creates a large second copy of support payloads.
+        for group in range(parquet.num_row_groups):
+            for batch in parquet.iter_batches(batch_size=_READ_BATCH_ROWS, row_groups=[group], use_threads=False):
+                for projected in batch.to_pylist():
+                    row = json.loads(projected.pop("payload"), object_pairs_hook=_unique_object)
+                    if not isinstance(row, dict):
+                        raise LightGraphError("invalid_graph_parquet_record")
+                    _json_value(row)
+                    if _projection(row) != projected:
+                        raise LightGraphError("invalid_graph_parquet_record")
+                    result.append(row)
     if len(result) != expected_rows:
         raise LightGraphError("invalid_graph_parquet_record")
     return result
 
 
-def read_graph_record(path: Path) -> dict:
+def read_graph_record(path: Path, *, expected_digest: str | None = None) -> dict:
     """Read and verify one snapshot; the caller enforces its workspace boundary."""
     from .workspace import INTERNAL_YAML_MAX_BYTES, safe_load_yaml
 
@@ -207,6 +237,8 @@ def read_graph_record(path: Path) -> dict:
                 or {"nodes", "edges"} & set(metadata["graph_metadata"])):
             raise LightGraphError("invalid_graph_parquet_record")
         graph = metadata["graph_metadata"]
+        if expected_digest is not None and metadata.get("graph_digest") != expected_digest:
+            raise LightGraphError("graph_parquet_checksum_mismatch")
         for category in ("nodes", "edges"):
             entry = metadata["collections"][category]
             if (not isinstance(entry, dict) or entry.get("file") != f"{category}.parquet"

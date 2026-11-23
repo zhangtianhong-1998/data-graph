@@ -179,7 +179,7 @@ def test_repeated_pages_and_two_hops_read_the_published_file_once(published, mon
     node_id = graph['nodes'][0]['id']
     details = graph_details(config, entity_id=node_id)
     assert details['supports']
-    monkeypatch.setattr(views, 'digest', lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('paged view digested the graph')))
+    monkeypatch.setattr(views, '_graph_digest', lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('paged view digested the graph')))
     page = views.graph_page(config, limit=1000)
     focused = views.graph_page(config, focus=node_id, hops=2, limit=1000)
     assert calls['n'] == 1

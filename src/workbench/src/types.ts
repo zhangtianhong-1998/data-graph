@@ -244,6 +244,7 @@ export interface Run {
   run_mode?: 'continue' | 'fresh'
   workflow?: boolean
   workflow_units?: string[]
+  current_workflow_run_id?: string | null
   workflow_state?: WorkflowState | null
   failure_detail?: WorkflowFailureDetail
   output_path?: string

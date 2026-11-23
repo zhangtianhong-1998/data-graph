@@ -149,35 +149,36 @@ beforeEach(() => {
         edges: [{ id: 'e1', source: 'n1', target: 'n2', relation: 'SETTLED_BY', status: 'accepted' }],
       })
     }
-    if (url.endsWith('/runs')) {
-      if (method === 'POST') return response({ run_id: 'run_canvas', project_id: 'wf_proj', status: 'completed', stage: 'finished', created_at: '2026-11-15T00:00:00Z', cleanup_status: 'completed', workflow: true }, 202)
+    if (url.endsWith('/runs') && method === 'POST') return response({ run_id: 'run_canvas', project_id: 'wf_proj', status: 'completed', stage: 'finished', created_at: '2026-11-15T00:00:00Z', cleanup_status: 'completed', workflow: true }, 202)
+    if (url.endsWith('/runs?view=summary') || url.endsWith('/runs/run_parent_1?view=workbench')) {
+      const header = {
+        run_id: 'run_parent_1',
+        project_id: 'wf_proj',
+        status: 'completed_with_gaps',
+        stage: 'finished',
+        created_at: '2026-11-15T00:00:00Z',
+        cleanup_status: 'completed',
+        workflow: true,
+      }
+      if (url.endsWith('?view=summary')) return response({ runs: [header] })
       return response({
-        runs: [
-          {
-            run_id: 'run_parent_1',
-            project_id: 'wf_proj',
-            status: 'completed_with_gaps',
-            stage: 'finished',
-            created_at: '2026-11-15T00:00:00Z',
-            cleanup_status: 'completed',
-            workflow: true,
-            workflow_state: {
-              parent_run_id: 'run_parent_1',
-              status: 'completed_with_gaps',
-              units: {
-                unit_1: { unit_id: 'unit_1', label: 'A+B 链路', status: 'completed', run_id: 'run_u1', nodes: 12, edges: 8 },
-                unit_2: { unit_id: 'unit_2', label: 'A+C 链路', status: 'failed', run_id: 'run_u2', error_code: 'run_time_budget_exhausted', nodes: 0, edges: 0 },
-              },
-              merge_nodes: {
-                merge_1: { node_id: 'merge_1', label: '全节点合并抽取', merge_mode: 'merge_and_extract', status: 'completed',
-                  nodes: 20, edges: 14, merge_counts: { input_nodes: 16, output_nodes: 10,
-                    source_replay_status: 'ran', source_replay_collapsed_nodes: 0, hierarchy_replay_collapsed_nodes: 4, observed_dictionary_collapsed_nodes: 2 },
-                  delta_merge_counts: { source_replay_status: 'ran', source_replay_collapsed_nodes: 2 } },
-              },
-              merge: { status: 'completed', nodes: 12, edges: 8, candidate_identity_merges: 1, candidate_column_alignments: 2 },
-            },
+        ...header,
+        current_workflow_run_id: 'run_retry_u2',
+        workflow_state: {
+          parent_run_id: 'run_parent_1',
+          status: 'completed_with_gaps',
+          units: {
+            unit_1: { unit_id: 'unit_1', label: 'A+B 链路', status: 'completed', run_id: 'run_u1', nodes: 12, edges: 8 },
+            unit_2: { unit_id: 'unit_2', label: 'A+C 链路', status: 'failed', run_id: 'run_u2', error_code: 'run_time_budget_exhausted', nodes: 0, edges: 0 },
           },
-        ],
+          merge_nodes: {
+            merge_1: { node_id: 'merge_1', label: '全节点合并抽取', merge_mode: 'merge_and_extract', status: 'completed',
+              nodes: 20, edges: 14, merge_counts: { input_nodes: 16, output_nodes: 10,
+                source_replay_status: 'ran', source_replay_collapsed_nodes: 0, hierarchy_replay_collapsed_nodes: 4, observed_dictionary_collapsed_nodes: 2 },
+              delta_merge_counts: { source_replay_status: 'ran', source_replay_collapsed_nodes: 2 } },
+          },
+          merge: { status: 'completed', nodes: 12, edges: 8, candidate_identity_merges: 1, candidate_column_alignments: 2 },
+        }
       })
     }
     if (url.endsWith('/workflow')) {
@@ -478,7 +479,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     button('运行与结果').click()
     await nextTick()
 
-    expect(root.textContent).toContain('A+B 链路')
+    await vi.waitFor(() => expect(root.textContent).toContain('A+B 链路'))
     expect(root.textContent).toContain('全节点合并抽取')
     expect(root.textContent).toContain('上游合并 16 → 10 个节点，同源去重 0 个，同源层级归并 4 个，按字典成员合并 2 个')
     expect(root.textContent).toContain('补充抽取后同源去重 2 个')

@@ -34,18 +34,24 @@ beforeEach(() => {
     if (url.endsWith('/session')) return Promise.resolve(response({ session_id: 'session' }))
     if (url.endsWith('/config')) return Promise.resolve(response({ model: { mode: 'disabled' }, goal_markdown: '发现关系', sources: [] }))
     if (url.endsWith('/metadata')) return Promise.resolve(response({ tables: [], nodes: [], edges: [] }))
-    if (url.endsWith('/runs')) return Promise.resolve(response({ runs: [] }))
+    if (url.endsWith('/runs?view=summary')) return Promise.resolve(response({ runs: [] }))
     if (url.endsWith('/credentials')) return Promise.resolve(response({ database_sources: [], model: false }))
     throw new Error(`Unexpected ${url}`)
   }))
 })
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); clearSessions(); sessionStorage.clear() })
 
+async function showGraphOptions() {
+  const options = root.querySelector<HTMLDetailsElement>('.graph-view-options')!
+  options.open = true; options.dispatchEvent(new Event('toggle')); await nextTick()
+}
+
 async function switchToCandidates() {
   root = document.createElement('div'); document.body.append(root); app = createApp(App); app.mount(root)
   await vi.waitFor(() => expect(button('运行与结果')).toBeDefined())
   button('运行与结果').click(); await nextTick(); button('业务图谱').click(); await nextTick()
   expect(root.querySelector('[data-testid="graph-loading"]')?.textContent).toBe('true')
+  await showGraphOptions()
   const toggle = root.querySelector<HTMLInputElement>('input[type="checkbox"]')!
   expect(toggle.disabled).toBe(false)
   toggle.checked = true; toggle.dispatchEvent(new Event('change', { bubbles: true }))
@@ -72,6 +78,40 @@ function graphFetch(implementation: (url: string, init?: RequestInit) => Promise
 }
 
 describe('background graph request isolation', () => {
+  it.each([
+    ['合并节点', 'merge_1', { verify_checkpoints_in_background: true }],
+    ['抽取节点', 'extract_1', {}],
+  ])('从%s重新运行，使用所选父运行并发送对应的校验方式', async (label, nodeId, options) => {
+    const original = vi.mocked(fetch).getMockImplementation()!
+    const state = { parent_run_id: 'old', artifacts: {},
+      units: { extract_1: { unit_id: 'extract_1', status: 'completed' } },
+      merge_nodes: { merge_1: { node_id: 'merge_1', status: 'completed', nodes: 29_462 } } }
+    const run = { project_id: 'p', run_id: 'old', status: 'completed', workflow: true, workflow_state: state }
+    let payload: unknown
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url.endsWith('/runs/old/resume')) {
+        payload = JSON.parse(String(init?.body))
+        return response({ ...run, run_id: 'new', status: 'running', workflow_state: null })
+      }
+      if (url.endsWith('/config')) return response({ workflow: { enabled: true, units: [], merge_nodes: [] } })
+      if (url.endsWith('/runs?view=summary')) return response({ runs: [{...run, workflow_state: null}] })
+      if (url.endsWith('/runs/old?view=workbench')) return response(run)
+      if (url.endsWith('/workflow')) return response({ enabled: true, units: [], state })
+      return original(input, init)
+    })
+    root = document.createElement('div'); document.body.append(root); app = createApp(App); app.mount(root)
+    await vi.waitFor(() => expect(button('运行与结果')).toBeDefined())
+    button('运行与结果').click(); await nextTick()
+    const row = await vi.waitFor(() => {
+      const match = [...root.querySelectorAll('tr')].find(item => item.querySelector('.badge')?.textContent === label)
+      expect(match).toBeDefined()
+      return match!
+    })
+    row.querySelector('button')!.click()
+    await vi.waitFor(() => expect(payload).toEqual({ from_node_id: nodeId, action: 'rerun_node', ...options }))
+    expect(graphCalls).toHaveLength(0)
+  })
   it('keeps the selected history visible when the previous version responds late', async () => {
     const original = vi.mocked(fetch).getMockImplementation()!
     let finishA!: (value: Response) => void
@@ -86,6 +126,9 @@ describe('background graph request isolation', () => {
       return original(input, init)
     })
     await openBusinessGraph()
+    expect(root.querySelector('#graph-version')).toBeNull()
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes('/graph/contexts?'))).toBe(false)
+    await showGraphOptions()
     await vi.waitFor(() => expect(root.querySelectorAll('#graph-version option')).toHaveLength(3))
     const select = root.querySelector<HTMLSelectElement>('#graph-version')!
     select.value = 'a'; select.dispatchEvent(new Event('change')); await nextTick()

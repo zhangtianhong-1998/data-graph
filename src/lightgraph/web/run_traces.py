@@ -14,7 +14,7 @@ _reader_lock = threading.RLock()
 
 
 def _paths(manager, pid, rid):
-    record = manager.get(pid, rid)
+    record = manager.get(pid, rid, view='summary')
     _, record_path = manager._paths(pid, rid)
     trace = record_path.with_name(rid + '.trace.jsonl')
     paths = (trace, trace.with_suffix('.index.jsonl'), trace.with_suffix('.status.json'),
@@ -33,6 +33,9 @@ AGENT_EVENTS = frozenset({
 })
 _kind_caches = OrderedDict()
 _kind_lock = threading.RLock()
+# The cache contains numeric file positions and counts, never event payloads.
+_page_indexes = OrderedDict()
+_page_lock = threading.Lock()
 
 
 def _legacy_kinds(trace):
@@ -73,11 +76,34 @@ def _index(trace, index, *, offset=0, limit=0, view='all'):
     """
     if not trace.exists() or not index.exists():
         return [],0,0,0
-    size = trace.stat().st_size
-    entries = []
-    total = selected = end = 0
+    def stamp(path):
+        stat = path.stat()
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+    signature = stamp(trace), stamp(index)
+    size = signature[0][2]
+    key = str(trace), view
+    with _page_lock:
+        cached = _page_indexes.get(key)
+        if cached and cached[0] == signature:
+            _page_indexes.move_to_end(key)
+        else:
+            cached = None
+    # At most a few thousand anchors per archive even for gigabyte indexes.
+    stride = max(128, signature[1][2] // 4096)
+    anchors = []
+    start = selected = end = total = 0
+    if cached:
+        _, anchors, count, committed, recorded = cached
+        if not limit or offset >= count:
+            return [], count, committed, recorded
+        start, total, end = anchors[offset // stride]
+        selected = offset // stride * stride
     kinds = _legacy_kinds(trace) if view != 'all' else None
+    entries = []
     with index.open('rb') as stream, trace.open('rb') as archive:
+        stream.seek(start)
+        position = start
         for line in stream:
             if not line.endswith(b'\n'):
                 break
@@ -102,22 +128,48 @@ def _index(trace, index, *, offset=0, limit=0, view='all'):
                     if kind is None:
                         kind = _read_event(archive, item)['kind']
                         with _kind_lock:
-                            # Keep a stable prefix at the cap. Evicting the
-                            # oldest while scanning from seq=1 would thrash and
-                            # force a full reread on every poll of a large file.
                             if len(kinds) < 40000:
                                 kinds[cache_key] = kind
                 include = (kind in AGENT_EVENTS) == (view == 'agent')
             if include:
+                if not cached and selected % stride == 0:
+                    anchors.append((position, total, end))
                 if offset <= selected < offset+limit:
                     entries.append(item)
                 selected += 1
+                if cached and selected >= min(offset+limit, count):
+                    break
             total += 1
             end = item['offset'] + item['length']
+            position += len(line)
+    if cached:
+        return entries, count, committed, recorded
+    if signature == (stamp(trace), stamp(index)):
+        with _page_lock:
+            _page_indexes[key] = signature, anchors, selected, end, total
+            _page_indexes.move_to_end(key)
+            while len(_page_indexes) > 32:
+                _page_indexes.popitem(last=False)
     return entries,selected,end,total
 
 
-def read_run_trace(manager, pid, rid, *, offset=0, limit=10, view='all'):
+def _event_summary(event):
+    # Match tracePresentation's labels without returning full prompts or tool results.
+    data = event.get('data')
+    summary = {}
+    if isinstance(data, dict):
+        for field in ('task', 'discovery_step', 'max_discovery_steps', 'attempt', 'dispatch_index',
+                      'harness_turn', 'harness_step', 'call_id', 'name'):
+            value = data.get(field)
+            if isinstance(value, (str, int)):
+                summary[field] = value[:256] if isinstance(value, str) else value
+        call = data.get('call')
+        if not summary.get('name') and isinstance(call, dict) and isinstance(call.get('name'), str):
+            summary['name'] = call['name'][:256]
+    return {key: event.get(key) for key in ('seq', 'kind', 'time')} | {'data': summary}
+
+
+def read_run_trace(manager, pid, rid, *, offset=0, limit=10, view='all', summary=False):
     if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 50 or view not in {'all','agent','runtime'}:
         raise LightGraphError('run_trace_page_invalid')
     record, (trace, index, status_path, cleared) = _paths(manager, pid, rid)
@@ -138,7 +190,8 @@ def read_run_trace(manager, pid, rid, *, offset=0, limit=10, view='all'):
     if entries:
         with trace.open('rb') as stream:
             for item in entries:
-                events.append(_read_event(stream, item))
+                event = _read_event(stream, item)
+                events.append(_event_summary(event) if summary else event)
     return {'events': events, 'next_offset': offset+limit if offset+limit<total else None,
         'total_events':total, 'recorded_events':recorded_total, 'view':view, 'status':status, 'active':active,
         'incomplete': bool(error_code), 'error_code':error_code}
@@ -208,6 +261,9 @@ def clear_run_trace(manager, pid, rid):
         if _readers.get(trace):raise LightGraphError('run_trace_export_active')
         with _kind_lock:
             _kind_caches.pop(str(trace), None)
+        with _page_lock:
+            for view in ('all', 'agent', 'runtime'):
+                _page_indexes.pop((str(trace), view), None)
         for path in (trace, index, status):
             path.unlink(missing_ok=True)
         for path in worker_log_artifacts(record_path):

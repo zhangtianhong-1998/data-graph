@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import ReportPage from './ReportPage.vue'
 const props = defineProps<{ report: unknown }>()
 type Check = { passed?: boolean | null; diagnostics?: Array<{ code?: string }>; metrics?: Record<string, number> }
 type Draft = { draft_id: string; revision: number; status: string; entity_types: number; relation_types: number; mappings: number; unresolved?: string[]; decisions?: string[]; suggestions?: string[]; validation?: Check }
@@ -19,15 +20,27 @@ const report = computed(() => props.report as { construction?: Construction; val
 const data = computed(() => report.value?.construction)
 const structureOnly = computed(() => report.value?.validation?.construction_target === 'structure')
 const structurePublications = computed(() => data.value?.execution?.structure_publications || [])
+const entityStats = computed(() => Object.entries(data.value?.statistics?.entity_types || {}))
+const relationStats = computed(() => Object.entries(data.value?.statistics?.relation_types || {}))
+const revisionKey = (draft: { draft_id: string; revision: number }) => `${draft.draft_id}:${draft.revision}`
+const structureRevisions = computed(() => new Set(structurePublications.value.map(revisionKey)))
 const isolated = computed(() => data.value?.execution?.conflict_isolation)
-const subsetPublication = (draft: Draft) => data.value?.execution?.instance_publications?.find(item => item.draft_id === draft.draft_id && item.revision === draft.revision && item.coverage === 'conflict_isolated')
+const subsetPublications = computed(() => {
+  const publications = new Map<string, InstancePublication>()
+  for (const item of data.value?.execution?.instance_publications || []) {
+    const key = revisionKey(item)
+    if (item.coverage === 'conflict_isolated' && !publications.has(key)) publications.set(key, item)
+  }
+  return publications
+})
+const subsetPublication = (draft: Draft) => subsetPublications.value.get(revisionKey(draft))
 const publishedStructures = computed(() => data.value?.summary?.published_structures ?? report.value?.counts?.structures_published ?? (data.value?.execution?.structure_publications ? structurePublications.value.length : undefined))
 const modelLabels: Record<string, string> = { executed: '已执行真实模型调用', test_double: '仅模拟调用', not_run: '未执行', interrupted: '调用过程被中断' }
 const checkLabels: Record<string, string> = { passed: '已通过', failed: '未通过', conflict_isolated: '冲突已隔离，仍需修订', not_run: '未执行', incomplete: '尚未完成' }
 const acceptanceLabels: Record<string, string> = { passed: '已验收', failed: '未通过', not_run: '尚未验收', partial: '尚未完成' }
 const draftLabels: Record<string, string> = { candidate: '草稿已保存', validated: '数据检查已通过', published: '已发布', needs_revision: '需要修订', stale: '来源已变化，需重验' }
 const draftCheck = (draft: Draft) => draft.validation?.passed === true ? '已通过' : draft.validation?.passed === false ? '未通过' : '未执行'
-const structurePublished = (draft: Draft) => structurePublications.value.some(item => item.draft_id === draft.draft_id && item.revision === draft.revision)
+const structurePublished = (draft: Draft) => structureRevisions.value.has(revisionKey(draft))
 const structureDraftCheck = (draft: Draft) => structurePublished(draft) || data.value?.execution?.structure_validation === 'passed' ? '已通过' : '未记录单项结果'
 const quantity = (value: number | null | undefined) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value.toLocaleString('zh-CN') : '未记录'
 const usageValue = (value: number | undefined) => (data.value?.usage?.measured_calls || data.value?.usage?.complete) ? quantity(value) : '未记录'
@@ -55,7 +68,9 @@ const compactionTokens = computed(() => data.value?.usage?.by_purpose?.compactio
     <p v-if="!structureOnly && isolated?.nodes" class="note amber" aria-label="冲突隔离结果">已发布无冲突部分；{{ isolated.nodes }} 个节点及 {{ isolated.edges ?? 0 }} 条关联边已隔离，原始候选与冲突证据保留。目标仍有缺口，修订并重验后可恢复相关节点。</p>
     <section v-if="structurePublications.length" aria-label="已发布结构方案">
       <h4>已发布结构方案</h4>
-      <ul><li v-for="item in structurePublications" :key="`${item.draft_id}:${item.revision}`"><strong>{{ item.draft_id }} · 修订 {{ item.revision }}</strong><p v-if="item.path" class="structure-path">产物路径：<code>{{ item.path }}</code></p></li></ul>
+      <ReportPage :items="structurePublications" label="结构方案" v-slot="{ items }">
+        <ul><li v-for="item in items" :key="`${item.draft_id}:${item.revision}`"><strong>{{ item.draft_id }} · 修订 {{ item.revision }}</strong><p v-if="item.path" class="structure-path">产物路径：<code>{{ item.path }}</code></p></li></ul>
+      </ReportPage>
       <p class="field-hint">路径相对于本次运行的 construction 目录，产物为结构 YAML。</p>
     </section>
     <section v-if="data.usage" aria-label="模型用量">
@@ -71,19 +86,25 @@ const compactionTokens = computed(() => data.value?.usage?.by_purpose?.compactio
     </section>
     <template v-if="!structureOnly && data.statistics?.complete">
       <h4>已发布图谱统计</h4><p>{{ data.statistics.nodes }} 个节点 · {{ data.statistics.edges }} 条关系。以下计数由程序根据当前可见图谱计算。</p>
-      <div v-if="Object.keys(data.statistics.entity_types || {}).length" class="table-scroll"><table><thead><tr><th>实体类型</th><th>节点</th><th>不同展示名称</th><th>不同来源名称</th><th>别名</th></tr></thead><tbody><tr v-for="(stats, kind) in data.statistics.entity_types" :key="kind"><th>{{ kind }}</th><td>{{ stats.nodes }}</td><td>{{ stats.unique_labels }}</td><td>{{ stats.unique_source_labels ?? '未记录' }}</td><td>{{ stats.aliases }}</td></tr></tbody></table></div>
-      <div v-if="Object.keys(data.statistics.relation_types || {}).length" class="table-scroll"><table><thead><tr><th>关系类型</th><th>边</th><th>多入边节点</th><th>当前图是否有环</th><th>映射要求无环</th></tr></thead><tbody><tr v-for="(stats, kind) in data.statistics.relation_types" :key="kind"><th>{{ kind }}</th><td>{{ stats.edges }}</td><td>{{ stats.multiple_parent_nodes }}</td><td>{{ stats.acyclic ? '无环' : `有环（${stats.cycle_nodes} 个节点）` }}</td><td>{{ stats.acyclic_declared ? '是' : '未声明' }}</td></tr></tbody></table></div>
+      <ReportPage v-if="entityStats.length" :items="entityStats" label="实体类型" v-slot="{ items }">
+        <div class="table-scroll"><table><thead><tr><th>实体类型</th><th>节点</th><th>不同展示名称</th><th>不同来源名称</th><th>别名</th></tr></thead><tbody><tr v-for="[kind, stats] in items" :key="kind"><th>{{ kind }}</th><td>{{ stats.nodes }}</td><td>{{ stats.unique_labels }}</td><td>{{ stats.unique_source_labels ?? '未记录' }}</td><td>{{ stats.aliases }}</td></tr></tbody></table></div>
+      </ReportPage>
+      <ReportPage v-if="relationStats.length" :items="relationStats" label="关系类型" v-slot="{ items }">
+        <div class="table-scroll"><table><thead><tr><th>关系类型</th><th>边</th><th>多入边节点</th><th>当前图是否有环</th><th>映射要求无环</th></tr></thead><tbody><tr v-for="[kind, stats] in items" :key="kind"><th>{{ kind }}</th><td>{{ stats.edges }}</td><td>{{ stats.multiple_parent_nodes }}</td><td>{{ stats.acyclic ? '无环' : `有环（${stats.cycle_nodes} 个节点）` }}</td><td>{{ stats.acyclic_declared ? '是' : '未声明' }}</td></tr></tbody></table></div>
+      </ReportPage>
     </template>
-    <article v-for="draft in data.drafts || []" :key="`${draft.draft_id}:${draft.revision}`" class="construction-draft">
-      <h4>{{ draft.draft_id }} · 修订 {{ draft.revision }} <span class="badge">{{ structureOnly ? (structurePublished(draft) ? '结构方案已发布' : '结构映射草稿') : (draftLabels[draft.status] || draft.status) }}</span></h4>
-      <p v-if="structureOnly">{{ draft.entity_types }} 类对象定义 · {{ draft.relation_types }} 类关系定义 · {{ draft.mappings }} 个映射 · 结构检查：{{ structureDraftCheck(draft) }}</p>
-      <p v-else>{{ draft.entity_types }} 类实体 · {{ draft.relation_types }} 类关系 · {{ draft.mappings }} 个映射 · 数据检查：{{ draftCheck(draft) }}</p>
-      <p v-if="!structureOnly && subsetPublication(draft)" class="note amber">本修订的无冲突部分已发布：{{ subsetPublication(draft)?.published_nodes }} 个节点、{{ subsetPublication(draft)?.published_edges }} 条边；隔离 {{ subsetPublication(draft)?.isolated_nodes }} 个冲突节点。完整草稿的数据检查仍未通过。</p>
-      <p v-if="!structureOnly && draft.validation?.diagnostics?.length" class="note amber">检查诊断：{{ draft.validation.diagnostics.map(item => item.code || '未提供代码').join('、') }}</p>
-      <section v-if="draft.unresolved?.length" aria-label="目标缺口"><h5>目标缺口</h5><ul><li v-for="(item, i) in draft.unresolved" :key="i">{{ item }}</li></ul></section>
-      <section v-if="draft.decisions?.length" aria-label="已采用的解释"><h5>已采用的解释</h5><ul><li v-for="(item, i) in draft.decisions" :key="i">{{ item }}</li></ul></section>
-      <section v-if="draft.suggestions?.length" aria-label="可选建议"><h5>可选建议</h5><p class="field-hint">供后续选择，不影响本次目标完成状态。</p><ul><li v-for="(item, i) in draft.suggestions" :key="i">{{ item }}</li></ul></section>
-    </article>
+    <ReportPage :items="data.drafts || []" label="草稿" v-slot="{ items }">
+      <article v-for="draft in items" :key="`${draft.draft_id}:${draft.revision}`" class="construction-draft">
+        <h4>{{ draft.draft_id }} · 修订 {{ draft.revision }} <span class="badge">{{ structureOnly ? (structurePublished(draft) ? '结构方案已发布' : '结构映射草稿') : (draftLabels[draft.status] || draft.status) }}</span></h4>
+        <p v-if="structureOnly">{{ draft.entity_types }} 类对象定义 · {{ draft.relation_types }} 类关系定义 · {{ draft.mappings }} 个映射 · 结构检查：{{ structureDraftCheck(draft) }}</p>
+        <p v-else>{{ draft.entity_types }} 类实体 · {{ draft.relation_types }} 类关系 · {{ draft.mappings }} 个映射 · 数据检查：{{ draftCheck(draft) }}</p>
+        <p v-if="!structureOnly && subsetPublication(draft)" class="note amber">本修订的无冲突部分已发布：{{ subsetPublication(draft)?.published_nodes }} 个节点、{{ subsetPublication(draft)?.published_edges }} 条边；隔离 {{ subsetPublication(draft)?.isolated_nodes }} 个冲突节点。完整草稿的数据检查仍未通过。</p>
+        <p v-if="!structureOnly && draft.validation?.diagnostics?.length" class="note amber">检查诊断：{{ draft.validation.diagnostics.map(item => item.code || '未提供代码').join('、') }}</p>
+        <section v-if="draft.unresolved?.length" aria-label="目标缺口"><h5>目标缺口</h5><ul><li v-for="(item, i) in draft.unresolved" :key="i">{{ item }}</li></ul></section>
+        <section v-if="draft.decisions?.length" aria-label="已采用的解释"><h5>已采用的解释</h5><ul><li v-for="(item, i) in draft.decisions" :key="i">{{ item }}</li></ul></section>
+        <section v-if="draft.suggestions?.length" aria-label="可选建议"><h5>可选建议</h5><p class="field-hint">供后续选择，不影响本次目标完成状态。</p><ul><li v-for="(item, i) in draft.suggestions" :key="i">{{ item }}</li></ul></section>
+      </article>
+    </ReportPage>
   </section>
 </template>
 <style scoped>

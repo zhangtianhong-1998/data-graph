@@ -8,6 +8,7 @@ from collections import Counter
 from pathlib import Path
 
 from lightgraph.contracts import digest
+from lightgraph.construction.graph_storage import _graph_digest
 from lightgraph.errors import LightGraphError
 from lightgraph.graph_neighborhood import neighborhood_paths
 from .graph_payload import canvas_page, MAX_PAGE_BYTES
@@ -18,7 +19,7 @@ def _authorized_view(workspace, pid, config, layer, include_candidates):
     from .execution import read_metadata, _bounded_view
     if layer == 'metadata':
         view = read_metadata(workspace, pid, config=config, full_graph=True)
-        return view, digest(view)
+        return view, _graph_digest(view)
     if construction_graph.available(config):
         graph, generation = construction_graph.load_prepared(config)
         return {**graph, 'display_schema': construction_graph.vocabulary(graph)}, generation
@@ -34,7 +35,7 @@ def _authorized_view(workspace, pid, config, layer, include_candidates):
                                 include_candidates=include_candidates)
         view = _bounded_view(authorized, layer, bounded=False)
         view['display_schema'] = display_schema(store, authorized)
-    return view, digest(view)
+    return view, _graph_digest(view)
 
 
 def read_graph_batch(workspace, pid, *, config, layer='business', part='nodes', offset=0,

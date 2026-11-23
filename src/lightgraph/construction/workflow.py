@@ -22,6 +22,7 @@ from lightgraph.runtime.config import (
 from lightgraph.runtime.retention import atomic_text
 from .access import access_fingerprint
 from .artifact_io import artifact_step
+from .graph_storage import _graph_digest
 from .inheritance import freeze_inherited_graphs, frozen_contributors
 from .intent import effective_goal_markdown
 from .merger import identity_candidate_node_counts, merge_construction_graphs, write_sharded_graph
@@ -475,7 +476,7 @@ def publish_premerged_graph(
     root_construction.mkdir(parents=True, exist_ok=True)
     from .snapshot_registry import register_access_context
     policy_id = register_access_context(root_construction, project_config)
-    ctx_fingerprint = digest('workflow_merge_v2', access_fingerprint(project_config), merged)
+    ctx_fingerprint = _graph_digest(merged, 'workflow_merge_v2', access_fingerprint(project_config))
     persisted = write_sharded_graph(
         root_construction,
         merged,

@@ -284,7 +284,7 @@ def read_worker_log(record_path):
 
 
 def read_worker_diagnostics(manager, pid, rid):
-    record = manager.get(pid, rid)
+    record = manager.get(pid, rid, view='summary')
     _, path = manager._paths(pid, rid)
     return {'run_id': rid, 'active': record['status'] in {'queued', 'running'}, **read_worker_log(path)}
 

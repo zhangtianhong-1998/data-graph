@@ -6,11 +6,13 @@ until the user explicitly clears it; subprocess output is not a run transcript.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -59,6 +61,67 @@ def _json_file(path):
 
 def _save(path, value):
     atomic_text(path, json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+_RUN_SUMMARY_FIELDS = ('project_id', 'run_id', 'status', 'stage', 'created_at', 'finished_at', 'cleanup_status',
+                       'run_mode', 'config_revision', 'workflow', 'output_path', 'error_code')
+
+
+def _fields(record, names):
+    return {key: record[key] for key in names if key in record}
+
+
+def _file_stamp(path):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise LightGraphError("run_record_invalid")
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+@lru_cache(maxsize=32)
+def _workflow_table(output, rid, stamp):
+    """Cache only fields displayed by the workbench, keyed by the physical state's revision."""
+    from ..construction.workflow import load_workflow_state
+    state = load_workflow_state(output, rid)
+    if not state:
+        return None
+    table = _fields(state, ('parent_run_id', 'resumed_from_run_id', 'terminal_ids', 'plan_mode', 'status',
+                            'created_at', 'finished_at', 'recomposed_nodes'))
+    node_fields = ('unit_id', 'node_id', 'run_id', 'label', 'status', 'merge_mode', 'model_calls', 'nodes',
+                   'edges', 'updated_at', 'error_code', 'failure_detail', 'reused')
+    counts = ('input_nodes', 'output_nodes', 'source_replay_status', 'source_replay_collapsed_nodes',
+              'hierarchy_replay_collapsed_nodes', 'observed_dictionary_collapsed_nodes')
+    for bucket in ('units', 'merge_nodes'):
+        if bucket in state:
+            table[bucket] = {}
+            for key, node in state[bucket].items():
+                table[bucket][key] = _fields(node, node_fields)
+                for field in ('merge_counts', 'delta_merge_counts'):
+                    if isinstance(node.get(field), dict):
+                        table[bucket][key][field] = _fields(node[field], counts)
+    if 'artifacts' in state:
+        table['artifacts'] = {key: _fields(record, ('artifact_id', 'graph_kind', 'coverage'))
+                              for key, record in state['artifacts'].items()}
+    if isinstance(state.get('merge'), dict):
+        merge = state['merge']
+        table['merge'] = _fields(merge, ('status', 'publication_status', 'nodes', 'edges', 'pending_definitions',
+                                         'pending_relations', 'candidate_identity_merges', 'candidate_column_alignments'))
+        if isinstance(merge.get('conflict_isolation'), dict):
+            table['merge']['conflict_isolation'] = _fields(merge['conflict_isolation'], ('coverage',))
+    return table
+
+
+def _workbench_workflow(output, rid=None):
+    from ..construction.workflow import _state_path
+    path = _state_path(output, rid)
+    try:
+        stamp = _file_stamp(path)
+    except FileNotFoundError:
+        if rid is None:
+            return None
+        state = _workbench_workflow(output)
+        return state if state and state.get('parent_run_id') == rid else None
+    return _workflow_table(output, rid, stamp)
 
 
 def _worker_calls(runs, child, status):
@@ -315,6 +378,7 @@ class RunManager:
         self.cancel_timeout = cancel_timeout
         self.after_publication = None
         self._processes = {}
+        self._run_summaries = {}
         self._guard = threading.RLock()
         self._closed = False
         self._service_lock = FileLock(self.workspace.root / ".service.lock",
@@ -352,12 +416,14 @@ class RunManager:
                 if not _RUN_ID.fullmatch(path.stem):
                     continue
                 try:
+                    stamp = _file_stamp(path)
                     record = _json_file(path)
+                    self._run_summaries.setdefault(project.name, {})[path.stem] = (stamp, _fields(record, _RUN_SUMMARY_FIELDS))
                     if record.get("status") in ACTIVE_STATUSES:
                         record.update(status="interrupted", stage="finished", finished_at=_now(),
                                       cleanup_status="unknown", error_code="service_restarted")
                         finish_progress(progress_path(path), record.get("run_id"), "interrupted")
-                        _save(path, record)
+                        self._save_run(path, record)
                     # Exclusive service ownership proves no surviving worker
                     # still needs a cancellation request from a previous run.
                     _cancel_path(path.with_name(path.stem + ".result.json")).unlink(missing_ok=True)
@@ -435,7 +501,7 @@ class RunManager:
                       "run_mode": run_mode,
                       "output_path": Path(config.output_dir).relative_to(project).as_posix(),
                       "config_revision": self.workspace.config_revision(pid)}
-            _save(runs / (rid + ".json"), record)
+            self._save_run(runs / (rid + ".json"), record)
             env = os.environ.copy()
             source_root = str(Path(__file__).resolve().parents[2])
             env["PYTHONPATH"] = source_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
@@ -463,7 +529,7 @@ class RunManager:
                 proc.stdin.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
                 proc.stdin.close()
                 record.update(status="running", stage="extracting")
-                _save(runs / (rid + ".json"), record)
+                self._save_run(runs / (rid + ".json"), record)
             except Exception as exc:
                 if pid in self._processes:
                     proc = self._processes.pop(pid)["process"]
@@ -475,17 +541,17 @@ class RunManager:
                     self.workspace.select_output_generation(pid, previous_generation)
                 record.update(status="failed", stage="finished", finished_at=_now(),
                               cleanup_status="unknown", error_code="worker_start_failed")
-                _save(runs / (rid + ".json"), record)
+                self._save_run(runs / (rid + ".json"), record)
                 return dict(record)
             threading.Thread(target=self._watch, args=(pid, proc), daemon=True).start()
             return dict(record)
 
     def resume(self, pid, source_run_id, *, from_node_id=None, action='rerun_node', artifact_id=None,
-               source_credentials=None, model_api_key=None):
+               source_credentials=None, model_api_key=None, verify_checkpoints_in_background=False):
         """Start a new run from explicitly pinned upstream publications."""
         from ..construction.access import access_fingerprint
         from ..construction.checkpoints import (WorkflowCheckpointError, commit_checkpoint, load_checkpoint,
-                                                recover_committed_checkpoint, usable_result)
+                                                recover_committed_checkpoint, usable_result, verify_checkpoint_files)
         from ..construction.snapshot_registry import authorize_snapshot, register_access_context
         from ..construction.inheritance import authorize_frozen_inheritance
         from ..construction.workflow import (build_unit_config, committed_unit_output, load_unit_contributor,
@@ -557,6 +623,12 @@ class RunManager:
             locations = {}
             legacy_contributors = {}
             legacy = 'node_inputs' not in state
+            # Only a deterministic rerun can verify its pinned inputs as it reads
+            # them, before it starts a worker or publishes a replacement.
+            verify_in_worker = (verify_checkpoints_in_background and action == 'rerun_node' and not legacy
+                                and not rerun.intersection(plan.extract_ids)
+                                and all(node.merge_mode == 'deterministic' for node in config.workflow.merge_nodes
+                                        if node.node_id in rerun))
             if legacy:
                 # Before checkpoints existed there was one aggregate digest. Only
                 # accept its exact historical schema, with the same config revision.
@@ -594,6 +666,7 @@ class RunManager:
                         if contributor['graph'].get('status') != 'published' or contributor['graph'].get('target') != 'graph':
                             raise LightGraphError('workflow_checkpoint_invalid')
                         legacy_contributors[nid] = contributor
+                        checkpoint_access = contributor['graph'].get('access_fingerprint')
                     else:
                         if not artifact or artifact.get('node_id') != nid:
                             raise LightGraphError('workflow_checkpoint_missing')
@@ -608,9 +681,14 @@ class RunManager:
                         location = state.get('artifact_outputs', {}).get(nid, source['output_path'])
                         original_output = run_output_path(project, location)
                         authorize_snapshot(original_output / 'construction', artifact, scoped)
-                        contributor = load_checkpoint(original_output, artifact)
+                        if verify_in_worker:
+                            verify_checkpoint_files(original_output, artifact)
+                            checkpoint_access = artifact.get('access_fingerprint')
+                        else:
+                            contributor = load_checkpoint(original_output, artifact)
+                            checkpoint_access = contributor['graph'].get('access_fingerprint')
                         locations[nid] = location
-                    if contributor['graph'].get('access_fingerprint') != access_fingerprint(scoped):
+                    if checkpoint_access != access_fingerprint(scoped):
                         raise LightGraphError('graph_access_context_changed')
                 except LightGraphError as exc:
                     raise WorkflowCheckpointError(exc.code, nid) from None
@@ -668,12 +746,12 @@ class RunManager:
             return self._start_workflow(pid, config, project, source_path.parent, rid,
                 source_credentials=source_credentials, model_api_key=model_api_key,
                 selected_unit_ids=[uid for uid in plan.extract_ids if uid in rerun],
-                resume_state=state, resume_nodes=rerun)
+                resume_state=state, resume_nodes=rerun, verify_in_worker=verify_in_worker)
 
     def _start_workflow(self, pid, config, project, runs, rid, *, source_credentials=None,
                         model_api_key=None, run_mode="continue", previous_generation=None,
                         generation_already_selected=False, selected_unit_ids=None, resume_state=None,
-                        resume_nodes=None):
+                        resume_nodes=None, verify_in_worker=False):
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from ..construction.access import access_fingerprint
         from ..construction.inheritance import authorize_frozen_inheritance, freeze_inherited_graphs, frozen_contributors
@@ -803,7 +881,7 @@ class RunManager:
             'reused_nodes': sorted(set(reused_artifacts) - set((resume_state or {}).get('recomposed_nodes', []))),
             'rerun_nodes': sorted(resume_nodes) if resume_nodes is not None else [*plan.extract_ids, *plan.merge_order],
         }
-        _save(runs / (rid + ".json"), record)
+        self._save_run(runs / (rid + ".json"), record)
 
         cancel_event = threading.Event()
         done_event = threading.Event()
@@ -1015,6 +1093,8 @@ class RunManager:
                             code = _safe_code(getattr(exc, 'code', None), 'graph_workspace_record_unavailable')
                             units_state[uid].update(status='failed', error_code=code, updated_at=_now())
                             units_state[uid]['failure_detail'] = failure_detail(exc, 'extract_contributor_load')
+                            if verify_in_worker and uid in reused_artifacts:
+                                raise
                             attempts.pop(uid, None)
                             skipped_units.append(uid)
                             save_workflow_state(config.output_dir, wf_state)
@@ -1166,6 +1246,8 @@ class RunManager:
                                 merge_nodes_state[mid].update(status='failed', error_code=code, updated_at=_now(),
                                     failure_detail=failure_detail(exc, stage),
                                     artifact_status='committed' if mid in wf_state['artifacts'] else 'uncommitted')
+                                if verify_in_worker and mid in reused_artifacts:
+                                    raise
                                 save_workflow_state(config.output_dir, wf_state)
 
                         # Publish terminal outputs
@@ -1288,7 +1370,7 @@ class RunManager:
                         error_code=error_code,
                         report=_safe_report(report_obj),
                     )
-                    _save(runs / (rid + ".json"), record)
+                    self._save_run(runs / (rid + ".json"), record)
                     if merge_summary is not None and self.after_publication:
                         self.after_publication(pid, config)
                     self._processes.pop(pid, None)
@@ -1312,7 +1394,7 @@ class RunManager:
                     record.update(status=terminal_status, stage="finished", finished_at=_now(),
                                   cleanup_status="unknown", error_code=code, failure_detail=detail)
                     try:
-                        artifact_step('run_record_write', _save, runs / (rid + ".json"), record)
+                        artifact_step('run_record_write', self._save_run, runs / (rid + ".json"), record)
                     finally:
                         self._processes.pop(pid, None)
             finally:
@@ -1480,7 +1562,7 @@ class RunManager:
         record.update(stage="finished", finished_at=_now())
         record_path = self._paths(pid, record["run_id"])[1]
         finish_progress(progress_path(record_path), record["run_id"], record["status"])
-        _save(record_path, record)
+        self._save_run(record_path, record)
         if record['status'] in {'completed', 'completed_with_gaps', 'partial'} and self.after_publication:
             self.after_publication(pid, entry['config'])
         try:
@@ -1495,15 +1577,64 @@ class RunManager:
         with self._guard:
             return pid in self._processes
 
-    def get(self, pid, rid):
+    def _save_run(self, path, record):
+        _save(path, record)
+        try:
+            stamp = _file_stamp(path)
+        except (OSError, LightGraphError):
+            # The run JSON was committed successfully. The next read can
+            # rebuild the optional summary if a concurrent restore moved it.
+            return
+        self._run_summaries.setdefault(path.parent.parent.name, {})[path.stem] = (stamp, _fields(record, _RUN_SUMMARY_FIELDS))
+
+    def forget_run_summaries(self, pid):
+        self._run_summaries.pop(pid, None)
+
+    def _summary(self, path):
+        # The service writes run records atomically. Also detect histories restored
+        # or replaced on disk while this process was running.
+        try:
+            stamp = _file_stamp(path)
+        except OSError:
+            raise LightGraphError('run_record_invalid') from None
+        summaries = self._run_summaries.setdefault(path.parent.parent.name, {})
+        cached = summaries.get(path.stem)
+        if cached is None or cached[0] != stamp:
+            row = _fields(_json_file(path), _RUN_SUMMARY_FIELDS)
+            summaries[path.stem] = (stamp, row)
+        else:
+            row = cached[1]
+        if row.get('run_id') != path.stem or row.get('project_id') != path.parent.parent.name:
+            raise LightGraphError('run_record_invalid')
+        if row.get('status') in ACTIVE_STATUSES:
+            progress = read_progress(progress_path(path), row['run_id'])
+            if progress:
+                return dict(row, stage=progress['stage'])
+        return dict(row)
+
+    def get(self, pid, rid, *, view='full'):
         with self.workspace.lock(pid):
-            _, path = self._paths(pid, rid)
+            project, path = self._paths(pid, rid)
             if not path.exists():
                 raise LightGraphError("run_not_found")
-            return self._with_progress(_json_file(path), path)
+            if view == 'summary':
+                return self._summary(path)
+            record = _json_file(path)
+            if view == 'workbench':
+                if record.get('run_id') != rid or record.get('project_id') != pid:
+                    raise LightGraphError('run_record_invalid')
+                current = None
+                if record.get('workflow'):
+                    from ..construction.workflow import run_output_path
+                    generation = self.workspace.output_generation(pid)
+                    current_output = run_output_path(project, 'output/generations/' + generation if generation else 'output')
+                    current = _workbench_workflow(current_output)
+                record = {**_fields(record, (*_RUN_SUMMARY_FIELDS, 'failure_detail', 'workflow_units', 'report')),
+                          'current_workflow_run_id': (current or {}).get('parent_run_id')}
+            return self._with_progress(record, path, workbench=view == 'workbench')
 
     @staticmethod
-    def _with_progress(record, path):
+    def _with_progress(record, path, *, workbench=False):
         # A worker owns only its sibling progress file. Optional telemetry cannot
         # break old records or override the authoritative terminal run status.
         if record.get("run_id") != path.stem:
@@ -1513,24 +1644,26 @@ class RunManager:
             record = dict(record, progress=progress)
             if record.get("status") in ACTIVE_STATUSES:
                 record["stage"] = progress["stage"]
-        diagnostics = read_worker_log(path)
-        record = dict(record, worker_diagnostics={key: diagnostics[key] for key in ('status', 'incomplete')},
-                      worker_diagnostic_events=len(diagnostics['events']))
+        if not workbench:
+            diagnostics = read_worker_log(path)
+            record = dict(record, worker_diagnostics={key: diagnostics[key] for key in ('status', 'incomplete')},
+                          worker_diagnostic_events=len(diagnostics['events']))
         if record.get("workflow") and record.get("output_path"):
             from ..construction.workflow import load_workflow_state, run_output_path
             out_dir = run_output_path(path.parent.parent, record['output_path'])
-            wf_state = load_workflow_state(out_dir, record["run_id"])
+            wf_state = (deepcopy(_workbench_workflow(out_dir, record["run_id"])) if workbench
+                        else load_workflow_state(out_dir, record["run_id"]))
             if wf_state is not None and wf_state.get("parent_run_id") == record.get("run_id"):
                 record["workflow_state"] = _with_node_calls(wf_state, path.parent)
         return record
 
-    def list(self, pid):
+    def list(self, pid, *, view='full'):
         with self.workspace.lock(pid):
             _, directory = self._paths(pid)
             records = []
             for path in directory.glob("run_*.json"):
                 if _RUN_ID.fullmatch(path.stem):
-                    records.append(self._with_progress(_json_file(path), path))
+                    records.append(self._summary(path) if view == 'summary' else self._with_progress(_json_file(path), path))
             return sorted(records, key=lambda r: r["created_at"], reverse=True)
 
     def delete_record(self, pid, rid):
@@ -1550,6 +1683,7 @@ class RunManager:
             for suffix in ('.progress.json', '.result.json', '.trace.cleared.json'):
                 path.with_suffix(suffix).unlink(missing_ok=True)
             path.unlink()
+            self._run_summaries.get(pid, {}).pop(rid, None)
             return {'deleted': True, 'run_id': rid}
 
     def cancel(self, pid, rid):

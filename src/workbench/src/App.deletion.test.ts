@@ -56,7 +56,7 @@ beforeEach(() => {
     if (url.endsWith('/metadata')) return structuredClone(metadata)
     if (url.includes('/metadata/yaml?')) return { files: [] }
     if (url.includes('/graph?')) return { nodes: [], edges: [] }
-    if (url.endsWith('/runs')) return { runs: running ? [{ run_id: 'active', status: 'running', stage: 'starting' }] : [] }
+    if (url.endsWith('/runs?view=summary')) return { runs: running ? [{ run_id: 'active', status: 'running', stage: 'starting' }] : [] }
     if (url.endsWith('/credentials')) return { database_sources: [], model: false }
     const project = projects.find(project => url === `/projects/${project.project_id}`)
     if (project) return structuredClone(project)

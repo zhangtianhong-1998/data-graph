@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it } from 'vitest'
-import { createApp } from 'vue'
+import { createApp, nextTick } from 'vue'
 import type { App } from 'vue'
 import ConstructionReport from './ConstructionReport.vue'
 import RunIssues from './RunIssues.vue'
@@ -11,6 +11,24 @@ function mount(component: typeof ConstructionReport | typeof RunIssues, report: 
 }
 afterEach(() => { app?.unmount(); root?.remove() })
 describe('构建报告与程序统计', () => {
+  it('大报告按原顺序展示每条独立问题，翻页保留首条重复记录', async () => {
+    const issues = Array.from({ length: 63 }, (_, i) => ({
+      code: 'future_safe_error', table: `表 ${i}`,
+    }))
+    mount(RunIssues, { issues: [...issues, ...issues] })
+    const nav = root.querySelector('[aria-label="问题分页"]')!
+    const names = () => [...root.querySelectorAll('p.note strong')].map(el => el.textContent)
+    expect(names()).toEqual(issues.slice(0, 50).map(i => i.table))
+    expect(nav.textContent).toContain('1–50 / 63')
+    const [previous, next] = nav.querySelectorAll('button')
+    next.click()
+    await nextTick()
+    expect(names()).toEqual(issues.slice(50).map(i => i.table))
+    expect(next.disabled).toBe(true)
+    previous.click()
+    await nextTick()
+    expect(names()).toEqual(issues.slice(0, 50).map(i => i.table))
+  })
   it('明确显示冲突隔离和可用成果，不将部分发布描述为完整通过', () => {
     mount(ConstructionReport, { construction: { summary: { published_drafts: 1 },
       execution: { data_validation: 'failed', conflict_isolation: { nodes: 39, edges: 50, coverage: 'incomplete' },

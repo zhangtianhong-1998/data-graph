@@ -121,6 +121,7 @@ class ResumeRun(InputModel):
     action: Literal['rerun_node', 'publish_artifact', 'recompose_legacy_merge'] = 'rerun_node'
     from_node_id: str | None = Field(default=None, pattern=r'^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')
     artifact_id: str | None = Field(default=None, pattern=r'^artifact_[a-f0-9]{32}$')
+    verify_checkpoints_in_background: StrictBool = False
 
 
 class NewProject(InputModel):
@@ -394,6 +395,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             if analytics.active(pid):
                 raise LightGraphError('analytics_job_active')
             result = delete_project(workspace, pid)
+            manager.forget_run_summaries(pid)
             credentials.clear_project(pid)
             return result
 
@@ -951,9 +953,9 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return discovery_review(workspace,pid,decision=data)
 
     @app.get('/api/projects/{pid}/runs')
-    def runs(pid:str):
+    def runs(pid:str,view:Literal['full','summary']='full'):
         workspace.get(pid)
-        return {'runs':manager.list(pid)}
+        return {'runs':manager.list(pid,view=view)}
 
     @app.post('/api/projects/{pid}/runs',status_code=202)
     def start_run(pid:str,data:StartRun|None=None,x_workbench_session:str|None=Header(default=None),if_match:str|None=Header(default=None)):
@@ -968,9 +970,9 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return manager.start(pid,**options)
 
     @app.get('/api/projects/{pid}/runs/{rid}')
-    def run_status(pid:str,rid:str):
+    def run_status(pid:str,rid:str,view:Literal['full','summary','workbench']='full'):
         workspace.get(pid)
-        return manager.get(pid,rid)
+        return manager.get(pid,rid,view=view)
 
     @app.delete('/api/projects/{pid}/runs/{rid}')
     def delete_run_record(pid: str, rid: str, if_match: str | None = Header(default=None)):
@@ -1009,8 +1011,9 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
                 all_sources = [s.id for s in config.sources]
                 needed = {sid for node in workers for sid in (node.source_ids or all_sources)}
                 sources, model = resolved_credentials(pid, x_workbench_session, source_ids=needed)
+            options = {'verify_checkpoints_in_background': True} if data.verify_checkpoints_in_background else {}
             return manager.resume(pid, rid, from_node_id=data.from_node_id,
-                                  source_credentials=sources, model_api_key=model)
+                                  source_credentials=sources, model_api_key=model, **options)
 
     @app.post('/api/projects/{pid}/workflow/units/{unit_id}/retry', status_code=202)
     def retry_workflow_unit(pid: str, unit_id: str, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
@@ -1151,10 +1154,10 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return manager.cancel(pid,rid)
 
     @app.get('/api/projects/{pid}/runs/{rid}/trace')
-    def run_trace(pid:str,rid:str,offset:int=0,limit:int=10,view:str='all'):
+    def run_trace(pid:str,rid:str,offset:int=0,limit:int=10,view:str='all',summary:bool=False):
         from .run_traces import read_run_trace
         with workspace.lock(pid):
-            return read_run_trace(manager,pid,rid,offset=offset,limit=limit,view=view)
+            return read_run_trace(manager,pid,rid,offset=offset,limit=limit,view=view,summary=summary)
 
     @app.get('/api/projects/{pid}/runs/{rid}/worker-diagnostics')
     def worker_diagnostics(pid:str,rid:str):

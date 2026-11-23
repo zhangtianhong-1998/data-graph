@@ -94,6 +94,22 @@ def test_declared_display_is_scoped_and_does_not_replace_source_name():
     assert result['nodes'][1]['label_origin'] == 'source'
 
 
+def test_owned_publication_reuses_only_authorized_supports():
+    visible = node('a', '科目', {'编号': '01'}, '可见')
+    allowed, = visible['supports']
+    visible['supports'].append({**allowed, 'label': '受限', 'required_scope_refs': ['B']})
+    original = graph([visible], [edge('a', 'a'), edge('a', 'a', '内部', scope='B')])
+
+    independent = filter_graph_scopes(original, ['A'])
+    transferred = filter_graph_scopes(original, ['A'], copy_supports=False)
+    assert transferred == independent
+    assert transferred['nodes'][0]['supports'] == [allowed]
+    assert transferred['nodes'][0]['supports'][0] is allowed
+    assert independent['nodes'][0]['supports'][0] is not allowed
+    assert transferred['edges'][0]['supports'][0] is original['edges'][0]['supports'][0]
+    assert '受限' not in str(transferred) and '内部' not in str(transferred)
+
+
 def test_identity_mode_full_key_and_cycles_do_not_recurse():
     first = node('a', '对象', {'范围': '甲', '码': '001'})
     second = node('b', '对象', {'范围': '乙', '码': '001'})

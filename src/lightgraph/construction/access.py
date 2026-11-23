@@ -1,5 +1,6 @@
 """Program-owned result visibility, separate from source connection permissions."""
 from copy import deepcopy
+from itertools import chain
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
 from .display import derive_display_graph
@@ -65,11 +66,13 @@ def access_fingerprint(config) -> str:
     })
 
 
-def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_context=None):
+def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_context=None, copy_supports=True):
     """Authorize each existence, label, alias, property and edge before display.
 
     Aggregated convenience fields are never trusted to be visible. Rebuild them
     exclusively from allowed supports, including when a node spans many scopes.
+    A reader that owns a freshly decoded graph can transfer its visible supports
+    to the result with copy_supports=False. Other callers get independent copies.
     """
     if not isinstance(scopes, (list, tuple, set, frozenset)) or any(not isinstance(s, str) for s in scopes):
         raise LightGraphError('explicit_scope_set_required')
@@ -82,7 +85,7 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
                          if k not in {'hierarchy_replay_inputs', 'physical_source_namespace_binding'}})
 
     def supports_for(item):
-        return [deepcopy(support) for support in item.get('supports', [])
+        return [deepcopy(support) if copy_supports else support for support in item.get('supports', [])
                 if support.get('scope_ref') in allowed
                 and all(scope in allowed for scope in support.get('required_scope_refs', []))
                 and business_context_matches(support, selection)]
@@ -92,16 +95,14 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
         provenance = []
         for support in supports:
             for name, values in support.get('properties', {}).items():
-                selected = properties.setdefault(name, [])
+                selected = properties.setdefault(name, {})
                 for value in values:
-                    if canonical(value) not in {canonical(v) for v in selected}:
-                        selected.append(value)
+                    selected.setdefault(canonical(value), value)
             origin = {**support.get('provenance', {}), 'scope_ref': support['scope_ref']}
             if origin not in provenance:
                 provenance.append(origin)
-        for values in properties.values():
-            values.sort(key=canonical)
-        return properties, sorted(provenance, key=canonical)
+        ordered = {name: [values[k] for k in sorted(values)] for name, values in properties.items()}
+        return ordered, sorted(provenance, key=canonical)
 
     nodes = []
     merged_observation_nodes = 0
@@ -145,7 +146,7 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
                       'supports': supports, 'scopes': sorted({support['scope_ref'] for support in supports})})
     entity_types = {node['type'] for node in nodes}
     relation_types = {edge['type'] for edge in edges}
-    node_ids, edge_ids = {node['id'] for node in nodes}, {edge['id'] for edge in edges}
+    node_ids, edge_ids = visible, {edge['id'] for edge in edges}
     unresolved = []
     for item in graph.get('unresolved_relations', []):
         summary = _visible_candidates([item], node_ids, edge_ids)
@@ -172,7 +173,7 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
                      'physical_source_namespace_binding'}
     view = _view_shell(graph, omit=report_fields)
     refs = set()
-    for item in nodes + edges + unresolved:
+    for item in chain(nodes, edges, unresolved):
         for support in item['supports']:
             prov = support.get('provenance', {})
             endpoint = prov.get('metadata_endpoint', {}).get('column', {})

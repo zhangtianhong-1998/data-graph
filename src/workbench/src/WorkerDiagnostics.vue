@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { projectPath, request } from './api'
 import { isActive } from './state'
 import type { Run } from './types'
@@ -11,7 +11,7 @@ type Entry = { time?: string; code: string; stage?: string; error_code?: string;
     boundary_recovery_attempts?: number; recovery_attempt_limit?: number; terminal?: boolean };
   exit_code?: number; stderr_bytes?: number; connection_generation?: number; reconnect_attempts?: number; frames?: { file: string; line: number }[] }
 type Page = { status: 'available' | 'not_recorded' | 'unavailable' | 'cleared'; events: Entry[]; incomplete: boolean; active: boolean }
-const opened = ref(false), loading = ref(false), error = ref(''), page = ref<Page | null>(null)
+const opened = ref(false), loading = ref(false), error = ref(''), page = shallowRef<Page | null>(null)
 const path = computed(() => `${projectPath(props.run.project_id)}/runs/${encodeURIComponent(props.run.run_id)}/worker-diagnostics`)
 const labels: Record<string, string> = {
   worker_starting: '准备启动进程', worker_started: '进程已启动', worker_finished: '进程任务结束',
@@ -65,7 +65,7 @@ async function load() {
 function toggle(event: Event) {
   opened.value = (event.currentTarget as HTMLDetailsElement).open
   if (opened.value) void load()
-  else { epoch++; controller?.abort(); clearTimeout(timer); loading.value = false }
+  else { epoch++; controller?.abort(); clearTimeout(timer); loading.value = false; page.value = null; error.value = '' }
 }
 function time(value?: string) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—' }
 watch([() => props.run.project_id, () => props.run.run_id], () => {
@@ -79,6 +79,7 @@ onUnmounted(() => { epoch++; controller?.abort(); clearTimeout(timer) })
 <template>
   <details class="worker-diagnostics" @toggle="toggle">
     <summary>查看进程诊断</summary>
+    <template v-if="opened">
     <p class="field-hint">记录进程退出、异常位置和数据库错误分类，供排查连接与运行故障；不包含原始异常正文、SQL 或凭据。这里不是 Agent 的思考记录。</p>
     <div class="actions"><button class="btn small" :disabled="loading" @click="load">刷新进程诊断</button><a v-if="page?.status === 'available'" class="btn small" :href="`/api${path}/export`" :download="`${run.run_id}-worker.jsonl`">导出进程诊断</a></div>
     <p v-if="loading && !page" role="status">正在读取进程诊断…</p>
@@ -111,6 +112,7 @@ onUnmounted(() => { epoch++; controller?.abort(); clearTimeout(timer) })
         <div v-for="frame in entry.frames || []" :key="`${frame.file}:${frame.line}`" class="mono">{{ frame.file }}:{{ frame.line }}</div>
       </td></tr>
     </tbody></table></div>
+    </template>
   </details>
 </template>
 

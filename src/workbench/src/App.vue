@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import GraphCanvas from './GraphCanvas.vue'
 import GraphAnalysis from './GraphAnalysis.vue'
 import GraphHistory from './GraphHistory.vue'
@@ -35,7 +35,7 @@ import { ApiError, ensureSession, clearSessions, clearSession, json, projectPath
 import { assertNoCredentials, graphOutcome, isActive, runLabels, stageLabel, workflowFailureLabel } from './state'
 import { WorkbenchLocation } from './workbenchLocation'
 import { readGraph } from './graphRead'
-import type { DocumentScope, EmbeddingConfig, Graph, InheritedGraphRef, Metadata, Project, ProjectFile, RetrievalStatusResponse, Run, RunConfig, SourceConfig, WorkflowConfig, WorkflowState } from './types'
+import type { DocumentScope, EmbeddingConfig, Graph, InheritedGraphRef, Metadata, Project, ProjectFile, RetrievalStatusResponse, Run, RunConfig, SourceConfig, WorkflowConfig } from './types'
 
 
 const projects = ref<Project[]>([])
@@ -100,7 +100,6 @@ const internalEmbeddingHttp = computed(() => {
 })
 const workflowConfig = ref<WorkflowConfig | null>(null)
 const inheritedGraphs = ref<InheritedGraphRef[]>([])
-const workflowRunStatus = ref<{ enabled: boolean; units: string[]; state: WorkflowState | null; merge_summary?: Record<string, unknown> | null } | null>(null)
 const retrievalStatus = ref<RetrievalStatusResponse | null>(null)
 const { running: vectorizing, job: vectorJob, start: startVectorization, error: vectorError } = useVectorization(
   () => ['business', 'retrieval'].includes(tab.value) ? project.value?.project_id : undefined,
@@ -164,7 +163,7 @@ const modelKey = ref('')
 type CredentialStatus = { database_sources: string[]; database_errors?: Record<string, string>; model: boolean; model_error?: string; model_environment?: boolean }
 const credentials = ref<CredentialStatus>({ database_sources: [], model: false })
 const metadata = ref<Metadata>({ tables: [], nodes: [], edges: [] })
-const business = ref<Graph>({ nodes: [], edges: [] })
+const business = shallowRef<Graph>({ nodes: [], edges: [] })
 const selectedGraphVersion = ref('')
 const graphBusinessContext = ref<BusinessContext | null>(null)
 async function selectGraphVersion(version: string) {
@@ -172,23 +171,33 @@ async function selectGraphVersion(version: string) {
   business.value = { nodes: [], edges: [] }; structurePreviewOpen.value = false
   await loadBusinessGraph()
 }
+const graphOptionsOpen = ref(false)
+function toggleGraphOptions(event: Event) { graphOptionsOpen.value = (event.currentTarget as HTMLDetailsElement).open }
 const structurePreviewOpen = ref(false)
 const graphLoading = ref(false), graphError = ref('')
 let graphRequestEpoch = 0
 let graphController: AbortController | undefined
-const runs = ref<Run[]>([])
+const runs = shallowRef<Run[]>([])
 const runMode = ref<'continue' | 'fresh'>('continue')
-const selectedRun = ref<Run | null>(null)
-watch(selectedRun, run => { if (run) workbenchLocation.selectRun(run.project_id, run.run_id) })
-const visibleWorkflowState = computed(() => {
-  const run = selectedRun.value
-  if (!run) return null
-  if (run.workflow_state) return run.workflow_state
-  const live = workflowRunStatus.value?.state
-  return live?.parent_run_id === run.run_id ? live : null
+const selectedRunId = ref('')
+const selectedRun = shallowRef<Run | null>(null)
+const runDetailError = ref('')
+let detailController: AbortController | undefined
+let pollController: AbortController | undefined
+const historyPage = ref(0)
+const historyPageSize = 50
+const historyPages = computed(() => Math.ceil(runs.value.length / historyPageSize))
+const historyRows = computed(() => runs.value.slice(historyPage.value * historyPageSize, (historyPage.value + 1) * historyPageSize))
+watch(selectedRunId, id => {
+  if (!id || !project.value) return
+  workbenchLocation.selectRun(project.value.project_id, id)
+  const index = runs.value.findIndex(run => run.run_id === id)
+  if (index >= 0) historyPage.value = Math.floor(index / historyPageSize)
 })
+watch(historyPages, count => { historyPage.value = Math.max(0, Math.min(historyPage.value, count - 1)) })
+const visibleWorkflowState = computed(() => selectedRun.value?.workflow_state)
 const canEditWorkflowRun = computed(() => Boolean(config.value.workflow?.enabled && selectedRun.value &&
-  workflowRunStatus.value?.state?.parent_run_id === selectedRun.value.run_id))
+  selectedRun.value.current_workflow_run_id === selectedRun.value.run_id))
 const workflowOutputLabel = computed(() => {
   const merge = visibleWorkflowState.value?.merge
   const status = merge?.status
@@ -315,28 +324,25 @@ async function loadProject(id: string) {
   runMode.value = 'continue'; selectedGraphVersion.value = ''; graphBusinessContext.value = null
   workbenchLocation.selectProject(id)
   const epoch = ++generation
-  graphController?.abort()
+  graphController?.abort(); graphOptionsOpen.value = false
   embeddingTesting.value = false
-  clearTimeout(pollTimer); loading.value = true; error.value = ''; selectedRun.value = null; runPollError.value = null; preview.value = null; databaseOpen.value = false; modelKey.value = ''; embeddingKey.value = ''; embeddingCredStatus.value = { embedding: false }; embeddingTestResult.value = null; workflowRunStatus.value = null; retrievalStatus.value = null; credentials.value = { database_sources: [], model: false }
+  clearTimeout(pollTimer); loading.value = true; error.value = ''; selectedRunId.value = ''; pollController?.abort(); historyPage.value = 0; runPollError.value = null; preview.value = null; databaseOpen.value = false; modelKey.value = ''; embeddingKey.value = ''; embeddingCredStatus.value = { embedding: false }; embeddingTestResult.value = null; retrievalStatus.value = null; credentials.value = { database_sources: [], model: false }
   const p = projectPath(id)
   try {
     const values = await Promise.all([request<Project>(p), request<RunConfig>(`${p}/config`)])
     if (epoch !== generation) return
     configRevision.value = undefined; project.value = values[0]; fillForms(values[1]); metadata.value = { tables: [], nodes: [], edges: [] }; business.value = { nodes: [], edges: [] }; runs.value = []
-    // An unavailable database must not prevent opening and repairing its project configuration.
-    // Graph loading can take longer than opening configuration. A graph read
-    // must not lock model fields or report a successful config load as failed.
-    void loadBusinessGraph(p, epoch)
-    const details = await Promise.allSettled([request<Metadata>(`${p}/metadata`), request<{ runs: Run[] }>(`${p}/runs`),
+    if (tab.value === 'business') void loadBusinessGraph(p, epoch)
+    const details = await Promise.allSettled([request<Metadata>(`${p}/metadata`), request<{ runs: Run[] }>(`${p}/runs?view=summary`),
       ensureSession(id).then(() => request<CredentialStatus>(`${p}/credentials`))])
     if (epoch !== generation) return
     if (details[0].status === 'fulfilled') { metadata.value = details[0].value }
-    if (details[1].status === 'fulfilled') runs.value = details[1].value.runs
+    if (details[1].status === 'fulfilled') runs.value = details[1].value.runs.map(historyRow)
     if (details[2].status === 'fulfilled') credentials.value = details[2].value
     const failed = details.find(result => result.status === 'rejected')
     if (failed?.status === 'rejected') report(failed.reason)
     const previousRun = workbenchLocation.lastRun(id)
-    selectedRun.value = runs.value.find(run => run.run_id === previousRun) || runs.value[0] || null
+    selectedRunId.value = (runs.value.find(run => run.run_id === previousRun) || runs.value[0])?.run_id || ''
     schedulePoll(epoch)
     const restored = workbenchLocation.restoreDatabase(id, config.value.sources || [])
     if (restored && !activeRun.value) {
@@ -398,12 +404,13 @@ async function refreshAfterIdentityDecision() {
   await Promise.all([refreshGraphs(), refreshRetrievalStatus()])
 }
 async function loadBusinessGraph(p = path.value, epoch = generation) {
+  if (tab.value !== 'business' || !project.value) return
   const requestEpoch = ++graphRequestEpoch
   graphController?.abort()
   const controller = new AbortController(); graphController = controller
   graphLoading.value = true; graphError.value = ''
   try {
-    const graph = await readGraph<Graph>(`${p}/graph?layer=business&include_candidates=${includeCandidates.value}&limit=1000${graphBusinessContext.value !== null ? `&business_context=${encodeURIComponent(JSON.stringify(graphBusinessContext.value))}` : ''}${selectedGraphVersion.value ? `&version=${encodeURIComponent(selectedGraphVersion.value)}` : ''}`, controller.signal)
+    const graph = await readGraph<Graph>(`${p}/graph?layer=business&include_candidates=${includeCandidates.value}&limit=240${graphBusinessContext.value !== null ? `&business_context=${encodeURIComponent(JSON.stringify(graphBusinessContext.value))}` : ''}${selectedGraphVersion.value ? `&version=${encodeURIComponent(selectedGraphVersion.value)}` : ''}`, controller.signal)
     if (epoch === generation && requestEpoch === graphRequestEpoch) business.value = graph
   } catch (exception) {
     if (epoch === generation && requestEpoch === graphRequestEpoch) {
@@ -413,27 +420,79 @@ async function loadBusinessGraph(p = path.value, epoch = generation) {
     }
   } finally { if (epoch === generation && requestEpoch === graphRequestEpoch) graphLoading.value = false }
 }
+// History rows must stay small even when a poll or start action returns a full run.
+function historyRow(run: Run): Run {
+  const { project_id, run_id, status, created_at, cleanup_status, workflow } = run
+  return { project_id, run_id, status, created_at, cleanup_status, workflow, stage: run.progress?.stage || run.stage }
+}
+function updateHistory(run: Run) {
+  const index = runs.value.findIndex(item => item.run_id === run.run_id)
+  if (index < 0) return
+  const before = runs.value[index]
+  const next = historyRow(run)
+  if (before.status === next.status && before.stage === next.stage && before.cleanup_status === next.cleanup_status) return
+  const rows = runs.value.slice()
+  rows[index] = next
+  runs.value = rows
+}
+async function readSelectedRun() {
+  const id = selectedRunId.value
+  if (!id || !project.value || tab.value !== 'runs' || detailController) return
+  const controller = new AbortController()
+  detailController = controller
+  const epoch = generation
+  try {
+    const run = await request<Run>(`${path.value}/runs/${encodeURIComponent(id)}?view=workbench`, { signal: controller.signal })
+    if (controller.signal.aborted || epoch !== generation || selectedRunId.value !== id || tab.value !== 'runs') return
+    selectedRun.value = run
+    runDetailError.value = ''
+    runPollError.value = null
+    updateHistory(run)
+    return run
+  } catch (exception) {
+    if (controller.signal.aborted || epoch !== generation) return
+    if (exception instanceof ApiError && [401, 403, 404, 409].includes(exception.status)) selectedRun.value = null
+    runDetailError.value = exception instanceof Error ? exception.message : '读取运行详情失败。'
+    runPollError.value = id
+  } finally {
+    if (detailController === controller) detailController = undefined
+  }
+}
 function schedulePoll(epoch: number) {
   clearTimeout(pollTimer)
+  pollController?.abort()
   if (epoch !== generation || !activeRun.value) return
   pollTimer = setTimeout(async () => {
     const runningId = activeRun.value?.run_id
     if (!runningId) return
+    const controller = new AbortController()
+    pollController = controller
     try {
-      const run = await request<Run>(`${path.value}/runs/${encodeURIComponent(runningId)}`)
-      if (epoch !== generation) return
-      runPollError.value = null
-      runs.value = runs.value.map(item => item.run_id === run.run_id ? run : item)
-      if (selectedRun.value?.run_id === run.run_id) selectedRun.value = run
-      if (!isActive(run)) {
+      let run: Run | undefined
+      if (tab.value === 'runs' && selectedRunId.value === runningId) {
+        run = await readSelectedRun()
+      } else {
+        run = await request<Run>(`${path.value}/runs/${encodeURIComponent(runningId)}?view=summary`, { signal: controller.signal })
+        if (controller.signal.aborted || epoch !== generation) return
+        updateHistory(run)
+      }
+      if (run && !isActive(run) && epoch === generation && !controller.signal.aborted) {
         try { await refreshGraphs() } catch (exception) { if (epoch === generation) report(exception) }
-        if (tab.value === 'business' || tab.value === 'retrieval') await refreshRetrievalStatus()
+        if (epoch === generation && (tab.value === 'business' || tab.value === 'retrieval')) await refreshRetrievalStatus()
         if (epoch === generation) notify(graphOutcome(run.report) || `运行${runLabels[run.status]}，请查看结果与报告。`)
       }
-    } catch { if (epoch === generation) runPollError.value = runningId }
-    schedulePoll(epoch)
+    } catch { if (epoch === generation && !controller.signal.aborted) runPollError.value = runningId }
+    if (epoch === generation && !controller.signal.aborted) schedulePoll(epoch)
   }, 1000)
 }
+watch([() => tab.value === 'runs' && selectedRunId.value, () => project.value?.project_id, configRevision], () => {
+  detailController?.abort()
+  detailController = undefined
+  selectedRun.value = null
+  runDetailError.value = ''
+  void readSelectedRun()
+  schedulePoll(generation)
+})
 async function refreshCredentials() {
   credentials.value = await request<CredentialStatus>(`${path.value}/credentials`)
 }
@@ -569,16 +628,6 @@ async function vectorizeGraph() {
     await startVectorization()
   } catch (exception) { report(exception) }
 }
-async function refreshWorkflowStatus() {
-  if (!project.value) return
-  const epoch = generation
-  const status = await request<NonNullable<typeof workflowRunStatus.value>>(`${path.value}/workflow`)
-  if (epoch !== generation) return
-  workflowRunStatus.value = status
-  if (selectedRun.value && status.state?.parent_run_id === selectedRun.value.run_id) {
-    selectedRun.value = { ...selectedRun.value, workflow_state: status.state }
-  }
-}
 async function retryWorkflowUnit(unitId: string) {
   await action(async () => {
     if (dirty.value || advancedDirty.value) await saveDraft()
@@ -588,15 +637,14 @@ async function retryWorkflowUnit(unitId: string) {
       headers: revisionHeaders(),
       body: '{}',
     })
-    runs.value = [run, ...runs.value.filter(item => item.run_id !== run.run_id)]
-    selectedRun.value = run
+    runs.value = [historyRow(run), ...runs.value.filter(item => item.run_id !== run.run_id)]
+    selectedRunId.value = run.run_id
     tab.value = 'runs'
-    try { await refreshWorkflowStatus() } catch { /* optional */ }
     schedulePoll(generation)
     notify(`已单独重跑链路 ${unitId}`)
   })
 }
-async function resumeWorkflow(target: { from_node_id: string; action?: 'recompose_legacy_merge' } | { artifact_id: string }) {
+async function resumeWorkflow(target: { from_node_id: string; action?: 'recompose_legacy_merge'; verify_checkpoints_in_background?: true } | { artifact_id: string }) {
   const original = selectedRun.value
   if (!original || !project.value) return
   await action(async () => {
@@ -606,11 +654,10 @@ async function resumeWorkflow(target: { from_node_id: string; action?: 'recompos
     const run = await request<Run>(`${projectPath(original.project_id)}/runs/${encodeURIComponent(original.run_id)}/resume`, {
       method: 'POST', headers: revisionHeaders(), body: json({ ...target, action: actionName }),
     })
-    runs.value = [run, ...runs.value.filter(item => item.run_id !== run.run_id)]
-    selectedRun.value = run; tab.value = 'runs'
+    runs.value = [historyRow(run), ...runs.value.filter(item => item.run_id !== run.run_id)]
+    selectedRunId.value = run.run_id; tab.value = 'runs'
     schedulePoll(generation)
     if (!isActive(run)) await loadBusinessGraph()
-    try { await refreshWorkflowStatus() } catch { /* The selected run has its own state. */ }
     notify(actionName === 'rerun_node' ? '已创建新的节点恢复运行' : '已创建项目发布任务')
   })
 }
@@ -622,7 +669,7 @@ async function remergeWorkflow() {
       headers: revisionHeaders(),
       body: '{}',
     })
-    await refreshWorkflowStatus()
+    await readSelectedRun()
     await refreshGraphs()
     notify(`已重新发布 ${summary.nodes ?? 0} 个节点、${summary.edges ?? 0} 条边`)
   })
@@ -685,7 +732,7 @@ async function confirmDeletion() {
       await request(`${base}/runs/${encodeURIComponent(rid)}`, { method: 'DELETE', headers: revisionHeaders() })
       if (project.value?.project_id !== id) return
       runs.value = runs.value.filter(run => run.run_id !== rid)
-      if (selectedRun.value?.run_id === rid) selectedRun.value = runs.value[0] || null
+      if (selectedRunId.value === rid) selectedRunId.value = runs.value[0]?.run_id || ''
       deletion.value = null
       notify('运行记录已删除')
       return
@@ -701,7 +748,7 @@ async function confirmDeletion() {
       generation++; graphController?.abort(); clearTimeout(pollTimer); clearSession(id); workbenchLocation.removeProject(id)
       projects.value = projects.value.filter(item => item.project_id !== id)
       project.value = null; fillForms({}); modelKey.value = ''; credentials.value = { database_sources: [], model: false }
-      metadata.value = { tables: [], nodes: [], edges: [] }; business.value = { nodes: [], edges: [] }; runs.value = []; selectedRun.value = null
+      metadata.value = { tables: [], nodes: [], edges: [] }; business.value = { nodes: [], edges: [] }; runs.value = []; selectedRunId.value = ''
       databaseOpen.value = false; databaseSource.value = null; preview.value = null
       tab.value = 'inputs'; configurationTab.value = 'inputs'; resultTab.value = 'runs'
       await reloadProjects()
@@ -795,22 +842,27 @@ async function startRun() {
       if (!selectedGraphVersion.value) { business.value = { nodes: [], edges: [] }; structurePreviewOpen.value = false; void loadBusinessGraph() }
     }
     runPollError.value = null
-    runs.value = [run, ...runs.value.filter(item => item.run_id !== run.run_id)]; selectedRun.value = run; tab.value = 'runs'; schedulePoll(generation)
+    runs.value = [historyRow(run), ...runs.value.filter(item => item.run_id !== run.run_id)]; selectedRunId.value = run.run_id; tab.value = 'runs'; schedulePoll(generation)
   })
 }
 async function cancelRun(run: Run) {
-  await action(async () => { const result = await request<Run>(`${path.value}/runs/${encodeURIComponent(run.run_id)}/cancel`, { method: 'POST', body: '{}' }); runs.value = runs.value.map(item => item.run_id === result.run_id ? result : item); selectedRun.value = result; schedulePoll(generation); if (!isActive(result)) await refreshGraphs() })
-}
-async function inspectRun(run: Run) {
-  const epoch = generation
   await action(async () => {
-    const current = await request<Run>(`${path.value}/runs/${encodeURIComponent(run.run_id)}`)
-    if (epoch !== generation) return
-    selectedRun.value = current
-    if (runPollError.value === run.run_id) runPollError.value = null
+    const result = await request<Run>(`${path.value}/runs/${encodeURIComponent(run.run_id)}/cancel`, { method: 'POST', body: '{}' })
+    updateHistory(result)
+    if (selectedRunId.value === result.run_id) {
+      detailController?.abort()
+      detailController = undefined
+      void readSelectedRun()
+    } else selectedRunId.value = result.run_id
+    schedulePoll(generation)
+    if (!isActive(result)) await refreshGraphs()
   })
 }
-function showRunProgress(run: Run) { selectedRun.value = run; tab.value = 'runs' }
+function inspectRun(run: Run) {
+  if (selectedRunId.value !== run.run_id) selectedRunId.value = run.run_id
+  else if (runDetailError.value) void readSelectedRun()
+}
+function showRunProgress(run: Run) { selectedRunId.value = run.run_id; tab.value = 'runs' }
 async function saveAdvanced() {
   await action(async () => {
     // Unedited JSON is only the last saved snapshot. It must not overwrite
@@ -855,14 +907,15 @@ function capabilityUploaded(file: ProjectFile, revision?: string) {
   configRevision.value = revision || configRevision.value
   if (project.value) project.value.files = [...project.value.files.filter(item => item.file_id !== file.file_id), file]
 }
-watch(tab, async value => {
+watch(tab, async (value, previous) => {
+  if (value === 'business') void loadBusinessGraph()
+  if (previous === 'business') {
+    graphRequestEpoch++; graphController?.abort(); graphLoading.value = false; graphOptionsOpen.value = false
+    business.value = { nodes: [], edges: [] }
+  }
   if (value === 'settings' && project.value && 'embedding' in config.value) {
     try { embeddingCredStatus.value = await request(`${path.value}/credentials/embedding`) } catch { /* optional */ }
   }
-  if (value === 'runs' && project.value && (config.value.workflow?.enabled || selectedRun.value?.workflow)) {
-    try { await refreshWorkflowStatus() } catch { /* optional */ }
-  }
-
 })
 watch([tab, () => project.value?.project_id], () => {
   if (['business', 'retrieval'].includes(tab.value)) void refreshRetrievalStatus()
@@ -870,7 +923,7 @@ watch([tab, () => project.value?.project_id], () => {
 watch(graphBusinessContext, () => { business.value = { nodes: [], edges: [] }; void loadBusinessGraph() })
 watch(includeCandidates, () => { void action(refreshGraphs) })
 onMounted(async () => { try { await reloadProjects() } catch (exception) { report(exception); loading.value = false } })
-onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTimer); clearTimeout(toastTimer); modelKey.value = ''; embeddingKey.value = ''; clearSessions() })
+onUnmounted(() => { generation++; detailController?.abort(); pollController?.abort(); graphController?.abort(); clearTimeout(pollTimer); clearTimeout(toastTimer); modelKey.value = ''; embeddingKey.value = ''; clearSessions() })
 </script>
 
 <template>
@@ -934,9 +987,9 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
             @preview="showContent" @delete-file="file => askDeletion({ kind: 'file', file })"/>
           <VectorizationProgress v-if="vectorizing && (tab === 'retrieval' || (tab === 'business' && !selectedGraphVersion))" :progress="vectorJob.progress"/>
           <template v-if="tab === 'metadata' || tab === 'business'"><div class="intro"><div><div class="graph-heading"><h2>{{ tab === 'metadata' ? '元数据关联图' : '业务知识图谱' }}</h2><span v-if="tab === 'business' && typeof business.merged_observation_nodes === 'number'" class="badge" title="当前范围内，合并后保留了多个抽取单元同源证据的节点数">已归并 {{ business.merged_observation_nodes }} 个节点</span></div></div><div class="actions"><template v-if="tab === 'business' && !selectedGraphVersion && (business.nodes.length > 0 || retrievalStatus?.has_graph)"><span class="badge" :class="retrievalStatus?.status === 'vectorized' ? 'green' : 'amber'">{{ retrievalStatus?.status === 'vectorized' ? `已完成向量化 · ${retrievalStatus.embedder_model || 'local_hash'} (${retrievalStatus.vector_dim ?? '—'}维)` : retrievalStatus?.status === 'stale' ? '图谱或模型已变更 · 待重新向量化' : '未向量化' }}</span><button class="btn" :class="{ primary: !retrievalStatus?.vectorized }" :disabled="vectorizing || busy" @click="vectorizeGraph">{{ vectorizing ? '正在向量化…' : retrievalStatus?.vectorized ? '重新向量化' : '立即向量化' }}</button></template><button v-if="tab === 'business' && !selectedGraphVersion" class="btn" :aria-expanded="structurePreviewOpen" @click="structurePreviewOpen = !structurePreviewOpen">{{ structurePreviewOpen ? '收起结构方案' : '查看结构方案' }}</button><button class="btn" :disabled="busy" @click="action(refreshGraphs)">刷新图谱</button></div></div><p v-if="tab === 'metadata' && metadata.requires_refresh" class="note graph-notice">{{ metadata.tables.length ? '目前仅显示已读取来源的元数据；其他来源仍需连接并读取。' : '尚未读取元数据。请在「项目配置 → 数据接入」连接来源并读取元数据。' }}</p><p v-if="tab === 'metadata' && metadata.stale_engine_metadata" class="note amber graph-notice">元数据声明已更新。重新运行抽取后，会刷新与新声明对应的关系。</p>
-            <details v-if="tab === 'business'" class="graph-view-options">
+            <details v-if="tab === 'business'" class="graph-view-options" @toggle="toggleGraphOptions">
               <summary><strong>版本与范围</strong><span>{{ selectedGraphVersion ? '历史快照' : '当前发布' }} · {{ graphBusinessContext === null ? '全部内容' : Object.entries(graphBusinessContext).map(([key, val]) => key + ' ' + val).join(' · ') || '仅通用知识' }}{{ includeCandidates ? ' · 含候选' : '' }}</span></summary>
-              <div class="graph-options-body">
+              <div v-if="graphOptionsOpen" class="graph-options-body">
                 <GraphHistory :project-id="project.project_id" :model-value="selectedGraphVersion" :config-revision="configRevision" :refresh-key="business" @update:model-value="selectGraphVersion"/>
                 <BusinessContextSelect v-model="graphBusinessContext" :project-id="project.project_id" :version="selectedGraphVersion" :refresh-key="`${configRevision}:${business.version_id || business.generation || ''}`" :disabled="busy"/>
                 <label class="checkbox-line graph-candidates-toggle"><input v-model="includeCandidates" type="checkbox" :disabled="busy"/>显示候选与未决关系</label>
@@ -949,12 +1002,20 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
           <template v-if="tab === 'retrieval'">
             <RetrievalPanel :key="project.project_id" :syncing="vectorizing" :project-id="project.project_id" :embedding="config.embedding" :status="retrievalStatus" :busy="busy || loading || dirty || advancedDirty || locked" @vectorize="vectorizeGraph"/>
           </template>
-          <template v-if="tab === 'runs'"><div class="intro"><div><h2>运行记录</h2></div></div><section class="panel"><div v-if="!runs.length" class="empty-state"><h3>尚未开始抽取</h3><p>先上传数据、配置目标和模型，再开始第一轮运行。</p></div><div v-else class="table-scroll run-history-table"><table><thead><tr><th>运行编号</th><th>状态</th><th>当前阶段</th><th>创建时间</th><th>资源释放</th><th></th></tr></thead><tbody><tr v-for="run in runs" :key="run.run_id" :class="{ chosen: run.run_id === selectedRun?.run_id }"><td class="mono">{{ run.run_id }}</td><td><span class="badge" :class="run.status === 'completed' ? 'green' : run.status === 'failed' ? 'red' : 'blue'">{{ runLabels[run.status] }}</span></td><td>{{ stageLabel(run.progress?.stage || run.stage) }}</td><td>{{ time(run.created_at) }}</td><td>{{ run.cleanup_status === 'completed' ? '已完成' : run.cleanup_status === 'pending' ? '待完成' : '未确认' }}</td><td><button class="btn small" :aria-pressed="run.run_id === selectedRun?.run_id" :disabled="busy" @click="inspectRun(run)">{{ run.run_id === selectedRun?.run_id ? '正在查看' : isActive(run) ? '查看进度' : '查看报告' }}</button> <button v-if="!isActive(run)" class="text-button danger" :disabled="busy" @click="askDeletion({kind: 'run', run})">删除</button></td></tr></tbody></table></div></section>
+          <template v-if="tab === 'runs'"><div class="intro"><div><h2>运行记录</h2></div></div><section class="panel"><div v-if="!runs.length" class="empty-state"><h3>尚未开始抽取</h3><p>先上传数据、配置目标和模型，再开始第一轮运行。</p></div><div v-else class="table-scroll run-history-table"><table><thead><tr><th>运行编号</th><th>状态</th><th>当前阶段</th><th>创建时间</th><th>资源释放</th><th></th></tr></thead><tbody><tr v-for="run in historyRows" :key="run.run_id" :class="{ chosen: run.run_id === selectedRunId }"><td class="mono">{{ run.run_id }}</td><td><span class="badge" :class="run.status === 'completed' ? 'green' : run.status === 'failed' ? 'red' : 'blue'">{{ runLabels[run.status] }}</span></td><td>{{ stageLabel(run.progress?.stage || run.stage) }}</td><td>{{ time(run.created_at) }}</td><td>{{ run.cleanup_status === 'completed' ? '已完成' : run.cleanup_status === 'pending' ? '待完成' : '未确认' }}</td><td><button class="btn small" :aria-pressed="run.run_id === selectedRunId" :disabled="busy" @click="inspectRun(run)">{{ run.run_id === selectedRunId ? '正在查看' : isActive(run) ? '查看进度' : '查看报告' }}</button> <button v-if="!isActive(run)" class="text-button danger" :disabled="busy" @click="askDeletion({kind: 'run', run})">删除</button></td></tr></tbody></table></div>
+              <nav v-if="historyPages > 1" class="actions" aria-label="运行记录分页">
+                <button class="btn small" :disabled="!historyPage" @click="historyPage--">上一页</button>
+                <span>{{ historyPage + 1 }} / {{ historyPages }}</span>
+                <button class="btn small" :disabled="historyPage + 1 >= historyPages" @click="historyPage++">下一页</button>
+              </nav>
+            </section>
+            <div v-if="runDetailError" class="note amber" role="alert">运行详情刷新失败：{{ runDetailError }} <button class="btn small" @click="readSelectedRun">重试</button></div>
+            <p v-else-if="selectedRunId && !selectedRun" class="note" role="status">正在读取运行 {{ selectedRunId }}…</p>
             <section v-if="visibleWorkflowState" class="panel run-report">
               <div class="panel-head">
                 <h2>工作流节点执行与合并结果</h2>
                 <div class="actions">
-                  <button class="btn small" :disabled="busy" @click="action(refreshWorkflowStatus)">刷新状态</button>
+                  <button class="btn small" :disabled="busy" @click="readSelectedRun">刷新状态</button>
                   <button v-if="canEditWorkflowRun && !config.workflow?.merge_nodes?.length" class="btn small primary" :disabled="locked" @click="remergeWorkflow">重新发布输出</button>
                 </div>
               </div>
@@ -989,7 +1050,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
                           <div v-if="m.delta_merge_counts?.source_replay_status === 'ran'" class="field-hint">补充抽取后同源去重 {{ m.delta_merge_counts.source_replay_collapsed_nodes }} 个<template v-if="m.delta_merge_counts.hierarchy_replay_collapsed_nodes">，同源层级归并 {{ m.delta_merge_counts.hierarchy_replay_collapsed_nodes }} 个</template><template v-if="m.delta_merge_counts.observed_dictionary_collapsed_nodes">，按字典成员合并 {{ m.delta_merge_counts.observed_dictionary_collapsed_nodes }} 个</template></div>
                           <div v-if="m.failure_detail" class="field-hint">{{ workflowFailureLabel(m.failure_detail) }}</div>
                         </td>
-                        <td><button class="btn small" :disabled="locked || !config.workflow?.enabled" @click="resumeWorkflow({ from_node_id: m.node_id })">从此节点重新运行</button>
+                        <td><button class="btn small" :disabled="locked || !config.workflow?.enabled" @click="resumeWorkflow({ from_node_id: m.node_id, verify_checkpoints_in_background: true })">从此节点重新运行</button>
                           <button v-if="!visibleWorkflowState?.artifacts && m.merge_mode === 'merge_and_extract' && ['partial', 'completed', 'completed_with_gaps'].includes(m.status)" class="btn small" :disabled="locked || dirty || advancedDirty" @click="resumeWorkflow({ from_node_id: m.node_id, action: 'recompose_legacy_merge' })">从原合并产物恢复发布</button>
                           <button v-if="visibleWorkflowState?.terminal_ids?.length === 1 && visibleWorkflowState.terminal_ids[0] === m.node_id && visibleWorkflowState.artifacts?.[m.node_id]?.graph_kind === 'node_full'" class="btn small" :disabled="locked" @click="resumeWorkflow({ artifact_id: visibleWorkflowState.artifacts[m.node_id]!.artifact_id })">仅发布此结果</button></td>
                       </tr>
@@ -1008,7 +1069,7 @@ onUnmounted(() => { generation++; graphController?.abort(); clearTimeout(pollTim
                 </p>
               </div>
             </section>
-            <RunProgress v-if="selectedRun" :key="`${selectedRun.project_id}:${selectedRun.run_id}`" :run="selectedRun" :refresh-error="runPollError === selectedRun.run_id"/><section v-if="selectedRun" class="panel run-report"><div class="panel-head"><h2>运行详情</h2><span class="badge">{{ selectedRun.run_id }}</span></div><div class="panel-body"><div class="report-summary"><div><small>执行状态</small><strong>{{ runLabels[selectedRun.status] }}</strong></div><div><small>当前阶段</small><strong>{{ stageLabel(selectedRun.progress?.stage || selectedRun.stage) }}</strong></div><div><small>运行方式</small><strong>{{ selectedRun.run_mode === 'fresh' ? '从零开始' : '继续上次工作' }}</strong></div><div><small>配置修订</small><strong>{{ selectedRun.config_revision ?? '历史记录未提供' }}</strong></div><div><small>结束时间</small><strong>{{ time(selectedRun.finished_at) }}</strong></div></div><p v-if="graphOutcome(selectedRun.report)" class="note">{{ graphOutcome(selectedRun.report) }}</p><p v-if="selectedRun.error_code" class="note amber">{{ new ApiError(selectedRun.error_code).message }}<span v-if="selectedRun.failure_detail"> · {{ workflowFailureLabel(selectedRun.failure_detail) }}</span></p><p v-if="selectedRun.output_path" class="field-hint">本轮成果目录：{{ selectedRun.output_path }}</p><ConstructionReport :report="selectedRun.report"/><RunIssues :report="selectedRun.report"/><TechnicalDetails v-if="selectedRun.report" :value="selectedRun.report" title="报告原始结构"/><p v-else class="note">{{ isActive(selectedRun) ? '运行尚未结束，报告会在后端生成后显示。' : '此运行没有可读取的报告，请结合状态和错误码判断。' }}</p></div></section><RunTrace v-if="selectedRun" :key="`${selectedRun.project_id}:${selectedRun.run_id}`" :run="selectedRun" :config-revision="configRevision"/></template>
+            <RunProgress v-if="selectedRun" :key="`${selectedRun.project_id}:${selectedRun.run_id}`" :run="selectedRun" :refresh-error="runPollError === selectedRun.run_id"/><section v-if="selectedRun" :key="selectedRun.run_id" class="panel run-report"><div class="panel-head"><h2>运行详情</h2><span class="badge">{{ selectedRun.run_id }}</span></div><div class="panel-body"><div class="report-summary"><div><small>执行状态</small><strong>{{ runLabels[selectedRun.status] }}</strong></div><div><small>当前阶段</small><strong>{{ stageLabel(selectedRun.progress?.stage || selectedRun.stage) }}</strong></div><div><small>运行方式</small><strong>{{ selectedRun.run_mode === 'fresh' ? '从零开始' : '继续上次工作' }}</strong></div><div><small>配置修订</small><strong>{{ selectedRun.config_revision ?? '历史记录未提供' }}</strong></div><div><small>结束时间</small><strong>{{ time(selectedRun.finished_at) }}</strong></div></div><p v-if="graphOutcome(selectedRun.report)" class="note">{{ graphOutcome(selectedRun.report) }}</p><p v-if="selectedRun.error_code" class="note amber">{{ new ApiError(selectedRun.error_code).message }}<span v-if="selectedRun.failure_detail"> · {{ workflowFailureLabel(selectedRun.failure_detail) }}</span></p><p v-if="selectedRun.output_path" class="field-hint">本轮成果目录：{{ selectedRun.output_path }}</p><ConstructionReport :report="selectedRun.report"/><RunIssues :report="selectedRun.report"/><TechnicalDetails v-if="selectedRun.report" :value="selectedRun.report" title="报告原始结构"/><p v-else class="note">{{ isActive(selectedRun) ? '运行尚未结束，报告会在后端生成后显示。' : '此运行没有可读取的报告，请结合状态和错误码判断。' }}</p></div></section><RunTrace v-if="selectedRun" :key="`${selectedRun.project_id}:${selectedRun.run_id}`" :run="selectedRun" :config-revision="configRevision"/></template>
           <template v-if="tab === 'settings'"><div class="intro"><div><h2>模型配置</h2></div></div><div class="layout-two"><section class="panel"><div class="panel-head"><h2>模型连接</h2></div><div class="panel-body"><p v-if="config.agent_config" class="note amber">当前配置引用独立模型文件 {{ config.agent_config }}。连接信息在该文件中配置，下方可调整额度和超时；保存时会生成新配置，保留原文件。</p><template v-else><div class="field"><label for="model-mode">模型模式</label><select id="model-mode" v-model="model.mode" :disabled="locked"><option value="disabled">关闭模型，暂不启动自主构建</option><option value="metadata_only">仅元数据，不向模型发送样本</option><option value="in_environment">环境内模型，可使用受限样本</option><option value="approved_external">已批准的外部模型</option></select></div><div class="field"><label for="model-url">服务 Base URL</label><input id="model-url" v-model="model.base_url" :disabled="locked" placeholder="https://model.example.com/v1" autocomplete="off"/><p class="field-hint">使用兼容 Chat Completions 的地址；不要在 URL 中包含密钥。</p></div><div class="two-fields"><div class="field"><label for="model-name">模型名称</label><input id="model-name" v-model="model.model" :disabled="locked" placeholder="模型服务提供的名称"/></div><div class="field"><label for="model-key">API key</label><input id="model-key" v-model="modelKey" :disabled="locked" type="password" autocomplete="new-password" :placeholder="credentials.model ? '已在本机保存，留空保留' : credentials.model_environment ? '服务器已配置，可留空' : '填写模型服务的 API key'"/></div></div><p class="credential-status field-hint"><span class="badge" :class="credentials.model || credentials.model_environment ? 'green' : ''">{{ credentials.model ? '已在本机保存密钥' : credentials.model_environment ? '已配置服务器环境变量' : '尚未配置密钥' }}</span><button v-if="credentials.model || credentials.model_error" class="text-button" :disabled="locked" @click="clearModelCredential">清除密钥</button></p><p v-if="credentials.model_error" class="note amber" role="alert">{{ new ApiError(credentials.model_error).message }}</p><details class="model-advanced"><summary>使用服务器环境变量（可选）</summary><div class="field"><label for="model-key-env">API key 环境变量名</label><input id="model-key-env" v-model="model.api_key_env" :disabled="locked" placeholder="LIGHTGRAPH_API_KEY" autocomplete="off"/></div></details><label v-if="internalHttpEndpoint" class="checkbox-line"><input id="model-allow-http" v-model="model.allow_insecure_http" type="checkbox" :disabled="locked"/>允许使用此内部 HTTP 服务</label></template>
 <div class="field"><label for="construction-target">构建结果</label><select id="construction-target" v-model="constructionTarget" :disabled="locked"><option value="instances">生成实例图谱</option><option value="structure">仅生成结构与映射</option></select><p class="field-hint">结构与映射可以单独保存和发布；这不代表具体节点、关系或全部数据已经验证。</p></div>
 <div class="field"><label for="max-db-queries">数据查询次数上限</label><label class="checkbox-line"><input id="query-count-unlimited" v-model="queryCountUnlimited" type="checkbox" :disabled="locked"/>不限次数</label><input id="max-db-queries" type="number" min="1" step="1" :value="maxDbQueries ?? ''" :disabled="locked || queryCountUnlimited" placeholder="填写正整数" @input="maxDbQueries = ($event.target as HTMLInputElement).value === '' ? null : Number(($event.target as HTMLInputElement).value)"/><p class="field-hint">所有数据来源共用，包括元数据与事务控制查询。不限次数仍受单次查询超时、整次运行时限和数据量限制。</p></div>

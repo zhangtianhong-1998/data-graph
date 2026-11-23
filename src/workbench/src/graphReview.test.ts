@@ -146,6 +146,9 @@ describe('业务图来源与归并裁决', () => {
     expect(node.querySelector('title')?.textContent).toContain(caption)
     node.dispatchEvent(new MouseEvent('click', { bubbles: true })); await nextTick()
     expect(root.querySelector('.detail-name')?.textContent).toBe(caption)
+    const raw = root.querySelector<HTMLDetailsElement>('.graph-detail .technical-details')!
+    expect(raw.querySelector('pre')).toBeNull()
+    raw.open = true; raw.dispatchEvent(new Event('toggle')); await nextTick()
     expect(root.querySelector('.detail-code')?.textContent).toContain('A/M0/P1')
     const input = root.querySelector<HTMLInputElement>('[aria-label="搜索图节点"]')!
     input.value = '占用'; input.dispatchEvent(new Event('input', { bubbles: true })); await nextTick()
@@ -322,13 +325,27 @@ describe('业务图来源与归并裁决', () => {
     expect(root.textContent).toContain('重复名称列尚未通过共享编码核验')
     expect(root.textContent).not.toContain('秘密源值')
   })
+  it('切换节点和关闭详情时取消上一次来源读取', async () => {
+    api.request.mockImplementation(() => new Promise(() => {}))
+    mount(GraphCanvas, { graph, layer: 'business', projectId: 'p' })
+    const nodes = root.querySelectorAll<SVGGElement>('.graph-node')
+    nodes[0]!.dispatchEvent(new MouseEvent('click')); await nextTick()
+    const first = api.request.mock.calls.at(-1)![1].signal
+    nodes[1]!.dispatchEvent(new MouseEvent('click')); await nextTick()
+    const second = api.request.mock.calls.at(-1)![1].signal
+    expect(first.aborted).toBe(true); expect(second.aborted).toBe(false)
+    root.querySelector<HTMLButtonElement>('.graph-detail [aria-label="关闭详情"]')!.click()
+    expect(second.aborted).toBe(true)
+  })
   it('显示候选关系状态，键盘选中后按 fact ID 读取授权支持', async () => {
     api.request.mockResolvedValue({ facts: [{ id: 'edge1', fact_kind: 'Edge', payload: graph.edges[0], status: 'candidate' }], supports: [{ id: 'support', fact_id: 'edge1', status: 'candidate', origin: 'source_query', source_binding: 'people.code → family.parent_code', rule_id: 'r', rule_revision: 3, publication_id: 'pub', scope_ref: 'public', document_ref: 'doc:family' }], rules: [{ identity_columns: ['code', 'name'] }], next_offset: null, supports_truncated: false })
     mount(GraphCanvas, { graph, layer: 'business', projectId: 'p', includeCandidates: true })
     const edge = root.querySelector<SVGGElement>('.graph-edge')!
     expect(edge.getAttribute('aria-label')).toContain('候选'); edge.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
     await vi.waitFor(() => expect(root.querySelector('[aria-label="来源支持"]')?.textContent).toContain('people.code → family.parent_code'))
-    expect(api.request).toHaveBeenCalledWith('/projects/p/graph/details?fact_id=edge1&include_candidates=true&offset=0')
+    expect(api.request).toHaveBeenCalledWith('/projects/p/graph/details?fact_id=edge1&include_candidates=true&offset=0', { signal: expect.any(AbortSignal) })
+    const evidence = [...root.querySelectorAll<HTMLDetailsElement>('.technical-details')].find(node => node.querySelector('summary')?.textContent === '来源标识与引用')!
+    evidence.open = true; evidence.dispatchEvent(new Event('toggle')); await nextTick()
     expect(root.querySelector('.graph-detail')?.textContent).toContain('候选'); expect(root.textContent).toContain('doc:family'); expect(root.textContent).toContain('字段映射与语义依据')
   })
   it('关联列表一次读取页外端点名称，属性与来源默认按表展示，技术ID可展开', async () => {
@@ -354,6 +371,9 @@ describe('业务图来源与归并裁决', () => {
     await vi.waitFor(() => expect(root.querySelector('.graph-detail h2[title]')?.textContent).toBe('经营支撑关系'))
     expect(root.querySelector('.relation-endpoints')?.textContent).toBe('经营利润 → 销售收入')
     expect(root.querySelector('.graph-detail .property-table')?.textContent).toContain('来源层位')
+    const raw = root.querySelector<HTMLDetailsElement>('.graph-detail .technical-details')!
+    expect(raw.querySelector('pre')).toBeNull()
+    raw.open = true; raw.dispatchEvent(new Event('toggle')); await nextTick()
     expect(root.querySelector('.graph-detail .technical-details')?.textContent).toContain('long_target_hash')
   })
   it('未知关系不猜测中文语义，明确提示缺少定义；长定义缩短显示并保留完整说明', async () => {

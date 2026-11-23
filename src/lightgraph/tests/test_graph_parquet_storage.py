@@ -40,6 +40,7 @@ def test_exact_roundtrip_and_queryable_columns_across_batches(tmp_path, monkeypa
     assert loaded == before == original
     assert digest(loaded) == digest(original)
     assert graph_storage._graph_digest(loaded) == digest(loaded)
+    assert graph_storage._graph_digest(loaded, "workflow_merge_v2", "域") == digest("workflow_merge_v2", "域", loaded)
     assert "label" not in loaded["nodes"][2]
     assert loaded["nodes"][1]["label"] is None
     assert [row["id"] for row in loaded["nodes"]] == ["n2", "n1", "n3"]

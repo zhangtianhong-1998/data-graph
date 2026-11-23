@@ -1,8 +1,10 @@
 """Authorized graph views stay in memory and can be reopened without YAML."""
+import json
 import threading
 
 import pytest
 
+from lightgraph.web import graph_view_cache as cache
 from lightgraph.web.graph_view_cache import (
     clear_graph_views, flush_graph_views, load_graph_view, view_token,
 )
@@ -106,3 +108,52 @@ def test_corrupt_disk_copy_is_ignored(tmp_path):
     clear_graph_views()
     load_graph_view(tmp_path, current, loader)
     assert calls == 2
+
+
+def test_oversize_refresh_stops_early_and_preserves_previous_complete_cache(tmp_path, monkeypatch):
+    previous = key(tmp_path / 'graph.yaml')
+    old_view = {'nodes': [{'id': 'n'}], 'edges': [], 'status': 'ok'}
+    load_graph_view(tmp_path, previous, lambda: (old_view, 'v1'))
+    flush_graph_views()
+    current = {**previous, 'mtime_ns': '11'}
+    encoded = []
+    dumps = json.dumps
+
+    def track(value, **kwargs):
+        if 'row' in value:
+            encoded.append(value['row'])
+        return dumps(value, **kwargs)
+
+    monkeypatch.setattr(cache, 'MAX_CACHE_BYTES', 1500)
+    monkeypatch.setattr(cache.json, 'dumps', track)
+    graph = {'nodes': [{'row': i, 'label': '码' * 200} for i in range(100)], 'edges': []}
+    assert load_graph_view(tmp_path, current, lambda: (graph, 'v2'))[1] == 'v2'
+    flush_graph_views()
+    assert 0 < len(encoded) < 5
+    assert list(tmp_path.glob('.view-*')) == []
+    clear_graph_views()
+    assert load_graph_view(tmp_path, previous, lambda: pytest.fail('old cache overwritten')) == (old_view, 'v1')
+
+
+def test_switching_large_views_evicts_older_versions_and_skips_evicted_writes(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    writes = []
+
+    def write(directory, key, value):
+        writes.append(value[1])
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(cache, 'MAX_CACHED_RECORDS', 3)
+    monkeypatch.setattr(cache, '_write_disk', write)
+    graph = {'nodes': [{'id': 'one'}, {'id': 'two'}], 'edges': []}
+    try:
+        for revision in ('v1', 'v2', 'v3'):
+            load_graph_view(tmp_path, key(tmp_path / revision), lambda: (graph.copy(), revision))
+            assert entered.wait(5)
+    finally:
+        release.set()
+        flush_graph_views()
+    assert writes == ['v1', 'v3']
+    reloaded = load_graph_view(tmp_path, key(tmp_path / 'v2'), lambda: (graph.copy(), 'rebuilt'))
+    assert reloaded[1] == 'rebuilt'

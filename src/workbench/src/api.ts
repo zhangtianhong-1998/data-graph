@@ -28,7 +28,7 @@ const messages: Record<string, string> = {
   workflow_partial_artifact_unverified: '缺少可验证的部分发布记录，已保留原项目图。',
   workflow_checkpoint_immutable: '同一运行已有不同的节点存档，请用新的运行恢复。',
   network_unavailable: '无法连接服务，请确认后端已启动。', invalid_response: '服务返回的内容无法读取，请刷新后重试。',
-  request_timeout: '请求超时，请检查后端服务、数据库地址和网络后重试。',
+  request_timeout: '请求超时，未能在时限内读取完整响应。',
   request_cancelled: '请求已取消。',
   invalid_model_limits: '模型额度配置无效，请检查输入、输出、超时和可选字节限制。',
   run_trace_not_found: '此运行没有可导出的轨迹，可能未记录或已被手动清理。',

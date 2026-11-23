@@ -208,3 +208,43 @@ def test_old_harness_pruning_is_reclassified_without_changing_export(client):
     assert client.get(path+'?view=all&offset=23').json()['events'][0]['data']['source_event_seqs'] == [13]
     assert client.get(path+'/export').content == before
     assert sink.path.read_bytes() == before
+
+
+def test_summary_keeps_context_and_reads_only_the_requested_complete_event(client):
+    rid, _, sink = seed(client)
+    payload = {'call': {'name': 'lookup', 'input': 'a' * 100000}, 'task': 'T0_discovery', 'attempt': 1}
+    sink('tool_call', payload)
+    path = f'/api/projects/p/runs/{rid}/trace?view=agent&offset=23&limit=1'
+    summary = client.get(path + '&summary=true')
+    assert len(summary.content) < 1024
+    event, = summary.json()['events']
+    assert event['seq'] == 24 and event['data'] == {'task': 'T0_discovery', 'attempt': 1, 'name': 'lookup'}
+    complete, = client.get(path).json()['events']
+    assert complete == {**event, 'data': payload}
+
+
+def test_cached_deep_trace_page_seeks_and_rechecks_changed_indexes(client, monkeypatch):
+    from lightgraph.web import run_traces
+    rid, _, sink = seed(client)
+    for number in range(300):
+        sink('model_request' if number % 2 == 0 else 'progress', {})
+    path = f'/api/projects/p/runs/{rid}/trace?view=agent&offset=128&limit=1'
+    value = client.get(path).json()
+    seen = []
+    original_loads = json.loads
+
+    def counted(data, *args, **kwargs):
+        if isinstance(data, bytes) and b'"length"' in data and b'"offset"' in data:
+            seen.append(data)
+        return original_loads(data, *args, **kwargs)
+    monkeypatch.setattr(run_traces.json, 'loads', counted)
+    assert client.get(path).json() == value
+    assert len(seen) == 1
+    sink('model_response', {'ok': True})
+    value = client.get(path).json()
+    assert value['recorded_events'] == 324
+    assert value['total_events'] == 174
+    assert len(seen) > 300
+    with sink.index_path.open('ab') as stream:
+        stream.write(b'{}\n')
+    assert client.get(path).status_code == 400

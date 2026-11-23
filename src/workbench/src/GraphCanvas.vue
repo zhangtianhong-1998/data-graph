@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { request, projectPath } from './api'
 import type { Graph, GraphNode, GraphEdge, BusinessContext } from './types'
 import { fitCamera, zoomCamera } from './graphViewport'
@@ -26,14 +26,17 @@ function graphUrl(endpoint: string, params: URLSearchParams) {
 }
 const search = ref('')
 const selectedKind = ref('')
-const remote = ref<Graph | null>(null), pageLoading = ref(false), pageError = ref('')
-const neighborhood = ref<{ center: GraphNode; graph: Graph; traversal: NeighborhoodTraversal; preview?: boolean } | null>(null)
+const remote = shallowRef<Graph | null>(null), pageLoading = ref(false), pageError = ref('')
+const neighborhood = shallowRef<{ center: GraphNode; graph: Graph; traversal: NeighborhoodTraversal; preview?: boolean } | null>(null)
 const baseGraph = computed(() => remote.value ?? props.graph)
 const graph = computed(() => neighborhood.value?.graph ?? baseGraph.value)
 const fullTransport = computed(() => !!props.projectId && props.graph.complete_batches === true)
+// Beyond twenty 1,000-record pages, open a bounded preview and fetch the full graph on demand.
+const deferFullGraph = computed(() => Number(props.graph.total_nodes || 0) + Number(props.graph.total_edges || 0) > 20_000)
 const fullLoading = ref(false), fullPaused = ref(false), fullError = ref('')
 let fullController: AbortController | undefined, fullEpoch = 0, fullTransfer: GraphTransfer | undefined
 let cameraTouched = false
+let pendingPreviewRefresh = false
 const fullComplete = computed(() => loadedGraphIsComplete(baseGraph.value))
 const fullProgress = computed(() => {
   const total = Number(baseGraph.value.total_nodes || 0) + Number(baseGraph.value.total_edges || 0)
@@ -44,6 +47,9 @@ async function loadFullGraph(restart = false) {
   if (!props.projectId) return
   const epoch = ++fullEpoch
   fullController?.abort(); fullController = new AbortController()
+  if (deferFullGraph.value && !neighborhood.value) {
+    pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); pageLoading.value = false; clearFilters()
+  }
   if (restart || !fullTransfer) fullTransfer = newGraphTransfer()
   fullLoading.value = true; fullPaused.value = false; fullError.value = ''
   try {
@@ -53,9 +59,7 @@ async function loadFullGraph(restart = false) {
     if (epoch === fullEpoch && !neighborhood.value && !cameraTouched) { await nextTick(); fit() }
   } catch (error) {
     if (epoch !== fullEpoch) return
-    if (invalidatesGraph(error)) {
-      remote.value = { nodes: [], edges: [], truncated: true }; neighborhood.value = null; clearSelection(); savedScene = null; fullTransfer = undefined
-    }
+    if (invalidatesGraph(error)) discardGraph()
     fullError.value = error instanceof Error ? error.message : '图谱读取失败，已加载的数据保留，可继续读取。'
   } finally { if (epoch === fullEpoch) fullLoading.value = false }
 }
@@ -77,7 +81,7 @@ async function loadScene(options: { focus?: string; q?: string; kind?: string; m
   pageLoading.value = true; pageError.value = ''
   const focus = options.focus || ''
   const start = options.more ? expansionOffsets.value.get(focus) || 0 : 0
-  const params = new URLSearchParams({ layer: props.layer, include_candidates: String(props.includeCandidates === true), offset: String(start), limit: focus ? '240' : '1000', q: options.q || '', kind: options.kind || '', focus })
+  const params = new URLSearchParams({ layer: props.layer, include_candidates: String(props.includeCandidates === true), offset: String(start), limit: focus || (options.replace && !options.q && !options.kind) ? '240' : '1000', q: options.q || '', kind: options.kind || '', focus })
   try {
     let value = await request<Graph>(graphUrl('graph', params), { signal: sceneController.signal })
     if (epoch !== pageGeneration) return
@@ -106,18 +110,22 @@ async function loadScene(options: { focus?: string; q?: string; kind?: string; m
       await nextTick(); if (epoch === pageGeneration) focusNode(center)
     }
     else if (!focus) { await nextTick(); fit() }
-  } catch (e) { if (epoch === pageGeneration) pageError.value = e instanceof Error ? e.message : '图谱读取失败' }
-  finally { if (epoch === pageGeneration) pageLoading.value = false }
+  } catch (error) {
+    if (epoch === pageGeneration) {
+      if (invalidatesGraph(error)) { pauseFullGraph(); discardGraph() }
+      pageError.value = error instanceof Error ? error.message : '图谱读取失败'
+    }
+  } finally { if (epoch === pageGeneration) pageLoading.value = false }
 }
 async function expandNode() {
   if (!selected.value || !serverPaging.value) return
   const id = selected.value.id
   await loadScene({ focus: id, more: expansionOffsets.value.has(id) })
 }
-const selected = ref<GraphNode | null>(null)
-const selectedEdge = ref<GraphEdge | null>(null)
+const selected = shallowRef<GraphNode | null>(null)
+const selectedEdge = shallowRef<GraphEdge | null>(null)
 type Provenance = { facts: Array<{ id: string; fact_kind: string; status: string; payload: Record<string, unknown> }>; supports: Array<{ id: string; fact_id: string; status: string; origin: string; source_binding: string; rule_id: string; rule_revision?: number; publication_id?: string; document_ref?: string; scope_ref: string; binding?: { source_kind?: string; evidence_refs?: string[]; metadata_endpoint?: MetadataEndpoint; constant_properties?: Record<string, unknown>; row_context?: { values?: Record<string, unknown> }; lookup_matches?: Array<Record<string, unknown>> } }>; rules: Array<Record<string, unknown>>; nodes?: GraphNode[]; standard_nodes?: StandardNode[]; display_schema?: DisplaySchema; next_offset: number | null; supports_truncated: boolean; total_incident_edges?: number | null }
-const details = ref<Provenance | null>(null), detailsLoading = ref(false), detailsError = ref('')
+const details = shallowRef<Provenance | null>(null), detailsLoading = ref(false), detailsError = ref('')
 const detailNodes = ref<Record<string, GraphNode>>({})
 const detailSchema = ref<DisplaySchema>({})
 const vocabulary = computed(() => mergeDisplaySchema(graph.value.display_schema, detailSchema.value))
@@ -138,16 +146,19 @@ const sourceSummary = (rule: Record<string, unknown>) => Object.fromEntries(Obje
 const lookupValues = (match: Record<string, unknown>) => ({ '关联端点': match.endpoint === 'source' ? '关系起点' : '关系终点', '匹配来源': match.source, '本行字段': match.input_columns, '本行取值': match.input_values, '目标匹配字段': match.match_columns, '目标身份字段': match.key_columns, '匹配后的身份': match.resolved_key, '可见范围': match.scope_ref })
 const mappingValues = (rule: Record<string, unknown>) => Object.fromEntries(['identity_columns', 'namespace_columns', 'attribute_columns', 'hierarchy_columns', 'reference_columns', 'concept_columns', 'source_columns', 'scope_columns', 'label_column', 'constant_properties', 'context_columns', 'endpoint_lookups'].filter(key => rule[key] && (typeof rule[key] === 'string' || Object.keys(rule[key] as object).length)).map(key => [key, rule[key]]))
 let detailGeneration = 0
+let detailController: AbortController | undefined
 const statusName = (value?: unknown) => ({ accepted: '已接受', candidate: '候选', unresolved: '未决', conflict: '冲突' }[String(value)] || '状态未提供')
 async function loadDetails(more = false) {
   const selector = selectedEdge.value?.id ? `fact_id=${encodeURIComponent(String(selectedEdge.value.id))}` : selected.value ? `entity_id=${encodeURIComponent(selected.value.id)}` : ''
   const epoch = ++detailGeneration
+  detailController?.abort()
   if (!props.projectId || !selector) { details.value = null; return }
   const offset = more ? details.value?.next_offset : 0
   detailsLoading.value = true; detailsError.value = ''
-  if (!more) details.value = null
+  if (!more) { details.value = null; detailNodes.value = {}; detailSchema.value = {} }
+  detailController = new AbortController()
   try {
-    const value = await request<Provenance>(graphUrl('graph/details', new URLSearchParams(`${selector}&include_candidates=${props.includeCandidates === true}&offset=${offset || 0}`)))
+    const value = await request<Provenance>(graphUrl('graph/details', new URLSearchParams(`${selector}&include_candidates=${props.includeCandidates === true}&offset=${offset || 0}`)), { signal: detailController.signal })
     if (epoch !== detailGeneration) return
     for (const node of value.nodes || []) detailNodes.value[node.id] = node
     const fullNode = selected.value && value.nodes?.find(node => node.id === selected.value!.id)
@@ -185,7 +196,11 @@ function nodeDoubleClick(node: GraphNode) {
   void showTwoHops(node)
 }
 function selectEdge(edge: GraphEdge) { selectedEdge.value = edge; void loadDetails() }
-function clearSelection() { detailGeneration++; selected.value = null; selectedEdge.value = null; details.value = null; detailsError.value = ''; detailsLoading.value = false; detailNodes.value = {}; detailSchema.value = {} }
+function clearSelection() { detailGeneration++; detailController?.abort(); selected.value = null; selectedEdge.value = null; details.value = null; detailsError.value = ''; detailsLoading.value = false; detailNodes.value = {}; detailSchema.value = {} }
+function discardGraph() {
+  remote.value = { nodes: [], edges: [], truncated: true }; neighborhood.value = null
+  fullTransfer = undefined; savedScene = null; expansionOffsets.value.clear(); clearSelection()
+}
 function clearFilters() {
   resettingSearch = true; search.value = ''; selectedKind.value = ''; searchMatches.value = null; searchMatchCount.value = null; resettingSearch = false
 }
@@ -227,7 +242,7 @@ async function showTwoHops(node: GraphNode, traversal: NeighborhoodTraversal = n
     neighborhood.value = { center, graph: value, traversal }; selectNode(center)
     await nextTick(); if (epoch === pageGeneration) fit()
   } catch (error) { if (epoch === pageGeneration) {
-    if (invalidatesGraph(error)) { pauseFullGraph(); remote.value = { nodes: [], edges: [], truncated: true }; neighborhood.value = null; fullTransfer = undefined; clearSelection() }
+    if (invalidatesGraph(error)) { pauseFullGraph(); discardGraph() }
     pageError.value = error instanceof Error ? error.message : '两跳关联读取失败'
   } }
   finally { if (epoch === pageGeneration) pageLoading.value = false }
@@ -259,7 +274,7 @@ const filtered = computed(() => graph.value.nodes.filter(n =>
     nodeSearchText(n).includes(search.value.toLocaleLowerCase())))))
 // Searching highlights and locates without removing the surrounding graph.
 const visible = computed(() => graph.value.nodes)
-const positions = ref<Map<string, Point>>(new Map())
+const positions = shallowRef<Map<string, Point>>(new Map())
 const points = computed(() => positions.value)
 const bounds = computed(() => sceneBounds(points.value))
 const largeScene = computed(() => visible.value.length > 300)
@@ -479,10 +494,11 @@ function paint() {
 }
 watch([bitmap, positions, zoom, offset, viewport, selected, selectedEdge, search, selectedKind], paint, { flush: 'post' })
 watch([() => props.graph, () => props.layer, () => props.projectId, () => props.includeCandidates, () => props.businessContext, snapshotVersion], () => {
+  pendingPreviewRefresh = false
   fullEpoch++; fullController?.abort(); fullTransfer = undefined; fullLoading.value = false; fullPaused.value = false; fullError.value = ''; cameraTouched = false
   pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); neighborhood.value = null; savedScene = null; remote.value = null; pageLoading.value = false; positions.value = placeNodes({ ...props.graph, nodes: props.graph.nodes })
   search.value = ''; searchMatches.value = null; searchMatchCount.value = null; selectedKind.value = ''; expansionOffsets.value.clear(); clearSelection(); reset()
-  if (fullTransport.value && !loadedGraphIsComplete(props.graph) && !props.loading) void loadFullGraph()
+  if (!deferFullGraph.value && fullTransport.value && !loadedGraphIsComplete(props.graph) && !props.loading) void loadFullGraph()
   else if (!fullTransport.value && serverPaging.value && Number(props.graph.total_nodes) <= 1000 && props.graph.next_offset != null) void loadScene()
 }, { immediate: true })
 // A configuration revision can narrow authorization without changing the
@@ -495,16 +511,23 @@ watch(() => props.configRevision, (revision, previous) => {
   pageLoading.value = false; pageError.value = ''; neighborhood.value = null; savedScene = null
   remote.value = { nodes: [], edges: [], truncated: true }
   positions.value = new Map(); expansionOffsets.value.clear(); clearFilters(); clearSelection(); reset()
-  if (fullTransport.value && !props.loading) void loadFullGraph(true)
+  pendingPreviewRefresh = fullTransport.value && deferFullGraph.value && !!props.loading
+  if (fullTransport.value && !props.loading) {
+    if (deferFullGraph.value) void loadScene({ replace: true })
+    else void loadFullGraph(true)
+  }
 }, { flush: 'sync' })
 watch(() => props.loading, loading => {
-  if (!loading && fullTransport.value && !fullTransfer && !fullPaused.value && !fullLoading.value && !loadedGraphIsComplete(baseGraph.value)) void loadFullGraph()
+  if (!loading && pendingPreviewRefresh) { pendingPreviewRefresh = false; void loadScene({ replace: true }); return }
+  if (!loading && !deferFullGraph.value && fullTransport.value && !fullTransfer && !fullPaused.value && !fullLoading.value && !loadedGraphIsComplete(baseGraph.value)) void loadFullGraph()
 })
 watch([search, selectedKind], () => {
   if (resettingSearch) return
   if (neighborhood.value) { if (filtered.value[0]) focusNode(filtered.value[0]); return }
   pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); pageLoading.value = false; searchMatches.value = null; searchMatchCount.value = null
-  if (!fullTransport.value && serverPaging.value && (search.value || selectedKind.value)) searchTimer = setTimeout(() => { void loadScene({ q: search.value, kind: selectedKind.value }) }, 200)
+  if (serverPaging.value && (!fullTransport.value || (deferFullGraph.value && !fullComplete.value && !fullLoading.value)) && (search.value || selectedKind.value)) {
+    searchTimer = setTimeout(() => { void loadScene({ q: search.value, kind: selectedKind.value, replace: deferFullGraph.value }) }, 200)
+  }
   else if (filtered.value[0]) focusNode(filtered.value[0])
 }, { flush: 'sync' })
 watch(canvas, element => {
@@ -521,7 +544,7 @@ watch(canvas, element => {
   observer.observe(element); void nextTick(fit)
 }, { flush: 'post' })
 onUnmounted(() => {
-  detailGeneration++; pageGeneration++; fullEpoch++
+  detailGeneration++; detailController?.abort(); pageGeneration++; fullEpoch++
   fullController?.abort(); sceneController?.abort(); clearTimeout(searchTimer); observer?.disconnect()
 })
 </script>
@@ -548,7 +571,7 @@ onUnmounted(() => {
         <progress :value="fullComplete ? 100 : fullProgress" max="100" :aria-label="fullComplete ? '全图加载完成' : '全图加载进度'"/>
         <span role="status">{{ fullComplete ? '已加载完整图谱' : fullLoading ? '正在加载全图' : fullPaused ? '全图加载已暂停，当前仅为部分数据' : '全图尚未加载完整' }} · 节点 {{ baseGraph.nodes.length }} / {{ baseGraph.total_nodes ?? '待确认' }} · 关系 {{ baseGraph.edges.length }} / {{ baseGraph.total_edges ?? '待确认' }}</span>
         <button v-if="fullLoading" class="btn small" @click="pauseFullGraph">暂停加载</button>
-        <button v-else-if="!fullComplete" class="btn small" @click="loadFullGraph()">{{ fullError ? '重试加载' : '继续加载' }}</button>
+        <button v-else-if="!fullComplete" class="btn small" @click="loadFullGraph()">{{ fullError ? '重试加载' : fullPaused ? '继续加载' : '加载全图' }}</button>
         <button v-if="fullError" class="btn small" @click="loadFullGraph(true)">重新加载全图</button>
         <p v-if="fullError" role="alert">{{ fullError }}</p>
       </div>

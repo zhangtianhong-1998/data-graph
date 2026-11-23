@@ -1,13 +1,109 @@
-"""Exercise the actual CSV -> two workers -> merge -> history -> resume HTTP path."""
+"""Exercise CSV workers, merge, history and resume through the workbench HTTP endpoints."""
 import json
 import subprocess
+import threading
 import time
 from pathlib import Path
 import runpy
 
-from lightgraph.tests.construction_worker_fixture import install_scripted_worker
+from lightgraph.tests.construction_worker_fixture import hierarchy_proposal, install_scripted_worker
 from lightgraph.tests.test_web_api import client, create, upload
 from lightgraph.tests.test_web_execution import wait_run
+
+
+def test_rerun_deterministic_merge_via_http_replays_four_checkpoints_before_publication(client, monkeypatch):
+    from lightgraph.construction import checkpoints, merger
+
+    install_scripted_worker(monkeypatch, draft_factory=hierarchy_proposal)
+    create(client)
+    api = '/api/projects/alpha'
+    upload(client, 'tree.csv', b'parent_code,parent_name,child_code,child_name\nP,Root,A,One\nP,Root,B,Two\n')
+    cfg = client.get(api + '/config').json()
+    cfg['goal']['purpose'] = '合并目录树'
+    cfg['model'].update(mode='in_environment', model='scripted-test', base_url='http://127.0.0.1:9999/v1')
+    units = ['extract_' + str(i) for i in range(1, 5)]
+    cfg['workflow'] = {'enabled': True, 'max_parallel_workers': 2,
+        'units': [{'unit_id': uid, 'source_ids': [cfg['sources'][0]['id']], 'goal_markdown': kind}
+                  for uid, kind in zip(units, ['Entry', 'Term', 'Subject', 'Heading'])],
+        'merge_nodes': [{'node_id': 'merge_1', 'merge_mode': 'deterministic'}],
+        'edges': [{'edge_id': uid, 'source': uid, 'target': 'merge_1'} for uid in units]}
+    assert client.put(api + '/config', json=cfg).is_success
+    manager = client.app.state.manager
+
+    def finish(response):
+        assert response.status_code == 202, response.text
+        return wait_run(manager, 'alpha', response.json()['run_id'], timeout=60)
+
+    # Simulate the historical merge implementation; leave the actual four leaf
+    # workers, checkpoints, policy and subsequent HTTP rerun unchanged.
+    merge = merger.merge_construction_graphs
+    with monkeypatch.context() as old:
+        old.setattr(merger, 'merge_construction_graphs',
+                    lambda *args, **kwargs: merge(*args, **kwargs, recognize_source_replays=False))
+        original = finish(client.post(api + '/runs'))
+    old_state = original['workflow_state']
+    assert original['status'] == 'completed' and old_state['merge_nodes']['merge_1']['nodes'] == 12
+    assert old_state['merge']['nodes'] == 12 and old_state['merge']['edges'] == 8
+    route = api + '/runs/' + original['run_id'] + '/resume'
+    payload = {'action': 'rerun_node', 'from_node_id': 'merge_1', 'verify_checkpoints_in_background': True}
+    headers = {'If-Match': client.get(api + '/config').headers['etag']}
+
+    # Holding a physical checkpoint read must not hold the HTTP request.
+    release = threading.Event()
+    read = checkpoints.load_checkpoint
+    reads = []
+
+    def load_once(output, record):
+        reads.append(record['node_id'])
+        assert release.wait(10), 'checkpoint body read on request thread'
+        return read(output, record)
+
+    monkeypatch.setattr(checkpoints, 'load_checkpoint', load_once)
+
+    def unexpected_worker(*args, **kwargs):
+        raise AssertionError('merge-only rerun started an extract worker')
+    monkeypatch.setattr(subprocess, 'Popen', unexpected_worker)
+    try:
+        accepted = client.post(route, json=payload, headers=headers)
+        assert accepted.status_code == 202, accepted.text
+    finally:
+        release.set()
+    rerun = finish(accepted)
+    state = rerun['workflow_state']
+    assert sorted(reads) == units and rerun['status'] == 'completed', state
+    assert state['rerun_nodes'] == ['merge_1'] and state['reused_nodes'] == units
+    assert state['resumed_from_run_id'] == original['run_id']
+    assert all(state['artifacts'][uid] == old_state['artifacts'][uid] for uid in units)
+    artifact = state['artifacts']['merge_1']
+    assert artifact['artifact_id'] != old_state['artifacts']['merge_1']['artifact_id']
+    assert artifact['upstream_artifacts'] == [state['artifacts'][uid]['artifact_id'] for uid in units]
+    assert all(state['units'][uid]['model_calls'] == 0 for uid in units)
+    node = state['merge_nodes']['merge_1']
+    counts = node['merge_counts']
+    assert node['model_calls'] == 0 and node['artifact_status'] == 'committed'
+    assert counts['source_replay_status'] == 'ran'
+    assert (counts['input_nodes'], counts['hierarchy_replay_collapsed_nodes'], node['nodes'], node['edges']) == (12, 9, 3, 8)
+    assert state['merge']['nodes'] == 3 and state['merge']['edges'] == 8
+    current = client.get(api + '/graph').json()
+    assert len(current['nodes']) == 3
+    assert client.get(api + '/runs/' + original['run_id']).json()['workflow_state']['merge']['nodes'] == 12
+
+    # Damage a pinned input after a successful run. Content corruption must
+    # fail the accepted run and leave the last good root visible.
+    project = client.app.state.workspace.project_path('alpha')
+    directory = project / original['output_path'] / state['artifacts'][units[0]]['relative_path']
+    (directory / 'nodes.parquet').write_bytes(b'corrupt')
+    failed = finish(client.post(route, json=payload, headers=headers))
+    assert failed['status'] == 'failed' and failed['error_code'] == 'workflow_checkpoint_invalid'
+    assert failed['workflow_state']['units'][units[0]]['error_code'] == 'workflow_checkpoint_invalid'
+    assert 'merge_1' not in failed['workflow_state']['artifacts']
+    assert client.get(api + '/graph').json()['version_id'] == current['version_id']
+    synchronous = client.post(route, json={'action': 'rerun_node', 'from_node_id': 'merge_1'}, headers=headers)
+    assert not synchronous.is_success and 'workflow_checkpoint_invalid' in synchronous.text
+    # A missing required file is catchable before the asynchronous run starts.
+    (directory / 'nodes.parquet').unlink()
+    missing = client.post(route, json=payload, headers=headers)
+    assert not missing.is_success and 'workflow_checkpoint_invalid' in missing.text
 
 
 def test_audit_replays_the_same_three_committed_workers_without_writing(client, monkeypatch, tmp_path):

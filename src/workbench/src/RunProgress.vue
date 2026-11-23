@@ -60,9 +60,10 @@ const labels: Record<string, string> = {
 }
 const levelLabels: Record<string, string> = { info: '信息', warning: '注意', error: '错误' }
 const eventLabel = (event: RunEvent) => labels[event.code] || '运行事件'
+const clockTime = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
 function time(value: string): string {
   const date = new Date(value)
-  return Number.isFinite(date.getTime()) ? date.toLocaleTimeString('zh-CN', { hour12: false }) : '—'
+  return Number.isFinite(date.getTime()) ? clockTime.format(date) : '—'
 }
 function eventCounts(event: RunEvent): string {
   if (typeof event.completed !== 'number' || typeof event.total !== 'number' || event.total < 0) return ''

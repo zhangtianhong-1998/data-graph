@@ -32,7 +32,7 @@ beforeEach(() => {
     if (url.endsWith('/metadata')) return structuredClone(metadata)
     if (url.includes('/metadata/yaml?')) return { files: [{ name: 'tables.yaml', content: 'table: metrics\ncolumns:\n  - metric_code' }] }
     if (url.includes('/graph')) throw new Error('图谱传输暂不可用')
-    if (url.endsWith('/runs')) return { runs: [] }
+    if (url.endsWith('/runs?view=summary')) return { runs: [] }
     if (url.endsWith('/credentials')) return { database_sources: ['warehouse'], model: false }
     if (url.includes('/database/drafts/')) return { saved: false, revision: 0 }
     if (url.endsWith('/database/connections/warehouse')) return { saved: true, connection: {

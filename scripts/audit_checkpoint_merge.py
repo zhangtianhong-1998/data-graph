@@ -379,7 +379,51 @@ def compare_hierarchy_audits(previous, current, output_ids):
             "previous_member_pairs": {k: pair_counts[k] for k in ("retained", "split", "unverified")}}
 
 
-def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False, compare_to=None):
+def _run_summary(run, state, project, node_id):
+    """Inspect committed markers and Parquet footers without materializing or replaying a graph."""
+    from lightgraph.construction.checkpoints import verify_checkpoint_files
+    import pyarrow.parquet as pq
+
+    step = state.get('merge_nodes', {}).get(node_id)
+    if step is None:
+        raise ValueError("所选运行中没有这个合并节点。")
+    artifacts = state.get('artifacts', {})
+    target = artifacts.get(node_id)
+
+    def footer(record):
+        identity = {k: record.get(k) for k in ('run_id', 'node_id', 'artifact_id', 'graph_digest', 'input_digest')}
+        try:
+            location = state.get('artifact_outputs', {}).get(record['node_id'], run['output_path'])
+            path = verify_checkpoint_files(run_output_path(project, location), record)
+            counts = {name: pq.read_metadata(path / (name + '.parquet')).num_rows for name in ('nodes', 'edges')}
+        except LightGraphError as exc:
+            return {**identity, 'read_error': exc.code}
+        except (OSError, ValueError):
+            return {**identity, 'read_error': 'parquet_footer_unreadable'}
+        return {**identity, **counts}
+
+    upstream = {record['artifact_id']: record for record in artifacts.values()}
+    inputs = [footer(upstream[key]) if key in upstream else {'artifact_id': key, 'status': 'not_in_run_state'}
+              for key in target['upstream_artifacts']] if target else []
+    return {
+        'mode': 'recorded_run_and_parquet_footers', 'run_id': run['run_id'], 'run_status': run.get('status'),
+        'resumed_from_run_id': state.get('resumed_from_run_id'), 'resume_action': state.get('resume_action'),
+        'rerun_nodes': state.get('rerun_nodes'), 'reused_nodes': state.get('reused_nodes'),
+        'node_id': node_id, 'node_status': step.get('status'), 'artifact_status': step.get('artifact_status'),
+        'error_code': step.get('error_code') or run.get('error_code'),
+        'merge_mode': step.get('merge_mode'), 'plan_mode': state.get('plan_mode'), 'terminal_ids': state.get('terminal_ids'),
+        'configured_inputs': [e['source'] for e in (state.get('plan') or {}).get('edges', []) if e['target'] == node_id],
+        'reported_nodes': step.get('nodes'), 'reported_edges': step.get('edges'),
+        'merge_counts': step.get('merge_counts'), 'delta_merge_counts': step.get('delta_merge_counts'),
+        'inputs': inputs,
+        'output': footer(target) if target else None,
+        'publication': {k: v for k, v in (state.get('merge') or {}).items()
+                        if k in ('status', 'mode', 'publication_status', 'published_artifact_id', 'nodes', 'edges', 'error_code')},
+    }
+
+
+def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False, compare_to=None,
+          run_summary=False):
     """Use the run's committed inputs and policy, even when the current project has been edited."""
     run_file = Path(run_file)
     run = json.loads(run_file.read_text(encoding="utf-8"))
@@ -390,6 +434,8 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
     state = load_workflow_state(output, run["run_id"])
     if not state or state.get("parent_run_id") != run["run_id"]:
         raise ValueError("缺少这次运行的工作流状态。")
+    if run_summary:
+        return _run_summary(run, state, project, node_id)
     step = state.get("merge_nodes", {}).get(node_id, {})
     if step.get("merge_mode") != "deterministic":
         raise ValueError("请选择一个已提交的确定性合并节点。")
@@ -485,16 +531,18 @@ def main():
     parser.add_argument("run_file", type=Path, help="原项目 runs/run_….json")
     parser.add_argument("--node", default="merge_1", help="要核对的确定性合并节点 ID")
     mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--run-summary", action="store_true", help="只读正式运行记录、检查点标记和 Parquet 行数，不加载图或重放合并")
     mode.add_argument("--observations-only", action="store_true", help="只核查已提交图的实际观测，跳过合并重放")
     mode.add_argument("--include-hierarchy-membership", action="store_true", help="在重放报告中列出层级归并前后的节点 ID")
     parser.add_argument("--compare-hierarchy-audit", type=Path, metavar="AUDIT_JSON",
                         help="与同一批检查点的上一轮完整审计报告逐组比较，并输出本轮成员映射")
     args = parser.parse_args()
-    if args.observations_only and args.compare_hierarchy_audit:
+    if (args.observations_only or args.run_summary) and args.compare_hierarchy_audit:
         parser.error("--compare-hierarchy-audit 需要执行合并重放")
     try:
         report = audit(args.run_file, args.node, observations_only=args.observations_only,
-                       include_hierarchy_membership=args.include_hierarchy_membership, compare_to=args.compare_hierarchy_audit)
+                       include_hierarchy_membership=args.include_hierarchy_membership, compare_to=args.compare_hierarchy_audit,
+                       run_summary=args.run_summary)
     except LightGraphError as exc:
         parser.exit(1, f"检查点或合并未通过校验：{exc.code}\n")
     except (KeyError, OSError, ValueError) as exc:

@@ -39,8 +39,8 @@ beforeEach(() => {
     if (url.endsWith('/credentials')) return response({ database_sources: [], model: false })
     if (url.endsWith('/metadata')) return response({ tables: [], nodes: [], edges: [] })
     if (url.includes('/graph?')) return response({ nodes: [], edges: [] })
+    if (url.endsWith('/runs?view=summary')) return response({ runs: [] })
     if (url.endsWith('/runs')) {
-      if (method === 'GET') return response({ runs: [] })
       runModels.push(structuredClone(config.agent_config ? limits : config.model!))
       return response({ run_id: 'new', project_id: 'p', status: 'completed', stage: 'finished', cleanup_status: 'completed' })
     }
@@ -206,15 +206,11 @@ describe('visible model limits', () => {
     expect(config.model).toMatchObject({ model: 'new-model', max_output_tokens: 65536 })
     expect(root.querySelector('.error-strip')).toBeNull()
   })
-  it('does not block configuration on a pending or failed graph read', async () => {
-    const original = vi.mocked(fetch).getMockImplementation()!
-    let rejectGraph!: (reason: Error) => void
-    vi.mocked(fetch).mockImplementation((input, init) => String(input).includes('/graph?') ? new Promise((_, reject) => { rejectGraph = reject }) : original(input, init))
+  it('opens and saves configuration without requesting a published graph', async () => {
     await mount(); await edit('model-output-tokens', '65536'); button('保存配置').click()
     await vi.waitFor(() => expect(root.textContent).toContain('模型配置已保存'))
-    rejectGraph(new Error('graph unavailable')); await nextTick(); await nextTick()
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes('/graph?'))).toBe(false)
     expect(root.querySelector('.error-strip')).toBeNull()
-    expect(root.querySelector<HTMLInputElement>('#model-output-tokens')!.value).toBe('65536')
   })
   it('does not report a committed config write as failed when credential status cannot refresh', async () => {
     await mount(); await edit('model-output-tokens', '65536')

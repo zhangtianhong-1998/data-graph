@@ -149,7 +149,8 @@ def recover_committed_checkpoint(output_dir, run_id, node_id):
         raise LightGraphError('workflow_checkpoint_invalid') from None
 
 
-def load_checkpoint(output_dir, record):
+def verify_checkpoint_files(output_dir, record) -> Path:
+    """Verify the commit marker and required file locations without decoding the graph."""
     try:
         directory = _directory(output_dir, record['run_id'], record['node_id'], record['graph_kind'])
         path = directory / 'graph.graph'
@@ -157,9 +158,23 @@ def load_checkpoint(output_dir, record):
         if (committed != record or record['artifact_status'] != 'committed'
                 or record['relative_path'] != path.relative_to(output_dir).as_posix()):
             raise ValueError
-        graph = read_graph_record(path)
-        evidence = json.loads((directory / 'evidence.json').read_text('utf-8')) if record['has_evidence'] else {}
-        if (_graph_digest(graph) != record['graph_digest'] or digest(evidence) != record['evidence_digest']
+        files = [path / name for name in ('metadata.yaml', 'nodes.parquet', 'edges.parquet')]
+        if record['has_evidence']:
+            files.append(directory / 'evidence.json')
+        if (not isinstance(record['graph_digest'], str)
+                or any(file.is_symlink() or not file.is_file() for file in files)):
+            raise ValueError
+        return path
+    except (LightGraphError, KeyError, TypeError, ValueError, OSError):
+        raise LightGraphError('workflow_checkpoint_invalid') from None
+
+
+def load_checkpoint(output_dir, record):
+    path = verify_checkpoint_files(output_dir, record)
+    try:
+        graph = read_graph_record(path, expected_digest=record['graph_digest'])
+        evidence = json.loads((path.parent / 'evidence.json').read_text('utf-8')) if record['has_evidence'] else {}
+        if (digest(evidence) != record['evidence_digest']
                 or record['access_fingerprint'] != graph.get('access_fingerprint')):
             raise ValueError
         return {'contributor_id': record['node_id'], 'kind': record['contributor_kind'],

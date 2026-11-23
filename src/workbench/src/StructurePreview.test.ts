@@ -163,7 +163,7 @@ describe('结构方案预览', () => {
       if (path.endsWith('/config')) return { model: { mode: 'disabled' }, goal_markdown: '发现结构', sources: [] }
       if (path.endsWith('/credentials')) return { database_sources: [], model: false }
       if (path.endsWith('/metadata')) return { tables: [], nodes: [], edges: [] }
-      if (path.endsWith('/runs')) return { runs: [] }
+      if (path.endsWith('/runs?view=summary')) return { runs: [] }
       if (path.includes('/graph?')) return { nodes: [], edges: [] }
       if (path.endsWith('/graph/structure')) return result()
       throw new Error(`Unexpected ${path}`)

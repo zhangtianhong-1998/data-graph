@@ -1,4 +1,4 @@
-"""Remember one authorized graph so later pages do not parse it again.
+"""Reuse authorized graph views across page and detail requests.
 
 Published YAML is immutable aside from an in-place replacement, which changes
 the file size or mtime. Callers must not mutate the returned graph.
@@ -6,16 +6,18 @@ the file size or mtime. Callers must not mutate the returned graph.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
-import time
 from collections import OrderedDict
+from itertools import chain
 from pathlib import Path
 from typing import Callable
 
 from lightgraph.contracts import digest
-from lightgraph.runtime.retention import atomic_text
 
 MAX_CACHED_VIEWS = 4
+MAX_CACHED_RECORDS = 100_000
 MAX_CACHE_BYTES = 256 * 1024 * 1024
 Loader = Callable[[], tuple[dict, str]]
 
@@ -23,7 +25,8 @@ _lock = threading.Lock()
 _views: OrderedDict[str, tuple[dict, str]] = OrderedDict()
 _generations: dict[int, str] = {}
 _inflight: dict[str, tuple[threading.Event, dict]] = {}
-_writers: list[threading.Thread] = []
+_pending: OrderedDict[str, tuple[Path, dict]] = OrderedDict()
+_writer: threading.Thread | None = None
 
 
 def view_token(key: dict) -> str:
@@ -46,15 +49,14 @@ def clear_graph_views() -> None:
     with _lock:
         _views.clear()
         _generations.clear()
+        _pending.clear()
 
 
 def flush_graph_views(timeout: float = 30) -> None:
     with _lock:
-        writers = list(_writers)
-    for writer in writers:
+        writer = _writer
+    if writer is not None:
         writer.join(timeout)
-    with _lock:
-        _writers[:] = [writer for writer in _writers if writer.is_alive()]
 
 
 def load_graph_view(directory: Path, key: dict, loader: Loader) -> tuple[dict, str]:
@@ -80,12 +82,14 @@ def load_graph_view(directory: Path, key: dict, loader: Loader) -> tuple[dict, s
         return flight[1]['value']
     try:
         value = _read_disk(directory, key)
-        if value is None:
+        from_disk = value is not None
+        if not from_disk:
             value = loader()
-            _write_later(directory, key, value)
         with _lock:
             _store(token, value)
             flight[1]['value'] = value
+            if not from_disk:
+                _write_later(directory, key, token)
         return value
     except BaseException as error:
         flight[1]['error'] = error
@@ -101,8 +105,15 @@ def _store(token: str, value: tuple[dict, str]) -> None:
     _views.move_to_end(token)
     graph, generation = value
     _generations[id(graph)] = generation
-    while len(_views) > MAX_CACHED_VIEWS:
-        _dropped, (dropped_graph, _generation) = _views.popitem(last=False)
+
+    def records(graph):
+        return len(graph.get('nodes', ())) + len(graph.get('edges', ()))
+
+    total = sum(records(view) for view, _ in _views.values())
+    while len(_views) > 1 and (len(_views) > MAX_CACHED_VIEWS or total > MAX_CACHED_RECORDS):
+        dropped, (dropped_graph, _generation) = _views.popitem(last=False)
+        total -= records(dropped_graph)
+        _pending.pop(dropped, None)
         if dropped_graph is not graph:
             _generations.pop(id(dropped_graph), None)
 
@@ -116,41 +127,85 @@ def _read_disk(directory: Path, key: dict):
     path = directory / _disk_name(key)
     try:
         info = path.stat()
-        if path.is_symlink() or not path.is_file() or info.st_size > MAX_CACHE_BYTES:
+        if directory.is_symlink() or path.is_symlink() or not path.is_file() or info.st_size > MAX_CACHE_BYTES:
             return None
-        payload = json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        with path.open('rb') as stream:
+            # Format 2 is a JSON array with one header, followed by node records
+            # and then edge records. Rebuild older, single-line disk caches.
+            if stream.readline(2) != b'[\n':
+                return None
+            header = json.loads(stream.readline())
+            if not isinstance(header, dict) or header.get('format') != 2 or header.get('key') != key:
+                return None
+            generation, graph = header.get('generation'), header.get('graph')
+            if not isinstance(generation, str) or not isinstance(graph, dict):
+                return None
+            for field in ('nodes', 'edges'):
+                count = header.get(field)
+                if type(count) is not int or count < 0:
+                    return None
+                graph[field] = []
+                for _ in range(count):
+                    if stream.read(1) != b',':
+                        return None
+                    item = json.loads(stream.readline())
+                    if not isinstance(item, dict):
+                        return None
+                    graph[field].append(item)
+            if stream.read(3) != b']\n':
+                return None
+            return graph, generation
+    except (OSError, ValueError, RecursionError):
         return None
-    if not isinstance(payload, dict) or payload.get('format') != 1 or payload.get('key') != key:
-        return None
-    graph, generation = payload.get('graph'), payload.get('generation')
-    if not isinstance(generation, str) or not isinstance(graph, dict):
-        return None
-    if not isinstance(graph.get('nodes'), list) or not isinstance(graph.get('edges'), list):
-        return None
-    return graph, generation
 
 
-def _write_later(directory: Path, key: dict, value: tuple[dict, str]) -> None:
+def _write_disk(directory: Path, key: dict, value: tuple[dict, str]) -> None:
     if directory.is_symlink():
         return
+    directory.mkdir(parents=True, exist_ok=True)
+    graph, generation = value
+    nodes, edges = graph['nodes'], graph['edges']
+    header = {'format': 2, 'key': key, 'generation': generation,
+              'graph': {k: v for k, v in graph.items() if k not in ('nodes', 'edges')},
+              'nodes': len(nodes), 'edges': len(edges)}
+    fd, temporary = tempfile.mkstemp(prefix='.view-', dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(b'[\n')
+            for index, record in enumerate(chain((header,), nodes, edges)):
+                data = json.dumps(record, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+                if index:
+                    stream.write(b',')
+                if stream.tell() + len(data) + len(b'\n]\n') > MAX_CACHE_BYTES:
+                    return
+                stream.write(data)
+                stream.write(b'\n')
+            stream.write(b']\n')
+        os.replace(temporary, directory / _disk_name(key))
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
-    def write() -> None:
+
+def _write_later(directory: Path, key: dict, token: str) -> None:
+    """Schedule under _lock. Waiting writes hold cache keys, not graph objects."""
+    global _writer
+    _pending[token] = directory, key
+    if _writer is None:
+        _writer = threading.Thread(target=_drain_writes, name='graph-view-cache', daemon=True)
+        _writer.start()
+
+
+def _drain_writes() -> None:
+    global _writer
+    while True:
+        with _lock:
+            if not _pending:
+                _writer = None
+                return
+            token, (directory, key) = _pending.popitem(last=False)
+            value = _views[token]
         try:
-            # Dumping a large graph holds the interpreter. Let the page response finish first.
-            time.sleep(0.25)
-            if directory.is_symlink():
-                return
-            text = json.dumps({'format': 1, 'key': key, 'generation': value[1], 'graph': value[0]},
-                              ensure_ascii=False, separators=(',', ':'))
-            if len(text.encode('utf-8')) > MAX_CACHE_BYTES:
-                return
-            atomic_text(directory / _disk_name(key), text)
-        except (OSError, TypeError, ValueError):
-            return
-
-    thread = threading.Thread(target=write, name='graph-view-cache', daemon=True)
-    with _lock:
-        _writers[:] = [item for item in _writers if item.is_alive()]
-        _writers.append(thread)
-    thread.start()
+            _write_disk(directory, key, value)
+        except (OSError, TypeError, ValueError, RecursionError):
+            # Disk caching is optional, including for an unwritable workspace.
+            continue

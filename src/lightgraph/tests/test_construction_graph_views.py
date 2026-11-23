@@ -110,6 +110,30 @@ def test_missing_fact_is_not_an_empty_success(data):
         views.graph_details(SimpleNamespace(isolation_domain="default"), fact_id="missing")
 
 
+def test_hub_details_count_all_edges_but_only_read_evidence_on_the_requested_page():
+    class OffPageSupports(list):
+        def __iter__(self):
+            raise AssertionError('read evidence from an unrelated fact')
+
+    support = {'scope_ref': 'public', 'provenance': {'definition': 'component'}}
+    nodes = [{'id': n, 'kind': 'metric', 'label': n, 'supports': []} for n in ('hub', 'part', 'unrelated')]
+    edges = [{'id': f'r_{i}', 'source': 'hub', 'target': 'part', 'relation': 'component',
+              'supports': [support] * 12} for i in range(100)]
+    graph = {'nodes': nodes, 'edges': edges}
+    edges[-1]['supports'] = OffPageSupports(edges[-1]['supports'])
+    first = views.graph_details(None, entity_id='hub', prepared_graph=graph)
+    assert first['total_facts'] == 102 and first['total_incident_edges'] == 100
+    assert first['facts'][-1]['id'] == 'r_47' and first['next_offset'] == 50
+    assert first['total_supports'] == 48 * 12 and len(first['supports']) == 500
+    assert first['supports_truncated'] is True
+    last = views.graph_details(None, entity_id='hub', offset=102, prepared_graph=graph)
+    assert not last['facts'] and last['next_offset'] is None and last['total_supports'] == 0
+    nodes[-1]['supports'] = OffPageSupports([support])
+    detail = views.graph_details(None, fact_id='r_73', prepared_graph=graph)
+    assert [fact['id'] for fact in detail['facts']] == ['r_73']
+    assert detail['total_supports'] == 12 and not detail['supports_truncated']
+
+
 def test_search_includes_identity_and_aliases_but_not_provenance(data):
     data['nodes'][0].update(identity={'机构': '华东分部', '设备编号': 'EQ-102'},
                             aliases=['Assembly Robot'], display_label='装配机器人')

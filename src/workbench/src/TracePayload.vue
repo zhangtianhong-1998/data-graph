@@ -1,17 +1,39 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref, shallowRef, watch } from 'vue'
+import { request } from './api'
 import { formatTraceValue, traceBlocks } from './tracePresentation'
 import type { TraceEvent } from './tracePresentation'
-const props = defineProps<{ event: TraceEvent }>()
-const blocks = computed(() => traceBlocks(props.event))
+const props = defineProps<{ seq: number; url: string }>()
+const event = shallowRef<TraceEvent | null>(null)
+const error = ref('')
+let controller: AbortController | undefined
+async function load() {
+  controller?.abort()
+  const current = new AbortController()
+  controller = current
+  event.value = null; error.value = ''; open.value.clear()
+  try {
+    const page = await request<{ events: TraceEvent[] }>(props.url, { signal: current.signal })
+    if (current.signal.aborted) return
+    if (page.events[0]?.seq !== props.seq) throw new Error('轨迹记录已变更，请刷新轨迹。')
+    event.value = page.events[0]
+  } catch (exception) {
+    if (!current.signal.aborted) error.value = exception instanceof Error ? exception.message : '轨迹记录读取失败。'
+  }
+}
+const blocks = computed(() => event.value ? traceBlocks(event.value) : [])
 const open = ref(new Set<number>())
 function toggle(index: number, event: Event) {
   if ((event.currentTarget as HTMLDetailsElement).open) open.value.add(index)
   else open.value.delete(index)
 }
+watch([() => props.url, () => props.seq], load, { immediate: true })
+onUnmounted(() => controller?.abort())
 </script>
 <template>
-  <div class="trace-content">
+  <p v-if="error" class="note amber" role="alert">{{ error }} <button class="btn small" @click="load">重试</button></p>
+  <p v-else-if="!event" role="status">正在读取记录…</p>
+  <div v-else class="trace-content">
     <details v-for="(block, index) in blocks" :key="`${event.seq}:${index}`" class="trace-message" @toggle="toggle(index, $event)">
       <summary>{{ block.title }}</summary>
       <pre v-if="open.has(index)" class="code trace-payload">{{ formatTraceValue(block.value) }}</pre>

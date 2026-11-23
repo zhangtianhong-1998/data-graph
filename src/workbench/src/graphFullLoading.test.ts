@@ -15,11 +15,28 @@ function page(path: string) {
   const values = (part === 'nodes' ? nodes : edges).slice(offset, offset + 1000), total = part === 'nodes' ? nodes.length : edges.length
   return { ...initial, generation: 'complete', part, offset, next_offset: offset + values.length < total ? offset + values.length : null, nodes: part === 'nodes' ? values : [], edges: part === 'edges' ? values : [], matched_nodes: nodes.length, matched_edges: edges.length }
 }
-function mount() { root = document.createElement('div'); document.body.append(root); const props = reactive({ graph: initial, projectId: 'p', layer: 'business', configRevision: 1 }); app = createApp({ render: () => h(GraphCanvas, props) }); app.mount(root); return props }
+function mount(graph = initial) { root = document.createElement('div'); document.body.append(root); const props = reactive({ graph, projectId: 'p', layer: 'business', configRevision: 1 }); app = createApp({ render: () => h(GraphCanvas, props) }); app.mount(root); return props }
 function button(text: string) { return [...root.querySelectorAll('button')].find(b => b.textContent?.trim() === text)! }
 beforeEach(() => { api.request.mockReset(); vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} }); vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null) })
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 describe('full graph canvas', () => {
+  it('opens a large snapshot as a preview, searches outside the first page and loads all batches on request', async () => {
+    const large = { ...initial, total_nodes: 29_462, total_edges: 34_954 }
+    api.request.mockImplementation(async path => {
+      if (path.includes('/details')) return { facts: [], supports: [], rules: [], next_offset: null }
+      if (path.includes('/batches?')) return page(path)
+      return { ...large, nodes: [nodes[4000]], edges: [], matched_nodes: 1, next_offset: null }
+    })
+    mount(large); await nextTick()
+    expect(api.request).not.toHaveBeenCalled()
+    const input = root.querySelector<HTMLInputElement>('[aria-label="搜索图节点"]')!
+    input.value = '节点4000'; input.dispatchEvent(new Event('input', { bubbles: true }))
+    await vi.waitFor(() => expect(root.querySelector('.detail-name')?.textContent).toContain('节点4000'))
+    expect(api.request.mock.calls.some(([url]) => url.includes('/batches?'))).toBe(false)
+    expect(root.textContent).not.toContain('已加载完整图谱')
+    button('加载全图').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('已加载完整图谱'))
+  })
   it('loads full node properties on selection when the canvas batch contains an explicit summary', async () => {
     api.request.mockImplementation(async path => {
       if (path.includes('/details')) return { nodes: [{ id: 'n0', label: '节点0', properties: { note: ['完整属性按需加载'] } }], facts: [], supports: [], rules: [], next_offset: null }

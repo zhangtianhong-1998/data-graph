@@ -63,7 +63,7 @@ beforeEach(() => {
     if (url.endsWith('/config')) return options?.method === 'PUT' ? JSON.parse(options.body) : { sources: [{ id: 'db', kind: 'gauss_database', allowed_tables: [] }] }
     if (url.endsWith('/metadata')) return { tables: [], nodes: [], edges: [] }
     if (url.includes('/graph?')) return { nodes: [], edges: [] }
-    if (url.endsWith('/runs')) return { runs: [] }
+    if (url.endsWith('/runs?view=summary')) return { runs: [] }
     if (url.endsWith('/credentials')) return { database_sources: [], model: false }
     if (url.includes('/database/drafts/')) return { saved: false, revision: 0 }
     const project = projects.find(project => url === `/projects/${project.project_id}`)
