@@ -536,6 +536,46 @@ def effective_merge_policy(config, node=None):
     return policy
 
 
+def deterministic_stage_inputs(input_ids, *, units, merged, merge_nodes, plan, artifacts, policy, config, bases):
+    """Reuse original unit checkpoints through transparent deterministic stages in the same workflow.
+
+    A new peer may contradict an earlier fold. Rechecking all leaves can undo the old
+    fold as well as extend it. A worker delta, inherited publication, different policy
+    or a partially isolated stage remains a self-contained input with its own decisions.
+    """
+    direct = [units[key] if key in units else merged[key] for key in input_ids]
+    if not any(key in merged for key in input_ids):
+        return [*bases, *direct]
+    if bases:
+        return direct
+    leaves = {}
+    pending = list(input_ids)
+    visited = set()
+    while pending:
+        key = pending.pop()
+        if key in visited:
+            continue
+        visited.add(key)
+        record = artifacts.get(key, {})
+        if key in units:
+            if (not record.get('artifact_id') or record.get('status') != 'completed'
+                    or record.get('coverage') == 'incomplete' or record.get('inherited_grants')
+                    or units[key]['graph'].get('extends_base_graph')):
+                return direct
+            leaves[key] = units[key]
+            continue
+        node = merge_nodes.get(key)
+        parents = plan.merge_inputs.get(key, [])
+        if (node is None or node.merge_mode != 'deterministic' or not parents
+                or effective_merge_policy(config, node) != policy
+                or not record.get('artifact_id') or record.get('status') != 'completed' or record.get('coverage') != 'complete'
+                or record.get('inherited_grants') or record.get('recomposed_from')
+                or record.get('upstream_artifacts') != [artifacts.get(p, {}).get('artifact_id') for p in parents]):
+            return direct
+        pending.extend(parents)
+    return [leaves[key] for key in sorted(leaves)]
+
+
 def publish_merged_contributors(
     project_output_dir: str | Path,
     project_config: RunConfig,

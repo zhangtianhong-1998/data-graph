@@ -185,6 +185,10 @@ def record_graph_head(manifest, head, *, root, graph_kind=None, coverage=None):
         head['inherited_summary'] = summary
     head['inherited_digest'] = digest(summary) if summary is not None else None
     head['inherited_grants'] = inherited_grants(root, summary=summary) if summary is not None else []
+    return append_graph_head(manifest, head, root=root)
+
+
+def append_graph_head(manifest, head, *, root):
     # A content-addressed store may reuse one file for several publications.
     # Bind the commit (run, access, coverage and frozen inputs) before deriving
     # its relocatable external ID. Legacy heads enter history by verbatim copy.

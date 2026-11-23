@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from lightgraph.construction.contexts import business_context_identity, normalize_context_selection
 from lightgraph.contracts import canonical
 from lightgraph.errors import LightGraphError
-from .path_evidence import FANOUT, MAX_EXPANSIONS, MAX_STATES, MAX_WITNESS_PAIRS, evidence_preview, path_node
+from .path_evidence import FANOUT, MAX_EXPANSIONS, MAX_STATES, MAX_WITNESS_PAIRS, evidence_preview, path_node, grounds_slot
 from .retriever import _join_contexts
 
 
@@ -21,10 +21,12 @@ class _Chain:
     via_count: int
 
 
-def _context_witnesses(item):
+def _context_witnesses(item, slots=()):
     """One visible witness per distinct applicability suffices for this edge or node."""
     seen = set()
     for observation in item.get('observations', ()):
+        if not all(grounds_slot(item, observation, s) for s in slots):
+            continue
         context = business_context_identity(observation)
         key = canonical(context)
         if key not in seen:
@@ -72,6 +74,9 @@ def retrieve_traversal(retriever, query, scopes, *, seed_ids, business_context=N
     states = work = 0
     via_positions = {nid: i for i, nid in enumerate(via_ids)}
 
+    anchor_slots = {nid: [s for s in slots if any(c['node_id'] == nid for c in s['candidates'])]
+                    for nid in endpoints}
+
     def next_via(nid, position):
         if nid not in via_positions:
             return position
@@ -82,7 +87,7 @@ def retrieve_traversal(retriever, query, scopes, *, seed_ids, business_context=N
         position = next_via(nid, 0)
         if position is None:
             continue
-        for context, observation in _context_witnesses(nodes[nid]):
+        for context, observation in _context_witnesses(nodes[nid], anchor_slots.get(nid, ())):
             if states >= MAX_STATES:
                 reasons.add('path_state_budget_reached')
                 break
@@ -136,7 +141,7 @@ def retrieve_traversal(retriever, query, scopes, *, seed_ids, business_context=N
                 joined = _join_contexts(path.context, edge_ctx)
                 if joined is None:
                     continue
-                for node_ctx, node_obs in _context_witnesses(nodes[nxt]):
+                for node_ctx, node_obs in _context_witnesses(nodes[nxt], anchor_slots.get(nxt, ())):
                     work += 1
                     if work >= MAX_WITNESS_PAIRS or states >= MAX_STATES:
                         reasons.add('path_search_limit')

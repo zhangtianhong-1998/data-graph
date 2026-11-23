@@ -452,10 +452,23 @@ class GraphWorkspace:
         entry['published_graph_digest'] = digest(published)
         # Check conflicts against every still-current independent publication
         # before advancing either the publication set or the merged graph head.
-        graphs = [self._merge_contribution(value, manifest, isolate_conflicts) for key, value in publications.items()
+        graphs = [{**self._merge_contribution(value, manifest, isolate_conflicts), 'draft_id': key}
+                  for key, value in publications.items()
                   if key != draft_id and value['context_fingerprint'] == self.context_fingerprint]
-        contributors = graphs + [_with_quarantine_witnesses(published, validated_graph) if isolated else published]
-        merged = _merge_graphs(contributors, fusion_policy=fusion_policy, isolate_conflicts=isolate_conflicts)
+        addition = _with_quarantine_witnesses(published, validated_graph) if isolated else published
+        contributors = graphs + [{**addition, 'draft_id': draft_id}]
+        # Older validations predate the per-mapping authority marker. Resolve
+        # their original issued evidence in this workspace's current context.
+        records = {}
+        if len(contributors) > 1:
+            refs = {ref for contribution in contributors for d in contribution.get('definitions', {}).get('entities', [])
+                    if d.get('identity_scope') == 'global' for ref in d.get('identity_evidence_refs', [])}
+            for ref in refs & manifest['evidence'].keys():
+                evidence = self._read_record(manifest['evidence'][ref])
+                if evidence.get('ref') == ref and evidence.get('context_fingerprint') == self.context_fingerprint:
+                    records[ref] = evidence
+        merged = _merge_graphs(contributors, fusion_policy=fusion_policy, isolate_conflicts=isolate_conflicts,
+                               identity_records=records)
         entry['graph'] = self._append_record('published', published)
         manifest.setdefault('publication_history', []).append(entry)
         publications[draft_id] = entry
@@ -568,7 +581,7 @@ def _with_quarantine_witnesses(published, candidate):
             'conflict_isolation': {**published['conflict_isolation'], 'edge_ids': []}}
 
 
-def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False):
+def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False, identity_records=None):
     """Combine independently checked subgraphs without silently replacing facts."""
     from lightgraph.source_values import persisted_identity_key
     from .fusion import (merge_definition, deduplicate_supports, stamp_execution,
@@ -593,16 +606,40 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False):
     if fusion_policy and fusion_policy.entity_rules:
         from .fusion import prepare_graph
         graphs = [prepare_graph(graph, fusion_policy, copy=False) for graph in graphs]
+    local_candidates = []
+    matched = []
     if len(graphs) > 1:
         # Drafts refer to the same local source namespace. Align before
         # qualifying incompatible definitions, just as the DAG merger does.
         excluded = {rule.canonical_type for rule in fusion_policy.entity_rules} if fusion_policy else set()
         observed = align_draft_nodes(graphs, excluded)
         for graph, remap in zip(graphs, observed, strict=True):
+            matched.append([n['id'] in remap for n in graph.get('nodes', [])])
             for node in graph.get('nodes', []):
                 node['id'] = remap.get(node['id'], node['id'])
             remap_graph_endpoints(graph, remap, self_contained=False)
     retain_definition_variants(graphs, self_contained=[False] * len(graphs))
+    if matched:
+        from .identity_authority import separate_unverified_ids
+        anonymous_counts = {}
+        inputs = []
+        for graph in graphs:
+            owner = graph.get('draft_id')
+            if not owner:
+                signature = digest(graph)
+                occurrence = anonymous_counts.get(signature, 0)
+                anonymous_counts[signature] = occurrence + 1
+                owner = digest('anonymous_draft', signature, occurrence)
+            inputs.append((owner, 'draft', graph))
+        targets = [{n['id']: n['id'] for n, confirmed in zip(g.get('nodes', []), flags, strict=True) if confirmed}
+                   for g, flags in zip(graphs, matched, strict=True)]
+        explicit = {(r.canonical_type, r.identity_domain) for r in fusion_policy.entity_rules} if fusion_policy else set()
+        local_candidates = separate_unverified_ids(inputs, targets, excluded_types=set(), explicit_domains=explicit,
+                                                   records=identity_records, draft=True)
+        for graph, remap in zip(graphs, targets, strict=True):
+            for node in graph.get('nodes', []):
+                node['id'] = remap.get(node['id'], node['id'])
+            remap_graph_endpoints(graph, remap, self_contained=False)
     result = {'format_version': 1, 'target': 'graph', 'status': 'published',
               **({'extends_base_graph': True} if any(g.get('extends_base_graph') for g in graphs) else {}),
               'semantic_origin': 'agent_authored', 'definitions': {'entities': [], 'relations': []},
@@ -717,6 +754,10 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False):
                             merged.append(deepcopy(value))
     result['definitions'] = {key: [value[name] for name in sorted(value)] for key, value in definitions.items()}
     result.update({key: sorted(value.values(), key=lambda item: item['id']) for key, value in items.items()})
+    if local_candidates:
+        visible = set(items['nodes'])
+        result['candidate_identity_merges'] = [{**g, 'node_ids': sorted(ids)} for g in local_candidates
+                                               if len(ids := visible.intersection(g['node_ids'])) > 1]
     result['definition_conflicts'] = definition_conflict_diagnostics(result)
     pending = {canonical(item): item for graph in graphs for item in graph.get('unresolved_relations', [])}
     result['unresolved_relations'] = [pending[key] for key in sorted(pending)]

@@ -114,7 +114,7 @@ def test_old_mixed_only_index_requires_explicit_rebuild(search, tmp_path):
     with pytest.raises(LightGraphError, match='retrieval_index_stale'):
         active_index(tmp_path)
     sync_graph_to_retrieval(_scoped_graph(), tmp_path)
-    assert active_index(tmp_path)[1]['format'] == 5
+    assert active_index(tmp_path)[1]['format'] == 6
 
 
 def test_remote_index_allows_keyless_keyword_and_id_queries_after_sync(tmp_path, monkeypatch):

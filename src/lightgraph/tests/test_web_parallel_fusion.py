@@ -1,4 +1,5 @@
 """Exercise the actual CSV -> two workers -> merge -> history -> resume HTTP path."""
+import json
 import subprocess
 import time
 from pathlib import Path
@@ -9,7 +10,7 @@ from lightgraph.tests.test_web_api import client, create, upload
 from lightgraph.tests.test_web_execution import wait_run
 
 
-def test_audit_replays_the_same_three_committed_workers_without_writing(client, monkeypatch):
+def test_audit_replays_the_same_three_committed_workers_without_writing(client, monkeypatch, tmp_path):
     install_scripted_worker(monkeypatch)
     create(client)
     base = '/api/projects/alpha'
@@ -44,6 +45,13 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
     membership = report['with_source_replay']['hierarchy_membership']
     assert membership['groups_by_output_id'] == {} and membership['represented_collapsed_nodes'] == 0
     assert membership['agrees_with_recorded_count']  # These copies folded through the row-identity channel.
+    previous = tmp_path / 'audit.json'
+    previous.write_text(json.dumps(report), encoding='utf-8-sig')
+    rerun = audit(run_file, 'merged', compare_to=previous)
+    assert rerun['with_source_replay']['hierarchy_membership'] == membership
+    comparison = rerun['hierarchy_comparison']
+    assert comparison['policy_digest_comparison'] == 'matched'
+    assert comparison['net_node_reduction'] == comparison['additional_hierarchy_collapses'] == 0
     assert report['committed']['integrity'] == report['with_source_replay']['integrity'] == {
         'duplicate_node_ids': 0, 'duplicate_edge_ids': 0, 'edges_with_missing_endpoints': 0,
         'edges_with_missing_definition': 0, 'edges_with_wrong_endpoint_types': 0, 'self_links': 0}

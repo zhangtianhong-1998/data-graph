@@ -101,6 +101,15 @@ class GoalScopedSource(SourceAdapter):
             if close is not None:
                 close()
 
+    def sheet_row_snapshot(self, table):
+        getter = getattr(self._adapter, 'sheet_row_snapshot', None)
+        return getter(table) if getter else None
+
+    def sheet_row_projection(self, table, columns, *, predicate, limit, witness_bytes):
+        self._validate(self.compiler.projection(table, columns, predicate=predicate, limit=limit))
+        return self._adapter.sheet_row_projection(table, columns, predicate=predicate,
+                                                  limit=limit, witness_bytes=witness_bytes)
+
     @contextmanager
     def snapshot(self):
         self._check_open()

@@ -3,7 +3,7 @@ from collections import defaultdict, deque
 from itertools import zip_longest
 
 from .dimensional import empty_answer
-from .path_evidence import MAX_STATES, PathCollection, matches_operand
+from .path_evidence import MAX_STATES, PathCollection
 from .store_sqlite import normalize_term
 from .traversal import retrieve_traversal
 
@@ -86,14 +86,13 @@ def retrieve_associations(retriever, request, scopes, plan, truncation):
         ids = [nid for _, nid in path]
         proof = retrieve_traversal(retriever, request.query, scopes, seed_ids=ids, start_id=ids[0],
             via_ids=ids[1:-1], target_id=ids[-1], route_node_ids=ids, max_depth=len(ids) - 1,
+            slots=[{'surface':surface[term], 'candidates':[{'node_id':nid}]} for term, nid in path],
             max_nodes=request.max_nodes, max_edges=request.max_edges, business_context=plan['business_context'])
         evidence = proof['traverse']['paths']
         if not evidence:
             result.truncation.update(proof['truncation_reasons'])
             continue
         nodes = {n['id']: n for n in proof['nodes']}
-        if not all(matches_operand(nodes[nid], term) for term, nid in path):
-            continue
         for term, nid in path:
             nodes[nid]['matched_slots'] = [surface[term]]
         if not result.add(proof):

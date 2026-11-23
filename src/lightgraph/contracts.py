@@ -47,6 +47,16 @@ class TableSpec(StrictModel):
     @property
     def column_names(self) -> list[str]:
         return [c.name for c in self.columns]
+
+    def workbook_position_evidence(self, columns=None) -> dict:
+        """Return original Excel positions for columns in this authorized catalog view."""
+        if not self._workbook_ordinals:
+            return {}
+        selected = set(columns) if columns is not None else None
+        observed = {c.name: self._workbook_ordinals[c.name] for c in self.columns
+                    if c.name in self._workbook_ordinals and (selected is None or c.name in selected)}
+        return {'source_column_ordinals': observed} if observed else {}
+
     @property
     def qualified_name(self) -> str:
         return f"{self.schema_name}.{self.name}"

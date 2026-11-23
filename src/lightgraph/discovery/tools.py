@@ -318,6 +318,7 @@ class ToolExecutor:
         entries = []
         for entry in tables:
             value = entry.model_dump(mode="json", by_alias=True)
+            value.update(entry.workbook_position_evidence())
             value["qualified_name"] = entry.qualified_name
             value["tool_table_id"] = f'{entry.source_id}:{entry.qualified_name}'
             source_adapter = self.source_adapters.get(entry.source_id)

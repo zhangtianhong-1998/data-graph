@@ -1,4 +1,4 @@
-"""Return a hierarchy chain or an explicitly directed legacy drilldown with compatible row witnesses."""
+"""Return a hierarchy chain or a directed drilldown with independently witnessed, context-compatible edges."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,8 +7,8 @@ import re
 
 from lightgraph.construction.contexts import normalize_context_selection
 from lightgraph.errors import LightGraphError
-from .path_evidence import FANOUT, MAX_EXPANSIONS, MAX_STATES, MAX_WITNESS_PAIRS, evidence_preview, path_node
-from .retriever import _join_contexts, _join_rows, _observation_groups, _row_witnesses
+from .path_evidence import FANOUT, MAX_EXPANSIONS, MAX_STATES, MAX_WITNESS_PAIRS, evidence_preview, path_node, grounds_slot
+from .retriever import _join_contexts, _observation_groups
 
 
 @dataclass
@@ -18,7 +18,6 @@ class _Path:
     node_witnesses: tuple
     edge_witnesses: tuple
     context: dict
-    rows: dict
     terms: frozenset
 
 
@@ -39,7 +38,7 @@ def _matched(query_terms, witness, node):
 
 def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_ids=(), relation_types=(),
                        direction='outgoing', target_id=None, max_depth=12, max_nodes=80, max_edges=150,
-                       field='all', method='hybrid', top_n=20, target_kind=None, hierarchies=None):
+                       field='all', method='hybrid', top_n=20, target_kind=None, hierarchies=None, conditions=()):
     """Find a compact directed chain, preferring target and anchor coverage.
 
     Bounds apply to explored states, adjacency reads, path length and returned
@@ -57,6 +56,9 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
         hits = retriever.retrieve(query, scopes=scopes, business_context=business_context,
                                   hops=0, top_p_seeds=1, max_nodes=32, field=field, method=method, top_n=top_n)
         slots = hits['slots']
+        conditions = [{**slot, 'match': 'exact', 'candidates': [
+            c for c in slot['candidates'] if c.get('match_type') in {'exact_name', 'exact_code'}]}
+            for slot in slots]
         ids = [n['id'] for n in hits['nodes'] if n['is_seed']]
         reasons.update(hits['truncation_reasons'])
     seeds = retriever.index.load_authorized_nodes(ids, scopes=cohorts)
@@ -132,7 +134,7 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
         nonlocal states
         if backwards and path.ids[-1] in seed_set:
             proof = _Path(path.ids[::-1], path.edges[::-1], path.node_witnesses[::-1],
-                          path.edge_witnesses[::-1], path.context, path.rows, path.terms)
+                          path.edge_witnesses[::-1], path.context, path.terms)
             consider(proof, 'target_reached')
             if seed_set.issubset(path.ids):
                 return
@@ -153,10 +155,17 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
         heapq.heappush(queue, (priority, path))
         states += 1
 
+    def grounded(nid, observations):
+        terms = [s for s in conditions if any(c['node_id'] == nid for c in s['candidates'])]
+        return [o for o in observations if all(grounds_slot(nodes[nid], o, s) for s in terms)]
+
     for nid in sorted(starts):
         for context, observations in _observation_groups(starts[nid]):
+            observations = grounded(nid, observations)
+            if not observations:
+                continue
             witness = max(observations, key=lambda obs: len(_matched(query_terms, obs, nodes[nid])))
-            enqueue(_Path((nid,), (), (witness,), (), context, _row_witnesses([witness]),
+            enqueue(_Path((nid,), (), (witness,), (), context,
                           frozenset(_matched(query_terms, witness, nodes[nid]))))
     while queue:
         _, path = heapq.heappop(queue)
@@ -178,16 +187,14 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
                 if pairs > MAX_WITNESS_PAIRS:
                     break
                 ctx = _join_contexts(path.context, edge_ctx)
-                rows = _join_rows(path.rows, _row_witnesses(edge_obs))
-                if ctx is None or rows is None:
+                if ctx is None:
                     continue
                 for node_ctx, node_obs in _observation_groups(nodes[nid]):
                     pairs += 1
                     if pairs > MAX_WITNESS_PAIRS:
                         break
                     joined = _join_contexts(ctx, node_ctx)
-                    witnesses = _join_rows(rows, _row_witnesses(node_obs))
-                    if joined is None or witnesses is None:
+                    if joined is None:
                         continue
                     if nid in path.ids:
                         cycle = True
@@ -195,10 +202,13 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
                     if len(path.edges) >= limit:
                         depth_limited = True
                         break
+                    node_obs = grounded(nid, node_obs)
+                    if not node_obs:
+                        continue
                     extended = True
                     witness = max(node_obs, key=lambda obs: len(_matched(query_terms, obs, nodes[nid])))
                     enqueue(_Path((*path.ids, nid), (*path.edges, edge), (*path.node_witnesses, witness),
-                                  (*path.edge_witnesses, edge_obs[0]), joined, witnesses,
+                                  (*path.edge_witnesses, edge_obs[0]), joined,
                                   path.terms.union(_matched(query_terms, witness, nodes[nid]))))
                 if pairs > MAX_WITNESS_PAIRS or depth_limited:
                     break
@@ -230,7 +240,7 @@ def retrieve_drilldown(retriever, query, scopes, business_context=None, *, seed_
         details['paths'].append({'node_ids': list(best.ids), 'edge_ids': [e['id'] for e in best.edges],
                                  'business_context': best.context, 'stop_reason': stop,
                                  'context_status': 'unverified' if best.context['status'] == 'unknown' else 'compatible',
-                                 'path_semantics': 'condition_compatible_evidence_chain', 'observed_path': False})
+                                 'path_semantics': 'individually_supported_edges', 'observed_path': False})
         details['uncovered_seed_ids'] = sorted(seed_set.difference(best.ids))
         answer['connected_components'] = [list(best.ids)]
     details.update(status='found' if best else 'no_visible_seed' if not seeds else 'target_not_reached',

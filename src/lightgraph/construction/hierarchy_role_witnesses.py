@@ -33,7 +33,7 @@ class IsolatedRoleIndex:
     node to either endpoint. Different slots may have different witnesses.
     """
 
-    def __init__(self, nodes, members, layouts, incidents, excluded):
+    def __init__(self, nodes, members, layouts, incidents, excluded, original_boundaries):
         self.roles = {}
         self.anchors = {}
         self.common = {}
@@ -85,7 +85,8 @@ class IsolatedRoleIndex:
             if not origins:
                 continue
             roles = {keys: _mapping_role(node, member, keys, origins) for keys in member.bindings}
-            for parent, keys, other_keys, other_value, other_facts, edge_fact in edges:
+            for incident in edges:
+                parent, keys, other_keys, other_value, other_facts, edge_fact = incident
                 if member.value == other_value:
                     continue
                 role = roles[keys]
@@ -96,7 +97,11 @@ class IsolatedRoleIndex:
                     continue
                 boundary, _ = edge_fact
                 own_facts = member.bindings[keys]
-                if any(fact[3] != boundary for fact in (*own_facts, *other_facts)):
+                # Check the original local edge projection against both endpoint mappings.
+                # The physical worksheet interval is only for comparing independently
+                # verified anchors across units; nodes do not carry an edge's row proof.
+                local_boundaries = original_boundaries.get((nid, incident), {boundary})
+                if not any(all(fact[3] == original for fact in (*own_facts, *other_facts)) for original in local_boundaries):
                     continue
                 own_names = frozenset((col, label) for _, col, label, _, _ in own_facts)
                 self.anchors[role].add((parent, member.value, own_names, other_keys, other_value, other_facts, edge_fact))

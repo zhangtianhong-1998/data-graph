@@ -30,15 +30,27 @@ def _extract_branch(config, directory, project):
     fact_mapping = {'source_id': source_id, 'table': facts.name,
                     'context_columns': ['project', 'period', 'code', 'product']}
     scenario_keys = ['code'] if project == 'M' else ['project', 'code']
+    directory.mkdir(parents=True, exist_ok=True)
+    registry = directory / 'products.md'
+    registry.write_text(
+        '---\nid: product-registry\npurpose: data_description\n'
+        'scope: {tables: [A.public.facts_M, B.public.facts_K, C.public.catalog], columns: [product, code]}\n'
+        '---\n# Product keys\nThe product column in both fact tables stores the globally unique code '
+        'from the shared C catalog. All three columns use the C_product_catalog registry.\n',
+        encoding='utf-8')
+    config = config.model_copy(update={'documents': [*config.documents, str(registry)]})
     with MemorySource([facts, catalog, links], rows) as adapter:
-        tools = ConstructionTools(config, directory / 'construction', adapters=[adapter])
+        tools = ConstructionTools(config, directory / 'construction', adapters=[adapter], drop_unbound_documents=True)
         try:
             source = next(t for t in tools.describe_sources()['tables'] if t['name'] == 'catalog')
             evidence = tools.call('inspect_source', table=source['table'], operation='get_metadata')
             assert evidence['status'] == 'ok', evidence
+            document = tools.call('read_material', name='document:product-registry')
+            assert document['section_fully_read'], document
             draft = {'draft_id': 'branch_' + project, 'entities': [
                 {'type': 'Product', 'key_names': ['code'], 'identity_scope': 'global',
-                 'identity_domain': 'C_product_catalog', 'identity_evidence_refs': [evidence['evidence_ref']],
+                 'identity_domain': 'C_product_catalog',
+                 'identity_evidence_refs': [evidence['evidence_ref'], *document['evidence_refs']],
                  'mappings': [
                      {'source_id': 'C', 'table': 'catalog', 'key_columns': ['code'], 'label_column': 'name',
                       'business_context': global_context},

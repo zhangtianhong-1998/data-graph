@@ -14,12 +14,14 @@ from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import MergePolicyConfig
 from lightgraph.source_values import identity_cell, persisted_identity_key
 from .display import derive_display_graph
-from .fusion import (deduplicate_supports, definition_conflict_diagnostics, label_priority,
+from .fusion import (deduplicate_supports, definition_conflict_diagnostics, label_priority, mark_relation_meanings,
                      merge_definition, prepare_graph, relation_identity, retain_definition_variants)
 from .context_topology import detect_context_cycles
 from .hierarchy_replay import reconcile_hierarchy_projections
+from .hierarchy_stage import original_stage_inputs, record_stage
 from .models import COLUMN_IDENTITY_NAMES
 from .observed_identity import align_dictionary_nodes, align_observed_nodes
+from .source_namespaces import isolate_physical_ids, namespace_groups, record_namespace
 from .workspace import read_internal_yaml, write_yaml
 
 SHARD_COUNT = 32
@@ -63,6 +65,8 @@ def _rewrite_evidence_in_graph(
                 'original_ref': orig_ref,
                 'kind': record.get('kind', 'unknown'),
                 'source_ref': record.get('source_ref'),
+                **({'details': {k: record['details'][k] for k in ('operation', 'complete') if k in record['details']}}
+                   if record.get('kind') == 'source_probe' and record.get('details') else {}),
             }
         return scoped
 
@@ -249,7 +253,9 @@ def _merge_contributor_nodes_and_edges(
         raise LightGraphError('published_graph_key_semantics_conflict')
     contributor_ids = set()
     upstream_isolations = []
-    for item in sorted(contributors, key=lambda c: (c.get('kind', 'unit'), c['contributor_id'])):
+    ordered = sorted(contributors, key=lambda c: (c.get('kind', 'unit'), c['contributor_id']))
+    source_namespaces, source_groups = namespace_groups(ordered)
+    for item in ordered:
         cid = str(item['contributor_id'])
         ckind = str(item.get('kind', 'unit'))
         if (ckind, cid) in contributor_ids:
@@ -285,7 +291,7 @@ def _merge_contributor_nodes_and_edges(
 
     observed_ids = [{} for _ in prepared_contributors]
     observation_witnesses = []
-    source_replay_counts = {}
+    source_replay_counts = Counter()
     local_bases = {str(item['contributor_id']) for item in contributors if item.get('local_source_namespace') is True}
     if independent_outputs:
         replay_status = 'independent_outputs'
@@ -296,9 +302,18 @@ def _merge_contributor_nodes_and_edges(
     else:
         replay_status = 'ran'
         excluded_types = shared_types | ({rule.canonical_type for rule in fusion.entity_rules} if fusion else set())
-        observed_ids, observation_witnesses = align_observed_nodes(
-            prepared_contributors, local_bases=local_bases, excluded_types=excluded_types,
-            emit_candidates=policy.emit_alignment_candidates, diagnostics=source_replay_counts)
+        for indices in source_groups:
+            counts = {}
+            remaps, witnesses = align_observed_nodes(
+                [prepared_contributors[i] for i in indices], local_bases=local_bases, excluded_types=excluded_types,
+                emit_candidates=policy.emit_alignment_candidates, diagnostics=counts)
+            source_replay_counts.update(counts)
+            for i, remap in zip(indices, remaps, strict=True):
+                observed_ids[i] = remap
+            if len(source_groups) == 1:
+                observation_witnesses = witnesses
+            else:
+                observation_witnesses.extend({(indices[local], nid) for local, nid in group} for group in witnesses)
 
     variant_remaps = [{} for _ in prepared_contributors]
     if independent_outputs:
@@ -311,15 +326,30 @@ def _merge_contributor_nodes_and_edges(
     observed_ids = [{variants.get(original, original): target for original, target in observed.items()}
                     for observed, variants in zip(observed_ids, variant_remaps, strict=True)]
     node_targets = observed_ids
-    dictionary_targets = set()
-    dictionary_counts = {}
+    dictionary_counts = Counter()
+    dictionary_ids = [{} for _ in prepared_contributors]
     if replay_status == 'ran':
-        catalog_targets = _local_catalog_targets(prepared_contributors, local_bases)
-        dictionary_ids, dictionary_counts = align_dictionary_nodes(
-            prepared_contributors, observed_ids, local_bases=local_bases, excluded_types=excluded_types)
-        dictionary_targets = {target for mapping in dictionary_ids for target in mapping.values()}
-        node_targets = [rows | dictionary | columns for rows, dictionary, columns
-                        in zip(observed_ids, dictionary_ids, catalog_targets, strict=True)]
+        node_targets = [dict(targets) for targets in observed_ids]
+        for indices in source_groups:
+            scoped = [prepared_contributors[i] for i in indices]
+            catalog = _local_catalog_targets(scoped, local_bases)
+            dictionaries, counts = align_dictionary_nodes(
+                scoped, [observed_ids[i] for i in indices], local_bases=local_bases, excluded_types=excluded_types)
+            dictionary_counts.update(counts)
+            for i, dictionary, columns in zip(indices, dictionaries, catalog, strict=True):
+                dictionary_ids[i] = dictionary
+                node_targets[i].update(dictionary | columns)
+    if len(source_groups) > 1 and not independent_outputs:
+        node_targets = [dict(targets) for targets in node_targets]
+        isolate_physical_ids(prepared_contributors, node_targets, observed_ids, dictionary_ids, source_groups,
+                             source_namespaces, shared_types | {family for family, _ in explicit_domains})
+    dictionary_targets = {target for mapping in dictionary_ids for target in mapping.values()}
+    if len(prepared_contributors) > 1 and not independent_outputs:
+        from .identity_authority import separate_unverified_ids
+        node_targets = [dict(targets) for targets in node_targets]
+        separate_unverified_ids(prepared_contributors, node_targets,
+            excluded_types=shared_types, explicit_domains=explicit_domains,
+            records=evidence_catalog, local_bases=local_bases, source_namespaces=source_namespaces)
     originals = {(str(item.get('kind', 'unit')), str(item['contributor_id'])): item['graph']
                  for item in contributors}
     for (cid, ckind, rewritten), targets in zip(prepared_contributors, node_targets, strict=True):
@@ -663,6 +693,12 @@ def _merge_contributor_nodes_and_edges(
     if policy.emit_alignment_candidates:
         foreign_base_ids = {target for cid, kind, _, remap in contributor_remaps
                             if kind == 'base' and cid not in local_bases for target in remap.values()}
+        node_source_groups = defaultdict(set)
+        if len(source_groups) > 1:
+            for group, indices in enumerate(source_groups):
+                for index in indices:
+                    for target in contributor_remaps[index][3].values():
+                        node_source_groups[target].add(group)
         for (etype, _), items in sorted(same_code_buckets.items()):
             retained_items = [item for item in items if item['node_id'] in merged_nodes]
             distinct_nodes = sorted({item['node_id'] for item in retained_items})
@@ -671,8 +707,9 @@ def _merge_contributor_nodes_and_edges(
                     'status': 'candidate_only',
                     'reason': 'cross_unit_unverified_identity_domain',
                     'match_basis': 'same_typed_identity',
-                    'source_key_comparison': _source_key_comparison(
-                        [merged_nodes[nid] for nid in distinct_nodes], foreign_base_ids),
+                    'source_key_comparison': ('unverified_source_namespace'
+                        if len({g for nid in distinct_nodes for g in node_source_groups.get(nid, ())}) > 1
+                        else _source_key_comparison([merged_nodes[nid] for nid in distinct_nodes], foreign_base_ids)),
                     'entity_type': etype,
                     'node_ids': distinct_nodes,
                     'contributors': sorted({item['contributor_id'] for item in retained_items}),
@@ -691,6 +728,23 @@ def _merge_contributor_nodes_and_edges(
                 'entity_types': sorted({merged_nodes[nid]['type'] for nid in ids})}
             seen_groups.add(ids)
         candidate_identity_merges.extend(physical_candidates[ids] for ids in sorted(physical_candidates))
+        for _, kind, upstream, remap in contributor_remaps:
+            if kind not in ('unit', 'merged'):
+                continue
+            for prior in upstream.get('candidate_identity_merges', []):
+                original = prior.get('node_ids') or []
+                if (prior.get('status') != 'candidate_only' or not original
+                        or any(remap.get(n) not in merged_nodes for n in original)):
+                    continue
+                ids = tuple(sorted({remap[n] for n in original}))
+                if len(ids) < 2 or ids in seen_groups:
+                    continue
+                retained = {**deepcopy(prior), 'node_ids': list(ids)}
+                retained.pop('candidate_id', None)
+                if 'entity_types' in retained:
+                    retained['entity_types'] = sorted({merged_nodes[n]['type'] for n in ids})
+                candidate_identity_merges.append(retained)
+                seen_groups.add(ids)
         candidate_identity_merges.extend(_same_name_candidates(merged_nodes, seen_groups))
         for norm, items in sorted(column_label_buckets.items()):
             unique_cols = {i['node_id']: i for i in items}
@@ -729,11 +783,12 @@ def _merge_contributor_nodes_and_edges(
             'coverage': 'incomplete' if (quarantined_nodes or quarantined_edges or upstream_isolations) else 'complete',
         },
     }
-    # A physical table address is local to one project. Frozen base graphs
-    # and downstream merges retain the identities from their publication.
+    # A physical table address is local to one project. Unverified intermediate
+    # publications retain their decisions; verified stages have already supplied their leaves.
     hierarchy_collapsed = None
     hierarchy_diagnostics = {}
-    if replay_status == 'ran' and all(
+    compatible_namespace = source_namespaces is None or len(source_groups) == 1 and source_namespaces[0] is not None
+    if replay_status == 'ran' and compatible_namespace and all(
         kind == 'unit' and not graph.get('extends_base_graph') for _, kind, graph in prepared_contributors
     ):
         hierarchy_collapsed = reconcile_hierarchy_projections(
@@ -778,7 +833,10 @@ def _merge_contributor_nodes_and_edges(
     if hierarchy_diagnostics.get('global_node_inputs'):
         counts['hierarchy_replay_diagnostics'] = hierarchy_diagnostics
     result['fusion_diagnostics'] = counts
-    return derive_display_graph(result, copy=False)
+    derive_display_graph(result, copy=False)
+    record_namespace(result, source_namespaces, source_groups)
+    record_stage(result, contributors, policy)
+    return result
 
 
 def _qualify_conflicting_output_types(prepared):
@@ -787,6 +845,7 @@ def _qualify_conflicting_output_types(prepared):
     Only the projection gets qualified names. Source publications retain the
     original names, IDs and evidence. Relations follow their branch's entities.
     """
+    mark_relation_meanings(graph for _, _, graph in prepared)
     for category, items in (('entities', 'nodes'), ('relations', 'edges')):
         shapes = defaultdict(set)
         for _, _, graph in prepared:
@@ -862,11 +921,18 @@ def merge_construction_graphs(
     independent_outputs: bool = False,
     recognize_source_replays: bool = True,
 ) -> dict[str, Any]:
-    """Public entry point for deterministic cross-unit / cross-project graph merging."""
+    """Merge authorized graph contributors.
+
+    Callers may bind each contributor to the same project with `source_namespace`.
+    A complete deterministic hierarchy stage can then recover its verified original
+    observations, or accept exact `original_units` on the merged contributor.
+    """
     policy = (
         merge_policy if isinstance(merge_policy, MergePolicyConfig)
         else MergePolicyConfig.model_validate(merge_policy or {})
     )
+    if not independent_outputs and recognize_source_replays:
+        contributors = original_stage_inputs(contributors, policy, target_access_fingerprint)
     return _merge_contributor_nodes_and_edges(
         contributors,
         policy=policy,

@@ -10,7 +10,7 @@ from lightgraph.construction.conflicts import isolate_validation, isolate_public
 from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
 from lightgraph.tests.test_construction_tools import config_for, draft
-from lightgraph.tests.test_graph_yaml_workspace import payload, graph
+from lightgraph.tests.test_graph_yaml_workspace import payload, graph, with_source_keys
 
 
 def conflict_tools(tmp_path, *, label_policy='quarantine'):
@@ -101,6 +101,7 @@ def test_tampered_candidate_cannot_publish_subset(tmp_path):
 def test_cross_draft_conflict_quarantines_both_contributors_and_can_be_repaired(tmp_path):
     work = GraphWorkspace(tmp_path, 'context')
     def publish(name, candidate, *, revision=1):
+        with_source_keys(candidate)
         work.save_draft(payload(name))
         work.record_validation(name, revision=revision, passed=True, graph=candidate)
         return work.publish(name, revision=revision, graph=candidate, isolate_conflicts=True)
@@ -140,7 +141,7 @@ def test_quarantine_follows_definition_variant_and_leaves_unrelated_raw_id_visib
     from lightgraph.tests.test_definition_variant_retention import branch
 
     store = GraphWorkspace(tmp_path, 'ctx')
-    first = branch()
+    first = with_source_keys(branch())
     first['draft_id'] = 'first'
     first['nodes'][0]['supports'].append({'scope_ref': 'public', 'label': 'alternate'})
     store.save_draft(payload('first'))
@@ -151,7 +152,7 @@ def test_quarantine_follows_definition_variant_and_leaves_unrelated_raw_id_visib
 
     # Even a newer unvalidated revision cannot erase the published counterexample.
     store.save_draft({**payload('first'), 'purpose': 'Latest revision'})
-    second = branch(label_kind='derived')
+    second = with_source_keys(branch(label_kind='derived'))
     second['draft_id'] = 'second'
     store.save_draft(payload('second'))
     store.record_validation('second', revision=1, passed=True, graph=second)

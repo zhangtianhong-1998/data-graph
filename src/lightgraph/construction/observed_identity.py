@@ -71,7 +71,7 @@ def _observed_name_pair(support, provenance):
     return sorted(((primary, support['label']), (columns[0], aliases[0])))
 
 
-def _node_evidence(node, definition, *, dictionary=None, reciprocal_names=False):
+def _node_evidence(node, definition, *, dictionary=None, reciprocal_names=False, local_collision=False):
     names = definition.get('key_names', [])
     if (not names or set(node.get('identity', {})) != set(names)
             or node.get('identity_domain') != definition.get('identity_domain')
@@ -95,7 +95,7 @@ def _node_evidence(node, definition, *, dictionary=None, reciprocal_names=False)
             return None
         # Dictionary membership is checked separately against an observed
         # unique-key row. Its address can then stand in for the local binding.
-        binding_parts = [source, columns, label_column] if dictionary is None else ['catalog_key', dictionary]
+        binding_parts = [source, columns, None if local_collision else label_column] if dictionary is None else ['catalog_key', dictionary]
         if reciprocal_names:
             name_values = _observed_name_pair(support, prov)
             if name_values is None:
@@ -127,6 +127,19 @@ def _node_evidence(node, definition, *, dictionary=None, reciprocal_names=False)
                         canonical(property_values) == canonical([row_values[column]])):
                     continue
                 unscoped_properties[column] = sorted(property_values, key=canonical)
+        if local_collision and row.get('values'):
+            # Repeated key cells add no new context. Compare driver values by
+            # the same typed identity semantics as the endpoint (e.g. Decimal
+            # 1.0 and 1.00); other projected attributes remain binding.
+            row_values = dict(row['values'])
+            row_types = dict(row.get('value_types') or {})
+            for column, value in zip(columns, values, strict=True):
+                if column in row_values:
+                    if column not in row_types or identity_cell({'identity': row_values, 'identity_types': row_types}, column) != value:
+                        return None
+                    row_values.pop(column)
+                    row_types.pop(column)
+            row = {'values': row_values, 'value_types': row_types}
         boundary = canonical([support['scope_ref'], sorted(support.get('required_scope_refs', [])),
                               facts, row.get('values'), row.get('value_types'), unscoped_properties])
         observation = canonical([boundary, name_values]) if reciprocal_names else boundary
@@ -348,6 +361,7 @@ def align_observed_nodes(prepared, *, local_bases, excluded_types, emit_candidat
     groups = defaultdict(list)
     type_owners = defaultdict(set)
     witnesses = defaultdict(set)
+    catalog_members = defaultdict(set)
     name_pairs = defaultdict(list)
     considered_nodes = eligible_nodes = 0
     for index, (cid, kind, graph) in enumerate(prepared):
@@ -385,6 +399,15 @@ def align_observed_nodes(prepared, *, local_bases, excluded_types, emit_candidat
                 for node, (observations, values, contexts) in entries:
                     for observation in observations:
                         witnesses[observation, values, contexts].add((index, node['id']))
+                    # A declared unique row can be displayed using independent language
+                    # columns. Its physical key warrants review even without a shared name.
+                    # Only a direct catalogue member qualifies, never two unverified FKs.
+                    binding = _dictionary_binding(node, definition)
+                    if binding and binding[2]:
+                        address = binding[0]
+                        evidence = _node_evidence(node, definition, dictionary=address)
+                        if evidence:
+                            catalog_members[address, evidence].add((index, node['id']))
             shape = definition_contract(definition)
             family = shape.pop('type')
             key_names = shape.pop('key_names')
@@ -401,6 +424,7 @@ def align_observed_nodes(prepared, *, local_bases, excluded_types, emit_candidat
         for peers in _compatible_roles(members):
             _align_roles(peers, contract, prepared, type_owners, overrides, component_inputs)
     review = [group for group in witnesses.values() if len({index for index, _ in group}) > 1]
+    review.extend(group for group in catalog_members.values() if len({index for index, _ in group}) > 1)
     confirmed_pairs = _align_name_pairs(name_pairs, prepared, overrides)
     if emit_candidates:
         review.extend(confirmed_pairs)

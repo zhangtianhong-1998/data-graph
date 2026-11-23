@@ -755,7 +755,7 @@ def build_plan(retriever, scopes, query, business_context, conditions=(), drill_
         kinds = {c['kind'] for c in candidates}
         role = item.get('role') or kind or (next(iter(kinds)) if len(kinds) == 1 else None)
         plan['conditions'].append({'text': item.get('text') or item.get('role') or '节点', 'role': role,
-                                   'candidates': candidates})
+                                   'match': 'node_id' if item.get('node_id') else 'exact', 'candidates': candidates})
     if len(conditions) > 12:
         plan['candidate_limit'] = True
         unresolved.append('条件数量超出本次联合查询范围。')

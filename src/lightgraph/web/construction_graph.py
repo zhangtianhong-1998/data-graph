@@ -48,8 +48,32 @@ def _record_path(root: Path, relative):
 
 def _view_key(kind, path: Path, stat, access, scopes):
     # Nanosecond timestamps do not survive a JSON number round trip.
-    return {'version': 4, 'kind': kind, 'path': str(path), 'size': stat.st_size,
+    return {'version': 5, 'kind': kind, 'path': str(path), 'size': stat.st_size,
             'mtime_ns': str(stat.st_mtime_ns), 'access': access, 'scopes': scopes}
+
+
+def read_publication_record(root, head, config, *, compose_base, pinned_summary, policy_record):
+    """Read and verify the immutable source graph, including any pinned inherited component."""
+    published = _record_path(root, head.get('path'))
+    if published.is_dir():
+        from lightgraph.construction.graph_storage import read_graph_record
+        graph = read_graph_record(published)
+    else:
+        graph = read_internal_yaml(published)
+    if graph.get('storage_layout') == 'sharded_v1':
+        from lightgraph.construction.merger import load_sharded_graph
+        graph = load_sharded_graph(root, graph)
+    if graph.get('access_fingerprint') != head.get('access_fingerprint'):
+        raise LightGraphError('graph_access_context_changed')
+    if head.get('graph_digest') and published.is_dir():
+        if read_internal_yaml(published / 'metadata.yaml').get('graph_digest') != head['graph_digest']:
+            raise LightGraphError('graph_parquet_checksum_mismatch')
+    if compose_base and graph.get('storage_layout') not in {'sharded_v1', 'parquet_v1'}:
+        from lightgraph.construction.inheritance import compose_published_graph, load_frozen_base_graph
+        base_graph, _ = load_frozen_base_graph(root, config=config, summary=pinned_summary,
+                                                authorized_digest=(policy_record or {}).get('inheritance_digest'))
+        graph = compose_published_graph(graph, base_graph, access_fingerprint(config))
+    return graph
 
 
 def load_prepared(config, *, root=None, head=None, authorization_root=None):
@@ -119,27 +143,15 @@ def load_prepared(config, *, root=None, head=None, authorization_root=None):
         key['inherited_files'] = stamps
 
     def build():
-        if published.is_dir():
-            from lightgraph.construction.graph_storage import read_graph_record
-            graph = read_graph_record(published)
-        else:
-            graph = read_internal_yaml(published)
-        if graph.get('storage_layout') == 'sharded_v1':
-            from lightgraph.construction.merger import load_sharded_graph
-            graph = load_sharded_graph(root, graph)
+        graph = read_publication_record(root, head, config, compose_base=compose_base, pinned_summary=pinned_summary,
+                                        policy_record=policy_record)
         graph.pop('_checkpoint_evidence_records', None)
-        if graph.get('access_fingerprint') != head.get('access_fingerprint'):
-            raise LightGraphError('graph_access_context_changed')
-        if head.get('graph_digest') and published.is_dir():
-            if read_internal_yaml(published / 'metadata.yaml').get('graph_digest') != head['graph_digest']:
-                raise LightGraphError('graph_parquet_checksum_mismatch')
-        if compose_base and graph.get('storage_layout') not in {'sharded_v1', 'parquet_v1'}:
-            from lightgraph.construction.inheritance import compose_published_graph, load_frozen_base_graph
-            base_graph, _ = load_frozen_base_graph(root, config=config, summary=pinned_summary,
-                                                    authorized_digest=(policy_record or {}).get('inheritance_digest'))
-            graph = compose_published_graph(graph, base_graph, expected_access)
         graph = filter_graph_scopes(graph, config.scopes)
         graph['version_id'] = snapshot_id(head, root=root)
+        from lightgraph.construction.human_identity import candidate_key
+        for group in graph.get('candidate_identity_merges', []):
+            if 'identity_review' not in head or 'candidate_id' not in group:
+                group['candidate_id'] = candidate_key(graph['version_id'], group)
         graph['nodes'] = [{**node, 'kind': node['type'], 'layer': 'business', 'status': 'accepted'}
                           for node in graph.get('nodes', [])]
         graph['edges'] = [{**edge, 'relation': edge['type'], 'status': 'accepted',

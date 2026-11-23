@@ -54,6 +54,7 @@ def column_node(entity, index, mapping, catalog, goal=None):
     catalog_basis = 'catalog_comment' if column.comment.strip() else 'column_name'
     origin = {'definition': entity.type, 'mapping': index,
               'source': {'source_id': table.source_id, 'schema': table.schema_name, 'table': table.name},
+              **table.workbook_position_evidence([column.name]),
               'columns': [column.name], 'scope_columns': [], 'source_kind': 'metadata_column',
               'evidence_refs': mapping.evidence_refs}
     catalog_properties = {'physical_column': [column.name], 'data_type': [column.data_type],

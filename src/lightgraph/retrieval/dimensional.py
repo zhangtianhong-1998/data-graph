@@ -6,7 +6,8 @@ from itertools import product
 
 from lightgraph.contracts import canonical
 from lightgraph.source_values import scalar_kind
-from .path_evidence import evidence_preview, path_node
+from .path_evidence import evidence_preview, path_node, grounds_slot
+from .joint_evidence import common_record
 from .retriever import _join_contexts, _observation_groups, _row_witnesses
 
 _LIMIT = 4096
@@ -29,16 +30,24 @@ def _row_key(observation):
     return (*next(iter(rows.items())), canonical([row['values'], row.get('value_types', {})]))
 
 
-def _values_match_identity(node, columns, values, types):
+def _values_match_identity(node, columns, values, types, witness):
     identity = node['identity']
-    if not columns or len(columns) != len(identity) or len(values) != len(columns) or len(types) != len(columns):
+    if not columns or len(values) != len(columns) or len(types) != len(columns):
         return False
-    if set(columns) == set(identity):
-        names = columns
-    elif len(columns) == 1:
-        names = list(identity)
-    else:
-        # The logical order of composite alias keys cannot be reconstructed by sorting them.
+    original = witness.get('source_identity')
+    if original:
+        return canonical(original['values']) == canonical(values) and original['value_types'] == types
+    if witness.get('identity_decision_refs') or len(columns) != len(identity):
+        return False
+    names = witness.get('identity_key_names')
+    if not names:
+        if set(columns) == set(identity):
+            names = columns
+        elif len(columns) == 1:
+            names = list(identity)
+        else:
+            return False
+    if len(names) != len(identity) or set(names) != set(identity):
         return False
     return all(canonical(identity[name]) == canonical(value) and node['identity_types'].get(name) == value_type
                for name, value, value_type in zip(names, values, types))
@@ -54,8 +63,8 @@ def _bound_values(observation, columns):
     return [values[c] for c in columns], [types.get(c) or scalar_kind(values[c]) for c in columns]
 
 
-def _binds_identity(node, observation, columns):
-    return _values_match_identity(node, columns, *_bound_values(observation, columns))
+def _binds_identity(node, observation, columns, witness):
+    return _values_match_identity(node, columns, *_bound_values(observation, columns), witness)
 
 
 def _lookup_binding(node, observation, end, columns, witness):
@@ -65,7 +74,7 @@ def _lookup_binding(node, observation, end, columns, witness):
         values, types = _bound_values(observation, columns)
         if (not values or canonical(values) != canonical(lookup.get('input_values')) or types != lookup.get('input_value_types')
                 or not _values_match_identity(node, lookup.get('key_columns'), lookup.get('resolved_key') or [],
-                                              lookup.get('resolved_key_types') or [])):
+                                              lookup.get('resolved_key_types') or [], witness)):
             continue
         if lookup.get('inherited_node_id') == node['id']:
             return True
@@ -87,22 +96,26 @@ def _lookup_binding(node, observation, end, columns, witness):
     return False
 
 
-def _endpoint(node, observation, edge, row_key, context):
+def _endpoint(node, observation, edge, row_key, context, slot=None):
     end = 'source' if edge['source'] == node['id'] else 'target'
     columns = (observation.get('provenance') or {}).get(end + '_key_columns')
     lookup_required = any(m.get('endpoint') == end for m in observation.get('lookup_matches') or ())
-    directly_bound = not lookup_required and _binds_identity(node, observation, columns)
     for node_context, group in _observation_groups(node):
         joined = _join_contexts(context, node_context)
         if joined is None or joined['status'] == 'unknown':
             continue
         for witness in group:
+            bindings = (observation.get('identity_decision_endpoints') or {}).get(end, {})
+            members = witness.get('identity_decision_members') or {}
+            if any(members.get(version) != member for version, member in bindings.items()):
+                continue
+            if slot and not grounds_slot(node, witness, slot):
+                continue
             key = _row_key(witness)
             if key and key[0] == row_key[0] and key != row_key:
                 continue
-            if (directly_bound or _lookup_binding(node, observation, end, columns, witness)
-                    or (not lookup_required and row_key == key and _binds_identity(
-                        node, witness, (witness.get('provenance') or {}).get('key_columns')))):
+            if (_binds_identity(node, observation, columns, witness) if not lookup_required
+                    else _lookup_binding(node, observation, end, columns, witness)):
                 yield joined, witness
 
 
@@ -188,7 +201,7 @@ def retrieve_dimensional(retriever, query, scopes, plan, *, direction='outgoing'
                         grain = _row_key(obs)
                         if not grain:
                             continue
-                        for ctx, witness in _endpoint(nodes[nid], obs, edge, grain, edge_ctx):
+                        for ctx, witness in _endpoint(nodes[nid], obs, edge, grain, edge_ctx, item):
                             binding = (nid, edge, obs, ctx, witness)
                             if viable is None or (center, grain) in viable:
                                 facts[center, grain][slot].append(binding)
@@ -233,6 +246,7 @@ def retrieve_dimensional(retriever, query, scopes, plan, *, direction='outgoing'
     # Verify the complete conjunction before using its graph edges as an answer.
     qualified = []
     proofs = set()
+    unverified_row = False
     for (center, grain), hits in sorted(facts.items()):
         if len(hits) != len(slots):
             continue
@@ -250,6 +264,11 @@ def retrieve_dimensional(retriever, query, scopes, plan, *, direction='outgoing'
                 if ctx is None:
                     break
             if ctx is None:
+                continue
+            row_observations = [part[2] for part in combo]
+            row_proof = common_record(row_observations)
+            if not row_proof:
+                unverified_row = True
                 continue
             central = next(_center_witnesses(nodes[center], ctx, grain), None)
             if not central:
@@ -273,11 +292,11 @@ def retrieve_dimensional(retriever, query, scopes, plan, *, direction='outgoing'
             details['witnesses'].append({'fact_id': center, 'row_id': grain[1],
                 'source': combo[0][2]['provenance']['source'], 'grain_columns': combo[0][2]['provenance']['context_columns'],
                 'edge_ids': edge_ids, 'conditions': [{'text': s['text'], 'node_id': nid} for s, nid in zip(slots, ids)],
-                'business_context': ctx})
-            qualified.append((center, grain, ctx, ids))
+                'business_context': ctx, 'common_record': row_proof})
+            qualified.append((center, grain, ctx, ids, row_observations))
     children, level_hits = set(), set()
     if qualified and plan.get('drill_role'):
-        for center, grain, context, ids in qualified:
+        for center, grain, context, ids, row_observations in qualified:
             # A global/catalog hierarchy may be stored separately. Its child
             # must also be bound independently to this very fact tuple.
             memberships = defaultdict(list)
@@ -289,10 +308,10 @@ def retrieve_dimensional(retriever, query, scopes, plan, *, direction='outgoing'
                             break
                         if _row_key(obs) == grain:
                             memberships[child_id].append((membership, obs, member_ctx))
-            queue = deque((nid, 0, context) for nid, s in zip(ids, slots) if s['role'] == plan['drill_role'])
+            queue = deque((nid, 0, context, row_observations) for nid, s in zip(ids, slots) if s['role'] == plan['drill_role'])
             seen = set()
             while queue and within_budget():
-                parent, depth, ctx = queue.popleft()
+                parent, depth, ctx, ancestor_observations = queue.popleft()
                 signature = (parent, canonical(ctx))
                 if signature in seen:
                     continue
@@ -311,6 +330,8 @@ def retrieve_dimensional(retriever, query, scopes, plan, *, direction='outgoing'
                             hierarchy_grain = _row_key(obs)
                             membership_proof = None
                             if hierarchy_grain == grain:
+                                if not common_record([*ancestor_observations, obs]):
+                                    continue
                                 match = next(_endpoint(nodes[child], obs, edge, grain, joined), None)
                             else:
                                 if hierarchy_grain and hierarchy_grain[0] == grain[0]:
@@ -318,7 +339,7 @@ def retrieve_dimensional(retriever, query, scopes, plan, *, direction='outgoing'
                                 match = None
                                 for member_edge, member_obs, member_ctx in memberships.get(child, ()):
                                     verified = _join_contexts(joined, member_ctx)
-                                    if verified:
+                                    if verified and common_record([*ancestor_observations, member_obs]):
                                         match = next(_endpoint(nodes[child], member_obs, member_edge, grain, verified), None)
                                     if match:
                                         membership_proof = (member_edge, member_obs)
@@ -340,19 +361,20 @@ def retrieve_dimensional(retriever, query, scopes, plan, *, direction='outgoing'
                             if plan.get('requested_level') and nodes[child]['kind'] == plan['requested_level']:
                                 level_hits.add(child)
                             else:
-                                queue.append((child, depth + 1, match[0]))
+                                verified_obs = membership_proof[1] if membership_proof else obs
+                                queue.append((child, depth + 1, match[0], [*ancestor_observations, verified_obs]))
                             break
     if qualified:
         details.update(status='matched', matched_conditions=[s['text'] for s in slots],
                        fact_ids=sorted({w['fact_id'] for w in details['witnesses']}), children=sorted(children),
                        level_node_ids=sorted(level_hits),
-                       multiple_bindings=len({ids for _, _, _, ids in qualified}) > 1,
+                       multiple_bindings=len({ids for _, _, _, ids, _ in qualified}) > 1,
                        stop_reason=('search_limit' if reasons else 'level_reached' if level_hits else
                                     'requested_level_unreached' if plan.get('requested_level') else
                                     'no_further_witnessed_child' if plan['drill_role'] else 'conditions_met'))
     else:
         details.update(status='incomplete' if reasons else 'no_common_fact',
-                       stop_reason='search_limit' if reasons else 'no_joint_row_evidence')
+                       stop_reason='search_limit' if reasons else 'row_cooccurrence_unverified' if unverified_row else 'no_joint_row_evidence')
     answer.update(nodes=list(node_output.values()), edges=list(edge_output.values()),
                   truncated=bool(reasons), truncation_reasons=sorted(reasons))
     return answer

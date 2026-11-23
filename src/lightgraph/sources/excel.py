@@ -1,5 +1,8 @@
 """Read-only Excel input; no formula execution, network access, or staging files."""
 from __future__ import annotations
+from array import array
+import hashlib
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import date, datetime, time as daytime
 import re
@@ -13,6 +16,7 @@ from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler, SQLGuard
 from lightgraph.query.compiler import ident
 from lightgraph.query.predicate import ScopeConjunction
+from .base import row_bytes
 from .memory import MemorySource
 from .budget import BudgetedCursor
 
@@ -30,6 +34,10 @@ def _cell_value(cell, cached):
 class ExcelSource(MemorySource):
     def __init__(self, path: str | Path, *, source_id: str = "excel", limits: QueryLimits | None = None, header_row: int = 1, include_hidden: bool = False, max_file_bytes: int = 200 * 1024 * 1024, max_rows: int = 200000, max_columns: int = 2000, max_memory_bytes: int = 128 * 1024 * 1024, query_budget=None, metadata_only: bool = False, allowed_tables: list[str] | None = None, allowed_columns: dict[str, list[str]] | None = None):
         path = Path(path)
+        self._sheet_rows = {}
+        self._position_bytes = 0
+        self._witness_table = None
+        self.workbook_snapshot = None
         selected_tables = set(allowed_tables) if allowed_tables is not None else None
         selected_columns = allowed_columns or {}
         if allowed_tables is not None and len(allowed_tables) != len(selected_tables):
@@ -43,7 +51,11 @@ class ExcelSource(MemorySource):
         if not path.is_file() or path.stat().st_size > max_file_bytes: raise LightGraphError("excel_file_limit")
         if path.suffix.lower() != ".xlsx": raise LightGraphError("excel_format_unsupported")
         if header_row < 1 or header_row > 100: raise LightGraphError("excel_header_invalid")
+        before = path.stat()
         try:
+            if not metadata_only:
+                with path.open("rb") as source_file:
+                    self.workbook_snapshot = hashlib.file_digest(source_file, "sha256").hexdigest()
             with zipfile.ZipFile(path) as archive:
                 members = archive.infolist()
                 if sum(x.file_size for x in members) > max_memory_bytes * 4 or len(members) > 10000:
@@ -103,8 +115,9 @@ class ExcelSource(MemorySource):
                     rows[table.qualified_name] = ()
                     continue
                 excluded = set(visible) - set(kept)
+                sheet_rows = self._sheet_rows[table.qualified_name] = array("I")
                 def iterate(sheet=ws, sr=source_rows, vr=value_rows, keep=kept, hidden=hidden_rows,
-                            column_names=tuple(names), excluded_columns=excluded):
+                            column_names=tuple(names), excluded_columns=excluded, positions=sheet_rows):
                     for index, (raw, cached) in enumerate(zip(sr, vr), header_row + 1):
                         if index - header_row > max_rows: raise LightGraphError("excel_row_limit")
                         if index in hidden: continue
@@ -129,7 +142,23 @@ class ExcelSource(MemorySource):
                             # string counts as data; a formula without a cache does not.
                             populated = any(_cell_value(raw[i], cached[i] if i < len(cached) else None)
                                             is not None for i in excluded_columns if i < len(raw))
-                        if populated: yield tuple(converted)
+                        if populated:
+                            record = tuple(converted)
+                            if self.workbook_snapshot:
+                                # Mirror the ordinary imported-row charge before yielding.
+                                # At the existing limit, retain input data and discard the
+                                # complete optional position index across every sheet.
+                                required = self._input_bytes + row_bytes(record) + 64
+                                self._position_bytes += positions.itemsize
+                                if required + self._position_bytes > max_memory_bytes:
+                                    for saved_positions in self._sheet_rows.values():
+                                        del saved_positions[:]
+                                    self._sheet_rows.clear()
+                                    self._position_bytes = 0
+                                    self.workbook_snapshot = None
+                                else:
+                                    positions.append(index)
+                            yield record
                 rows[table.qualified_name] = iterate()
             available_tables = {table.qualified_name for table in tables}
             if selected_tables is not None and selected_tables - available_tables:
@@ -140,6 +169,10 @@ class ExcelSource(MemorySource):
             super().__init__(tables, rows, limits=limits, max_memory_bytes=max_memory_bytes, query_budget=query_budget)
             if not metadata_only:
                 self._infer_loaded_types()
+                after = path.stat()
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                    raise LightGraphError("excel_input_changed")
             self.compiler = QueryCompiler(self._tables, dialect="sqlite", physical_columns=physical_columns)
         except LightGraphError:
             if hasattr(self, "_db"): self.close()
@@ -212,7 +245,7 @@ class ExcelSource(MemorySource):
             raise LightGraphError("formula_cache_missing_in_projection")
         yield from super().project(table,columns,predicate,distinct,limit)
 
-    def execute(self, query, *, row_limit=None):
+    def _check_formula_query(self, query):
         """Missing formula caches remain unknown through every SQL entry point.
 
         The normal catalog guard validates first. Removing unavailable columns
@@ -234,7 +267,103 @@ class ExcelSource(MemorySource):
                 if exc.code == "unauthorized_column":
                     raise LightGraphError("formula_cache_missing_in_projection") from None
                 raise
+
+    def execute(self, query, *, row_limit=None):
+        self._check_formula_query(query)
         yield from super().execute(query, row_limit=row_limit)
+
+    def _authorize(self, action, arg1, arg2, db, trigger):
+        if self._witness_table:
+            if (action == sqlite3.SQLITE_READ and (db, arg1) == self._witness_table
+                    and (arg2 or '').casefold() == 'rowid'):
+                return sqlite3.SQLITE_OK
+            if action == sqlite3.SQLITE_FUNCTION and arg2 == 'lg_capture_row':
+                return sqlite3.SQLITE_OK
+        return super()._authorize(action, arg1, arg2, db, trigger)
+
+    def sheet_row_snapshot(self, table):
+        # SQLite's implicit row identifier is addressable through any alias the
+        # imported table has not shadowed. A source cell must never serve as a locator.
+        names = {c.casefold() for c in self.compiler.tables[table.qualified_name].column_names}
+        if {'rowid', '_rowid_', 'oid'} <= names:
+            return None
+        return self.workbook_snapshot
+
+    @contextmanager
+    def sheet_row_projection(self, table, columns, *, predicate, limit, witness_bytes):
+        """Keep DISTINCT representatives and return-column budgets identical to normal projection.
+
+        The private observer sees each qualifying source row while SQLite scans its immutable
+        worksheet. Grouping and output still belong to the ordinary DISTINCT operator. The
+        caller reads the locator only after exhausting the complete cursor, since duplicates
+        may occur after the last newly observed tuple.
+        """
+        snapshot = self.sheet_row_snapshot(table)
+        query = self.compiler.projection(table, columns, predicate=predicate, limit=limit)
+        self._check_formula_query(query)
+        if (not snapshot or len(columns) + 1 > self._db.getlimit(sqlite3.SQLITE_LIMIT_FUNCTION_ARG)
+                or witness_bytes <= 0):
+            yield self.project(table, columns, predicate=predicate, limit=limit), lambda row: None
+            return
+        params = {}
+        fields = self.compiler.columns(table, columns)
+        where = self.compiler.predicate(table, predicate, params)
+        names = {c.casefold() for c in self.compiler.tables[table.qualified_name].column_names}
+        alias = next(a for a in ('rowid', '_rowid_', 'oid') if a not in names)
+        sql = (f"SELECT DISTINCT {', '.join(fields)} FROM {self.compiler.table(table)} "
+               f"WHERE CASE WHEN {where} THEN lg_capture_row({ident(alias)}, {', '.join(fields)}) ELSE 0 END "
+               "LIMIT :cap")
+        params['cap'] = limit + 1
+        positions = self._sheet_rows[table.qualified_name]
+        members = {}
+        used_bytes = 0
+
+        def capture(sqlite_id, *values):
+            nonlocal used_bytes
+            if used_bytes > witness_bytes:
+                return 1
+            # Python tuple equality matches SQLite DISTINCT for these BLOB-affinity
+            # file values, including integer 1 and real 1.0. Preserve types separately.
+            float_mask = sum(1 << i for i, v in enumerate(values) if isinstance(v, float))
+            if values not in members:
+                used_bytes += row_bytes(values) + 256
+                members[values] = (float_mask, array('I'))
+            group = members[values]
+            if group is not None:
+                if group[0] == float_mask:
+                    group[1].append(positions[sqlite_id - 1])
+                    used_bytes += group[1].itemsize
+                else:
+                    # One SQL representative covers several concrete source types.
+                    members[values] = None
+            if used_bytes > witness_bytes:
+                members.clear()
+            return 1
+
+        def witness(row):
+            group = members.get(tuple(row[c] for c in columns))
+            if group is None:
+                return None
+            ranges = []
+            for index in sorted(group[1]):
+                if ranges and ranges[-1][1] + 1 == index:
+                    ranges[-1][1] = index
+                else:
+                    ranges.append([index, index])
+            return {'kind': 'excel_rows_v1', 'snapshot': snapshot, 'rows': ranges}
+
+        with self._lock:
+            if self._closed:
+                raise LightGraphError('source_closed')
+            self._db.create_function('lg_capture_row', -1, capture)
+            self._witness_table = (table.schema_name, table.name)
+            stream = self._read_cursor(sql, params, (), limit)
+            try:
+                yield stream, witness
+            finally:
+                stream.close()
+                self._witness_table = None
+                self._db.create_function('lg_capture_row', -1, None)
 
     @staticmethod
     def _hidden_positions(path, ws, include_hidden, *, columns_only=False):

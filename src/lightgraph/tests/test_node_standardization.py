@@ -40,6 +40,9 @@ def test_standard_node_details_separate_names_descriptions_catalog_notes_and_phy
         'sources': [],
         'model': {'mode': 'in_environment'},
         'scopes': ['public'],
+        # This fixture combines complementary fields from a single product catalogue.
+        'fusion_policy': {'entity_rules': [{'entity_type': 'Product', 'canonical_type': 'Product',
+            'identity_domain': 'product_catalog', 'key_mapping': {'code': 'code'}}]},
         'scope_bindings': [
             {'source_id': 'db_a', 'schema': 'dm', 'table': 'income_f', 'columns': ['tenant']},
             {'source_id': 'db_b', 'schema': 'dm', 'table': 'order_f', 'columns': ['tenant']},

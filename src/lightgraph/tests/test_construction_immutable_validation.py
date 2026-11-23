@@ -20,7 +20,7 @@ def test_budget_failure_retains_snapshot_and_publishes_without_reading_database(
     config, database, connection, opened = mixed_config(tmp_path, monkeypatch, 'gauss', 'excel')
     tools = ConstructionTools(config, tmp_path / 'work')
     try:
-        draft = mixed_draft(tools.describe_sources())
+        draft = mixed_draft(tools)
         tools.call('save_graph_draft', yaml_text=dump_yaml(draft))
         checked = tools.call('validate_graph_draft', draft_id=draft['draft_id'])
         assert checked['passed']
@@ -58,7 +58,7 @@ def test_live_database_change_does_not_rewrite_validated_snapshot(tmp_path, monk
     config, database, connection, _ = mixed_config(tmp_path, monkeypatch, 'gauss', 'csv')
     tools = ConstructionTools(config, tmp_path / 'work')
     try:
-        draft = mixed_draft(tools.describe_sources())
+        draft = mixed_draft(tools)
         tools.call('save_graph_draft', yaml_text=dump_yaml(draft))
         checked = tools.call('validate_graph_draft', draft_id=draft['draft_id'])
         assert checked['passed']
@@ -81,7 +81,7 @@ def test_database_snapshot_survives_restart_without_rereading_rows(tmp_path, mon
     config, database, _, _ = mixed_config(tmp_path, monkeypatch, 'gauss', 'csv')
     tools = ConstructionTools(config, tmp_path / 'work')
     try:
-        draft = mixed_draft(tools.describe_sources())
+        draft = mixed_draft(tools)
         tools.call('save_graph_draft', yaml_text=dump_yaml(draft))
         checked = tools.call('validate_graph_draft', draft_id=draft['draft_id'])
         assert checked['passed']
@@ -121,7 +121,7 @@ def test_database_connection_environment_change_invalidates_saved_snapshot(tmp_p
     config, database, _, _ = mixed_config(tmp_path, monkeypatch, 'gauss', 'csv')
     tools = ConstructionTools(config, tmp_path / 'work')
     try:
-        draft = mixed_draft(tools.describe_sources())
+        draft = mixed_draft(tools)
         tools.call('save_graph_draft', yaml_text=dump_yaml(draft))
         assert tools.call('validate_graph_draft', draft_id=draft['draft_id'])['passed']
         original_context = tools.workspace.context_fingerprint

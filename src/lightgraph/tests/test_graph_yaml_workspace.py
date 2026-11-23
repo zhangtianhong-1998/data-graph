@@ -19,6 +19,20 @@ def graph(node_id='n1', kind='物品', label='名称'):
                        'aliases': [], 'properties': {}, 'provenance': []}], 'edges': [], 'evidence_refs': []}
 
 
+def with_source_keys(graph):
+    """Add the source witnesses these publication tests intend the drafts to share."""
+    for node in graph['nodes']:
+        node['identity_types'] = {key: 'text' for key in node['identity']}
+        if 'supports' not in node:
+            node['supports'] = [{'scope_ref': 'public', 'label': node['label']}]
+        supports = node['supports']
+        for support in supports:
+            support['provenance'] = {'source': {'source_id': 'sample', 'schema': 'public', 'table': node['type']},
+                'key_columns': list(node['identity']), 'label_column': 'title'}
+            support['business_context'] = {'status': 'global', 'dimensions': {}}
+    return graph
+
+
 def test_yaml_preserves_codes_without_implicit_dates_or_booleans():
     value = safe_load_yaml("code: 0012\nword: yes\ndate: 2026-11-03\nflag: true\ncount: 12\n")
     assert value == {'code': '0012', 'word': 'yes', 'date': '2026-11-03', 'flag': True, 'count': 12}
@@ -90,12 +104,12 @@ def test_publish_requires_exact_graph_revision_and_preserves_independent_outputs
     store = GraphWorkspace(tmp_path, 'ctx')
     store.save_draft(payload())
     with pytest.raises(LightGraphError, match='graph_validation_required'):
-        store.publish('物品关系', revision=1, graph=graph())
-    store.record_validation('物品关系', revision=1, passed=True, graph=graph())
-    changed = graph(label='篡改')
+        store.publish('物品关系', revision=1, graph=with_source_keys(graph()))
+    store.record_validation('物品关系', revision=1, passed=True, graph=with_source_keys(graph()))
+    changed = with_source_keys(graph(label='篡改'))
     with pytest.raises(LightGraphError, match='validated_graph_mismatch'):
         store.publish('物品关系', revision=1, graph=changed)
-    first = store.publish('物品关系', revision=1, graph=graph())
+    first = store.publish('物品关系', revision=1, graph=with_source_keys(graph()))
     first_files = {p: p.read_bytes() for p in (tmp_path / first['graph']).iterdir()}
     other = payload('另一个', '位置')
     store.save_draft(other)

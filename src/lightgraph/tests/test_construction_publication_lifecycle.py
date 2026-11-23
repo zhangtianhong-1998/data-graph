@@ -23,7 +23,10 @@ def test_individually_acyclic_drafts_cannot_publish_a_joint_cycle(tmp_path):
               for name in ('first', 'reverse', 'independent')]
     rows = {'public.first': [('A', 'B')], 'public.reverse': [('B', 'A')],
             'public.independent': [('X', 'Y')]}
-    config = RunConfig(sources=[], model={'mode': 'in_environment'})
+    # Both publishers explicitly refer to the same identifier system.
+    config = RunConfig(sources=[], model={'mode': 'in_environment'}, fusion_policy={'entity_rules': [
+        {'entity_type': '对象', 'canonical_type': '对象', 'identity_domain': '共同对象',
+         'key_mapping': {'编号': '编号'}}]})
     with MemorySource(tables, rows) as adapter:
         tools = ConstructionTools(config, tmp_path / 'work', adapters=[adapter])
         try:

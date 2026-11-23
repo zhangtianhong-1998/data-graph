@@ -78,7 +78,8 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
     if graph.get('support_visibility_version') != 1:
         if graph.get('nodes') or graph.get('edges'):
             raise LightGraphError('graph_support_visibility_missing')
-        return deepcopy(graph)
+        return deepcopy({k: v for k, v in graph.items()
+                         if k not in {'hierarchy_replay_inputs', 'physical_source_namespace_binding'}})
 
     def supports_for(item):
         return [deepcopy(support) for support in item.get('supports', [])
@@ -167,7 +168,8 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
     report_fields = {'conflict_isolation', 'candidate_identity_merges', 'candidate_column_alignments', 'definition_conflicts',
                      'unresolved_relations', 'context_cycle_diagnostics',
                      'evidence_catalog', 'evidence_refs', 'validation_snapshots', 'read_window',
-                     'quality_diagnostics', 'fusion_diagnostics', 'fusion_policy'}
+                     'quality_diagnostics', 'fusion_diagnostics', 'fusion_policy', 'hierarchy_replay_inputs',
+                     'physical_source_namespace_binding'}
     view = _view_shell(graph, omit=report_fields)
     refs = set()
     for item in nodes + edges + unresolved:
@@ -222,8 +224,13 @@ def _visible_candidates(candidates, node_ids, edge_ids):
                 or not isinstance(links, list) or not all(isinstance(eid, str) for eid in links)
                 or not set(ids).issubset(node_ids) or not set(links).issubset(edge_ids)):
             continue
-        result.append({key: deepcopy(candidate[key]) for key in (
-            'status', 'reason', 'category', 'node_ids', 'edge_ids', 'definition_ids') if key in candidate})
+        summary = {key: deepcopy(candidate[key]) for key in (
+            'status', 'reason', 'category', 'node_ids', 'edge_ids', 'definition_ids') if key in candidate}
+        identifier = candidate.get('candidate_id')
+        if isinstance(identifier, str) and len(identifier) == 43 and identifier[:3] == 'pc_' and all(
+                char in '0123456789abcdef' for char in identifier[3:]):
+            summary['candidate_id'] = identifier
+        result.append(summary)
     return result
 
 

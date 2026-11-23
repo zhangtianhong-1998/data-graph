@@ -1,5 +1,6 @@
 """Compare source observations without changing the evidence stored on a member or edge."""
 import re
+from collections import defaultdict
 from typing import NamedTuple
 
 from lightgraph.contracts import canonical
@@ -10,7 +11,7 @@ from .contexts import business_context_identity
 
 class ObservationBoundary(NamedTuple):
     scope: str
-    row_context: str
+    row_context: str | tuple
     predicate: tuple
 
 
@@ -61,6 +62,152 @@ def observation_boundary(support, key_columns, positions, *, witnessed_captions=
     return ObservationBoundary(
         observation_scope(support),
         canonical([values, types]), _predicate_terms(prov.get('predicate'), nonnull))
+
+
+def _worksheet_projection(support):
+    witness = support.get('source_row_witness')
+    if witness is None:
+        return None
+    if (not isinstance(witness, dict) or witness.get('kind') != 'excel_rows_v1'
+            or not isinstance(witness.get('snapshot'), str)
+            or not re.fullmatch(r'[0-9a-f]{64}', witness['snapshot'])):
+        raise ValueError('invalid worksheet witness')
+    ranges = witness.get('rows')
+    if not isinstance(ranges, list) or not ranges:
+        raise ValueError('missing worksheet rows')
+    previous = 0
+    for span in ranges:
+        if (not isinstance(span, list) or len(span) != 2 or any(type(n) is not int for n in span)
+                or not previous < span[0] <= span[1] <= 1_048_576):
+            raise ValueError('invalid worksheet rows')
+        previous = span[1]
+    context = support.get('row_context') or {}
+    values, types = context.get('values', {}), context.get('value_types', {})
+    columns = set(support['provenance'].get('context_columns') or ())
+    if (not isinstance(values, dict) or not isinstance(types, dict)
+            or set(values) != columns or set(types) != columns
+            or not columns.issubset(support['provenance'].get('columns') or ())):
+        raise ValueError('incomplete worksheet context')
+    # Two imports can select different header rows from the same workbook.
+    # Bind every shared column name to its original physical position, including
+    # endpoints not requested as row context. A projected column index is insufficient.
+    projected = set(support['provenance'].get('columns') or ())
+    ordinals = support['provenance'].get('source_column_ordinals') or {}
+    if (not isinstance(ordinals, dict)
+            or any(type(n) is not int or not 1 <= n <= 16_384 for n in ordinals.values())
+            or len(set(ordinals.values())) != len(ordinals)):
+        raise ValueError('invalid worksheet column coordinates')
+    cells = {('ordinal', c): n for c, n in ordinals.items() if c in projected}
+    cells.update({('column', n): c for c, n in ordinals.items() if c in projected})
+    complete_header = bool(projected) and projected <= ordinals.keys()
+    for col, value in values.items():
+        kind = types[col]
+        if value is not None and not isinstance(value, (bool, str, float, int)):
+            raise ValueError('invalid worksheet cell')
+        if not (kind == scalar_kind(value) or
+                (isinstance(value, str) and kind in ('date', 'datetime', 'time', 'decimal'))):
+            raise ValueError('invalid worksheet cell type')
+        cells[col] = canonical([kind, value])
+    return witness['snapshot'], tuple(map(tuple, ranges)), cells, complete_header
+
+
+# A pathological set of staggered projections can otherwise expand quadratically
+# even though the input contains only a few thousand intervals for this one edge.
+_MAX_EDGE_ROW_COMPARISONS = 65_536
+
+
+def worksheet_edge_boundaries(entries, diagnostics):
+    """Compare independent projections of one physical edge against its complete worksheet row sets.
+
+    entries contains (projection owner, support, original boundary/property pair). Row intervals are
+    split only at a recorded endpoint. Each piece keeps its own predicate and scope.
+    A legacy support keeps its original row comparison and cannot bridge different
+    witnessed rows. None marks contradictory or malformed evidence.
+    """
+    result = [[boundary] for _, _, (boundary, _) in entries]
+    if not any('source_row_witness' in support for _, support, _ in entries):
+        return result
+    events = defaultdict(lambda: defaultdict(list))
+    owner_facts = defaultdict(set)
+    cells_by_index = {}
+    protected_by_index = {}
+    legacy_facts = set()
+    located_facts = defaultdict(lambda: defaultdict(set))
+    incomplete_headers = set()
+    for i, (owner, support, fact) in enumerate(entries):
+        boundary, _ = fact
+        try:
+            witness = _worksheet_projection(support)
+        except ValueError:
+            result[i] = None
+            continue
+        if witness is None:
+            legacy_facts.add(fact)
+            continue
+        snapshot, ranges, cells, complete_header = witness
+        if not complete_header:
+            incomplete_headers.add(i)
+            legacy_facts.add(fact)
+        cells_by_index[i] = cells
+        prov = support['provenance']
+        mapping = prov.get('business_context_mapping') or {}
+        protected_by_index[i] = (set((prov.get('property_columns') or {}).values())
+                                 | set(prov.get('scope_columns') or ())
+                                 | set((mapping.get('columns') or {}).values()))
+        physical_fact = (snapshot, ranges, frozenset(cells.items()))
+        owner_facts[owner].add((fact, physical_fact))
+        raw_cells = frozenset((col, cell) for col, cell in cells.items() if isinstance(col, str))
+        located_facts[fact][owner].add((snapshot, ranges, raw_cells))
+        for first, last in ranges:
+            events[snapshot][first].append((i, True))
+            events[snapshot][last + 1].append((i, False))
+    # Identical projections keep their original boundary. In particular, a
+    # disconnected member can still compare its mappings to its role anchor.
+    changed = len({frozenset(facts) for facts in owner_facts.values()}) > 1
+    keep_exact = {fact for fact in legacy_facts
+                  if len({frozenset(rows) for rows in located_facts[fact].values()}) == 1}
+    normalize = {i for i in cells_by_index if changed and entries[i][2] not in keep_exact}
+    for i in normalize:
+        result[i] = None if i in incomplete_headers else []
+    # Charge a support once per active interval piece, without expanding a
+    # single range to individual worksheet rows. Most merges have one active
+    # support per projection. On exhaustion no located support from this edge
+    # may supply identity evidence, including those already compared.
+    range_count = sum(sum(map(len, steps.values())) for steps in events.values()) // 2
+    remaining = min(_MAX_EDGE_ROW_COMPARISONS, 16 * range_count)
+    for snapshot, steps in events.items():
+        positions = sorted(steps)
+        active = set()
+        for first, following in zip(positions, positions[1:]):
+            for i, start in steps[first]:
+                if start:
+                    active.add(i)
+                else:
+                    active.remove(i)
+            if not active:
+                continue
+            remaining -= len(active)
+            if remaining < 0:
+                field = 'worksheet_edges_exceeding_row_comparison_budget'
+                diagnostics[field] = diagnostics.get(field, 0) + 1
+                return [None if i in cells_by_index else boundaries for i, boundaries in enumerate(result)]
+            common = {}
+            protected = set()
+            conflict = False
+            for i in active:
+                protected.update(protected_by_index[i])
+                for col, cell in cells_by_index[i].items():
+                    if common.setdefault(col, cell) != cell:
+                        conflict = True
+            for i in active:
+                if conflict:
+                    result[i] = None
+                elif i in normalize and result[i] is not None:
+                    boundary, _ = entries[i][2]
+                    binding = tuple(sorted((c, cells_by_index[i][c]) for c in protected & cells_by_index[i].keys()))
+                    section = ('excel_rows_v1', snapshot, first, following - 1, binding)
+                    result[i].append(boundary._replace(row_context=section))
+    return result
 
 
 # The mapping language permits arbitrary property names. Restrict positional

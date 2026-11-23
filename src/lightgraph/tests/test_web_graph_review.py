@@ -84,6 +84,11 @@ def test_identity_review_cas_mutability_and_revoke_preserve_original_evidence(cl
     assert 'PRIVATE' not in str(listing)
     body={'candidate_id':candidate['candidate_id'],'verdict':'same','revision':0}
     url='/api/projects/p/graph/identity-decisions'
+    # An explicit empty context means global assertions only. The legacy store
+    # cannot prove that selection on its original facts.
+    limited=client.get('/api/projects/p/graph/identity-candidates',params={'business_context':'{}'})
+    assert limited.status_code==409 and limited.json()['error']['code']=='resolution_version_conflict'
+    assert client.post(url,json={**body,'business_context':{}},headers=revision(client)).status_code==409
     assert client.post(url,json=body).status_code==428
     monkeypatch.setattr(client.app.state.manager,'active',lambda _:True)
     assert client.post(url,json=body,headers=revision(client)).status_code==409

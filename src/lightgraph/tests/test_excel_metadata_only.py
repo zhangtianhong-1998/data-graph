@@ -6,6 +6,11 @@ from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import RunConfig, open_sources
 from lightgraph.sources import ExcelSource
 from lightgraph.construction.executor import execute_draft
+from lightgraph.construction.tools import ConstructionTools
+from lightgraph.construction.models import COLUMN_IDENTITY_NAMES
+from lightgraph.construction.workspace import dump_yaml
+from lightgraph.construction.workflow import load_unit_contributor
+from lightgraph.construction.checkpoints import commit_checkpoint, load_checkpoint
 
 
 def workbook(tmp_path):
@@ -90,3 +95,52 @@ def test_projection_records_original_excel_ordinals_after_hidden_and_unselected_
         node, = result['graph']['nodes']
         support, = node['supports']
         assert support['provenance']['source_column_ordinals'] == {'code': 2, 'caption': 4}
+
+
+def test_excel_metadata_probe_and_validation_retain_only_observed_authorized_positions(tmp_path):
+    path = tmp_path / 'positions.xlsx'
+    book = openpyxl.Workbook()
+    sheet = book.active
+    sheet.title = 'items'
+    sheet.append(['heading'])
+    sheet.append(['hidden', 'code', 'secret', 'caption', 'outside', 'excluded'])
+    sheet.append(['private', 'object-1', 'private', 'name-1', 'private', 'private'])
+    sheet.column_dimensions['A'].hidden = True
+    book.save(path)
+    book.close()
+    config = RunConfig(sources=[{'id': 'book', 'kind': 'excel_workbook', 'path': str(path),
+        'header_row': 2, 'allowed_tables': ['public.items'],
+        'allowed_columns': {'public.items': ['caption', 'code', 'excluded', 'secret']}}],
+        goal={'excluded_columns': ['excluded']}, model={'mode': 'in_environment'})
+    expected = {'code': 2, 'caption': 4}
+    output = tmp_path / 'work'
+    tools = ConstructionTools(config, output / 'construction')
+    try:
+        table, = tools.call('describe_sources')['tables']
+        assert table['source_column_ordinals'] == expected
+        probe = tools.call('inspect_source', table=table['table'], operation='get_metadata')
+        assert probe['data']['tables'][0]['source_column_ordinals'] == expected
+        evidence = tools.workspace.read_evidence(probe['evidence_ref'])
+        assert evidence.details['source_column_ordinals'] == expected
+        assert 'object-1' not in str(evidence) and 'name-1' not in str(evidence)
+        source = {'source_id': 'book', 'table': 'items'}
+        raw = {'draft_id': 'items', 'entities': [
+            {'type': 'Item', 'key_names': ['id'], 'mappings': [
+                {**source, 'key_columns': ['code'], 'label_column': 'caption'}]},
+            {'type': 'Field', 'key_names': COLUMN_IDENTITY_NAMES, 'mappings': [
+                {**source, 'kind': 'metadata_column', 'column': 'code', 'evidence_refs': [probe['evidence_ref']]}]}]}
+        assert tools.call('save_graph_draft', yaml_text=dump_yaml(raw))['status'] == 'ok'
+        structure = tools.call('validate_graph_draft', draft_id='items', mode='structure')
+        checked = tools.workspace._read_record(structure['structure_artifact'])
+        assert [b['source_column_ordinals'] for b in checked['bindings']] == [expected, {'code': 2}]
+        assert tools.call('validate_graph_draft', draft_id='items')['passed']
+        assert tools.call('publish_graph_draft', draft_id='items')['nodes'] == 2
+        for node in tools.workspace.read_published_graph()['nodes']:
+            origin = node['supports'][0]['provenance']
+            assert origin['source_column_ordinals'] == (expected if node['type'] == 'Item' else {'code': 2})
+        contributor = load_unit_contributor(output, 'extract')
+        record = commit_checkpoint(output, 'run_' + 'a' * 24, 'extract', contributor, input_digest='test')
+        restored = load_checkpoint(output, record)
+        assert restored['evidence_records'][evidence.ref]['details']['source_column_ordinals'] == expected
+    finally:
+        tools.close()

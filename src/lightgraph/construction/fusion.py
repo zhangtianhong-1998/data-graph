@@ -88,6 +88,22 @@ def remap_graph_endpoints(graph, remap, *, self_contained, record_fusion=False):
         edge['id'] = relation_identity(edge)
 
 
+def mark_relation_meanings(graphs):
+    """Preserve distinct source explanations until the relation definitions have been aligned."""
+    relation_families = defaultdict(list)
+    for graph in graphs:
+        for relation in graph.get('definitions', {}).get('relations', []):
+            relation_families[relation.get('original_type') or relation['type']].append(relation)
+    distinct_meanings = set()
+    for family, relations in relation_families.items():
+        descriptions = [' '.join((r.get('description') or '').split()) for r in relations]
+        if len(set(descriptions) - {''}) > 1 or any('relation_meaning_digest' in r for r in relations):
+            distinct_meanings.add(family)
+            for relation, description in zip(relations, descriptions, strict=True):
+                relation['relation_meaning_digest'] = digest(description)
+    return distinct_meanings
+
+
 def retain_definition_variants(graphs, *, self_contained=None):
     """Keep incompatible contracts as stable local variants, preserving all facts.
 
@@ -97,6 +113,7 @@ def retain_definition_variants(graphs, *, self_contained=None):
     """
     self_contained = self_contained or [True] * len(graphs)
     remaps = [{} for _ in graphs]
+    distinct_meanings = mark_relation_meanings(graphs)
     for category, item_key in (('entities', 'nodes'), ('relations', 'edges')):
         families = defaultdict(set)
         already_qualified = set()
@@ -160,6 +177,12 @@ def retain_definition_variants(graphs, *, self_contained=None):
                         item['id'] = variant_id
                     remaps[index][previous_id] = item['id']
                 elif category == 'relations' and previous_type != variant_type:
+                    if family in distinct_meanings:
+                        origin = {'edge_id': item['id'], 'type': previous_type,
+                                  'source': item['source'], 'target': item['target']}
+                        for support in item.get('supports', []):
+                            if origin not in support.setdefault('endpoint_origins', []):
+                                support['endpoint_origins'].append(dict(origin))
                     item['id'] = relation_identity(item)
             if category == 'relations':
                 for pending in graph.get('unresolved_relations', []):

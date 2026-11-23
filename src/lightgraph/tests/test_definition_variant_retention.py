@@ -4,6 +4,7 @@ from copy import deepcopy
 from lightgraph.construction.fusion import relation_identity
 from lightgraph.construction.merger import merge_construction_graphs
 from lightgraph.construction.workspace import _merge_graphs
+from lightgraph.tests.test_graph_yaml_workspace import with_source_keys
 
 
 def branch(*, label_kind='identifier', relation_acyclic=False):
@@ -69,6 +70,8 @@ def test_variant_ids_survive_nested_merge_and_new_matching_contribution():
 
 def test_workspace_publication_preserves_definition_variants_and_unchanged_inputs():
     a, b = branch(), branch(label_kind='derived')
+    with_source_keys(a)
+    with_source_keys(b)
     original = deepcopy([a, b])
     graph = _merge_graphs([a, b])
     assert [a, b] == original
@@ -83,6 +86,8 @@ def test_workspace_publication_preserves_definition_variants_and_unchanged_input
 
 def test_relation_constraints_are_preserved_as_independent_variants():
     a, b = branch(), branch(relation_acyclic=True)
+    with_source_keys(a)
+    with_source_keys(b)
     graph = _merge_graphs([a, b])
     assert len(graph['nodes']) == 2
     assert len(graph['edges']) == 2
@@ -92,12 +97,20 @@ def test_relation_constraints_are_preserved_as_independent_variants():
 
 def test_global_domain_evidence_is_retained_without_false_definition_conflict():
     a, b = branch(), branch()
+    with_source_keys(a)
+    with_source_keys(b)
     for graph, ref in ((a, 'e1'), (b, 'e2')):
         definition = graph['definitions']['entities'][0]
         definition.update(identity_scope='global', identity_domain='financial-items',
                           identity_context_keys=[], identity_evidence_refs=[ref])
         graph['nodes'][0]['identity_domain'] = 'financial-items'
         graph['evidence_refs'] = [ref]
+    from lightgraph.contracts import digest
+    for entry in (a, b):
+        node = entry['nodes'][0]
+        prov = node['supports'][0]['provenance']
+        prov['global_identity_authority'] = {'binding': digest(node['identity_domain'], ('sample', 'public', 'Item'), ['code']),
+                                              'source_metadata': True}
     graph = merge_construction_graphs(contributors(a, b))
     items = [node for node in graph['nodes'] if node['type'] == 'Item']
     assert len(items) == 1
@@ -115,6 +128,8 @@ def test_legacy_default_context_fields_do_not_manufacture_conflicts():
 
 def test_global_and_project_local_identity_contracts_stay_separate():
     a, b = branch(), branch()
+    with_source_keys(a)
+    with_source_keys(b)
     a['definitions']['entities'][0].update(identity_scope='global', identity_domain='items',
                                           identity_evidence_refs=['e1'])
     b['definitions']['entities'][0].update(identity_scope='scoped', identity_context_keys=['code'])
@@ -199,12 +214,20 @@ def test_verified_global_identity_keeps_label_and_property_variants_by_default()
     import pytest
     from lightgraph.errors import LightGraphError
     a, b = branch(), branch()
+    with_source_keys(a)
+    with_source_keys(b)
     for graph, label, value in ((a, '主名称', 'M'), (b, '别名', 'K')):
         graph['definitions']['entities'][0].update(identity_scope='global', identity_domain='items',
                                                   identity_evidence_refs=['e1'])
         graph['nodes'][0]['identity_domain'] = 'items'
         graph['nodes'][0]['supports'][0].update(label=label, properties={'project': [value]})
         graph['nodes'][0]['properties'] = {'project': [value]}
+    from lightgraph.contracts import digest
+    for entry in (a, b):
+        node = entry['nodes'][0]
+        prov = node['supports'][0]['provenance']
+        prov['global_identity_authority'] = {'binding': digest(node['identity_domain'], ('sample', 'public', 'Item'), ['code']),
+                                              'source_metadata': True}
     graph = merge_construction_graphs(contributors(a, b))
     node = next(n for n in graph['nodes'] if n['type'] == 'Item')
     assert node['label_conflict'] and set(node['label_variants']) == {'主名称', '别名'}

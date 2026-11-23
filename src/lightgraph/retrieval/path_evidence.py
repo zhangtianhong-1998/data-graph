@@ -23,6 +23,8 @@ def evidence_preview(witness):
                'label': str(witness.get('label') or '')[:256], 'business_context': witness.get('business_context'),
                'evidence_refs': refs[:8], 'evidence_ref_count': len(refs),
                'source_tables': (witness.get('source_tables') or [])[:8]}
+    if witness.get('identity_decision_refs'):
+        preview['identity_reviewed'] = True
     # An agent can use a large observation's physical binding independently of
     # its attribute map. Keep the predicate and keys together or omit the binding.
     provenance = witness.get('provenance')
@@ -31,6 +33,10 @@ def evidence_preview(witness):
         binding = {key: provenance[key] for key in BINDING_FIELDS if key in provenance}
         binding['source'] = {key: source[key] for key in ('source_id', 'schema', 'table') if key in source}
         mapped = {**preview, 'projection': 'source_binding', 'provenance': binding}
+        if witness.get('source_identity'):
+            with_key = {**mapped, 'source_identity': witness['source_identity']}
+            if len(canonical(with_key).encode('utf-8')) <= 2048:
+                return with_key
         if len(canonical(mapped).encode('utf-8')) <= 2048:
             return mapped
     return preview
@@ -52,10 +58,34 @@ def witness_names(node):
                 yield normalize_term(value)
 
 
+def _witness_codes(node, observation):
+    if observation.get('identity_decision_refs') or observation.get('identity_reviewed'):
+        return (str(v) for v in (observation.get('source_identity') or {}).get('values', ()))
+    return node.get('identity', {}).values()
+
+
 def matches_operand(node, term):
     """Only a name on the selected witness or a typed identity can ground this operand."""
     return (term in witness_names(node)
-            or any(normalize_term(value) == term for value in node.get('identity', {}).values()))
+            or any(normalize_term(value) == term for obs in node['observations'] for value in _witness_codes(node, obs)))
+
+
+def grounds_slot(node, observation, slot):
+    """Tie a textual operand to the particular authorized name or code used in a proof."""
+    match = slot.get('match') or slot.get('source') or 'exact'
+    if match == 'node_id':
+        return True
+    candidate = next((c for c in slot['candidates'] if c['node_id'] == node['id']), {})
+    terms = [slot.get('text') or slot.get('surface')]
+    if match == 'semantic':
+        terms = candidate.get('matched_terms') or []
+    if match == 'assumption':
+        terms = [candidate.get('display_name')]
+    names = {normalize_term(v) for v in (
+        observation.get('label'), observation.get('english_name'), *(observation.get('aliases') or ()),
+        *_witness_codes(node, observation)) if v is not None}
+    names.discard('')
+    return any(normalize_term(term) in names for term in terms)
 
 
 def _merge_proofs(collection, incoming):

@@ -30,6 +30,8 @@ def agent_context(answer, *, version=None, sources=()):
         'unbound_mentions': plan.get('unbound_mentions', []),
         'overview': _fields(answer.get('overview') or {}, ('status', 'counts', 'ranking_metric', 'sampled')),
         'candidate_limit': bool(plan.get('candidate_limit')),
+        'dimensional': _fields(answer.get('dimensional') or {}, ('status', 'stop_reason')),
+        'traverse': _fields(answer.get('traverse') or {}, ('status',)),
         'conditions': [{'term': s.get('text'), 'match': s.get('match'),
                         'candidate_ids': [n['node_id'] for n in s.get('candidates', [])]}
                        for s in plan.get('conditions', [])],
@@ -56,6 +58,10 @@ def agent_context(answer, *, version=None, sources=()):
             source = prov.get('source') or {}
             mapping = _fields(prov, BINDING_FIELDS)
             row = _fields(obs, ('business_context', 'scopes', 'required_scope_refs', 'source_tables', 'evidence_refs', 'properties'))
+            if obs.get('identity_decision_refs') or obs.get('identity_reviewed'):
+                row['identity_reviewed'] = True
+                if obs.get('source_identity') and mapping.get('key_columns'):
+                    row['source_identity'] = obs['source_identity']
             if source.get('table'):
                 row.update(source=_fields(source, ('source_id', 'schema', 'table')),
                            source_kind=kinds.get(source.get('source_id')), mapping=mapping)
@@ -126,7 +132,7 @@ def agent_context(answer, *, version=None, sources=()):
             if (witness.get('fact_id') in node_ids and set(witness.get('edge_ids', [])) <= edge_ids
                     and all(c.get('node_id') in node_ids for c in witness.get('conditions', []))):
                 add('joint_witnesses', {'part': label, **_fields(witness, ('fact_id', 'row_id', 'conditions',
-                                                                           'edge_ids', 'business_context'))})
+                                                                           'edge_ids', 'business_context', 'common_record'))})
             else:
                 context['truncated'] = True
     for passage in partial.get('passages', []):

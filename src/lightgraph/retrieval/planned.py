@@ -4,6 +4,7 @@ from .dimensional import empty_answer, retrieve_dimensional
 from .grouping import retrieve_grouping
 from .drilldown import retrieve_drilldown
 from .traversal import retrieve_traversal
+from .path_evidence import grounds_slot
 from .intent import build_plan, _parent_roles, _residuals
 
 
@@ -27,7 +28,7 @@ def _candidate_path(retriever, request, scopes, cohorts, plan, context):
         candidate = options[0]
         assumptions.append({'text': gap['text'], 'node_id': candidate['node_id'],
                             'display_name': candidate['display_name'], 'kind': candidate['kind']})
-        slots.append({'text': gap['text'], 'role': candidate['kind'], 'candidates': [candidate]})
+        slots.append({'text': gap['text'], 'role': candidate['kind'], 'match': 'assumption', 'candidates': [candidate]})
     if len({s['role'] for s in slots}) != len(slots):
         return None
 
@@ -68,8 +69,13 @@ def _available_context(retriever, request, scopes, plan, answer=None):
     cohorts = retriever.authorized_cohorts(scopes, plan['business_context'])
     bound = [slot for slot in plan['conditions'] if len(slot['candidates']) == 1]
     ids = [slot['candidates'][0]['node_id'] for slot in bound][:request.max_nodes]
-    labels = retriever.index.authorized_labels(ids, scopes=cohorts)
-    context['nodes'] = [{'id': nid, 'display_name': label} for nid, label in labels.items()]
+    nodes = retriever.index.load_authorized_nodes(ids, scopes=cohorts)
+    for slot, nid in zip(bound, ids):
+        node = nodes.get(nid)
+        if node:
+            observation = next((obs for obs in node['observations'] if grounds_slot(node, obs, slot)), None)
+            if observation is not None:
+                context['nodes'].append({'id': nid, 'display_name': observation.get('label') or node['display_name']})
     # A verified intersection of a subset has its own witnesses. Keep its
     # graph outside the main nodes/edges even when it fits all output budgets.
     co_observation = not (plan.get('operation') == 'traverse' or request.mode == 'traverse')
@@ -170,7 +176,7 @@ def retrieve_planned(retriever, request, scopes):
             plan['unresolved'].append('需要唯一的起点及可确认方向的层级关系。')
             return _available_context(retriever, request, scopes, plan)
         answer = retrieve_drilldown(retriever, plan['focus'], scopes, selection, seed_ids=sorted(ids),
-            hierarchies=hierarchies,
+            hierarchies=hierarchies, conditions=plan['conditions'],
             target_kind=plan['requested_level'], max_depth=request.max_depth, **limits)
     else:
         slots = plan['conditions']

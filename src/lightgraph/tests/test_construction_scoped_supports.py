@@ -120,11 +120,14 @@ def test_agent_cannot_set_scopes_and_trusted_binding_cannot_read_excluded_column
             tools.close()
 
 
-def test_independent_supports_merge_without_leaking_other_scope(tmp_path):
+@pytest.mark.parametrize('same_catalog', [True, False])
+def test_independent_supports_merge_without_leaking_other_scope(tmp_path, same_catalog):
     tables = [TableSpec(source_id='s', name=name, columns=[ColumnSpec(name=c) for c in ('范围', 'code', 'name', 'alias')])
               for name in ('a', 'b')]
     rows = {'public.a': [('A', 'X', 'A名称', 'A别名')], 'public.b': [('B', 'X', 'B名称', 'B别名')]}
-    config = RunConfig(sources=[], model={'mode': 'in_environment'}, scopes=['A', 'B'], scope_bindings=[
+    policy = {'entity_rules': [{'entity_type': '对象', 'canonical_type': '对象', 'identity_domain': '共同目录',
+                               'key_mapping': {'code': 'code'}}]} if same_catalog else {}
+    config = RunConfig(sources=[], model={'mode': 'in_environment'}, scopes=['A', 'B'], fusion_policy=policy, scope_bindings=[
         {'source_id': 's', 'table': table.name, 'columns': ['范围']} for table in tables])
     with MemorySource(tables, rows) as adapter:
         tools = ConstructionTools(config, tmp_path / 'work', adapters=[adapter])
@@ -136,9 +139,11 @@ def test_independent_supports_merge_without_leaking_other_scope(tmp_path):
                 assert tools.call('validate_graph_draft', draft_id=name)['passed']
                 assert tools.call('publish_graph_draft', draft_id=name)['status'] == 'ok'
             graph = tools.workspace.read_published_graph()
-            assert len(graph['nodes']) == 1
+            assert len(graph['nodes']) == (1 if same_catalog else 2)
             assert filter_graph_scopes(graph, ['A'])['nodes'][0]['aliases'] == ['A别名']
             assert filter_graph_scopes(graph, ['B'])['nodes'][0]['aliases'] == ['B别名']
+            assert not filter_graph_scopes(graph, ['A']).get('candidate_identity_merges')
+            assert not filter_graph_scopes(graph, ['B']).get('candidate_identity_merges')
             # Replacing one draft with a complete empty result withdraws only
             # its supports; the independent B publication stays visible.
             record = tools.workspace.get_draft('a')

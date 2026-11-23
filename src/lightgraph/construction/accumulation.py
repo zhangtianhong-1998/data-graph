@@ -71,6 +71,25 @@ class GraphAccumulator:
             self.labels[key] = (first, True)
         return conflict
 
+    def drop_support_field(self, items, field):
+        """Re-index affected supports when optional evidence yields to the graph budget."""
+        saved_bytes = freed_indexes = 0
+        for item in items:
+            supports = item['supports']
+            if not any(field in support for support in supports):
+                continue
+            old_size = len(self.encoded(supports))
+            unique = {}
+            for support in supports:
+                support.pop(field, None)
+                token = sha256(self.encoded(support)).digest()
+                unique.setdefault(token, support)
+            item['supports'] = list(unique.values())
+            self.seen[item['id'], 'supports', None] = set(unique)
+            saved_bytes += old_size - len(self.encoded(item['supports']))
+            freed_indexes += (len(supports) - len(unique)) * 128
+        return saved_bytes, freed_indexes
+
     def clear(self):
         self.seen.clear()
         self.labels.clear()

@@ -52,6 +52,7 @@ def validate_structure(draft, tables, *, goal=None, dialects=None, scope_binding
         compiler.projection(table, selected, predicate=mapping_predicate(mapping), limit=1)
         bindings.append({'source_id': table.source_id, 'schema': table.schema_name,
                          'table': table.name, 'columns': selected, 'path': location,
+                         **table.workbook_position_evidence(selected),
                          'predicate': mapping.predicate})
 
     if not draft.entities and not (draft.extends_base_graph and base_types and draft.relations):
@@ -67,9 +68,10 @@ def validate_structure(draft, tables, *, goal=None, dialects=None, scope_binding
                 path = [category, index, 'mappings', number]
                 try:
                     if is_metadata_mapping(mapping):
-                        checked_column(mapping, catalog, goal)
+                        table, column = checked_column(mapping, catalog, goal)
                         bindings.append({'source_id': mapping.source_id, 'schema': mapping.schema_name,
                             'table': mapping.table, 'columns': [mapping.column], 'path': path,
+                            **table.workbook_position_evidence([column.name]),
                             'source_kind': 'metadata_column', 'evidence_refs': mapping.evidence_refs,
                             'fact_queries': 0})
                     else:

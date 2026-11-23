@@ -53,6 +53,12 @@ def _projection_columns(mapping):
 projection_columns = _projection_columns
 
 
+class _SheetRow(dict):
+    # Physical column names remain unrestricted. Metadata is kept outside the
+    # mapping namespace and is never an input to a graph identity or row_context.
+    __slots__ = ('witness', 'witness_bytes')
+
+
 @reuse_validation_sessions
 def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 1024 * 1024,
                   max_rows=20000, max_seconds=1800, scope_bindings=(), cancelled=None,
@@ -112,6 +118,22 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         if cancelled is not None and cancelled():
             raise LightGraphError('construction_cancelled')
 
+    # Locate worksheet observations for hierarchy reconciliation and common-fact queries.
+    sheet_snapshots = {}
+    for relation in draft.relations:
+        hierarchy = relation.source_type == relation.target_type and relation.hierarchy_orientation != 'none'
+        for mapping in relation.mappings:
+            if not hierarchy and not mapping.context_columns:
+                continue
+            table = allowed.get((mapping.source_id, mapping.schema_name, mapping.table))
+            snapshot = getattr(by_source.get(mapping.source_id), 'sheet_row_snapshot', None)
+            if table is not None and snapshot and metadata_endpoint(mapping)[1] is None:
+                revision = snapshot(table)
+                if revision:
+                    sheet_snapshots[id(mapping)] = revision
+
+    collect_sheet_rows = bool(sheet_snapshots)
+
     def projection_key(mapping):
         adapter = by_source.get(mapping.source_id)
         cap = min(max_rows, adapter.limits.max_result_rows) if adapter else max_rows
@@ -125,9 +147,11 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         # projection; non-null evidence remains separate through its effective
         # column-specific predicate. Each mapping still checks its endpoint and
         # permissions before reuse and builds its own provenance afterward.
-        return canonical([mapping.source_id, mapping.schema_name, mapping.table,
-            sorted(set(_projection_columns(mapping) + scope_columns(mapping))),
-            predicate_parts, cap])
+        key = [mapping.source_id, mapping.schema_name, mapping.table,
+               sorted(set(_projection_columns(mapping) + scope_columns(mapping))), predicate_parts, cap]
+        if id(mapping) in sheet_snapshots:
+            key.append(['excel_rows_v1', sheet_snapshots[id(mapping)]])
+        return canonical(key)
 
     def co_projection_group_key(mapping):
         adapter = by_source.get(mapping.source_id)
@@ -150,7 +174,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     co_groups = defaultdict(dict)
     if enable_co_projection:
         for m in all_row_mappings:
-            if getattr(m, 'source_id', None) == '__base_graph__':
+            if m.source_id == '__base_graph__' or id(m) in sheet_snapshots:
                 continue
             pkey = projection_key(m)
             gkey = co_projection_group_key(m)
@@ -246,10 +270,30 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             # Never retry later mappings against that same snapshot.
             unavailable_sources[source_id] = error.code
 
+    def drop_sheet_witnesses():
+        nonlocal collect_sheet_rows, cache_bytes, graph_bytes, accumulation_index_bytes
+        collect_sheet_rows = False
+        # The immutable cache can share these row objects. Discard its optional
+        # copies before changing local accounting or reusing a degraded tuple.
+        if immutable_projections is not None:
+            immutable_projections.trim(0)
+        for key, cached_rows in projection_cache.items():
+            for row in cached_rows:
+                if isinstance(row, _SheetRow) and row.witness is not None:
+                    projection_sizes[key] -= row.witness_bytes
+                    cache_bytes -= row.witness_bytes
+                    row.witness = None
+        saved, indexes = accumulation.drop_support_field(edges.values(), 'source_row_witness')
+        graph_bytes -= saved
+        accumulation_index_bytes -= indexes
+
     def check_memory(phase, pending_projection_bytes=0):
         nonlocal peak_working_bytes
         required = (graph_bytes + cache_bytes + lookup_bytes + accumulation_index_bytes
                     + pending_projection_bytes)
+        if collect_sheet_rows and required > max_working_bytes:
+            drop_sheet_witnesses()
+            required = graph_bytes + cache_bytes + lookup_bytes + accumulation_index_bytes + pending_projection_bytes
         if immutable_projections is not None:
             immutable_projections.trim(max_working_bytes - required)
             required += immutable_projections.bytes
@@ -316,11 +360,11 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         compiler.projection(table, columns, predicate=predicate, limit=cap)
         return table, adapter, predicate, columns, cap, compiler
 
-    def _run_projection(table, adapter, compiler, columns, predicate, cap, snapshot_key):
+    def _run_projection(table, adapter, compiler, columns, predicate, cap, snapshot_key, sheet_snapshot=None):
         nonlocal projection_operation_seconds
         started = time.monotonic()
         try:
-            return _read_projection(table, adapter, compiler, columns, predicate, cap, snapshot_key)
+            return _read_projection(table, adapter, compiler, columns, predicate, cap, snapshot_key, sheet_snapshot)
         finally:
             # Includes qualification and snapshot teardown, which are I/O, not
             # Python graph materialization. Account for failed operations too.
@@ -334,7 +378,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             if hasattr(stream, 'close'):
                 cleanup_preserving_error(stream.close)
 
-    def _read_projection(table, adapter, compiler, columns, predicate, cap, snapshot_key):
+    def _read_projection(table, adapter, compiler, columns, predicate, cap, snapshot_key, sheet_snapshot):
         nonlocal sql_count_seconds, sql_projection_seconds
         proj_timeout = (adapter.limits.effective_timeout_ms('projection')
                         if hasattr(adapter.limits, 'effective_timeout_ms') else None)
@@ -360,19 +404,45 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             rows, retained_bytes = [], 0
             t1 = time.monotonic()
             try:
-                with batch_stream(adapter.project(table, columns, predicate=predicate, distinct=True, limit=cap)) as stream:
+                with ExitStack() as streams:
+                    witness_for = None
+                    if sheet_snapshot:
+                        witness_bytes = max(0, max_working_bytes - graph_bytes - cache_bytes - lookup_bytes
+                                            - accumulation_index_bytes) // 4
+                        projection, witness_for = streams.enter_context(adapter.sheet_row_projection(
+                            table, columns, predicate=predicate, limit=cap, witness_bytes=witness_bytes))
+                    else:
+                        projection = adapter.project(table, columns, predicate=predicate, distinct=True, limit=cap)
+                    stream = streams.enter_context(batch_stream(projection))
                     for batch in stream:
                         with batch:
                             if tuple(batch.columns) != tuple(columns):
                                 raise LightGraphError('projection_columns_mismatch')
                             for row in batch:
                                 clock()
-                                item = dict(zip(batch.columns, (source_scalar(value) for value in row)))
+                                item = dict(zip(columns, (source_scalar(value) for value in row)))
                                 retained_bytes += len(canonical(item).encode())
                                 check_memory('projection', retained_bytes)
                                 if len(rows) >= cap:
                                     raise LightGraphError('projection_truncated')
                                 rows.append(item)
+                    if witness_for and collect_sheet_rows:
+                        # Optional physical provenance is never a partial set of rows.
+                        # Omit an entire witness if its full intervals exceed the spare budget.
+                        spare = max(0, max_working_bytes - graph_bytes - cache_bytes - lookup_bytes
+                                    - accumulation_index_bytes - retained_bytes)
+                        witness_room = min(witness_bytes, spare // 4)
+                        for idx, row in enumerate(rows):
+                            witness = witness_for(row)
+                            if witness:
+                                cost = len(canonical(witness).encode())
+                                if cost <= witness_room:
+                                    item = _SheetRow(row)
+                                    item.witness = witness
+                                    item.witness_bytes = cost
+                                    rows[idx] = item
+                                    witness_room -= cost
+                                    retained_bytes += cost
             finally:
                 sql_projection_seconds += max(0.0, time.monotonic() - t1)
             if len(rows) != expected:
@@ -478,20 +548,21 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             reusable_hits += 1
             source_read_windows.append({**window, 'reused_immutable_projection': True})
             return rows
-        if enable_co_projection:
+        if enable_co_projection and id(mapping) not in sheet_snapshots:
             co_rows = _try_co_projection(mapping, table, adapter, predicate, cap)
             if co_rows is not None:
                 return co_rows
-        rows, retained_bytes = _run_projection(table, adapter, compiler, columns, predicate, cap, cache_key)
+        rows, retained_bytes = _run_projection(table, adapter, compiler, columns, predicate, cap, cache_key,
+                                               sheet_snapshots.get(id(mapping)) if collect_sheet_rows else None)
         # Reuse only complete observations from this validation; the window above
         # records when each projection was read, without a whole-run snapshot claim.
         cache_bytes += retained_bytes
         projection_sizes[cache_key] = retained_bytes
         unique_projections.add(cache_key)
-        if immutable_projections is not None:
-            immutable_projections.put(mapping.source_id, cache_key, rows, retained_bytes, source_read_windows[-1])
-            check_memory('projection')
         projection_cache[cache_key] = rows
+        if immutable_projections is not None and (collect_sheet_rows or id(mapping) not in sheet_snapshots):
+            immutable_projections.put(mapping.source_id, cache_key, rows, retained_bytes, source_read_windows[-1])
+        check_memory('projection')
         return rows
 
     def identity(kind, key):
@@ -853,6 +924,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                                     accumulation.register(edge)
                                 graph_properties(edge, mapping, row)
                                 accumulation.append(edge, 'provenance', support)
+                                if collect_sheet_rows and isinstance(row, _SheetRow) and row.witness:
+                                    current_support['source_row_witness'] = row.witness
                                 accumulation.append(edge, 'supports', current_support)
                         if targets and not compatible_context_pairs:
                             diagnostic('inherited_lookup_context_conflict', **location)
@@ -918,6 +991,11 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     rendered = derive_display_graph(graph, copy=False)
     display_seconds = max(0.0, time.monotonic() - disp_started)
     rendered_bytes = len(canonical(rendered).encode())
+    if collect_sheet_rows and rendered_bytes > max_working_bytes:
+        drop_sheet_witnesses()
+        for edge in rendered['edges']:
+            edge['supports'].sort(key=canonical)
+        rendered_bytes = len(canonical(rendered).encode())
     if immutable_projections is not None:
         immutable_projections.trim(max_working_bytes - rendered_bytes)
         peak_working_bytes = max(peak_working_bytes, rendered_bytes + immutable_projections.bytes)

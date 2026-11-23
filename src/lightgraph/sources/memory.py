@@ -91,16 +91,21 @@ class MemorySource(SourceAdapter):
             # Revalidate against this source's catalog; validated queries are not
             # transferable authority between adapters.
             validated = self.compiler.guard.validate(query.sql, query.parameters)
+            yield from self._read_cursor(query.sql, query.parameters, validated.derived_count_sources, row_limit)
+
+    def _read_cursor(self, sql, parameters, derived_count_sources, row_limit):
+        """Execute an already authorized statement under the source lock and ordinary budgets."""
+        with self._lock:
             self.query_budget.charge_query()
             start = time.monotonic(); self._cancelled = False; cursor = self._db.cursor()
             self.stats.queries += 1
             timeout_ms = self._effective_timeout_ms()
             self._db.set_progress_handler(lambda: int(self._cancelled or (time.monotonic() - start) * 1000 > timeout_ms or time.monotonic() > self.query_budget.deadline), 500)
             previous_derived = self._derived_count_sources
-            self._derived_count_sources = frozenset(validated.derived_count_sources)
+            self._derived_count_sources = frozenset(derived_count_sources)
             try:
                 with self.stats.measure_sql():
-                    cursor.execute(query.sql, query.parameters)
+                    cursor.execute(sql, parameters)
                 columns = tuple(d[0] for d in cursor.description)
                 yield from cursor_batches(cursor, limits=self.limits, columns=columns, row_limit=row_limit or self.limits.max_result_rows, stats=self.stats, deadline=start + timeout_ms / 1000, timeout_ms=timeout_ms, cancelled=lambda: self._cancelled, budget=self.query_budget)
             except LightGraphError as exc:

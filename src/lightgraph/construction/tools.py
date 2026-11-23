@@ -372,6 +372,7 @@ class ConstructionTools:
                             "sql_dialect": self.executors[t.source_id].compiler.dialect,
                             "fact_data_allowed": self._fact_data_allowed(t.source_id),
                             "name": t.name, "columns": [c.model_dump(mode="json") for c in t.columns],
+                            **t.workbook_position_evidence(),
                             "declared_unique_keys": t.unique_keys,
                             "declared_foreign_keys": [fk.model_dump(mode="json") for fk in t.foreign_keys]}
                            for key, t in self.tables.items()],
@@ -431,51 +432,63 @@ class ConstructionTools:
                                     'source_id': column.source_id, 'table': column.table, 'column': column.column})
         return issues
 
-    def _document_identity_issues(self, draft):
-        """Check the applicability of document-only global identity declarations.
-
-        The caller still has to interpret what the cited text actually says. A
-        section may cover the entire source table or individual key components.
-        Other identity evidence (e.g. source probes) keeps its existing semantics.
-        """
-        issues = []
+    def _identity_evidence_issues(self, draft, authorities=None):
+        """Check the evidence for each mapping and for every column of its key."""
+        from .identity_authority import metadata_probe
         catalog = {(t.source_id, t.schema_name, t.name): t for t in self.tables.values()}
         applicable = {}
+        issues = []
         for index, entity in enumerate(draft.entities):
-            if entity.identity_scope != 'global':
+            if entity.identity_scope != 'global' and not entity.identity_evidence_refs:
                 continue
             refs = [self.workspace.read_evidence(ref) for ref in entity.identity_evidence_refs]
-            if any(r.kind not in {'document_section', 'document_version'} for r in refs):
-                continue
-            sections = {r.ref for r in refs if r.kind == 'document_section' and r.details.get('complete')}
+            probes = {metadata_probe(r.model_dump(mode='json')) for r in refs if r.kind == 'source_probe'}
+            sections = {r.ref: digest('identity_field_section_v1', r.details['document_id'], r.details['revision'],
+                                      r.details['section_id'], r.details['content_digest'])
+                        for r in refs if r.kind == 'document_section' and r.details.get('complete')
+                        and all(r.details.get(k) for k in ('document_id', 'revision', 'section_id', 'content_digest'))}
             for number, mapping in enumerate(entity.mappings):
+                if not hasattr(mapping, 'key_columns'):
+                    continue
                 key = (mapping.source_id, mapping.schema_name, mapping.table)
                 table = catalog.get(key)
                 if table is None or not set(mapping.key_columns) <= set(table.column_names):
                     continue  # The mapping validator reports unauthorized or unknown columns.
                 missing = []
+                documents_by_key = []
                 for column in mapping.key_columns:
-                    if (key, column) not in applicable:
+                    if sections and (key, column) not in applicable:
                         applicable[key, column] = {f"{s['doc_id']}@{s['revision']}:{s['section_id']}"
                             for s in self.documents.context_for(table, [column])
                             if s['evidence_role'] == 'definition_evidence'}
-                    if not sections.intersection(applicable[key, column]):
+                    covered = sections.keys() & applicable.get((key, column), set())
+                    if not covered:
                         missing.append(column)
-                if missing:
-                    issues.append({'code': 'identity_document_not_applicable',
+                    documents_by_key.append({sections[ref] for ref in covered})
+                if authorities is not None and (not missing or key in probes):
+                    documents = set.intersection(*documents_by_key) if not missing else set()
+                    if not missing and not documents:
+                        documents = {digest('composite_key_sections_v1', [sorted(d) for d in documents_by_key])}
+                    authorities[entity.type, number] = {
+                        'binding': digest(entity.identity_domain, key, mapping.key_columns),
+                        **({'key_sections_v1': sorted(documents)} if not missing else {}),
+                        **({'source_metadata': True} if key in probes else {})}
+                if entity.identity_scope == 'global' and missing and key not in probes:
+                    code = ('identity_document_not_applicable' if all(r.kind in {'document_section', 'document_version'} for r in refs)
+                            else 'identity_evidence_not_applicable')
+                    issues.append({'code': code,
                         'path': ['entities', index, 'mappings', number, 'key_columns'],
                         'source_id': mapping.source_id, 'schema': mapping.schema_name,
                         'table': mapping.table, 'columns': missing})
         return issues
 
-    def _evidence_error(self, draft):
-        identity_issues = self._document_identity_issues(draft)
+    def _evidence_error(self, draft, authorities=None):
+        identity_issues = self._identity_evidence_issues(draft, authorities)
         if identity_issues:
-            return {'status': 'error', 'code': 'identity_document_not_applicable',
+            return {'status': 'error', 'code': identity_issues[0]['code'],
                     'diagnostics': identity_issues,
-                    'next_action': 'Read the applicable field definition sections covering the full key and '
-                        'its identifier system. If identity is not documented, retain the local mapping '
-                        'with unknown identity scope and continue extracting its supported relations.'}
+                    'next_action': 'Cite applicable field definitions for the complete key or metadata for '
+                        'a mapped catalog table. Use unknown scope when the identity domain is unverified.'}
         issues = self._metadata_evidence_issues(draft)
         if issues:
             return {'status': 'error', 'code': 'metadata_evidence_not_applicable', 'diagnostics': issues,
@@ -617,6 +630,10 @@ class ConstructionTools:
                                    and not result.get("coverage", {}).get("truncated", False)}
             if isinstance(result.get("aggregates"), dict):
                 details["aggregates"] = result["aggregates"]
+            if operation == 'get_metadata':
+                table_metadata, = result['data']['tables']
+                if positions := table_metadata.get('source_column_ordinals'):
+                    details['source_column_ordinals'] = positions
             evidence = self.workspace.issue_evidence("source_probe",
                 source_ref={"source_id": physical.source_id, "schema": physical.schema_name,
                             "table": physical.name}, details=details)
@@ -848,6 +865,8 @@ class ConstructionTools:
         if mode == 'structure':
             self._check_current_inputs()
             record = self.workspace.get_draft(draft_id)
+            if record.status == 'stale':
+                raise LightGraphError('stale_graph_draft')
             error = self._evidence_error(record.draft)
             if error:
                 return error
@@ -865,16 +884,18 @@ class ConstructionTools:
             raise LightGraphError("metadata_only_query_forbidden")
         self._check_current_inputs()
         record = self.workspace.get_draft(draft_id)
+        if record.status == 'stale':
+            raise LightGraphError('stale_graph_draft')
         self._check_metadata_catalog(record.draft)
-        error = self._evidence_error(record.draft)
+        from .identity_authority import cross_table_identity_issues
+        authorities = {}
+        error = self._evidence_error(record.draft, authorities)
         if error:
             return error
         inherit_err = self._inheritance_error(record.draft)
         if inherit_err:
             return inherit_err
         self._require_draft_sources(record.draft)
-        if record.status == "stale":
-            raise LightGraphError("stale_graph_draft")
         for ref in draft_evidence_refs(record.draft):
             self.workspace.read_evidence(ref)
         from .models import iter_fact_mappings
@@ -891,6 +912,9 @@ class ConstructionTools:
                 and record.validation.context_fingerprint == self.workspace.context_fingerprint):
             reused_graph = self.workspace.read_validation_graph(draft_id, record.validation)
             if reused_graph.get('access_fingerprint') == access_fingerprint(self.config):
+                issues = cross_table_identity_issues(reused_graph, record.draft, authorities, self.config.fusion_policy)
+                if issues:
+                    return {'status': 'error', 'passed': False, 'code': issues[0]['code'], 'diagnostics': issues}
                 visible_graph = filter_graph_scopes(reused_graph, self.config.scopes, external_visible_ids=self._base_visible_ids)
                 from .statistics import graph_statistics
                 from .quality import name_mapping_advice
@@ -926,6 +950,11 @@ class ConstructionTools:
             base_graph=self.base_graph, label_conflict_policy=self.config.fusion_policy.label_conflict_policy,
             immutable_projections=self._immutable_projections if self._immutable_projections.versions else None,
             enable_co_projection=getattr(self.config, 'enable_co_projection', False))
+        issues = cross_table_identity_issues(result['graph'], record.draft, authorities, self.config.fusion_policy)
+        if issues:
+            result['diagnostics'].extend(issues)
+            result['passed'] = False
+            result['graph']['status'] = 'candidate'
         self.validation_phase_timings.update(result.get('phase_timings', {}))
         self.projection_counts.update({k: result['metrics'].get(k, 0) for k in (
             'immutable_projection_hits', 'projection_cache_hits', 'co_projection_hits', 'unique_projections')})
@@ -968,6 +997,13 @@ class ConstructionTools:
                  'access_fingerprint': access_fingerprint(self.config),
                  'read_window': read_window,
                  'evidence_refs': sorted(draft_evidence_refs(record.draft) | {evidence.ref})}
+        if authorities:
+            for node in graph.get('nodes', []):
+                for support in node.get('supports', []):
+                    prov = support.get('provenance') or {}
+                    applicable = authorities.get((node['type'], prov.get('mapping')))
+                    if applicable:
+                        prov['global_identity_authority'] = applicable
         # Store numeric phase timings inside metrics (scalar floats only so metric contracts hold).
         phase_timings = result.pop('phase_timings', {})
         metrics_with_timings = {**result['metrics'], **{k: round(v, 4) for k, v in phase_timings.items()}}
@@ -1036,6 +1072,12 @@ class ConstructionTools:
             return {'status': 'error', 'code': 'source_initialization_failed',
                     'retryable': False, 'blocked_sources': [
                         self.unavailable_sources[source].initialization_failure for source in failed]}
+        if record.status == 'stale':
+            raise LightGraphError('stale_graph_draft')
+        authorities = {}
+        error = self._evidence_error(record.draft, authorities)
+        if error:
+            return error
         if mode == 'structure':
             if validation_id is not None:
                 raise LightGraphError('structure_validation_selection_unsupported')
@@ -1053,6 +1095,10 @@ class ConstructionTools:
         graph = self.workspace.read_validation_graph(draft_id, selected)
         if graph.get('access_fingerprint') != access_fingerprint(self.config):
             raise LightGraphError('validated_graph_access_mismatch')
+        from .identity_authority import cross_table_identity_issues
+        issues = cross_table_identity_issues(graph, record.draft, authorities, self.config.fusion_policy)
+        if issues:
+            return {'status': 'error', 'code': issues[0]['code'], 'diagnostics': issues}
         publication = self.workspace.publish(draft_id, revision=record.revision, graph=graph,
                                              validation_id=selected.validation_id, isolate_conflicts=isolate,
                                              fusion_policy=self.config.fusion_policy)

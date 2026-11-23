@@ -51,6 +51,9 @@ def test_real_source_save_validate_publish_and_independent_drafts(tmp_path, exce
         assert probe['status'] == 'ok'
         assert probe['evidence_ref'] == 'e1'
         metadata = probe['data']
+        positions = {'编码': 1, '名称': 2, '归属': 3} if excel else None
+        assert metadata['tables'][0].get('source_column_ordinals') == positions
+        assert tools.workspace.read_evidence('e1').details.get('source_column_ordinals') == positions
         assert all('id' not in c and 'sql_identifier' in c for t in metadata['tables'] for c in t['columns'])
         assert 'proposal_references' not in metadata['identifier_usage']
         assert 'probe_id' not in probe

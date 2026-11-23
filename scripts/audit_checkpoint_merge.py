@@ -19,7 +19,22 @@ def graph_counts(graph):
     physical = sum(node.get("identity_origin") == "physical_column" for node in graph["nodes"])
     return {"nodes": len(graph["nodes"]), "physical_column_nodes": physical,
             "row_nodes": len(graph["nodes"]) - physical, "edges": len(graph["edges"]),
+            "hierarchy_input_evidence": hierarchy_input_evidence(graph),
             **alignment_counts(graph)}
+
+
+def hierarchy_input_evidence(graph):
+    """Count recorded evidence on the inputs, independently of any later identity verdict."""
+    hierarchy_types = {r["type"] for r in graph.get("definitions", {}).get("relations", [])
+                       if r.get("source_type") == r.get("target_type") and r.get("hierarchy_orientation") != "none"}
+    edges = witnessed = 0
+    for edge in graph["edges"]:
+        if edge["type"] in hierarchy_types:
+            for support in edge.get("supports", []):
+                edges += 1
+                witnessed += (support.get("source_row_witness") or {}).get("kind") == "excel_rows_v1"
+    return {"same_type_potential_hierarchy_edge_supports": edges,
+            "with_recorded_excel_row_witness": witnessed}
 
 
 def alignment_counts(graph):
@@ -297,7 +312,74 @@ def hierarchy_membership(graph, control_ids):
             "agrees_with_recorded_count": len(removed) == represented == recorded if recorded is not None else None}
 
 
-def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False):
+def _membership_groups(report):
+    replay = report.get("with_source_replay") or {}
+    membership = replay.get("hierarchy_membership") if isinstance(replay, dict) else None
+    if not isinstance(membership, dict):
+        raise ValueError("对照报告缺少层级归并成员记录。")
+    groups = membership.get("groups_by_output_id")
+    if not isinstance(groups, dict) or membership.get("agrees_with_recorded_count") is not True:
+        raise ValueError("对照报告缺少已核实的逐成员映射。请使用带 --include-hierarchy-membership 的审计输出。")
+    owners = {}
+    for winner, members in groups.items():
+        if (not isinstance(members, list) or len(members) < 2 or winner not in members
+                or not all(isinstance(n, str) and n for n in members)):
+            raise ValueError("层级归并成员记录无效。")
+        for nid in members:
+            if nid in owners:
+                raise ValueError("同一原节点在层级归并映射中重复出现。")
+            owners[nid] = winner
+    collapsed = len(owners) - len(groups)
+    if collapsed != membership.get("represented_collapsed_nodes") or collapsed != replay.get("hierarchy_replay_collapsed_nodes"):
+        raise ValueError("逐成员记录与层级归并计数不一致。")
+    if type(replay.get("output_nodes")) is not int or replay["output_nodes"] < len(groups):
+        raise ValueError("审计报告的输出节点数无效。")
+    return groups, owners
+
+
+def compare_hierarchy_audits(previous, current, output_ids):
+    """Trace previously joined original IDs, including groups whose winning ID changed."""
+    for key in ("run_id", "node_id", "artifact_id", "upstream_artifacts"):
+        if not previous.get(key) or previous[key] != current[key]:
+            raise ValueError(f"对照报告与本轮检查点不一致：{key}")
+    if previous.get("explicit_entity_rules") != current.get("explicit_entity_rules"):
+        raise ValueError("两轮的显式实体规则数量不一致。")
+    if "merge_policy_sha256" in previous and previous["merge_policy_sha256"] != current.get("merge_policy_sha256"):
+        raise ValueError("两轮重放采用的合并策略不一致。")
+    old_groups, _ = _membership_groups(previous)
+    new_groups, owners = _membership_groups(current)
+    group_counts = Counter()
+    pair_counts = Counter()
+    for members in old_groups.values():
+        targets = Counter()
+        for original in members:
+            if original in owners:
+                targets[owners[original]] += 1
+            elif original in output_ids:
+                targets[original] += 1
+        known = sum(targets.values())
+        pairs = len(members) * (len(members) - 1) // 2
+        resolved = known * (known - 1) // 2
+        retained = sum(count * (count - 1) // 2 for count in targets.values())
+        pair_counts.update(retained=retained, split=resolved - retained, unverified=pairs - resolved)
+        if known < len(members):
+            outcome = "unverified"
+        elif len(targets) > 1:
+            outcome = "split"
+        elif len(new_groups[next(iter(targets))]) > known:
+            outcome = "expanded"
+        else:
+            outcome = "unchanged"
+        group_counts[outcome] += 1
+    before, after = previous["with_source_replay"], current["with_source_replay"]
+    return {"policy_digest_comparison": "matched" if "merge_policy_sha256" in previous else "previous_digest_not_recorded",
+            "net_node_reduction": before["output_nodes"] - after["output_nodes"],
+            "additional_hierarchy_collapses": after["hierarchy_replay_collapsed_nodes"] - before["hierarchy_replay_collapsed_nodes"],
+            "previous_groups": {k: group_counts[k] for k in ("unchanged", "expanded", "split", "unverified")},
+            "previous_member_pairs": {k: pair_counts[k] for k in ("retained", "split", "unverified")}}
+
+
+def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False, compare_to=None):
     """Use the run's committed inputs and policy, even when the current project has been edited."""
     run_file = Path(run_file)
     run = json.loads(run_file.read_text(encoding="utf-8"))
@@ -355,20 +437,12 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
     totals = {f"input_{kind}": sum(len(c["graph"][kind]) for c in inputs) for kind in ("nodes", "edges")}
     if any(key in saved_counts and saved_counts[key] != count for key, count in totals.items()):
         raise ValueError("抽取检查点合计与原运行记录不符，可能还有其他输入。")
-    modules = [merger, observed_identity, executor, fusion, metadata_columns, workspace]
-    # A standalone copy of this script can also audit checkpoints using the
-    # older backend, which did not retain catalog identity references.
-    for name in ('catalog_identity', 'hierarchy_replay', 'hierarchy_observations', 'hierarchy_captions',
-                 'hierarchy_role_witnesses', 'hierarchy_neighborhood'):
-        module = sys.modules.get('lightgraph.construction.' + name)
-        if module is not None:
-            modules.append(module)
     report = {
         "run_id": run["run_id"], "node_id": node_id,
         "artifact_id": target["artifact_id"], "upstream_artifacts": target["upstream_artifacts"],
         "explicit_entity_rules": len(fused.get("entity_rules", [])),
-        "source_sha256": {m.__name__: hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest()
-                          for m in modules}, "merger_path": str(Path(merger.__file__).resolve()),
+        "merge_policy_sha256": hashlib.sha256(canonical(policy).encode("utf-8")).hexdigest(),
+        "merger_path": str(Path(merger.__file__).resolve()),
         "inputs": {c["contributor_id"]: graph_counts(c["graph"]) for c in inputs}, "committed": counts,
         "historical_input_totals_verified": totals.keys() <= saved_counts.keys(),
     }
@@ -378,12 +452,31 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
                                                 merge_policy=policy, recognize_source_replays=enabled)
         report[label] = {**merger.merge_accounting(inputs, graph), **alignment_counts(graph),
                          "integrity": output_checks(graph)}
-        if include_hierarchy_membership:
+        if include_hierarchy_membership or compare_to is not None:
             if enabled:
                 report[label]["hierarchy_membership"] = hierarchy_membership(graph, control_ids)
+                if compare_to is not None:
+                    previous = json.loads(Path(compare_to).read_text(encoding="utf-8-sig"))
+                    if not isinstance(previous, dict):
+                        raise ValueError("请选择上一轮完整的 audit.json。")
+                    report["hierarchy_comparison"] = compare_hierarchy_audits(
+                        previous, report, {n["id"] for n in graph["nodes"]})
             else:
                 control_ids = {n["id"] for n in graph["nodes"]}
         del graph
+    # Some modules are loaded only by branches exercised during the replay.
+    modules = [merger, observed_identity, executor, fusion, metadata_columns, workspace]
+    for name in ('catalog_identity', 'hierarchy_replay', 'hierarchy_observations', 'hierarchy_captions',
+                 'hierarchy_role_witnesses', 'hierarchy_neighborhood', 'hierarchy_stage',
+                 'identity_authority', 'source_namespaces'):
+        module = sys.modules.get('lightgraph.construction.' + name)
+        if module is not None:
+            modules.append(module)
+    source_files = {m.__name__: Path(m.__file__).read_bytes() for m in modules}
+    report["source_sha256"] = {name: hashlib.sha256(content).hexdigest() for name, content in source_files.items()}
+    source_files["audit_checkpoint_merge.py"] = Path(__file__).read_bytes()
+    report["source_sha256_lf"] = {name: hashlib.sha256(content.replace(b"\r\n", b"\n")).hexdigest()
+                                  for name, content in source_files.items()}
     return report
 
 
@@ -394,10 +487,14 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--observations-only", action="store_true", help="只核查已提交图的实际观测，跳过合并重放")
     mode.add_argument("--include-hierarchy-membership", action="store_true", help="在重放报告中列出层级归并前后的节点 ID")
+    parser.add_argument("--compare-hierarchy-audit", type=Path, metavar="AUDIT_JSON",
+                        help="与同一批检查点的上一轮完整审计报告逐组比较，并输出本轮成员映射")
     args = parser.parse_args()
+    if args.observations_only and args.compare_hierarchy_audit:
+        parser.error("--compare-hierarchy-audit 需要执行合并重放")
     try:
         report = audit(args.run_file, args.node, observations_only=args.observations_only,
-                       include_hierarchy_membership=args.include_hierarchy_membership)
+                       include_hierarchy_membership=args.include_hierarchy_membership, compare_to=args.compare_hierarchy_audit)
     except LightGraphError as exc:
         parser.exit(1, f"检查点或合并未通过校验：{exc.code}\n")
     except (KeyError, OSError, ValueError) as exc:

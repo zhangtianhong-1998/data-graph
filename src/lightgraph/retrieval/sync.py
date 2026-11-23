@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from lightgraph.source_values import scalar_kind
+from lightgraph.source_values import original_key_types, scalar_kind
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.retention import atomic_text
@@ -76,17 +76,34 @@ def _edge_source_info(edge: dict[str, Any]) -> tuple[list[str], list[str], list[
     return sorted(scopes), sorted(refs), sorted(tables)
 
 
-def _observations(item):
+def _observations(item, key_names=()):
     """Keep each qualified assertion with its own values and supporting sources."""
     result = []
     for support in item.get('supports', []):
         scopes, refs, tables = _edge_source_info({'supports': [support]})
-        result.append({'business_context': business_context_identity(support),
+        ordered = {}
+        origins = support.get('identity_origins') or []
+        original = support.get('original_key_values') or {}
+        columns = (support.get('provenance') or {}).get('key_columns') or []
+        if original and columns and set(columns) == set(original):
+            # Fusion can rename/reorder keys or normalize their printed values.
+            # Recover the original driver type only if every matching origin agrees.
+            recorded = support.get('original_key_types')
+            if recorded is None and not support.get('identity_decision_refs'):
+                recorded = original_key_types(original, origins)
+            if (isinstance(recorded, dict) and set(columns) == set(recorded)
+                    and all(isinstance(recorded[c], str) and recorded[c] for c in columns)):
+                ordered['source_identity'] = {'values': [original[c] for c in columns],
+                                              'value_types': [recorded[c] for c in columns]}
+        elif key_names and not origins and set(key_names) == set(item.get('identity', {})):
+            ordered['identity_key_names'] = list(key_names)
+        result.append({**ordered, 'business_context': business_context_identity(support),
                        'properties': support.get('properties', {}),
                        'evidence_refs': refs, 'source_tables': tables, 'scopes': scopes,
                        **{key: support[key] for key in ('observation_id', 'label', 'description', 'english_name', 'property_observations',
-                           'aliases', 'row_context', 'provenance',
+                           'aliases', 'row_context', 'source_row_witness', 'provenance',
                            'execution_origins', 'lookup_matches', 'endpoint_origins', 'identity_origins', 'identity_basis',
+                           'identity_decision_refs', 'identity_decision_members', 'identity_decision_endpoints',
                            'inherited_from', 'contributor_id', 'required_scope_refs') if key in support}})
     return result
 
@@ -101,7 +118,7 @@ def active_index(root: Path, expected_generation: str | None = None) -> tuple[Pa
         path = root / 'builds' / build
         if not isinstance(manifest['cohorts'], dict) or not isinstance(manifest['embedder'], str):
             raise ValueError
-        if manifest['format'] != 5 or (expected_generation is not None and manifest['generation'] != expected_generation):
+        if manifest['format'] != 6 or (expected_generation is not None and manifest['generation'] != expected_generation):
             raise ValueError
         if not isinstance(manifest['cohort_contexts'], dict) or set(manifest['cohort_contexts']) != set(manifest['cohorts']):
             raise ValueError
@@ -181,6 +198,7 @@ def sync_graph_to_retrieval(
     terms: list[dict[str, Any]] = []
     vector_items: list[dict[str, Any]] = []
 
+    key_names = {d['type']: d.get('key_names', []) for d in graph.get('definitions', {}).get('entities', [])}
     for scope_ref, required_scopes in cohorts.items():
         scoped_graph = filter_graph_scopes(cohort_graphs[scope_ref], required_scopes,
                                            external_visible_ids=endpoint_ids)
@@ -226,6 +244,7 @@ def sync_graph_to_retrieval(
             english_name = en_names[0] if en_names else None
             description = '；'.join(descs) if descs else None
 
+            observations = _observations(node, key_names.get(kind))
             scope_views.append({
                 'node_id': nid,
                 'scope_ref': scope_ref,
@@ -236,7 +255,7 @@ def sync_graph_to_retrieval(
                 'aliases': aliases,
                 'description': description,
                 'source_tables': src_tables,
-                'observations': _observations(node),
+                'observations': observations,
             })
 
             seen_terms: set[tuple[str, str, int]] = set()
@@ -261,6 +280,10 @@ def sync_graph_to_retrieval(
 
             for val in (node.get('identity') or {}).values():
                 add_term(val, 'identity_code', True)
+            for observation in observations:
+                if observation.get('identity_decision_refs'):
+                    for value in (observation.get('source_identity') or {}).get('values', []):
+                        add_term(str(value), 'identity_code', True)
             for name in cn_names:
                 add_term(name, 'chinese_name')
             for name in en_names:
@@ -333,7 +356,7 @@ def sync_graph_to_retrieval(
         nodes_indexed = len(node_rows)
         edges_indexed = len({row['edge_id'] for row in edge_rows})
         manifest = {
-            'format': 5,
+            'format': 6,
             'generation': gen_token,
             'build': build_id,
             'cohorts': cohorts,

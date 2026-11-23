@@ -12,6 +12,7 @@ from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
 from lightgraph.construction.contexts import business_context_matches, normalize_context_selection, support_business_context
 from .sync import active_index
+from .path_evidence import grounds_slot
 from .store_sqlite import SQLiteGraphIndex, normalize_term
 from .vector_local import Embedder, LocalHashEmbedder, LocalNumpyVectorStore, embedder_fingerprint
 
@@ -74,7 +75,7 @@ def _join_rows(left, right):
     return {**left, **right}
 
 
-def _context_paths(nodes, adjacency, seeds_by_slot, hops):
+def _context_paths(nodes, adjacency, seeds_by_slot, hops, constraints=None):
     """Bounded alternate witness paths; different contexts remain distinct.
 
     Neighborhood expansion supplies a union of individually visible facts. Only
@@ -115,6 +116,11 @@ def _context_paths(nodes, adjacency, seeds_by_slot, hops):
         for sid in seeds:
             if sid in nodes:
                 for context, observations in _observation_groups(nodes[sid]):
+                    bound = (constraints or {}).get((slot, sid))
+                    if bound:
+                        observations = [o for o in observations if grounds_slot(nodes[sid], o, bound)]
+                        if not observations:
+                            continue
                     retain(sid, context, _row_witnesses(observations), [], frozenset({sid}))
         while queue and state_attempts < _PATH_STATE_LIMIT:
             current, context, rows, steps, visited = queue.popleft()
@@ -433,7 +439,12 @@ class SubgraphRetriever:
             adj[e['source']].append(e)
             adj[e['target']].append(e)
 
-        slot_routes, node_hit_slots, path_truncated = _context_paths(nodes_map, adj, seeds_by_slot, hops)
+        constraints = {(s['text'], c['node_id']): s for s in resolved_conditions for c in s['candidates']}
+        for slot in slot_results:
+            for c in slot['candidates']:
+                if c.get('match_type') in {'exact_name', 'exact_code'}:
+                    constraints.setdefault((slot['surface'], c['node_id']), slot)
+        slot_routes, node_hit_slots, path_truncated = _context_paths(nodes_map, adj, seeds_by_slot, hops, constraints)
 
         # A common endpoint is a bridge only when at least two real paths have
         # compatible conditions. Keep alternate witnesses rather than combining

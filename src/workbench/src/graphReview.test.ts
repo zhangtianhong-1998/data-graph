@@ -388,6 +388,32 @@ describe('业务图来源与归并裁决', () => {
     expect(api.request.mock.calls.find(call => call[0].endsWith('/revoke'))?.[1].body).toBe(JSON.stringify({ revision: 1 }))
     expect(root.textContent).toContain('已撤销')
   })
+  it('发布图按当前版本和范围读取候选，只提交用户选中的原成员', async () => {
+    const nodes = [...graph.nodes, { ...graph.nodes[0], id: 'c', label: 'C' }]
+    const review = { backend: 'publication', version_id: 'v-old', revision: 3, decisions: [],
+      total_candidates: 1, next_offset: null, candidates: [{ candidate_id: 'group', members: ['a', 'b', 'c'],
+        nodes, channels: ['same_source_observation'], facts: [], evidence: [], supports: [], status: 'candidate' }] }
+    api.request.mockImplementation(async (_url, options) => options?.method === 'POST' ? { version_id: 'v-new' } : review)
+    const changed = vi.fn()
+    mount(IdentityCandidates, { projectId: 'p', configRevision: '"7"', graph: { ...graph, version_id: 'v-old' },
+      businessContext: { project: 'M' }, onChanged: changed })
+    await vi.waitFor(() => expect(root.querySelector('#identity-candidate')).not.toBeNull())
+    const url = new URL(api.request.mock.calls[0][0], 'http://localhost')
+    expect(url.searchParams.get('version')).toBe('v-old')
+    expect(JSON.parse(url.searchParams.get('business_context')!)).toEqual({ project: 'M' })
+    const select = root.querySelector<HTMLSelectElement>('#identity-candidate')!
+    select.value = 'group'; select.dispatchEvent(new Event('change')); await nextTick()
+    expect(button('确认为同一对象').disabled).toBe(true)
+    const boxes = root.querySelectorAll<HTMLInputElement>('fieldset input')
+    boxes[0].click(); boxes[2].click(); await nextTick()
+    expect(button('确认为不同对象').disabled).toBe(false)
+    vi.stubGlobal('confirm', () => true)
+    button('确认为不同对象').click()
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledOnce())
+    const write = api.request.mock.calls.find(call => call[1]?.method === 'POST')!
+    expect(JSON.parse(write[1].body)).toEqual({ revision: 3, version_id: 'v-old', candidate_id: 'group',
+      verdict: 'different', members: ['a', 'c'], business_context: { project: 'M' } })
+  })
   it('运行或配置未保存期间不能提交裁决', async () => {
     api.request.mockResolvedValue({ revision: 0, candidates: [{ candidate_id: 'pair', members: ['a', 'b'], nodes: graph.nodes, evidence: [], facts: [], supports: [], channels: ['name'], status: 'candidate' }], decisions: [], total_candidates: 1, next_offset: null })
     mount(IdentityCandidates, { projectId: 'p', configRevision: '"7"', graph, disabled: true })

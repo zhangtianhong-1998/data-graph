@@ -185,7 +185,13 @@ class IdentityRevision(InputModel):
     revision: int = Field(ge=0,le=9007199254740991)
 
 
-class IdentityDecision(IdentityRevision):
+class PublicationRevision(IdentityRevision):
+    version_id: str | None = Field(default=None, pattern=r'^v_[0-9a-f]{32}$')
+    business_context: dict | None = None
+
+
+class IdentityDecision(PublicationRevision):
+    members: list[str] | None = Field(default=None, min_length=2, max_length=256)
     candidate_id: str = Field(min_length=1,max_length=128)
     verdict: Literal['same','different']
 
@@ -906,10 +912,11 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return read_graph_consistently(workspace,pid,read_structure,draft_id=draft_id,revision=revision)
 
     @app.get('/api/projects/{pid}/graph/identity-candidates')
-    def identity_candidates(pid:str,offset:int=0,decision_offset:int=0):
+    def identity_candidates(pid:str,offset:int=0,decision_offset:int=0,version:str|None=None,business_context:str|None=None):
         with workspace.lock(pid):
             workspace.get(pid)
-            return identity_review(workspace,pid,offset=offset,decision_offset=decision_offset)
+            return identity_review(workspace,pid,offset=offset,decision_offset=decision_offset,version=version,
+                                   business_context=parse_business_context(business_context))
 
     @app.post('/api/projects/{pid}/graph/identity-decisions')
     def identity_decision(pid:str,data:IdentityDecision,if_match:str|None=Header(default=None)):
@@ -917,14 +924,16 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             mutable(pid)
             workspace.require_config_revision(pid,if_match)
             return resolve_identity(workspace,pid,candidate_id=data.candidate_id,verdict=data.verdict,
-                                    expected_revision=data.revision)
+                                    expected_revision=data.revision,version_id=data.version_id,members=data.members,
+                                    business_context=data.business_context)
 
     @app.post('/api/projects/{pid}/graph/identity-decisions/{decision_id}/revoke')
-    def revoke_identity(pid:str,decision_id:str,data:IdentityRevision,if_match:str|None=Header(default=None)):
+    def revoke_identity(pid:str,decision_id:str,data:PublicationRevision,if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             workspace.require_config_revision(pid,if_match)
-            return resolve_identity(workspace,pid,decision_id=decision_id,expected_revision=data.revision)
+            return resolve_identity(workspace,pid,decision_id=decision_id,expected_revision=data.revision,
+                                    version_id=data.version_id,business_context=data.business_context)
 
     @app.get('/api/projects/{pid}/discovery/candidates')
     def discovery_candidates(pid:str,offset:int=0):
@@ -1088,7 +1097,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return read_graph_consistently(workspace, pid, read)
 
     @app.post('/api/projects/{pid}/retrieval/query')
-    async def query_retrieval(pid: str, data: RetrieveSubgraphRequest, sql_preview: bool = False,
+    async def query_retrieval(pid: str, data: RetrieveSubgraphRequest, sql_preview: bool = False, version: str | None = None,
                               x_workbench_session: str | None = Header(default=None)):
         from .construction_graph import project_retriever
         if sql_preview and data.mode != 'auto':
@@ -1099,16 +1108,19 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             if (data.mode in {'auto', 'dimensional', 'traverse'} and not data.conditions and not data.seed_ids
                     and config.resolved_model.mode in {'in_environment', 'approved_external'}):
                 model_key = resolve_api_key(pid, x_workbench_session, config, model=True)
-            retriever, _ = project_retriever(config, embedding_api_key=emb_key, model_api_key=model_key)
+            retriever, _ = project_retriever(config, embedding_api_key=emb_key, model_api_key=model_key,
+                **({'expected_version': version} if version is not None else {}))
             # The source project can revoke a grant without changing this
             # project's config revision while a multi-condition query runs.
             entry = None
             if any(ref.source_project_id for ref in config.inherited_graphs):
-                version = retriever.version_id
-                if version:
-                    entry = graph_history.resolve_version(workspace, pid, config, version)
+                retriever_version = retriever.version_id
+                if retriever_version:
+                    entry = graph_history.resolve_version(workspace, pid, config, retriever_version)
                     graph_history._authorize_entry(workspace, entry, config)
             answer = data.run(retriever, config.scopes)
+            if getattr(retriever, 'version_id', None):
+                answer['version_id'] = retriever.version_id
             if entry:
                 graph_history._authorize_entry(workspace, entry, config)
             if data.mode == 'auto':

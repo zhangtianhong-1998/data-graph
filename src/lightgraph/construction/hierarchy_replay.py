@@ -9,7 +9,8 @@ from lightgraph.source_values import identity_cell
 from .fusion import definition_contract, relation_identity, remap_graph_endpoints
 from .hierarchy_captions import HierarchyCaptions
 from .hierarchy_neighborhood import neighborhood_difference_counts
-from .hierarchy_observations import edge_observation_properties, observation_boundary, observation_properties
+from .hierarchy_observations import (edge_observation_properties, observation_boundary, observation_properties,
+                                     worksheet_edge_boundaries)
 from .hierarchy_role_witnesses import IsolatedRoleIndex
 
 
@@ -170,13 +171,15 @@ def _member(node, definition, layouts, captions=None):
                    units.pop(), len(labels) > 1, raw_key)
 
 
-def _neighborhoods(graph, nodes, members, relations, layouts, captions):
+def _neighborhoods(graph, nodes, members, relations, layouts, captions, stats):
     """Compare parent and child observations in physical coordinates, including reverse encodings."""
     incidents = defaultdict(set)
     blocked = set()
     known = defaultdict(set)
+    physical_edges = defaultdict(list)
     observations = []
     edge_rows = defaultdict(list)
+    original_boundaries = defaultdict(set)
     for edge in graph['edges']:
         endpoints = (edge['source'], edge['target'])
         if not any(n in members for n in endpoints):
@@ -214,16 +217,33 @@ def _neighborhoods(graph, nodes, members, relations, layouts, captions):
             # physical edge and applicability, never unrelated rows in the table.
             positions = [(col, member.value, member.bindings[col])
                          for col, member in zip(columns, (left, right))]
-            pair = (left.address, tuple(sorted(positions, key=lambda pos: pos[0])), fact)
-            if orientation in ('parent_to_child', 'child_to_parent'):
-                known[pair].add(columns[0 if orientation == 'parent_to_child' else 1])
-            observations.append((pair, columns, endpoints, fact))
+            physical_pair = (left.address, tuple(sorted(positions, key=lambda pos: pos[0])))
+            physical_edges[physical_pair].append((edge['id'], endpoints, columns, orientation, support, fact, level_index))
+    while physical_edges:
+        physical_pair, entries = physical_edges.popitem()
+        projections = [(edge_id, support, fact) for edge_id, _, _, _, support, fact, _ in entries]
+        for entry, boundaries in zip(entries, worksheet_edge_boundaries(projections, stats), strict=True):
+            _, endpoints, columns, orientation, support, original_fact, level_index = entry
+            if boundaries is None:
+                blocked.update(endpoints)
+                continue
+            row = support.get('row_context') or {}
+            ancestor_facts = {original_fact}
+            for boundary in boundaries:
+                fact = (boundary, original_fact[1])
+                pair = (*physical_pair, fact)
+                if orientation in ('parent_to_child', 'child_to_parent'):
+                    known[pair].add(columns[0 if orientation == 'parent_to_child' else 1])
+                observations.append((pair, columns, endpoints, fact, original_fact[0]))
+                ancestor_facts.add(fact)
             if row.get('values') and level_index:
-                for index, neighbor in enumerate((right, left)):
-                    edge_rows[endpoints[index]].append(
-                        (columns[index], (columns[1 - index], neighbor.value), row, level_index, fact))
+                for index, nid in enumerate(endpoints):
+                    neighbor = members[endpoints[1 - index]]
+                    for fact in ancestor_facts:
+                        edge_rows[nid].append((columns[index], (columns[1 - index], neighbor.value),
+                                              row, level_index, fact))
     missing_orientation = set()
-    for pair, columns, endpoints, boundary in observations:
+    for pair, columns, endpoints, boundary, original in observations:
         if len(known[pair]) != 1:
             missing_orientation.update(endpoints)
             continue
@@ -231,9 +251,12 @@ def _neighborhoods(graph, nodes, members, relations, layouts, captions):
         for index in (0, 1):
             other = 1 - index
             neighbor = members[endpoints[other]]
-            incidents[endpoints[index]].add((columns[index] == parent, columns[index], columns[other],
-                                             neighbor.value, neighbor.bindings[columns[other]], boundary))
-    return incidents, blocked, missing_orientation, edge_rows
+            incident = (columns[index] == parent, columns[index], columns[other], neighbor.value,
+                        neighbor.bindings[columns[other]], boundary)
+            incidents[endpoints[index]].add(incident)
+            if boundary[0] != original:
+                original_boundaries[endpoints[index], incident].add(original)
+    return incidents, blocked, missing_orientation, edge_rows, original_boundaries
 
 
 def _complementary_paths_agree(left, right):
@@ -264,6 +287,9 @@ def _complementary_paths_agree(left, right):
 def _ancestor_paths_agree(batch, nodes, layouts, edge_rows, *, members=None, captions=None):
     """Compare observed ancestor tuples within the same applicability and row context."""
     views = []
+    comparing_worksheet_rows = any(
+        observation is not None and isinstance(observation[0].row_context, tuple)
+        for nid in batch for _, _, _, _, observation in edge_rows.get(nid, ()))
     for nid in batch:
         node = nodes[nid]
         view = defaultdict(lambda: defaultdict(set))
@@ -293,6 +319,12 @@ def _ancestor_paths_agree(batch, nodes, layouts, edge_rows, *, members=None, cap
                 # recorded ancestry for disjoint subsets of their observations.
                 view[keys, neighbor, None][columns].add(path)
                 view[keys, neighbor, observation][columns].add(path)
+                if comparing_worksheet_rows and observation is not None:
+                    # A node may supply an ancestor missing on the other
+                    # projection's edge (or vice versa). Extra row columns on
+                    # one carrier may not hide a contradiction between them.
+                    boundary, _ = observation
+                    view[keys, neighbor, ('worksheet_ancestors', boundary.scope)][columns].add(path)
         carriers = defaultdict(lambda: defaultdict(list))
         for (keys, neighbor, observation), windows in view.items():
             if observation is not None:
@@ -381,7 +413,8 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
         if roles and any(roles.keys() & ((s.get('row_context') or {}).get('values') or {}).keys()
                          for s in node['supports']):
             members[nid] = _member(node, definitions[node['type']], layouts, captions)
-    incidents, invalid_roles, missing_orientation, edge_rows = _neighborhoods(graph, nodes, members, relations, layouts, captions)
+    incidents, invalid_roles, missing_orientation, edge_rows, original_boundaries = _neighborhoods(
+        graph, nodes, members, relations, layouts, captions, stats)
     blocked = set()
     isolation = graph.get('conflict_isolation') or {}
     incomplete = {c['contributor_id'] for c in isolation.get('contributors_with_gaps', []) if c.get('contributor_id')}
@@ -449,7 +482,8 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
                 if isolated_pairs:
                     if role_index is None:
                         role_index = IsolatedRoleIndex(nodes, members, layouts, incidents,
-                                                       blocked | invalid_roles | missing_orientation)
+                                                       blocked | invalid_roles | missing_orientation,
+                                                       original_boundaries)
                     batches.extend((batch, 'isolated_member_role') for batch in role_index.batches(isolated))
                 for batch, basis in batches:
                     joint = _cross_unit_pairs(batch, members)

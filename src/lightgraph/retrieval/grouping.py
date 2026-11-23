@@ -114,7 +114,8 @@ def retrieve_grouping(retriever, request, scopes, plan):
         proof = retrieve_traversal(retriever, request.query, scopes, seed_ids=[seed], start_id=seed,
             business_context=plan['business_context'], via_ids=chain[1:-1], target_id=target,
             max_depth=min(2, request.max_depth), max_nodes=request.max_nodes, max_edges=request.max_edges,
-            route_node_ids=chain)
+            route_node_ids=chain, slots=[{'surface': subject, 'source': bound.get('match', 'exact'),
+                'candidates': [c for c in bound['candidates'] if c['node_id'] == seed]}])
         paths = proof['traverse']['paths']
         if not paths:
             reasons.update(proof['truncation_reasons'])

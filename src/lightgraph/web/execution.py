@@ -680,7 +680,7 @@ class RunManager:
         from ..construction.merger import merge_accounting, merge_construction_graphs
         from ..construction.workflow import (
             archive_workflow_state, build_merge_node_config, build_unit_config, committed_unit_output,
-            copy_frozen_inheritance, effective_merge_policy, upstream_binding_inventory,
+            copy_frozen_inheritance, deterministic_stage_inputs, effective_merge_policy, upstream_binding_inventory,
             load_unit_contributor, load_workflow_state, publish_merged_contributors, publish_premerged_graph,
             published_unit_attempts, resolve_workflow_plan, run_output_path, save_workflow_state, unit_output_path,
         )
@@ -1057,15 +1057,10 @@ class RunManager:
                                     merge_nodes_state[mid].update(status="skipped", error_code="workflow_units_not_ready", updated_at=_now())
                                     save_workflow_state(config.output_dir, wf_state)
                                     continue
-                                has_upstream_merge = any(i in merge_node_contribs for i in in_ids)
-                                node_inputs: list[dict] = []
-                                if not has_upstream_merge:
-                                    node_inputs.extend(base_contributors)
-                                for iid in in_ids:
-                                    if iid in unit_contribs:
-                                        node_inputs.append(unit_contribs[iid])
-                                    elif iid in merge_node_contribs:
-                                        node_inputs.append(merge_node_contribs[iid])
+                                node_inputs = deterministic_stage_inputs(in_ids, units=unit_contribs,
+                                    merged=merge_node_contribs, merge_nodes=merge_nodes_map, plan=plan,
+                                    artifacts=wf_state['artifacts'], policy=eff_policy, config=config,
+                                    bases=base_contributors)
 
                                 stage = 'merge_upstream'
                                 merged_upstream = merge_construction_graphs(
@@ -1755,13 +1750,19 @@ def read_graph_details(workspace, pid, *, entity_id=None, fact_id=None, include_
             "include_candidates": include_candidates}
 
 
-def identity_review(workspace, pid, *, offset=0, decision_offset=0):
+def identity_review(workspace, pid, *, offset=0, decision_offset=0, version=None, business_context=None):
     """Show original endpoints and authorized evidence before identity decisions."""
     from ..store import GraphStore
     from ..identity.reconciliation import list_candidates
     if offset < 0 or decision_offset < 0:
         raise LightGraphError("graph_selection_invalid")
-    config = workspace.resolved_config(pid)
+    config = workspace.result_config(pid)
+    from . import construction_graph, publication_identity, graph_history
+    if construction_graph.available(config):
+        return graph_history.read_consistently(workspace, pid, publication_identity.review, offset=offset,
+            decision_offset=decision_offset, version=version, business_context=business_context)
+    if version or business_context is not None:
+        raise LightGraphError("resolution_version_conflict")
     path = Path(config.output_dir) / "graph.sqlite"
     if path.is_symlink():
         raise LightGraphError("workspace_path_invalid")
@@ -1789,11 +1790,19 @@ def identity_review(workspace, pid, *, offset=0, decision_offset=0):
             "next_decision_offset": decision_offset + len(decisions) if decision_offset + len(decisions) < len(listing["decisions"]) else None}
 
 
-def resolve_identity(workspace, pid, *, candidate_id=None, verdict=None, decision_id=None, expected_revision):
+def resolve_identity(workspace, pid, *, candidate_id=None, verdict=None, decision_id=None, expected_revision,
+                     version_id=None, members=None, business_context=None):
     """The caller serializes this mutation with runs and project configuration."""
     from ..store import GraphStore
     from ..identity.reconciliation import decide, revoke
-    config = workspace.resolved_config(pid)
+    from . import construction_graph, publication_identity
+    config = workspace.result_config(pid)
+    if construction_graph.available(config):
+        return publication_identity.change(workspace, pid, config, candidate_id=candidate_id, verdict=verdict,
+            decision_id=decision_id, expected_revision=expected_revision, version_id=version_id, members=members,
+            business_context=business_context)
+    if version_id or business_context is not None:
+        raise LightGraphError("resolution_version_conflict")
     path = Path(config.output_dir) / "graph.sqlite"
     if path.is_symlink():
         raise LightGraphError("workspace_path_invalid")
@@ -1803,7 +1812,7 @@ def resolve_identity(workspace, pid, *, candidate_id=None, verdict=None, decisio
         options = {"scopes": set(config.scopes), "domain": config.isolation_domain, "expected_revision": expected_revision}
         if decision_id:
             return revoke(store, decision_id, **options)
-        return decide(store, candidate_id, verdict, **options)
+        return decide(store, candidate_id, verdict, members=members, **options)
 
 
 def _metadata_context(config, project_path):

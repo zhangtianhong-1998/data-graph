@@ -126,6 +126,18 @@ def plain_value(value):
     return value
 
 
+def original_key_types(values_by_column, origins):
+    """Recover driver types only when all matching recorded origins agree."""
+    result = {}
+    for column, value in values_by_column.items():
+        kinds = {origin.get('identity_types', {}).get(name) for origin in origins
+                 for name, observed in origin.get('identity', {}).items() if canonical(observed) == canonical(value)}
+        if len(kinds) != 1 or None in kinds:
+            return {}
+        result[column] = kinds.pop()
+    return result
+
+
 def persisted_identity_key(node):
     """Compare stored identities without treating display spelling as type.
 

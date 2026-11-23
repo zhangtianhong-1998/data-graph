@@ -119,20 +119,32 @@ def mixed_config(tmp_path, monkeypatch, db_kind, file_kind, *, qualified=True):
         manifest = tmp_path / 'capability.yaml'
         manifest.write_text(dump_yaml({'database': qualification}), encoding='utf-8')
         database['capability_manifest'] = str(manifest)
-    config = RunConfig.model_validate({'sources': [local, database],
+    file_schema = local.get('schema_name', 'public')
+    registry = tmp_path / 'department-codes.md'
+    registry.write_text('---\nid: departments\npurpose: data_description\nscope:\n'
+        f'  columns: [file.{file_schema}.items.parent_code, database.{schema}.items.code]\n'
+        '---\n# 部门编码\n项目文件的 parent_code 引用数据库部门目录中的 code。'
+        '部门目录统一分配该编码。项目文件自己的 code 是项目编号。\n', encoding='utf-8')
+    config = RunConfig.model_validate({'sources': [local, database], 'documents': [str(registry)],
         'deployment_retention_verified': True, 'model': {'mode': 'in_environment'},
         'goal': {'purpose': '合并本地项目与数据库部门资料，补充属性和所属关系'}})
     return config, data, connection, opened
 
 
-def mixed_draft(catalog):
+def mixed_draft(tools, *, reference=None, use_dictionary=True):
+    catalog = tools.describe_sources()
     tables = {t['source']: {'source_id': t['source'], 'schema': t['schema'], 'table': t['name']}
               for t in catalog['tables']}
     file, database = tables['file'], tables['database']
+    evidence = [reference] if reference else []
+    if use_dictionary:
+        material = tools.call('read_material', name='document:departments')
+        assert material['section_fully_read'], material
+        evidence.extend(material['evidence_refs'])
     return {'draft_id': '联合构建', 'entities': [
         {'type': '项目', 'key_names': ['编码'], 'mappings': [
             {**file, 'key_columns': ['code'], 'label_column': 'name'}]},
-        {'type': '部门', 'key_names': ['编码'], 'mappings': [
+        {'type': '部门', 'key_names': ['编码'], 'identity_evidence_refs': evidence, 'mappings': [
             {**database, 'key_columns': ['code'], 'label_column': 'name'},
             {**file, 'key_columns': ['parent_code'], 'properties': {'补充': 'note'}}]}],
         'relations': [{'type': '归属', 'source_type': '项目', 'target_type': '部门',
@@ -173,8 +185,7 @@ def test_mixed_adapters_inspect_join_validate_and_publish(tmp_path, monkeypatch,
         assert refs['aggregates']['unique_matches'] == 2
         assert refs['coverage']['consistency_scope'] == 'independent_source_snapshots'
         assert not opened[0].capabilities().consistent_snapshot
-        draft = mixed_draft(catalog)
-        draft['evidence_refs'] = [refs['evidence_ref']]
+        draft = mixed_draft(tools, reference=refs['evidence_ref'])
         assert tools.call('save_graph_draft', yaml_text=dump_yaml(draft))['status'] == 'ok'
         check = tools.call('validate_graph_draft', draft_id=draft['draft_id'])
         assert check['passed'], check
@@ -187,6 +198,7 @@ def test_mixed_adapters_inspect_join_validate_and_publish(tmp_path, monkeypatch,
         department = next(n for n in nodes.values() if n['label'] == '部门甲')
         assert department['properties']['补充'] == ['补充甲']
         assert {p['source']['source_id'] for p in department['provenance']} == {'file', 'database'}
+        assert all(refs['evidence_ref'] in observation['evidence_refs'] for observation in department['supports'])
         assert not opened[0].capabilities().consistent_snapshot
         # Neither raw writes nor a forged source qualifier reach the database.
         before = len(connection.executed)
@@ -230,12 +242,32 @@ def test_snapshot_entry_without_consistency_still_blocks_projection(tmp_path):
         assert adapter.stats.queries == 0 and adapter._depth == 0
 
 
+def test_equal_reference_values_do_not_establish_a_shared_department_registry(tmp_path, monkeypatch):
+    config, data, _, _ = mixed_config(tmp_path, monkeypatch, 'gauss', 'csv')
+    tools = ConstructionTools(config, tmp_path / 'work')
+    try:
+        tables = {t['source']: t['table'] for t in tools.describe_sources()['tables']}
+        probe = tools.call('inspect_source', table=tables['file'], operation='check_reference', arguments={
+            'source_table': tables['file'], 'source_columns': ['parent_code'],
+            'target_table': tables['database'], 'target_columns': ['code']})
+        assert probe['coverage']['confirmed'] and not probe['coverage']['semantic_identity_confirmed']
+        draft = mixed_draft(tools, reference=probe['evidence_ref'], use_dictionary=False)
+        assert tools.call('save_graph_draft', yaml_text=dump_yaml(draft))['status'] == 'ok'
+        check = tools.call('validate_graph_draft', draft_id=draft['draft_id'])
+        assert not check['passed']
+        assert check['diagnostics'][0]['code'] == 'cross_table_identity_unverified'
+        assert tools.call('publish_graph_draft', draft_id=draft['draft_id'])['status'] == 'error'
+    finally:
+        tools.close()
+        data.close()
+
+
 @pytest.mark.parametrize('db_kind', ['mysql', 'gauss'])
 def test_unverified_database_still_cannot_publish_mixed_graph(tmp_path, monkeypatch, db_kind):
     config, data, connection, opened = mixed_config(tmp_path, monkeypatch, db_kind, 'csv', qualified=False)
     tools = ConstructionTools(config, tmp_path / 'work')
     try:
-        draft = mixed_draft(tools.call('describe_sources'))
+        draft = mixed_draft(tools)
         tools.call('save_graph_draft', yaml_text=dump_yaml(draft))
         result = tools.call('validate_graph_draft', draft_id=draft['draft_id'])
         assert not result['passed']
