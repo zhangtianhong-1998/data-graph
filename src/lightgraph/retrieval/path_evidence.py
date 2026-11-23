@@ -1,5 +1,6 @@
 """Shared search budgets and evidence projection for graph paths."""
 from lightgraph.contracts import canonical
+from .joint_evidence import worksheet_row_witness
 from .store_sqlite import normalize_term
 
 
@@ -9,14 +10,19 @@ MAX_EXPANSIONS = 128
 MAX_WITNESS_PAIRS = 8192
 MAX_STATES = 2048
 FANOUT = 48
+MAX_OBSERVATION_BYTES = 2048
 BINDING_FIELDS = ('columns', 'key_columns', 'label_column', 'property_columns', 'source_key_columns',
                   'target_key_columns', 'scope_columns', 'predicate', 'context_columns', 'constant_properties',
                   'business_context_mapping', 'source_lookup', 'target_lookup')
 
 
+def _fits_preview(observation):
+    return len(canonical(observation).encode('utf-8')) <= MAX_OBSERVATION_BYTES
+
+
 def evidence_preview(witness):
-    """Large attribute maps and execution histories are available via exact-ID lookup."""
-    if len(canonical(witness).encode('utf-8')) <= 2048:
+    """Keep the selected observation's complete binding and worksheet location when they fit."""
+    if _fits_preview(witness):
         return witness
     refs = witness.get('evidence_refs') or []
     preview = {'projection': 'reference_only', 'observation_id': witness.get('observation_id'),
@@ -35,9 +41,14 @@ def evidence_preview(witness):
         mapped = {**preview, 'projection': 'source_binding', 'provenance': binding}
         if witness.get('source_identity'):
             with_key = {**mapped, 'source_identity': witness['source_identity']}
-            if len(canonical(with_key).encode('utf-8')) <= 2048:
-                return with_key
-        if len(canonical(mapped).encode('utf-8')) <= 2048:
+            if _fits_preview(with_key):
+                mapped = with_key
+        if _fits_preview(mapped):
+            locator = worksheet_row_witness(witness.get('source_row_witness'))
+            if locator and all(isinstance(source.get(k), str) and source[k] for k in ('source_id', 'schema', 'table')):
+                located = {**mapped, 'source_row_witness': locator}
+                if _fits_preview(located):
+                    return located
             return mapped
     return preview
 

@@ -4,7 +4,10 @@ from __future__ import annotations
 from collections import deque
 import json
 
+from .joint_evidence import worksheet_row_witness
 from .path_evidence import BINDING_FIELDS
+
+_BINDING_BYTES = 10000
 
 
 def _compact(value):
@@ -13,6 +16,20 @@ def _compact(value):
 
 def _fields(item, names):
     return {key: item[key] for key in names if item.get(key) not in (None, '', [], {})}
+
+
+def _row_citation(obs):
+    citation = {}
+    source = (obs.get('provenance') or {}).get('source') or {}
+    if all(isinstance(source.get(k), str) and source[k] for k in ('source_id', 'schema', 'table')):
+        witness = worksheet_row_witness(obs.get('source_row_witness'))
+        if witness:
+            citation['source_row_witness'] = witness
+    if citation or obs.get('projection') in ('source_binding', 'reference_only'):
+        observation_id = obs.get('observation_id')
+        if isinstance(observation_id, str) and observation_id:
+            citation['observation_id'] = observation_id
+    return citation
 
 
 def agent_context(answer, *, version=None, sources=()):
@@ -40,19 +57,24 @@ def agent_context(answer, *, version=None, sources=()):
         'nodes': [], 'edges': [], 'bindings': [], 'paths': [], 'joint_witnesses': [], 'source_passages': [],
     }
     # Separate budgets keep a large entity list from crowding out paths and physical mappings.
-    remaining = dict(nodes=6000, edges=6000, bindings=10000, paths=4000, joint_witnesses=3000, source_passages=1200)
+    remaining = dict(nodes=6000, edges=6000, bindings=_BINDING_BYTES, paths=4000, joint_witnesses=3000, source_passages=1200)
 
-    def add(section, row):
+    def add(section, row, *, replace=None):
         size = len(_compact(row).encode('utf-8')) + 1
+        if replace is not None:
+            size -= len(_compact(replace).encode('utf-8')) + 1
         if size > remaining[section]:
             context['truncated'] = True
             return False
         remaining[section] -= size
-        context[section].append(row)
+        if replace is None:
+            context[section].append(row)
+        else:
+            replace.update(row)
         return True
 
     def observations(item):
-        seen = set()
+        seen = {}
         for obs in item.get('observations', []):
             prov = obs.get('provenance') or {}
             source = prov.get('source') or {}
@@ -65,11 +87,15 @@ def agent_context(answer, *, version=None, sources=()):
             if source.get('table'):
                 row.update(source=_fields(source, ('source_id', 'schema', 'table')),
                            source_kind=kinds.get(source.get('source_id')), mapping=mapping)
-            if row:
+            projected = obs.get('projection') in ('source_binding', 'reference_only')
+            if row or (projected and obs.get('observation_id')):
                 key = _compact(row)
-                if key not in seen:
-                    seen.add(key)
-                    yield {'ref': item['id'], **row}
+                first = key not in seen
+                candidates = seen.setdefault(key, [])
+                if projected or 'source_row_witness' in obs:
+                    candidates.append(obs)
+                if first:
+                    yield {'ref': item['id'], **row}, candidates
 
     # Prefer whole named paths when a large result needs clipping.
     paths = []
@@ -109,19 +135,51 @@ def agent_context(answer, *, version=None, sources=()):
     # another observation from a heavily referenced entity.
     priority_refs = priority | priority_edges
     pending = deque(observations(item) for item in sorted(supported, key=lambda item: item['id'] not in priority_refs))
+    retained_bindings = []
     while pending and remaining['bindings'] > 0:
         stream = pending.popleft()
-        binding = next(stream, None)
-        if binding is not None:
+        observation = next(stream, None)
+        if observation is not None:
+            binding, citations = observation
             retained = add('bindings', binding)
             if not retained and 'properties' in binding:
                 # Preserve an entire physical mapping even when one property is document-sized.
                 binding.pop('properties')
-                retained = add('bindings', {**binding, 'properties_omitted': True})
+                binding['properties_omitted'] = True
+                retained = add('bindings', binding)
             if retained:
+                retained_bindings.append((binding, citations))
                 pending.append(stream)
     if pending:
         context['truncated'] = True
+    # Reserve the existing mappings first. Distinct observations of the same
+    # mapping may cite different rows; each citation stays with its own ID.
+    for binding, citations in retained_bindings:
+        if not citations:
+            continue
+        base = dict(binding)
+        emitted = set()
+        for obs in citations:
+            citation = _row_citation(obs)
+            key = citation.get('observation_id')
+            if key in emitted:
+                continue
+            locator = citation.get('source_row_witness')
+            # Even the shortest JSON interval uses six bytes including its delimiter.
+            if locator and len(locator['rows']) * 6 > _BINDING_BYTES:
+                context['truncated'] = True
+                del citation['source_row_witness']
+            if not citation:
+                continue
+            key = key or _compact(citation)
+            if key in emitted:
+                continue
+            replace = None if emitted else binding
+            retained = add('bindings', {**base, **citation}, replace=replace)
+            if not retained and 'source_row_witness' in citation and 'observation_id' in citation:
+                retained = add('bindings', {**base, 'observation_id': citation['observation_id']}, replace=replace)
+            if retained:
+                emitted.add(key)
     for path in paths:
         if set(path.get('node_ids', [])) <= node_ids and set(path.get('edge_ids', [])) <= edge_ids:
             add('paths', path)

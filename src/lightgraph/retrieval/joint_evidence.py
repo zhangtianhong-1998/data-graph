@@ -37,6 +37,23 @@ def _clauses(predicate):
             yield predicate
 
 
+def worksheet_row_witness(value):
+    """Read a complete physical worksheet locator without copying unrelated support fields."""
+    if not isinstance(value, dict) or value.get('kind') != 'excel_rows_v1':
+        return None
+    snapshot, rows = value.get('snapshot'), value.get('rows')
+    if (not isinstance(snapshot, str) or len(snapshot) != 64 or any(c not in '0123456789abcdef' for c in snapshot)
+            or not isinstance(rows, list) or not rows):
+        return None
+    last = 0
+    for span in rows:
+        if (not isinstance(span, list) or len(span) != 2 or any(type(v) is not int for v in span)
+                or not last < span[0] <= span[1] <= 1_048_576):
+            return None
+        last = span[1]
+    return {'kind': 'excel_rows_v1', 'snapshot': snapshot, 'rows': rows}
+
+
 def common_record(observations):
     """Edges already share a source, typed projected grain and compatible applicability.
 
@@ -50,21 +67,11 @@ def common_record(observations):
     filters = []
     complete_bindings = True
     for obs in observations:
-        witness = obs.get('source_row_witness')
-        if witness is not None:
-            if not isinstance(witness, dict) or witness.get('kind') != 'excel_rows_v1':
+        if obs.get('source_row_witness') is not None:
+            witness = worksheet_row_witness(obs['source_row_witness'])
+            if witness is None:
                 return None
-            revision, rows = witness.get('snapshot'), witness.get('rows')
-            if (not isinstance(revision, str) or len(revision) != 64
-                    or any(c not in '0123456789abcdef' for c in revision)
-                    or not isinstance(rows, list) or not rows):
-                return None
-            last = 0
-            for pair in rows:
-                if (not isinstance(pair, list) or len(pair) != 2 or any(type(v) != int for v in pair)
-                        or not last < pair[0] <= pair[1] <= 1048576):
-                    return None
-                last = pair[1]
+            revision, rows = witness['snapshot'], witness['rows']
             if snapshot is not None and revision != snapshot:
                 return None
             snapshot = revision
