@@ -21,6 +21,7 @@ function toggleMember(id: string, event: Event) {
 }
 const channel = (name: string) => ({ name: '名称相似', code: '编码相似', definition: '定义相似',
   same_source_observation: '同源记录', same_typed_identity: '同类型同编码', normalized_label: '名称相近',
+  same_source_key_different_identity_domains: '同一来源键值，草稿声明的身份域不同',
   independent_drafts_unverified_identity: '不同草稿使用相同编码', source_key_requires_role_review: '同一来源键，对象角色待核对' }[name] || name)
 const label = (node: GraphNode) => String(node.label || node.name || node.id)
 let generation = 0

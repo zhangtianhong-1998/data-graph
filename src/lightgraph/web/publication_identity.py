@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from lightgraph.construction.access import filter_graph_scopes
+from lightgraph.construction.domain_variant_candidates import domain_variant_candidates
 from lightgraph.construction.graph_storage import write_graph_record
 from lightgraph.construction.human_identity import Decisions, candidate_key, check_review_scope, project
 from lightgraph.construction.snapshot_registry import append_graph_head, authorize_snapshot, snapshot_id
@@ -59,7 +60,16 @@ class Review:
         self.nodes = {n['id']: n for n in self.visible['nodes']}
         self.state = Decisions(self.ledger['decisions'])
         self.groups = {}
-        for group in self.visible.get('candidate_identity_merges', []):
+        # Older publications may hold two domain variants without a recorded candidate.
+        # Derive review suggestions from this reader's visible base witnesses so GET,
+        # submit and revoke all use the same immutable member IDs.
+        stored = self.visible.get('candidate_identity_merges', [])
+        existing = {frozenset(group['node_ids']) for group in stored}
+        local_workspace = (self.base.get('graph_kind') == 'workspace_publication' and not config.inherited_graphs
+                           and not self.base.get('inherited_summary') and not self.raw.get('extends_base_graph'))
+        suggestions = [group for group in domain_variant_candidates(self.visible, local_workspace=local_workspace)
+                       if frozenset(group['node_ids']) not in existing]
+        for group in [*stored, *suggestions]:
             members = sorted(self.state.expanded(group['node_ids']))
             if set(members) <= self.nodes.keys():
                 self.groups[candidate_key(self.base_id, group)] = (members, group)
