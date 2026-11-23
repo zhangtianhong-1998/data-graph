@@ -319,7 +319,7 @@ def _matches_position(name, value, columns, positions, prov, column_ordinals):
     return False
 
 
-def edge_observation_properties(support, columns, positions, orientation):
+def edge_observation_properties(support, columns, positions, orientation, *, worksheet_properties=()):
     """Bind structural annotations to their specific endpoint before comparing edges."""
     src, dst = columns
     roles = None
@@ -333,10 +333,12 @@ def edge_observation_properties(support, columns, positions, orientation):
             # Layout can decode an annotation. A separate observation still
             # has to establish a direction for this exact edge and scope.
             roles['parent'], roles['child'] = sorted(columns, key=lambda c: positions[c[0]])
-    return observation_properties(support, src + dst, positions, endpoint_roles=roles)
+    return observation_properties(support, src + dst, positions, endpoint_roles=roles,
+                                  worksheet_properties=worksheet_properties)
 
 
-def observation_properties(support, key_columns, positions, *, column_ordinals=None, endpoint_roles=None):
+def observation_properties(support, key_columns, positions, *, column_ordinals=None, endpoint_roles=None,
+                           worksheet_properties=()):
     """Omit a materialized position annotation only when its physical role is verified.
 
     Optional source ordinals are 1-based physical positions in the full original
@@ -370,7 +372,7 @@ def observation_properties(support, key_columns, positions, *, column_ordinals=N
     projected = set(prov.get('context_columns') or ()) & set(prov.get('columns') or ())
     properties = set()
     for name, values in observed.items():
-        if name in positions_only:
+        if name in positions_only or name in worksheet_properties:
             continue
         column = bindings.get(name)
         if name not in constants and column in projected and column in row_values and column in row_types:

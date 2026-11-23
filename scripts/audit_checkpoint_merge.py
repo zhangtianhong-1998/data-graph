@@ -467,7 +467,7 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
     # Some modules are loaded only by branches exercised during the replay.
     modules = [merger, observed_identity, executor, fusion, metadata_columns, workspace]
     for name in ('catalog_identity', 'hierarchy_replay', 'hierarchy_observations', 'hierarchy_captions',
-                 'hierarchy_role_witnesses', 'hierarchy_neighborhood', 'hierarchy_stage',
+                 'hierarchy_role_witnesses', 'hierarchy_neighborhood', 'hierarchy_worksheet_properties', 'hierarchy_stage',
                  'identity_authority', 'source_namespaces'):
         module = sys.modules.get('lightgraph.construction.' + name)
         if module is not None:

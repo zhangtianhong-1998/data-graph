@@ -12,6 +12,7 @@ from .hierarchy_neighborhood import neighborhood_difference_counts
 from .hierarchy_observations import (edge_observation_properties, observation_boundary, observation_properties,
                                      worksheet_edge_boundaries)
 from .hierarchy_role_witnesses import IsolatedRoleIndex
+from .hierarchy_worksheet_properties import worksheet_property_matches
 
 
 def _address(prov):
@@ -171,6 +172,53 @@ def _member(node, definition, layouts, captions=None):
                    units.pop(), len(labels) > 1, raw_key)
 
 
+def _worksheet_edge_facts(entries, stats):
+    projections = [(edge_id, support, fact) for edge_id, _, _, _, support, fact, _ in entries]
+    sections = worksheet_edge_boundaries(projections, stats)
+    matches = worksheet_property_matches(projections, sections)
+    targets = {}
+    directions = defaultdict(set)
+    if matches:
+        for index, (entry, boundaries) in enumerate(zip(entries, sections, strict=True)):
+            _, _, columns, orientation, support, original, layout = entry
+            residuals = {}
+            for boundary in boundaries or ():
+                old = (boundary, original[1])
+                new = old
+                if match := matches.get(index, {}).get(boundary):
+                    aligned, names = match
+                    if names not in residuals:
+                        residuals[names] = edge_observation_properties(
+                            support, columns, layout, orientation, worksheet_properties=names)
+                    new = (aligned, residuals[names])
+                # An old fact must still have one representation across all
+                # owners. Rewriting only one copy can exchange an existing pair.
+                if targets.setdefault(old, new) != new:
+                    targets[old] = old
+                if orientation in ('parent_to_child', 'child_to_parent'):
+                    parent = columns[0 if orientation == 'parent_to_child' else 1]
+                    directions[old].add(parent)
+                    directions[new].add(parent)
+    for entry, boundaries in zip(entries, sections, strict=True):
+        if boundaries is None:
+            yield entry, None
+            continue
+        facts = []
+        changed = False
+        for boundary in boundaries:
+            old = (boundary, entry[5][1])
+            target = targets.get(old, old)
+            if target != old and len(directions[target]) <= 1:
+                changed = True
+                facts.append(target)
+            else:
+                facts.append(old)
+        if changed:
+            key = 'worksheet_property_corroborated_supports'
+            stats[key] = stats.get(key, 0) + 1
+        yield entry, facts
+
+
 def _neighborhoods(graph, nodes, members, relations, layouts, captions, stats):
     """Compare parent and child observations in physical coordinates, including reverse encodings."""
     incidents = defaultdict(set)
@@ -221,16 +269,14 @@ def _neighborhoods(graph, nodes, members, relations, layouts, captions, stats):
             physical_edges[physical_pair].append((edge['id'], endpoints, columns, orientation, support, fact, level_index))
     while physical_edges:
         physical_pair, entries = physical_edges.popitem()
-        projections = [(edge_id, support, fact) for edge_id, _, _, _, support, fact, _ in entries]
-        for entry, boundaries in zip(entries, worksheet_edge_boundaries(projections, stats), strict=True):
+        for entry, facts in _worksheet_edge_facts(entries, stats):
             _, endpoints, columns, orientation, support, original_fact, level_index = entry
-            if boundaries is None:
+            if facts is None:
                 blocked.update(endpoints)
                 continue
             row = support.get('row_context') or {}
             ancestor_facts = {original_fact}
-            for boundary in boundaries:
-                fact = (boundary, original_fact[1])
+            for fact in facts:
                 pair = (*physical_pair, fact)
                 if orientation in ('parent_to_child', 'child_to_parent'):
                     known[pair].add(columns[0 if orientation == 'parent_to_child' else 1])
