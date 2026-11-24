@@ -69,6 +69,15 @@ def name_mapping_advice(draft, graph=None):
             continue
         has_primary_mapping = any(mapping.label_column for mapping in entity.mappings)
         for number, mapping in enumerate(entity.mappings):
+            if len(mapping.key_columns) > 1 and mapping.label_column in mapping.key_columns:
+                advice.append({
+                    'code': 'primary_name_in_composite_key', 'severity': 'suggestion',
+                    'entity_type': entity.type, 'path': ['entities', index, 'mappings', number, 'key_columns'],
+                    'column': mapping.label_column, 'key_columns': list(mapping.key_columns),
+                    'message': '主名称也是复合身份键的一部分。名称变更会生成另一个节点。',
+                    'next_action': '核对业务键或唯一约束。若已有独立编码可识别对象，将名称映射到 label_column；'
+                                   '若名称确实参与识别，保留完整复合键并记录依据。',
+                })
             if has_primary_mapping or not mapping.display_columns:
                 continue
             advice.append({

@@ -35,6 +35,19 @@ def test_no_previous_revision_or_no_loss_returns_no_advice():
     assert revision_loss_advice(value, reordered) == []
 
 
+def test_revision_distinguishes_changed_identity_from_new_attributes():
+    old = example()
+    new = deepcopy(old)
+    new['entities'][0]['mappings'][0]['properties'] = {'补充信息': 'additional'}
+    assert revision_loss_advice(old, new) == []
+    new['entities'][0]['key_names'] = ['new_id']
+    new['entities'][0]['identity_domain'] = 'other_registry'
+    item, = revision_loss_advice(old, new)
+    assert item['code'] == 'revision_entity_identity_changed'
+    assert item['changed_fields'] == ['key_names', 'identity_domain']
+    assert item['definition_type'] == 'Item'
+
+
 def test_removing_database_and_relation_keeps_exact_declaration_loss_visible():
     previous = example()
     current = deepcopy(previous)

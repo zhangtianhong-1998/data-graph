@@ -6,7 +6,7 @@ from lightgraph.construction.contexts import business_context_identity, normaliz
 from lightgraph.contracts import canonical
 from .dimensional import empty_answer
 from .intent import _new_plan, _resolve_text
-from .path_evidence import MAX_WITNESS_PAIRS, evidence_preview, path_node
+from .path_evidence import MAX_WITNESS_PAIRS, evidence_preview, grounds_slot, path_node
 from .retriever import _join_contexts
 from .traversal import _context_witnesses
 
@@ -27,6 +27,30 @@ def _observed_identity(node, witness):
     keys = (witness.get('provenance') or {}).get('key_columns') or []
     values = (witness.get('source_identity') or {}).get('values') or []
     return dict(zip(keys, values)) if len(keys) == len(values) else {}
+
+
+def _describe_candidate(candidate, node, slot):
+    """Describe the observations that matched this term within the caller's scope."""
+    bindings = set()
+    for obs in node.get('observations', []):
+        if not grounds_slot(node, obs, slot):
+            continue
+        if 'identity' not in candidate:
+            candidate['identity'] = _observed_identity(node, obs)
+        if obs.get('label') and not candidate.get('display_name'):
+            candidate['display_name'] = obs['label']
+        prov = obs.get('provenance') or {}
+        source = prov.get('source') or {}
+        address = tuple(source.get(k) for k in ('source_id', 'schema', 'table'))
+        keys = prov.get('key_columns')
+        if (all(isinstance(part, str) and part for part in address) and isinstance(keys, list)
+                and keys and all(isinstance(key, str) and key for key in keys)):
+            bindings.add((*address, tuple(keys)))
+    if bindings:
+        candidate['source_bindings'] = [
+            {'source_id': sid, 'schema': schema, 'table': table, 'key_columns': list(keys)}
+            for sid, schema, table, keys in sorted(bindings)[:5]]
+        candidate['source_bindings_truncated'] = len(bindings) > 5
 
 
 def _compatible_endpoints(seeds, edge_context, neighbors, remaining):
@@ -65,13 +89,9 @@ def retrieve_hierarchy(retriever, request, scopes, *, term, direction):
     if len(candidates) > 1:
         visible = retriever.index.load_authorized_nodes([c['node_id'] for c in candidates], scopes=cohorts)
         for c in candidates:
-            node = visible[c['node_id']]
-            witness = next((obs for _, obs in _context_witnesses(node, [slot])), None)
-            if witness is not None:
-                c['display_name'] = witness.get('label') or term
-                c['identity'] = _observed_identity(node, witness)
+            _describe_candidate(c, visible[c['node_id']], slot)
         detail['status'] = 'ambiguous'
-        plan.update(intent='clarify', unresolved=['有多个同名对象，请用完整编码或节点编号指定。'])
+        plan.update(intent='clarify', unresolved=['匹配到多个对象。请核对类型、业务标识和来源后选择查询起点。'])
     if len(candidates) != 1:
         if capped:
             answer.update(truncated=True, truncation_reasons=['candidate_limit_reached'])

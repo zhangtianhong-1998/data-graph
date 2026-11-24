@@ -100,6 +100,40 @@ def test_name_must_bind_in_compatible_context(tmp_path):
     assert len(ask(r, mode='hierarchy', query='另一名称', business_context={'dept': 'K'})['edges']) == 6
 
 
+def test_ambiguous_code_lists_evidenced_columns_per_visible_candidate(tmp_path):
+    graph = publication()
+
+    def observation(label, table, scope='public'):
+        return {**support(label, scope=scope), 'provenance': {
+            'source': {**TABLE, 'table': table}, 'key_columns': ['subject_code']}}
+
+    graph['nodes'] = [
+        {'id': 'x', 'type': '科目', 'identity': {'code': 'S-41'}, 'supports': [
+            observation('拨备', 'ledger'), observation('拨备', 'budget'),
+            observation('拨备', 'budget'), observation('拨备', 'private_rows', 'private')]},
+        {'id': 'y', 'type': '指标', 'identity': {'code': 'S-41'}, 'supports': [
+            observation('拨备13', 'metrics'), observation('其他', 'other_name')]},
+    ]
+    graph['edges'] = []
+    graph['definitions']['entities'].append({'type': '指标', 'key_names': ['code']})
+    sync_graph_to_retrieval(graph, tmp_path)
+    r = SubgraphRetriever(tmp_path)
+    out = ask(r, mode='hierarchy', query='S-41')
+    assert out['hierarchy']['status'] == 'ambiguous' and out['hierarchy']['items'] == []
+    assert out['edges'] == []
+    candidates = out['slots'][0]['candidates']
+    assert [c['node_id'] for c in candidates] == ['x', 'y']
+    assert [b['table'] for b in candidates[0]['source_bindings']] == ['budget', 'ledger']
+    assert candidates[0]['source_bindings'][0] == {
+        'source_id': 'file', 'schema': 'public', 'table': 'budget', 'key_columns': ['subject_code']}
+    assert all(c['identity'] == {'code': 'S-41'} for c in candidates)
+    # Name-based queries only expose columns on observations that support the name.
+    graph['nodes'][1]['supports'][0]['label'] = '拨备'
+    sync_graph_to_retrieval(graph, tmp_path)
+    name = ask(SubgraphRetriever(tmp_path), mode='hierarchy', query='拨备')
+    assert [b['table'] for b in name['slots'][0]['candidates'][1]['source_bindings']] == ['metrics']
+
+
 def test_each_returned_context_has_its_own_endpoint_witnesses(tmp_path):
     graph = publication()
     graph['nodes'][0]['supports'] = [support(f'总成本-{dept}', dept=dept) for dept in 'MKX']

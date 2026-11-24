@@ -718,7 +718,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     mat_started = time.monotonic()
     try:
         clock()
-        contract_error = inherited_contract_error(draft, inherited.keys)
+        contract_error = inherited_contract_error(draft, inherited.contracts)
         if contract_error:
             raise LightGraphError(contract_error)
         for entity in draft.entities:

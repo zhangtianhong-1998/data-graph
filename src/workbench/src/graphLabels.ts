@@ -101,12 +101,24 @@ export function mergeDisplaySchema(...schemas: Array<DisplaySchema | undefined>)
   }
   return result
 }
-export const nodeCaption = (node: GraphNode) => String([node.display_label, node.label, node.name].find(value => value && value !== node.id) || '未命名节点')
+export function nodeCaption(node: GraphNode): string {
+  if (node.label_conflict && Array.isArray(node.label_variants) && node.label_variants.length > 1)
+    return node.label_variants.join(' / ')
+  if (['identity', 'relations', 'declared'].includes(String(node.label_origin))) {
+    const identity = Object.values(nodeIdentity(node))
+    const display = node.label_origin === 'declared' && node.display_values && typeof node.display_values === 'object'
+      ? Object.values(node.display_values).flat() : []
+    const parts = (display.length ? display : identity).filter(value =>
+      ['string', 'number', 'boolean'].includes(typeof value) && value !== '' && value !== node.id)
+    return parts.length ? parts.join(' · ') : '未提供名称'
+  }
+  return String([node.display_label, node.label, node.name].find(value => value && value !== node.id) || '未提供名称')
+}
 export function nodeIdentity(node: GraphNode): Record<string, unknown> {
   return node.identity && typeof node.identity === 'object' && !Array.isArray(node.identity) ? node.identity as Record<string, unknown> : {}
 }
 export function nodeSearchText(node: GraphNode): string {
-  return [nodeCaption(node), node.kind || '', ...Object.entries(nodeIdentity(node)).flat(),
+  return [nodeCaption(node), node.display_label || '', node.kind || '', ...Object.entries(nodeIdentity(node)).flat(),
     ...(Array.isArray(node.aliases) ? node.aliases : [])].map(String).join(' ').toLocaleLowerCase()
 }
 export function nodeProperties(node: GraphNode): Record<string, unknown> {

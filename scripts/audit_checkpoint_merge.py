@@ -12,6 +12,7 @@ from lightgraph.construction.contexts import business_context_identity
 from lightgraph.construction.workflow import load_workflow_state, run_output_path
 from lightgraph.contracts import canonical
 from lightgraph.errors import LightGraphError
+from lightgraph.runtime.config import MergePolicyConfig
 from lightgraph.source_values import identity_cell, persisted_identity_key
 
 
@@ -539,8 +540,11 @@ def _run_summary(run, state, project, node_id):
 
 
 def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False, compare_to=None,
-          run_summary=False, include_edge_lineage=False, explain_identity=None):
+          run_summary=False, include_edge_lineage=False, explain_identity=None, overlap_patterns_only=False):
     """Use the run's committed inputs and policy, even when the current project has been edited."""
+    if overlap_patterns_only and any((include_hierarchy_membership, include_edge_lineage, compare_to,
+                                      explain_identity is not None, observations_only, run_summary)):
+        raise ValueError("--overlap-patterns-only 需单独运行。")
     if include_edge_lineage and (observations_only or run_summary):
         raise ValueError("--include-edge-lineage 需要执行合并重放")
     if explain_identity is not None and (observations_only or run_summary or not explain_identity.strip()):
@@ -557,8 +561,8 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
     if run_summary:
         return _run_summary(run, state, project, node_id)
     step = state.get("merge_nodes", {}).get(node_id, {})
-    if step.get("merge_mode") != "deterministic":
-        raise ValueError("请选择一个已提交的确定性合并节点。")
+    if step.get("merge_mode") not in {"deterministic", "overlap_review"}:
+        raise ValueError("请选择一个已提交的规则合并或重叠模式审查节点。")
     artifacts = state["artifacts"]
     target = artifacts[node_id]
     if target["run_id"] != run["run_id"]:
@@ -582,12 +586,11 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
             any(r["contributor_kind"] != "unit" or r.get("inherited_grants") for r in parents)):
         raise ValueError("此核查适用于直接合并抽取单元的节点。该节点还依赖其他合并或继承图。")
 
-    committed = read(target)["graph"]
-    counts = graph_counts(committed)
-    counts["integrity"] = output_checks(committed)
-    counts.update(inspect_observations(committed))
-    if "fusion_diagnostics" in committed:
-        counts["merge_counts"] = committed["fusion_diagnostics"]
+    checkpoint = read(target)
+    committed = checkpoint["graph"]
+    review = checkpoint.get("overlap_review")
+    if step.get("merge_mode") == "overlap_review" and not isinstance(review, dict):
+        raise ValueError("合并检查点缺少已提交的重叠审查记录。")
     fused = committed.get("fusion_policy")
     if fused is None:
         raise ValueError("提交图未记录实际生效的 fusion_policy，无法重放原策略。")
@@ -596,9 +599,35 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
     if node is None:
         raise ValueError("历史工作流缺少该合并节点的配置。")
     policy = {**(node.get("merge_policy") or plan["merge_policy"]), "fusion_policy": fused}
-    del committed
+    if review is not None:
+        policy = review["effective_merge_policy"]
+        if policy.get("fusion_policy") != fused:
+            raise ValueError("审查记录中的生效规则与提交图不一致。")
+    if not overlap_patterns_only:
+        counts = graph_counts(committed)
+        counts["integrity"] = output_checks(committed)
+        counts.update(inspect_observations(committed))
+        if "fusion_diagnostics" in committed:
+            counts["merge_counts"] = committed["fusion_diagnostics"]
+    del committed, checkpoint
 
+    if overlap_patterns_only and review is not None:
+        return {"run_id": run["run_id"], "node_id": node_id, "artifact_id": target["artifact_id"],
+                "upstream_artifacts": target["upstream_artifacts"], "mode": "committed_overlap_review",
+                "overlap_review": review}
     inputs = [read(r) for r in parents]
+    if overlap_patterns_only:
+        from lightgraph.construction.overlap_patterns import analyze_overlap_patterns
+        from lightgraph.construction.workflow_overlap import overlap_review_skip_reason
+        preview = {"run_id": run["run_id"], "node_id": node_id, "artifact_id": target["artifact_id"],
+                   "upstream_artifacts": target["upstream_artifacts"], "mode": "overlap_preview", "model_calls": 0}
+        skip = overlap_review_skip_reason(inputs, [r['node_id'] for r in parents], artifacts,
+                                          bool(target.get('inherited_grants')))
+        if skip:
+            return {**preview, "patterns": [], "summary": {"reason": skip}}
+        local_inputs = [{**item, "source_namespace": run["project_id"]} for item in inputs]
+        analysis = analyze_overlap_patterns(local_inputs, MergePolicyConfig.model_validate(policy))
+        return {**preview, "patterns": analysis.patterns, "summary": analysis.summary}
     saved_counts = step.get("merge_counts") or {}
     totals = {f"input_{kind}": sum(len(c["graph"][kind]) for c in inputs) for kind in ("nodes", "edges")}
     if any(key in saved_counts and saved_counts[key] != count for key, count in totals.items()):
@@ -612,6 +641,11 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         "inputs": {c["contributor_id"]: graph_counts(c["graph"]) for c in inputs}, "committed": counts,
         "historical_input_totals_verified": totals.keys() <= saved_counts.keys(),
     }
+    if review is not None:
+        report["overlap_review"] = review
+        report["effective_entity_rules"] = len(fused.get("entity_rules", []))
+        report["explicit_entity_rules"] = len(review["configured_merge_policy"]["fusion_policy"]["entity_rules"])
+        report["added_entity_rules"] = report["effective_entity_rules"] - report["explicit_entity_rules"]
     if include_edge_lineage:
         report['lineage_input_artifacts'] = {r['node_id']: r['artifact_id'] for r in parents}
     control_ids = set()
@@ -667,8 +701,9 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_file", type=Path, help="原项目 runs/run_….json")
-    parser.add_argument("--node", default="merge_1", help="要核对的确定性合并节点 ID")
+    parser.add_argument("--node", default="merge_1", help="要核对的合并节点 ID")
     mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--overlap-patterns-only", action="store_true", help="只读已提交的模式审查记录；旧规则合并则从上游检查点汇总重叠模式，不调用模型")
     mode.add_argument("--run-summary", action="store_true", help="只读正式运行记录、检查点标记和 Parquet 行数，不加载图或重放合并")
     mode.add_argument("--observations-only", action="store_true", help="只核查已提交图的实际观测，跳过合并重放")
     mode.add_argument("--include-hierarchy-membership", action="store_true", help="在重放报告中列出层级归并前后的节点 ID")
@@ -683,7 +718,7 @@ def main():
         report = audit(args.run_file, args.node, observations_only=args.observations_only,
                        include_hierarchy_membership=args.include_hierarchy_membership, compare_to=args.compare_hierarchy_audit,
                        run_summary=args.run_summary, include_edge_lineage=args.include_edge_lineage,
-                       explain_identity=args.explain_identity)
+                       explain_identity=args.explain_identity, overlap_patterns_only=args.overlap_patterns_only)
     except LightGraphError as exc:
         parser.exit(1, f"检查点或合并未通过校验：{exc.code}\n")
     except (KeyError, OSError, ValueError) as exc:

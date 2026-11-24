@@ -80,6 +80,14 @@ def standardize_node_details(
     display_name = entity_name(node)
     source_name = display_name if display_name in source_labels else next(iter(source_labels), None)
 
+    names_by_priority = defaultdict(set)
+    for support in supports:
+        label, priority = support.get('label'), support.get('label_priority')
+        if (isinstance(label, str) and label.strip() and isinstance(priority, int)
+                and support.get('source_kind') not in {'catalog', 'declared'}):
+            names_by_priority[priority].add(label.strip())
+    preferred = names_by_priority[min(names_by_priority)] if names_by_priority else set()
+
     explicit_english = sorted({
         str(s['english_name']).strip()
         for s in supports
@@ -198,6 +206,10 @@ def standardize_node_details(
                 add_field('metadata_column', '物理列定义', col_name)
 
         prop_col_map = prov.get('property_columns') if isinstance(prov.get('property_columns'), dict) else {}
+        # One table column can play a different role in another draft, even on
+        # the same node. Classify each value against the mapping that read it.
+        dedicated_columns = set(prov.get('key_columns') or []) | set(prov.get('alias_columns') or [])
+        dedicated_columns.update(prov.get(role) for role in ('label_column', 'english_name_column', 'description_column'))
         entries = support.get('property_observations', [])
         if not entries:
             entries = [{'property': name, 'original_property': name, 'value': value, 'raw_value': value}
@@ -212,7 +224,13 @@ def standardize_node_details(
             origin = {'source_id': source_id, 'qualified_table': qtable or source_id,
                       'column': col_name or None, 'data_type': dtype}
             attr_origins[attr_key][(source_id, tkey[1], tkey[2], col_name)] = origin
-            value_origin = {**origin, 'value': entry['value'], 'raw_value': entry['raw_value'],
+            if col_name and src.get('source_id') and src.get('table'):
+                binding_role = 'dedicated_column' if col_name in dedicated_columns else 'attribute_column'
+            elif entry['original_property'] in (prov.get('constant_properties') or {}):
+                binding_role = 'mapping_constant'
+            else:
+                binding_role = 'unlocated'
+            value_origin = {**origin, 'binding_role': binding_role, 'value': entry['value'], 'raw_value': entry['raw_value'],
                             'original_property': entry['original_property'], 'scope_ref': support.get('scope_ref'),
                             'business_context': support_business_context(support),
                             'evidence_refs': sorted(set(prov.get('evidence_refs', [])) | set(support.get('evidence_refs', [])))}
@@ -266,6 +284,8 @@ def standardize_node_details(
         'name': display_name,
         'status': node.get('status', 'accepted'),
         'source_name': source_name,
+        'source_names': source_labels,
+        'preferred_source_name': next(iter(preferred)) if len(preferred) == 1 else None,
         'chinese_name': source_name,  # Legacy API name for the mapped primary label.
         'english_name': english_name,
         'english_name_status': english_name_status,

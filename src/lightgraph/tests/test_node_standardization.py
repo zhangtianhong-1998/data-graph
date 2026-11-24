@@ -162,3 +162,35 @@ def test_same_table_positions_keep_both_key_columns_and_catalog_notes():
     assert {note['column'] for note in view['catalog_metadata_notes'][0]['column_comments']} == {'name1', 'name2'}
     assert [attribute['key'] for attribute in view['attributes']] == ['unit']
     assert view['english_name'] is None
+
+
+def test_multiple_source_labels_have_no_preferred_name_until_a_priority_distinguishes_them():
+    from lightgraph.construction.node_standardizer import standardize_node_details
+
+    supports = [{'label': name} for name in ('拨备13', '拨备')]
+    node = {'id': 'n1', 'identity': {'code': 'STD_SUB_13900'}, 'supports': supports}
+    result = standardize_node_details(node)
+    assert result['source_names'] == ['拨备', '拨备13']
+    assert result['preferred_source_name'] is None
+    supports[0]['label_priority'] = 0
+    assert standardize_node_details(node)['preferred_source_name'] == '拨备13'
+    supports[1]['label_priority'] = 0
+    assert standardize_node_details(node)['preferred_source_name'] is None
+
+
+def test_attribute_source_role_is_local_to_the_mapping_that_read_the_value():
+    from lightgraph.construction.node_standardizer import standardize_node_details
+
+    source = {'source_id': 'sheet', 'table': 'Sheet1'}
+    supports = [
+        {'properties': {'origin': ['映射常量']},
+         'provenance': {'source': source, 'constant_properties': {'origin': '映射常量'}}},
+        {'properties': {'origin': ['华东']},
+         'provenance': {'source': source, 'property_columns': {'origin': '地区'}, 'key_columns': ['代码']}},
+        {'properties': {'origin': ['华南']},
+         'provenance': {'source': source, 'property_columns': {'origin': '地区'}, 'key_columns': ['地区']}},
+    ]
+    view = standardize_node_details({'supports': supports, 'properties': {'origin': ['华东', '华南', '映射常量']}})
+    observations = view['attributes'][0]['observations']
+    assert {(obs['value'], obs['binding_role'], obs['column']) for obs in observations} == {
+        ('华东', 'attribute_column', '地区'), ('华南', 'dedicated_column', '地区'), ('映射常量', 'mapping_constant', None)}

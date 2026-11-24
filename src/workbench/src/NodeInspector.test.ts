@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp } from 'vue'
+import { createApp, nextTick } from 'vue'
 import type { App } from 'vue'
 import GraphCanvas from './GraphCanvas.vue'
 import type { Graph, StandardNode } from './types'
@@ -10,6 +10,17 @@ vi.mock('./api', async original => ({ ...await original<typeof import('./api')>(
 
 let app: App
 let root: HTMLDivElement
+
+async function expandEvidence(selector: string) {
+  const panel = await vi.waitFor(() => {
+    const el = root.querySelector<HTMLDetailsElement>(selector)
+    expect(el).not.toBeNull()
+    return el!
+  })
+  panel.open = true
+  panel.dispatchEvent(new Event('toggle'))
+  await nextTick()
+}
 
 beforeEach(() => {
   api.request.mockReset()
@@ -48,11 +59,15 @@ describe('标准化节点详情面板 (NodeInspector)', () => {
         },
       ],
       attributes: [
+        { key: 'tree_level', label: '映射层位', values: [5], observations: [
+          { value: 5, source_id: 'gauss_main', qualified_table: 'dm.income', column: null },
+        ], data_type: 'unknown', origin_tables: [] },
         {
           key: 'unit',
           label: '计量单位',
           values: ['万元', { '范围': '国内' }],
           observations: [
+            { value: '映射常量', source_id: 'gauss_main', qualified_table: 'dm.income', column: null },
             { value: '万元', raw_value: '万元', source_id: 'gauss_main', qualified_table: 'dm.income', column: 'unit_name', scope_ref: 'public' },
             { value: { '范围': '国内' }, source_id: 'csv_1', qualified_table: 'csv.supplement', column: 'unit_scope' },
           ],
@@ -118,6 +133,15 @@ describe('标准化节点详情面板 (NodeInspector)', () => {
     root.querySelector('.graph-node')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     await vi.waitFor(() => expect(root.querySelectorAll('.source-evidence-card')).toHaveLength(2))
 
+    const attributes = root.querySelector('[aria-label="业务属性"]')!.textContent
+    expect(attributes).toContain('云专线')
+    expect(attributes).not.toContain('映射常量')
+    expect(attributes).not.toContain('映射层位')
+    expect(root.querySelector('.dynamic-attr-item .support-detail')).toBeNull()
+    expect(root.querySelector('.node-facts .fact-detail')).toBeNull()
+    expect(root.querySelector('.source-columns')?.textContent).toContain('dm.dma_fin_income_f.prod_code')
+    await expandEvidence('.dynamic-attr-item .attr-origin')
+    await expandEvidence('.record-properties')
     const text = root.querySelector('.graph-detail')!.textContent || ''
     expect(text).toContain('企业级云专线')
     expect(text).toContain('Enterprise Cloud Line')
@@ -139,7 +163,7 @@ describe('标准化节点详情面板 (NodeInspector)', () => {
     expect([...root.querySelectorAll('.graph-detail pre')].every(node => !!node.closest('details:not([open])'))).toBe(true)
   })
 
-  it('旧图缺少独立英文名列时明确显示未知，不强猜别名', async () => {
+  it('旧图的别名照常显示，缺少独立英文名的节点不补写英文名', async () => {
     const legacyStd: StandardNode = {
       id: 'n_old',
       kind: 'Metric',
@@ -179,8 +203,9 @@ describe('标准化节点详情面板 (NodeInspector)', () => {
     root.querySelector('.graph-node')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     await vi.waitFor(() => expect(root.querySelector('.standard-node-summary')).not.toBeNull())
     const card = root.querySelector('.standard-node-summary')!.textContent || ''
-    expect(card).toContain('未知（未单独映射）')
-    expect(card).toContain('RevenueAlias')
+    expect(card).toContain('营业收入')
+    expect(root.querySelector('.secondary-name')).toBeNull()
+    await vi.waitFor(() => expect(root.querySelector('[aria-label="业务属性"]')?.textContent).toContain('RevenueAlias'))
     expect([...root.querySelectorAll('.node-inspector > .property-table th')].map(el => el.textContent)).not.toContain('aliases')
 
     // Later pages can contain only edge facts and other endpoints.
@@ -188,9 +213,10 @@ describe('标准化节点详情面板 (NodeInspector)', () => {
       facts: [], supports: [], rules: [], standard_nodes: [{ ...legacyStd, id: 'neighbor' }],
       next_offset: null, supports_truncated: false,
     })
+    await expandEvidence('.node-facts')
     const more = [...root.querySelectorAll('button')].find(button => button.textContent === '读取更多事实支持')!
     more.click()
     await vi.waitFor(() => expect(api.request).toHaveBeenCalledTimes(2))
-    await vi.waitFor(() => expect(root.querySelector('.standard-node-summary')?.textContent).toContain('RevenueAlias'))
+    await vi.waitFor(() => expect(root.querySelector('[aria-label="业务属性"]')?.textContent).toContain('RevenueAlias'))
   })
 })

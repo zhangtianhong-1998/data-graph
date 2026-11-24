@@ -169,6 +169,52 @@ def test_homonymous_properties_can_keep_separate_meanings_per_source_table():
     assert filter_graph_scopes(merged, ['public'])['nodes'][0]['properties'] == node['properties']
 
 
+def test_frozen_entity_accepts_incremental_attribute_mapping_with_its_own_source_and_scope():
+    base = source_graph('Item', 'sku', ' A ', 'catalog', '产品', 'colour', '蓝')
+    delta = source_graph('Item', 'sku', 'A', 'sales', '产品', 'territory', '华东', scope='private')
+    for node in delta['nodes']:
+        node['properties']['colour'] = ['红']
+        node['supports'][0]['provenance']['property_columns']['colour'] = 'sales_colour'
+    base['definitions']['entities'][0].update(description='已确认的产品分类', display_mode='identity')
+    delta['definitions']['entities'][0].update(description='A new suggestion', display_mode='auto')
+    initial_rule = fusion_rule('Item', 'sku', 'colour')
+    initial_rule.update(property_aliases={'colour': '颜色'}, property_normalizers={})
+    first = {'contributor_id': 'catalog', 'graph': base}
+    second = {'contributor_id': 'sales', 'graph': delta}
+    def policy(rule):
+        return {'fusion_policy': {'entity_rules': [rule]}}
+    baseline = merge_construction_graphs([first], merge_policy=policy(initial_rule))
+    original = digest(baseline)
+    rule = deepcopy(initial_rule)
+    rule['property_aliases']['sales.dm.products.territory'] = '区域'
+    rule['property_normalizers']['区域'] = ['trim']
+    frozen = {'kind': 'base', 'contributor_id': 'base', 'graph': baseline}
+    merged = merge_construction_graphs([frozen, second], merge_policy=policy(rule))
+    batch = merge_construction_graphs([first, second], merge_policy=policy(rule))
+    assert digest(baseline) == original
+    assert merged['definitions']['entities'] == baseline['definitions']['entities']
+    assert {n['id'] for n in merged['nodes']} == {n['id'] for n in baseline['nodes']}
+    def entities(graph):
+        return {n['id']: (n['type'], n['identity'], n['properties']) for n in graph['nodes']}
+    assert entities(merged) == entities(batch)
+    item = next(n for n in merged['nodes'] if n['identity']['code'] == 'A')
+    assert item['properties']['区域'] == ['华东'] and set(item['properties']['颜色']) == {'蓝', '红'}
+    assert {s['provenance']['source']['source_id'] for s in item['supports']} == {'sales', 'catalog'}
+    visible = filter_graph_scopes(merged, ['public'])
+    assert all(n['properties'] == {'颜色': ['蓝']} for n in visible['nodes'])
+    assert '华东' not in str(visible)
+    repeat = merge_construction_graphs([{'kind': 'base', 'contributor_id': 'next', 'graph': merged}, second],
+                                       merge_policy=policy(rule))
+    assert entities(repeat) == entities(merged)
+    assert all(len(n['supports']) == 2 for n in repeat['nodes'])
+    for forbidden in ({'property_aliases': {'colour': '地区'}},
+                      {'property_aliases': {**rule['property_aliases'], 'catalog.dm.products.colour': '地区'}},
+                      {'property_normalizers': {'颜色': ['trim']}},
+                      {'identity_domain': 'other'}):
+        with pytest.raises(LightGraphError, match='fusion_policy_requires_original_contributions'):
+            merge_construction_graphs([frozen, second], merge_policy=policy({**rule, **forbidden}))
+
+
 def test_homonyms_are_candidates_with_a_reason_and_never_imply_shared_identity():
     a = source_graph('Product', 'code', 'A', 'master', '同名', 'group', 'A')
     b = source_graph('Contract', 'number', 'X', 'orders', '同名', 'group', 'B')

@@ -70,6 +70,8 @@ interface RetrievalQueryResponse {
       kind: string
       display_name?: string
       identity?: Record<string, unknown>
+      source_bindings?: Array<{ source_id: string; schema: string; table: string; key_columns: string[] }>
+      source_bindings_truncated?: boolean
       rrf_score: number | null
       vec_rank: number | null
       vec_score: number | null
@@ -433,8 +435,11 @@ async function runQuery(withSQL = false, candidateId?: string) {
             <template v-if="result.hierarchy.status === 'ambiguous'">
               <p>有多个匹配对象，请选择要查看的一个。</p>
               <ul class="hierarchy-items"><li v-for="candidate in result.slots.flatMap(slot => slot.candidates)" :key="candidate.node_id">
-                <button type="button" class="btn small" @click="runQuery(false, candidate.node_id)">{{ candidate.display_name || nodeLabel(candidate.node_id) }} · {{ candidate.kind }}</button>
-                <small class="result-node-id">{{ [...Object.values(candidate.identity || {}), candidate.node_id].join(' · ') }}</small>
+                <button type="button" class="btn small" @click="runQuery(false, candidate.node_id)">{{ candidate.display_name || '未记录名称' }} · {{ candidate.kind.replace(/__def_[a-f0-9]{16,64}$/, '') }}</button>
+                <small v-for="(value, key) in candidate.identity" :key="key" class="hierarchy-code">{{ key }} · {{ value }}</small>
+                <small v-for="binding in candidate.source_bindings" :key="JSON.stringify(binding)" class="hierarchy-code">{{ binding.source_id }} / {{ binding.schema }}.{{ binding.table }} · {{ binding.key_columns.join('、') }}</small>
+                <small v-if="candidate.source_bindings_truncated">仅列出前 5 组来源列。</small>
+                <details><summary>节点标识</summary><code>{{ candidate.kind }} · {{ candidate.node_id }}</code></details>
               </li></ul>
             </template>
             <p v-else-if="result.hierarchy.status === 'no_visible_seed'">当前范围内没有匹配的起点。</p>

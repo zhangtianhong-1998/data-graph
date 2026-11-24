@@ -22,7 +22,7 @@ from .hierarchy_replay import reconcile_hierarchy_projections
 from .hierarchy_stage import original_stage_inputs, record_stage
 from .models import COLUMN_IDENTITY_NAMES
 from .observed_identity import align_dictionary_nodes, align_observed_nodes
-from .source_namespaces import isolate_physical_ids, namespace_groups, record_namespace
+from .source_namespaces import BINDING, isolate_physical_ids, namespace_groups, record_namespace
 from .workspace import read_internal_yaml, write_yaml
 
 SHARD_COUNT = 32
@@ -258,7 +258,7 @@ def _merge_contributor_nodes_and_edges(
     upstream_isolations = []
     ordered = sorted(contributors, key=lambda c: (c.get('kind', 'unit'), c['contributor_id']))
     source_namespaces, source_groups = namespace_groups(ordered)
-    for item in ordered:
+    for index, item in enumerate(ordered):
         cid = str(item['contributor_id'])
         ckind = str(item.get('kind', 'unit'))
         if (ckind, cid) in contributor_ids:
@@ -273,7 +273,12 @@ def _merge_contributor_nodes_and_edges(
             evidence_records=item.get('evidence_records'),
         )
         if fusion and fusion.entity_rules and not independent_outputs:
-            rewritten = prepare_graph(rewritten, fusion, copy=False, self_contained=ckind in {'base', 'merged'})
+            local = (source_namespaces is None or len(source_groups) == 1 and source_namespaces[index] is not None)
+            if ckind in {'base', 'merged'}:
+                local = local and (item.get('local_source_namespace') is True
+                                   or source_namespaces is not None and bool(rewritten.get(BINDING)))
+            rewritten = prepare_graph(rewritten, fusion, copy=False, self_contained=ckind in {'base', 'merged'},
+                                      local_namespace=local)
         evidence_catalog.update(cat)
         for ref in rewritten.get('evidence_refs', []):
             if ref not in evidence_refs:
@@ -324,7 +329,8 @@ def _merge_contributor_nodes_and_edges(
     else:
         variant_remaps = retain_definition_variants(
             [graph for _, _, graph in prepared_contributors],
-            self_contained=[kind in {'base', 'merged'} for _, kind, _ in prepared_contributors])
+            self_contained=[kind in {'base', 'merged'} for _, kind, _ in prepared_contributors],
+            frozen_indices={i for i, (_, kind, _) in enumerate(prepared_contributors) if kind == 'base'})
 
     observed_ids = [{variants.get(original, original): target for original, target in observed.items()}
                     for observed, variants in zip(observed_ids, variant_remaps, strict=True)]
@@ -394,6 +400,7 @@ def _merge_contributor_nodes_and_edges(
 
     # Pass 1: collect definitions & all nodes from all contributors, retaining per-contributor id_remap.
     contributor_remaps: list[tuple[str, str, dict[str, Any], dict[str, str]]] = []
+    frozen_presentation = {}
     for (cid, ckind, graph), variant_remap, targets in zip(prepared_contributors, variant_remaps, node_targets, strict=True):
         for category in ('entities', 'relations'):
             for defn in graph.get('definitions', {}).get(category, []):
@@ -402,7 +409,15 @@ def _merge_contributor_nodes_and_edges(
                     copied.setdefault('display_mode', 'auto')
                     copied.setdefault('identity_origin', 'row')
                 prev = definitions[category].get(copied['type'])
-                definitions[category][copied['type']] = merge_definition(prev, copied)
+                merged = merge_definition(prev, copied)
+                key = (category, copied['type'])
+                if ckind == 'base':
+                    # Bases are processed first. Keep the published presentation
+                    # when a new table extends an otherwise compatible definition.
+                    frozen_presentation[key] = {k: merged[k] for k in ('description', 'display_mode') if merged.get(k)}
+                elif key in frozen_presentation:
+                    merged.update(frozen_presentation[key])
+                definitions[category][copied['type']] = merged
 
         id_remap: dict[str, str] = {}
         for raw_node in graph.get('nodes', []):

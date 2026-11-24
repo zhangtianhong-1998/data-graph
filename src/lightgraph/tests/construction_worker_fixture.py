@@ -16,6 +16,23 @@ def metric_proposal(tools, table):
                     'label_column': 'metric_name'}]}]}
 
 
+def overlapping_metric_proposal(tools, table):
+    kind = tools.config.goal_markdown.splitlines()[-1]
+    field = {'IncomeMetric': 'unit', 'LedgerItem': 'currency'}[kind]
+    binding = {'source_id': table['source'], 'schema': table['schema'], 'table': table['name']}
+    address = f"{table['source']}:{table['schema']}.{table['name']}"
+    ref = tools.call('inspect_source', table=address, operation='get_metadata')['evidence_ref']
+    return {'draft_id': 'metrics', 'entities': [
+        {'type': kind, 'key_names': ['code'], 'identity_scope': 'global', 'identity_domain': 'test.metrics',
+         'identity_evidence_refs': [ref], 'mappings': [{**binding, 'key_columns': ['metric_code'],
+         'label_column': 'metric_name', 'properties': {field: field}, 'applicability': {'status': 'global'}}]},
+        {'type': 'MetricCategory', 'key_names': ['class_code'], 'mappings': [
+            {**binding, 'key_columns': ['class_code'], 'label_column': 'class_name'}]}],
+        'relations': [{'type': 'belongs_to', 'source_type': kind, 'target_type': 'MetricCategory',
+                       'mappings': [{**binding, 'source_key_columns': ['metric_code'],
+                                     'target_key_columns': ['class_code']}]}]}
+
+
 def hierarchy_proposal(tools, table):
     kind = tools.config.goal_markdown.splitlines()[-1]
     binding = {'source_id': table['source'], 'schema': table['schema'], 'table': table['name']}

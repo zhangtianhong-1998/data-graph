@@ -30,10 +30,17 @@ def test_individually_acyclic_drafts_cannot_publish_a_joint_cycle(tmp_path):
     with MemorySource(tables, rows) as adapter:
         tools = ConstructionTools(config, tmp_path / 'work', adapters=[adapter])
         try:
+            rule, = tools.call('describe_sources')['configured_identity_rules']
+            assert rule == {'canonical_type': '对象', 'entity_type': '对象', 'identity_domain': '共同对象',
+                            'key_mapping': {'编号': '编号'}}
             for name in ('first', 'reverse', 'independent'):
                 assert tools.call('save_graph_draft', yaml_text=dump_yaml(definition(name)))['status'] == 'ok'
                 assert tools.call('validate_graph_draft', draft_id=name)['passed']
             assert tools.call('publish_graph_draft', draft_id='first')['status'] == 'ok'
+            from lightgraph.construction.workspace import safe_load_yaml
+            contracts = safe_load_yaml(tools.call('read_workspace')['content'])['published_entity_contracts']
+            assert contracts['对象']['key_names'] == ['编号']
+            assert contracts['对象']['identity_domain'] == '共同对象'
             previous = tools.workspace.read_published_graph()
             rejected = tools.call('publish_graph_draft', draft_id='reverse')
             assert rejected['code'] == 'published_relation_cycle'

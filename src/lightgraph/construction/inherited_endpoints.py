@@ -9,24 +9,36 @@ from lightgraph.source_values import identity_cell, scalar_cell, scalar_kind, ty
 from .contexts import support_business_context, intersect_business_contexts
 
 
-def inherited_keys(graph):
-    return {entity['type']: entity['key_names']
-            for entity in (graph or {}).get('definitions', {}).get('entities', [])
-            if entity.get('key_names')}
+def graph_entity_contracts(graph):
+    """The frozen identifier contract. Old snapshots can omit default fields."""
+    return {entity['type']: {
+        'key_names': list(entity['key_names']),
+        'identity_origin': entity.get('identity_origin', 'row'),
+        'identity_scope': entity.get('identity_scope', 'unknown'),
+        'identity_context_keys': list(entity.get('identity_context_keys', [])),
+        'identity_domain': entity.get('identity_domain'),
+    } for entity in (graph or {}).get('definitions', {}).get('entities', []) if entity.get('key_names')}
 
 
-def inherited_contract_error(draft, key_names):
-    """Check the actual frozen key, independently of the Agent's optional arity hint."""
+def inherited_contract_error(draft, contracts):
+    """A declared reuse must keep the frozen identity, including its grain."""
     if not draft.extends_base_graph:
         return None
-    if not key_names:
+    if not contracts:
         return 'inherited_base_graph_missing'
+    key_names = {kind: item['key_names'] for kind, item in contracts.items()}
     for kind in draft.inherited_entity_types:
         if kind not in key_names:
             return 'inherited_entity_type_missing'
         if draft.inherited_entity_key_arities.get(kind, len(key_names[kind])) != len(key_names[kind]):
             return 'relation_key_arity_mismatch'
     local_types = {definition.type for definition in draft.entities}
+    for entity in draft.entities:
+        if entity.type in draft.inherited_entity_types:
+            proposed = entity.model_dump(include={'key_names', 'identity_scope', 'identity_context_keys', 'identity_domain'})
+            proposed['identity_origin'] = 'physical_column' if entity.mappings[0].kind == 'metadata_column' else 'row'
+            if proposed != contracts[entity.type]:
+                return 'inherited_entity_identity_contract_changed'
     for relation in draft.relations:
         for mapping in relation.mappings:
             for end in ('source', 'target'):
@@ -54,7 +66,8 @@ def _cells(node, support, column):
 
 class InheritedEndpoints:
     def __init__(self, graph):
-        self.keys = inherited_keys(graph)
+        self.contracts = graph_entity_contracts(graph)
+        self.keys = {kind: item['key_names'] for kind, item in self.contracts.items()}
         self.nodes = defaultdict(list)
         for node in (graph or {}).get('nodes', []):
             self.nodes[node['type']].append(node)

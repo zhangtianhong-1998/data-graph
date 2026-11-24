@@ -1025,6 +1025,8 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
                 all_sources = [s.id for s in config.sources]
                 needed = {sid for node in workers for sid in (node.source_ids or all_sources)}
                 sources, model = resolved_credentials(pid, x_workbench_session, source_ids=needed)
+            elif any(m.node_id in rerun and m.merge_mode == 'overlap_review' for m in config.workflow.merge_nodes):
+                model = resolve_api_key(pid, x_workbench_session, config, model=True)
             options = {'verify_checkpoints_in_background': True} if data.verify_checkpoints_in_background else {}
             return manager.resume(pid, rid, from_node_id=data.from_node_id,
                                   source_credentials=sources, model_api_key=model, **options)

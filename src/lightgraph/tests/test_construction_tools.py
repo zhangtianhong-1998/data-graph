@@ -38,6 +38,46 @@ def draft(table, *, draft_id='设备', kind='设备'):
                           'key_columns': ['编码'], 'label_column': '名称', 'properties': {'归属': '归属'}}]}]}
 
 
+def test_parallel_unit_catalog_only_offers_complete_authorized_identity_bindings(tmp_path):
+    from lightgraph.construction.workflow import build_unit_config
+    from lightgraph.runtime.config import FusionPolicyConfig, WorkflowUnitConfig
+
+    config = config_for(tmp_path)
+    other = tmp_path / 'other.csv'
+    other.write_text('本地编号,区域\n02,南\n', encoding='utf-8')
+    config.sources.append(config.sources[0].model_copy(update={
+        'id': 'other', 'path': str(other), 'table_name': '另一单元的表'}))
+    config.goal.evidence_only_columns = ['名称']
+    first = {'source_id': 'input', 'schema': 'public', 'table': '资料',
+             'key_columns': {'id': '编码', 'area': '归属'}}
+    second = {'source_id': 'other', 'schema': 'public', 'table': '另一单元的表',
+              'key_columns': {'id': '本地编号', 'area': '区域'}}
+    rule = {'entity_type': '设备', 'canonical_type': '设备', 'identity_domain': '资产目录',
+            'key_mapping': {'编号': 'id', '地区': 'area'}}
+    # Both a filtered key part and an evidence-only key part make a whole binding inapplicable.
+    restricted = [{**first, 'key_columns': {'id': '编码', 'area': column}} for column in ('密钥', '名称')]
+    config.fusion_policy = FusionPolicyConfig(entity_rules=[{**rule, 'source_bindings': [first, second, *restricted]},
+        {**rule, 'entity_type': '二部设备', 'source_bindings': [second]}])
+    for active, visible_binding in [('input', first), ('other', second)]:
+        out = tmp_path / active
+        cfg = build_unit_config(config, WorkflowUnitConfig(unit_id='extract', source_ids=[active]), unit_output_dir=out)
+        tools = ConstructionTools(cfg, out / 'construction')
+        try:
+            # A frozen graph may have been built with an earlier table-specific policy.
+            frozen_rule = {**rule, 'entity_type': '旧设备', 'source_bindings': [first, second, *restricted]}
+            tools.inherited_summary = {'inherited_count': 1, 'fusion_policy': {'entity_rules': [frozen_rule]}}
+            catalog = tools.call('describe_sources')
+            expected = [{**rule, 'source_bindings': [visible_binding]}]
+            if active == 'other':
+                expected.append({**rule, 'entity_type': '二部设备', 'source_bindings': [second]})
+            assert catalog['configured_identity_rules'] == expected
+            assert catalog['inherited_graph_summary']['fusion_policy']['entity_rules'] == [
+                {**rule, 'entity_type': '旧设备', 'source_bindings': [visible_binding]}]
+            assert tools.inherited_summary['fusion_policy']['entity_rules'] == [frozen_rule]
+        finally:
+            tools.close()
+
+
 @pytest.mark.parametrize('excel', [False, True])
 def test_real_source_save_validate_publish_and_independent_drafts(tmp_path, excel):
     config = config_for(tmp_path, excel=excel)

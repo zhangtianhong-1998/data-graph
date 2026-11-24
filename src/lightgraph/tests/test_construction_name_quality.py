@@ -44,6 +44,28 @@ def test_attribute_enrichment_does_not_require_another_primary_name():
     assert name_mapping_advice(value)[0]['display_columns'] == ['n']
 
 
+def test_primary_name_in_a_composite_identity_is_reported_without_changing_natural_keys(tmp_path):
+    tools = ConstructionTools(config_for(tmp_path), tmp_path / 'work')
+    try:
+        value = draft(tools.describe_sources()['tables'][0])
+        value['relations'] = []
+        entity = value['entities'][0]
+        mapping = entity['mappings'][0]
+        entity['key_names'].append('local_name')
+        mapping['key_columns'].append(mapping['label_column'])
+        assert tools.save_graph_draft(dump_yaml(value))['status'] == 'ok'
+        result = tools.validate_graph_draft(value['draft_id'])
+        assert result['passed']
+        item, = result['quality_advice']
+        assert item['code'] == 'primary_name_in_composite_key'
+        assert item['key_columns'] == mapping['key_columns']
+        assert tools.publish_graph_draft(value['draft_id'])['status'] == 'ok'
+        nodes = tools.workspace.read_published_graph()['nodes']
+        assert all(node['identity']['local_name'] == node['label'] for node in nodes)
+    finally:
+        tools.close()
+
+
 def test_name_field_schema_explains_roles_without_column_name_heuristics():
     from lightgraph.construction.models import EntityMapping
     props = EntityMapping.model_json_schema()['properties']

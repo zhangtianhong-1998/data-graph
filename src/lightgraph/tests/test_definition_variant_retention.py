@@ -150,6 +150,62 @@ def test_incompatible_base_definitions_with_overlapping_old_ids_stay_visible():
     assert graph['definition_conflicts'][0]['node_ids'] == sorted(n['id'] for n in graph['nodes'])
 
 
+def test_delta_contracts_keep_frozen_node_relation_and_branch_ids():
+    from lightgraph.construction.access import filter_graph_scopes
+    from lightgraph.construction.fusion import definition_contract
+
+    policy = {'shared_entity_types': ['Item', 'Shared']}
+    baseline = merge_construction_graphs([{'kind': 'unit', 'contributor_id': 'master', 'graph': branch()}],
+                                         merge_policy=policy)
+    original = deepcopy(baseline)
+    def append(base, deltas):
+        return merge_construction_graphs([{'kind': 'base', 'contributor_id': 'published', 'graph': base},
+                                          *deltas], merge_policy=policy)
+
+    deltas = []
+    for name in ('derived', 'other'):
+        graph = branch(label_kind=name)
+        for item in graph['nodes'] + graph['edges']:
+            item['supports'][0]['scope_ref'] = 'private'
+        deltas.append({'kind': 'unit', 'contributor_id': name, 'graph': graph})
+    first = append(baseline, deltas[:1])
+    incremental = append(first, deltas[1:])
+    batch = append(baseline, list(reversed(deltas)))
+
+    def structure(graph):
+        return ({(n['id'], n['type']) for n in graph['nodes']},
+                {(e['id'], e['type'], e['source'], e['target']) for e in graph['edges']})
+
+    old_nodes, old_edges = structure(baseline)
+    first_nodes, first_edges = structure(first)
+    current_nodes, current_edges = structure(incremental)
+    assert original == baseline
+    assert old_nodes < first_nodes < current_nodes
+    assert old_edges < first_edges < current_edges
+    assert structure(batch) == structure(incremental)
+    assert structure(filter_graph_scopes(incremental, ['public'])) == (old_nodes, old_edges)
+    for category in ('entities', 'relations'):
+        current = {d['type']: d for d in incremental['definitions'][category]}
+        for prior in baseline['definitions'][category]:
+            assert definition_contract(current[prior['type']]) == definition_contract(prior)
+    assert {c['category'] for c in incremental['definition_conflicts']} == {'entities', 'relations'}
+
+
+def test_incoming_literal_type_name_cannot_take_an_existing_frozen_variant():
+    peers = merge_construction_graphs(contributors(branch(), branch(label_kind='derived')))
+    original = {n['id']: n['type'] for n in peers['nodes']}
+    old_fork = next(n['type'] for n in peers['nodes'] if n.get('original_type') == 'Item')
+    incoming = {'definitions': {'entities': [{'type': old_fork, 'key_names': ['order_no']}], 'relations': []},
+                'nodes': [{'id': 'order', 'type': old_fork, 'identity': {'order_no': 1},
+                           'supports': [{'scope_ref': 'public', 'label': '订单'}]}], 'edges': []}
+    extended = merge_construction_graphs([{'kind': 'base', 'contributor_id': 'published', 'graph': peers},
+                                          {'kind': 'unit', 'contributor_id': 'delta', 'graph': incoming}])
+    current = {n['id']: n['type'] for n in extended['nodes']}
+    assert {i: current[i] for i in original} == original
+    new, = (n for n in extended['nodes'] if n['id'] not in original)
+    assert new['type'] != old_fork and new['original_type'] == old_fork
+
+
 def test_variant_edge_rekey_preserves_distinct_business_contexts():
     a, b = branch(), branch(label_kind='derived')
     for graph in (a, b):

@@ -217,6 +217,14 @@ class EmbeddingConfig(StrictModel):
         return value
 
 
+class FusionSourceBinding(StrictModel):
+    source_id: str = Field(min_length=1)
+    schema_name: str = Field(alias='schema', min_length=1)
+    table: str = Field(min_length=1)
+    key_columns: dict[str, str] = Field(min_length=1, max_length=32,
+        description="Existing logical identity key name to the physical column in this table.")
+
+
 class EntityFusionRule(StrictModel):
     """Explicit cross-source identity mapping; never infer identity from labels."""
     entity_type: str = Field(min_length=1, max_length=100)
@@ -228,6 +236,8 @@ class EntityFusionRule(StrictModel):
     property_aliases: dict[str, str] = Field(default_factory=dict, max_length=128,
         description="Existing property name -> canonical property name. Use source_id.schema.table.property for a table-specific mapping. Units and meaning must already agree.")
     property_normalizers: dict[str, list[Literal['trim', 'casefold', 'nfkc']]] = Field(default_factory=dict, max_length=128)
+    source_bindings: list[FusionSourceBinding] = Field(default_factory=list, max_length=512,
+        description="Optional approved tables and complete physical keys for this rule.")
 
     @model_validator(mode='after')
     def unambiguous_keys(self):
@@ -236,7 +246,23 @@ class EntityFusionRule(StrictModel):
                 or not set(self.key_normalizers) <= set(self.key_mapping)
                 or any(not value.strip() for pair in self.property_aliases.items() for value in pair)):
             raise ValueError('invalid_fusion_key_mapping')
+        for binding in self.source_bindings:
+            if (binding.key_columns.keys() != set(self.key_mapping.values())
+                    or len(set(binding.key_columns.values())) != len(binding.key_columns)
+                    or not all(s.strip() for s in (binding.source_id, binding.schema_name, binding.table,
+                                                    *binding.key_columns.values()))):
+                raise ValueError('invalid_fusion_source_binding')
         return self
+
+    @model_serializer(mode='wrap')
+    def serialize_rule(self, handler):
+        data = handler(self)
+        if not self.source_bindings:
+            data.pop('source_bindings', None)  # Preserve historical policy and checkpoint fingerprints.
+        for binding in data.get('source_bindings', ()):
+            if 'schema_name' in binding:
+                binding['schema'] = binding.pop('schema_name')
+        return data
 
 
 class FusionPolicyConfig(StrictModel):
@@ -281,7 +307,7 @@ class WorkflowMergeNodeConfig(StrictModel):
     """A merge or merge-and-extract node joining upstream workflow outputs."""
     node_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
     label: str | None = Field(default=None, max_length=120)
-    merge_mode: Literal["deterministic", "merge_and_extract"] = "deterministic"
+    merge_mode: Literal["deterministic", "overlap_review", "merge_and_extract"] = "deterministic"
     source_ids: list[str] = Field(default_factory=list, max_length=64)
     source_table_overrides: dict[str, list[str]] = Field(default_factory=dict, max_length=64)
     document_ids: list[str] | None = Field(default=None, max_length=128)

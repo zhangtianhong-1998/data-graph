@@ -129,7 +129,7 @@ def mark_relation_meanings(graphs):
                 relation.setdefault('relation_meaning_digest', digest(description))
 
 
-def retain_definition_variants(graphs, *, self_contained=None):
+def retain_definition_variants(graphs, *, self_contained=None, frozen_indices=()):
     """Keep incompatible contracts as stable local variants, preserving all facts.
 
     Mutates private graph copies only. Compatibility is deliberately conservative:
@@ -145,22 +145,38 @@ def retain_definition_variants(graphs, *, self_contained=None):
         already_qualified = set()
         name_owners = defaultdict(set)
         previous_names = defaultdict(set)
-        for graph in graphs:
+        frozen_owners = defaultdict(set)
+        for index, graph in enumerate(graphs):
             for definition in graph.get('definitions', {}).get(category, []):
                 contract = definition_contract(definition)
                 family = contract['type']
                 signature = digest(contract)
                 families[family].add(signature)
                 name_owners[definition['type']].add((family, signature))
+                if index in frozen_indices:
+                    frozen_owners[definition['type']].add((family, signature))
                 if definition.get('definition_variant'):
                     already_qualified.add(family)
                     previous_names[(family, signature)].add(definition['type'])
+        # A delta proposing a different contract must not take a frozen
+        # publication's existing type name or change its node and edge IDs.
+        # Multiple bases with competing claims keep the symmetric split.
+        frozen_names = defaultdict(list)
+        for name, owners in frozen_owners.items():
+            if len(owners) == 1:
+                owner, = owners
+                frozen_names[owner].append(name)
+                for other_family, _ in name_owners[name] - owners:
+                    already_qualified.add(other_family)
         variant_names = {}
         for family, signatures in sorted(families.items()):
             if len(signatures) < 2 and family not in already_qualified:
                 continue
             for signature in sorted(signatures):
                 owner = (family, signature)
+                if len(frozen_names[owner]) == 1:
+                    variant_names[owner] = frozen_names[owner][0]
+                    continue
                 existing = sorted(name for name in previous_names[owner] if name_owners[name] == {owner})
                 name = existing[0] if existing else f'{family[:60]}__def_{signature[:32]}'
                 attempt = 0
@@ -314,7 +330,62 @@ def _check_unrecorded_fusion(graph, rules, target_types, previous_targets):
             raise LightGraphError('fusion_policy_requires_original_contributions')
 
 
-def prepare_graph(graph, policy, *, copy=True, self_contained=None):
+def _only_adds_unobserved_property_mappings(graph, old, new):
+    """An incremental rule may name a new table's attributes without reinterpreting the base."""
+    fields = {'property_aliases', 'property_normalizers'}
+    if {k: v for k, v in old.items() if k not in fields} != {k: v for k, v in new.items() if k not in fields}:
+        return False
+    if any(new[field].get(k) != v for field in fields for k, v in old.get(field, {}).items()):
+        return False
+    old_aliases = old.get('property_aliases', {})
+    new_aliases = new['property_aliases']
+    added_normalizers = new['property_normalizers'].keys() - old.get('property_normalizers', {}).keys()
+    other_inputs = {(rule['entity_type'], frozenset(rule['key_mapping'].values()))
+                    for rule in graph.get('fusion_policy', {}).get('entity_rules', ())
+                    if (rule['canonical_type'], rule['identity_domain']) == (old['canonical_type'], old['identity_domain'])}
+    other_inputs.discard((old['entity_type'], frozenset(old['key_mapping'].values())))
+
+    def from_other_rule(origin):
+        return (isinstance(origin, dict) and origin.get('id') and isinstance(origin.get('identity'), dict)
+                and (origin.get('type'), frozenset(origin['identity'])) in other_inputs)
+
+    for node in graph.get('nodes', ()):
+        if (old['canonical_type'] not in (node['type'], node.get('original_type'))
+                or node.get('identity_domain') != old['identity_domain']):
+            continue
+        if not node.get('supports'):
+            return False
+        observed = set()
+        for support in node['supports']:
+            observed.update((key, canonical(value)) for key, values in support.get('properties', {}).items()
+                            for value in values)
+            # Several rules may feed one canonical type. A field name can mean
+            # something different for another original type or key contract.
+            origins = support.get('identity_origins') or ()
+            if origins and all(from_other_rule(origin) for origin in origins):
+                continue
+            source = (support.get('provenance') or {}).get('source') or {}
+            if not source.get('source_id') or not source.get('table'):
+                return False
+            prefix = f"{source['source_id']}.{source.get('schema') or 'public'}.{source['table']}."
+            names = set(support.get('observed_properties', support.get('properties', {})))
+            if 'observed_properties' not in support:
+                # A legacy support may contain only canonical names. Check every
+                # possible prior source name for the properties that survived.
+                stored = names.copy()
+                names.update(key.removeprefix(prefix) for key, target in old_aliases.items() if target in stored)
+            for name in names:
+                previous = old_aliases.get(prefix + name, old_aliases.get(name, name))
+                incoming = new_aliases.get(prefix + name, new_aliases.get(name, name))
+                if previous != incoming or incoming in added_normalizers:
+                    return False
+        if any((key, canonical(value)) not in observed for key, values in node.get('properties', {}).items()
+               for value in values):
+            return False
+    return True
+
+
+def prepare_graph(graph, policy, *, copy=True, self_contained=None, local_namespace=True):
     """Return a new graph with explicit type/key mapping and rewritten endpoints.
 
     No key may be dropped, and physical-column identities remain source-specific.
@@ -332,9 +403,19 @@ def prepare_graph(graph, policy, *, copy=True, self_contained=None):
         previous = policy_snapshot
     previous_targets = {rule['canonical_type'] for rule in previous.get('entity_rules', [])}
     _check_unrecorded_fusion(result, rules, target_types, previous_targets)
+    from .fusion_bindings import validate_source_bindings
+    validate_source_bindings(result, rules, previous_targets, local_namespace=local_namespace)
     for old in previous.get('entity_rules', []):
         new = rules.get((old['entity_type'], frozenset(old['key_mapping'].values())))
-        if new and new.model_dump(mode='json') != old:
+        if not new:
+            continue
+        if old.get('source_bindings') and not new.source_bindings:
+            raise LightGraphError('fusion_policy_requires_original_contributions')
+        # All current bindings, including newly restricted historical sources,
+        # have already been checked per observation.
+        snapshot = new.model_dump(mode='json', exclude={'source_bindings'})
+        old = {k: v for k, v in old.items() if k != 'source_bindings'}
+        if snapshot != old and not _only_adds_unobserved_property_mappings(result, old, snapshot):
             # A canonical node can already represent several original identities.
             # Re-keying it requires its pre-fusion contributions and edge witnesses.
             raise LightGraphError('fusion_policy_requires_original_contributions')
@@ -389,6 +470,8 @@ def prepare_graph(graph, policy, *, copy=True, self_contained=None):
         if node.get('identity_domain') not in (None, rule.identity_domain):
             raise LightGraphError('fusion_identity_domain_conflict')
         original = {key: deepcopy(node[key]) for key in ('id', 'type', 'identity', 'identity_types') if key in node}
+        if rule.source_bindings:
+            original['source_key_names'] = list(original_key_names[node['type']])
         if any(value is None for value in original['identity'].values()):
             raise LightGraphError('fusion_missing_identity_value')
         if any(rule.key_normalizers.get(key) and original.get('identity_types', {}).get(source, 'text') != 'text'

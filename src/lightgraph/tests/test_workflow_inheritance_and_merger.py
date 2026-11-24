@@ -90,7 +90,26 @@ def test_cross_project_inheritance_bypasses_isolation_domain_and_resolves_base_e
     with MemorySource([t_orders], {t_orders.qualified_name: [('ORD_100', '营业收入')]}) as src_b:
         tools_b = ConstructionTools(cfg_b, Path(cfg_b.output_dir) / 'construction', adapters=[src_b])
         try:
-            assert tools_b.describe_sources()['inherited_graph_summary']['entity_types'] == ['Indicator']
+            summary = tools_b.describe_sources()['inherited_graph_summary']
+            assert summary['entity_types'] == ['Indicator']
+            assert summary['entity_contracts'] == {'Indicator': {'key_names': ['code'], 'identity_origin': 'row',
+                'identity_domain': None, 'identity_context_keys': [], 'identity_scope': 'unknown'}}
+            enrichment = {'draft_id': 'additional_fields', 'extends_base_graph': True,
+                'inherited_entity_types': ['Indicator'], 'entities': [
+                    {'type': 'Indicator', 'key_names': ['code'], 'mappings': [
+                        {'source_id': 'new_db', 'table': 'orders', 'key_columns': ['ord_id'],
+                         'properties': {'additional_name': 'ind_name'}}]}]}
+            assert tools_b.call('save_graph_draft', yaml_text=dump_yaml(enrichment))['status'] == 'ok'
+            assert tools_b.call('validate_graph_draft', draft_id='additional_fields', mode='structure')['passed']
+            enrichment['entities'][0]['key_names'] = ['display_name']
+            rejected = tools_b.call('save_graph_draft', yaml_text=dump_yaml(enrichment))
+            assert rejected['code'] == 'inherited_entity_identity_contract_changed'
+            assert tools_b.workspace.get_draft('additional_fields').revision == 1
+            # A revision saved with older code must pass the same checks before publication.
+            tools_b.workspace.save_draft(enrichment)
+            for mode in ('instances', 'structure'):
+                for tool in ('validate_graph_draft', 'publish_graph_draft'):
+                    assert tools_b.call(tool, draft_id='additional_fields', mode=mode)['code'] == rejected['code']
             assert tools_b.call('save_graph_draft', yaml_text=dump_yaml(delta_draft))['status'] == 'ok'
             val = tools_b.call('validate_graph_draft', draft_id='delta_orders')
             assert val['passed'], val

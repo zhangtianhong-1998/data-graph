@@ -178,6 +178,8 @@ beforeEach(() => {
               delta_merge_counts: { source_replay_status: 'ran', source_replay_collapsed_nodes: 2, input_edges: 15, output_edges: 14,
                 output_directed_endpoint_pairs: 10, output_multi_edge_pairs: 3, output_endpoint_pair_excess: 4, output_self_loop_edges: 1 } },
             merge_2: { node_id: 'merge_2', label: '确定性合并', merge_mode: 'deterministic', status: 'completed', run_id: null },
+            reviewed: { node_id: 'reviewed', label: '并行子图融合', merge_mode: 'overlap_review', status: 'completed',
+              overlap_review: { status: 'reviewed', pattern_count: 7, reviewed_patterns: 5, omitted_patterns: 2, selected_patterns: 1, added_entity_rules: 2, model_calls: 1 } },
             merge_3: { node_id: 'merge_3', label: '从产物恢复', merge_mode: 'merge_and_extract', status: 'completed', run_id: 'run_old' },
           },
           recomposed_nodes: ['merge_3'],
@@ -362,7 +364,8 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     await nextTick()
     expect(root.querySelectorAll('.wf-node-merge')).toHaveLength(1)
     const modeSelect = root.querySelector<HTMLSelectElement>('#inspector-merge-mode-0')!
-    expect(modeSelect.value).toBe('deterministic')
+    expect(modeSelect.value).toBe('overlap_review')
+    expect(modeSelect.querySelector('option[value="deterministic"]')).not.toBeNull()
     modeSelect.value = 'merge_and_extract'
     modeSelect.dispatchEvent(new Event('change', { bubbles: true }))
     await nextTick()
@@ -556,6 +559,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     const current = rows.find(row => row.textContent?.includes('全节点合并抽取'))!
     expect(current.textContent).toContain('补充抽取后合并关系记录 15 → 14 条')
     expect(current.textContent).toContain('有向端点对 10 组，其中 3 组有多条关系')
+    expect(rows.find(row => row.textContent?.includes('并行子图融合'))?.textContent).toContain('7 种重叠模式，模型审查 5 种、建议合并 1 种，生效的新规则 2 条')
     expect(current.textContent).toContain('每对端点只计一次，记录数相差 4 条。自环 1 条')
     expect(rows.find(row => row.textContent?.includes('确定性合并'))?.textContent).toContain('此运行未记录有向端点统计')
 
@@ -686,6 +690,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     await nextTick()
     const candidates = ['101', '202'].map(code => ({
       node_id: 'n' + code, kind: '科目', display_name: '设备', identity: { code },
+      source_bindings: [{ source_id: 'finance', schema: 'public', table: 'stock', key_columns: ['asset_code'] }],
     }))
     retrievalFixture = {
       slots: [{ surface: '设备', candidates }],
@@ -700,7 +705,9 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     await vi.waitFor(() => expect(root.querySelectorAll('.hierarchy-answer button')).toHaveLength(2))
     expect(JSON.parse(requests.filter(r => r.url.endsWith('/retrieval/query')).at(-1)!.body!))
       .toEqual({ mode: 'hierarchy', query: '设备', hierarchy_direction: 'parents' })
-    expect(root.querySelector('.hierarchy-answer')?.textContent).toContain('202 · n202')
+    expect(root.querySelector('.hierarchy-answer')?.textContent).toContain('code · 202')
+    expect(root.querySelector('.hierarchy-answer')?.textContent).toContain('finance / public.stock · asset_code')
+    expect(root.querySelector('.hierarchy-answer li:nth-child(2) details:not([open]) code')?.textContent).toContain('n202')
     retrievalFixture = {
       hierarchy: { direction: 'parents', status: 'found', anchor_id: 'n202',
         items: [{ node_id: 'p', edge_ids: ['forward', 'inverse'] }] },

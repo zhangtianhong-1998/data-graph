@@ -77,6 +77,14 @@ def revision_loss_advice(previous_draft, new_draft):
             if definition.type not in after:
                 continue
             current_index, new_definition = after[definition.type]
+            if kind == 'entity':
+                fields = ['key_names', 'identity_scope', 'identity_context_keys', 'identity_domain']
+                changed = [name for name in fields if getattr(definition, name) != getattr(new_definition, name)]
+                if definition.mappings[0].kind != new_definition.mappings[0].kind:
+                    changed.append('identity_origin')
+                if changed:
+                    add('revision_entity_identity_changed', '同名类型的身份定义已修改，请核对原有对象能否沿用。',
+                        definition_type=definition.type, path=[collection, current_index], changed_fields=changed)
             candidates = defaultdict(list)
             for number, mapping in enumerate(new_definition.mappings):
                 candidates[_mapping_key(mapping)].append((number, mapping))

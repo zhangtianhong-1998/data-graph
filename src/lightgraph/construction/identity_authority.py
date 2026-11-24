@@ -24,15 +24,20 @@ def metadata_probe(record):
 def cross_table_identity_issues(graph, draft, authorities, fusion):
     """An authored type alone cannot align two tables' independently observed instances."""
     declarations = {}
+    issues = []
     for entity in draft.entities:
+        rule = next((r for r in fusion.entity_rules if r.entity_type == entity.type
+                     and set(entity.key_names) == set(r.key_mapping.values())), None)
+        if rule and rule.source_bindings:
+            from .fusion_bindings import draft_binding_issues
+            issues.extend(draft_binding_issues(entity, rule))
         if len({(m.source_id, m.schema_name, m.table) for m in entity.mappings}) < 2:
             continue
-        if any(r.entity_type == entity.type and entity.identity_domain in (None, r.identity_domain)
-               and set(entity.key_names) == set(r.key_mapping.values()) for r in fusion.entity_rules):
+        if rule and entity.identity_domain in (None, rule.identity_domain):
             continue
         declarations[entity.type] = entity
     if not declarations:
-        return []
+        return issues
     collisions = defaultdict(int)
     for node in graph.get('nodes', []):
         entity = declarations.get(node['type'])
@@ -58,7 +63,7 @@ def cross_table_identity_issues(graph, draft, authorities, fusion):
         if dictionary and dictionary[2] and len(dictionary[1]) <= 1:
             continue
         collisions[entity.type, tuple(sorted(mapping_numbers))] += 1
-    return [{'code': 'cross_table_identity_unverified', 'entity_type': name, 'mappings': list(numbers),
+    return issues + [{'code': 'cross_table_identity_unverified', 'entity_type': name, 'mappings': list(numbers),
              'affected_nodes': count,
              'guidance': 'Use separate types or add the source scope to the key. To share identities, cite '
                          'a field definition common to the complete keys or configure an explicit fusion rule.'}

@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import DeferredDetails from './DeferredDetails.vue'
 import PropertyTable from './PropertyTable.vue'
 import { isHierarchyLoop } from './graphRelationLines'
 import TechnicalDetails from './TechnicalDetails.vue'
-import { metadataRelationValues, nodeCaption, nodeIdentity, nodeProperties, supportOriginName, vocabularyDescription, vocabularyLabel } from './graphLabels'
+import { metadataRelationValues, nodeCaption, nodeIdentity, supportOriginName, vocabularyDescription, vocabularyLabel } from './graphLabels'
 import type { DisplaySchema, MetadataEndpoint } from './graphLabels'
-import type { GraphEdge, GraphNode, StandardNode } from './types'
+import type { GraphEdge, GraphNode, StandardNode, StandardNodeSourceEvidence } from './types'
 
 type SupportItem = {
   id: string; fact_id: string; status: string; origin: string; source_binding: string
@@ -65,6 +66,54 @@ const standardNode = computed<StandardNode | null>(() =>
   props.details?.standard_nodes?.find(item => item.id === props.selected.id) ?? null,
 )
 
+const identity = computed(() => standardNode.value?.identity ?? nodeIdentity(props.selected))
+const title = computed(() => {
+  const standard = standardNode.value
+  const names = nameVariants.value.length ? nameVariants.value : standard?.source_names ?? []
+  return standard?.preferred_source_name || (names.length > 1 ? names.join(' / ') : standard?.source_name)
+    || standard?.chinese_name || standard?.english_name || nodeCaption(props.selected)
+})
+const aliases = computed(() => (standardNode.value?.aliases ?? (Array.isArray(props.selected.aliases) ? props.selected.aliases : []))
+  .filter(alias => alias && alias !== title.value))
+const sources = computed(() => standardNode.value?.source_evidences.filter(source => source.table) ?? [])
+function sourceColumns(source: StandardNodeSourceEvidence) {
+  const roles = new Map<string, Set<string>>()
+  function add(column: string, role: string) {
+    if (!column) return
+    if (!roles.has(column)) roles.set(column, new Set())
+    roles.get(column)!.add(role)
+  }
+  for (const column of source.key_columns) add(column, '身份键')
+  for (const field of source.contributed_fields) add(field.column, field.field)
+  return [...roles].map(([column, fields]) => ({ column, roles: [...fields].join('、') }))
+}
+
+const businessAttributes = computed(() => {
+  const reserved = new Set(sources.value.flatMap(source => [
+    ...source.key_columns,
+    ...source.contributed_fields.filter(field => ['chinese_name', 'english_name', 'alias', 'description', 'identity'].includes(field.role))
+      .map(field => field.column),
+  ].map(column => JSON.stringify([source.source_id, source.qualified_table, column]))))
+  function usable(origin: { source_id: string; qualified_table: string; column?: string | null }) {
+    return origin.column && origin.source_id && origin.source_id !== 'unknown' && origin.qualified_table
+      && origin.qualified_table !== origin.source_id
+      && !reserved.has(JSON.stringify([origin.source_id, origin.qualified_table, origin.column]))
+  }
+  return (standardNode.value?.attributes ?? []).flatMap(attr => {
+    if (attr.observations?.length) {
+      const observations = attr.observations.filter(obs =>
+        obs.binding_role ? obs.binding_role === 'attribute_column' : usable(obs))
+      if (!observations.length) return []
+      const values = [...new Map(observations.map(obs => [JSON.stringify(obs.value), obs.value])).values()]
+      return [{ ...attr, values, observations }]
+    }
+    // Older details may only identify columns at the field level. Mixed or
+    // unlocated values stay in the original record until their source is known.
+    return attr.origin_tables.length && attr.origin_tables.every(usable) ? [attr] : []
+  })
+})
+const recordProperties = computed(() => props.selected.properties && typeof props.selected.properties === 'object'
+  && !Array.isArray(props.selected.properties) ? props.selected.properties as Record<string, unknown> : {})
 const nameVariants = computed(() => {
   if (standardNode.value?.label_conflict) return standardNode.value.label_variants || []
   return props.selected.label_conflict && Array.isArray(props.selected.label_variants) ? props.selected.label_variants : []
@@ -73,13 +122,16 @@ const nameVariants = computed(() => {
 const statusName = (value?: unknown) => ({ accepted: '已接受', candidate: '候选', unresolved: '未决', conflict: '冲突' }[String(value)] || '状态未提供')
 const kindName = (value: unknown) => vocabularyLabel('entity_types', value, props.vocabulary)
 const relationName = (value: unknown) => vocabularyLabel('relations', value, props.vocabulary)
-const propertyName = (value: string) => vocabularyLabel('properties', value, props.vocabulary)
+const propertyName = (value: string) => {
+  const label = vocabularyLabel('properties', value, props.vocabulary)
+  return label === value + '（未提供中文名）' ? value : label
+}
 const relationDescription = (value: unknown) => vocabularyDescription('relations', value, props.vocabulary)
 
 const labelOrigin = (node: GraphNode) => ({
-  declared: '名称由已声明的展示字段生成',
-  relations: '名称由关联对象和身份键生成',
-  identity: '名称由身份键生成',
+  declared: '来源未提供主名称',
+  relations: '来源未提供主名称',
+  identity: '来源未提供主名称',
   metadata: '名称来自字段元数据；此节点代表列定义',
   metadata_declared: '名称由 Agent 依据元数据或文档声明；此节点代表列定义',
 }[String(node.label_origin)] || '')
@@ -93,6 +145,14 @@ const endpointName = (id: unknown) => {
   return node ? nodeCaption(node) : '节点名称尚未加载'
 }
 
+function direction(edge: GraphEdge) {
+  if (edge.source === edge.target) return '自环'
+  const fromHere = edge.source === props.selected.id
+  if (edge.hierarchy_direction === 'outgoing') return fromHere ? '下级' : '上级'
+  if (edge.hierarchy_direction === 'incoming') return fromHere ? '上级' : '下级'
+  return fromHere ? '出向' : '入向'
+}
+
 const hierarchyLoops = computed(() => props.adjacent.filter(isHierarchyLoop))
 const neighborGroups = computed(() => {
   const groups = new Map<string, GraphEdge[]>()
@@ -103,7 +163,7 @@ const neighborGroups = computed(() => {
     if (group) group.push(edge)
     else groups.set(other, [edge])
   }
-  return [...groups].map(([id, edges]) => ({ id, edges }))
+  return [...groups].map(([id, edges]) => ({ id, edges, directions: [...new Set(edges.map(direction))].join('、') }))
 })
 const neighborLimit = ref(40)
 const expandedNeighbors = ref(new Map<string, number>())
@@ -134,118 +194,60 @@ const mappingValues = (rule: Record<string, unknown>) => Object.fromEntries([
   'constant_properties', 'context_columns', 'endpoint_lookups',
 ].filter(key => rule[key] && (typeof rule[key] === 'string' || Object.keys(rule[key] as object).length)).map(key => [key, rule[key]]))
 
-const descriptionOriginLabel = (origin: StandardNode['business_description_origin']) => ({
-  source_column: '数据表描述字段',
-  entity_definition: '实体类型定义',
-  none: '未提供',
-}[origin])
 
 </script>
 
 <template>
   <div class="node-inspector">
-    <span class="badge blue">{{ kindName(selected.kind || selected.layer) }}</span>
-    <span class="badge" :class="selected.status === 'accepted' ? 'green' : 'amber'">{{ statusName(selected.status) }}</span>
-    <h2 class="detail-name">{{ nodeCaption(selected) }}</h2>
-    <p v-if="nameVariants.length" class="note amber">来源名称不一致：{{ nameVariants.join('、') }}。此节点保留各来源的记录。</p>
-    <p v-if="labelOrigin(selected)" class="muted small-text">{{ labelOrigin(selected) }}</p>
-    <p v-if="selected.overview_only" class="note">此节点先显示精简摘要，完整属性正在按需读取；读取失败时可重试来源详情。</p>
-
-    <section v-if="standardNode" class="standard-node-summary" aria-label="标准化节点名片">
-      <div class="standard-card-grid">
-        <div class="standard-row">
-          <span class="standard-label">中文名</span>
-          <strong class="standard-val">{{ standardNode.chinese_name || '未单独映射（使用显示名称）' }}</strong>
-        </div>
-        <div class="standard-row">
-          <span class="standard-label">英文名</span>
-          <span class="standard-val" :class="{ muted: standardNode.english_name_status === 'unknown' }">
-            {{ standardNode.english_name_status === 'mapped' && standardNode.english_name ? standardNode.english_name : '未知（未单独映射）' }}
-          </span>
-        </div>
-        <div v-if="standardNode.aliases.length" class="standard-row">
-          <span class="standard-label">别名</span>
-          <span class="standard-val">{{ standardNode.aliases.join('、') }}</span>
-        </div>
+    <header class="standard-node-summary" aria-label="节点名称与类型">
+      <div class="entity-kind">
+        {{ kindName(standardNode?.type_family || selected.original_type || selected.kind || selected.layer).replace(/（未提供中文名）$/, '') }}
+        <span v-if="selected.status && selected.status !== 'accepted'" class="badge amber">{{ statusName(selected.status) }}</span>
       </div>
+      <h2 class="detail-name">{{ title }}</h2>
+      <p v-if="nameVariants.length" class="note amber">{{ standardNode?.preferred_source_name ? '各来源名称：' + nameVariants.join('、') : '各来源记录了不同名称' }}</p>
+      <p v-if="labelOrigin(selected) && !standardNode?.source_name && !standardNode?.english_name" class="muted small-text">{{ labelOrigin(selected) }}</p>
+      <p v-if="standardNode?.english_name && standardNode.english_name !== title" class="secondary-name">{{ standardNode.english_name }}</p>
+      <p v-if="standardNode?.business_description_origin === 'source_column'" class="standard-desc">{{ standardNode.business_description }}</p>
+    </header>
+    <p v-if="selected.overview_only" class="note">正在读取完整节点信息。</p>
 
-      <div class="divider"></div>
-      <div class="standard-section">
-        <div class="section-title-row">
-          <h3>节点描述</h3>
-          <span class="badge">{{ descriptionOriginLabel(standardNode.business_description_origin) }}</span>
-        </div>
-        <p class="standard-desc">{{ standardNode.business_description || '暂无实体描述' }}</p>
+    <section v-if="Object.keys(identity).length" class="node-section">
+      <h3>实体身份</h3>
+      <PropertyTable :values="identity" :label="propertyName" />
+    </section>
 
-        <div v-if="standardNode.catalog_metadata_notes.length" class="catalog-notes">
-          <p class="muted small-text">源表或列的目录注释</p>
-          <div v-for="note in standardNode.catalog_metadata_notes" :key="`${note.source_id}:${note.qualified_table}`" class="catalog-note-item">
-            <strong>{{ note.source_id }} · {{ note.qualified_table }}</strong>
-            <span v-if="note.table_comment"> · 表注释：{{ note.table_comment }}</span>
-            <ul v-if="note.column_comments.length" class="compact-list">
-              <li v-for="col in note.column_comments" :key="col.column">
-                {{ col.column }} ({{ col.data_type }})：{{ col.comment }}
-              </li>
-            </ul>
-          </div>
-        </div>
+    <section v-if="aliases.length || businessAttributes.length" class="node-section" aria-label="业务属性">
+      <h3>业务属性</h3>
+      <PropertyTable v-if="aliases.length" :values="{ '别名': aliases }" />
+      <div v-for="attr in businessAttributes" :key="attr.key" class="dynamic-attr-item">
+        <PropertyTable :values="{ [propertyName(attr.label)]: attr.values }" />
+        <DeferredDetails v-if="attr.observations?.length" :key="selected.id + ':' + attr.key" class="attr-origin" :title="'查看取值来源（' + attr.observations.length + '）'">
+          <article v-for="(obs, index) in attr.observations" :key="index" class="support-detail">
+            <PropertyTable :values="{ '值': obs.value, '来源': [obs.source_id, obs.qualified_table, obs.column].join('.'), ...(obs.raw_value !== undefined && obs.raw_value !== obs.value ? { '原值': obs.raw_value } : {}), ...(obs.original_property && obs.original_property !== attr.key ? { '原属性': obs.original_property } : {}), ...(obs.scope_ref ? { '可见范围': obs.scope_ref } : {}), ...(obs.evidence_refs?.length ? { '证据引用': obs.evidence_refs } : {}) }"/>
+            <PropertyTable :values="contextValues(obs.business_context)" />
+            <template v-if="obs.row_context?.values"><strong>同一行的上下文</strong><PropertyTable :values="obs.row_context.values"/></template>
+          </article>
+        </DeferredDetails>
+        <p v-else class="attr-origin">{{ attr.origin_tables.map(o => [o.source_id, o.qualified_table, o.column].join('.')).join('、') }}</p>
       </div>
     </section>
 
-    <template v-if="Object.keys(nodeIdentity(selected)).length">
-      <div class="divider"></div>
-      <h3>实体身份</h3>
-      <PropertyTable :values="nodeIdentity(selected)" />
-    </template>
-    <p v-if="accessLabel(selected)" class="muted small-text">可见范围：{{ accessLabel(selected) }}（访问授权）</p>
-
-    <div class="divider"></div>
-    <h3>节点属性</h3>
-    <template v-if="standardNode && standardNode.attributes.length">
-      <div class="dynamic-attr-list" aria-label="动态构建属性列表">
-        <div v-for="attr in standardNode.attributes" :key="attr.key" class="dynamic-attr-item">
-          <div class="attr-head">
-            <strong>{{ propertyName(attr.label) }}</strong>
-            <span v-if="attr.data_type && attr.data_type !== 'unknown'" class="badge">{{ attr.data_type }}</span>
-          </div>
-          <PropertyTable :values="{ 值: attr.values }" />
-          <details v-if="attr.observations?.length" class="attr-origin">
-            <summary>逐值查看适用范围与来源（{{ attr.observations.length }} 条观察）</summary>
-            <article v-for="(obs, index) in attr.observations" :key="index" class="support-detail">
-              <PropertyTable :values="{ '值': obs.value, '来源': [obs.source_id, obs.qualified_table, obs.column].filter(Boolean).join(' · '), ...(obs.original_property ? { '原属性': obs.original_property } : {}), ...(obs.raw_value !== undefined ? { '原值': obs.raw_value } : {}), ...(obs.scope_ref ? { '可见范围': obs.scope_ref } : {}), ...(obs.evidence_refs?.length ? { '证据引用': obs.evidence_refs } : {}) }"/>
-              <PropertyTable :values="contextValues(obs.business_context)"/><template v-if="obs.row_context?.values"><strong>同一行的上下文</strong><PropertyTable :values="obs.row_context.values"/></template>
-            </article>
-          </details>
-          <div v-else-if="attr.origin_tables.length" class="muted small-text attr-origin">
-            来源：{{ attr.origin_tables.map(o => o.column ? `${o.qualified_table}.${o.column}` : o.qualified_table).join('、') }}
-          </div>
-        </div>
-      </div>
-    </template>
-    <p v-else-if="standardNode" class="muted small-text">暂无属性</p>
-    <PropertyTable v-else :values="nodeProperties(selected)" :label="propertyName" />
-
-    <section v-if="standardNode && standardNode.source_evidences.length" aria-label="来源物理表清单">
-      <div class="divider"></div>
-      <h3>物理表来源与证据（{{ standardNode.source_evidences.length }} 张表）</h3>
-      <div v-for="ev in standardNode.source_evidences" :key="`${ev.source_id}:${ev.qualified_table}`" class="source-evidence-card">
-        <div class="ev-head">
-          <span class="badge blue">{{ ev.source_kind_label }}</span>
-          <strong>{{ ev.source_id }} · {{ ev.qualified_table }}</strong>
-        </div>
-        <div class="ev-meta small-text">
-          <div v-if="ev.key_columns.length">身份键列：{{ ev.key_columns.join('、') }}</div>
-          <div v-if="ev.contributed_fields.length">
-            贡献字段：
-            <span v-for="(field, idx) in ev.contributed_fields" :key="`${field.role}:${field.column}`">
-              {{ idx > 0 ? '、' : '' }}{{ field.field }}({{ field.column }}<template v-if="field.data_type && field.data_type !== 'unknown'">:{{ field.data_type }}</template>)
-            </span>
-          </div>
-          <div>可见范围：{{ ev.scopes.join('、') }}<template v-if="ev.evidence_refs.length"> · 证据：{{ ev.evidence_refs.join('、') }}</template></div>
-          <div v-if="ev.inherited_from" class="muted">
-            继承来源：{{ ev.inherited_from.source_project_id || ev.inherited_from.inherit_id }}
-          </div>
-        </div>
+    <section v-if="sources.length" class="node-section" aria-label="物理表与列">
+      <h3>数据来源</h3>
+      <div v-for="ev in sources" :key="JSON.stringify([ev.source_id,ev.qualified_table])" class="source-evidence-card">
+        <div class="source-heading"><strong>{{ ev.qualified_table }}</strong> <span>{{ ev.source_id }}</span></div>
+        <dl v-if="sourceColumns(ev).length" class="source-columns">
+          <template v-for="field in sourceColumns(ev)" :key="field.column">
+            <dt>{{ field.roles }}</dt><dd>{{ ev.qualified_table }}.{{ field.column }}</dd>
+          </template>
+        </dl>
+        <p v-else class="muted small-text">此来源未记录列映射。</p>
+        <details v-if="ev.evidence_refs.length || ev.inherited_from" class="attr-origin">
+          <summary>查看来源记录</summary>
+          <p v-if="ev.inherited_from">继承自 {{ ev.inherited_from.source_project_id || ev.inherited_from.inherit_id }}</p>
+          <p>{{ ev.evidence_refs.join('、') }}</p>
+        </details>
       </div>
     </section>
 
@@ -261,10 +263,10 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
     <component v-for="group in neighborGroups.slice(0, neighborLimit)" :key="`${selected.id}:${group.id}`" @toggle.self="toggleNeighbor(group.id, $event)"
       :is="group.edges.length > 1 ? 'details' : 'div'" class="neighbor-relations">
       <summary v-if="group.edges.length > 1">
-        {{ endpointName(group.id) }} · {{ group.edges.length }} 条关系
+        {{ group.directions }} · {{ endpointName(group.id) }} · {{ group.edges.length }} 条关系
       </summary>
       <button v-for="(edge, i) in group.edges.slice(0, group.edges.length === 1 ? 1 : expandedNeighbors.get(group.id) || 0)" :key="edge.id || i" type="button" class="edge-detail relation-selection" @click="emit('selectEdge', edge)">
-        <span class="badge" :title="relationDescription(edge.relation)">{{ relationName(edge.relation) }} · {{ statusName(edge.status) }}</span>
+        <span class="badge" :title="relationDescription(edge.relation)">{{ direction(edge) }} · {{ relationName(edge.relation) }}<template v-if="edge.status && edge.status !== 'accepted'"> · {{ statusName(edge.status) }}</template></span>
         <p>{{ endpointName(edge.source) }} → {{ endpointName(edge.target) }}</p>
       </button>
       <button v-if="expandedNeighbors.has(group.id) && group.edges.length > expandedNeighbors.get(group.id)!" class="btn small"
@@ -278,12 +280,12 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
 
     <section v-if="projectId" aria-label="来源支持">
       <div class="divider"></div>
-      <h3>来源支持</h3>
+
       <p v-if="detailsLoading" role="status">正在读取来源…</p>
       <p v-if="detailsError" role="alert">{{ detailsError }}
         <button type="button" class="btn small" @click="emit('retryDetails')">重试读取详情</button>
       </p>
-      <template v-if="details">
+      <DeferredDetails v-if="details" :key="selected.id" title="事实与抽取依据" class="audit-details node-facts">
         <article v-for="fact in details.facts" :key="fact.id" class="fact-detail">
           <strong>{{ factTitle(fact) }}</strong> <span class="badge">{{ statusName(fact.status) }}</span>
           <p v-if="fact.fact_kind === 'Edge'" class="relation-endpoints">{{ endpointName(fact.payload.source) }} → {{ endpointName(fact.payload.target) }}</p>
@@ -326,8 +328,21 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
         </details>
         <p v-if="details.supports_truncated" class="note amber">本页支持超过 500 条，仅展示前 500 条。</p>
         <button v-if="details.next_offset !== null" class="btn small" :disabled="detailsLoading" @click="emit('loadMoreDetails')">读取更多事实支持</button>
-      </template>
+      </DeferredDetails>
     </section>
+    <DeferredDetails v-if="Object.keys(recordProperties).length || standardNode?.catalog_metadata_notes.length || standardNode?.business_description_origin === 'entity_definition' || accessLabel(selected)" :key="'mapping:' + selected.id" class="audit-details record-properties" title="原始属性与映射说明">
+      <p v-if="accessLabel(selected)">可见范围：{{ accessLabel(selected) }}</p>
+      <p v-if="standardNode?.business_description_origin === 'entity_definition'">类型定义：{{ standardNode.business_description }}</p>
+      <PropertyTable v-if="Object.keys(recordProperties).length" :values="recordProperties" :label="propertyName" />
+      <template v-if="standardNode?.catalog_metadata_notes.length">
+        <h4>源表或列的目录注释</h4>
+        <article v-for="note in standardNode.catalog_metadata_notes" :key="JSON.stringify([note.source_id,note.qualified_table])" class="catalog-note">
+          <strong>{{ note.source_id }} · {{ note.qualified_table }}</strong>
+          <p v-if="note.table_comment">{{ note.table_comment }}</p>
+          <p v-for="col in note.column_comments" :key="col.column">{{ col.column }} ({{ col.data_type }}) · {{ col.comment }}</p>
+        </article>
+      </template>
+    </DeferredDetails>
 
     <TechnicalDetails :value="selected" title="节点底层技术结构（开发调试）" />
   </div>
@@ -341,20 +356,15 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
 .support-detail { margin: 8px 0; padding: 6px; background: var(--surface-alt, #f8fafc); }
 .mapping-details summary { cursor: pointer; }
 .fact-detail ul { padding-left: 18px; font-size: 12px; }
-.standard-card-grid { display: grid; gap: 8px; margin-top: 10px; padding: 10px 12px; background: #f8fafd; border: 1px solid var(--line, #e5eaf2); border-radius: 8px; }
-.standard-row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 12px; }
-.standard-label { color: var(--muted, #7c899e); flex-shrink: 0; }
-.standard-val { text-align: right; overflow-wrap: anywhere; }
-.section-title-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
-.standard-desc { font-size: 12px; line-height: 1.7; color: #31425e; }
-.catalog-notes { margin-top: 10px; padding: 8px 10px; background: #fcfdff; border-left: 3px solid #cbdcf9; font-size: 11px; }
-.catalog-note-item { margin-top: 6px; }
-.compact-list { margin: 4px 0 0; padding-left: 16px; }
-.dynamic-attr-list { display: grid; gap: 8px; margin-bottom: 10px; }
-.dynamic-attr-item { padding: 8px 10px; border: 1px solid var(--line, #e5eaf2); border-radius: 6px; background: #fcfdff; font-size: 12px; }
-.attr-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.attr-origin { margin-top: 4px; }
-.source-evidence-card { margin-top: 8px; padding: 10px 12px; border: 1px solid #dce7fb; border-radius: 8px; background: #f8fbff; }
-.ev-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; }
-.ev-meta { margin-top: 6px; display: grid; gap: 4px; line-height: 1.6; overflow-wrap: anywhere; }
+.entity-kind, .source-heading span, .secondary-name, .attr-origin { color: var(--muted, #62738b); font-size: 12px; }
+.standard-desc { font-size: 13px; line-height: 1.6; }
+.node-section { border-top: 1px solid var(--line, #e5eaf2); padding-top: 12px; margin: 14px 0; }
+.source-evidence-card { overflow-wrap: anywhere; margin: 10px 0; }
+.source-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px; font-size: 13px; }
+.source-columns { display: grid; grid-template-columns: minmax(4em, 30%) 1fr; gap: 4px 8px; margin: 6px 0; font-size: 12px; }
+.source-columns dt { color: var(--muted, #62738b); }
+.source-columns dd { margin: 0; }
+.catalog-note { margin: 8px 0; }
+.audit-details { padding: 8px 0; overflow-wrap: anywhere; }
+.audit-details :deep(summary), .attr-origin :deep(summary) { cursor: pointer; color: var(--muted, #62738b); font-size: 12px; }
 </style>

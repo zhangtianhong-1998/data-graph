@@ -272,6 +272,30 @@ def test_inherited_lookup_uses_exact_support_and_published_id():
         assert len(view['edges']) == expected
 
 
+def test_reusing_frozen_type_with_new_properties_preserves_identifier_domain_grain_and_key_order():
+    from lightgraph.construction.structure import validate_structure
+
+    table, _, _ = example()
+    base_type = {'type': 'Order', 'key_names': ['tenant', 'number'], 'identity_scope': 'scoped',
+                 'identity_context_keys': ['tenant'], 'identity_domain': 'orders'}
+    contract = {'definitions': {'entities': [base_type]}}
+    entity = {**base_type, 'mappings': [{'source_id': table.source_id, 'table': table.name,
+        'key_columns': ['scope', 'order_id'], 'properties': {'联系人': 'email'}}]}
+    value = {'draft_id': 'delta', 'extends_base_graph': True, 'inherited_entity_types': ['Order'], 'entities': [entity]}
+    with MemorySource([table], {table.qualified_name: [('O1', 'first@example', 'public')]}) as src:
+        for change in ({'key_names': ['number', 'tenant']}, {'identity_context_keys': ['number']},
+                       {'identity_scope': 'unknown', 'identity_context_keys': []}, {'identity_domain': 'other'}):
+            changed = {**value, 'entities': [{**entity, **change}]}
+            for result in (validate_structure(changed, [table], base_graph=contract),
+                           execute_draft(changed, [src], [table], base_graph=contract)):
+                assert {d['code'] for d in result['diagnostics']} == {'inherited_entity_identity_contract_changed'}
+        added = execute_draft(value, [src], [table], base_graph=contract)
+        assert added['passed'], added['diagnostics']
+        node, = added['graph']['nodes']
+        assert node['properties']['联系人'] == ['first@example']
+        assert node['identity'] == {'tenant': 'public', 'number': 'O1'}
+
+
 def test_inherited_relation_only_plan_checks_real_key_arity_in_both_modes():
     from lightgraph.construction.structure import validate_structure
 

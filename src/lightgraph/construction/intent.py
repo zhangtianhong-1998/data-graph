@@ -54,6 +54,8 @@ def initial_intent(config, materials: list[dict], *, discover_only=False, inheri
             f"# 已继承的基础知识图谱\n\n本次工作区已只读继承 {inherited_summary['inherited_count']} 份基准图谱（包含实体类型：{types}）。"
             "如需将新表对象连接到继承图谱节点而不再重查旧表，可在增量草稿中设置 `extends_base_graph: true`、"
             "`inherited_entity_types: [...]`，并在关系查找中使用 `source_id: \"__base_graph__\"` 匹配继承节点。"
+            "新表补充已有类型的属性时，在 describe_sources 的 inherited_graph_summary.entity_contracts 核对身份定义，"
+            "在 inherited_entity_types 列明复用的类型。保留原身份键和范围，并记录新属性对应的表列。"
         )
     if getattr(config, 'construction_target', 'instances') == 'structure':
         parts.append('本次产出是图谱结构与字段映射。使用 validate_graph_draft(mode="structure") 检查并以 '

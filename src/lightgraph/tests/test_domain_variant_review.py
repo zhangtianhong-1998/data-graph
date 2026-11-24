@@ -11,7 +11,7 @@ from lightgraph.tests.test_web_graph_review import client
 from lightgraph.tests.test_web_publication_identity import GRAPH, ROOT, listing, publish, revoke, submit
 
 
-def _variant_unit():
+def _draft_graphs():
     facts = [('orders', 'order', '订货'), ('income', 'revenue', '收入'),
              ('sheet', 'sheet-only', '工作表科目')]
     tables = [table(name, ['code', 'name', 'record']) for name, _, _ in facts]
@@ -36,7 +36,11 @@ def _variant_unit():
             result = execute_draft(draft, [source], source.describe())
         assert result['passed'], result['diagnostics']
         contributions.append({**result['graph'], 'draft_id': owner})
-    graph = _merge_graphs(contributions)
+    return contributions
+
+
+def _variant_unit():
+    graph = _merge_graphs(_draft_graphs())
     graph.pop('candidate_identity_merges', None)  # A historical unit checkpoint without these candidates.
     return graph
 
@@ -47,6 +51,22 @@ def _by_code(graph):
         if node.get('original_type', node['type']) == 'indicator':
             members[node['identity']['indicator_code']].add(node['id'])
     return members
+
+
+def test_frozen_base_contract_is_still_addressable_in_per_code_domain_review():
+    from lightgraph.construction.domain_variant_candidates import domain_variant_candidates
+    from lightgraph.construction.merger import merge_construction_graphs
+
+    tree, tracking = _draft_graphs()
+    # Both revisions were materialized by the same unit in the same project.
+    # The source-key witness is scoped to that owner.
+    graph = merge_construction_graphs([
+        {'kind': 'base', 'contributor_id': 'extract', 'source_namespace': 'project', 'graph': tree},
+        {'kind': 'unit', 'contributor_id': 'extract', 'source_namespace': 'project', 'graph': tracking}])
+    members = _by_code(graph)
+    assert next(n for n in graph['nodes'] if n['identity'] == {'indicator_code': 'sheet-only'})['type'] == 'indicator'
+    candidates = domain_variant_candidates(graph)
+    assert {frozenset(c['node_ids']) for c in candidates} == {frozenset(members[k]) for k in ('order', 'revenue')}
 
 
 def test_review_two_codes_in_an_old_publication_and_revoke_individually(client):

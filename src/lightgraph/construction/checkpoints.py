@@ -63,7 +63,7 @@ def _directory(output, run_id, node_id, graph_kind):
         current = current / part
         if current.is_symlink():
             raise LightGraphError('workflow_checkpoint_invalid')
-    if any((current / name).is_symlink() for name in ('graph.graph', 'checkpoint.json', 'evidence.json')):
+    if any((current / name).is_symlink() for name in ('graph.graph', 'checkpoint.json', 'evidence.json', 'overlap_review.json')):
         raise LightGraphError('workflow_checkpoint_invalid')
     return current
 
@@ -77,9 +77,14 @@ def commit_checkpoint(output_dir, run_id, node_id, contributor, *, input_digest,
     evidence = contributor.get('evidence_records') or {}
     checksum = artifact_step('checkpoint_digest', _graph_digest, graph)
     evidence_checksum = artifact_step('checkpoint_digest', digest, evidence)
+    review = contributor.get('overlap_review')
+    review_checksum = artifact_step('checkpoint_digest', digest, review) if review is not None else None
+    identity = [run_id, node_id, graph_kind, checksum, evidence_checksum]
+    if review_checksum is not None:
+        identity.append(review_checksum)
     record = {
         'format_version': 1, 'run_id': run_id, 'node_id': node_id, 'source_attempt': source_attempt or run_id,
-        'artifact_id': 'artifact_' + digest(run_id, node_id, graph_kind, checksum, evidence_checksum)[:32],
+        'artifact_id': 'artifact_' + digest(*identity)[:32],
         'relative_path': (directory.relative_to(output_dir) / 'graph.graph').as_posix(),
         'graph_digest': checksum, 'evidence_digest': evidence_checksum, 'has_evidence': bool(evidence),
         'input_digest': input_digest, 'upstream_artifacts': list(upstream_artifacts),
@@ -93,11 +98,13 @@ def commit_checkpoint(output_dir, run_id, node_id, contributor, *, input_digest,
     }
     if recomposed_from is not None:
         record['recomposed_from'] = recomposed_from
+    if review_checksum is not None:
+        record['overlap_review_digest'] = review_checksum
     lock = FileLock(directory / '.writer.lock', busy_code='workflow_checkpoint_busy',
                     invalid_code='workflow_checkpoint_lock_invalid')
     artifact_step('checkpoint_lock', lock.acquire)
     try:
-        return _commit(output_dir, directory, record, graph, evidence)
+        return _commit(output_dir, directory, record, graph, evidence, review)
     finally:
         lock.close()
 
@@ -117,7 +124,7 @@ def _write_graph(directory, graph, checksum):
         artifact_step('checkpoint_graph_install', staged.rename, destination)
 
 
-def _commit(output_dir, directory, record, graph, evidence):
+def _commit(output_dir, directory, record, graph, evidence, review):
     commit = directory / 'checkpoint.json'
     if commit.exists():
         existing = artifact_step('checkpoint_marker_read', lambda: json.loads(commit.read_text(encoding='utf-8')))
@@ -130,6 +137,9 @@ def _commit(output_dir, directory, record, graph, evidence):
     artifact_step('checkpoint_graph_write', _write_graph, directory, graph, record['graph_digest'])
     if evidence:
         artifact_step('checkpoint_evidence_write', atomic_text, directory / 'evidence.json', json.dumps(evidence, ensure_ascii=False))
+    if review is not None:
+        artifact_step('checkpoint_review_write', atomic_text, directory / 'overlap_review.json',
+                      json.dumps(review, ensure_ascii=False, sort_keys=True))
     record['created_at'] = datetime.now(timezone.utc).isoformat()
     artifact_step('checkpoint_marker_write', atomic_text, commit, json.dumps(record, ensure_ascii=False, sort_keys=True))
     return record
@@ -161,6 +171,8 @@ def verify_checkpoint_files(output_dir, record) -> Path:
         files = [path / name for name in ('metadata.yaml', 'nodes.parquet', 'edges.parquet')]
         if record['has_evidence']:
             files.append(directory / 'evidence.json')
+        if 'overlap_review_digest' in record:
+            files.append(directory / 'overlap_review.json')
         if (not isinstance(record['graph_digest'], str)
                 or any(file.is_symlink() or not file.is_file() for file in files)):
             raise ValueError
@@ -177,7 +189,13 @@ def load_checkpoint(output_dir, record):
         if (digest(evidence) != record['evidence_digest']
                 or record['access_fingerprint'] != graph.get('access_fingerprint')):
             raise ValueError
-        return {'contributor_id': record['node_id'], 'kind': record['contributor_kind'],
-                'graph': graph, 'evidence_records': evidence}
+        contributor = {'contributor_id': record['node_id'], 'kind': record['contributor_kind'],
+                       'graph': graph, 'evidence_records': evidence}
+        if 'overlap_review_digest' in record:
+            review = json.loads((path.parent / 'overlap_review.json').read_text('utf-8'))
+            if not isinstance(review, dict) or digest(review) != record['overlap_review_digest']:
+                raise ValueError
+            contributor['overlap_review'] = review
+        return contributor
     except (LightGraphError, KeyError, TypeError, ValueError, OSError):
         raise LightGraphError('workflow_checkpoint_invalid') from None

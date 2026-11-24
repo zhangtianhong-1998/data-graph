@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 import runpy
 
+import pytest
+
 from lightgraph.tests.construction_worker_fixture import hierarchy_proposal, install_scripted_worker
 from lightgraph.tests.test_web_api import client, create, upload
 from lightgraph.tests.test_web_execution import wait_run
@@ -160,6 +162,10 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
     def unexpected_merge(*args, **kwargs):
         raise AssertionError("observations-only must not replay the merge")
     monkeypatch.setattr('lightgraph.construction.merger.merge_construction_graphs', unexpected_merge)
+    preview = audit(run_file, 'merged', overlap_patterns_only=True)
+    assert preview['mode'] == 'overlap_preview' and preview['model_calls'] == 0
+    assert preview['upstream_artifacts'] == report['upstream_artifacts']
+    assert preview['patterns'] == audit(run_file, 'merged', overlap_patterns_only=True)['patterns']
     observations = audit(run_file, 'merged', observations_only=True)
     assert observations['typed_row_identity'] == report['committed']['typed_row_identity']
     assert observations['typed_row_identity']['multiple_contributor_groups'] == 2
@@ -167,7 +173,8 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
     assert snapshot() == before
 
 
-def test_apply_merge_rule_to_committed_extracts_via_http(client, monkeypatch):
+@pytest.mark.parametrize('restrict_sources', [False, True])
+def test_apply_merge_rule_to_committed_extracts_via_http(client, monkeypatch, restrict_sources):
     install_scripted_worker(monkeypatch)
     create(client)
     base = '/api/projects/alpha'
@@ -204,9 +211,19 @@ def test_apply_merge_rule_to_committed_extracts_via_http(client, monkeypatch):
 
     # Adjust only the merge: neither branch, its source file, nor its successful rules changed.
     cfg = client.get(base + '/config').json()
-    cfg['workflow']['merge_nodes'][0]['merge_policy'] = {'fusion_policy': {'entity_rules': [{
-        'entity_type': 'Metric', 'canonical_type': 'Metric', 'identity_domain': '统一指标编码',
-        'key_mapping': {'code': 'code'}}]}}
+    rule = {'entity_type': 'Metric', 'canonical_type': 'Metric', 'identity_domain': '统一指标编码',
+            'key_mapping': {'code': 'code'}}
+    if restrict_sources:
+        bindings = []
+        for member in graph['nodes']:
+            detail = client.get(base + '/graph/details', params={'version': version, 'entity_id': member['id']}).json()
+            source, = detail['standard_nodes'][0]['source_evidences']
+            assert source['key_columns'] == ['metric_code']
+            bindings.append({key: source[key] for key in ('source_id', 'schema', 'table')}
+                            | {'key_columns': {'code': 'metric_code'}})
+        assert len({binding['source_id'] for binding in bindings}) == 2
+        rule['source_bindings'] = bindings
+    cfg['workflow']['merge_nodes'][0]['merge_policy'] = {'fusion_policy': {'entity_rules': [rule]}}
     assert client.put(base + '/config', json=cfg).is_success
     monkeypatch.setattr(subprocess, 'Popen', lambda *a, **k: (_ for _ in ()).throw(AssertionError('unexpected worker')))
     route = base + '/runs/' + first['run_id'] + '/resume'

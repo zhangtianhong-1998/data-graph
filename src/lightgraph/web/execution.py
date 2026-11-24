@@ -90,7 +90,7 @@ def _workflow_table(output, rid, stamp):
     table = _fields(state, ('parent_run_id', 'resumed_from_run_id', 'terminal_ids', 'plan_mode', 'status',
                             'created_at', 'finished_at', 'recomposed_nodes'))
     node_fields = ('unit_id', 'node_id', 'run_id', 'label', 'status', 'merge_mode', 'model_calls', 'nodes',
-                   'edges', 'updated_at', 'error_code', 'failure_detail', 'reused')
+                   'edges', 'updated_at', 'error_code', 'failure_detail', 'reused', 'overlap_review')
     counts = ('input_nodes', 'output_nodes', 'input_edges', 'output_edges', 'output_directed_endpoint_pairs',
               'output_multi_edge_pairs', 'output_endpoint_pair_excess', 'output_self_loop_edges',
               'source_replay_status', 'source_replay_collapsed_nodes',
@@ -628,11 +628,10 @@ class RunManager:
             locations = {}
             legacy_contributors = {}
             legacy = 'node_inputs' not in state
-            # Only a deterministic rerun can verify its pinned inputs as it reads
-            # them, before it starts a worker or publishes a replacement.
+            # A merge-only run verifies its pinned inputs before reviewing or applying rules.
             verify_in_worker = (verify_checkpoints_in_background and action == 'rerun_node' and not legacy
                                 and not rerun.intersection(plan.extract_ids)
-                                and all(node.merge_mode == 'deterministic' for node in config.workflow.merge_nodes
+                                and all(node.merge_mode in {'deterministic', 'overlap_review'} for node in config.workflow.merge_nodes
                                         if node.node_id in rerun))
             if legacy:
                 # Before checkpoints existed there was one aggregate digest. Only
@@ -997,6 +996,10 @@ class RunManager:
             if config.inherited_graphs:
                 authorize_frozen_inheritance(config, self.workspace)
 
+        def check_cancelled():
+            if cancel_event.is_set():
+                raise LightGraphError('run_cancelled')
+
         def publication_status(summary=None):
             if summary is not None:
                 return 'published'
@@ -1148,11 +1151,29 @@ class RunManager:
                                     bases=base_contributors)
 
                                 stage = 'merge_upstream'
-                                merged_upstream = merge_construction_graphs(
-                                    node_inputs,
-                                    target_access_fingerprint=access_fingerprint(config),
-                                    merge_policy=eff_policy,
-                                )
+                                review = None
+                                if mnode.merge_mode == 'overlap_review':
+                                    from ..construction.workflow_overlap import merge_with_overlap_review
+                                    stage = 'overlap_review'
+                                    merge_nodes_state[mid].update(status='running', model_calls=0, updated_at=_now())
+                                    save_workflow_state(config.output_dir, wf_state)
+
+                                    def count_review_call():
+                                        merge_nodes_state[mid]['model_calls'] += 1
+
+                                    merged_upstream, review = merge_with_overlap_review(
+                                        config, mnode, eff_policy, node_inputs, in_ids, wf_state['artifacts'],
+                                        inherited=bool(base_contributors or config.inherited_graphs),
+                                        source_namespace=pid, model_api_key=model_api_key,
+                                        check_cancelled=check_cancelled, deadline=deadline, on_model_call=count_review_call)
+                                    merge_nodes_state[mid].update(overlap_review=review['summary'],
+                                                                model_calls=review['summary']['model_calls'])
+                                else:
+                                    merged_upstream = merge_construction_graphs(
+                                        node_inputs,
+                                        target_access_fingerprint=access_fingerprint(config),
+                                        merge_policy=eff_policy,
+                                    )
                                 merge_nodes_state[mid]['merge_counts'] = merge_accounting(node_inputs, merged_upstream)
 
                                 if mnode.merge_mode == "merge_and_extract":
@@ -1227,9 +1248,12 @@ class RunManager:
                                         "graph": merged_upstream,
                                         "evidence_records": {},
                                     }
+                                    if review is not None:
+                                        merge_node_contribs[mid]['overlap_review'] = review
                                     merged_status = 'completed'
 
                                 stage = 'merge_checkpoint_prepare'
+                                check_cancelled()
                                 merged_graph = merge_outputs[mid]
                                 merge_nodes_state[mid].update(status='running', artifact_status='committing',
                                     nodes=len(merged_graph.get('nodes', [])), edges=len(merged_graph.get('edges', [])),

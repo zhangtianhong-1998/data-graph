@@ -13,6 +13,17 @@ let app: App, root: HTMLDivElement
 const graph: Graph = { nodes: [{ id: 'a', label: 'A', kind: 'Person', layer: 'business', status: 'accepted' }, { id: 'b', label: 'B', kind: 'Person', layer: 'business', status: 'candidate' }], edges: [{ id: 'edge1', source: 'a', target: 'b', relation: 'knows', status: 'candidate' }] }
 function button(text: string) { return [...root.querySelectorAll('button')].find(b => b.textContent?.trim() === text)! }
 function mount(component: typeof GraphCanvas | typeof IdentityCandidates | typeof RunIssues, props: Record<string, unknown>) { root = document.createElement('div'); document.body.append(root); app = createApp(component, props); app.mount(root) }
+async function expandEvidence(selector: string) {
+  const panel = await vi.waitFor(() => {
+    const el = root.querySelector<HTMLDetailsElement>(selector)
+    expect(el).not.toBeNull()
+    return el!
+  })
+  panel.open = true
+  panel.dispatchEvent(new Event('toggle'))
+  await nextTick()
+}
+
 beforeEach(() => { api.request.mockReset(); vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} }) })
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
@@ -39,6 +50,7 @@ describe('业务图来源与归并裁决', () => {
     root.querySelector('.graph-node')!.dispatchEvent(new MouseEvent('click', { bubbles: true })); await nextTick()
     expect(root.textContent).toContain('层级自环 · 1 条原始记录')
     expect(root.textContent).toContain('已加载关联 · 2 个对象 / 5 条关系')
+    expect(root.querySelector('details.neighbor-relations summary')?.textContent).toContain('下级、上级')
   })
   it('缩小全图后保留可点击且互不覆盖的节点名称，查看详情后可关闭侧栏', async () => {
     const nodes = Array.from({ length: 160 }, (_, index) => ({ id: String(index), label: `观测资料 ${index}` }))
@@ -76,6 +88,7 @@ describe('业务图来源与归并裁决', () => {
       ], rules: [], next_offset: null, supports_truncated: false })
     mount(GraphCanvas, { graph: { nodes: [definition], edges: [] }, layer: 'business', projectId: 'p' })
     root.querySelector('.graph-node')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await expandEvidence('.node-facts')
     await vi.waitFor(() => expect(root.querySelectorAll('.support-detail')).toHaveLength(2))
     const tables = [...root.querySelectorAll('.support-detail .property-table')].map(n => n.textContent).join(' ')
     expect(tables).toContain('授权字段元数据'); expect(tables).toContain('Agent 依据材料声明')
@@ -83,6 +96,7 @@ describe('业务图来源与归并裁决', () => {
     expect(tables).not.toContain('事实数据查询')
     expect(root.querySelector('.graph-detail')?.textContent).toContain('此节点代表列定义')
     expect(nodeProperties(definition)).not.toHaveProperty('identity_origin')
+    await expandEvidence('.record-properties')
     const propertyTables = [...root.querySelectorAll('.graph-detail .property-table')].map(n => n.textContent).join(' ')
     expect(propertyTables).toContain('物理字段'); expect(propertyTables).toContain('字段注释')
     expect(propertyTables).not.toContain('physical_column（未提供中文名）')
@@ -100,6 +114,7 @@ describe('业务图来源与归并裁决', () => {
       rules: [], next_offset: null, supports_truncated: false })
     mount(GraphCanvas, { graph, layer: 'business', projectId: 'p' })
     root.querySelector('.graph-node')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await expandEvidence('.node-facts')
     await vi.waitFor(() => expect(root.querySelector('.metadata-relation-basis')).not.toBeNull())
     const values = root.querySelector('.metadata-relation-basis .property-table')?.textContent
     expect(values).toContain(title); expect(values).toContain(observation)
@@ -115,6 +130,7 @@ describe('业务图来源与归并裁决', () => {
       rules: [], next_offset: null, supports_truncated: false, total_incident_edges: 5 })
     mount(GraphCanvas, { graph, layer: 'business', projectId: 'p' })
     root.querySelector('.graph-node')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await expandEvidence('.node-facts')
     await vi.waitFor(() => expect(root.querySelector('.support-detail')?.textContent).toContain('同一行路径上下文'))
     const tables = [...root.querySelectorAll('.support-detail .property-table')].map(n => n.textContent).join(' ')
     expect(tables).toContain('slot_b'); expect(tables).toContain('path_7'); expect(tables).toContain('P10'); expect(tables).toContain('P20')
@@ -131,6 +147,7 @@ describe('业务图来源与归并裁决', () => {
     expect(node.querySelectorAll('.node-label tspan')).toHaveLength(2)
     expect(node.querySelector('.node-label')?.textContent).toBe(name)
     node.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await expandEvidence('.node-facts')
     await vi.waitFor(() => expect(root.textContent).toContain('记录匹配依据'))
     expect(root.querySelector('.detail-name')?.textContent).toBe(name)
     const table = root.querySelector('.support-detail')?.textContent
@@ -146,6 +163,7 @@ describe('业务图来源与归并裁决', () => {
     node.dispatchEvent(new MouseEvent('click', { bubbles: true })); await nextTick()
     const detail = root.querySelector('.graph-detail')!
     expect(detail.textContent).toContain('实体身份')
+    await expandEvidence('.record-properties')
     expect(detail.textContent).toContain('可见范围：public')
     const tables = [...detail.querySelectorAll('.property-table')].map(table => table.textContent).join(' ')
     expect(tables).toContain('RTL_PNL_1410')
@@ -403,7 +421,9 @@ describe('业务图来源与归并裁决', () => {
     expect(api.request).toHaveBeenCalledTimes(1)
     expect(root.querySelector('.relation-selection')?.textContent).toContain('经营支撑关系')
     expect(root.querySelector('.relation-selection')?.textContent).not.toContain('long_')
-    const table = root.querySelector('.graph-detail .property-table')!
+    expect(root.querySelector('[aria-label="业务属性"]')).toBeNull()
+    await expandEvidence('.record-properties')
+    const table = root.querySelector('.record-properties .property-table')!
     expect(table.textContent).toContain('业务编码'); expect(table.textContent).toContain('M01')
     expect(table.textContent).toContain('英文名'); expect(table.textContent).toContain('Operating profit')
     expect(table.textContent).toContain('来源层位'); expect(table.textContent).not.toContain('long_source_hash')

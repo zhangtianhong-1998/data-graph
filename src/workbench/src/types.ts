@@ -39,6 +39,7 @@ export interface EntityFusionRule {
   entity_type: string; canonical_type: string; identity_domain: string
   key_mapping: Record<string, string>; property_aliases?: Record<string, string>
   key_normalizers?: Record<string, string[]>; property_normalizers?: Record<string, string[]>
+  source_bindings?: Array<{ source_id: string; schema: string; table: string; key_columns: Record<string, string> }>
 }
 export interface FusionPolicy {
   version: 1; label_conflict_policy: 'retain_variants' | 'strict' | 'quarantine'
@@ -54,7 +55,7 @@ export interface MergePolicyConfig {
 export interface WorkflowMergeNodeConfig {
   node_id: string
   label?: string | null
-  merge_mode: 'deterministic' | 'merge_and_extract'
+  merge_mode: 'deterministic' | 'overlap_review' | 'merge_and_extract'
   source_ids: string[]
   source_table_overrides: Record<string, string[]>
   document_ids: string[] | null
@@ -113,6 +114,17 @@ export interface WorkflowMergeNodeState {
   failure_detail?: WorkflowFailureDetail
   merge_counts?: WorkflowMergeCounts
   delta_merge_counts?: WorkflowMergeCounts
+  overlap_review?: {
+    status: string
+    reason?: string | null
+    pattern_count: number
+    reviewed_patterns: number
+    omitted_patterns: number
+    truncated?: boolean
+    selected_patterns: number
+    added_entity_rules: number
+    model_calls: number
+  }
   nodes?: number
   model_calls?: number | null
   edges?: number
@@ -219,7 +231,7 @@ export interface AvailableRetrievalContext {
   }
   truncated?: boolean
 }
-export interface AttributeObservation { business_context?: FactContext; row_context?: { values?: Record<string, unknown> } | null; value: unknown; raw_value?: unknown; original_property?: string; source_id: string; qualified_table: string; column?: string | null; scope_ref?: string; evidence_refs?: string[]; observation_id?: string }
+export interface AttributeObservation { binding_role?: 'attribute_column' | 'dedicated_column' | 'mapping_constant' | 'unlocated'; business_context?: FactContext; row_context?: { values?: Record<string, unknown> } | null; value: unknown; raw_value?: unknown; original_property?: string; source_id: string; qualified_table: string; column?: string | null; scope_ref?: string; evidence_refs?: string[]; observation_id?: string }
 export interface StandardNodeAttribute { observations?: AttributeObservation[]; key: string; label: string; values: unknown[]; data_type: string; origin_tables: StandardNodeAttributeOrigin[] }
 export interface StandardNodeSourceEvidenceField { role: string; field: string; column: string; data_type: string }
 export interface StandardNodeSourceEvidence {
@@ -233,6 +245,7 @@ export interface StandardNodeCatalogNote {
 }
 export interface StandardNode {
   label_variants?: string[]; label_conflict?: boolean
+  source_name?: string | null; source_names?: string[]; preferred_source_name?: string | null; type_family?: string
   id: string; kind: string; status: string; chinese_name: string | null; english_name: string | null
   english_name_status: 'mapped' | 'unknown'; display_name: string; aliases: string[]
   identity: Record<string, unknown>; identity_types: Record<string, string>

@@ -48,8 +48,12 @@ describe('full graph canvas', () => {
     const input = root.querySelector<HTMLInputElement>('[aria-label="搜索图节点"]')!
     input.value = '节点0'; input.dispatchEvent(new Event('input', { bubbles: true })); await nextTick()
     button('节点0 · 状态未提供 ·').click()
-    await vi.waitFor(() => expect(root.textContent).toContain('完整属性按需加载'))
-    expect(root.textContent).not.toContain('此节点先显示精简摘要')
+    await vi.waitFor(() => expect(root.querySelector('.record-properties')).not.toBeNull())
+    const record = root.querySelector<HTMLDetailsElement>('.record-properties')!
+    expect(record.open).toBe(false)
+    record.open = true; record.dispatchEvent(new Event('toggle')); await nextTick()
+    expect(record.textContent).toContain('完整属性按需加载')
+    expect(root.textContent).not.toContain('正在读取完整节点信息')
     expect(api.request.mock.calls.filter(([url]) => url.includes('/details'))).toHaveLength(1)
   })
   it('automatically loads beyond 4000 and shows a complete graph with cross-page edges', async () => {

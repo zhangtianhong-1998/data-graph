@@ -201,6 +201,25 @@ const visibleWorkflowState = computed(() => selectedRun.value?.workflow_state)
 function workflowRelationSummary(node: WorkflowMergeNodeState) {
   const counts = node.delta_merge_counts ?? node.merge_counts
   const lines = []
+  const review = node.overlap_review
+  if (review) {
+    lines.push(`列出 ${review.pattern_count} 种重叠模式，模型审查 ${review.reviewed_patterns} 种、建议合并 ${review.selected_patterns} 种，生效的新规则 ${review.added_entity_rules} 条`)
+    if (review.omitted_patterns) lines.push(`另有 ${review.omitted_patterns} 种模式未送审`)
+    if (review.status === 'skipped' || review.status === 'fallback') {
+      const reasons: Record<string, string> = {
+        no_patterns: '未发现可审查的重叠模式', model_not_configured: '未配置审查模型',
+        model_credentials_unavailable: '未取得模型密钥', mixed_extraction_batches: '抽取结果来自不同批次',
+        inherited_graph: '输入包含已发布图', requires_direct_extract_inputs: '输入含其他合并节点',
+        insufficient_extract_units: '只有一个抽取分支', incomplete_extract_inputs: '上游抽取结果不完整',
+        model_call_budget_exhausted: '模型调用额度已用完', wall_time_budget_exhausted: '审查时间已用完',
+        model_prompt_budget_exhausted: '模式说明超出模型输入上限', invalid_decisions: '模型回复未通过校验',
+        analysis_budget_exceeded: '输入超出模式分析上限', overlap_pattern_policy_conflict: '建议的规则相互冲突',
+        merge_requires_isolation: '采用新规则会隔离来源数据',
+      }
+      const reason = review.reason && (reasons[review.reason] ?? review.reason)
+      lines.push(reason ? `沿用原合并规则（${reason}）` : '沿用原合并规则')
+    }
+  }
   if (counts?.input_edges != null && counts.output_edges != null) {
     const stage = node.delta_merge_counts ? '补充抽取后合并' : '合并'
     lines.push(`${stage}关系记录 ${counts.input_edges} → ${counts.output_edges} 条`)

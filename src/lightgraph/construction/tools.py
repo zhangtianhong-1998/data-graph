@@ -355,10 +355,45 @@ class ConstructionTools:
                     'rename a draft or remove source mappings to claim the full goal is complete. '
                     'Three blocked requests end data exploration and leave two model dispatches for closeout.'}
 
+    def _visible_identity_rules(self, rules):
+        """Only expose complete key bindings available to this extraction unit."""
+        from lightgraph.discovery.goal import column_is_evidence_only
+        visible = []
+        catalog = {(t.source_id, t.schema_name, t.name): t for t in self.tables.values()}
+        for rule in rules:
+            item = rule.model_dump(include={'entity_type', 'canonical_type', 'identity_domain', 'key_mapping'})
+            if rule.source_bindings:
+                bindings = []
+                for binding in rule.source_bindings:
+                    table = catalog.get((binding.source_id, binding.schema_name, binding.table))
+                    if table is None:
+                        continue
+                    keys = binding.key_columns.values()
+                    if all(column in table.column_names and not column_is_evidence_only(self.config.goal, table, column)
+                           for column in keys):
+                        bindings.append(binding.model_dump(mode='json', by_alias=True))
+                if not bindings:
+                    continue
+                item['source_bindings'] = bindings
+            visible.append(item)
+        return visible
+
     def describe_sources(self):
         """Return the authorized physical catalog without inferred business roles."""
+        from .inherited_endpoints import graph_entity_contracts
         titles = {d.document_id: d.title for d in self.documents.documents}
         source_kinds = {s.id: s.kind for s in self.config.sources}
+        rules = self._visible_identity_rules(self.config.fusion_policy.entity_rules)
+        inherited = {}
+        if self.inherited_summary.get('inherited_count'):
+            inherited = {**self.inherited_summary, 'entity_contracts': graph_entity_contracts(self.base_graph)}
+            if 'fusion_policy' in inherited:
+                # The frozen policy applies to the whole project. Only its unit-visible rule
+                # projection belongs in the Agent's catalog; the stored policy stays intact.
+                from lightgraph.runtime.config import FusionPolicyConfig
+                frozen = FusionPolicyConfig.model_validate(inherited['fusion_policy'])
+                inherited['fusion_policy'] = {**inherited['fusion_policy'],
+                    'entity_rules': self._visible_identity_rules(frozen.entity_rules)}
         return {"status": "ok", "goal": goal_descriptor(self.config),
                 "query_budget": self.query_budget.snapshot(),
                 "construction_target": self.config.construction_target,
@@ -380,7 +415,8 @@ class ConstructionTools:
                                    for s in self._sections}.values()),
                 "unavailable_sources": deepcopy(self.initialization_failures),
                 "source_circuits": self.source_circuits.summary(),
-                **({"inherited_graph_summary": self.inherited_summary} if self.inherited_summary.get("inherited_count") else {}),
+                **({"inherited_graph_summary": inherited} if inherited else {}),
+                **({"configured_identity_rules": rules} if rules else {}),
                 "workspace": self.workspace.read_summary()}
 
     def _fact_data_allowed(self, source_id):
@@ -1078,6 +1114,9 @@ class ConstructionTools:
         error = self._evidence_error(record.draft, authorities)
         if error:
             return error
+        inherit_err = self._inheritance_error(record.draft)
+        if inherit_err:
+            return inherit_err
         if mode == 'structure':
             if validation_id is not None:
                 raise LightGraphError('structure_validation_selection_unsupported')
@@ -1140,6 +1179,8 @@ class ConstructionTools:
                 graph = filter_graph_scopes(self.workspace.read_published_graph(), self.config.scopes,
                                             external_visible_ids=self._base_visible_ids)
                 value['statistics'] = graph_statistics(graph)
+                from .inherited_endpoints import graph_entity_contracts
+                value['published_entity_contracts'] = graph_entity_contracts(graph)
             except LightGraphError as exc:
                 if exc.code != 'stale_published_graph':
                     raise
@@ -1179,11 +1220,12 @@ class ConstructionTools:
         return option
 
     def _inheritance_error(self, draft):
-        from .inherited_endpoints import inherited_contract_error, inherited_keys
-        error = inherited_contract_error(draft, inherited_keys(self.base_graph))
+        from .inherited_endpoints import inherited_contract_error, graph_entity_contracts
+        error = inherited_contract_error(draft, graph_entity_contracts(self.base_graph))
         if error:
             return {'status': 'error', 'code': error,
-                    'next_action': 'Use the inherited entity types and ordered key names in inherited_graph_summary.'}
+                    'next_action': '核对 describe_sources 返回的 inherited_graph_summary.entity_contracts。'
+                        '复用类型时沿用完整身份定义；新表的业务属性可单独映射。'}
         return None
 
     def _unavailable_table_source(self, table):

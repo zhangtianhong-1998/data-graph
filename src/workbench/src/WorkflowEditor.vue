@@ -159,7 +159,7 @@ function makeMergeNode(
   return {
     node_id: mid,
     label: label || `合并节点 ${merges.length + 1}`,
-    merge_mode: 'deterministic',
+    merge_mode: 'overlap_review',
     source_ids: [],
     source_table_overrides: {},
     document_ids: null,
@@ -923,7 +923,7 @@ const topologySummary = computed(() => {
                   <strong>{{ mnode.label || mnode.node_id }}</strong>
                 </div>
                 <div class="wf-node-body">
-                  <span class="wf-chip">{{ mnode.merge_mode === 'merge_and_extract' ? '补充跨分支关系' : '自动合并已有结果' }}</span>
+                  <span class="wf-chip">{{ mnode.merge_mode === 'merge_and_extract' ? '补充跨分支关系' : mnode.merge_mode === 'overlap_review' ? '审查分支间的重叠模式' : '按已有规则合并' }}</span>
                 </div>
                 <button
                   type="button"
@@ -1047,9 +1047,10 @@ const topologySummary = computed(() => {
                 :id="`inspector-merge-mode-${selectedMergeIndex}`"
                 :value="current.merge_nodes[selectedMergeIndex]!.merge_mode"
                 :disabled="locked"
-                @change="updateMergeNodeField(selectedMergeIndex, 'merge_mode', ($event.target as HTMLSelectElement).value as 'deterministic' | 'merge_and_extract')"
+                @change="updateMergeNodeField(selectedMergeIndex, 'merge_mode', ($event.target as HTMLSelectElement).value as WorkflowMergeNodeConfig['merge_mode'])"
               >
-                <option value="deterministic">自动合并已有结果</option>
+                <option value="overlap_review">由模型审查重叠模式，再按证据合并</option>
+                <option value="deterministic">按已有规则合并</option>
                 <option value="merge_and_extract">合并后用模型补充跨分支关系</option>
               </select>
             </div>

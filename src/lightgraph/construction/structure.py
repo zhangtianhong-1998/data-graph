@@ -11,7 +11,7 @@ from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler
 from .access import scope_binding_map
 from .executor import _projection_columns
-from .inherited_endpoints import inherited_contract_error, inherited_keys
+from .inherited_endpoints import inherited_contract_error, graph_entity_contracts
 from .models import GraphDraft
 from .metadata_columns import is_metadata_mapping, metadata_endpoint, mapping_predicate, checked_column
 from .quality import name_mapping_advice
@@ -23,7 +23,7 @@ def validate_structure(draft, tables, *, goal=None, dialects=None, scope_binding
                                      if isinstance(draft, GraphDraft) else draft)
     catalog = {(t.source_id, t.schema_name, t.name): t for t in tables}
     visibility = scope_binding_map(scope_bindings)
-    base_types = inherited_keys(base_graph)
+    base_types = graph_entity_contracts(base_graph)
     diagnostics, bindings = [], []
     error = inherited_contract_error(draft, base_types)
     if error:

@@ -38,9 +38,10 @@ class SourceMapping(StrictModel):
     schema_name: str = Field(default="public", alias="schema")
     predicate: dict[str, Any] | None = Field(default=None,
         description='Typed Predicate/1.0 filter: is_not_null/is_null have no value, ne uses value; logical all/any/not (and alias). Read reference:predicate-guide.md. No raw SQL.')
-    properties: dict[str, str] = Field(default_factory=dict, max_length=128)
+    properties: dict[str, str] = Field(default_factory=dict, max_length=128,
+        description='Business property name -> physical column carrying the value in this table. Omit a property when this table does not provide it; another mapping may supply it.')
     constant_properties: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=32,
-        description='Agent-declared mapping annotations, such as the observed slot or endpoint positions. Not identity keys or source-verified values.')
+        description='Agent-declared mapping annotations, distinct from source values. Source table, key columns, and endpoint columns are already recorded in provenance.')
     context_columns: list[str] = Field(default_factory=list, max_length=32,
         description='Authorized columns that identify a source-row context shared across mappings. Retained on each support, never added to entity identity. Use the same column set for related mappings.')
     # Existing snapshots and draft fingerprints use business_context on output.
@@ -234,7 +235,7 @@ class GraphDraft(StrictModel):
     extends_base_graph: bool = Field(default=False,
         description="Whether this incremental draft references entity types inherited from a frozen base graph.")
     inherited_entity_types: list[str] = Field(default_factory=list, max_length=128,
-        description="Explicitly inherited entity type names available as relation endpoints without re-scanning old sources.")
+        description="Explicitly reused frozen types. They can be relation endpoints or receive new property mappings under their existing identity contract. See inherited_graph_summary.entity_contracts.")
     inherited_entity_key_arities: dict[str, int] = Field(default_factory=dict, max_length=128,
         description="Optional expected identity key arity per inherited entity type.")
     entities: list[EntityDefinition] = Field(default_factory=list, max_length=128)
