@@ -348,6 +348,24 @@ describe('业务图来源与归并裁决', () => {
     evidence.open = true; evidence.dispatchEvent(new Event('toggle')); await nextTick()
     expect(root.querySelector('.graph-detail')?.textContent).toContain('候选'); expect(root.textContent).toContain('doc:family'); expect(root.textContent).toContain('字段映射与语义依据')
   })
+  it('关联面板按节点编号分组，同名不同节点独立、相反方向的关系分别可查', async () => {
+    mount(GraphCanvas, { layer: 'business', graph: {
+      nodes: [{ id: 'a', label: '上级' }, { id: 'b', label: '子项' }, { id: 'c', label: '子项' }],
+      edges: [{ id: 'e1', source: 'a', target: 'b', relation: 'parent' },
+        { id: 'e2', source: 'b', target: 'a', relation: 'member' },
+        { id: 'e3', source: 'a', target: 'c', relation: 'parent' }],
+    } })
+    root.querySelector('.graph-node')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await nextTick()
+    expect(root.querySelectorAll('.neighbor-relations')).toHaveLength(2)
+    const group = root.querySelector<HTMLDetailsElement>('details.neighbor-relations')!
+    expect(group.querySelector('summary')?.textContent).toContain('子项 · 2 条关系')
+    expect(group.querySelectorAll('button')).toHaveLength(0)
+    group.open = true; group.dispatchEvent(new Event('toggle')); await nextTick()
+    expect([...group.querySelectorAll('button p')].map(p => p.textContent)).toEqual(['上级 → 子项', '子项 → 上级'])
+    group.querySelectorAll('button')[1]!.click(); await nextTick()
+    expect(root.querySelector('.relation-endpoints')?.textContent).toBe('子项 → 上级')
+  })
   it('关联列表一次读取页外端点名称，属性与来源默认按表展示，技术ID可展开', async () => {
     const edge = { source: 'long_source_hash', target: 'long_target_hash', relation: 'custom_relation', qualifiers: { source_level: 1, target_level: 2 } }
     api.request.mockResolvedValue({

@@ -13,6 +13,7 @@ import unicodedata
 from lightgraph.construction.fusion import definition_contract
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
+from .hierarchy_bindings import mapped_direction, corroborated_level_keys
 
 # LIMIT caps returned routes, but sorting a dense two-hop join can take
 # quadratic work before LIMIT is applied. Bound SQLite VM work as well.
@@ -266,33 +267,43 @@ class SQLiteGraphIndex:
                 tokens * 3))
 
     def authorized_hierarchies(self, scopes):
+        return self.hierarchy_directions(scopes)[0]
+
+    def hierarchy_directions(self, scopes, *, anchor=None):
         """Return directions only for type signatures with a visible edge and visible endpoints."""
         tokens = sorted(set(scopes))
         if not tokens:
-            return {}
+            return {}, {}
         marks = ','.join('?' for _ in tokens)
         orientations_by_signature = defaultdict(set)
         with closing(self._connect()) as conn:
             # Existing immutable format-5 indexes predate orientation metadata.
             has_semantics = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE name='kg_relation_semantics'").fetchone()
+            if anchor is not None and not has_semantics:
+                raise LightGraphError('retrieval_index_stale')
             field = 'sem.orientation' if has_semantics else 'NULL'
             join = (' LEFT JOIN kg_relation_semantics sem ON sem.rel_type=e.rel_type '
                     'AND sem.src_kind=a.kind AND sem.dst_kind=b.kind') if has_semantics else ''
+            incident = ' WHERE e.src_id=? OR e.dst_id=?' if anchor is not None else ''
             rows = conn.execute(
                 f'SELECT DISTINCT a.kind, e.rel_type, b.kind, {field} FROM ({self._authorized_edges_sql(marks)}) e '
-                f'JOIN kg_nodes a ON a.node_id=e.src_id JOIN kg_nodes b ON b.node_id=e.dst_id{join}',
-                tokens * 3)
+                f'JOIN kg_nodes a ON a.node_id=e.src_id JOIN kg_nodes b ON b.node_id=e.dst_id{join}{incident}',
+                tokens * 3 + ([anchor, anchor] if anchor is not None else []))
             for src, rel, dst, orientation in rows:
                 orientations_by_signature[src, rel, dst].add(orientation)
-        result = {}
+        result, mapped = {}, {}
         for signature, orientations in orientations_by_signature.items():
             if orientations == {None} or orientations == {'undeclared'}:
                 # Compatibility for the explicit legacy parent/child predicates.
                 # Generic containment, prose labels, and acyclic topology don't
                 # distinguish classification, composition and other associations.
                 legacy = signature[1].casefold().replace('-', '_').replace(' ', '_')
-                if legacy in {'has_child', 'has_children', 'parent_of'}:
+                if anchor is not None:
+                    flow = mapped_direction(signature[1])
+                    if orientations == {'undeclared'} and flow:
+                        mapped[signature] = flow
+                elif legacy in {'has_child', 'has_children', 'parent_of'}:
                     orientations = {'parent_to_child'}
                 elif legacy in {'child_of', 'has_parent'}:
                     orientations = {'child_to_parent'}
@@ -300,7 +311,7 @@ class SQLiteGraphIndex:
                 result[signature] = 'outgoing'
             elif orientations == {'child_to_parent'}:
                 result[signature] = 'incoming'
-        return result
+        return result, mapped
 
     def authorized_relations(self, scopes):
         tokens = sorted(set(scopes))
@@ -687,6 +698,7 @@ class SQLiteGraphIndex:
         preferred_neighbor_ids: Sequence[str] = (),
         allowed_neighbor_ids: Sequence[str] | None = None,
         hierarchies: dict[tuple[str, str, str], str] | None = None,
+        mapped_hierarchies: dict[tuple[str, str, str], str] | None = None,
     ) -> dict[str, Any]:
         scope_list = sorted({str(s) for s in scopes})
         if not seed_ids or not scope_list:
@@ -711,6 +723,8 @@ class SQLiteGraphIndex:
         visited_expanded: set[str] = set()
 
         with closing(self._connect()) as conn:
+            if mapped_hierarchies:
+                conn.create_function('corroborated_level_keys', 2, corroborated_level_keys, deterministic=True)
             for hop in range(1, hops + 1):
                 if not frontier:
                     break
@@ -751,13 +765,19 @@ class SQLiteGraphIndex:
                         # Select the exact typed predicate and its parent endpoint
                         # before limits, including when successive levels reverse
                         # their physical edge orientation.
-                        signatures = [key for key, orientation in hierarchies.items() if orientation == flow]
-                        condition += """ AND (
+                        typed_predicate = """(
                             (SELECT kind FROM kg_nodes WHERE node_id=src_id), rel_type,
                             (SELECT kind FROM kg_nodes WHERE node_id=dst_id)
                         ) IN (SELECT json_extract(value,'$[0]'), json_extract(value,'$[1]'),
                                     json_extract(value,'$[2]') FROM json_each(?))"""
-                        frontier_params.append(json.dumps(signatures))
+                        predicates = [typed_predicate]
+                        frontier_params.append(json.dumps([key for key in hierarchies if hierarchies[key] == flow]))
+                        if mapped_hierarchies:
+                            predicates.append(f'({typed_predicate} AND corroborated_level_keys(rel_type, observations_json))')
+                            frontier_params.append(json.dumps([key for key in mapped_hierarchies if mapped_hierarchies[key] == flow]))
+                        condition += ' AND (' + ' OR '.join(predicates) + ')'
+                        if mapped_hierarchies is not None:
+                            condition += ' AND src_id != dst_id'
                     frontier_tests.append(f'({condition})')
                 frontier_sql = ' OR '.join(frontier_tests)
                 priority_sql, priority_params = '', []

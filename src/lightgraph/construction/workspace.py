@@ -585,7 +585,8 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False, identi
     """Combine independently checked subgraphs without silently replacing facts."""
     from lightgraph.source_values import persisted_identity_key
     from .fusion import (merge_definition, deduplicate_supports, stamp_execution,
-                         retain_definition_variants, definition_conflict_diagnostics, remap_graph_endpoints)
+                         retain_definition_variants, definition_conflict_diagnostics, edge_reference, record_input_edge,
+                         remap_graph_endpoints)
     from .observed_identity import align_draft_nodes
     # A noisy independent draft keeps its own definition and facts. Never mutate
     # the validated publication, whose digest remains part of the audit trail.
@@ -603,6 +604,7 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False, identi
                          if edge['source'] in blocked or edge['target'] in blocked}
         graphs = [exclude_nodes(graph, blocked) for graph in graphs]
         raw_ids = [[node['id'] for node in graph.get('nodes', [])] for graph in graphs]
+    input_edges = [[edge_reference(e) for e in g.get('edges', ())] for g in graphs]
     if fusion_policy and fusion_policy.entity_rules:
         from .fusion import prepare_graph
         graphs = [prepare_graph(graph, fusion_policy, copy=False) for graph in graphs]
@@ -640,6 +642,10 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False, identi
             for node in graph.get('nodes', []):
                 node['id'] = remap.get(node['id'], node['id'])
             remap_graph_endpoints(graph, remap, self_contained=False)
+    for graph, originals in zip(graphs, input_edges, strict=True):
+        owner = {k: graph[k] for k in ('draft_id', 'draft_revision', 'validation_id') if k in graph}
+        for edge, original in zip(graph.get('edges', ()), originals, strict=True):
+            record_input_edge(edge, original, input_kind='draft', **owner)
     result = {'format_version': 1, 'target': 'graph', 'status': 'published',
               **({'extends_base_graph': True} if any(g.get('extends_base_graph') for g in graphs) else {}),
               'semantic_origin': 'agent_authored', 'definitions': {'entities': [], 'relations': []},

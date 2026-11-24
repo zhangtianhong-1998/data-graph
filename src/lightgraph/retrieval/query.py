@@ -23,7 +23,7 @@ class Condition(BaseModel):
 class RetrieveSubgraphRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', hide_input_in_errors=True)
 
-    mode: Literal['search', 'drilldown', 'auto', 'dimensional', 'traverse'] = 'search'
+    mode: Literal['search', 'drilldown', 'auto', 'dimensional', 'traverse', 'hierarchy'] = 'search'
     query: str = Field(default='', max_length=4000)
     node_id: str | None = Field(default=None, min_length=1, max_length=512)
     field: Literal['all', 'name', 'description'] = 'all'
@@ -38,6 +38,7 @@ class RetrieveSubgraphRequest(BaseModel):
     max_edges: int = Field(default=150, ge=1, le=1000)
     seed_ids: list[Annotated[str, Field(min_length=1, max_length=512)]] = Field(default_factory=list, max_length=32)
     target_id: str | None = Field(default=None, min_length=1, max_length=512)
+    hierarchy_direction: Literal['children', 'parents'] = 'children'
     target_kind: str | None = Field(default=None, min_length=1, max_length=256)
     direction: Literal['outgoing', 'incoming', 'both'] = 'outgoing'
     relation_types: list[Annotated[str, Field(min_length=1, max_length=512)]] = Field(default_factory=list, max_length=64)
@@ -68,6 +69,13 @@ class RetrieveSubgraphRequest(BaseModel):
     @model_validator(mode='after')
     def validate_lookup(self):
         options = self.model_fields_set
+        if self.mode == 'hierarchy':
+            if (bool(self.query.strip()) == bool(self.node_id) or options - {
+                    'mode', 'query', 'node_id', 'business_context', 'hierarchy_direction', 'max_nodes', 'max_edges'}):
+                raise ValueError('hierarchy_requires_one_anchor')
+            return self
+        if 'hierarchy_direction' in options:
+            raise ValueError('hierarchy_direction_requires_hierarchy_mode')
         if self.include_endpoint_variants and not self.relation_types:
             raise ValueError('endpoint_variants_require_relation_types')
         ranking = {'field', 'method', 'top_n'}
@@ -111,6 +119,18 @@ class RetrieveSubgraphRequest(BaseModel):
         return self
 
     def run(self, retriever, scopes):
+        if self.mode == 'hierarchy':
+            from .direct_hierarchy import retrieve_hierarchy
+            return retrieve_hierarchy(retriever, self, scopes, term=self.query.strip(), direction=self.hierarchy_direction)
+        if self.mode == 'auto':
+            from .direct_hierarchy import hierarchy_question, retrieve_hierarchy
+            question = hierarchy_question(self.query)
+            if question:
+                cohorts = retriever.authorized_cohorts(scopes, self.business_context)
+                names = retriever.index.exact_names([self.query], scopes=cohorts, limit_per_term=1, include_codes=True)
+                if not any(names.values()):
+                    term, direction = question
+                    return retrieve_hierarchy(retriever, self, scopes, term=term, direction=direction)
         if self.mode in {'auto', 'dimensional'} or (self.mode == 'traverse' and not self.seed_ids):
             from .planned import retrieve_planned
             return retrieve_planned(retriever, self, scopes)
@@ -126,7 +146,7 @@ class RetrieveSubgraphRequest(BaseModel):
                 max_nodes=self.max_nodes, max_edges=self.max_edges)
         if self.mode == 'drilldown':
             from .drilldown import retrieve_drilldown
-            options = self.model_dump(exclude={'mode', 'target_kind', 'node_id', 'hops', 'top_p_seeds', 'max_per_rel', 'hub_degree_limit', 'conditions', 'drill_role', 'relation_types', 'include_endpoint_variants'})
+            options = self.model_dump(exclude={'mode', 'hierarchy_direction', 'target_kind', 'node_id', 'hops', 'top_p_seeds', 'max_per_rel', 'hub_degree_limit', 'conditions', 'drill_role', 'relation_types', 'include_endpoint_variants'})
             return retrieve_drilldown(retriever, scopes=scopes, relation_types=relations, **options)
-        options = self.model_dump(exclude={'mode', 'target_kind', 'seed_ids', 'target_id', 'direction', 'relation_types', 'max_depth', 'conditions', 'drill_role', 'include_endpoint_variants'})
+        options = self.model_dump(exclude={'mode', 'hierarchy_direction', 'target_kind', 'seed_ids', 'target_id', 'direction', 'relation_types', 'max_depth', 'conditions', 'drill_role', 'include_endpoint_variants'})
         return retriever.retrieve(scopes=scopes, **options)

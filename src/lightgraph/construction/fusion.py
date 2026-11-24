@@ -54,6 +54,29 @@ def relation_identity(edge):
     return 'r_' + digest(*parts)
 
 
+def edge_reference(edge):
+    return {'edge_id': edge['id'], 'type': edge['type'], 'source': edge['source'], 'target': edge['target']}
+
+
+def _add_endpoint_origin(support, origin):
+    origins = support.setdefault('endpoint_origins', [])
+    if isinstance(origins, dict):
+        # Older observations can carry a single endpoint address.
+        origins = support['endpoint_origins'] = [origins]
+    if origin not in origins:
+        origins.append(origin.copy())
+
+
+def record_input_edge(edge, original, **owner):
+    """Bind each rewritten support to the edge as supplied at this merge boundary."""
+    if (edge['id'], edge['type'], edge['source'], edge['target']) == (
+            original['edge_id'], original['type'], original['source'], original['target']):
+        return
+    origin = {**original, **owner}
+    for support in edge.get('supports', ()):
+        _add_endpoint_origin(support, origin)
+
+
 def remap_graph_endpoints(graph, remap, *, self_contained, record_fusion=False):
     """Rewrite local references and keep inherited lookups in their base namespace."""
     if not remap:
@@ -83,25 +106,27 @@ def remap_graph_endpoints(graph, remap, *, self_contained, record_fusion=False):
             if old[0] != old[1] and edge['source'] == edge['target'] and not relations.get(edge['type'], {}).get('allow_self_links'):
                 raise LightGraphError('self_link_forbidden')
             for support in edge.get('supports', []):
-                support.setdefault('endpoint_origins', []).append({
-                    'edge_id': edge['id'], 'type': edge['type'], 'source': old[0], 'target': old[1]})
+                _add_endpoint_origin(support, {'edge_id': edge['id'], 'type': edge['type'],
+                                               'source': old[0], 'target': old[1]})
         edge['id'] = relation_identity(edge)
 
 
 def mark_relation_meanings(graphs):
     """Preserve distinct source explanations until the relation definitions have been aligned."""
-    relation_families = defaultdict(list)
+    contracts = defaultdict(list)
     for graph in graphs:
         for relation in graph.get('definitions', {}).get('relations', []):
-            relation_families[relation.get('original_type') or relation['type']].append(relation)
-    distinct_meanings = set()
-    for family, relations in relation_families.items():
+            # Already distinct endpoint contracts do not need a second qualifier
+            # derived from wording. Keep their published structural fingerprints.
+            structural = {k: v for k, v in relation.items() if k != 'relation_meaning_digest'}
+            contracts[canonical(definition_contract(structural))].append(relation)
+    for relations in contracts.values():
         descriptions = [' '.join((r.get('description') or '').split()) for r in relations]
         if len(set(descriptions) - {''}) > 1 or any('relation_meaning_digest' in r for r in relations):
-            distinct_meanings.add(family)
             for relation, description in zip(relations, descriptions, strict=True):
-                relation['relation_meaning_digest'] = digest(description)
-    return distinct_meanings
+                # A qualified publication still owns this meaning when its
+                # display text is later abbreviated or omitted.
+                relation.setdefault('relation_meaning_digest', digest(description))
 
 
 def retain_definition_variants(graphs, *, self_contained=None):
@@ -113,8 +138,9 @@ def retain_definition_variants(graphs, *, self_contained=None):
     """
     self_contained = self_contained or [True] * len(graphs)
     remaps = [{} for _ in graphs]
-    distinct_meanings = mark_relation_meanings(graphs)
     for category, item_key in (('entities', 'nodes'), ('relations', 'edges')):
+        if category == 'relations':
+            mark_relation_meanings(graphs)
         families = defaultdict(set)
         already_qualified = set()
         name_owners = defaultdict(set)
@@ -177,12 +203,6 @@ def retain_definition_variants(graphs, *, self_contained=None):
                         item['id'] = variant_id
                     remaps[index][previous_id] = item['id']
                 elif category == 'relations' and previous_type != variant_type:
-                    if family in distinct_meanings:
-                        origin = {'edge_id': item['id'], 'type': previous_type,
-                                  'source': item['source'], 'target': item['target']}
-                        for support in item.get('supports', []):
-                            if origin not in support.setdefault('endpoint_origins', []):
-                                support['endpoint_origins'].append(dict(origin))
                     item['id'] = relation_identity(item)
             if category == 'relations':
                 for pending in graph.get('unresolved_relations', []):
@@ -456,6 +476,14 @@ def deduplicate_supports(item):
         observed = dict(support)
         for key in ('contributor_id', 'evidence_refs', 'execution_origins', 'observation_id', 'identity_origins', 'validation_origin', 'label_authority', 'label_priority'):
             observed.pop(key, None)
+        # A checkpoint address is lineage of an observation, not data from its row.
+        # Ignore the newly attached input references when identifying observations;
+        # retain the original behavior of legacy, unqualified endpoint histories.
+        if isinstance(observed.get('endpoint_origins'), list):
+            observed['endpoint_origins'] = [{k: v for k, v in o.items() if k != 'stage'}
+                                           for o in observed['endpoint_origins'] if 'input_kind' not in o]
+            if not observed['endpoint_origins']:
+                observed.pop('endpoint_origins')
         # A normalizer can map two raw codes in one table to a single key.
         # Their raw source rows are separate observations even when their names agree.
         raw_keys = [origin.get('identity') for origin in support.get('identity_origins', [])]
@@ -474,10 +502,13 @@ def deduplicate_supports(item):
         for origin in support.get('identity_origins', []):
             if origin not in target.setdefault('identity_origins', []):
                 target['identity_origins'].append(origin)
+        if isinstance(support.get('endpoint_origins'), list):
+            for origin in support['endpoint_origins']:
+                _add_endpoint_origin(target, origin)
         for where in (None, 'provenance'):
             src = support if where is None else support.get(where, {})
-            dst = target if where is None else target.setdefault(where, {})
             if 'evidence_refs' in src:
+                dst = target if where is None else target.setdefault(where, {})
                 dst['evidence_refs'] = sorted(set(dst.get('evidence_refs', [])) | set(src['evidence_refs']))
     for target in collected.values():
         target['execution_origins'].sort(key=canonical)

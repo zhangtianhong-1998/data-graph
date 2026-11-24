@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import PropertyTable from './PropertyTable.vue'
 import TechnicalDetails from './TechnicalDetails.vue'
 import { metadataRelationValues, nodeCaption, nodeIdentity, nodeProperties, supportOriginName, vocabularyDescription, vocabularyLabel } from './graphLabels'
@@ -84,12 +84,30 @@ const labelOrigin = (node: GraphNode) => ({
 
 const accessLabel = (node: GraphNode) => Array.isArray(node.scopes) ? node.scopes.join('、') : ''
 
+const canvasNodes = computed(() => new Map(props.allNodes.map(node => [node.id, node])))
 const endpointName = (id: unknown) => {
   const key = String(id || '')
-  const node = props.detailNodes[key] || props.allNodes.find(item => item.id === key)
+  const node = props.detailNodes[key] || canvasNodes.value.get(key)
   return node ? nodeCaption(node) : '节点名称尚未加载'
 }
 
+const neighborGroups = computed(() => {
+  const groups = new Map<string, GraphEdge[]>()
+  for (const edge of props.adjacent) {
+    const other = edge.source === props.selected.id ? edge.target : edge.source
+    const group = groups.get(other)
+    if (group) group.push(edge)
+    else groups.set(other, [edge])
+  }
+  return [...groups].map(([id, edges]) => ({ id, edges }))
+})
+const neighborLimit = ref(40)
+const expandedNeighbors = ref(new Map<string, number>())
+function toggleNeighbor(id: string, event: Event) {
+  if ((event.currentTarget as HTMLDetailsElement).open) expandedNeighbors.value.set(id, 40)
+  else expandedNeighbors.value.delete(id)
+}
+watch(() => props.selected.id, () => { neighborLimit.value = 40; expandedNeighbors.value.clear() })
 const factTitle = (fact: FactItem) => fact.fact_kind === 'PropertyValue' ? propertyName(String(fact.payload.name || '')) : fact.fact_kind === 'Edge' ? relationName(fact.payload.relation) : fact.fact_kind === 'UnresolvedRelation' ? '待确认关系' : '对象存在'
 const visibleQualifiers = (value: unknown) => Object.fromEntries(Object.entries((value || {}) as Record<string, unknown>).filter(([key]) => !['semantic_basis', 'document_ref', 'source_group'].includes(key)))
 const contextValues = (value: unknown) => { const c = value as { status?: string; dimensions?: Record<string, unknown> } | undefined; return !c || c.status === 'unknown' ? { '适用范围': '尚未确认' } : c.status === 'global' ? { '适用范围': '通用知识' } : { '适用范围': c.dimensions } }
@@ -228,7 +246,7 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
     </section>
 
     <div class="divider"></div>
-    <h3>已加载关联 · {{ adjacent.length }}</h3>
+    <h3>已加载关联 · {{ neighborGroups.length }} 个对象 / {{ adjacent.length }} 条关系</h3>
     <p class="field-hint" aria-label="节点关联范围">
       当前画布显示 {{ drawnIncidentEdges }} 条相连关系<template v-if="knownIncidentEdges != null">，当前授权图中共有 {{ knownIncidentEdges }} 条</template><template v-else>；完整关系数量尚未读取</template>。<template v-if="knownIncidentEdges == null || drawnIncidentEdges < knownIncidentEdges">当前是局部视图，不能据此判断节点孤立。</template>
     </p>
@@ -236,11 +254,19 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
     <button v-if="serverPaging && !fullTransport && !hasNeighborhood" class="btn small" :disabled="pageLoading || expansionOffset === null" @click="emit('expandNode')">
       {{ hasExpansionOffset ? '继续展开关联' : '展开相邻节点' }}
     </button>
-    <button v-for="(edge, i) in adjacent.slice(0, 40)" :key="i" type="button" class="edge-detail relation-selection" @click="emit('selectEdge', edge)">
-      <span class="badge" :title="relationDescription(edge.relation)">{{ relationName(edge.relation) }} · {{ statusName(edge.status) }}</span>
-      <p>{{ endpointName(edge.source) }} → {{ endpointName(edge.target) }}</p>
-    </button>
-    <p v-if="adjacent.length > 40" class="muted small-text">仅展示前 40 条关系；来源详情按事实分页读取。</p>
+    <component v-for="group in neighborGroups.slice(0, neighborLimit)" :key="`${selected.id}:${group.id}`" @toggle.self="toggleNeighbor(group.id, $event)"
+      :is="group.edges.length > 1 ? 'details' : 'div'" class="neighbor-relations">
+      <summary v-if="group.edges.length > 1">
+        {{ endpointName(group.id) }} · {{ group.edges.length }} 条关系
+      </summary>
+      <button v-for="(edge, i) in group.edges.slice(0, group.edges.length === 1 ? 1 : expandedNeighbors.get(group.id) || 0)" :key="edge.id || i" type="button" class="edge-detail relation-selection" @click="emit('selectEdge', edge)">
+        <span class="badge" :title="relationDescription(edge.relation)">{{ relationName(edge.relation) }} · {{ statusName(edge.status) }}</span>
+        <p>{{ endpointName(edge.source) }} → {{ endpointName(edge.target) }}</p>
+      </button>
+      <button v-if="expandedNeighbors.has(group.id) && group.edges.length > expandedNeighbors.get(group.id)!" class="btn small"
+        @click="expandedNeighbors.set(group.id, expandedNeighbors.get(group.id)! + 40)">查看更多关系</button>
+    </component>
+    <button v-if="neighborGroups.length > neighborLimit" class="btn small" @click="neighborLimit += 40">查看更多关联对象</button>
 
     <section v-if="projectId" aria-label="来源支持">
       <div class="divider"></div>
@@ -300,6 +326,7 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
 </template>
 
 <style scoped>
+.neighbor-relations summary { cursor: pointer; padding: 10px 0; overflow-wrap: anywhere; }
 .relation-selection { display: block; width: 100%; text-align: left; background: transparent; color: inherit; cursor: pointer; border: 0; }
 .fact-detail { padding: 12px 0; border-bottom: 1px solid var(--border, #e2e8f0); }
 .relation-endpoints { overflow-wrap: anywhere; line-height: 1.7; }

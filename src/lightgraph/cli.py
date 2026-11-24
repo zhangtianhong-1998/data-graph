@@ -61,7 +61,7 @@ def parser():
     c.add_argument('config')
     c.add_argument('query', nargs='?')
     c.add_argument('--sync', action='store_true', help='先更新当前图谱的检索索引')
-    c.add_argument('--mode', choices=('search', 'drilldown', 'auto', 'dimensional', 'traverse'))
+    c.add_argument('--mode', choices=('search', 'drilldown', 'auto', 'dimensional', 'traverse', 'hierarchy'))
     c.add_argument('--field', choices=('all', 'name', 'description'))
     c.add_argument('--method', choices=('hybrid', 'keyword', 'vector'))
     c.add_argument('--node-id', help='精确查找节点，配合 --hops 可展开邻域')
@@ -74,6 +74,7 @@ def parser():
     c.add_argument('--include-endpoint-variants', action='store_true', default=None,
                    help='按原关系名查询时，包含因端点类型改变而生成的同一关系的分支')
     c.add_argument('--direction', choices=('incoming', 'outgoing', 'both'))
+    c.add_argument('--hierarchy-direction', choices=('parents', 'children'), help='查看指定节点的直接上级或下级')
     c.add_argument('--target-id')
     c.add_argument('--target-kind', help='多层关联路径的目标节点类型')
     for option in ('hops', 'top-n', 'top-p-seeds', 'max-depth', 'max-nodes', 'max-edges',

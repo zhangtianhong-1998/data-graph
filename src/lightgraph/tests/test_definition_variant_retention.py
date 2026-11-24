@@ -324,3 +324,89 @@ def test_context_disjoint_relationships_do_not_create_a_false_cross_draft_cycle(
     graph = merge_construction_graphs(contributors(a, b), merge_policy={'shared_entity_types': ['Item']})
     assert len(graph['edges']) == 2
     assert graph['conflict_isolation']['edges'] == 0
+
+
+def test_description_changes_on_distinct_endpoint_contracts_keep_branch_ids_and_input_edges():
+    """A historical snapshot already distinguished the two endpoint contracts."""
+    a, b = branch(), branch(label_kind='derived')
+    inputs = contributors(a, b)
+    policy = {'shared_entity_types': ['Item', 'Shared']}
+    history = merge_construction_graphs(inputs, merge_policy=policy)
+    a['definitions']['relations'][0]['description'] = 'Catalogue entry lists a section'
+    b['definitions']['relations'][0]['description'] = 'A derived entry lists a section'
+    replay = merge_construction_graphs(inputs, merge_policy=policy)
+
+    def identities(graph):
+        return {e['id']: (e['type'], e['source'], e['target'], e['definition_variant']['contract_digest'])
+                for e in graph['edges']}
+
+    assert identities(replay) == identities(history)
+    assert len(identities(replay)) == 2
+    assert len({r['description'] for r in replay['definitions']['relations']}) == 2
+    assert replay == merge_construction_graphs(inputs[::-1], merge_policy=policy)
+    assert identities(merge_construction_graphs([{'kind': 'merged', 'contributor_id': 'previous',
+                                                  'graph': replay}])) == identities(replay)
+    for edge in replay['edges']:
+        support, = edge['supports']
+        origin, = support['endpoint_origins']
+        assert origin == {'edge_id': 'relation', 'source': 'item', 'target': 'shared', 'type': 'contains',
+                          'input_kind': 'unit', 'contributor_id': support['contributor_id']}
+
+
+def test_checkpoint_origins_survive_support_deduplication_without_splitting_the_observation():
+    a, b = branch(), branch()
+    a['edges'][0]['id'] = 'old-edge-a'
+    b['edges'][0]['id'] = 'old-edge-b'
+    # Both old checkpoints store this one scoped fact under different local IDs.
+    for graph in (a, b):
+        context = {'version': 1, 'status': 'scoped', 'dimensions': {'quarter': 'Q1'},
+                   'value_types': {'quarter': 'text'}}
+        graph['edges'][0]['business_context'] = context
+        graph['edges'][0]['supports'][0]['business_context'] = deepcopy(context)
+    policy = {'shared_entity_types': ['Item', 'Shared'], 'fusion_policy': {'entity_rules': []}}
+    merged = merge_construction_graphs(contributors(a, b), merge_policy=policy)
+    edge, = merged['edges']
+    support, = edge['supports']
+    assert {(origin['contributor_id'], origin['edge_id']) for origin in support['endpoint_origins']} == {
+        ('a', 'old-edge-a'), ('b', 'old-edge-b')}
+    assert {e['contributor_id'] for e in support['execution_origins']} == {'a', 'b'}
+    frozen = merge_construction_graphs([{'kind': 'merged', 'contributor_id': 'previous', 'graph': merged}],
+                                       merge_policy=policy)
+    assert frozen['edges'] == merged['edges']
+
+
+def test_retype_without_endpoint_change_traces_each_input_in_draft_and_workflow_merge():
+    a, b = branch(), branch(relation_acyclic=True)
+    for source, graph in (('a', a), ('b', b)):
+        graph.update(draft_id=source, draft_revision=1)
+        with_source_keys(graph)
+        graph['edges'][0]['id'] = 'original-' + source
+    policy = {'shared_entity_types': ['Item', 'Shared']}
+    workflow = merge_construction_graphs(contributors(a, b), merge_policy=policy)
+    published = _merge_graphs([a, b])
+    for graph, kind in ((workflow, 'unit'), (published, 'draft')):
+        assert len(graph['edges']) == 2
+        for edge in graph['edges']:
+            support, = edge['supports']
+            origin, = support['endpoint_origins']
+            owner = origin['contributor_id'] if kind == 'unit' else origin['draft_id']
+            assert origin['input_kind'] == kind
+            assert (origin['source'], origin['target']) == (edge['source'], edge['target']) == ('item', 'shared')
+            assert edge['type'] != origin['type'] == 'contains'
+            assert origin['edge_id'] == 'original-' + owner
+
+
+def test_previously_qualified_relation_meanings_survive_omitted_display_text():
+    a, b = branch(), branch()
+    a['definitions']['relations'][0]['description'] = 'Item owns the section'
+    b['definitions']['relations'][0]['description'] = 'Item cites the section'
+    policy = {'shared_entity_types': ['Item', 'Shared']}
+    merged = merge_construction_graphs(contributors(a, b), merge_policy=policy)
+    published = deepcopy(merged)
+    for relation in published['definitions']['relations']:
+        del relation['description']
+    repeated = merge_construction_graphs([{'kind': 'merged', 'contributor_id': 'previous', 'graph': published}],
+                                         merge_policy=policy)
+    assert len(repeated['edges']) == 2
+    assert repeated['definitions']['relations'] == published['definitions']['relations']
+    assert repeated['edges'] == published['edges']

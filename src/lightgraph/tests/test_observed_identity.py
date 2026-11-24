@@ -31,6 +31,19 @@ def test_legacy_candidate_without_member_ids_omits_unknown_counts():
     assert identity_candidate_node_counts({'candidate_identity_merges': [{'label': '旧候选'}]}) == {}
 
 
+@pytest.mark.parametrize(('endpoints', 'expected'), [
+    ([], (0, 0, 0, 0, 0)),
+    ([('p', 'c'), ('p', 'c'), ('p', 'c'), ('c', 'p'), ('x', 'x'), ('x', 'x')], (6, 3, 2, 3, 2)),
+])
+def test_merge_counts_report_directed_endpoint_pairs_per_edge_record(endpoints, expected):
+    graph = {'nodes': [], 'edges': [{'id': str(i), 'type': str(i), 'source': source, 'target': target,
+                                     'supports': [{}, {}]} for i, (source, target) in enumerate(endpoints)]}
+    counts = merge_accounting([], graph)
+    keys = ('output_edges', 'output_directed_endpoint_pairs', 'output_multi_edge_pairs',
+            'output_endpoint_pair_excess', 'output_self_loop_edges')
+    assert tuple(counts[key] for key in keys) == expected
+
+
 def test_overlapping_identity_candidates_count_members_once_in_run_and_publication(tmp_path):
     from lightgraph.construction.workflow import publish_premerged_graph
     from lightgraph.construction.workspace import read_internal_yaml
@@ -71,6 +84,8 @@ def test_alias_replay_combines_typed_source_facts_and_rewires_edges():
     assert result['candidate_identity_merges'] == []
     assert merge_accounting(graphs, result) == {
         'input_nodes': 4, 'input_edges': 2, 'output_nodes': 2, 'output_edges': 1,
+        'output_directed_endpoint_pairs': 1, 'output_multi_edge_pairs': 0,
+        'output_endpoint_pair_excess': 0, 'output_self_loop_edges': 0,
         'candidate_identity_groups': 0, 'quarantined_nodes': 0, 'quarantined_edges': 0,
         'candidate_identity_nodes': 0, 'candidate_identity_nodes_in_multiple_groups': 0,
         'unresolved_relations': 0,

@@ -44,6 +44,29 @@ beforeEach(() => {
 afterEach(() => { app?.unmount(); root?.remove(); vi.unstubAllGlobals(); vi.restoreAllMocks(); clearSessions(); sessionStorage.clear() })
 
 describe('完整配置与修订', () => {
+  it('会话恢复后更新未保存的连接状态，用户可以继续编辑', async () => {
+    config.sources = [{ id: 'warehouse', kind: 'mysql_database', credential_mode: 'session', allowed_tables: ['public.metrics'] }]
+    const original = vi.mocked(fetch).getMockImplementation()!
+    let sessions = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string, options: RequestInit = {}) => {
+      if (url.endsWith('/session')) return response({ session_id: String(++sessions), expires_in_seconds: 3600 })
+      const token = new Headers(options.headers).get('X-Workbench-Session')
+      if (url.endsWith('/credentials')) return response({ database_sources: token === '1' ? ['warehouse'] : [], model: false })
+      if (url.endsWith('/metadata/refresh') && token === '1') return new Response(JSON.stringify({ error: { code: 'credential_session_invalid' } }), {
+        status: 400, headers: { 'X-Workbench-Session-Rejected': '1' },
+      })
+      return original(url, options)
+    }))
+    await ready()
+    expect(root.textContent).toContain('已恢复可用的连接信息')
+    button('刷新元数据').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('暂未恢复连接信息'))
+    expect(sessions).toBe(2)
+    expect(writes().filter(r => r.url.endsWith('/metadata/refresh'))).toHaveLength(1)
+    expect(root.querySelector('.error-strip')).toBeNull()
+    expect(button('＋ 连接').disabled).toBe(false)
+  })
+
   it.each(['continue', 'fresh'])('启动时传递所选运行方式 %s，不改写项目配置', async mode => {
     await ready()
     const selector = root.querySelector<HTMLSelectElement>('#run-mode')!

@@ -6,7 +6,7 @@ from itertools import combinations
 
 from lightgraph.contracts import canonical, digest
 from lightgraph.source_values import identity_cell
-from .fusion import definition_contract, relation_identity, remap_graph_endpoints
+from .fusion import definition_contract, edge_reference, record_input_edge, relation_identity, remap_graph_endpoints
 from .hierarchy_captions import HierarchyCaptions
 from .hierarchy_neighborhood import neighborhood_difference_counts
 from .hierarchy_observations import (edge_observation_properties, observation_boundary, observation_properties,
@@ -733,9 +733,12 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
         batch = [nodes[i] for i in sorted(batches[winner])]
         _merge_members(nodes[winner], batch, definitions)
     touched = {e['type'] for e in graph['edges'] if e['source'] in remap or e['target'] in remap}
-    remap_graph_endpoints(graph, remap, self_contained=True, record_fusion=True)
+    before = [(e, edge_reference(e)) for e in graph['edges'] if e['type'] in touched]
+    remap_graph_endpoints(graph, remap, self_contained=True)
     graph['nodes'] = [n for n in graph['nodes'] if n['id'] not in remap]
     _update_endpoint_contracts(graph, nodes, touched)
+    for edge, original in before:
+        record_input_edge(edge, original, stage='before_hierarchy_replay')
     graph['edges'].sort(key=lambda e: e['id'])
     retired_types = {nodes[i]['type'] for i in remap}
     used_types = {n['type'] for n in graph['nodes']}

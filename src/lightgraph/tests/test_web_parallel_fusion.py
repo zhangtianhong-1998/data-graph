@@ -135,6 +135,7 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
     run_file = project / 'runs' / (rid + '.json')
     report = audit(run_file, 'merged', include_hierarchy_membership=True)
     assert report['historical_input_totals_verified'] and report['explicit_entity_rules'] == 0
+    assert 'edge_lineage' not in report['with_source_replay']
     assert report['without_source_replay']['output_nodes'] == 6
     assert report['with_source_replay']['output_nodes'] == report['committed']['nodes'] == 4
     assert report['with_source_replay']['source_replay_collapsed_nodes'] == 2
@@ -143,7 +144,9 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
     assert membership['agrees_with_recorded_count']  # These copies folded through the row-identity channel.
     previous = tmp_path / 'audit.json'
     previous.write_text(json.dumps(report), encoding='utf-8-sig')
-    rerun = audit(run_file, 'merged', compare_to=previous)
+    rerun = audit(run_file, 'merged', compare_to=previous, include_edge_lineage=True)
+    assert rerun['without_source_replay']['edge_lineage']['before_hierarchy_replay']['captured_edges'] is None
+    assert rerun['with_source_replay']['edge_lineage']['before_hierarchy_replay']['captured_edges'] == report['with_source_replay']['output_edges']
     assert rerun['with_source_replay']['hierarchy_membership'] == membership
     comparison = rerun['hierarchy_comparison']
     assert comparison['policy_digest_comparison'] == 'matched'

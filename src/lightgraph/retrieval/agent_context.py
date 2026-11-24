@@ -180,6 +180,18 @@ def agent_context(answer, *, version=None, sources=()):
                 retained = add('bindings', {**base, 'observation_id': citation['observation_id']}, replace=replace)
             if retained:
                 emitted.add(key)
+    hierarchy = answer.get('hierarchy')
+    if hierarchy is not None:
+        direct = _fields(hierarchy, ('status', 'direction', 'anchor_id'))
+        direct['items'] = []
+        context['hierarchy'] = direct
+        # Cite only the nodes and raw edges still present in this bounded context.
+        for item in hierarchy['items']:
+            visible = [eid for eid in item['edge_ids'] if eid in edge_ids]
+            if len(visible) != len(item['edge_ids']):
+                context['truncated'] = True
+            if item['node_id'] in node_ids and visible:
+                direct['items'].append({'node_id': item['node_id'], 'edge_ids': visible})
     for path in paths:
         if set(path.get('node_ids', [])) <= node_ids and set(path.get('edge_ids', [])) <= edge_ids:
             add('paths', path)

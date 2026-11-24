@@ -91,7 +91,9 @@ def _workflow_table(output, rid, stamp):
                             'created_at', 'finished_at', 'recomposed_nodes'))
     node_fields = ('unit_id', 'node_id', 'run_id', 'label', 'status', 'merge_mode', 'model_calls', 'nodes',
                    'edges', 'updated_at', 'error_code', 'failure_detail', 'reused')
-    counts = ('input_nodes', 'output_nodes', 'source_replay_status', 'source_replay_collapsed_nodes',
+    counts = ('input_nodes', 'output_nodes', 'input_edges', 'output_edges', 'output_directed_endpoint_pairs',
+              'output_multi_edge_pairs', 'output_endpoint_pair_excess', 'output_self_loop_edges',
+              'source_replay_status', 'source_replay_collapsed_nodes',
               'hierarchy_replay_collapsed_nodes', 'observed_dictionary_collapsed_nodes')
     for bucket in ('units', 'merge_nodes'):
         if bucket in state:

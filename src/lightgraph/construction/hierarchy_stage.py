@@ -124,8 +124,11 @@ def _original_item(item, support, execution, field):
                 'identity_context': item['identity_context'], 'aliases': []}
     origins = support.get('endpoint_origins', [])
     if origins:
-        origin, = [i for i in origins if i.get('type') == definition]
-        shell = {'id': origin['edge_id'], 'source': origin['source'], 'target': origin['target'], 'type': definition}
+        if isinstance(origins, dict):
+            origins = [origins]
+        matches = [i for i in origins if i.get('input_kind') == 'unit' and i.get('contributor_id') == cid]
+        origin, = matches or [i for i in origins if 'input_kind' not in i and i.get('type') == definition]
+        shell = {'id': origin['edge_id'], 'source': origin['source'], 'target': origin['target'], 'type': origin['type']}
     else:
         if item['type'] != definition:
             raise ValueError('missing source endpoints')

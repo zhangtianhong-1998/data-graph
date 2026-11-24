@@ -40,6 +40,13 @@ describe('知识文档卡片', () => {
     await click(get('.scope-toggle', first!))
     const options = first!.querySelectorAll<HTMLInputElement>('.table-option input')
     await click(options[0]!); await click(options[1]!)
+    expect(get<HTMLDialogElement>('dialog', first!).open).toBe(true)
+    expect(second!.querySelector('dialog')).toBeNull()
+    await click(get('button[aria-label="关闭关联范围"]', first!))
+    expect(first!.querySelector('dialog')).toBeNull()
+    expect(save).not.toHaveBeenCalled()
+    await click(get('.scope-toggle', first!))
+    expect([...first!.querySelectorAll<HTMLInputElement>('.table-option input')].every(input => input.checked)).toBe(true)
     state.files = [structuredClone(pending), { ...guide, purpose: 'mixed' }]
     await nextTick()
     expect(get<HTMLSelectElement>('select', second!).value).toBe('mixed')

@@ -32,11 +32,11 @@ import { goalMarkdown } from './goalMarkdown'
 import { documentManifestBody } from './documentManifest'
 import { configurationTabs, resultTabs, isResultTab } from './onboarding'
 import type { ConfigurationTab, ResultTab, WorkbenchTab } from './onboarding'
-import { ApiError, ensureSession, clearSessions, clearSession, json, projectPath, request, responseRevision } from './api'
+import { ApiError, ensureSession, onSessionRenewed, clearSessions, clearSession, json, projectPath, request, responseRevision } from './api'
 import { assertNoCredentials, graphOutcome, isActive, runLabels, stageLabel, workflowFailureLabel } from './state'
 import { WorkbenchLocation } from './workbenchLocation'
 import { readGraph } from './graphRead'
-import type { DocumentScope, EmbeddingConfig, Graph, InheritedGraphRef, Metadata, Project, ProjectFile, RetrievalStatusResponse, Run, RunConfig, SourceConfig, WorkflowConfig } from './types'
+import type { DocumentScope, EmbeddingConfig, Graph, InheritedGraphRef, Metadata, Project, ProjectFile, RetrievalStatusResponse, Run, RunConfig, SourceConfig, WorkflowConfig, WorkflowMergeNodeState } from './types'
 
 
 const projects = ref<Project[]>([])
@@ -197,6 +197,22 @@ watch(selectedRunId, id => {
 })
 watch(historyPages, count => { historyPage.value = Math.max(0, Math.min(historyPage.value, count - 1)) })
 const visibleWorkflowState = computed(() => selectedRun.value?.workflow_state)
+function workflowRelationSummary(node: WorkflowMergeNodeState) {
+  const counts = node.delta_merge_counts ?? node.merge_counts
+  const lines = []
+  if (counts?.input_edges != null && counts.output_edges != null) {
+    const stage = node.delta_merge_counts ? '补充抽取后合并' : '合并'
+    lines.push(`${stage}关系记录 ${counts.input_edges} → ${counts.output_edges} 条`)
+  }
+  if (counts?.output_directed_endpoint_pairs != null && counts.output_multi_edge_pairs != null &&
+      counts.output_endpoint_pair_excess != null && counts.output_self_loop_edges != null) {
+    lines.push(`有向端点对 ${counts.output_directed_endpoint_pairs} 组，其中 ${counts.output_multi_edge_pairs} 组有多条关系`,
+      `每对端点只计一次，记录数相差 ${counts.output_endpoint_pair_excess} 条。自环 ${counts.output_self_loop_edges} 条`)
+  } else if (node.status === 'completed') {
+    lines.push('此运行未记录有向端点统计')
+  }
+  return lines
+}
 const traceNodeId = ref('')
 function nodeTraceTarget(nodeId: string) {
   const state = visibleWorkflowState.value
@@ -335,21 +351,22 @@ async function reloadProjects(select?: string) {
 }
 // Load each tab's inputs on demand. Keep project navigation and run reports usable
 // while an input view is waiting for its metadata or saved connection status.
-function useProjectInput<T>(tabs: WorkbenchTab[], target: Ref<T>, read: (id: string, signal: AbortSignal) => Promise<T>) {
+function useProjectInput<T>(tabs: WorkbenchTab[], target: Ref<T>, read: (id: string, signal: AbortSignal) => Promise<T>, revision = ref(0)) {
   const pending = ref(false)
-  let loadedGeneration: number | undefined
-  watch([() => !loading.value && tabs.includes(tab.value) ? project.value?.project_id : undefined, configRevision], async ([id], _, onCleanup) => {
+  let loadedGeneration: number | undefined, loadedRevision: number | undefined
+  watch([() => !loading.value && tabs.includes(tab.value) ? project.value?.project_id : undefined, configRevision, revision], async ([id, , version], _, onCleanup) => {
     pending.value = false
-    if (!id || loadedGeneration === generation) return
+    if (!id || (loadedGeneration === generation && loadedRevision === version)) return
     const epoch = generation, controller = new AbortController()
     onCleanup(() => controller.abort())
-    pending.value = true
+    pending.value = loadedGeneration !== generation
     const previous = target.value
     try {
       const value = await read(id, controller.signal)
       if (!controller.signal.aborted && epoch === generation) {
         if (target.value === previous) target.value = value
         loadedGeneration = epoch
+        loadedRevision = version
       }
     } catch (exception) {
       if (!controller.signal.aborted && epoch === generation) report(exception)
@@ -359,11 +376,19 @@ function useProjectInput<T>(tabs: WorkbenchTab[], target: Ref<T>, read: (id: str
 }
 const metadataPending = useProjectInput(['inputs', 'documents', 'goal', 'workflow', 'metadata'], metadata,
   (id, signal) => request<Metadata>(`${projectPath(id)}/metadata`, { signal }))
+const credentialSessionRevision = ref(0)
+const stopSessionUpdates = onSessionRenewed(id => {
+  if (project.value?.project_id === id) {
+    credentials.value = { database_sources: [], model: false }
+    credentialSessionRevision.value++
+  }
+})
+onUnmounted(stopSessionUpdates)
 const credentialsPending = useProjectInput(['inputs', 'settings'], credentials, async (id, signal) => {
   await ensureSession(id)
   signal.throwIfAborted()
   return request<CredentialStatus>(`${projectPath(id)}/credentials`, { signal })
-})
+}, credentialSessionRevision)
 async function loadProject(id: string) {
   if (project.value?.project_id === id && !loading.value) return
   if (project.value && project.value.project_id !== id && (dirty.value || advancedDirty.value) && !window.confirm('当前项目有未保存的配置修改。切换项目会放弃这些修改，继续吗？')) return
@@ -1111,8 +1136,9 @@ onUnmounted(() => { generation++; detailController?.abort(); pollController?.abo
                         <td>{{ m.model_calls ?? '—' }}</td>
                         <td class="mono">{{ m.run_id || '—' }}</td>
                         <td>{{ m.error_code ? new ApiError(m.error_code).message : '正常' }}
-                          <div v-if="m.merge_counts" class="field-hint">上游合并 {{ m.merge_counts.input_nodes }} → {{ m.merge_counts.output_nodes }} 个节点<template v-if="m.merge_counts.source_replay_status === 'ran'">，同源去重 {{ m.merge_counts.source_replay_collapsed_nodes }} 个</template><template v-if="m.merge_counts.hierarchy_replay_collapsed_nodes">，同源层级归并 {{ m.merge_counts.hierarchy_replay_collapsed_nodes }} 个</template><template v-if="m.merge_counts.observed_dictionary_collapsed_nodes">，按字典成员合并 {{ m.merge_counts.observed_dictionary_collapsed_nodes }} 个</template></div>
+                          <div v-if="m.merge_counts?.input_nodes != null && m.merge_counts.output_nodes != null" class="field-hint">上游合并 {{ m.merge_counts.input_nodes }} → {{ m.merge_counts.output_nodes }} 个节点<template v-if="m.merge_counts.source_replay_status === 'ran'">，同源去重 {{ m.merge_counts.source_replay_collapsed_nodes }} 个</template><template v-if="m.merge_counts.hierarchy_replay_collapsed_nodes">，同源层级归并 {{ m.merge_counts.hierarchy_replay_collapsed_nodes }} 个</template><template v-if="m.merge_counts.observed_dictionary_collapsed_nodes">，按字典成员合并 {{ m.merge_counts.observed_dictionary_collapsed_nodes }} 个</template></div>
                           <div v-if="m.delta_merge_counts?.source_replay_status === 'ran'" class="field-hint">补充抽取后同源去重 {{ m.delta_merge_counts.source_replay_collapsed_nodes }} 个<template v-if="m.delta_merge_counts.hierarchy_replay_collapsed_nodes">，同源层级归并 {{ m.delta_merge_counts.hierarchy_replay_collapsed_nodes }} 个</template><template v-if="m.delta_merge_counts.observed_dictionary_collapsed_nodes">，按字典成员合并 {{ m.delta_merge_counts.observed_dictionary_collapsed_nodes }} 个</template></div>
+                          <div v-for="line in workflowRelationSummary(m)" :key="line" class="field-hint">{{ line }}</div>
                           <div v-if="m.failure_detail" class="field-hint">{{ workflowFailureLabel(m.failure_detail) }}</div>
                         </td>
                         <td><button v-if="nodeTraceTarget(mergeId)" class="btn small" :aria-expanded="traceNodeId === mergeId" @click="toggleNodeTrace(mergeId)">{{ traceNodeId === mergeId ? '收起节点轨迹' : '查看节点轨迹' }}</button>

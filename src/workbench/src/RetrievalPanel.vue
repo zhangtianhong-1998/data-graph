@@ -3,6 +3,7 @@ import { computed, onUnmounted, ref, watch } from 'vue'
 import { ApiError, ensureSession, projectPath, request } from './api'
 import BusinessContextSelect from './BusinessContextSelect.vue'
 import PropertyTable from './PropertyTable.vue'
+import TechnicalDetails from './TechnicalDetails.vue'
 import AvailableContext from './AvailableRetrievalContext.vue'
 import type { AvailableRetrievalContext, BusinessContext, FactContext, EmbeddingConfig, RetrievalStatusResponse } from './types'
 
@@ -21,6 +22,12 @@ interface RetrievalQueryResponse {
   sql_preview?: { status: 'generated' | 'insufficient_context' | 'unavailable'; sql?: string; reason?: string; code?: string }
 
   available_context?: AvailableRetrievalContext
+  hierarchy?: {
+    direction: 'parents' | 'children'
+    anchor_id: string | null
+    status: 'found' | 'empty' | 'ambiguous' | 'no_visible_seed' | 'incomplete'
+    items: Array<{node_id: string; edge_ids: string[]}>
+  }
   grouping?: { axis: string; paths: PathResult['paths'] }
   plan?: {
     intent: string
@@ -60,6 +67,8 @@ interface RetrievalQueryResponse {
     candidates: Array<{
       node_id: string
       kind: string
+      display_name?: string
+      identity?: Record<string, unknown>
       rrf_score: number | null
       vec_rank: number | null
       vec_score: number | null
@@ -120,7 +129,11 @@ const emit = defineEmits<{
 
 const queryText = ref('')
 const businessContext = ref<BusinessContext | null>(null)
-const atomicOpen = ref(false)
+const queryKind = ref<'question' | 'hierarchy' | 'atomic'>('question')
+const atomicOpen = computed(() => queryKind.value === 'atomic')
+const hierarchyDirection = ref<'children' | 'parents'>('children')
+const hierarchyInput = ref<'query' | 'node_id'>('query')
+const anchorText = ref('')
 const mode = ref<'search' | 'id' | 'drilldown' | 'traverse'>('search')
 const method = ref<'hybrid' | 'keyword' | 'vector'>('hybrid')
 const field = ref<'all' | 'name' | 'description'>('all')
@@ -141,7 +154,12 @@ watch(selectedRelations, names => { if (!names.length) includeEndpointVariants.v
 const pathMode = computed(() => mode.value === 'drilldown' || mode.value === 'traverse')
 const bySeedIds = computed(() => pathMode.value && seedInput.value === 'ids')
 watch(mode, value => { direction.value = value === 'traverse' ? 'both' : 'outgoing' })
-const hasInput = computed(() => atomicOpen.value && mode.value === 'id' ? Boolean(nodeId.value.trim()) : atomicOpen.value && bySeedIds.value ? listValues(seedIds.value).length > 0 : Boolean(queryText.value.trim()))
+const hasInput = computed(() => {
+  if (queryKind.value === 'hierarchy') return Boolean(anchorText.value.trim())
+  if (atomicOpen.value && mode.value === 'id') return Boolean(nodeId.value.trim())
+  if (atomicOpen.value && bySeedIds.value) return listValues(seedIds.value).length > 0
+  return Boolean(queryText.value.trim())
+})
 const topPSeeds = ref(4)
 const working = ref(false)
 const panelError = ref('')
@@ -158,10 +176,11 @@ function clearResult() {
   result.value = null
 }
 onUnmounted(clearResult)
-watch([businessContext, atomicOpen, mode, seedInput, () => props.status?.generation, () => props.status?.vectorized], clearResult)
+watch([businessContext, queryKind, hierarchyDirection, hierarchyInput, mode, seedInput, () => props.status?.generation, () => props.status?.vectorized], clearResult)
 watch(() => props.projectId, () => {
   clearResult()
   businessContext.value = null
+  anchorText.value = ''
   queryText.value = nodeId.value = seedIds.value = pathHint.value = targetId.value = relationTypes.value = ''
 })
 const pathResult = computed(() => result.value?.traverse || result.value?.drilldown ||
@@ -172,7 +191,7 @@ const fallbackLabels: Record<string, string> = {
   no_visible_context: '当前范围没有可见对象',
 }
 const activeStatus = computed(() => props.status)
-const showMainGraph = computed(() => result.value && (
+const showMainGraph = computed(() => result.value && !result.value.hierarchy && (
   !result.value.available_context || result.value.nodes.length > 0 || result.value.edges.length > 0
 ))
 const stopLabels: Record<string, string> = {
@@ -195,19 +214,24 @@ const nodeLabel = (id: string) => nodeMap.value.get(id)?.display_name ||
   result.value?.available_context?.nodes.find(n => n.id === id)?.display_name || id
 
 const generatingSQL = ref(false)
-async function runQuery(withSQL = false) {
-  if (!hasInput.value || working.value || props.syncing || !props.status?.vectorized) return
+async function runQuery(withSQL = false, candidateId?: string) {
+  if ((!candidateId && !hasInput.value) || working.value || props.syncing || !props.status?.vectorized) return
   generatingSQL.value = withSQL
   const epoch = ++queryEpoch
   const controller = new AbortController()
   queryController = controller
+  const directionForCandidate = result.value?.hierarchy?.direction
   result.value = null
   working.value = true
   panelError.value = ''
   const project = props.projectId
   const body: Record<string, unknown> = {}
   if (businessContext.value !== null || atomicOpen.value) body.business_context = businessContext.value
-  if (!atomicOpen.value) {
+  if (queryKind.value === 'hierarchy' || candidateId) {
+    body.mode = 'hierarchy'
+    body.hierarchy_direction = candidateId ? directionForCandidate : hierarchyDirection.value
+    body[candidateId ? 'node_id' : hierarchyInput.value] = candidateId || anchorText.value.trim()
+  } else if (!atomicOpen.value) {
     body.query = queryText.value.trim()
   } else if (mode.value === 'id') {
     Object.assign(body, { node_id: nodeId.value.trim(), hops: idHops.value })
@@ -262,11 +286,25 @@ async function runQuery(withSQL = false) {
       </div>
       <div class="panel-body">
         <form class="retrieval-form" @submit.prevent="runQuery()">
-          <div v-if="!atomicOpen" class="field">
+          <div class="retrieval-modes" role="group" aria-label="查询方式">
+            <button type="button" :aria-pressed="queryKind === 'question'" @click="queryKind = 'question'">问题检索</button>
+            <button type="button" :aria-pressed="queryKind === 'hierarchy'" @click="queryKind = 'hierarchy'">直接上下级</button>
+            <button type="button" :aria-pressed="atomicOpen" @click="queryKind = 'atomic'">调试检索算子</button>
+          </div>
+          <div v-if="queryKind === 'hierarchy'" class="hierarchy-query">
+            <div class="two-fields">
+              <div class="field"><label for="hierarchy-direction">查找方向</label>
+                <select id="hierarchy-direction" v-model="hierarchyDirection"><option value="children">直接下级</option><option value="parents">直接上级</option></select></div>
+              <div class="field"><label for="hierarchy-input">定位对象</label>
+                <select id="hierarchy-input" v-model="hierarchyInput"><option value="query">名称或完整码</option><option value="node_id">节点 ID</option></select></div>
+            </div>
+            <div class="field"><label for="hierarchy-anchor">{{ hierarchyInput === 'query' ? '对象名称或完整码' : '节点 ID' }}</label>
+              <input id="hierarchy-anchor" v-model="anchorText" :maxlength="hierarchyInput === 'query' ? 4000 : 512" required autocomplete="off" /></div>
+          </div>
+          <div v-if="queryKind === 'question'" class="field">
             <label for="retrieval-query">问题</label>
             <textarea id="retrieval-query" v-model="queryText" maxlength="4000" rows="3" required :disabled="working" placeholder="输入想查的问题，或粘贴一段文字"/>
           </div>
-          <button type="button" class="text-button atomic-toggle" :aria-expanded="atomicOpen" @click="atomicOpen = !atomicOpen">{{ atomicOpen ? '返回问题检索' : '调试检索算子' }}</button>
           <template v-if="atomicOpen">
           <div class="retrieval-modes" role="group" aria-label="检索方式">
             <button v-for="item in ([['search','文本检索'], ['id','按节点 ID'], ['traverse','多层关联'], ['drilldown','路径下钻']] as const)" :key="item[0]" type="button" :aria-pressed="mode === item[0]" @click="mode = item[0]">{{ item[1] }}</button>
@@ -322,7 +360,7 @@ async function runQuery(withSQL = false) {
           </details>
           <div class="actions">
             <button class="btn primary" type="submit" :disabled="working || syncing || !activeStatus?.vectorized || !hasInput">{{ (working && !generatingSQL) ? '正在检索…' : '检索' }}</button>
-            <button v-if="!atomicOpen" class="btn" type="button" :disabled="working || syncing || !activeStatus?.vectorized || !hasInput" @click="runQuery(true)">{{ working && generatingSQL ? '正在召回并生成 SQL…' : '召回并试写 SQL' }}</button>
+            <button v-if="queryKind === 'question'" class="btn" type="button" :disabled="working || syncing || !activeStatus?.vectorized || !hasInput" @click="runQuery(true)">{{ working && generatingSQL ? '正在召回并生成 SQL…' : '召回并试写 SQL' }}</button>
             <button v-if="working" class="btn small" type="button" @click="clearResult">停止等待</button>
             <span v-if="activeStatus?.has_graph && !activeStatus.vectorized" class="field-hint">请先为当前图谱建立索引。</span>
           </div>
@@ -386,6 +424,35 @@ async function runQuery(withSQL = false) {
               <p v-if="result.dimensional.stop_reason === 'requested_level_unreached'">已有事实支持上述条件，尚未找到可证实的目标层级。</p>
               <p v-else-if="result.dimensional.stop_reason === 'search_limit'">已到本次搜索上限，可能还有其他符合条件的结果。</p>
             </template>
+          </section>
+          <section v-if="result.hierarchy" class="hierarchy-answer" aria-label="直接上下级查询结果">
+            <h3>{{ result.hierarchy.anchor_id ? nodeLabel(result.hierarchy.anchor_id) + '的' : '' }}{{ result.hierarchy.direction === 'children' ? '直接下级' : '直接上级' }}<template v-if="result.hierarchy.items.length"> · {{ result.hierarchy.items.length }} 个</template></h3>
+            <template v-if="result.hierarchy.status === 'ambiguous'">
+              <p>有多个匹配对象，请选择要查看的一个。</p>
+              <ul class="hierarchy-items"><li v-for="candidate in result.slots.flatMap(slot => slot.candidates)" :key="candidate.node_id">
+                <button type="button" class="btn small" @click="runQuery(false, candidate.node_id)">{{ candidate.display_name || nodeLabel(candidate.node_id) }} · {{ candidate.kind }}</button>
+                <small class="result-node-id">{{ [...Object.values(candidate.identity || {}), candidate.node_id].join(' · ') }}</small>
+              </li></ul>
+            </template>
+            <p v-else-if="result.hierarchy.status === 'no_visible_seed'">当前范围内没有匹配的起点。</p>
+            <p v-else-if="result.hierarchy.status === 'empty'">当前可见记录中没有能确认方向的直接上下级关系。</p>
+            <p v-else-if="result.hierarchy.status === 'incomplete'">本次只核实了部分记录。</p>
+            <ul v-if="result.hierarchy.items.length" class="hierarchy-items">
+              <li v-for="item in result.hierarchy.items" :key="item.node_id">
+                <strong>{{ nodeLabel(item.node_id) }}</strong>
+                <small v-if="nodeMap.get(item.node_id)?.identity" class="hierarchy-code">{{ Object.values(nodeMap.get(item.node_id)!.identity!).join(' · ') }}</small>
+                <details><summary>关系依据（{{ item.edge_ids.length }} 条）</summary>
+                  <div v-for="id in item.edge_ids" :key="id" class="hierarchy-edge">
+                    <template v-if="edgeMap.get(id)">
+                      <p>{{ nodeLabel(edgeMap.get(id)!.source) }} → {{ nodeLabel(edgeMap.get(id)!.target) }}</p>
+                      <span>{{ edgeMap.get(id)!.relation }}</span>
+                      <TechnicalDetails :value="edgeMap.get(id)" title="原始关系与来源" />
+                    </template>
+                    <code v-else>{{ id }}</code>
+                  </div>
+                </details>
+              </li>
+            </ul>
           </section>
           <div v-if="pathResult" class="retrieved-paths">
             <h3>{{ result.grouping ? '分组候选路径' : (result.traverse || result.association_paths) ? '关联路径' : '下钻路径' }}</h3>
@@ -509,7 +576,13 @@ async function runQuery(withSQL = false) {
 </template>
 
 <style scoped>
-.atomic-toggle { justify-self: start }
+.hierarchy-query { display: grid; gap: 12px; }
+.hierarchy-answer { margin-block: 12px; }
+.hierarchy-items { padding: 0; list-style: none; }
+.hierarchy-items li { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.hierarchy-code { margin-left: 8px; color: #52637a; overflow-wrap: anywhere; }
+.hierarchy-items summary { cursor: pointer; color: #4d6380; padding-block: 5px; }
+.hierarchy-edge { padding: 5px 12px; margin-block: 6px; border-left: 2px solid #c9d9ef; overflow-wrap: anywhere; }
 .fact-witness { display: grid; gap: 4px; margin-block: 10px; overflow-wrap: anywhere }
 .plan-summary { margin-bottom: 12px }
 

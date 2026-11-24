@@ -577,3 +577,41 @@ def test_failed_connection_restores_staged_document_bytes_and_pending_binding(cl
     assert workspace.get_config(pid)["documents"] == []
     assert workspace.get(pid)["files"] == [pending]
     assert workspace.file_path(pid, pending["file_id"]).read_bytes() == text
+
+
+def test_expired_session_before_dispatch_can_recover_only_saved_connections(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', fake_open(calls))
+    vault = client.app.state.credentials
+    now = [10.]
+    vault.clock = lambda: now[0]
+    old = session(client)
+    for source_id, remember in [('saved', True), ('temporary', False)]:
+        body = {**db_body(source_id), 'remember_connection': remember}
+        assert client.post('/api/projects/alpha/database/connect', headers=old, json=body).status_code == 200
+    now[0] += vault.ttl_seconds
+    count = len(calls)
+    rejected = client.post('/api/projects/alpha/database/connect', headers=old, json=db_body('new'))
+    assert rejected.json()['error']['code'] == 'credential_session_invalid'
+    assert rejected.headers['X-Workbench-Session-Rejected'] == '1' and len(calls) == count
+    fresh = session(client)
+    status = client.get('/api/projects/alpha/credentials', headers=fresh)
+    assert status.json()['database_sources'] == ['saved']
+    assert {s['id'] for s in client.get('/api/projects/alpha/config').json()['sources']} == {'saved', 'temporary'}
+
+
+def test_session_failure_after_a_mutation_never_authorizes_replay(client, monkeypatch):
+    set_model(client)
+    headers = session(client)
+    saved = client.app.state.saved_connections
+    save = saved.save_model
+
+    def save_then_expire(*args):
+        save(*args)
+        client.app.state.credentials.clear()
+
+    monkeypatch.setattr(saved, 'save_model', save_then_expire)
+    result = client.put('/api/projects/alpha/credentials/model', headers=headers, json={'api_key': 'test-secret'})
+    assert result.json()['error']['code'] == 'credential_session_invalid'
+    assert 'X-Workbench-Session-Rejected' not in result.headers
+    assert client.get('/api/projects/alpha/credentials', headers=session(client)).json()['model']

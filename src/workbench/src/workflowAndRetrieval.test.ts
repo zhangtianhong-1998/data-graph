@@ -175,7 +175,8 @@ beforeEach(() => {
             merge_1: { node_id: 'merge_1', label: '全节点合并抽取', merge_mode: 'merge_and_extract', status: 'completed', run_id: 'run_m1',
               nodes: 20, edges: 14, merge_counts: { input_nodes: 16, output_nodes: 10,
                 source_replay_status: 'ran', source_replay_collapsed_nodes: 0, hierarchy_replay_collapsed_nodes: 4, observed_dictionary_collapsed_nodes: 2 },
-              delta_merge_counts: { source_replay_status: 'ran', source_replay_collapsed_nodes: 2 } },
+              delta_merge_counts: { source_replay_status: 'ran', source_replay_collapsed_nodes: 2, input_edges: 15, output_edges: 14,
+                output_directed_endpoint_pairs: 10, output_multi_edge_pairs: 3, output_endpoint_pair_excess: 4, output_self_loop_edges: 1 } },
             merge_2: { node_id: 'merge_2', label: '确定性合并', merge_mode: 'deterministic', status: 'completed', run_id: null },
             merge_3: { node_id: 'merge_3', label: '从产物恢复', merge_mode: 'merge_and_extract', status: 'completed', run_id: 'run_old' },
           },
@@ -525,6 +526,12 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(root.textContent).toContain('全节点合并抽取')
     expect(root.textContent).toContain('上游合并 16 → 10 个节点，同源去重 0 个，同源层级归并 4 个，按字典成员合并 2 个')
     expect(root.textContent).toContain('补充抽取后同源去重 2 个')
+    const rows = [...root.querySelectorAll('tr')]
+    const current = rows.find(row => row.textContent?.includes('全节点合并抽取'))!
+    expect(current.textContent).toContain('补充抽取后合并关系记录 15 → 14 条')
+    expect(current.textContent).toContain('有向端点对 10 组，其中 3 组有多条关系')
+    expect(current.textContent).toContain('每对端点只计一次，记录数相差 4 条。自环 1 条')
+    expect(rows.find(row => row.textContent?.includes('确定性合并'))?.textContent).toContain('此运行未记录有向端点统计')
 
     // 业务图谱页显示「未向量化」，不主动触发 /retrieval/sync
     button('业务图谱').click()
@@ -641,6 +648,46 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(posts).toHaveLength(1)
     expect(posts[0]!.url).toContain('sql_preview=true')
     expect(JSON.parse(posts[0]!.body!)).toEqual({ query: question.value })
+  })
+  it('按完整码选择同名起点，上下级答案为每个对象保留有方向的原边', async () => {
+    vectorizedState = { ...vectorizedState, vectorized: true, status: 'vectorized' }
+    await mountReady()
+    button('运行与结果').click()
+    await nextTick()
+    button('子图召回').click()
+    await vi.waitFor(() => expect(root.querySelector('#retrieval-query')).not.toBeNull())
+    button('直接上下级').click()
+    await nextTick()
+    const candidates = ['101', '202'].map(code => ({
+      node_id: 'n' + code, kind: '科目', display_name: '设备', identity: { code },
+    }))
+    retrievalFixture = {
+      slots: [{ surface: '设备', candidates }],
+      hierarchy: { direction: 'parents', status: 'ambiguous', anchor_id: null, items: [] },
+    }
+    const direction = root.querySelector<HTMLSelectElement>('#hierarchy-direction')!
+    direction.value = 'parents'; direction.dispatchEvent(new Event('change'))
+    const anchor = root.querySelector<HTMLInputElement>('#hierarchy-anchor')!
+    anchor.value = '设备'; anchor.dispatchEvent(new Event('input'))
+    await nextTick()
+    button('检索').click()
+    await vi.waitFor(() => expect(root.querySelectorAll('.hierarchy-answer button')).toHaveLength(2))
+    expect(JSON.parse(requests.filter(r => r.url.endsWith('/retrieval/query')).at(-1)!.body!))
+      .toEqual({ mode: 'hierarchy', query: '设备', hierarchy_direction: 'parents' })
+    expect(root.querySelector('.hierarchy-answer')?.textContent).toContain('202 · n202')
+    retrievalFixture = {
+      hierarchy: { direction: 'parents', status: 'found', anchor_id: 'n202',
+        items: [{ node_id: 'p', edge_ids: ['forward', 'inverse'] }] },
+      nodes: [{ id: 'n202', display_name: '设备' }, { id: 'p', display_name: '收入' }],
+      edges: [{ id: 'forward', source: 'p', target: 'n202', relation: '包含科目' },
+        { id: 'inverse', source: 'n202', target: 'p', relation: '隶属科目' }],
+    }
+    root.querySelectorAll<HTMLButtonElement>('.hierarchy-answer button')[1]!.click()
+    await vi.waitFor(() => expect(root.querySelector('.hierarchy-answer h3')?.textContent).toContain('设备的直接上级 · 1 个'))
+    expect(JSON.parse(requests.filter(r => r.url.endsWith('/retrieval/query')).at(-1)!.body!))
+      .toEqual({ mode: 'hierarchy', node_id: 'n202', hierarchy_direction: 'parents' })
+    expect(root.querySelectorAll('.hierarchy-items li')).toHaveLength(1)
+    expect([...root.querySelectorAll('.hierarchy-edge p')].map(p => p.textContent)).toEqual(['收入 → 设备', '设备 → 收入'])
   })
   it('按字段检索、精确 ID 及下钻分别传递对应参数，切换时清除旧结果', async () => {
     vectorizedState = { ...vectorizedState, vectorized: true, status: 'vectorized' }

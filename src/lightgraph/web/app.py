@@ -14,7 +14,7 @@ import re
 from typing import Literal
 
 import yaml
-from fastapi import FastAPI, File, Header, UploadFile
+from fastapi import Depends, FastAPI, File, Header, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool
@@ -252,7 +252,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     app.state.analytics_jobs=analytics
     app.add_middleware(CORSMiddleware,allow_origins=sorted(ALLOWED_ORIGINS),
         allow_methods=['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-        allow_headers=['Content-Type','X-Workbench-Session','If-Match'],expose_headers=['ETag'],allow_credentials=False)
+        allow_headers=['Content-Type','X-Workbench-Session','If-Match'],expose_headers=['ETag','X-Workbench-Session-Rejected'],allow_credentials=False)
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver'])
     app.add_middleware(RequestBoundary)
 
@@ -266,7 +266,10 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         if isinstance(exc, (ConfigValidationError, DocumentManifestError)):
             return JSONResponse({'error': {'code': exc.code, 'diagnostics': exc.diagnostics}},
                                 status_code=400, headers={'Cache-Control': 'no-store'})
-        return error_response(exc.code,error_status(exc.code))
+        response = error_response(exc.code, error_status(exc.code))
+        if exc.code == 'credential_session_invalid' and exc.retryable:
+            response.headers['X-Workbench-Session-Rejected'] = '1'
+        return response
 
     @app.exception_handler(RequestValidationError)
     async def invalid_input(request,exc):
@@ -275,6 +278,17 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     @app.exception_handler(HTTPException)
     async def http_error(request,exc):
         return error_response('not_found' if exc.status_code==404 else 'request_invalid',exc.status_code)
+
+    async def project_session(pid: str, x_workbench_session: str | None = Header(default=None)):
+        # Only a rejection before dispatch can authorize replay of a write.
+        if x_workbench_session is not None:
+            try:
+                credentials.require(pid, x_workbench_session)
+            except LightGraphError as exc:
+                if exc.code == 'credential_session_invalid':
+                    raise LightGraphError(exc.code, retryable=True) from None
+                raise
+        return x_workbench_session
 
     def versioned(pid, value, status=200):
         return JSONResponse(value, status_code=status, headers={"ETag": workspace.config_etag(pid)})
@@ -384,7 +398,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return workspace.rename(pid,data.name)
 
     @app.delete('/api/projects/{pid}')
-    def remove_project(pid: str, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+    def remove_project(pid: str, x_workbench_session: str | None = Depends(project_session), if_match: str | None = Header(default=None)):
         from .deletion import delete_project
         with workspace.lock(pid):
             mutable(pid)
@@ -411,15 +425,15 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return versioned(pid, result)
 
     @app.delete('/api/projects/{pid}/files/{fid}')
-    def remove_file(pid: str, fid: str, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+    def remove_file(pid: str, fid: str, x_workbench_session: str | None = Depends(project_session), if_match: str | None = Header(default=None)):
         return remove_input(pid, x_workbench_session, if_match, fid=fid)
 
     @app.delete('/api/projects/{pid}/sources/{sid}')
-    def remove_source(pid: str, sid: str, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+    def remove_source(pid: str, sid: str, x_workbench_session: str | None = Depends(project_session), if_match: str | None = Header(default=None)):
         return remove_input(pid, x_workbench_session, if_match, sid=sid)
 
     @app.delete('/api/projects/{pid}/sources/{sid}/tables')
-    def remove_table(pid: str, sid: str, data: DeleteTable, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+    def remove_table(pid: str, sid: str, data: DeleteTable, x_workbench_session: str | None = Depends(project_session), if_match: str | None = Header(default=None)):
         return remove_input(pid, x_workbench_session, if_match, sid=sid, table=data.table)
 
     @app.post('/api/projects/{pid}/session',status_code=201)
@@ -429,13 +443,13 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return {'session_id':credentials.create(pid),'expires_in_seconds':credentials.ttl_seconds}
 
     @app.get('/api/projects/{pid}/credentials')
-    def get_credentials(pid:str,x_workbench_session:str|None=Header(default=None)):
+    def get_credentials(pid:str,x_workbench_session:str|None=Depends(project_session)):
         with workspace.lock(pid):
             workspace.get(pid)
             return credential_status(pid,x_workbench_session)
 
     @app.put('/api/projects/{pid}/credentials/model')
-    def model_credential(pid:str,data:ModelCredential,x_workbench_session:str|None=Header(default=None),if_match:str|None=Header(default=None)):
+    def model_credential(pid:str,data:ModelCredential,x_workbench_session:str|None=Depends(project_session),if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             credentials.require(pid,x_workbench_session)
@@ -451,7 +465,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return credential_status(pid,x_workbench_session)
 
     @app.delete('/api/projects/{pid}/credentials/model')
-    def clear_model_credential(pid:str,x_workbench_session:str|None=Header(default=None),if_match:str|None=Header(default=None)):
+    def clear_model_credential(pid:str,x_workbench_session:str|None=Depends(project_session),if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             credentials.require(pid,x_workbench_session)
@@ -467,7 +481,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return embedding_credential_status(pid)
 
     @app.put('/api/projects/{pid}/credentials/embedding')
-    def put_embedding_credential(pid: str, data: EmbeddingCredential, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+    def put_embedding_credential(pid: str, data: EmbeddingCredential, x_workbench_session: str | None = Depends(project_session), if_match: str | None = Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             credentials.require(pid, x_workbench_session)
@@ -480,7 +494,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return embedding_credential_status(pid)
 
     @app.delete('/api/projects/{pid}/credentials/embedding')
-    def delete_embedding_credential(pid: str, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+    def delete_embedding_credential(pid: str, x_workbench_session: str | None = Depends(project_session), if_match: str | None = Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             credentials.require(pid, x_workbench_session)
@@ -518,7 +532,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             await file.close()
 
     @app.post('/api/projects/{pid}/database/connect')
-    def database_connect(pid:str,data:ConnectDatabase,x_workbench_session:str|None=Header(default=None),if_match:str|None=Header(default=None)):
+    def database_connect(pid:str,data:ConnectDatabase,x_workbench_session:str|None=Depends(project_session),if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             credentials.require(pid,x_workbench_session)
@@ -589,7 +603,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return source
 
     @app.get('/api/projects/{pid}/database/drafts/{key}')
-    def load_connection_draft(pid:str,key:str,x_workbench_session:str|None=Header(default=None)):
+    def load_connection_draft(pid:str,key:str,x_workbench_session:str|None=Depends(project_session)):
         with workspace.lock(pid):
             workspace.get(pid)
             credentials.require(pid,x_workbench_session)
@@ -601,7 +615,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return {'saved':False,**({'revision':revision} if revision else {})}
 
     @app.put('/api/projects/{pid}/database/drafts/{key}')
-    def save_connection_draft(pid:str,key:str,data:SaveConnectionDraft,x_workbench_session:str|None=Header(default=None)):
+    def save_connection_draft(pid:str,key:str,data:SaveConnectionDraft,x_workbench_session:str|None=Depends(project_session)):
         # Incomplete forms are drafts, not live credentials or extraction config.
         # Saving never tests the connection or changes an active run's inputs.
         with workspace.lock(pid):
@@ -614,7 +628,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return {'saved':True,'revision':revision}
 
     @app.delete('/api/projects/{pid}/database/drafts/{key}')
-    def delete_connection_draft(pid:str,key:str,data:DeleteConnectionDraft|None=None,x_workbench_session:str|None=Header(default=None)):
+    def delete_connection_draft(pid:str,key:str,data:DeleteConnectionDraft|None=None,x_workbench_session:str|None=Depends(project_session)):
         with workspace.lock(pid):
             workspace.get(pid)
             credentials.require(pid,x_workbench_session)
@@ -623,7 +637,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return {'saved':saved_connections.load_draft(pid,key) is not None,'revision':revision}
 
     @app.get('/api/projects/{pid}/database/connections/{sid}')
-    def load_database_connection(pid:str,sid:str,x_workbench_session:str|None=Header(default=None)):
+    def load_database_connection(pid:str,sid:str,x_workbench_session:str|None=Depends(project_session)):
         with workspace.lock(pid):
             workspace.get(pid)
             credentials.require(pid,x_workbench_session)
@@ -636,7 +650,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return {'saved':False} if saved is None else {'saved':True,'connection':saved['connection']}
 
     @app.delete('/api/projects/{pid}/database/connections/{sid}')
-    def forget_database_connection(pid:str,sid:str,x_workbench_session:str|None=Header(default=None)):
+    def forget_database_connection(pid:str,sid:str,x_workbench_session:str|None=Depends(project_session)):
         with workspace.lock(pid):
             mutable(pid)
             credentials.require(pid,x_workbench_session)
@@ -816,7 +830,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return metadata_yaml(workspace,pid,source_id=source_id,schema=schema,table=table)
 
     @app.post('/api/projects/{pid}/metadata/refresh')
-    def refresh_metadata(pid:str,x_workbench_session:str|None=Header(default=None)):
+    def refresh_metadata(pid:str,x_workbench_session:str|None=Depends(project_session)):
         with workspace.lock(pid):
             mutable(pid)
             sources,_=resolved_credentials(pid,x_workbench_session,include_model=False)
@@ -958,7 +972,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return {'runs':manager.list(pid,view=view)}
 
     @app.post('/api/projects/{pid}/runs',status_code=202)
-    def start_run(pid:str,data:StartRun|None=None,x_workbench_session:str|None=Header(default=None),if_match:str|None=Header(default=None)):
+    def start_run(pid:str,data:StartRun|None=None,x_workbench_session:str|None=Depends(project_session),if_match:str|None=Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             sources,model=resolved_credentials(pid,x_workbench_session)
@@ -986,7 +1000,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return manager.workflow_status(pid)
 
     @app.post('/api/projects/{pid}/runs/{rid}/resume', status_code=202)
-    def resume_workflow(pid: str, rid: str, data: ResumeRun, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+    def resume_workflow(pid: str, rid: str, data: ResumeRun, x_workbench_session: str | None = Depends(project_session), if_match: str | None = Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             workspace.require_config_revision(pid, if_match)
@@ -1016,7 +1030,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
                                   source_credentials=sources, model_api_key=model, **options)
 
     @app.post('/api/projects/{pid}/workflow/units/{unit_id}/retry', status_code=202)
-    def retry_workflow_unit(pid: str, unit_id: str, x_workbench_session: str | None = Header(default=None), if_match: str | None = Header(default=None)):
+    def retry_workflow_unit(pid: str, unit_id: str, x_workbench_session: str | None = Depends(project_session), if_match: str | None = Header(default=None)):
         with workspace.lock(pid):
             mutable(pid)
             sources, model = resolved_credentials(pid, x_workbench_session)
@@ -1036,7 +1050,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return manager.merge_workflow(pid)
 
     @app.post('/api/projects/{pid}/retrieval/embedding/test')
-    async def test_embedding(pid: str, data: TestEmbeddingRequest | None = None, x_workbench_session: str | None = Header(default=None)):
+    async def test_embedding(pid: str, data: TestEmbeddingRequest | None = None, x_workbench_session: str | None = Depends(project_session)):
         from pydantic import ValidationError
         from ..runtime.config import EmbeddingConfig
         from ..retrieval import test_embedding_service
@@ -1075,7 +1089,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return retrieval_jobs.start(pid, revision, lambda: read_graph_consistently(workspace, pid, build))
 
     @app.post('/api/projects/{pid}/retrieval/jobs', status_code=202)
-    def start_vectorization(pid: str, x_workbench_session: str | None = Header(default=None)):
+    def start_vectorization(pid: str, x_workbench_session: str | None = Depends(project_session)):
         job, _ = schedule_vectorization(pid, x_workbench_session)
         return job
 
@@ -1086,13 +1100,13 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             return retrieval_jobs.status(pid)
 
     @app.post('/api/projects/{pid}/retrieval/sync')
-    def sync_retrieval(pid: str, x_workbench_session: str | None = Header(default=None)):
+    def sync_retrieval(pid: str, x_workbench_session: str | None = Depends(project_session)):
         # Legacy synchronous clients join the same build as the workbench.
         _, future = schedule_vectorization(pid, x_workbench_session)
         return future.result()
 
     @app.get('/api/projects/{pid}/retrieval/status')
-    def get_retrieval_status(pid: str, x_workbench_session: str | None = Header(default=None)):
+    def get_retrieval_status(pid: str, x_workbench_session: str | None = Depends(project_session)):
         from .construction_graph import retrieval_status
         def read(_workspace, _pid, *, config):
             emb_key = resolve_api_key(pid, x_workbench_session, config)
@@ -1101,7 +1115,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
 
     @app.post('/api/projects/{pid}/retrieval/query')
     async def query_retrieval(pid: str, data: RetrieveSubgraphRequest, sql_preview: bool = False, version: str | None = None,
-                              x_workbench_session: str | None = Header(default=None)):
+                              x_workbench_session: str | None = Depends(project_session)):
         from .construction_graph import project_retriever
         if sql_preview and data.mode != 'auto':
             raise LightGraphError('sql_preview_requires_question')

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { clearSessions, ensureSession, request } from './api'
+import { clearSession, clearSessions, ensureSession, request } from './api'
 
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); clearSessions() })
 
@@ -55,5 +55,85 @@ describe('request feedback', () => {
     await expect(ensureSession('test')).rejects.toMatchObject({ code: 'network_unavailable' })
     await ensureSession('test')
     expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+})
+
+const sessionReply = (token: string) => Response.json({ session_id: token, expires_in_seconds: 3600 })
+const staleSession = (rejected = true) => Response.json({ error: { code: 'credential_session_invalid' } }, {
+  status: 400, headers: rejected ? { 'X-Workbench-Session-Rejected': '1' } : {},
+})
+
+describe('project session renewal', () => {
+  it('renews an expired token once on the next use and keeps the write revision', async () => {
+    vi.useFakeTimers()
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(sessionReply('one'))
+      .mockResolvedValueOnce(sessionReply('two'))
+      .mockResolvedValueOnce(Response.json({}))
+    vi.stubGlobal('fetch', fetcher)
+    await ensureSession('test')
+    await vi.advanceTimersByTimeAsync(3600000)
+    await Promise.all([ensureSession('test'), ensureSession('test')])
+    await request('/projects/test/runs', { method: 'POST', headers: { 'If-Match': 'rev' }, body: '{}' })
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual(['/api/projects/test/session', '/api/projects/test/session', '/api/projects/test/runs'])
+    expect(fetcher.mock.calls[2]![1].headers).toMatchObject({ 'X-Workbench-Session': 'two', 'If-Match': 'rev' })
+  })
+
+  it('recovers concurrent requests after a server restart and honours cancellation during renewal', async () => {
+    let creations = 0
+    let finish!: (value: Response) => void
+    const writes: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      if (url.endsWith('/session')) {
+        if (++creations === 1) return sessionReply('old')
+        return new Promise<Response>(resolve => { finish = resolve })
+      }
+      if (new Headers(init.headers).get('X-Workbench-Session') === 'old') return staleSession()
+      writes.push(String(init.body))
+      return Response.json({ done: true })
+    }))
+    await ensureSession('test')
+    const caller = new AbortController()
+    const url = '/projects/test/runs'
+    const first = request(url, { method: 'POST', body: 'first' })
+    const cancelled = expect(request(url, { method: 'POST', body: 'second', signal: caller.signal }))
+      .rejects.toMatchObject({ code: 'request_cancelled' })
+    await vi.waitFor(() => expect(finish).toBeDefined())
+    caller.abort()
+    await cancelled
+    finish(sessionReply('new'))
+    await expect(first).resolves.toEqual({ done: true })
+    expect(writes).toEqual(['first'])
+    expect(creations).toBe(2)
+  })
+
+  it('only resends a write on pre-dispatch rejection, at most once', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(sessionReply('old'))
+      .mockResolvedValueOnce(staleSession(false))
+      .mockResolvedValueOnce(staleSession())
+      .mockResolvedValueOnce(sessionReply('new'))
+      .mockResolvedValueOnce(staleSession())
+    vi.stubGlobal('fetch', fetcher)
+    await ensureSession('test')
+    const write = () => request('/projects/test/runs', { method: 'POST', body: '{}' })
+    await expect(write()).rejects.toMatchObject({ code: 'credential_session_invalid' })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    await expect(write()).rejects.toMatchObject({ code: 'credential_session_invalid' })
+    expect(fetcher).toHaveBeenCalledTimes(5)
+  })
+
+  it('does not reinstall a pending session after clearing a project', async () => {
+    let finish!: (value: Response) => void
+    const fetcher = vi.fn().mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+      .mockResolvedValueOnce(sessionReply('new')).mockResolvedValueOnce(Response.json({}))
+    vi.stubGlobal('fetch', fetcher)
+    const discarded = expect(ensureSession('test')).rejects.toMatchObject({ code: 'request_cancelled' })
+    clearSession('test')
+    await ensureSession('test')
+    finish(sessionReply('old'))
+    await discarded
+    await request('/projects/test/credentials')
+    expect(fetcher.mock.calls[2]![1].headers).toMatchObject({ 'X-Workbench-Session': 'new' })
   })
 })

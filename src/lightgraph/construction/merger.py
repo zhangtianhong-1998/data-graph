@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Callable, Iterable
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -14,8 +15,8 @@ from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import MergePolicyConfig
 from lightgraph.source_values import identity_cell, persisted_identity_key
 from .display import derive_display_graph
-from .fusion import (deduplicate_supports, definition_conflict_diagnostics, label_priority, mark_relation_meanings,
-                     merge_definition, prepare_graph, relation_identity, retain_definition_variants)
+from .fusion import (deduplicate_supports, definition_conflict_diagnostics, edge_reference, label_priority, mark_relation_meanings,
+                     merge_definition, prepare_graph, record_input_edge, relation_identity, retain_definition_variants)
 from .context_topology import detect_context_cycles
 from .hierarchy_replay import reconcile_hierarchy_projections
 from .hierarchy_stage import original_stage_inputs, record_stage
@@ -230,6 +231,7 @@ def _merge_contributor_nodes_and_edges(
     target_access_fingerprint: str | None = None,
     independent_outputs: bool = False,
     recognize_source_replays: bool = True,
+    observe_before_hierarchy: Callable[[Iterable[dict]], None] | None = None,
 ) -> dict[str, Any]:
     """Merge graphs while blocking unverified cross-unit auto-merges & auto-connections."""
     fusion = policy.fusion_policy
@@ -489,7 +491,10 @@ def _merge_contributor_nodes_and_edges(
             pending['node_ids'] = sorted({id_remap.get(nid, nid) for nid in pending.get('node_ids', [])})
             if pending not in unresolved_relations:
                 unresolved_relations.append(pending)
-        for raw_edge in graph.get('edges', []):
+        # Preparation may have already qualified both endpoint and relation types.
+        # Read the original identity from the contributor, before either rewrite.
+        input_edges = originals[(ckind, cid)].get('edges', [])
+        for original, raw_edge in zip(input_edges, graph.get('edges', []), strict=True):
             edge = deepcopy(raw_edge)
             ambiguous_endpoints = {}
             def resolve_endpoint(key):
@@ -536,6 +541,7 @@ def _merge_contributor_nodes_and_edges(
                                original_endpoints={key: raw_edge[key] for key in ('source', 'target')},
                                candidate_endpoints=candidates,
                                node_ids=sorted({nid for values in candidates.values() for nid in values}))
+                record_input_edge(pending, edge_reference(original), input_kind=ckind, contributor_id=cid)
                 pending.pop('source', None)
                 pending.pop('target', None)
                 unresolved_relations.append(pending)
@@ -551,6 +557,7 @@ def _merge_contributor_nodes_and_edges(
                 edge['id'] = 'r_' + digest('unit_scoped', cid, edge['id'])
             elif src != raw_edge['source'] or dst != raw_edge['target']:
                 edge['id'] = relation_identity(edge)
+            record_input_edge(edge, edge_reference(original), input_kind=ckind, contributor_id=cid)
             eid = edge['id']
             existing_edge = merged_edges.get(eid)
             if existing_edge is None:
@@ -791,6 +798,8 @@ def _merge_contributor_nodes_and_edges(
     if replay_status == 'ran' and compatible_namespace and all(
         kind == 'unit' and not graph.get('extends_base_graph') for _, kind, graph in prepared_contributors
     ):
+        if observe_before_hierarchy is not None:
+            observe_before_hierarchy([edge_reference(e) for e in result['edges']])
         hierarchy_collapsed = reconcile_hierarchy_projections(
             result, excluded_types=excluded_types, diagnostics=hierarchy_diagnostics)
     result['definition_conflicts'] = definition_conflict_diagnostics(result)
@@ -900,11 +909,22 @@ def merge_accounting(contributors, graph):
     if 'fusion_diagnostics' in graph:
         return dict(graph['fusion_diagnostics'])
     isolation = graph.get('conflict_isolation') or {}
+    pair_counts = Counter()
+    self_loops = 0
+    for edge in graph['edges']:
+        source, target = edge['source'], edge['target']
+        pair_counts[source, target] += 1
+        if source == target:
+            self_loops += 1
     return {
         'input_nodes': sum(len(c['graph'].get('nodes', ())) for c in contributors),
         'input_edges': sum(len(c['graph'].get('edges', ())) for c in contributors),
         'output_nodes': len(graph['nodes']),
         'output_edges': len(graph['edges']),
+        'output_directed_endpoint_pairs': len(pair_counts),
+        'output_multi_edge_pairs': sum(size > 1 for size in pair_counts.values()),
+        'output_endpoint_pair_excess': len(graph['edges']) - len(pair_counts),
+        'output_self_loop_edges': self_loops,
         'candidate_identity_groups': len(graph.get('candidate_identity_merges', ())),
         **identity_candidate_node_counts(graph),
         'quarantined_nodes': isolation.get('nodes', 0),
@@ -920,6 +940,7 @@ def merge_construction_graphs(
     merge_policy: MergePolicyConfig | dict[str, Any] | None = None,
     independent_outputs: bool = False,
     recognize_source_replays: bool = True,
+    observe_before_hierarchy: Callable[[Iterable[dict]], None] | None = None,
 ) -> dict[str, Any]:
     """Merge authorized graph contributors.
 
@@ -939,6 +960,7 @@ def merge_construction_graphs(
         target_access_fingerprint=target_access_fingerprint,
         independent_outputs=independent_outputs,
         recognize_source_replays=recognize_source_replays,
+        observe_before_hierarchy=observe_before_hierarchy,
     )
 
 

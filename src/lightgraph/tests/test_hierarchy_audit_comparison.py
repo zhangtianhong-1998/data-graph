@@ -75,3 +75,67 @@ def test_comparison_requires_same_artifacts_and_complete_disjoint_groups():
             compare({**baseline, **wrong}, baseline, {"a"})
     with pytest.raises(ValueError):
         compare(report({"a": ["a", "b"], "c": ["c", "b"]}, 2), baseline, {"a"})
+
+
+def test_edge_lineage_qualifies_shared_input_ids_and_validates_actual_hierarchy_stage():
+    from lightgraph.construction.fusion import edge_reference
+    review = compare.__globals__['edge_lineage']
+    raw = {'id': 'same', 'source': 'a', 'target': 'b', 'type': 'base'}
+    inputs = [{'contributor_id': c, 'graph': {'edges': [raw]}} for c in ('one', 'two', 'three')]
+    interim = {**raw, 'id': 'intermediate', 'source': 'qualified-a'}
+    final = {**interim, 'id': 'final', 'type': 'new'}
+    stage = {('intermediate', 'base', 'qualified-a', 'b')}
+    support = {'contributor_id': 'one', 'endpoint_origins': [
+        {**edge_reference(raw), 'input_kind': 'unit', 'contributor_id': 'one'},
+        {**edge_reference(raw), 'input_kind': 'unit', 'contributor_id': 'nonexistent'},
+        {**edge_reference(interim), 'stage': 'before_hierarchy_replay'},
+        {**edge_reference(raw), 'stage': 'before_hierarchy_replay'}]}
+    # The unchanged legacy address has no owner. It cannot account for either remaining contributor.
+    unknown = {**raw, 'id': 'other', 'supports': [{'endpoint_origins': edge_reference(raw)}]}
+    graph = {'edges': [{**final, 'supports': [support, support]}, unknown]}
+    result = review(inputs, graph, stage)
+    assert result['input_ids_shared_across_contributors'] == result['input_tuples_shared_across_contributors'] == 1
+    assert result['input_edge_counts_by_contributor'] == {
+        'one': {'qualified_origin': 1}, 'two': {'ambiguous_owner': 1}, 'three': {'ambiguous_owner': 1}}
+    assert result['qualified_origin_bindings'] == {'verified': 1, 'not_in_named_checkpoint': 1}
+    assert result['before_hierarchy_replay']['captured_edges'] == 1
+    assert result['before_hierarchy_replay']['origin_bindings'] == {'verified': 1, 'not_in_stage': 1}
+    assert review(inputs[::-1], {'edges': graph['edges'][::-1]}, stage) == result
+    assert review(inputs, graph, None)['before_hierarchy_replay']['origin_bindings'] == {'not_captured': 2}
+    graph['edges'][0]['definition_variant'] = {'contract_digest': 'revised'}
+    changed = review(inputs, graph, stage)
+    assert changed['output_edge_contract_sha256'] != result['output_edge_contract_sha256']
+    assert changed['output_edge_identity_sha256'] == result['output_edge_identity_sha256']
+    # Swapping the same origins between two observations cannot be seen at edge granularity.
+    edge = graph['edges'][0]
+    edge['supports'] = [{'observation_id': 'obs_1', 'endpoint_origins': support['endpoint_origins']},
+                        {'properties': {'row': ['another']}}]
+    before = review(inputs, graph, stage)
+    edge['supports'][1]['endpoint_origins'] = edge['supports'][0].pop('endpoint_origins')
+    after = review(inputs, graph, stage)
+    assert before['qualified_origin_bindings_sha256'] == after['qualified_origin_bindings_sha256']
+    assert before['output_support_endpoint_origins_sha256'] != after['output_support_endpoint_origins_sha256']
+
+
+def test_actual_partial_fold_reconciles_retyped_edges_to_units_and_the_captured_intermediate():
+    from lightgraph.construction.fusion import relation_identity
+    from lightgraph.construction.merger import merge_construction_graphs
+    from lightgraph.tests.test_hierarchy_projection_variants import _projection, contributor
+
+    units = []
+    for i in range(3):
+        g = _projection(i, conflict=True)
+        for r in g['definitions']['relations']:
+            r['type'] = 'contains'
+        for e in g['edges']:
+            e['type'] = 'contains'
+            e['id'] = relation_identity(e)
+        units.append(contributor(str(i), g))
+    captured = []
+    graph = merge_construction_graphs(units, observe_before_hierarchy=captured.extend)
+    stage = {compare.__globals__['_edge_key'](e, 'edge_id') for e in captured}
+    result = compare.__globals__['edge_lineage'](units, graph, stage)
+    assert result['input_edge_counts_by_contributor'] == {str(i): {'qualified_origin': 3} for i in range(3)}
+    results = result['before_hierarchy_replay']['origin_bindings']
+    assert results.get('verified', 0) > 0 and set(results) == {'verified'}
+    assert len(stage) == result['before_hierarchy_replay']['captured_edges'] == 9

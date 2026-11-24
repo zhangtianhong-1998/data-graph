@@ -312,6 +312,122 @@ def hierarchy_membership(graph, control_ids):
             "agrees_with_recorded_count": len(removed) == represented == recorded if recorded is not None else None}
 
 
+def _edge_key(edge, id_field):
+    return tuple(edge.get(k) for k in (id_field, 'type', 'source', 'target'))
+
+
+def _rows_hash(rows):
+    h = hashlib.sha256()
+    for row in sorted(canonical(row) for row in rows):
+        h.update(row.encode('utf-8') + b'\n')
+    return h.hexdigest()
+
+
+def edge_lineage(inputs, graph, stage):
+    """Count input edge occurrences by contributor. Separate checkpoint and in-memory addresses."""
+    owners = defaultdict(set)
+    id_owners = defaultdict(set)
+    counts = Counter()
+    for item in inputs:
+        owner = (item.get('kind', 'unit'), item['contributor_id'])
+        for edge in item['graph']['edges']:
+            key = _edge_key(edge, 'id')
+            owners[key].add(owner)
+            id_owners[key[0]].add(owner)
+            counts[owner, key] += 1
+    matches = defaultdict(lambda: defaultdict(set))
+    uncertain = defaultdict(set)
+    qualified = set()
+    qualified_results = Counter()
+    stage_results = Counter()
+    identities, contracts, support_bindings = [], [], []
+    declarations = {r['type']: hashlib.sha256(canonical(fusion.definition_contract(r)).encode('utf-8')).hexdigest()
+                    for r in graph.get('definitions', {}).get('relations', ())}
+
+    def match_support(output, key, support_owners, declared, basis):
+        possible = {o for o in owners.get(key, ()) if o[1] not in declared}
+        remaining = support_owners - declared - {None}
+        attributed = {o for o in possible if o[1] in remaining}
+        if len(remaining) == len(attributed) == 1:
+            matches[next(iter(attributed)), key][output].add(basis)
+        elif not declared or remaining:
+            for owner in attributed or possible:
+                ambiguous = len(remaining) > 1 or len(attributed or possible) > 1
+                uncertain[owner, key].add('ambiguous_owner' if ambiguous else 'unattributed')
+
+    for edge in graph['edges']:
+        output = _edge_key(edge, 'id')
+        identities.append(output)
+        contracts.append((output, (edge.get('definition_variant') or {}).get('contract_digest'),
+                          declarations.get(edge['type'])))
+        seen_stage = set()
+        for support in edge.get('supports') or [{}]:
+            support_owners = {s.get('contributor_id') for s in support.get('execution_origins', ())}
+            support_owners.add(support.get('contributor_id'))
+            origins = support.get('endpoint_origins') or []
+            if isinstance(origins, dict):
+                origins = [origins]
+            if edge.get('supports'):
+                observation = support.get('observation_id')
+                if not observation:
+                    evidence = {k: v for k, v in support.items() if k not in ('observation_id', 'endpoint_origins')}
+                    observation = 'support_sha256:' + _rows_hash([evidence])
+                support_bindings.append((output, observation, _rows_hash(origins)))
+            declared = {o.get('contributor_id') for o in origins if o.get('input_kind') == 'unit'}
+            # A contributor with an explicit origin has already identified its
+            # actual input. Coinciding intermediate or output IDs add no evidence.
+            match_support(output, output, support_owners, declared, 'unchanged')
+            for origin in origins:
+                key = _edge_key(origin, 'edge_id')
+                if 'input_kind' in origin:
+                    owner = (origin['input_kind'], origin.get('contributor_id'))
+                    if origin['input_kind'] != 'unit':
+                        continue  # This audit accepts direct unit checkpoints only.
+                    claim = output, owner, key
+                    if claim not in qualified:
+                        qualified.add(claim)
+                        verified = owner in owners.get(key, ())
+                        qualified_results['verified' if verified else 'not_in_named_checkpoint'] += 1
+                        if verified:
+                            matches[owner, key][output].add('qualified_origin')
+                elif origin.get('stage') == 'before_hierarchy_replay':
+                    verified = stage is not None and key in stage
+                    if key not in seen_stage:
+                        seen_stage.add(key)
+                        status = 'not_captured' if stage is None else 'verified' if verified else 'not_in_stage'
+                        stage_results[status] += 1
+                    if verified:
+                        match_support(output, key, support_owners, declared, 'stage_tuple_and_owner_match_checkpoint')
+                elif not origin.get('stage'):
+                    match_support(output, key, support_owners, declared, 'legacy_tuple_and_owner_match_checkpoint')
+
+    by_owner = {item['contributor_id']: Counter() for item in inputs}
+    for (owner, key), count in counts.items():
+        outputs = matches.get((owner, key), {})
+        if count > 1:
+            status = 'duplicate_input_tuple'
+        elif len(outputs) > 1:
+            status = 'multiple_matching_outputs'
+        elif outputs:
+            bases = next(iter(outputs.values()))
+            status = next(b for b in ('unchanged', 'qualified_origin', 'stage_tuple_and_owner_match_checkpoint',
+                                      'legacy_tuple_and_owner_match_checkpoint') if b in bases)
+        else:
+            unresolved = uncertain.get((owner, key), ())
+            status = 'ambiguous_owner' if 'ambiguous_owner' in unresolved else 'unattributed' if unresolved else 'unverified'
+        by_owner[owner[1]][status] += count
+    return {'input_edge_counts_by_contributor': by_owner,
+            'input_ids_shared_across_contributors': sum(len(v) > 1 for v in id_owners.values()),
+            'input_tuples_shared_across_contributors': sum(len(v) > 1 for v in owners.values()),
+            'qualified_origin_bindings': dict(qualified_results),
+            'before_hierarchy_replay': {'captured_edges': None if stage is None else len(stage),
+                                        'identity_sha256': None if stage is None else _rows_hash(stage),
+                                        'origin_bindings': dict(stage_results)},
+            'output_edge_identity_sha256': _rows_hash(identities), 'output_edge_contract_sha256': _rows_hash(contracts),
+            'qualified_origin_bindings_sha256': _rows_hash(qualified),
+            'output_support_endpoint_origins_sha256': _rows_hash(support_bindings)}
+
+
 def _membership_groups(report):
     replay = report.get("with_source_replay") or {}
     membership = replay.get("hierarchy_membership") if isinstance(replay, dict) else None
@@ -423,8 +539,10 @@ def _run_summary(run, state, project, node_id):
 
 
 def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False, compare_to=None,
-          run_summary=False):
+          run_summary=False, include_edge_lineage=False):
     """Use the run's committed inputs and policy, even when the current project has been edited."""
+    if include_edge_lineage and (observations_only or run_summary):
+        raise ValueError("--include-edge-lineage 需要执行合并重放")
     run_file = Path(run_file)
     run = json.loads(run_file.read_text(encoding="utf-8"))
     project = run_file.parent.parent
@@ -492,12 +610,23 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         "inputs": {c["contributor_id"]: graph_counts(c["graph"]) for c in inputs}, "committed": counts,
         "historical_input_totals_verified": totals.keys() <= saved_counts.keys(),
     }
+    if include_edge_lineage:
+        report['lineage_input_artifacts'] = {r['node_id']: r['artifact_id'] for r in parents}
     control_ids = set()
     for enabled, label in [(False, "without_source_replay"), (True, "with_source_replay")]:
+        stage = None
+
+        def capture_stage(refs):
+            nonlocal stage
+            stage = {_edge_key(ref, 'edge_id') for ref in refs}
+
+        options = {'observe_before_hierarchy': capture_stage} if include_edge_lineage else {}
         graph = merger.merge_construction_graphs(inputs, target_access_fingerprint=target["access_fingerprint"],
-                                                merge_policy=policy, recognize_source_replays=enabled)
+                                                merge_policy=policy, recognize_source_replays=enabled, **options)
         report[label] = {**merger.merge_accounting(inputs, graph), **alignment_counts(graph),
                          "integrity": output_checks(graph)}
+        if include_edge_lineage:
+            report[label]['edge_lineage'] = edge_lineage(inputs, graph, stage)
         if include_hierarchy_membership or compare_to is not None:
             if enabled:
                 report[label]["hierarchy_membership"] = hierarchy_membership(graph, control_ids)
@@ -534,6 +663,7 @@ def main():
     mode.add_argument("--run-summary", action="store_true", help="只读正式运行记录、检查点标记和 Parquet 行数，不加载图或重放合并")
     mode.add_argument("--observations-only", action="store_true", help="只核查已提交图的实际观测，跳过合并重放")
     mode.add_argument("--include-hierarchy-membership", action="store_true", help="在重放报告中列出层级归并前后的节点 ID")
+    parser.add_argument("--include-edge-lineage", action="store_true", help="逐单元核对原边来源和层级归并前的边，输出计数与摘要")
     parser.add_argument("--compare-hierarchy-audit", type=Path, metavar="AUDIT_JSON",
                         help="与同一批检查点的上一轮完整审计报告逐组比较，并输出本轮成员映射")
     args = parser.parse_args()
@@ -542,7 +672,7 @@ def main():
     try:
         report = audit(args.run_file, args.node, observations_only=args.observations_only,
                        include_hierarchy_membership=args.include_hierarchy_membership, compare_to=args.compare_hierarchy_audit,
-                       run_summary=args.run_summary)
+                       run_summary=args.run_summary, include_edge_lineage=args.include_edge_lineage)
     except LightGraphError as exc:
         parser.exit(1, f"检查点或合并未通过校验：{exc.code}\n")
     except (KeyError, OSError, ValueError) as exc:

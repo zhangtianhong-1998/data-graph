@@ -71,8 +71,8 @@ const messages: Record<string, string> = {
   config_path_must_be_unambiguous_project_file: '配置中的文件未在当前项目注册，请从数据接入或知识文档页面上传后再选择。',
   config_path_must_be_project_file: '配置路径必须指向当前项目已上传的文件。',
   model_credential_missing: '请在模型配置中保存 API key，或配置服务器环境变量。', source_credential_missing: '请重新连接数据库，或检查服务器的连接环境变量。',
-  session_required: '页面会话已失效，请刷新后继续，已保存的密钥和连接信息会自动恢复。', session_invalid: '页面会话已失效，请刷新后继续，已保存的密钥和连接信息会自动恢复。',
-  credential_session_invalid: '页面会话已失效，请刷新后继续，已保存的密钥和连接信息会自动恢复。', credential_session_capacity_reached: '服务当前会话已满，请稍后重试。',
+  session_required: '页面会话已失效。请核对刚才的操作结果后重试。', session_invalid: '页面会话已失效。请核对刚才的操作结果后重试。',
+  credential_session_invalid: '页面会话已失效。请核对刚才的操作结果后重试。', credential_session_capacity_reached: '服务当前会话已满，请稍后重试。',
   model_endpoint_required: '请先填写并保存模型服务地址和模型名称。',
   model_credential_binding_conflict: '模型服务地址或名称已变化，密钥未保存。请重新加载配置并核对密钥对应的服务。',
   database_tls_required: '远程数据库要求 TLS 证书校验，请使用包含 TLS 配置的连接串。',
@@ -170,25 +170,45 @@ export class ApiError extends Error {
   }
 }
 // Tokens and credentials stay in this page's memory, never browser storage.
-const sessions = new Map<string, string>()
-const pendingSessions = new Map<string, Promise<void>>()
-function sessionHeader(path: string): Record<string, string> {
-  const project = path.match(/^\/projects\/([^/]+)(?:\/|$)/)?.[1]
-  const token = project ? sessions.get(project) : undefined
-  return token ? { 'X-Workbench-Session': token } : {}
+type WorkbenchSession = { token?: string; expiresAt: number; pending?: Promise<void> }
+const sessions = new Map<string, WorkbenchSession>()
+const renewalListeners = new Set<(projectId: string) => void>()
+export function onSessionRenewed(listener: (projectId: string) => void) {
+  renewalListeners.add(listener)
+  return () => renewalListeners.delete(listener)
 }
-export function clearSession(projectId: string) { const id = encodeURIComponent(projectId); sessions.delete(id); pendingSessions.delete(id) }
-export function clearSessions() { sessions.clear(); pendingSessions.clear() }
-export async function ensureSession(projectId: string): Promise<void> {
+export function clearSession(projectId: string) { sessions.delete(encodeURIComponent(projectId)) }
+export function clearSessions() { sessions.clear() }
+export function ensureSession(projectId: string): Promise<void> {
   const id = encodeURIComponent(projectId)
-  if (sessions.has(id)) return
-  if (pendingSessions.has(id)) return pendingSessions.get(id)
-  const pending = request<{ session_id: string }>(`${projectPath(projectId)}/session`, { method: 'POST', body: '{}', timeoutMs: 10000 }).then(response => {
+  const session: WorkbenchSession = sessions.get(id) ?? { expiresAt: 0 }
+  if (session.pending) return session.pending
+  if (session.token && Date.now() < session.expiresAt) return Promise.resolve()
+  sessions.set(id, session)
+  session.pending = request<{ session_id: string; expires_in_seconds?: number }>(`${projectPath(projectId)}/session`, {
+    method: 'POST', body: '{}', timeoutMs: 10000,
+  }).then(response => {
+    if (sessions.get(id) !== session) throw new ApiError('request_cancelled')
     if (!response.session_id) throw new ApiError('invalid_response')
-    sessions.set(id, response.session_id)
-  }).finally(() => pendingSessions.delete(id))
-  pendingSessions.set(id, pending)
-  return pending
+    const renewed = Boolean(session.token)
+    session.token = response.session_id
+    const ttl = response.expires_in_seconds
+    session.expiresAt = typeof ttl === 'number' && ttl > 0 ? Date.now() + ttl * 1000 : Infinity
+    if (renewed) renewalListeners.forEach(notify => notify(projectId))
+  }).finally(() => { session.pending = undefined })
+  return session.pending
+}
+
+// A cancelled panel stops waiting without cancelling another caller's renewal.
+async function waitForSession(session: Promise<void>, signal: AbortSignal) {
+  signal.throwIfAborted()
+  let abort: () => void = () => {}
+  const cancelled = new Promise<never>((_, reject) => {
+    abort = () => reject(new ApiError('request_cancelled'))
+    signal.addEventListener('abort', abort, { once: true })
+  })
+  try { await Promise.race([session, cancelled]) }
+  finally { signal.removeEventListener('abort', abort) }
 }
 // Revision metadata belongs to the response object, never the editable config.
 const responseRevisions = new WeakMap<object, string>()
@@ -203,16 +223,36 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   const abort = () => controller.abort()
   signal?.addEventListener('abort', abort, { once: true })
   if (signal?.aborted) abort()
-  // Bound both waiting for headers and reading the response body. Never retry writes automatically.
+  // Keep the caller's timeout across renewal, transport and response decoding.
   const timer = timeoutMs === null ? undefined : setTimeout(() => { timedOut = true; controller.abort() }, timeoutMs)
   try {
-    const response = await fetch(`/api${path}`, { ...init, signal: controller.signal, credentials: 'same-origin', cache: 'no-store',
-      headers: { ...sessionHeader(path), ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...options.headers } })
+    const project = path.match(/^\/projects\/([^/?]+)(?:\/|$)/)?.[1]
+    const session = project && path !== `/projects/${project}/session` ? sessions.get(project) : undefined
+    const send = (token?: string) => fetch(`/api${path}`, { ...init, signal: controller.signal, credentials: 'same-origin', cache: 'no-store',
+      headers: { ...(token ? { 'X-Workbench-Session': token } : {}), ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...options.headers } })
+    let token = session?.token
+    let response = await send(token)
+    if (response.status === 400 && response.headers?.get('X-Workbench-Session-Rejected') === '1' && project && session && token) {
+      // Rejection by the server's session dependency guarantees the handler did not run.
+      // Late failures and network errors never authorize resubmitting a mutation.
+      if (sessions.get(project) !== session) throw new ApiError('request_cancelled')
+      if (session.token === token) session.expiresAt = 0
+      if (!init.keepalive && !(typeof ReadableStream !== 'undefined' && init.body instanceof ReadableStream)) {
+        controller.signal.throwIfAborted()
+        await response.body?.cancel()
+        await waitForSession(ensureSession(decodeURIComponent(project)), controller.signal)
+        controller.signal.throwIfAborted()
+        if (sessions.get(project) !== session) throw new ApiError('request_cancelled')
+        token = session.token
+        response = await send(token)
+      }
+    }
     if (response.ok && responseType === 'blob') return await response.blob() as T
     let data: unknown
     try { data = await response.json() } catch { throw new ApiError('invalid_response', response.status) }
     if (!response.ok) {
       const code = (data as { error?: { code?: unknown } })?.error?.code
+      if (code === 'credential_session_invalid' && token && session?.token === token) session.expiresAt = 0
       // Render only the short public error code; never reflect raw server errors or HTML.
       throw new ApiError(typeof code === 'string' && /^[a-zA-Z0-9_.:-]{1,100}$/.test(code) ? code : `http_${response.status}`, response.status,
         ['invalid_project_config', 'invalid_model_limits', 'invalid_document_manifest'].includes(String(code)) ? (data as { error?: { diagnostics?: unknown } })?.error?.diagnostics : [], (data as { error?: { node_id?: unknown } })?.error?.node_id)

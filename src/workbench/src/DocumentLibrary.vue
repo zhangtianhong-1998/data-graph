@@ -116,7 +116,7 @@ const example = `documents:
 .library-title h2 { margin: 0; font-size: 21px; }
 .library-title span, .manifest-files > .actions > span { color: #64738a; font-size: 13px; }
 .document-scroll { min-height: 0; flex: 1; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 1px 4px 12px 1px; }
-.card-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); align-items: start; gap: 10px; }
+.card-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); align-items: start; gap: 14px; }
 .manifest, .library-empty { border: 1px solid var(--line); border-radius: 8px; background: white; padding: 14px 18px; margin: 0 0 12px; }
 .manifest, .manifest-field, .manifest-files { display: grid; gap: 6px; min-width: 0; }
 .manifest { gap: 14px; }

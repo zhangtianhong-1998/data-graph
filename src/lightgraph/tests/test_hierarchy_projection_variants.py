@@ -217,13 +217,18 @@ def test_partial_fold_of_same_named_relations_preserves_edge_lineage_on_republic
         units.append(contributor(str(i), g))
     historical = merge_construction_graphs(units, recognize_source_replays=False)
     original = {e['id']: (e['type'], e['source'], e['target']) for e in historical['edges']}
+    checkpoints = {u['contributor_id']: {
+        e['id']: (e['type'], e['source'], e['target']) for e in u['graph']['edges']} for u in units}
     folded = merge_construction_graphs(units)
     assert len(folded['nodes']) == 7
     assert len(folded['edges']) == len(original) == 9
     for edge in folded['edges']:
-        if edge['id'] not in original:
-            for support in edge['supports']:
-                previous = support['endpoint_origins'][-1]
+        for support in edge['supports']:
+            sources = support['endpoint_origins']
+            raw, = [o for o in sources if o.get('input_kind') == 'unit']
+            assert checkpoints[raw['contributor_id']][raw['edge_id']] == (raw['type'], raw['source'], raw['target'])
+            if edge['id'] not in original:
+                previous, = [o for o in sources if o.get('stage') == 'before_hierarchy_replay']
                 assert original[previous['edge_id']] == (previous['type'], previous['source'], previous['target'])
     frozen = merge_construction_graphs([{'kind': 'merged', 'contributor_id': 'published', 'graph': folded}])
     assert {e['id'] for e in frozen['edges']} == {e['id'] for e in folded['edges']}

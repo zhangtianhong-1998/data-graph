@@ -89,6 +89,20 @@ export interface WorkflowFailureDetail {
   errno?: number
   winerror?: number
 }
+export interface WorkflowMergeCounts {
+  input_nodes?: number
+  output_nodes?: number
+  input_edges?: number
+  output_edges?: number
+  output_directed_endpoint_pairs?: number
+  output_multi_edge_pairs?: number
+  output_endpoint_pair_excess?: number
+  output_self_loop_edges?: number
+  source_replay_status?: string
+  source_replay_collapsed_nodes?: number
+  observed_dictionary_collapsed_nodes?: number
+  hierarchy_replay_collapsed_nodes?: number
+}
 export interface WorkflowMergeNodeState {
   node_id: string
   label?: string
@@ -97,8 +111,8 @@ export interface WorkflowMergeNodeState {
   run_id?: string | null
   error_code?: string | null
   failure_detail?: WorkflowFailureDetail
-  merge_counts?: { input_nodes: number; output_nodes: number; source_replay_status?: string; source_replay_collapsed_nodes?: number; observed_dictionary_collapsed_nodes?: number; hierarchy_replay_collapsed_nodes?: number }
-  delta_merge_counts?: { source_replay_status?: string; source_replay_collapsed_nodes?: number; observed_dictionary_collapsed_nodes?: number; hierarchy_replay_collapsed_nodes?: number }
+  merge_counts?: WorkflowMergeCounts
+  delta_merge_counts?: WorkflowMergeCounts
   nodes?: number
   model_calls?: number | null
   edges?: number

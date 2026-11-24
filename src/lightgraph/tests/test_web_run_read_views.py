@@ -57,6 +57,8 @@ def test_workbench_reads_recorded_state_and_distinguishes_current_workflow(clien
     manager = client.app.state.manager
     project, directory = manager._paths('alpha')
     old, new = ('run_' + n * 24 for n in ('1', '2'))
+    edge_totals = {'input_edges': 34_954, 'output_edges': 34_954, 'output_directed_endpoint_pairs': 26_780,
+                   'output_multi_edge_pairs': 4_346, 'output_endpoint_pair_excess': 8_174, 'output_self_loop_edges': 2_043}
     for rid, count in ((old, 29_462), (new, 23_958)):
         manager._save_run(directory / (rid + '.json'), record(rid, workflow=True, report={'counts': {'business_nodes': count}}))
         state = {'parent_run_id': rid, 'plan': {'heavy': 'hidden from table'}, 'units': {},
@@ -64,6 +66,8 @@ def test_workbench_reads_recorded_state_and_distinguishes_current_workflow(clien
                                              'nodes': count, 'merge_counts': {'output_nodes': count, 'internal': [1, 2]}}},
                  'artifacts': {'merge_1': {'artifact_id': 'artifact_' + rid, 'graph_kind': 'node_full', 'internal': [1, 2]}},
                  'merge': {'nodes': count}, 'terminal_ids': ['merge_1']}
+        if rid == new:
+            state['merge_nodes']['merge_1']['merge_counts'].update(edge_totals)
         save_workflow_state(project / 'output', state)
 
     # The default route retains the previous full payload independently.
@@ -75,7 +79,7 @@ def test_workbench_reads_recorded_state_and_distinguishes_current_workflow(clien
         assert selected['report']['counts']['business_nodes'] == expected
         table = selected['workflow_state']
         assert table['parent_run_id'] == rid and 'plan' not in table
-        assert table['merge_nodes']['merge_1']['merge_counts'] == {'output_nodes': expected}
+        assert table['merge_nodes']['merge_1']['merge_counts'] == {'output_nodes': expected, **(edge_totals if rid == new else {})}
         assert table['artifacts']['merge_1']['artifact_id'] == 'artifact_' + rid
         assert table['merge_nodes']['merge_1']['model_calls'] == 0
 
