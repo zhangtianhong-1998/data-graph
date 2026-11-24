@@ -183,6 +183,7 @@ const runs = shallowRef<Run[]>([])
 const runMode = ref<'continue' | 'fresh'>('continue')
 const selectedRunId = ref('')
 const selectedRun = shallowRef<Run | null>(null)
+const previousProjectRoot = ref('')
 const runDetailError = ref('')
 let detailController: AbortController | undefined
 let pollController: AbortController | undefined
@@ -580,6 +581,7 @@ watch([() => tab.value === 'runs' && selectedRunId.value, () => project.value?.p
   detailController?.abort()
   detailController = undefined
   selectedRun.value = null
+  previousProjectRoot.value = ''
   traceNodeId.value = ''
   runDetailError.value = ''
   void readSelectedRun()
@@ -745,12 +747,14 @@ async function retryWorkflowUnit(unitId: string) {
 async function resumeWorkflow(target: { from_node_id: string; action?: 'recompose_legacy_merge'; verify_checkpoints_in_background?: true } | { artifact_id: string }) {
   const original = selectedRun.value
   if (!original || !project.value) return
+  const actionName = 'artifact_id' in target ? 'publish_artifact' : target.action || 'rerun_node'
+  const previousRoot = actionName === 'rerun_node' ? previousProjectRoot.value.trim() : ''
   await action(async () => {
     if (dirty.value || advancedDirty.value) await saveDraft()
-    const actionName = 'artifact_id' in target ? 'publish_artifact' : target.action || 'rerun_node'
     if (actionName === 'rerun_node') await ensureSession(original.project_id)
     const run = await request<Run>(`${projectPath(original.project_id)}/runs/${encodeURIComponent(original.run_id)}/resume`, {
-      method: 'POST', headers: revisionHeaders(), body: json({ ...target, action: actionName }),
+      method: 'POST', headers: revisionHeaders(),
+      body: json({ ...target, action: actionName, ...(previousRoot && { previous_project_root: previousRoot }) }),
     })
     runs.value = [historyRow(run), ...runs.value.filter(item => item.run_id !== run.run_id)]
     selectedRunId.value = run.run_id; tab.value = 'runs'
@@ -1131,6 +1135,14 @@ onUnmounted(() => { generation++; detailController?.abort(); pollController?.abo
                 </div>
               </div>
               <div class="panel-body">
+                <details v-if="visibleWorkflowState.artifacts && config.workflow?.enabled" class="field">
+                  <summary>项目目录已迁移</summary>
+                  <div class="field">
+                    <label for="previous-project-root">原项目绝对路径（含项目名）</label>
+                    <input id="previous-project-root" v-model="previousProjectRoot" maxlength="4096" autocomplete="off" spellcheck="false" :disabled="locked" aria-describedby="previous-project-root-hint"/>
+                    <p id="previous-project-root-hint" class="field-hint">从副本重新运行节点时，可填写创建原检查点的项目目录，例如 D:\workspace\{{ project.project_id }}。</p>
+                  </div>
+                </details>
                 <div class="table-scroll">
                   <table>
                     <thead><tr><th>节点</th><th>类型</th><th>状态</th><th>节点数</th><th>关系数</th><th>本轮 LLM 调用</th><th>子运行编号</th><th>说明</th><th>操作</th></tr></thead>

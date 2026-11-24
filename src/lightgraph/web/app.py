@@ -122,6 +122,7 @@ class ResumeRun(InputModel):
     from_node_id: str | None = Field(default=None, pattern=r'^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')
     artifact_id: str | None = Field(default=None, pattern=r'^artifact_[a-f0-9]{32}$')
     verify_checkpoints_in_background: StrictBool = False
+    previous_project_root: str | None = Field(default=None, min_length=1, max_length=4096)
 
 
 class NewProject(InputModel):
@@ -1004,13 +1005,16 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         with workspace.lock(pid):
             mutable(pid)
             workspace.require_config_revision(pid, if_match)
+            options = {'previous_project_root': data.previous_project_root} if data.previous_project_root else {}
             if data.action == 'publish_artifact':
                 if not data.artifact_id or data.from_node_id:
                     raise LightGraphError('invalid_workflow_resume_request')
-                return manager.resume(pid, rid, action=data.action, artifact_id=data.artifact_id)
+                return manager.resume(pid, rid, action=data.action, artifact_id=data.artifact_id, **options)
             if not data.from_node_id or data.artifact_id:
                 raise LightGraphError('invalid_workflow_resume_request')
             if data.action == 'recompose_legacy_merge':
+                if options:
+                    raise LightGraphError('invalid_workflow_resume_request')
                 return manager.resume(pid, rid, action=data.action, from_node_id=data.from_node_id)
             from ..construction.workflow import resolve_workflow_plan
             from .execution import _workflow_descendants
@@ -1027,7 +1031,8 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
                 sources, model = resolved_credentials(pid, x_workbench_session, source_ids=needed)
             elif any(m.node_id in rerun and m.merge_mode == 'overlap_review' for m in config.workflow.merge_nodes):
                 model = resolve_api_key(pid, x_workbench_session, config, model=True)
-            options = {'verify_checkpoints_in_background': True} if data.verify_checkpoints_in_background else {}
+            if data.verify_checkpoints_in_background:
+                options['verify_checkpoints_in_background'] = True
             return manager.resume(pid, rid, from_node_id=data.from_node_id,
                                   source_credentials=sources, model_api_key=model, **options)
 

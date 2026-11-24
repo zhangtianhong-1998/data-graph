@@ -65,20 +65,32 @@ def hierarchy_proposal(tools, table):
                 {**binding, 'source_key_columns': ['parent_code'], 'target_key_columns': ['child_code']}]}]}
 
 
-def install_scripted_worker(monkeypatch, *, draft_factory=metric_proposal):
+def replace_worker_launch(monkeypatch, replacement):
+    """Script the workflow worker while preserving launches by other libraries."""
     original = subprocess.Popen
+
+    def launch(args, *popen_args, **kwargs):
+        if isinstance(args, (list, tuple)) and list(args[:3]) == [sys.executable, '-m', 'lightgraph.web.worker']:
+            return replacement(original, args, *popen_args, **kwargs)
+        return original(args, *popen_args, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'Popen', launch)
+
+
+def install_scripted_worker(monkeypatch, *, draft_factory=metric_proposal):
     script = (f'from lightgraph.tests.construction_worker_fixture import main, {draft_factory.__name__}; '
               f'import sys; sys.exit(main({draft_factory.__name__}))')
 
-    def child(args, **kwargs):
-        return original([sys.executable, '-c', script, args[-1]], **kwargs)
+    def child(original, args, *popen_args, **kwargs):
+        return original([sys.executable, '-c', script, args[-1]], *popen_args, **kwargs)
 
-    monkeypatch.setattr('lightgraph.web.execution.subprocess.Popen', child)
+    replace_worker_launch(monkeypatch, child)
 
 
 def main(draft_factory=metric_proposal):
     from lightgraph.construction import runner
     from lightgraph.construction.workspace import dump_yaml
+    from lightgraph.errors import LightGraphError
     from lightgraph.web.worker import main as worker_main
 
     captured = {}
@@ -95,12 +107,15 @@ def main(draft_factory=metric_proposal):
             return {'finish_reason': 'completed', 'budget': {'calls': 1}}
         table = tools.call('describe_sources')['tables'][0]
         proposal = draft_factory(tools, table)
-        saved = tools.call('save_graph_draft', yaml_text=dump_yaml(proposal))
-        assert saved['status'] == 'ok', saved
-        checked = tools.call('validate_graph_draft', draft_id=proposal['draft_id'])
-        assert checked.get('passed'), checked
-        published = tools.call('publish_graph_draft', draft_id=proposal['draft_id'])
-        assert published['status'] == 'ok', published
+        for name, args in [('save_graph_draft', {'yaml_text': dump_yaml(proposal)}),
+                           ('validate_graph_draft', {'draft_id': proposal['draft_id']}),
+                           ('publish_graph_draft', {'draft_id': proposal['draft_id']})]:
+            result = tools.call(name, **args)
+            if result.get('status') != 'ok' or (name == 'validate_graph_draft' and not result.get('passed')):
+                # The construction runner turns AssertionError into a generic harness failure.
+                # Preserve the failing call and its tool-issued error code on the unit report.
+                code = result.get('code') or next(iter(result.get('diagnostic_codes', {})), 'failed')
+                raise LightGraphError(f"scripted_{name}_{code}")
         return {'finish_reason': 'completed', 'budget': {'calls': 1}}
 
     original = runner.run_construction

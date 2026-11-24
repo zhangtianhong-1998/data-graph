@@ -10,7 +10,7 @@ from copy import deepcopy
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath, PurePosixPath
 import re
 import stat
 import subprocess
@@ -310,13 +310,50 @@ def check_dependencies(expected, project_path):
         raise LightGraphError("input_dependency_changed")
 
 
-def _workflow_node_inputs(config, project, files=None):
+def _historical_root(raw):
+    # The historical location is a string in the digest, never a filesystem to open.
+    if not isinstance(raw, str) or not raw or len(raw) > 4096:
+        raise LightGraphError('invalid_previous_project_root')
+    path = PureWindowsPath(raw)
+    if not path.is_absolute():
+        path = PurePosixPath(raw)
+    if not path.is_absolute() or '..' in path.parts:
+        raise LightGraphError('invalid_previous_project_root')
+    return path
+
+
+def _input_path_representation(scoped, project, previous):
+    def relocated(raw):
+        try:
+            relative = Path(raw).relative_to(project)
+        except ValueError:
+            raise LightGraphError('input_dependency_changed') from None
+        return relative.as_posix() if previous is None else str(previous.joinpath(*relative.parts))
+
+    scoped = scoped.model_copy(deep=True)
+    scoped.documents = [relocated(path) for path in scoped.documents]
+    scoped.rules = [relocated(path) for path in scoped.rules]
+    for source in scoped.sources:
+        if source.path:
+            source.path = relocated(source.path)
+        if source.capability_manifest:
+            source.capability_manifest = relocated(source.capability_manifest)
+    for ref in scoped.inherited_graphs:
+        if ref.snapshot_path:
+            ref.snapshot_path = relocated(ref.snapshot_path)
+    return scoped
+
+
+def _workflow_node_inputs(config, project, files=None, *, version=2, previous_project_root=None):
     """Node semantics exclude layout, display labels, budgets and credentials."""
     from ..construction.workflow import _apply_scoped_inputs, effective_merge_policy, resolve_workflow_plan
     plan = resolve_workflow_plan(config.workflow)
     result = {}
     files = _input_manifest(config, project) if files is None else files
     project = project.resolve()
+    if version not in (1, 2) or previous_project_root is not None and version != 1:
+        raise ValueError('unsupported workflow input version')
+    previous = _historical_root(previous_project_root) if previous_project_root is not None else None
     nodes = {u.unit_id: u for u in config.workflow.units}
     nodes.update({m.node_id: m for m in config.workflow.merge_nodes})
     frozen = []
@@ -330,7 +367,9 @@ def _workflow_node_inputs(config, project, files=None):
         _apply_scoped_inputs(scoped, source_ids=node.source_ids,
                             source_table_overrides=node.source_table_overrides, document_ids=node.document_ids)
         scoped.agent_config = None
-        config_data = scoped.model_dump(mode='json', exclude={
+        serialized = (_input_path_representation(scoped, project, previous)
+                      if version == 2 or previous is not None else scoped)
+        config_data = serialized.model_dump(mode='json', exclude={
             'workflow', 'model', 'agent_config', 'output_dir', 'max_run_seconds', 'embedding', 'record_trace',
             'max_working_bytes', 'max_db_queries', 'max_returned_rows', 'max_returned_bytes'})
         node_data = node.model_dump(mode='json', exclude={'label', 'position', 'max_calls', 'max_run_seconds'})
@@ -342,10 +381,57 @@ def _workflow_node_inputs(config, project, files=None):
             node_files = {path: files[path] for path in relative_paths}
         except (KeyError, ValueError):
             raise LightGraphError('input_dependency_changed') from None
-        result[nid] = digest('workflow_node_inputs_v1', config_data, node_data, frozen,
+        if version == 2:
+            node_files = {Path(path).as_posix(): value for path, value in node_files.items()}
+        elif previous is not None:
+            node_files = {str(type(previous)(*Path(path).parts)): value for path, value in node_files.items()}
+        result[nid] = digest(f'workflow_node_inputs_v{version}', config_data, node_data, frozen,
                              node_files,
                              {parent: result[parent] for parent in plan.merge_inputs.get(nid, [])})
     return result
+
+
+class _WorkflowInputProofs:
+    """Match immutable checkpoints against independently calculated complete node inputs."""
+    def __init__(self, config, project, files):
+        self.config = config
+        self.project = project
+        self.files = files
+        self.current = _workflow_node_inputs(config, project, files)
+        self.older = {}
+
+    def legacy_at(self, root):
+        if root not in self.older:
+            self.older[root] = _workflow_node_inputs(
+                self.config, self.project, self.files, version=1, previous_project_root=root)
+        return self.older[root]
+
+    def match(self, nid, archived, artifact, roots):
+        if not archived or archived != artifact.get('input_digest'):
+            raise LightGraphError('workflow_resume_input_changed')
+        if archived == self.current[nid]:
+            return None
+        for root in dict.fromkeys(roots):
+            if archived == self.legacy_at(root)[nid]:
+                return root or str(self.project.resolve())
+        raise LightGraphError('workflow_resume_input_changed')
+
+
+def _check_reused_access(root, artifact, scoped, project, legacy_input_root):
+    from ..construction.access import access_fingerprint
+    from ..construction.snapshot_registry import authorize_snapshot
+    witness = authorize_snapshot(root, artifact, scoped)
+    recorded = artifact.get('access_fingerprint')
+    if recorded == access_fingerprint(scoped):
+        return
+    # A portable result permission record and an exact input proof are both
+    # necessary. For v1 also reproduce the path-sensitive access fingerprint.
+    if not witness or not artifact.get('result_policy_id'):
+        raise LightGraphError('graph_access_context_changed')
+    if legacy_input_root is not None:
+        historical = _input_path_representation(scoped, project.resolve(), _historical_root(legacy_input_root))
+        if access_fingerprint(historical) != recorded:
+            raise LightGraphError('graph_access_context_changed')
 
 
 def _workflow_descendants(plan, node_id):
@@ -552,12 +638,12 @@ class RunManager:
             return dict(record)
 
     def resume(self, pid, source_run_id, *, from_node_id=None, action='rerun_node', artifact_id=None,
-               source_credentials=None, model_api_key=None, verify_checkpoints_in_background=False):
+               source_credentials=None, model_api_key=None, verify_checkpoints_in_background=False, previous_project_root=None):
         """Start a new run from explicitly pinned upstream publications."""
         from ..construction.access import access_fingerprint
         from ..construction.checkpoints import (WorkflowCheckpointError, commit_checkpoint, load_checkpoint,
                                                 recover_committed_checkpoint, usable_result, verify_checkpoint_files)
-        from ..construction.snapshot_registry import authorize_snapshot, register_access_context
+        from ..construction.snapshot_registry import register_access_context
         from ..construction.inheritance import authorize_frozen_inheritance
         from ..construction.workflow import (build_unit_config, committed_unit_output, load_unit_contributor,
             load_workflow_state, resolve_workflow_plan, run_output_path)
@@ -623,7 +709,11 @@ class RunManager:
             for mid in reversed(plan.merge_order):
                 if mid in required:
                     required.update(plan.merge_inputs[mid])
-            current_inputs = _workflow_node_inputs(config, project)
+            if previous_project_root is not None:
+                _historical_root(previous_project_root)
+            proofs = _WorkflowInputProofs(config, project, _input_manifest(config, project))
+            current_inputs = proofs.current
+            verified_roots = {}
             units = {u.unit_id: u for u in config.workflow.units}
             locations = {}
             legacy_contributors = {}
@@ -678,13 +768,15 @@ class RunManager:
                         if (artifact.get('graph_kind') != expected_kind or artifact.get('status') != outcome.get('status')
                                 or (nid in units and artifact.get('source_attempt') != attempt)):
                             raise LightGraphError('workflow_checkpoint_invalid')
-                        if state.get('node_inputs', {}).get(nid) != current_inputs[nid] or artifact.get('input_digest') != current_inputs[nid]:
-                            raise LightGraphError('workflow_resume_input_changed')
+                        roots = [None, state.get('legacy_node_input_roots', {}).get(nid), previous_project_root]
+                        legacy_root = proofs.match(nid, state['node_inputs'].get(nid), artifact, roots)
+                        if legacy_root is not None:
+                            verified_roots[nid] = legacy_root
                         if artifact.get('upstream_artifacts') != [artifacts[p]['artifact_id'] for p in plan.merge_inputs.get(nid, [])]:
                             raise LightGraphError('workflow_checkpoint_invalid')
                         location = state.get('artifact_outputs', {}).get(nid, source['output_path'])
                         original_output = run_output_path(project, location)
-                        authorize_snapshot(original_output / 'construction', artifact, scoped)
+                        _check_reused_access(original_output / 'construction', artifact, scoped, project, legacy_root)
                         if verify_in_worker:
                             verify_checkpoint_files(original_output, artifact)
                             checkpoint_access = artifact.get('access_fingerprint')
@@ -692,7 +784,8 @@ class RunManager:
                             contributor = load_checkpoint(original_output, artifact)
                             checkpoint_access = contributor['graph'].get('access_fingerprint')
                         locations[nid] = location
-                    if checkpoint_access != access_fingerprint(scoped):
+                    expected_access = access_fingerprint(scoped) if legacy and nid in units else artifact['access_fingerprint']
+                    if checkpoint_access != expected_access:
                         raise LightGraphError('graph_access_context_changed')
                 except LightGraphError as exc:
                     raise WorkflowCheckpointError(exc.code, nid) from None
@@ -746,6 +839,7 @@ class RunManager:
                 rerun = set()
             state = dict(state, resume_action=action, recomposed_nodes=[from_node_id] if action == 'recompose_legacy_merge' else [],
                          artifacts={nid: artifacts[nid] for nid in locations}, artifact_outputs=locations,
+                         node_inputs=state.get('node_inputs', current_inputs), legacy_node_input_roots=verified_roots,
                          ready_unit_attempts=ready_attempts)
             return self._start_workflow(pid, config, project, source_path.parent, rid,
                 source_credentials=source_credentials, model_api_key=model_api_key,
@@ -830,11 +924,17 @@ class RunManager:
             }
             for m in wf.merge_nodes
         }
-        input_digests = _workflow_node_inputs(config, project, payload_deps)
+        proofs = _WorkflowInputProofs(config, project, payload_deps)
+        input_digests = dict(proofs.current)
         reused_artifacts = {nid: artifact for nid, artifact in (resume_state or {}).get('artifacts', {}).items()
                             if nid not in (resume_nodes or set())}
-        if any(input_digests[nid] != art['input_digest'] for nid, art in reused_artifacts.items()):
-            raise LightGraphError('workflow_resume_input_changed')
+        historical_roots = {}
+        for nid, artifact in reused_artifacts.items():
+            root = proofs.match(nid, resume_state['node_inputs'].get(nid), artifact,
+                                [None, resume_state['legacy_node_input_roots'].get(nid)])
+            if root is not None:
+                historical_roots[nid] = root
+            input_digests[nid] = artifact['input_digest']
         if resume_state:
             for uid in plan.extract_ids:
                 if uid in reused_artifacts:
@@ -858,6 +958,8 @@ class RunManager:
             "merge_nodes": merge_nodes_state,
             "merge": {"status": "pending"},
             'node_inputs': input_digests,
+            'node_input_versions': {nid: 1 if nid in historical_roots else 2 for nid in input_digests},
+            'legacy_node_input_roots': historical_roots,
             'terminal_ids': plan.terminal_ids,
             'plan': config.workflow.model_dump(mode='json'),
             'resume_action': (resume_state or {}).get('resume_action'),
@@ -924,12 +1026,18 @@ class RunManager:
                     return {"unit_id": node_key, "status": "cancelled", "cleanup_status": "completed"}
                 state_bucket[node_key].update(status="running", run_id=node_rid, updated_at=_now())
                 save_workflow_state(config.output_dir, wf_state)
-                with self._service_lock.child_process_options() as child_options:
-                    proc = subprocess.Popen(
-                        [sys.executable, "-m", "lightgraph.web.worker", str(node_result)],
-                        cwd=project, env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                        **child_options,
-                    )
+                diagnostics = WorkerDiagnostics(node_result)
+                diagnostics.emit('worker_starting', stage='launch')
+                try:
+                    with self._service_lock.child_process_options() as child_options:
+                        proc = subprocess.Popen(
+                            [sys.executable, "-m", "lightgraph.web.worker", str(node_result)],
+                            cwd=project, env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            **child_options,
+                        )
+                except Exception as exc:
+                    diagnostics.emit('worker_start_failed', stage='launch', error=exc, error_code='worker_start_failed')
+                    raise
                 entry["unit_procs"][node_key] = (proc, node_result)
             collector = StderrCollector(proc.stderr)
             try:
@@ -951,13 +1059,16 @@ class RunManager:
                     proc.wait()
                 raise
             finally:
-                collector.finish()
+                diagnostics.emit('worker_stderr_summary', stage='finished', **collector.finish())
+                diagnostics.emit('worker_process_exited', stage='finished', exit_code=getattr(proc, 'returncode', None),
+                                 cancel_requested=cancel_event.is_set())
                 with entry["state_lock"]:
                     entry["unit_procs"].pop(node_key, None)
             try:
                 res = _json_file(node_result)
             except LightGraphError:
                 res = {"status": "failed", "cleanup_status": "unknown", "error_code": "worker_result_missing"}
+                diagnostics.emit('worker_error', stage='result', error_code='worker_result_missing')
             if cancel_event.is_set():
                 res["status"] = "cancelled"
                 res["error_code"] = "run_cancelled"
@@ -1063,7 +1174,11 @@ class RunManager:
                     tid = plan.terminal_ids[0]
                     committed = load_checkpoint(run_output_path(project, wf_state['artifact_outputs'][tid]), reused_artifacts[tid])
                     check_publication_inputs()
-                    merge_summary = publish_premerged_graph(config.output_dir, config, merged=committed['graph'],
+                    # This is a new project publication, potentially in another generation.
+                    # Bind it to the current verified full-project access context. The
+                    # original committed graph and its historical access remain immutable.
+                    graph = {**committed['graph'], 'access_fingerprint': access_fingerprint(config)}
+                    merge_summary = publish_premerged_graph(config.output_dir, config, merged=graph,
                         included_units=list(plan.extract_ids), skipped_units=[], unit_attempts=attempts, mode='dag_merge')
                     wf_state["merge"] = {"status": "completed", "published_artifact_id": reused_artifacts[tid]['artifact_id'],
                                          **merge_summary}
@@ -1091,7 +1206,13 @@ class RunManager:
                             c = (load_checkpoint(run_output_path(project, wf_state['artifact_outputs'][uid]), reused_artifacts[uid])
                                  if uid in reused_artifacts else fresh_contributors.get(uid) or load_unit_contributor(out_dir, uid))
                             unit_config = build_unit_config(config, units_by_id[uid], unit_output_dir=out_dir)
-                            expected_acc = access_fingerprint(unit_config)
+                            if uid in reused_artifacts:
+                                artifact = reused_artifacts[uid]
+                                root = run_output_path(project, wf_state['artifact_outputs'][uid]) / 'construction'
+                                _check_reused_access(root, artifact, unit_config, project, historical_roots.get(uid))
+                                expected_acc = artifact['access_fingerprint']
+                            else:
+                                expected_acc = access_fingerprint(unit_config)
                             if c is not None:
                                 require_partial_isolation(units_state[uid], c['graph'])
                             if c is not None and c['graph'].get('access_fingerprint') != expected_acc:
@@ -1135,7 +1256,7 @@ class RunManager:
                                 if mid in reused_artifacts:
                                     contrib = load_checkpoint(run_output_path(project, wf_state['artifact_outputs'][mid]), reused_artifacts[mid])
                                     merge_node_contribs[mid] = contrib
-                                    merge_outputs[mid] = contrib['graph']
+                                    merge_outputs[mid] = {**contrib['graph'], 'access_fingerprint': access_fingerprint(config)}
                                     continue
                                 in_ids = plan.merge_inputs.get(mid, [])
                                 unavailable = [i for i in in_ids if i not in unit_contribs and i not in merge_node_contribs]

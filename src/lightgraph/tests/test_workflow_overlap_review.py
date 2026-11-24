@@ -2,7 +2,6 @@
 import json
 from pathlib import Path
 import runpy
-import subprocess
 import time
 from types import SimpleNamespace
 
@@ -15,7 +14,8 @@ from lightgraph.construction.checkpoints import load_checkpoint
 from lightgraph.construction.workflow_overlap import overlap_review_skip_reason
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import FusionPolicyConfig, MergePolicyConfig, RunConfig, WorkflowMergeNodeConfig
-from lightgraph.tests.construction_worker_fixture import install_scripted_worker, overlapping_metric_proposal, regional_proposal
+from lightgraph.tests.construction_worker_fixture import (install_scripted_worker, overlapping_metric_proposal,
+                                                         regional_proposal, replace_worker_launch)
 from lightgraph.tests.test_web_api import client, create, upload
 from lightgraph.tests.test_web_execution import wait_run
 
@@ -58,7 +58,7 @@ def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monk
     monkeypatch.setattr(overlap_review.httpx, 'HTTPTransport', lambda: httpx.MockTransport(decide))
     def unexpected_worker(*args, **kwargs):
         raise AssertionError('unexpected worker during checkpoint reuse')
-    monkeypatch.setattr(subprocess, 'Popen', unexpected_worker)
+    replace_worker_launch(monkeypatch, unexpected_worker)
     headers = {'If-Match': client.get(base + '/config').headers['etag']}
     run = finished(client.post(base + '/runs/' + original['run_id'] + '/resume',
                                json={'action': 'rerun_node', 'from_node_id': 'join',
@@ -270,7 +270,7 @@ def test_three_region_projections_review_type_once_on_fresh_run_and_merge_only_r
 
     monkeypatch.setattr(overlap_patterns, '_read_node', fail)
     monkeypatch.setattr(overlap_patterns, '_read_edges', fail)
-    monkeypatch.setattr(subprocess, 'Popen', fail)
+    replace_worker_launch(monkeypatch, fail)
     headers = {'If-Match': client.get(base + '/config').headers['etag']}
     rerun = completed(client.post(base + '/runs/' + fresh['run_id'] + '/resume',
                                  json={'action': 'rerun_node', 'from_node_id': 'join'}, headers=headers))

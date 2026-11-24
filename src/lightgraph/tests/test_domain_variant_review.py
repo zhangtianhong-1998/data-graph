@@ -102,7 +102,10 @@ def test_review_two_codes_in_an_old_publication_and_revoke_individually(client):
         for support in edge['metadata']['supports']:
             recovered.update((o['edge_id'], o['source'], o['target']) for o in support.get('endpoint_origins', []))
     assert originals <= recovered
-    assert client.post(ROOT + '/retrieval/sync').status_code == 200
+    synced = client.post(ROOT + '/retrieval/sync')
+    assert synced.status_code == 200, synced.text
+    assert synced.json()['indexed'] and not synced.json()['vectorized']
+    assert synced.json()['vector_rows'] == 0
     for name, code in [('订货', 'order'), ('收入', 'revenue')]:
         answer = client.post(ROOT + '/retrieval/query', json={'query': name})
         assert answer.status_code == 200, answer.text

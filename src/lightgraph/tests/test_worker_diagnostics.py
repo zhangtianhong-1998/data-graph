@@ -276,9 +276,14 @@ def test_windows_long_path_and_symlink_destinations(tmp_path):
     assert external.read_text() == SECRET
 
 
-def test_manager_retains_exit_and_suppressed_stderr_without_result(tmp_path, monkeypatch):
+@pytest.mark.parametrize('parallel', [False, True])
+def test_manager_retains_exit_and_suppressed_stderr_without_result(tmp_path, monkeypatch, parallel):
+    from lightgraph.runtime.config import WorkflowConfig
+
     workspace = ProjectWorkspace(tmp_path / 'workspace')
     workspace.add('p')
+    if parallel:
+        workspace.configs['p'].workflow = WorkflowConfig(enabled=True, units=[{'unit_id': 'a'}, {'unit_id': 'b'}])
     original = subprocess.Popen
     def child(*args, **kwargs):
         return original([sys.executable, '-c',
@@ -288,13 +293,21 @@ def test_manager_retains_exit_and_suppressed_stderr_without_result(tmp_path, mon
     try:
         started = manager.start('p')
         result = wait_run(manager, 'p', started['run_id'])
-        assert result['error_code'] == 'worker_result_missing'
-        assert result['worker_diagnostics']['status'] == 'available'
-        path = manager._paths('p', started['run_id'])[1]
-        events = read_worker_log(path)['events']
-        assert next(item for item in events if item['code'] == 'worker_process_exited')['exit_code'] == 7
-        assert next(item for item in events if item['code'] == 'worker_stderr_summary')['observed_exception_types'] == ['RuntimeError']
-        assert SECRET not in worker_log_path(path).read_text()
+        if parallel:
+            units = result['workflow_state']['units']
+            workers = [units['a'], units['b']]
+            assert len({worker['run_id'] for worker in workers}) == 2
+        else:
+            workers = [result]
+        for worker in workers:
+            assert worker['error_code'] == 'worker_result_missing'
+            path = manager._paths('p', worker['run_id'])[1]
+            log = read_worker_log(path)
+            assert log['status'] == 'available'
+            events = {item['code']: item for item in log['events']}
+            assert events['worker_process_exited']['exit_code'] == 7
+            assert events['worker_stderr_summary']['observed_exception_types'] == ['RuntimeError']
+            assert SECRET not in worker_log_path(path).read_text()
     finally:
         manager.shutdown()
     assert worker_log_path(path).exists()

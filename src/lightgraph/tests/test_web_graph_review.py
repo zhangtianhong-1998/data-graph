@@ -12,6 +12,10 @@ from lightgraph.web.app import create_app
 def client(tmp_path):
     with TestClient(create_app(tmp_path/'workspace',frontend_dir=tmp_path/'missing')) as client:
         assert client.post('/api/projects',json={'name':'graph review','project_id':'p'}).status_code==201
+        # Identity review queries use the term index and run with no embedding service.
+        workspace = client.app.state.workspace
+        config = workspace.get_config('p')
+        workspace.save_config('p', {**config, 'embedding': {'provider': 'none'}})
         yield client
 
 

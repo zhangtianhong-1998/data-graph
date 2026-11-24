@@ -1,6 +1,7 @@
 """Exercise CSV workers, merge, history and resume through the workbench HTTP endpoints."""
 import json
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -8,9 +9,17 @@ import runpy
 
 import pytest
 
-from lightgraph.tests.construction_worker_fixture import hierarchy_proposal, install_scripted_worker
+from lightgraph.tests.construction_worker_fixture import hierarchy_proposal, install_scripted_worker, replace_worker_launch
 from lightgraph.tests.test_web_api import client, create, upload
 from lightgraph.tests.test_web_execution import wait_run
+
+
+def test_scripted_worker_preserves_unrelated_subprocesses(monkeypatch, tmp_path):
+    install_scripted_worker(monkeypatch)
+    # Dependencies can probe the platform while a workflow is running.
+    result = subprocess.run([sys.executable, '-c', 'print(7)'], capture_output=True, check=True, cwd=tmp_path)
+    assert result.stdout.strip() == b'7'
+    assert not list(tmp_path.iterdir())
 
 
 def test_rerun_deterministic_merge_via_http_replays_four_checkpoints_before_publication(client, monkeypatch):
@@ -64,7 +73,7 @@ def test_rerun_deterministic_merge_via_http_replays_four_checkpoints_before_publ
 
     def unexpected_worker(*args, **kwargs):
         raise AssertionError('merge-only rerun started an extract worker')
-    monkeypatch.setattr(subprocess, 'Popen', unexpected_worker)
+    replace_worker_launch(monkeypatch, unexpected_worker)
     try:
         accepted = client.post(route, json=payload, headers=headers)
         assert accepted.status_code == 202, accepted.text
@@ -233,7 +242,9 @@ def test_apply_merge_rule_to_committed_extracts_via_http(client, monkeypatch, re
         rule['source_bindings'] = bindings
     cfg['workflow']['merge_nodes'][0]['merge_policy'] = {'fusion_policy': {'entity_rules': [rule]}}
     assert client.put(base + '/config', json=cfg).is_success
-    monkeypatch.setattr(subprocess, 'Popen', lambda *a, **k: (_ for _ in ()).throw(AssertionError('unexpected worker')))
+    def unexpected_worker(*args, **kwargs):
+        raise AssertionError('unexpected worker')
+    replace_worker_launch(monkeypatch, unexpected_worker)
     route = base + '/runs/' + first['run_id'] + '/resume'
     headers = {'If-Match': client.get(base + '/config').headers['etag']}
     resumed = finished(client.post(route, json={'action': 'rerun_node', 'from_node_id': 'merge'}, headers=headers))

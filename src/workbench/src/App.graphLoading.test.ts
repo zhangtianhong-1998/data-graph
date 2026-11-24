@@ -79,9 +79,10 @@ function graphFetch(implementation: (url: string, init?: RequestInit) => Promise
 
 describe('background graph request isolation', () => {
   it.each([
-    ['合并节点', 'merge_1', { verify_checkpoints_in_background: true }],
-    ['抽取节点', 'extract_1', {}],
-  ])('从%s重新运行，使用所选父运行并发送对应的校验方式', async (label, nodeId, options) => {
+    ['合并节点', 'merge_1', '', { verify_checkpoints_in_background: true }],
+    ['抽取节点', 'extract_1', '', {}],
+    ['合并节点', 'merge_1', ' D:\\archive\\p ', { verify_checkpoints_in_background: true, previous_project_root: 'D:\\archive\\p' }],
+  ])('从%s重新运行 %s，按填写的原项目路径“%s”校验', async (label, nodeId, previousRoot, options) => {
     const original = vi.mocked(fetch).getMockImplementation()!
     const state = { parent_run_id: 'old', artifacts: {},
       units: { extract_1: { unit_id: 'extract_1', status: 'completed' } },
@@ -108,9 +109,53 @@ describe('background graph request isolation', () => {
       expect(match).toBeDefined()
       return match!
     })
+    if (previousRoot) {
+      const input = root.querySelector<HTMLInputElement>('#previous-project-root')!
+      expect(input.closest('details')!.open).toBe(false)
+      input.closest('details')!.open = true
+      input.value = previousRoot
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    }
     row.querySelector('button')!.click()
     await vi.waitFor(() => expect(payload).toEqual({ from_node_id: nodeId, action: 'rerun_node', ...options }))
     expect(graphCalls).toHaveLength(0)
+  })
+  it('原项目路径只属于当前运行，发布产物时不发送', async () => {
+    const original = vi.mocked(fetch).getMockImplementation()!
+    const state = { units: {}, terminal_ids: ['merge'], artifacts: { merge: { artifact_id: 'artifact', graph_kind: 'node_full' } },
+      merge_nodes: { merge: { node_id: 'merge', status: 'completed' } } }
+    const runs = ['a', 'b'].map(id => ({ project_id: 'p', run_id: id, status: 'completed', workflow_state: state }))
+    let publishBody: unknown
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url.endsWith('/runs/b/resume')) {
+        publishBody = JSON.parse(String(init?.body))
+        return response({ ...runs[1], run_id: 'new', status: 'running', workflow_state: null })
+      }
+      if (url.endsWith('/config')) return response({ workflow: { enabled: true, units: [], merge_nodes: [] } })
+      if (url.endsWith('/runs?view=summary')) return response({ runs })
+      if (url.endsWith('/workflow')) return response({ enabled: true, units: [], state })
+      const run = runs.find(r => url.endsWith(`/runs/${r.run_id}?view=workbench`))
+      return run ? response(run) : original(input, init)
+    })
+    root = document.createElement('div'); document.body.append(root); app = createApp(App); app.mount(root)
+    await vi.waitFor(() => expect(button('运行与结果')).toBeDefined())
+    button('运行与结果').click()
+    const pathInput = () => root.querySelector<HTMLInputElement>('#previous-project-root')!
+    await vi.waitFor(() => expect(pathInput()).not.toBeNull())
+    pathInput().closest('details')!.open = true
+    pathInput().value = '/archive/p'
+    pathInput().dispatchEvent(new Event('input', { bubbles: true }))
+    button('查看报告').click()
+    await vi.waitFor(() => {
+      expect(root.querySelector('.run-history-table tr.chosen td')?.textContent).toBe('b')
+      expect(pathInput()?.value).toBe('')
+    })
+    pathInput().closest('details')!.open = true
+    pathInput().value = '/moved/p'
+    pathInput().dispatchEvent(new Event('input', { bubbles: true }))
+    button('仅发布此结果').click()
+    await vi.waitFor(() => expect(publishBody).toEqual({ action: 'publish_artifact', artifact_id: 'artifact' }))
   })
   it('keeps the selected history visible when the previous version responds late', async () => {
     const original = vi.mocked(fetch).getMockImplementation()!
