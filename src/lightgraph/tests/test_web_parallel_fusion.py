@@ -162,10 +162,18 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
     def unexpected_merge(*args, **kwargs):
         raise AssertionError("observations-only must not replay the merge")
     monkeypatch.setattr('lightgraph.construction.merger.merge_construction_graphs', unexpected_merge)
-    preview = audit(run_file, 'merged', overlap_patterns_only=True)
-    assert preview['mode'] == 'overlap_preview' and preview['model_calls'] == 0
-    assert preview['upstream_artifacts'] == report['upstream_artifacts']
-    assert preview['patterns'] == audit(run_file, 'merged', overlap_patterns_only=True)['patterns']
+    def unexpected_rows(*args, **kwargs):
+        pytest.fail("type-index preview or reuse opened the graph's Parquet rows")
+
+    with monkeypatch.context() as guard:
+        guard.setattr('lightgraph.construction.graph_storage._read_rows', unexpected_rows)
+        guard.setattr('lightgraph.construction.graph_storage._file_digest', unexpected_rows)
+        preview = audit(run_file, 'merged', overlap_patterns_only=True)
+        assert preview['mode'] == 'overlap_preview' and preview['model_calls'] == 0
+        assert preview['upstream_artifacts'] == report['upstream_artifacts']
+        assert preview['patterns'] == audit(run_file, 'merged', overlap_patterns_only=True)['patterns']
+        prepared = audit(run_file, 'merged', prepare_overlap_indexes=True)
+        assert prepared['indexes'] == {u['unit_id']: 'reused' for u in units}
     observations = audit(run_file, 'merged', observations_only=True)
     assert observations['typed_row_identity'] == report['committed']['typed_row_identity']
     assert observations['typed_row_identity']['multiple_contributor_groups'] == 2

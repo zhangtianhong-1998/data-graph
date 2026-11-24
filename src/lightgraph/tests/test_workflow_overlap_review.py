@@ -9,13 +9,13 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from lightgraph.construction import overlap_review
+from lightgraph.construction import overlap_patterns, overlap_review
 from lightgraph.construction import workflow_overlap
 from lightgraph.construction.checkpoints import load_checkpoint
 from lightgraph.construction.workflow_overlap import overlap_review_skip_reason
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import FusionPolicyConfig, MergePolicyConfig, RunConfig, WorkflowMergeNodeConfig
-from lightgraph.tests.construction_worker_fixture import install_scripted_worker, overlapping_metric_proposal
+from lightgraph.tests.construction_worker_fixture import install_scripted_worker, overlapping_metric_proposal, regional_proposal
 from lightgraph.tests.test_web_api import client, create, upload
 from lightgraph.tests.test_web_execution import wait_run
 
@@ -139,7 +139,7 @@ def test_invalid_combined_rules_revert_to_existing_policy_without_second_request
     inputs = [{'kind': 'unit', 'contributor_id': uid, 'graph': {}} for uid in ids]
     artifacts = {uid: {'artifact_id': uid, 'artifact_status': 'committed', 'graph_kind': 'node_delta',
                        'status': 'completed', 'source_attempt': 'batch'} for uid in ids}
-    monkeypatch.setattr(workflow_overlap, 'analyze_overlap_patterns',
+    monkeypatch.setattr(workflow_overlap, 'analyze_indexed_overlap_patterns',
                         lambda *args: SimpleNamespace(patterns=[{'pattern_id': 'pair'}], summary={}))
     requests = []
 
@@ -171,3 +171,123 @@ def test_invalid_combined_rules_revert_to_existing_policy_without_second_request
     assert report['summary']['added_entity_rules'] == 0
     assert report['effective_merge_policy'] == policy.model_dump(mode='json')
     assert len(requests) == 1
+
+@pytest.mark.parametrize('inherited', [False, True])
+def test_missing_indexes_do_not_trigger_graph_scan_or_model_call(monkeypatch, inherited):
+    config = RunConfig(sources=[])
+    policy = MergePolicyConfig(fusion_policy=FusionPolicyConfig())
+    ids = ['sales', 'service']
+    inputs = [{'kind': 'unit', 'contributor_id': uid, 'graph': {}} for uid in ids]
+    artifacts = {uid: {'artifact_id': uid, 'artifact_status': 'committed', 'graph_kind': 'node_delta',
+                       'status': 'completed', 'source_attempt': 'batch'} for uid in ids}
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('missing indexes must not trigger another discovery path')
+
+    def merge(contributors, *, target_access_fingerprint, merge_policy):
+        assert contributors is inputs and merge_policy is policy
+        return {'nodes': [], 'edges': []}
+
+    monkeypatch.setattr(overlap_patterns, '_read_node', unexpected)
+    monkeypatch.setattr(overlap_patterns, '_read_edges', unexpected)
+    monkeypatch.setattr(workflow_overlap, 'review_overlap_patterns', unexpected)
+    monkeypatch.setattr(workflow_overlap, 'merge_construction_graphs', merge)
+    reads = []
+
+    def read_index(contributor):
+        assert not inherited
+        reads.append(contributor['contributor_id'])
+        return None
+
+    _, report = workflow_overlap.merge_with_overlap_review(
+        config, WorkflowMergeNodeConfig(node_id='merge', merge_mode='overlap_review'), policy, inputs,
+        ids, artifacts, inherited=inherited, source_namespace='alpha', model_api_key=None,
+        check_cancelled=lambda: None, deadline=time.monotonic() + 10, load_overlap_index=read_index)
+    assert report['summary']['model_calls'] == 0
+    if inherited:
+        assert reads == [] and report['summary']['reason'] == 'inherited_graph'
+    else:
+        assert reads == ids and report['summary']['reason'] == 'overlap_index_missing'
+        assert sorted(report['pattern_summary']['missing_index_contributors']) == ids
+    assert report['effective_merge_policy'] == report['configured_merge_policy']
+
+
+def test_three_region_projections_review_type_once_on_fresh_run_and_merge_only_rerun(client, monkeypatch):
+    install_scripted_worker(monkeypatch, draft_factory=regional_proposal)
+    create(client)
+    base = '/api/projects/alpha'
+    upload(client, 'regions.csv', (
+        'region_code,region_name,country_code,country_name,short_name,postal_prefix,zone\n'
+        'CN-BJ,北京地区,CN,中国,京,P10,Z01\nCN-JS,江苏地区,CN,中国,苏,P21,Z02\n'
+        'CN-TJ,天津地区,CN,中国,津,P30,Z03\n').encode())
+    cfg = client.get(base + '/config').json()
+    cfg['goal']['purpose'] = 'Identify regions shared across parallel business projections'
+    cfg['model'].update(mode='in_environment', model='scripted', base_url='http://localhost:9999/v1',
+                        api_key_env='LIGHTGRAPH_TEST_REVIEW_KEY')
+    monkeypatch.setenv('LIGHTGRAPH_TEST_REVIEW_KEY', 'test-only')
+    kinds = {'sales': 'SalesRegion', 'reporting': 'ReportingArea', 'service': 'ServiceTerritory'}
+    cfg['workflow'] = {
+        'enabled': True, 'units': [{'unit_id': uid, 'goal_markdown': kind, 'source_ids': [cfg['sources'][0]['id']]}
+                                   for uid, kind in kinds.items()],
+        'merge_nodes': [{'node_id': 'join', 'merge_mode': 'overlap_review'}],
+        'edges': [{'edge_id': uid, 'source': uid, 'target': 'join'} for uid in kinds]}
+    updated = client.put(base + '/config', json=cfg)
+    assert updated.is_success, updated.text
+    requests = []
+
+    def decide(request):
+        prompt = json.loads(request.content)['messages'][1]['content']
+        patterns = json.loads(prompt)['patterns']
+        assert not any(value in prompt for value in ('北京地区', '江苏地区', '天津地区', 'CN-BJ', 'CN-JS', 'CN-TJ'))
+        region, = [p for p in patterns if {m['type'] for m in p['members']} == set(kinds.values())]
+        assert region['overlapping_keys'] == 3 and 'apply' in region['eligible_actions']
+        requests.append(region['pattern_id'])
+        decisions = [{'pattern_id': p['pattern_id'], 'action': 'merge' if p is region else 'keep'} for p in patterns]
+        return httpx.Response(200, json={'choices': [{'message': {'role': 'assistant', 'content':
+                                               json.dumps({'decisions': decisions})}, 'finish_reason': 'stop'}]})
+    monkeypatch.setattr(overlap_review.httpx, 'HTTPTransport', lambda: httpx.MockTransport(decide))
+    analyzed = []
+    analyze = workflow_overlap.analyze_indexed_overlap_patterns
+
+    def indexed(descriptors, policy):
+        assert {d['contributor_id'] for d in descriptors} == set(kinds)
+        assert all('graph' not in d and d['overlap_index'] for d in descriptors)
+        analyzed.append(1)
+        return analyze(descriptors, policy)
+    monkeypatch.setattr(workflow_overlap, 'analyze_indexed_overlap_patterns', indexed)
+
+    def completed(response):
+        assert response.status_code == 202, response.text
+        run = wait_run(client.app.state.manager, 'alpha', response.json()['run_id'])
+        assert run['status'] in {'completed', 'completed_with_gaps'}, run['workflow_state']
+        meta = run['workflow_state']['merge_nodes']['join']
+        assert meta['model_calls'] == 1 and meta['overlap_review']['added_entity_rules'] == 3, meta
+        return run
+
+    fresh = completed(client.post(base + '/runs'))
+    def fail(*args, **kwargs):
+        pytest.fail('merge-only rerun must reuse verified per-branch indexes')
+
+    monkeypatch.setattr(overlap_patterns, '_read_node', fail)
+    monkeypatch.setattr(overlap_patterns, '_read_edges', fail)
+    monkeypatch.setattr(subprocess, 'Popen', fail)
+    headers = {'If-Match': client.get(base + '/config').headers['etag']}
+    rerun = completed(client.post(base + '/runs/' + fresh['run_id'] + '/resume',
+                                 json={'action': 'rerun_node', 'from_node_id': 'join'}, headers=headers))
+    state = rerun['workflow_state']
+    assert set(state['reused_nodes']) == set(kinds)
+    assert all(state['artifacts'][uid] == fresh['workflow_state']['artifacts'][uid] for uid in kinds)
+    assert len(requests) == len(analyzed) == 2 and requests[0] == requests[1]
+    checkpoint = load_checkpoint(client.app.state.workspace.project_path('alpha') / rerun['output_path'],
+                                 state['artifacts']['join'])
+    regions = [n for n in checkpoint['graph']['nodes'] if n['type'] in kinds.values()]
+    assert len(regions) == 3 and {n['label'] for n in regions} == {'北京地区', '江苏地区', '天津地区'}
+    for region in regions:
+        assert {s['contributor_id'] for s in region['supports']} == set(kinds)
+        assert set(region['properties']) >= {'short_name', 'postal_prefix', 'zone'}
+    relations = checkpoint['graph']['edges']
+    assert len(relations) == 3
+    assert {r['source'] for r in relations} == {r['id'] for r in regions}
+    for relation in relations:
+        assert relation['type'] == 'located_in' and relation['source'] != relation['target']
+        assert {s['contributor_id'] for s in relation['supports']} == set(kinds)

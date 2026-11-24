@@ -213,6 +213,8 @@ function workflowRelationSummary(node: WorkflowMergeNodeState) {
         insufficient_extract_units: '只有一个抽取分支', incomplete_extract_inputs: '上游抽取结果不完整',
         model_call_budget_exhausted: '模型调用额度已用完', wall_time_budget_exhausted: '审查时间已用完',
         model_prompt_budget_exhausted: '模式说明超出模型输入上限', invalid_decisions: '模型回复未通过校验',
+        overlap_index_missing: '上游抽取检查点缺少类型索引，请先为这些检查点补建索引',
+        overlap_index_incompatible: '上游类型索引版本不兼容',
         analysis_budget_exceeded: '输入超出模式分析上限', overlap_pattern_policy_conflict: '建议的规则相互冲突',
         merge_requires_isolation: '采用新规则会隔离来源数据',
       }

@@ -12,6 +12,7 @@ from lightgraph.errors import LightGraphError
 from lightgraph.runtime.retention import atomic_text
 from lightgraph.runtime.locking import FileLock
 from .artifact_io import artifact_step
+from . import checkpoint_overlap_index as overlap_store
 from .graph_storage import read_graph_record, write_graph_record, _graph_digest
 from .paths import io_path
 
@@ -63,7 +64,9 @@ def _directory(output, run_id, node_id, graph_kind):
         current = current / part
         if current.is_symlink():
             raise LightGraphError('workflow_checkpoint_invalid')
-    if any((current / name).is_symlink() for name in ('graph.graph', 'checkpoint.json', 'evidence.json', 'overlap_review.json')):
+    sidecars = ('graph.graph', 'checkpoint.json', 'evidence.json', 'overlap_review.json',
+                overlap_store.FILENAME, overlap_store.RECEIPT)
+    if any((current / name).is_symlink() for name in sidecars):
         raise LightGraphError('workflow_checkpoint_invalid')
     return current
 
@@ -128,9 +131,11 @@ def _commit(output_dir, directory, record, graph, evidence, review):
     commit = directory / 'checkpoint.json'
     if commit.exists():
         existing = artifact_step('checkpoint_marker_read', lambda: json.loads(commit.read_text(encoding='utf-8')))
-        if not isinstance(existing, dict) or {k: v for k, v in existing.items() if k != 'created_at'} != record:
+        if not isinstance(existing, dict) or {k: v for k, v in existing.items() if k not in {'created_at', 'overlap_index_digest'}} != record:
             raise LightGraphError('workflow_checkpoint_immutable')
         artifact_step('checkpoint_verify', load_checkpoint, output_dir, existing)
+        if 'overlap_index_digest' in existing:
+            artifact_step('checkpoint_overlap_verify', overlap_store.read, directory, existing)
         return existing
     # Evidence is separate from Parquet metadata so a large evidence map cannot
     # hit the workspace YAML limit. The final JSON marker commits both files.
@@ -140,6 +145,10 @@ def _commit(output_dir, directory, record, graph, evidence, review):
     if review is not None:
         artifact_step('checkpoint_review_write', atomic_text, directory / 'overlap_review.json',
                       json.dumps(review, ensure_ascii=False, sort_keys=True))
+    if _is_extract(record):
+        unit = {'contributor_id': record['node_id'], 'kind': 'unit', 'graph': graph}
+        record['overlap_index_digest'] = artifact_step('checkpoint_overlap_write', overlap_store.install,
+                                                      directory, record, unit)
     record['created_at'] = datetime.now(timezone.utc).isoformat()
     artifact_step('checkpoint_marker_write', atomic_text, commit, json.dumps(record, ensure_ascii=False, sort_keys=True))
     return record
@@ -181,6 +190,58 @@ def verify_checkpoint_files(output_dir, record) -> Path:
         raise LightGraphError('workflow_checkpoint_invalid') from None
 
 
+def _is_extract(record):
+    return record['graph_kind'] == 'node_delta' and record['contributor_kind'] == 'unit'
+
+
+def load_checkpoint_overlap_index(output_dir, record):
+    """Read the verified directory only. Evidence blocks are resolved on first use."""
+    directory = verify_checkpoint_files(output_dir, record).parent
+    return overlap_store.read(directory, record) if _is_extract(record) else None
+
+
+def prepare_checkpoint_overlap_index(output_dir, record):
+    """Explicitly build a derived index for one historical extract without modifying its marker."""
+    directory = verify_checkpoint_files(output_dir, record).parent
+    if not _is_extract(record):
+        raise LightGraphError('workflow_checkpoint_invalid')
+    lock = FileLock(directory / '.writer.lock', busy_code='workflow_checkpoint_busy',
+                    invalid_code='workflow_checkpoint_lock_invalid')
+    artifact_step('checkpoint_lock', lock.acquire)
+    try:
+        try:
+            index = overlap_store.read(directory, record, verify_blocks=True)
+        except LightGraphError:
+            # The derivative alone may be repaired. The original checkpoint and, for new
+            # records, its committed index digest must both match before replacement.
+            index = None
+        if index is not None:
+            return 'reused'
+        unit = load_checkpoint(output_dir, record)
+        address = artifact_step('checkpoint_overlap_write', overlap_store.install, directory, record, unit)
+        if 'overlap_index_digest' not in record:
+            artifact_step('checkpoint_overlap_receipt', overlap_store.commit_legacy_receipt, directory, record, address)
+        return 'built'
+    finally:
+        lock.close()
+
+
+def _read_review(directory, record):
+    if 'overlap_review_digest' not in record:
+        return None
+    try:
+        review = json.loads((directory / 'overlap_review.json').read_text('utf-8'))
+        if not isinstance(review, dict) or digest(review) != record['overlap_review_digest']:
+            raise ValueError
+        return review
+    except (KeyError, TypeError, ValueError, OSError):
+        raise LightGraphError('workflow_checkpoint_invalid') from None
+
+
+def read_checkpoint_overlap_review(output_dir, record):
+    return _read_review(verify_checkpoint_files(output_dir, record).parent, record)
+
+
 def load_checkpoint(output_dir, record):
     path = verify_checkpoint_files(output_dir, record)
     try:
@@ -192,10 +253,7 @@ def load_checkpoint(output_dir, record):
         contributor = {'contributor_id': record['node_id'], 'kind': record['contributor_kind'],
                        'graph': graph, 'evidence_records': evidence}
         if 'overlap_review_digest' in record:
-            review = json.loads((path.parent / 'overlap_review.json').read_text('utf-8'))
-            if not isinstance(review, dict) or digest(review) != record['overlap_review_digest']:
-                raise ValueError
-            contributor['overlap_review'] = review
+            contributor['overlap_review'] = _read_review(path.parent, record)
         return contributor
     except (LightGraphError, KeyError, TypeError, ValueError, OSError):
         raise LightGraphError('workflow_checkpoint_invalid') from None

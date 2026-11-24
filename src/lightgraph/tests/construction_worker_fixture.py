@@ -33,6 +33,24 @@ def overlapping_metric_proposal(tools, table):
                                      'target_key_columns': ['class_code']}]}]}
 
 
+def regional_proposal(tools, table):
+    kind = tools.config.goal_markdown.splitlines()[-1]
+    field = {'SalesRegion': 'short_name', 'ReportingArea': 'postal_prefix', 'ServiceTerritory': 'zone'}[kind]
+    binding = {'source_id': table['source'], 'schema': table['schema'], 'table': table['name']}
+    address = f"{table['source']}:{table['schema']}.{table['name']}"
+    evidence = tools.call('inspect_source', table=address, operation='get_metadata')['evidence_ref']
+    return {'draft_id': 'regions', 'entities': [
+        {'type': kind, 'key_names': ['code'], 'identity_scope': 'global',
+         'identity_domain': 'test.regions', 'identity_evidence_refs': [evidence], 'mappings': [
+             {**binding, 'key_columns': ['region_code'], 'label_column': 'region_name',
+              'properties': {field: field}, 'applicability': {'status': 'global'}}]},
+        {'type': 'Country', 'key_names': ['country_code'], 'mappings': [
+            {**binding, 'key_columns': ['country_code'], 'label_column': 'country_name'}]}],
+        'relations': [{'type': 'located_in', 'source_type': kind, 'target_type': 'Country',
+                       'mappings': [{**binding, 'source_key_columns': ['region_code'],
+                                     'target_key_columns': ['country_code']}]}]}
+
+
 def hierarchy_proposal(tools, table):
     kind = tools.config.goal_markdown.splitlines()[-1]
     binding = {'source_id': table['source'], 'schema': table['schema'], 'table': table['name']}

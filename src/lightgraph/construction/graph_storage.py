@@ -216,8 +216,8 @@ def _read_rows(path: Path, expected_rows: int) -> list[dict]:
     return result
 
 
-def read_graph_record(path: Path, *, expected_digest: str | None = None) -> dict:
-    """Read and verify one snapshot; the caller enforces its workspace boundary."""
+def read_graph_record_header(path: Path, *, expected_digest: str | None = None) -> dict:
+    """Read the stored manifest and check its declared snapshot ID without opening row files."""
     from .workspace import INTERNAL_YAML_MAX_BYTES, safe_load_yaml
 
     path = Path(path)
@@ -236,9 +236,21 @@ def read_graph_record(path: Path, *, expected_digest: str | None = None) -> dict
                 or set(metadata["collections"]) != {"nodes", "edges"}
                 or {"nodes", "edges"} & set(metadata["graph_metadata"])):
             raise LightGraphError("invalid_graph_parquet_record")
-        graph = metadata["graph_metadata"]
         if expected_digest is not None and metadata.get("graph_digest") != expected_digest:
             raise LightGraphError("graph_parquet_checksum_mismatch")
+        return metadata
+    except LightGraphError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        raise LightGraphError("invalid_graph_parquet_record") from None
+
+
+def read_graph_record(path: Path, *, expected_digest: str | None = None) -> dict:
+    """Read and verify one snapshot; the caller enforces its workspace boundary."""
+    path = Path(path)
+    metadata = read_graph_record_header(path, expected_digest=expected_digest)
+    graph = metadata["graph_metadata"]
+    try:
         for category in ("nodes", "edges"):
             entry = metadata["collections"][category]
             if (not isinstance(entry, dict) or entry.get("file") != f"{category}.parquet"

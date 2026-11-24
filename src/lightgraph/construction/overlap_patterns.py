@@ -7,12 +7,11 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import combinations
 
-from lightgraph.contracts import canonical, digest
+from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import EntityFusionRule, FusionPolicyConfig, MergePolicyConfig
 from lightgraph.source_values import identity_cell
 
-from .fusion import definition_contract
 from .hierarchy_observations import observation_scope
 from .identity_authority import source_address
 from .observed_identity import _dictionary_binding, _node_evidence
@@ -42,6 +41,7 @@ class _Family:
     owner: str
     name: str
     definition: dict
+    contract_fingerprint: str = ''
     by_source: dict = field(default_factory=lambda: defaultdict(set))
     by_catalog: dict = field(default_factory=lambda: defaultdict(set))
     observations: dict = field(default_factory=dict)
@@ -134,14 +134,14 @@ def _read_node(family, node):
     if physical_obs is None:
         family.problems.add('unverified_source_or_scope')
     family.observations[key] = (digest(sorted(labels)), digest(physical_obs),
-                                digest(catalog_obs) if catalog_obs else None, node['id'], distinct_name_column and len(labels) == 1)
+                                digest(catalog_obs) if catalog_obs else None, distinct_name_column and len(labels) == 1,
+                                digest(physical_obs[2]) if physical_obs else None)
+    return key
 
 
-def _read_edges(owner, graph, families, relations):
+def _read_edges(owner, graph, families, identities, relations):
     definitions = {d['type']: d for d in graph.get('definitions', {}).get('relations', [])}
     endpoints = {n['id']: n['type'] for n in graph.get('nodes', [])}
-    identities = {obs[3]: cell for (cid, _), f in families.items() if cid == owner
-                  for cell, obs in f.observations.items()}
     for edge in graph.get('edges', []):
         relation = definitions.get(edge['type'])
         family_ends = [(end, f) for end in ('source', 'target')
@@ -218,30 +218,83 @@ def _overlapping_members(members, projections):
             yield [members[i] for i in sorted(component)], overlap
 
 
-def _cross_table_name_candidates(families):
+def _group_alias_pairs(sources, pairs, inputs_by_owner):
+    """Group an entire clique only if every pair has identical scoped witnesses."""
+    adjacent = defaultdict(set)
+    for i, j in pairs:
+        adjacent[i].add(j)
+        adjacent[j].add(i)
+    groups = []
+    while adjacent:
+        pending = [next(iter(adjacent))]
+        component = set()
+        component_pairs = []
+        while pending:
+            i = pending.pop()
+            if i not in component:
+                component.add(i)
+                neighbors = adjacent.pop(i)
+                pending.extend(neighbors)
+                component_pairs.extend((i, j) for j in neighbors if i < j)
+        members = sorted(component)
+        first, second = members[:2]
+        reference = pairs.get((first, second))
+        owners = {sources[i][0].owner for i in members}
+        compatible = (2 < len(members) <= MAX_ALIAS_FANOUT and len(owners) == len(members)
+                      and len({sources[i][0].definition.get('identity_scope') for i in members}) == 1
+                      and reference and all(scope for _, scope in reference.values())
+                      and not _authority_issues(owners, inputs_by_owner)
+                      and all(pairs.get(pair) == reference for pair in combinations(members, 2)))
+        if compatible:
+            groups.append((members, len(reference)))
+        else:
+            groups.extend(([i, j], len(pairs[i, j])) for i, j in component_pairs)
+    return sorted(groups, key=lambda item: (-item[1], item[0]))
+
+
+def _cross_table_name_candidates(families, family_rows, read_counts, inputs_by_owner):
     """Bounded inverted index for differently named complete keys. Never issues a rule."""
     sources = [(f, next(iter(f.by_source))) for f in families.values()
                if len(f.by_source) == 1 and not f.problems]
     sources.sort(key=lambda entry: (entry[0].owner, entry[0].name))
     stats = {'status': 'complete', 'high_frequency_keys_suppressed': 0, 'comparisons': 0, 'omitted_patterns': 0}
-    if sum(len(f.observations) for f, _ in sources) > MAX_ALIAS_OBSERVATIONS:
+    from .overlap_index import possibly_overlapping
+    widths = defaultdict(list)
+    for i, (family, _) in enumerate(sources):
+        widths[len(family.names)].append((i, family_rows[family.owner, family.name]))
+    selected = set()
+    for group in widths.values():
+        possible = possibly_overlapping(group, 'alias_filter')
+        if (len({sources[i][0].names for i in possible}) < 2
+                or len({sources[i][1][:3] for i in possible}) < 2):
+            continue
+        # Raw-key occurrence counts suppress common weak codes even if the
+        # other sources disagreed on their labels. Read those postings only
+        # after a key-and-name overlap is possible between different schemas.
+        key_bits = 0
+        for i, row in group:
+            if i in possible:
+                key_bits |= int(row['key_filter'], 16)
+        selected.update(i for i, row in group if key_bits & int(row['key_filter'], 16))
+    if sum(family_rows[sources[i][0].owner, sources[i][0].name]['key_count'] for i in selected) > MAX_ALIAS_OBSERVATIONS:
         stats['status'] = 'observation_budget_exceeded'
         return [], stats
     postings = defaultdict(list)
     for i, (family, _) in enumerate(sources):
-        for cell, observation in family.observations.items():
-            if not observation[4]:  # A name derived from the key supplies no independent evidence.
-                continue
+        if i not in selected:
+            continue
+        read_counts['alias_sections'] += 1
+        for cell, label, scope in family_rows[family.owner, family.name]['aliases']:
             postings_for_key = postings[len(family.names), cell]
             if len(postings_for_key) <= MAX_ALIAS_FANOUT:
-                postings_for_key.append((i, observation[0]))
+                postings_for_key.append((i, label, scope))
 
-    pairs = {}
-    for occurrences in postings.values():
+    pairs = defaultdict(dict)
+    for (_, cell), occurrences in postings.items():
         if len(occurrences) > MAX_ALIAS_FANOUT:
             stats['high_frequency_keys_suppressed'] += 1
             continue
-        for (i, left_label), (j, right_label) in combinations(occurrences, 2):
+        for (i, left_label, left_scope), (j, right_label, right_scope) in combinations(occurrences, 2):
             if stats['comparisons'] >= MAX_ALIAS_COMPARISONS:
                 stats['status'] = 'comparison_budget_exceeded'
                 return [], stats
@@ -250,12 +303,12 @@ def _cross_table_name_candidates(families):
             right, right_source = sources[j]
             if left_label != right_label or left.names == right.names or left_source[:3] == right_source[:3]:
                 continue
-            count, first_label, multiple_names = pairs.get((i, j), (0, left_label, False))
-            pairs[i, j] = (count + 1, first_label, multiple_names or left_label != first_label)
-    choices = sorted(((-count, i, j) for (i, j), (count, _, multiple_names) in pairs.items()
-                      if count >= 2 and multiple_names))
+            pairs[i, j][cell] = (left_label, left_scope if left_scope == right_scope else None)
+    qualified = {pair: witnesses for pair, witnesses in pairs.items()
+                 if len(witnesses) >= 2 and len({label for label, _ in witnesses.values()}) >= 2}
+    choices = _group_alias_pairs(sources, qualified, inputs_by_owner)
     stats['omitted_patterns'] = max(0, len(choices) - MAX_ALIAS_PATTERNS)
-    return [(sources[i], sources[j], -n) for n, i, j in choices[:MAX_ALIAS_PATTERNS]], stats
+    return [([sources[i] for i in members], count) for members, count in choices[:MAX_ALIAS_PATTERNS]], stats
 
 
 def _authority_issues(owners, inputs_by_owner):
@@ -293,10 +346,7 @@ def _check_group(members, all_owners, basis, key, keys, blocked, inputs_by_owner
     contracts = set()
     for family in members:
         definition = family.definition
-        contract = definition_contract(definition)
-        for name in ('type', 'key_names'):
-            contract.pop(name, None)
-        contracts.add(canonical(contract))
+        contracts.add(family.contract_fingerprint)
         if (definition.get('identity_origin', 'row') != 'row' or definition.get('identity_scope') != 'global'
                 or definition.get('identity_context_keys') or definition.get('definition_variant')
                 or definition.get('original_type') or len(family.name) > 100 or len(family.names) > 32):
@@ -359,43 +409,84 @@ def _rules(members, basis, binding):
 
 
 def analyze_overlap_patterns(contributors, policy=None):
-    """Analyze the exact checked input batch. Exclude inherited or cumulative graphs."""
+    """Explicit in-memory analysis for callers that already own the original unit graphs."""
+    return analyze_indexed_overlap_patterns(
+        [{**c, 'overlap_index': build_overlap_index(c)} for c in contributors], policy)
+
+
+def build_overlap_index(contributor):
+    """Capture the committed unit's structural evidence once, before the merge stage."""
+    from .overlap_index import build_index
+    return build_index(contributor)
+
+
+def analyze_indexed_overlap_patterns(contributors, policy=None):
+    """Route by the checkpoint directories; never read contributor graphs here."""
+    from .overlap_index import family_header, load_family_evidence, possibly_overlapping, relation_binding
+    from .source_namespaces import BINDING
+
     policy = _policy(policy)
     patterns, rules = [], {}
-    summary = {'reported_patterns': 0, 'eligible_patterns': 0, 'omitted_patterns': 0, 'truncated': False}
+    counts = {'family_sections': 0, 'relation_sections': 0, 'alias_sections': 0}
+    summary = {'reported_patterns': 0, 'eligible_patterns': 0, 'omitted_patterns': 0, 'truncated': False,
+               'index_format': 1, 'index_directories': {'families': 0, 'relations': 0}, 'index_sections_read': counts}
     result = OverlapAnalysis(patterns, rules, summary)
     if (len(contributors) < 2 or len({c['contributor_id'] for c in contributors}) != len(contributors)
-            or any(c.get('kind', 'unit') != 'unit' or c['graph'].get('extends_base_graph') for c in contributors)):
+            or any(c.get('kind', 'unit') != 'unit' for c in contributors)):
         summary['reason'] = 'requires_independent_unit_outputs'
         return result
-    graphs = [c['graph'] for c in contributors]
-    records = sum(len(g.get(k, [])) for g in graphs for k in ('nodes', 'edges'))
-    definitions = sum(len(g.get('definitions', {}).get(k, [])) for g in graphs for k in ('entities', 'relations'))
-    if (records > MAX_RECORDS or definitions > MAX_DEFINITIONS
-            or sum(len(r.get('supports', [])) for g in graphs for k in ('nodes', 'edges')
-                   for r in g.get(k, [])) > MAX_SUPPORTS):
+    missing, incompatible = [], []
+    for c in contributors:
+        index = c.get('overlap_index')
+        owner = c['contributor_id']
+        if index is None:
+            missing.append(owner)
+        elif (not isinstance(index, dict) or index.get('format_version') != 1 or index.get('contributor_id') != owner
+              or index.get('status') not in ('complete', 'analysis_budget_exceeded')):
+            incompatible.append(owner)
+    if missing or incompatible:
+        summary.update(reason='overlap_index_missing' if missing else 'overlap_index_incompatible',
+                       missing_index_contributors=sorted(missing), incompatible_index_contributors=sorted(incompatible))
+        return result
+    indexes = [c['overlap_index'] for c in contributors]
+    if any(i['extends_base_graph'] for i in indexes):
+        summary['reason'] = 'requires_independent_unit_outputs'
+        return result
+    if (any(i['status'] != 'complete' for i in indexes)
+            or sum(i['counts']['definitions'] for i in indexes) > MAX_DEFINITIONS):
         summary.update(reason='analysis_budget_exceeded', truncated=True)
         return result
-
-    families, all_owners = {}, defaultdict(set)
-    relations = defaultdict(lambda: defaultdict(set))
-    inputs_by_owner = {c['contributor_id']: c for c in contributors}
-    for item in sorted(contributors, key=lambda c: c['contributor_id']):
-        owner, graph = item['contributor_id'], item['graph']
-        for definition in graph.get('definitions', {}).get('entities', []):
-            name = definition['type']
-            family = _Family(owner, name, definition)
-            if (owner, name) in families or not _columns(definition.get('key_names')):
-                family.problems.add('unverified_identity_contract')
-            families[owner, name] = family
+    families, family_rows, all_owners = {}, {}, defaultdict(set)
+    relations = defaultdict(dict)
+    inputs_by_owner = {}
+    for c in sorted(contributors, key=lambda item: item['contributor_id']):
+        owner, index = c['contributor_id'], c['overlap_index']
+        inputs_by_owner[owner] = {'contributor_id': owner, 'source_namespace': c.get('source_namespace'),
+                                  'graph': {'access_fingerprint': index['access_fingerprint'],
+                                            BINDING: index['namespace_binding']}}
+        summary['index_directories']['families'] += len(index['families'])
+        summary['index_directories']['relations'] += len(index['relations'])
+        for name in index['type_names']:
             all_owners[name].add(owner)
-        for node in graph.get('nodes', []):
-            family = families.get((owner, node['type']))
-            if family:
-                _read_node(family, node)
-            else:
-                all_owners[node['type']].add(owner)
-        _read_edges(owner, graph, families, relations)
+        for row in index['families']:
+            family = family_header(owner, row)
+            families[owner, family.name] = family
+            family_rows[owner, family.name] = row
+        for row in index['relations']:
+            relations[relation_binding(row['binding'])][owner, row['type']] = row
+    loaded = set()
+    peaks = {'member_keys_or_endpoint_pairs': 0, 'neighbor_witnesses': 0, 'skipped_groups': 0}
+    summary['index_evidence_budget'] = peaks
+
+    def reserve(records, witnesses=0):
+        if (peaks['member_keys_or_endpoint_pairs'] + records > MAX_RECORDS
+                or peaks['neighbor_witnesses'] + witnesses > MAX_SUPPORTS):
+            peaks['skipped_groups'] += 1
+            summary['omitted_patterns'] += 1
+            return False
+        peaks['member_keys_or_endpoint_pairs'] += records
+        peaks['neighbor_witnesses'] += witnesses
+        return True
 
     buckets = defaultdict(list)
     for f in families.values():
@@ -403,16 +494,17 @@ def analyze_overlap_patterns(contributors, policy=None):
             buckets['same_physical_key', key].append(f)
         for key in f.by_catalog:
             buckets['observed_catalog_key', key].append(f)
-        if f.observations:
+        if family_rows[f.owner, f.name]['key_count']:
             buckets['same_logical_keys_across_sources', f.names].append(f)
 
-    def record(kind, basis, members, sources, overlap, reasons, candidates=(), witness_binding=None):
+    def record(kind, basis, members, sources, overlap, reasons, candidates=(), witness_binding=None, pair_coverage=None):
         if len(members) > MAX_MEMBERS or len(sources) > MAX_MEMBERS:
             summary['omitted_patterns'] += 1
             return
         pid = 'pattern_' + digest(kind, basis, members, sources, witness_binding)[:24]
         patterns.append({'pattern_id': pid, 'kind': kind, 'basis': basis, 'members': members, 'sources': sources,
                          **({'witness_binding': witness_binding} if witness_binding else {}),
+                         **({'pair_coverage': pair_coverage} if pair_coverage else {}),
                          'overlapping_keys': overlap, 'reasons': reasons,
                          'eligible_actions': ['apply', 'retain'] if candidates else ['retain']})
         if candidates:
@@ -426,6 +518,22 @@ def analyze_overlap_patterns(contributors, policy=None):
             summary['omitted_patterns'] += 1
             continue
         members = sorted(members, key=lambda f: (f.owner, f.name))
+        if basis == 'same_logical_keys_across_sources' and len({b[:3] for f in members for b in f.by_source}) < 2:
+            continue
+        entries = [((f.owner, f.name), family_rows[f.owner, f.name]) for f in members]
+        candidates = possibly_overlapping(entries, 'key_filter')
+        if len(candidates) < 2:
+            continue
+        members = [f for f in members if (f.owner, f.name) in candidates]
+        pending = [family_rows[slot] for slot in candidates - loaded]
+        if not reserve(sum(row['key_count'] for row in pending), sum(row['witness_count'] for row in pending)):
+            continue
+        for family in members:
+            slot = family.owner, family.name
+            if slot not in loaded:
+                load_family_evidence(family, family_rows[slot]['evidence'])
+                loaded.add(slot)
+                counts['family_sections'] += 1
         if basis == 'same_logical_keys_across_sources':
             projections = [f.observations.keys() for f in members]
         elif basis == 'same_physical_key':
@@ -443,20 +551,26 @@ def analyze_overlap_patterns(contributors, policy=None):
             record('entity', basis, [f.descriptor() for f in group], [_public_source(b) for b in bindings],
                    len(overlap), reasons, candidates,
                    witness_binding=None if basis == 'same_logical_keys_across_sources' else _public_source(key))
-    aliases, alias_stats = _cross_table_name_candidates(families)
+    aliases, alias_stats = _cross_table_name_candidates(families, family_rows, counts, inputs_by_owner)
     summary['cross_table_key_name_search'] = alias_stats
     summary['omitted_patterns'] += alias_stats['omitted_patterns']
-    for (left, a), (right, b), count in aliases:
-        reasons = _authority_issues({left.owner, right.owner}, inputs_by_owner)
+    for peers, count in aliases:
+        reasons = _authority_issues({f.owner for f, _ in peers}, inputs_by_owner)
         reasons.add('cross_source_identity_unverified')
-        record('entity', 'same_typed_keys_and_names_across_sources', [left.descriptor(), right.descriptor()],
-               [_public_source(a), _public_source(b)], count, sorted(reasons))
+        pair_coverage = ([{'member_indexes': [i, j], 'overlapping_keys': count}
+                          for i, j in combinations(range(len(peers)), 2)] if len(peers) > 2 else None)
+        record('entity', 'same_typed_keys_and_names_across_sources', [f.descriptor() for f, _ in peers],
+               [_public_source(binding) for _, binding in peers], count, sorted(reasons), pair_coverage=pair_coverage)
     for (src, schema, table, left, right), pairs in sorted(relations.items()):
         if len(pairs) > MAX_MEMBERS:
             summary['omitted_patterns'] += 1
         elif len(pairs) > 1:
-            ordered = sorted(pairs)
-            for group, overlap in _overlapping_members(ordered, [pairs[m] for m in ordered]):
+            ordered = sorted(possibly_overlapping(pairs.items(), 'key_filter'))
+            if len(ordered) < 2 or not reserve(sum(pairs[m]['pair_count'] for m in ordered)):
+                continue
+            projected = [{tuple(pair) for pair in pairs[m]['evidence']} for m in ordered]
+            counts['relation_sections'] += len(ordered)
+            for group, overlap in _overlapping_members(ordered, projected):
                 members = [{'contributor_id': owner, 'type': name, 'key_names': [],
                             'property_names': [], 'roles': []} for owner, name in group]
                 source = {'source_id': src, 'schema': schema, 'table': table, 'key_columns': list(left + right),

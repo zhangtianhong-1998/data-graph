@@ -6,12 +6,13 @@ import time
 from lightgraph.errors import LightGraphError
 from .access import access_fingerprint
 from .merger import merge_construction_graphs
-from .overlap_patterns import analyze_overlap_patterns, apply_overlap_decisions
+from .overlap_patterns import analyze_indexed_overlap_patterns, apply_overlap_decisions
 from .overlap_review import review_overlap_patterns
 
 
 def overlap_review_skip_reason(inputs, input_ids, artifacts, inherited):
-    if inherited or any(c['graph'].get('extends_base_graph') for c in inputs):
+    if (inherited or any(c.get('graph', {}).get('extends_base_graph') for c in inputs)
+            or any(isinstance(i, dict) and i.get('extends_base_graph') for i in (c.get('overlap_index') for c in inputs))):
         return 'inherited_graph'
     if len(set(input_ids)) < 2:
         return 'insufficient_extract_units'
@@ -32,7 +33,8 @@ def overlap_review_skip_reason(inputs, input_ids, artifacts, inherited):
 
 
 def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts, *, inherited,
-                              source_namespace, model_api_key, check_cancelled, deadline, on_model_call=None):
+                              source_namespace, model_api_key, check_cancelled, deadline, on_model_call=None,
+                              load_overlap_index=None):
     if node.max_run_seconds is not None:
         deadline = min(deadline, time.monotonic() + node.max_run_seconds)
     effective = policy
@@ -44,7 +46,13 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
               'selected_pattern_ids': [], 'decisions': [], 'reviewed_patterns': 0, 'omitted_patterns': 0}
     check_cancelled()
     if reason is None:
-        analysis = analyze_overlap_patterns([{**c, 'source_namespace': source_namespace} for c in inputs], policy)
+        # Pattern discovery has no access to instance graphs. These are needed below
+        # only for materializing the output under the selected policy.
+        indexed_inputs = [{'contributor_id': c['contributor_id'], 'kind': c['kind'],
+                           'source_namespace': source_namespace,
+                           'overlap_index': load_overlap_index(c) if load_overlap_index else c.get('overlap_index')}
+                          for c in inputs]
+        analysis = analyze_indexed_overlap_patterns(indexed_inputs, policy)
         patterns, pattern_summary = analysis.patterns, analysis.summary
         check_cancelled()
         if not patterns and pattern_summary.get('reason'):
@@ -85,6 +93,8 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
     summary = {
         'status': 'fallback' if fallback else result['status'],
         'reason': fallback or result.get('reason'),
+        **{field: pattern_summary[field] for field in ('missing_index_contributors', 'incompatible_index_contributors')
+           if pattern_summary.get(field)},
         'pattern_count': len(patterns),
         'reviewed_patterns': result['reviewed_patterns'],
         'omitted_patterns': result['omitted_patterns'] + pattern_summary.get('omitted_patterns', 0),

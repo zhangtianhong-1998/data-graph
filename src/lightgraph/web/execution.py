@@ -768,7 +768,8 @@ class RunManager:
         )
         from ..construction.workspace import read_internal_yaml
         from ..construction.snapshot_registry import publication_run_id, register_access_context
-        from ..construction.checkpoints import commit_checkpoint, load_checkpoint, require_partial_isolation, usable_result
+        from ..construction.checkpoints import (commit_checkpoint, load_checkpoint, load_checkpoint_overlap_index,
+                                                require_partial_isolation, usable_result)
 
         if run_mode == "fresh" and not generation_already_selected:
             self.workspace.select_output_generation(pid, rid, create=True)
@@ -1161,10 +1162,16 @@ class RunManager:
                                     def count_review_call():
                                         merge_nodes_state[mid]['model_calls'] += 1
 
+                                    def load_overlap_index(item):
+                                        uid = item['contributor_id']
+                                        location = wf_state['artifact_outputs'].get(uid)
+                                        output = run_output_path(project, location) if location else config.output_dir
+                                        return load_checkpoint_overlap_index(output, wf_state['artifacts'][uid])
+
                                     merged_upstream, review = merge_with_overlap_review(
                                         config, mnode, eff_policy, node_inputs, in_ids, wf_state['artifacts'],
                                         inherited=bool(base_contributors or config.inherited_graphs),
-                                        source_namespace=pid, model_api_key=model_api_key,
+                                        source_namespace=pid, model_api_key=model_api_key, load_overlap_index=load_overlap_index,
                                         check_cancelled=check_cancelled, deadline=deadline, on_model_call=count_review_call)
                                     merge_nodes_state[mid].update(overlap_review=review['summary'],
                                                                 model_calls=review['summary']['model_calls'])
