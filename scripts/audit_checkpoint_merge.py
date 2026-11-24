@@ -539,10 +539,12 @@ def _run_summary(run, state, project, node_id):
 
 
 def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False, compare_to=None,
-          run_summary=False, include_edge_lineage=False):
+          run_summary=False, include_edge_lineage=False, explain_identity=None):
     """Use the run's committed inputs and policy, even when the current project has been edited."""
     if include_edge_lineage and (observations_only or run_summary):
         raise ValueError("--include-edge-lineage 需要执行合并重放")
+    if explain_identity is not None and (observations_only or run_summary or not explain_identity.strip()):
+        raise ValueError("--explain-identity 需要一个完整的文本键值，并执行合并重放")
     run_file = Path(run_file)
     run = json.loads(run_file.read_text(encoding="utf-8"))
     project = run_file.parent.parent
@@ -621,10 +623,15 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
             stage = {_edge_key(ref, 'edge_id') for ref in refs}
 
         options = {'observe_before_hierarchy': capture_stage} if include_edge_lineage else {}
+        if enabled and explain_identity is not None:
+            from lightgraph.construction.hierarchy_trace import HierarchyTrace
+            options['hierarchy_trace'] = HierarchyTrace(explain_identity)
         graph = merger.merge_construction_graphs(inputs, target_access_fingerprint=target["access_fingerprint"],
                                                 merge_policy=policy, recognize_source_replays=enabled, **options)
         report[label] = {**merger.merge_accounting(inputs, graph), **alignment_counts(graph),
                          "integrity": output_checks(graph)}
+        if 'hierarchy_trace' in options:
+            report[label]['identity_trace'] = options['hierarchy_trace'].report(graph)
         if include_edge_lineage:
             report[label]['edge_lineage'] = edge_lineage(inputs, graph, stage)
         if include_hierarchy_membership or compare_to is not None:
@@ -647,6 +654,8 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         module = sys.modules.get('lightgraph.construction.' + name)
         if module is not None:
             modules.append(module)
+    if explain_identity is not None:
+        modules.append(sys.modules['lightgraph.construction.hierarchy_trace'])
     source_files = {m.__name__: Path(m.__file__).read_bytes() for m in modules}
     report["source_sha256"] = {name: hashlib.sha256(content).hexdigest() for name, content in source_files.items()}
     source_files["audit_checkpoint_merge.py"] = Path(__file__).read_bytes()
@@ -664,6 +673,7 @@ def main():
     mode.add_argument("--observations-only", action="store_true", help="只核查已提交图的实际观测，跳过合并重放")
     mode.add_argument("--include-hierarchy-membership", action="store_true", help="在重放报告中列出层级归并前后的节点 ID")
     parser.add_argument("--include-edge-lineage", action="store_true", help="逐单元核对原边来源和层级归并前的边，输出计数与摘要")
+    parser.add_argument("--explain-identity", metavar="CODE", help="按完整的单字段文本键值，列出层级合并实际检查的节点、来源和判定")
     parser.add_argument("--compare-hierarchy-audit", type=Path, metavar="AUDIT_JSON",
                         help="与同一批检查点的上一轮完整审计报告逐组比较，并输出本轮成员映射")
     args = parser.parse_args()
@@ -672,7 +682,8 @@ def main():
     try:
         report = audit(args.run_file, args.node, observations_only=args.observations_only,
                        include_hierarchy_membership=args.include_hierarchy_membership, compare_to=args.compare_hierarchy_audit,
-                       run_summary=args.run_summary, include_edge_lineage=args.include_edge_lineage)
+                       run_summary=args.run_summary, include_edge_lineage=args.include_edge_lineage,
+                       explain_identity=args.explain_identity)
     except LightGraphError as exc:
         parser.exit(1, f"检查点或合并未通过校验：{exc.code}\n")
     except (KeyError, OSError, ValueError) as exc:

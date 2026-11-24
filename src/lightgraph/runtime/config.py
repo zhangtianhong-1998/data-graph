@@ -182,7 +182,7 @@ class WorkflowUnitConfig(StrictModel):
 class EmbeddingConfig(StrictModel):
     """Configurable, replaceable semantic embedding service for subgraph retrieval."""
     model_config = ConfigDict(hide_input_in_errors=True)
-    provider: Literal["local_hash", "openai_compatible"] = "local_hash"
+    provider: Literal["none", "openai_compatible"] = "none"
     base_url: str = ""
     model: str = ""
     api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
@@ -194,6 +194,11 @@ class EmbeddingConfig(StrictModel):
         description="Optional vector dimension; auto-detected when null (e.g. 1024 for Qwen3-Embedding-0.6B).")
     query_instruction: str = Field(default="", max_length=1000,
         description="Optional instruction prefix prepended only to retrieval queries (e.g. Qwen3-Embedding Instruct format).")
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def migrate_hash_provider(cls, value):
+        return "none" if value == "local_hash" else value
 
     @field_validator("base_url")
     @classmethod

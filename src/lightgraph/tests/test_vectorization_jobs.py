@@ -46,10 +46,10 @@ def test_refresh_rejoins_build_and_an_interrupted_or_failed_build_can_be_retried
 
 def test_sync_reports_real_batches_before_publication(tmp_path):
     from lightgraph.retrieval import sync_graph_to_retrieval
-    from lightgraph.retrieval.vector_local import LocalHashEmbedder
+    from lightgraph.tests.test_retrieval_fields import FixtureEmbedder
     from lightgraph.tests.test_retrieval_fields import _scoped_graph
 
-    embedder = LocalHashEmbedder()
+    embedder = FixtureEmbedder()
     embedder.batch_size = 2
     seen = []
 

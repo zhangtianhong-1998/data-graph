@@ -4,7 +4,7 @@ import sqlite3
 
 from lightgraph.retrieval import SubgraphRetriever, sync_graph_to_retrieval
 from lightgraph.retrieval.query import RetrieveSubgraphRequest
-from lightgraph.retrieval.vector_local import LocalHashEmbedder
+from lightgraph.tests.test_retrieval_fields import FixtureEmbedder
 
 
 def support(key, value, *, scope='public', project='M', **kwargs):
@@ -23,15 +23,18 @@ def build(tmp_path, supports, embedder=None):
 
 
 def test_query_can_return_source_property_evidence_without_entity_match(tmp_path):
-    class RecordingHash(LocalHashEmbedder):
+    indexed_texts = []
+
+    class RecordingEmbedder(FixtureEmbedder):
         def embed(self, texts):
-            assert all('晶罅' not in text for text in texts)
+            indexed_texts.extend(texts)
             return super().embed(texts)
 
     r = build(tmp_path, [support('report', {'observed': ['外壳出现晶罅']}),
                          support('other', '晶罅伴随形变', project='K'),
                          support('restricted', '秘密的晶罅位置', scope='private'),
-                         support('unrelated', '正常')], RecordingHash())
+                         support('unrelated', '正常')], RecordingEmbedder())
+    assert all('晶罅' not in text for text in indexed_texts)
     result = RetrieveSubgraphRequest.model_validate({'query':'M 项目中，晶罅'}).run(r,['public'])
     assert not result['nodes'] and not result['edges']
     assert result['available_context']['status'] == 'source_text_only'

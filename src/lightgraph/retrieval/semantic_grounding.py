@@ -5,7 +5,6 @@ import numpy as np
 
 from lightgraph.errors import LightGraphError
 from .store_sqlite import normalize_term
-from .vector_local import LocalHashEmbedder
 
 
 # A response-size budget, independent of any model's score scale.
@@ -15,7 +14,7 @@ _CANDIDATES = 5
 def _vector_neighbors(retriever, fragments, cohorts):
     """Return per-mention neighbors and unique first places in each semantic field."""
     unavailable = [None] * len(fragments)
-    if isinstance(retriever.embedder, LocalHashEmbedder):
+    if retriever.embedder is None:
         return unavailable
     try:
         vectors = np.asarray(retriever.embedder.embed(fragments))

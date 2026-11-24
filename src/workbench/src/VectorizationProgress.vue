@@ -5,9 +5,9 @@ const percent = computed(() => props.progress?.stage === 'embedding' && props.pr
   ? Math.floor(100 * props.progress.completed / props.progress.total) : undefined)
 </script>
 <template>
-  <section class="vector-build" aria-label="向量化进度">
+  <section class="vector-build" aria-label="索引进度">
     <div role="status">
-      <strong>{{ progress?.stage === 'embedding' ? '生成文本向量' : progress?.stage === 'publishing' ? '写入向量索引' : '准备检索数据' }}</strong>
+      <strong>{{ progress?.stage === 'embedding' ? '生成文本向量' : progress?.stage === 'publishing' ? '写入检索索引' : '准备检索数据' }}</strong>
       <span v-if="percent !== undefined && progress">{{ progress.completed }} / {{ progress.total }} 条文本 · {{ percent }}%</span>
     </div>
     <progress max="100" :value="percent" aria-label="当前阶段进度" />

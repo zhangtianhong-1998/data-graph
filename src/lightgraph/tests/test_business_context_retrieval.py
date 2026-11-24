@@ -224,7 +224,8 @@ def test_index_slices_process_each_support_once_for_many_contexts(tmp_path, monk
     assert sum(processed) == count * 2 + 1
     assert max(processed) == 2 and len(processed) == count + 1
     assert len(set(endpoint_sets)) == 1
-    assert summary['vector_cards'] == count + 1
+    assert summary['scope_views'] == count + 1
+    assert summary['vector_cards'] == 0
     result = SubgraphRetriever(tmp_path).retrieve('月份42', business_context={'project': 'M', 'period': 42}, top_p_seeds=1)
     assert {edge['id'] for edge in result['edges']} == {'edge_42'}
     shared = next(item for item in result['nodes'] if item['id'] == 'shared')

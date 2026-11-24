@@ -3,6 +3,7 @@ import { computed, onUnmounted, ref, watch } from 'vue'
 import { ApiError, ensureSession, projectPath, request } from './api'
 import BusinessContextSelect from './BusinessContextSelect.vue'
 import PropertyTable from './PropertyTable.vue'
+import RetrievalIndexControls from './RetrievalIndexControls.vue'
 import TechnicalDetails from './TechnicalDetails.vue'
 import AvailableContext from './AvailableRetrievalContext.vue'
 import type { AvailableRetrievalContext, BusinessContext, FactContext, EmbeddingConfig, RetrievalStatusResponse } from './types'
@@ -176,7 +177,7 @@ function clearResult() {
   result.value = null
 }
 onUnmounted(clearResult)
-watch([businessContext, queryKind, hierarchyDirection, hierarchyInput, mode, seedInput, () => props.status?.generation, () => props.status?.vectorized], clearResult)
+watch([businessContext, queryKind, hierarchyDirection, hierarchyInput, mode, seedInput, () => props.status?.generation, () => props.status?.status], clearResult)
 watch(() => props.projectId, () => {
   clearResult()
   businessContext.value = null
@@ -191,6 +192,10 @@ const fallbackLabels: Record<string, string> = {
   no_visible_context: '当前范围没有可见对象',
 }
 const activeStatus = computed(() => props.status)
+const indexReady = computed(() => props.status?.indexed || props.status?.vectorized)
+watch(() => props.status?.vectorized, enabled => {
+  method.value = enabled ? 'hybrid' : 'keyword'
+}, { immediate: true })
 const showMainGraph = computed(() => result.value && !result.value.hierarchy && (
   !result.value.available_context || result.value.nodes.length > 0 || result.value.edges.length > 0
 ))
@@ -215,7 +220,7 @@ const nodeLabel = (id: string) => nodeMap.value.get(id)?.display_name ||
 
 const generatingSQL = ref(false)
 async function runQuery(withSQL = false, candidateId?: string) {
-  if ((!candidateId && !hasInput.value) || working.value || props.syncing || !props.status?.vectorized) return
+  if ((!candidateId && !hasInput.value) || working.value || props.syncing || !indexReady.value) return
   generatingSQL.value = withSQL
   const epoch = ++queryEpoch
   const controller = new AbortController()
@@ -279,9 +284,7 @@ async function runQuery(withSQL = false, candidateId?: string) {
       <div class="panel-head">
         <h2>图谱检索</h2>
         <div v-if="activeStatus" class="actions index-status">
-          <span class="badge" :class="activeStatus.vectorized ? 'green' : 'amber'">{{ activeStatus.vectorized ? '已完成向量化' : activeStatus.status === 'stale' ? '索引待更新' : activeStatus.has_graph ? '未向量化' : '尚无图谱' }}</span>
-          <small v-if="activeStatus.vectorized">{{ activeStatus.embedder_model }} · {{ activeStatus.vector_dim }} 维</small>
-          <button v-if="activeStatus.has_graph" class="btn small" type="button" :disabled="syncing || working || busy" @click="emit('vectorize')">{{ syncing ? '正在向量化…' : activeStatus.vectorized ? '重新向量化' : '立即向量化' }}</button>
+          <RetrievalIndexControls :status="activeStatus" :working="syncing" :busy="working || busy" @build="emit('vectorize')"/>
         </div>
       </div>
       <div class="panel-body">
@@ -330,7 +333,7 @@ async function runQuery(withSQL = false, candidateId?: string) {
               <select id="retrieval-field" v-model="field" :disabled="working"><option value="all">全部</option><option value="name">名称</option><option value="description">描述</option></select>
             </div>
             <div class="field"><label for="retrieval-method">匹配方式</label>
-              <select id="retrieval-method" v-model="method" :disabled="working"><option value="hybrid">混合检索</option><option value="keyword">关键词</option><option value="vector">向量相似度</option></select>
+              <select id="retrieval-method" v-model="method" :disabled="working"><option v-if="activeStatus?.vectorized" value="hybrid">混合检索</option><option value="keyword">关键词</option><option v-if="activeStatus?.vectorized" value="vector">向量相似度</option></select>
             </div>
           </div>
           <div v-if="mode === 'id'" class="retrieval-params">
@@ -359,10 +362,10 @@ async function runQuery(withSQL = false, candidateId?: string) {
           <BusinessContextSelect v-model="businessContext" :project-id="projectId" :refresh-key="status?.generation" :disabled="working || syncing"/>
           </details>
           <div class="actions">
-            <button class="btn primary" type="submit" :disabled="working || syncing || !activeStatus?.vectorized || !hasInput">{{ (working && !generatingSQL) ? '正在检索…' : '检索' }}</button>
-            <button v-if="queryKind === 'question'" class="btn" type="button" :disabled="working || syncing || !activeStatus?.vectorized || !hasInput" @click="runQuery(true)">{{ working && generatingSQL ? '正在召回并生成 SQL…' : '召回并试写 SQL' }}</button>
+            <button class="btn primary" type="submit" :disabled="working || syncing || !indexReady || !hasInput">{{ (working && !generatingSQL) ? '正在检索…' : '检索' }}</button>
+            <button v-if="queryKind === 'question'" class="btn" type="button" :disabled="working || syncing || !indexReady || !hasInput" @click="runQuery(true)">{{ working && generatingSQL ? '正在召回并生成 SQL…' : '召回并试写 SQL' }}</button>
             <button v-if="working" class="btn small" type="button" @click="clearResult">停止等待</button>
-            <span v-if="activeStatus?.has_graph && !activeStatus.vectorized" class="field-hint">请先为当前图谱建立索引。</span>
+            <span v-if="activeStatus?.has_graph && !indexReady" class="field-hint">请先为当前图谱建立索引。</span>
           </div>
         </form>
         <p v-if="panelError" class="note amber" role="alert">{{ panelError }}</p>

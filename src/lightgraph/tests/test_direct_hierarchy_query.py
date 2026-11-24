@@ -129,3 +129,71 @@ def test_undeclared_relation_needs_verified_column_bindings_and_current_semantic
     with pytest.raises(LightGraphError, match='retrieval_index_stale'):
         ask(r, mode='hierarchy', node_id='p')
     assert ask(r, mode='search', node_id='p')['nodes']
+
+
+def test_workbench_pages_bundle_only_matching_levels_and_keep_original_ids(tmp_path):
+    from lightgraph.runtime.config import RunConfig
+    from lightgraph.web import construction_graph
+    from lightgraph.web.graph_batches import read_graph_batch
+
+    graph = publication()
+    config = RunConfig(sources=[], output_dir=str(tmp_path))
+    for node in graph['nodes']:
+        node.update(kind=node['type'], label=node['supports'][0]['label'])
+    for edge in graph['edges']:
+        edge['relation'] = edge['type']
+    # Same physical endpoints, but different visible applicability.
+    scoped = deepcopy(next(edge for edge in graph['edges'] if edge['id'] == 'b'))
+    scoped['id'] = 'different_scope'
+    scoped['supports'][0]['scope_ref'] = 'dept-a'
+    graph['edges'].append(scoped)
+    page = construction_graph.graph_page(config, prepared_graph=graph)
+    by_id = {edge['id']: edge for edge in page['edges']}
+    assert by_id['s']['hierarchy_direction'] == 'outgoing'
+    assert all('hierarchy_direction' not in by_id[key] for key in 'hijkl')
+    assert 'hierarchy_line_key' not in by_id['a']  # role declared without physical levels
+    assert by_id['b']['hierarchy_line_key'] == by_id['c']['hierarchy_line_key'] == by_id['d']['hierarchy_line_key']
+    assert by_id['e']['hierarchy_line_key'] != by_id['f']['hierarchy_line_key']
+    assert by_id['different_scope']['hierarchy_line_key'] != by_id['b']['hierarchy_line_key']
+    for offset, original in enumerate(graph['edges']):
+        batch = read_graph_batch(None, 'p', config=config, part='edges', offset=offset, limit=1,
+                                 prepared_view=(graph, 'g'))
+        assert batch['edges'] == [by_id[original['id']]]
+        assert 'hierarchy_direction' not in original
+
+
+def test_canvas_line_distinguishes_predicates_properties_and_physical_rows():
+    from lightgraph.web.graph_payload import canvas_item, relation_definitions
+
+    graph = publication()
+    edge = next(edge for edge in graph['edges'] if edge['id'] == 'b')
+    definitions = relation_definitions(graph)
+
+    def projected(*, predicate=None, properties=None, witness=None, row=None):
+        item = deepcopy(edge)
+        obs = item['supports'][0]
+        obs['provenance']['predicate'] = predicate
+        obs['properties'] = properties or {}
+        if witness is not None:
+            obs['source_row_witness'] = witness
+        if row is not None:
+            obs['row_context'] = {'values': row, 'value_types': {key: 'text' for key in row}}
+            obs['provenance']['context_columns'] = list(row)
+        return canvas_item(item, definitions)
+
+    plain = projected()['hierarchy_line_key']
+    key_filter = {'op': 'is_not_null', 'column': 'SUBJECT_L1_CODE'}
+    assert projected(predicate=key_filter)['hierarchy_line_key'] == plain
+    assert projected(row={'SUBJECT_L5_CODE': 'branch'})['hierarchy_line_key'] == plain
+    assert projected(row={'responsibility': 'EBG'})['hierarchy_line_key'] != plain
+    assert projected(properties={'method': ['net']})['hierarchy_line_key'] != plain
+    net = {'op': 'eq', 'column': 'method', 'value': 'net'}
+    gross = {**net, 'value': 'gross'}
+    assert projected(predicate=net)['hierarchy_line_key'] != projected(predicate=gross)['hierarchy_line_key']
+    assert projected(predicate={'all': [net, key_filter]})['hierarchy_line_key'] == projected(predicate=net)['hierarchy_line_key']
+    witness = {'kind': 'excel_rows_v1', 'snapshot': 'a' * 64, 'rows': [[10, 10]]}
+    assert projected(witness=witness)['hierarchy_line_key'] != projected(witness={**witness, 'rows': [[12, 12]]})['hierarchy_line_key']
+    for malformed in (42, 'legacy', [], {'snapshot': 'x'}, {**witness, 'rows': [[10, 1]]}):
+        actual = projected(witness=malformed)
+        assert actual['id'] == edge['id'] and 'hierarchy_line_key' not in actual
+        assert 'hierarchy_direction' not in actual

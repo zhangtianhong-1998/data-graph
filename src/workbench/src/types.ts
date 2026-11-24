@@ -119,7 +119,8 @@ export interface WorkflowMergeNodeState {
   updated_at?: string
 }
 export interface RetrievalStatusResponse {
-  status: 'no_graph' | 'not_vectorized' | 'stale' | 'vectorized'
+  status: 'no_graph' | 'not_vectorized' | 'stale' | 'vectorized' | 'indexed'
+  indexed?: boolean
   vectorized: boolean
   stale_reason: string | null
   has_graph: boolean
@@ -139,7 +140,7 @@ export interface RetrievalStatusResponse {
   config_error: string | null
 }
 export interface EmbeddingConfig {
-  provider?: 'local_hash' | 'openai_compatible'
+  provider?: 'none' | 'openai_compatible'
   base_url?: string
   model?: string
   api_key_env?: string

@@ -26,6 +26,7 @@ import GraphAlignmentReview from './GraphAlignmentReview.vue'
 import type { BusinessContext } from './types'
 import RetrievalPanel from './RetrievalPanel.vue'
 import VectorizationProgress from './VectorizationProgress.vue'
+import RetrievalIndexControls from './RetrievalIndexControls.vue'
 import { useVectorization } from './useVectorization'
 import ConfirmDelete from './ConfirmDelete.vue'
 import { goalMarkdown } from './goalMarkdown'
@@ -649,7 +650,7 @@ async function testEmbeddingEndpoint() {
     if (generation !== epoch) return
     const timeout = embedding.value.timeout_seconds ?? defaultEmbeddingTimeout
     const payload: Record<string, unknown> = {
-      provider: embedding.value.provider || 'local_hash',
+      provider: embedding.value.provider || 'none',
       base_url: embedding.value.base_url || '',
       model: embedding.value.model || '',
       api_key_env: embedding.value.api_key_env || 'LIGHTGRAPH_EMBEDDING_API_KEY',
@@ -1075,7 +1076,7 @@ onUnmounted(() => { generation++; detailController?.abort(); pollController?.abo
             :locked="locked" :busy="busy" @upload="upload" @import-manifest="importDocumentManifest" @save-binding="saveDocumentBinding"
             @preview="showContent" @delete-file="file => askDeletion({ kind: 'file', file })"/>
           <VectorizationProgress v-if="vectorizing && (tab === 'retrieval' || (tab === 'business' && !selectedGraphVersion))" :progress="vectorJob.progress"/>
-          <template v-if="tab === 'metadata' || tab === 'business'"><div class="intro"><div><div class="graph-heading"><h2>{{ tab === 'metadata' ? '元数据关联图' : '业务知识图谱' }}</h2><span v-if="tab === 'business' && typeof business.merged_observation_nodes === 'number'" class="badge" title="当前范围内，合并后保留了多个抽取单元同源证据的节点数">已归并 {{ business.merged_observation_nodes }} 个节点</span></div></div><div class="actions"><template v-if="tab === 'business' && !selectedGraphVersion && (business.nodes.length > 0 || retrievalStatus?.has_graph)"><span class="badge" :class="retrievalStatus?.status === 'vectorized' ? 'green' : 'amber'">{{ retrievalStatus?.status === 'vectorized' ? `已完成向量化 · ${retrievalStatus.embedder_model || 'local_hash'} (${retrievalStatus.vector_dim ?? '—'}维)` : retrievalStatus?.status === 'stale' ? '图谱或模型已变更 · 待重新向量化' : '未向量化' }}</span><button class="btn" :class="{ primary: !retrievalStatus?.vectorized }" :disabled="vectorizing || busy" @click="vectorizeGraph">{{ vectorizing ? '正在向量化…' : retrievalStatus?.vectorized ? '重新向量化' : '立即向量化' }}</button></template><button v-if="tab === 'business' && !selectedGraphVersion" class="btn" :aria-expanded="structurePreviewOpen" @click="structurePreviewOpen = !structurePreviewOpen">{{ structurePreviewOpen ? '收起结构方案' : '查看结构方案' }}</button><button class="btn" :disabled="busy" @click="action(refreshGraphs)">刷新图谱</button></div></div><p v-if="tab === 'metadata' && metadata.requires_refresh" class="note graph-notice">{{ metadata.tables.length ? '目前仅显示已读取来源的元数据；其他来源仍需连接并读取。' : '尚未读取元数据。请在「项目配置 → 数据接入」连接来源并读取元数据。' }}</p><p v-if="tab === 'metadata' && metadata.stale_engine_metadata" class="note amber graph-notice">元数据声明已更新。重新运行抽取后，会刷新与新声明对应的关系。</p>
+          <template v-if="tab === 'metadata' || tab === 'business'"><div class="intro"><div><div class="graph-heading"><h2>{{ tab === 'metadata' ? '元数据关联图' : '业务知识图谱' }}</h2><span v-if="tab === 'business' && typeof business.merged_observation_nodes === 'number'" class="badge" title="当前范围内，合并后保留了多个抽取单元同源证据的节点数">已归并 {{ business.merged_observation_nodes }} 个节点</span></div></div><div class="actions"><template v-if="tab === 'business' && !selectedGraphVersion && (business.nodes.length > 0 || retrievalStatus?.has_graph)"><RetrievalIndexControls :status="retrievalStatus" :working="vectorizing" :busy="busy" @build="vectorizeGraph"/></template><button v-if="tab === 'business' && !selectedGraphVersion" class="btn" :aria-expanded="structurePreviewOpen" @click="structurePreviewOpen = !structurePreviewOpen">{{ structurePreviewOpen ? '收起结构方案' : '查看结构方案' }}</button><button class="btn" :disabled="busy" @click="action(refreshGraphs)">刷新图谱</button></div></div><p v-if="tab === 'metadata' && metadata.requires_refresh" class="note graph-notice">{{ metadata.tables.length ? '目前仅显示已读取来源的元数据；其他来源仍需连接并读取。' : '尚未读取元数据。请在「项目配置 → 数据接入」连接来源并读取元数据。' }}</p><p v-if="tab === 'metadata' && metadata.stale_engine_metadata" class="note amber graph-notice">元数据声明已更新。重新运行抽取后，会刷新与新声明对应的关系。</p>
             <details v-if="tab === 'business'" class="graph-view-options" @toggle="toggleGraphOptions">
               <summary><strong>版本与范围</strong><span>{{ selectedGraphVersion ? '历史快照' : '当前发布' }} · {{ graphBusinessContext === null ? '全部内容' : Object.entries(graphBusinessContext).map(([key, val]) => key + ' ' + val).join(' · ') || '仅通用知识' }}{{ includeCandidates ? ' · 含候选' : '' }}</span></summary>
               <div v-if="graphOptionsOpen" class="graph-options-body">
@@ -1190,7 +1191,7 @@ onUnmounted(() => { generation++; detailController?.abort(); pollController?.abo
   <div class="field">
     <label for="embedding-provider">向量服务类型</label>
     <select id="embedding-provider" v-model="embedding.provider" :disabled="locked">
-      <option value="local_hash">内置离线哈希向量（无深度学习模型，仅兜底）</option>
+      <option value="none">仅用关键词和图关系</option>
       <option value="openai_compatible">可替换本地/远端向量服务（OpenAI /v1/embeddings 协议，如 Qwen3-Embedding-0.6B）</option>
     </select>
   </div>
@@ -1240,10 +1241,10 @@ onUnmounted(() => { generation++; detailController?.abort(); pollController?.abo
   </template>
   <div class="actions embedding-actions">
     <button class="btn small" type="button" :disabled="locked" @click="fillQwenEmbeddingPreset">填入本地 Qwen3-0.6B 默认参数</button>
-    <button class="btn small" type="button" :disabled="embeddingTesting || busy" @click="testEmbeddingEndpoint">{{ embeddingTesting ? '测试中…' : '测试向量服务连通性' }}</button>
+    <button v-if="embedding.provider === 'openai_compatible'" class="btn small" type="button" :disabled="embeddingTesting || busy" @click="testEmbeddingEndpoint">{{ embeddingTesting ? '测试中…' : '测试向量服务连通性' }}</button>
   </div>
   <p v-if="embeddingTestResult" class="note">
-    向量服务连通成功 · 模型：<strong>{{ embeddingTestResult.model || 'local_hash' }}</strong> · 向量维度：<strong>{{ embeddingTestResult.dimensions }}</strong> · 耗时：{{ embeddingTestResult.latency_ms }} ms
+    向量服务连通成功 · 模型：<strong>{{ embeddingTestResult.model }}</strong> · 向量维度：<strong>{{ embeddingTestResult.dimensions }}</strong> · 耗时：{{ embeddingTestResult.latency_ms }} ms
   </p>
 </fieldset>
 </div><div class="panel-footer"><span>API key 加密保存在服务端本机，刷新后无需重填</span><button class="btn primary" :disabled="locked || agentLimitsLoading || !!limitsError" @click="action(saveModelLimits)">保存配置</button></div></section><aside class="panel"><div class="panel-head"><h2>运行前检查</h2></div><div class="panel-body"><div class="setup-check"><strong>{{ config.sources?.length || 0 }} 个数据来源</strong><button class="text-button" @click="tab = 'inputs'">配置数据接入</button></div><div class="setup-check"><strong>{{ documentFiles.length }} 个知识文档</strong><button class="text-button" @click="tab = 'documents'">配置知识文档</button></div><div class="setup-check"><strong>{{ purpose.trim() ? '已填写抽取目标' : '尚未填写抽取目标' }}</strong><button class="text-button" @click="tab = 'goal'">配置抽取目标</button></div><div class="setup-check"><strong>{{ workflowConfig?.enabled ? `并行工作流（${workflowConfig.units.length} 条链路）` : '单链路运行模式' }}</strong><button class="text-button" @click="tab = 'workflow'">编排并行工作流</button></div></div></aside></div><details class="panel advanced-panel"><summary class="panel-head">高级配置（可选）</summary><div class="panel-head"><h2>完整项目配置</h2><span class="badge">JSON 编辑 · 服务端保存 YAML</span></div><div class="panel-body"><p class="field-hint editor-hint">此处与上方表单同步；两处修改不同字段时一并保存，同一字段有冲突时会提示。</p><label class="sr-only" for="advanced-config">完整项目 JSON 配置</label><textarea id="advanced-config" v-model="advanced" class="code-editor" :disabled="locked" spellcheck="false"/></div><div class="panel-footer"><span>完整配置不接受明文密码或 API key，请使用上方连接表单</span><div class="actions"><button v-if="advancedDirty && (formDirty || agentLimitsDirty)" class="btn" :disabled="locked" @click="discardFormEdits">放弃表单修改</button><button v-if="advancedDirty" class="btn" :disabled="locked" @click="resetAdvanced">放弃修改</button><button class="btn" :disabled="locked" @click="action(async () => { advanced = JSON.stringify(advancedConfig(), null, 2) })">格式化 JSON</button><button class="btn primary" :disabled="locked" @click="saveAdvanced">保存完整配置</button></div></div></details></template>

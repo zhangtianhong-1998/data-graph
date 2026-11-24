@@ -1,6 +1,7 @@
 """Field-specific ranking, scoped ID lookup, and filtered expansion."""
 import json
 
+import numpy as np
 import httpx
 import pytest
 
@@ -37,10 +38,23 @@ def _scoped_graph():
     return {'support_visibility_version': 1, 'nodes': nodes, 'edges': edges, 'definitions': {}}
 
 
+class FixtureEmbedder:
+    """Fixed vectors for exercising ranking fields and batched index writes."""
+    dim = 2
+
+    def embed(self, texts):
+        return np.array([[1., 0.] if text == '季度结余' else [0., 1.] for text in texts],
+                        dtype=np.float32).reshape(-1, self.dim)
+
+    def embed_queries(self, texts):
+        return self.embed(texts)
+
+
 @pytest.fixture
 def search(tmp_path):
-    sync_graph_to_retrieval(_scoped_graph(), tmp_path)
-    return SubgraphRetriever(tmp_path)
+    embedder = FixtureEmbedder()
+    sync_graph_to_retrieval(_scoped_graph(), tmp_path, embedder=embedder)
+    return SubgraphRetriever(tmp_path, embedder=embedder)
 
 
 @pytest.mark.parametrize('method', ['keyword', 'vector', 'hybrid'])
@@ -114,7 +128,7 @@ def test_old_mixed_only_index_requires_explicit_rebuild(search, tmp_path):
     with pytest.raises(LightGraphError, match='retrieval_index_stale'):
         active_index(tmp_path)
     sync_graph_to_retrieval(_scoped_graph(), tmp_path)
-    assert active_index(tmp_path)[1]['format'] == 6
+    assert active_index(tmp_path)[1]['format'] == 7
 
 
 def test_remote_index_allows_keyless_keyword_and_id_queries_after_sync(tmp_path, monkeypatch):

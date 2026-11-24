@@ -11,10 +11,10 @@ from itertools import combinations
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
 from lightgraph.construction.contexts import business_context_matches, normalize_context_selection, support_business_context
-from .sync import active_index
+from .sync import active_index, index_matches_embedder
 from .path_evidence import grounds_slot
 from .store_sqlite import SQLiteGraphIndex, normalize_term
-from .vector_local import Embedder, LocalHashEmbedder, LocalNumpyVectorStore, embedder_fingerprint
+from .vector_local import Embedder, LocalNumpyVectorStore
 
 _SPLIT_RE = re.compile(r'[，,。；;、?!？！\n]+')
 _PATH_STATE_LIMIT = 4096
@@ -303,14 +303,14 @@ class SubgraphRetriever:
         self.cohorts = manifest['cohorts']
         self.cohort_contexts = manifest['cohort_contexts']
         self.generation = manifest['generation']
-        self.vector_dim = int(manifest.get('vector_dim') or 0)
+        self.vector_dim = int(manifest.get('vector_dim') or 0) if embedder is not None else 0
         self.analytics_loader = analytics_loader
         self.mention_extractor = mention_extractor
-        self.index = SQLiteGraphIndex(self.root / 'retrieval.sqlite')
-        self.vectors = LocalNumpyVectorStore(self.root / 'vectors')
-        self.embedder = embedder or LocalHashEmbedder()
-        if manifest['embedder'] != embedder_fingerprint(self.embedder):
+        if not index_matches_embedder(manifest, embedder):
             raise LightGraphError('retrieval_index_stale')
+        self.index = SQLiteGraphIndex(self.root / 'retrieval.sqlite')
+        self.embedder = embedder
+        self.vectors = LocalNumpyVectorStore(self.root / 'vectors') if embedder is not None else None
 
     def authorized_cohorts(self, scopes, business_context=None):
         """Restrict all candidate scoring and traversal to permitted support slices."""
@@ -344,6 +344,8 @@ class SubgraphRetriever:
         cohorts = self.authorized_cohorts(scope_list, selection)
         if field not in {'all', 'name', 'description'} or method not in {'keyword', 'vector', 'hybrid'}:
             raise ValueError('invalid_retrieval_mode')
+        if method == 'vector' and self.embedder is None:
+            raise LightGraphError('embedding_not_configured')
         if hops is None:
             hops = 0 if node_id is not None else 2
         resolved = {c['text']: [hit['node_id'] for hit in c['candidates']] for c in resolved_conditions}
@@ -380,7 +382,7 @@ class SubgraphRetriever:
         truncated_slots = len(slots) > max_slots
         slots = slots[:max_slots]
         vec_batches = [[] for slot in slots]
-        if not resolved and method in {'hybrid', 'vector'} and cohorts:
+        if self.embedder is not None and not resolved and method in {'hybrid', 'vector'} and cohorts:
             slot_surfaces = [slot.surface for slot in slots]
             q_vectors = (
                 self.embedder.embed_queries(slot_surfaces)

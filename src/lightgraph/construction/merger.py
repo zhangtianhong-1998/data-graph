@@ -232,6 +232,7 @@ def _merge_contributor_nodes_and_edges(
     independent_outputs: bool = False,
     recognize_source_replays: bool = True,
     observe_before_hierarchy: Callable[[Iterable[dict]], None] | None = None,
+    hierarchy_trace=None,
 ) -> dict[str, Any]:
     """Merge graphs while blocking unverified cross-unit auto-merges & auto-connections."""
     fusion = policy.fusion_policy
@@ -292,6 +293,7 @@ def _merge_contributor_nodes_and_edges(
         prepared_contributors.append((cid, ckind, rewritten))
 
     observed_ids = [{} for _ in prepared_contributors]
+    excluded_types = shared_types | ({rule.canonical_type for rule in fusion.entity_rules} if fusion else set())
     observation_witnesses = []
     source_replay_counts = Counter()
     local_bases = {str(item['contributor_id']) for item in contributors if item.get('local_source_namespace') is True}
@@ -303,7 +305,6 @@ def _merge_contributor_nodes_and_edges(
         replay_status = 'insufficient_contributors'
     else:
         replay_status = 'ran'
-        excluded_types = shared_types | ({rule.canonical_type for rule in fusion.entity_rules} if fusion else set())
         for indices in source_groups:
             counts = {}
             remaps, witnesses = align_observed_nodes(
@@ -795,13 +796,16 @@ def _merge_contributor_nodes_and_edges(
     hierarchy_collapsed = None
     hierarchy_diagnostics = {}
     compatible_namespace = source_namespaces is None or len(source_groups) == 1 and source_namespaces[0] is not None
-    if replay_status == 'ran' and compatible_namespace and all(
+    if hierarchy_trace is not None:
+        hierarchy_trace.start(result)
+    if replay_status in ('ran', 'insufficient_contributors') and prepared_contributors and compatible_namespace and all(
         kind == 'unit' and not graph.get('extends_base_graph') for _, kind, graph in prepared_contributors
     ):
         if observe_before_hierarchy is not None:
             observe_before_hierarchy([edge_reference(e) for e in result['edges']])
         hierarchy_collapsed = reconcile_hierarchy_projections(
-            result, excluded_types=excluded_types, diagnostics=hierarchy_diagnostics)
+            result, excluded_types=excluded_types, diagnostics=hierarchy_diagnostics, trace=hierarchy_trace,
+            emit_candidates=policy.emit_alignment_candidates)
     result['definition_conflicts'] = definition_conflict_diagnostics(result)
     if fusion:
         result['fusion_policy'] = fusion.model_dump(mode='json')
@@ -941,6 +945,7 @@ def merge_construction_graphs(
     independent_outputs: bool = False,
     recognize_source_replays: bool = True,
     observe_before_hierarchy: Callable[[Iterable[dict]], None] | None = None,
+    hierarchy_trace=None,
 ) -> dict[str, Any]:
     """Merge authorized graph contributors.
 
@@ -961,6 +966,7 @@ def merge_construction_graphs(
         independent_outputs=independent_outputs,
         recognize_source_replays=recognize_source_replays,
         observe_before_hierarchy=observe_before_hierarchy,
+        hierarchy_trace=hierarchy_trace,
     )
 
 

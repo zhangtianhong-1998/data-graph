@@ -13,7 +13,7 @@ from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
 from lightgraph.retrieval import local_embed_server as server
 from lightgraph.retrieval.sync import active_index, sync_graph_to_retrieval
-from lightgraph.retrieval.vector_local import LocalHashEmbedder, OpenAIEmbedder, embedder_fingerprint
+from lightgraph.retrieval.vector_local import OpenAIEmbedder, embedder_fingerprint
 
 
 class StubBackend:
@@ -116,9 +116,47 @@ def test_client_keeps_fingerprint_stable_and_normalizes_large_finite_vectors(mon
     assert embedder_fingerprint(OpenAIEmbedder(base_url=embedder.base_url, model=embedder.model)) == fingerprint
 
 
-def test_existing_v2_offline_indexes_keep_their_original_fingerprint():
-    embedder = LocalHashEmbedder()
-    assert embedder_fingerprint(embedder) == digest(type(embedder).__module__, 'LocalHashEmbedder', 256, None, None)
+def test_new_and_legacy_lexical_indexes_never_generate_or_search_hash_vectors(tmp_path):
+    import json
+    from lightgraph.retrieval import SubgraphRetriever, resolve_embedder
+    from lightgraph.runtime.config import EmbeddingConfig
+
+    settings = EmbeddingConfig(provider='local_hash')
+    assert settings.provider == 'none'
+    assert resolve_embedder(SimpleNamespace(embedding=settings)) is None
+    graph = {'support_visibility_version': 1,
+             'nodes': [{'id': 'n1', 'type': 'Item', 'identity': {'code': 'A1'},
+                        'supports': [{'scope_ref': 'public', 'label': '采购', 'properties': {}}]}],
+             'edges': []}
+    result = sync_graph_to_retrieval(graph, tmp_path, generation='generation')
+    assert result['indexed'] and not result['vectorized']
+    assert result['vector_rows'] == result['vector_dim'] == result['vector_cards'] == 0
+    path, manifest = active_index(tmp_path, 'generation')
+    assert not (path / 'vectors').exists()
+    reader = SubgraphRetriever(tmp_path, expected_generation='generation')
+    assert reader.retrieve('A1', hops=0)['nodes'][0]['id'] == 'n1'
+    assert not reader.retrieve('完全无关的随机短语')['nodes']
+    with pytest.raises(LightGraphError, match='embedding_not_configured'):
+        reader.retrieve('采购', method='vector')
+
+    # Old format 6 already contains scoped terms and topology. Only the matrix
+    # is obsolete. A fresh reader can reuse SQLite without mutating the build.
+    manifest.update(format=6, embedder_provider='local_hash', embedder_model='local_hash',
+                    embedder=digest('lightgraph.retrieval.vector_local', 'LocalHashEmbedder', 256, None, None),
+                    vector_dim=256)
+    pointer = tmp_path / 'current.json'
+    pointer.write_text(json.dumps(manifest))
+    old = SubgraphRetriever(tmp_path, expected_generation='generation')
+    assert not old.vector_dim and old.vectors is None
+    assert [n['id'] for n in old.retrieve('采购')['nodes']] == ['n1']
+    assert not old.retrieve('无关的字符串')['nodes']
+    with pytest.raises(LightGraphError, match='retrieval_index_stale'):
+        SubgraphRetriever(tmp_path, expected_generation='different')
+    assert json.loads(pointer.read_text()) == manifest
+    for missing in ('generation', 'embedder_provider', 'embedder', 'cohorts', 'cohort_contexts'):
+        pointer.write_text(json.dumps({k: v for k, v in manifest.items() if k != missing}))
+        with pytest.raises(LightGraphError, match='retrieval_index_stale'):
+            SubgraphRetriever(tmp_path)
 
 
 def test_manual_rebuild_replaces_vectors_after_service_changes_in_place(tmp_path, monkeypatch):

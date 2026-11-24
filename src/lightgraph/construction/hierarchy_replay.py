@@ -416,7 +416,48 @@ def _cross_unit_pairs(ids, members):
     return pairs
 
 
-def _verified_groups(graph, excluded_types, stats, physical_sets):
+def _versioned_draft(item):
+    """A projection in a unit must be attributable to one specific draft revision."""
+    owners = set()
+    for support in item.get('supports') or []:
+        for origin in support.get('execution_origins') or [support.get('validation_origin') or {}]:
+            draft, revision = origin.get('draft_id'), origin.get('draft_revision')
+            unit = support.get('contributor_id')
+            if (not unit or origin.get('contributor_id', unit) != unit or not isinstance(draft, str)
+                    or not draft or type(revision) is not int or revision < 1):
+                return None
+            owners.add((unit, draft, revision))
+    return next(iter(owners)) if len(owners) == 1 else None
+
+
+def _draft_witnesses(graph, nodes, shared_slots):
+    owners = {nid: _versioned_draft(nodes[nid]) for nid in shared_slots}
+    for edge in graph['edges']:
+        ends = shared_slots.intersection((edge['source'], edge['target']))
+        if ends and edge['source'] != edge['target']:
+            draft = _versioned_draft(edge)
+            for nid in ends:
+                if owners[nid] != draft:
+                    owners[nid] = None
+    return owners
+
+
+def _unverified_siblings(batch, members, drafts, *, direct):
+    by_unit = defaultdict(list)
+    for nid in batch:
+        by_unit[members[nid].unit].append(nid)
+    rejected = set()
+    for siblings in by_unit.values():
+        if len(siblings) < 2:
+            continue
+        # A new revision of the same authored role is not an independent declaration.
+        authors = {drafts[i][1] for i in siblings if drafts.get(i)}
+        if not direct or len(authors) != len(siblings):
+            rejected.update(siblings)
+    return rejected
+
+
+def _verified_groups(graph, excluded_types, stats, physical_sets, trace=None, review_sets=None):
     nodes = {n['id']: n for n in graph['nodes']}
     definitions = {d['type']: d for d in graph['definitions']['entities']}
     relations = {r['type']: r for r in graph['definitions']['relations']}
@@ -424,6 +465,8 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
                 definitions.get(n['type'], {}).get('original_type') not in excluded_types and
                 definitions.get(n['type'], {}).get('identity_scope') == 'global']
     stats['global_node_inputs'] = len(eligible)
+    if trace is not None:
+        trace.record(trace.nodes.keys() - {n['id'] for n in eligible}, 'outside_eligible_global_types')
     if not eligible:
         return
     members = {}
@@ -437,6 +480,8 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
         refs = definition.get('identity_evidence_refs') or []
         if not refs or any(catalog.get(ref, {}).get('kind') != 'source_probe' for ref in refs):
             rejected_nodes['authoritative_or_unverified_domain'] += 1
+            if trace is not None:
+                trace.record({node['id']}, 'authoritative_or_unverified_domain')
             continue
         member = _member(node, definition, layouts)
         if member:
@@ -446,9 +491,17 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
                 physical_groups[member.address, binding, member.value].add(node['id'])
         else:
             rejected_nodes['incomplete_or_incompatible_source_observation'] += 1
+            if trace is not None:
+                trace.record({node['id']}, 'incomplete_or_incompatible_source_observation')
     stats['excluded_nodes'] = dict(rejected_nodes)
     stats['endpoint_only_multilabel_nodes'] = sum(m.has_label_conflict for m in members.values())
     stats['verified_source_node_inputs'] = len(members) - stats['endpoint_only_multilabel_nodes']
+    if trace is not None:
+        for (address, binding, _), peers in physical_groups.items():
+            if trace.nodes.keys() & peers:
+                trace.record(peers, 'physical_key_bucket', key_columns=list(binding),
+                             source_address=list(address), member_count=len(peers),
+                             contributor_count=len({members[i].unit for i in peers}))
     if not any(len(ids) > 1 for ids in physical_groups.values()):
         return
     # Caption witnesses come only from members which passed the original
@@ -473,9 +526,14 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
             blocked.update(choices)
     # A single key must identify exactly the same set of occurrences at every
     # observed level. Never take a transitive closure across overlapping sets.
-    sets = {frozenset(ids) for ids in physical_groups.values() if len(ids) > 1
-            and len({members[i].unit for i in ids}) > 1}
-    stats['cross_unit_physical_sets'] = len(sets)
+    sets = {frozenset(ids) for ids in physical_groups.values() if len(ids) > 1}
+    stats['cross_unit_physical_sets'] = sum(len({members[i].unit for i in ids}) > 1 for ids in sets)
+    stats['within_unit_physical_sets'] = len(sets) - stats['cross_unit_physical_sets']
+    same_unit_members = set()
+    for ids in sets:
+        counts = Counter(members[i].unit for i in ids)
+        same_unit_members.update(i for i in ids if counts[members[i].unit] > 1)
+    drafts = _draft_witnesses(graph, nodes, same_unit_members) if same_unit_members else {}
     physical_sets.extend(sets)
     rejected_sets, observation_differences = Counter(), Counter()
     partial_sets = retained_members = 0
@@ -486,9 +544,17 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
     for ids in sets:
         first = members[next(iter(ids))]
         labels = {label for i in ids for _, _, label, _, _ in members[i].observations}
+        complete_key = all(physical_groups[first.address, k, first.value] == ids for i in ids for k in members[i].bindings)
+        # A complete physical key can identify a focused review group even
+        # when labels or roles differ. All contributing observations must be
+        # visible to the same audience. No new identity authority is inferred.
+        if (review_sets is not None and complete_key and
+                any((nodes[i]['type'], first.address, k) in layouts for i in ids for k in members[i].bindings)
+                and len({boundary.scope for i in ids for _, _, _, boundary, _ in members[i].observations}) == 1):
+            review_sets.append(ids)
         if len(labels) > 1:
             reason = 'multiple_labels'
-        elif any(physical_groups[first.address, k, first.value] != ids for i in ids for k in members[i].bindings):
+        elif not complete_key:
             reason = 'overlapping_projection_sets'
         elif len({nodes[i]['type'] for i in ids}) != len(ids):
             reason = 'competing_instances_in_one_type'
@@ -500,19 +566,26 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
             for i in ids:
                 signatures[members[i].observations].add(i)
             if len(signatures) > 1:
-                observation_differences.update(_observation_differences(signatures))
+                fields = _observation_differences(signatures)
+                observation_differences.update(fields)
+                if trace is not None and trace.nodes.keys() & ids:
+                    for peers in signatures.values():
+                        trace.record(peers, 'equal_node_observation_partition', bucket_differing_fields=fields)
             matched = 0
             inconsistent_path = False
+            unverified_draft_role = False
             matching_batches = 0
             for peers in signatures.values():
-                remaining = _cross_unit_pairs(peers, members)
-                if not remaining:
+                if len(peers) < 2:
                     continue
+                remaining = _cross_unit_pairs(peers, members)
                 # For pairs whose own observations already agree, report the
                 # first actual exclusion separately from whole-set differences.
                 for reason, excluded in (('incomplete', blocked), ('endpoint_or_role', invalid_roles),
                                          ('direction', missing_orientation)):
                     if peers & excluded:
+                        if trace is not None:
+                            trace.record(peers & excluded, reason)
                         peers = peers - excluded
                         count = _cross_unit_pairs(peers, members)
                         equal_node_pairs[reason] += remaining - count
@@ -525,6 +598,10 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
                 matches = defaultdict(set)
                 for i in connected:
                     matches[frozenset(incidents[i])].add(i)
+                if trace is not None and trace.nodes.keys() & peers:
+                    for cohort in matches.values():
+                        trace.record(cohort, 'equal_direct_neighborhood_partition')
+                    trace.record(isolated, 'no_direct_nonself_neighbor')
                 batches = [(batch, 'direct_neighbors') for batch in matches.values()]
                 if isolated_pairs:
                     if role_index is None:
@@ -534,25 +611,47 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
                     batches.extend((batch, 'isolated_member_role') for batch in role_index.batches(isolated))
                 for batch, basis in batches:
                     joint = _cross_unit_pairs(batch, members)
-                    if not joint:
-                        continue
                     if basis == 'direct_neighbors':
                         count -= joint
                     else:
                         isolated_pairs -= joint
+                    rejected = _unverified_siblings(batch, members, drafts, direct=basis == 'direct_neighbors')
+                    if rejected:
+                        unverified_draft_role = True
+                        if trace is not None:
+                            trace.record(rejected, 'same_unit_unverified_draft_role')
+                        batch = batch - rejected
+                        remaining_joint = _cross_unit_pairs(batch, members)
+                        equal_node_pairs['same_unit_unverified_draft_role'] += joint - remaining_joint
+                        joint = remaining_joint
+                    if len(batch) < 2:
+                        continue
+                    if not joint:
+                        if basis != 'direct_neighbors':
+                            continue
+                        basis = 'same_unit_versioned_drafts'
                     if not _ancestor_paths_agree(batch, nodes, layouts, edge_rows, members=members, captions=captions):
                         inconsistent_path = True
                         equal_node_pairs['ancestor_path'] += joint
+                        if trace is not None:
+                            trace.record(batch, 'different_observed_ancestor_paths')
                         continue
                     matched += len(batch)
                     matching_batches += 1
                     equal_node_pairs['passed_before_endpoint_remap'] += joint
+                    if trace is not None:
+                        trace.record(batch, 'passed_before_endpoint_remap', evidence=basis)
                     yield batch, basis
                 equal_node_pairs['different_neighborhood'] += count
                 equal_node_pairs['no_witnessed_relationship'] += isolated_pairs
                 if count:
-                    neighborhood_differences.update(neighborhood_difference_counts(
-                        matches, members, row_context_differences=row_context_differences))
+                    row_detail = Counter()
+                    differences = neighborhood_difference_counts(matches, members, row_context_differences=row_detail)
+                    neighborhood_differences.update(differences)
+                    row_context_differences.update(row_detail)
+                    if trace is not None:
+                        trace.record(connected, 'different_neighborhood', cross_unit_pairs=dict(differences),
+                                     edge_row_context_by_first_difference=dict(row_detail))
             if matched:
                 if matching_batches > 1 or matched < len(ids):
                     partial_sets += 1
@@ -570,9 +669,13 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
                 reason = 'different_node_observations_or_scope'
             elif any(not incidents[i] for i in ids):
                 reason = 'no_witnessed_nonself_relationship'
+            elif unverified_draft_role:
+                reason = 'same_unit_unverified_draft_role'
             else:
                 reason = 'different_physical_neighbors_or_edge_scope'
         rejected_sets[reason] += 1
+        if trace is not None:
+            trace.record(ids, reason, stage='physical_set')
     stats['partitioned_physical_sets'] = partial_sets
     stats['unmatched_nodes_in_partitioned_sets'] = retained_members
     stats['rejected_physical_sets'] = dict(sorted(rejected_sets.items()))
@@ -582,6 +685,9 @@ def _verified_groups(graph, excluded_types, stats, physical_sets):
     stats['edge_row_context_pairs_by_first_difference'] = dict(sorted(row_context_differences.items()))
     if role_index is not None:
         stats['isolated_members_by_role_result'] = role_index.diagnostics
+        if trace is not None:
+            for nid in trace.nodes.keys() & role_index.results.keys():
+                trace.record({nid}, role_index.results[nid], stage='isolated_role')
 
 
 def _compatible_remaps(graph, batches, nodes):
@@ -707,25 +813,36 @@ def _merge_members(winner, batch, definitions):
                     seen.add(canonical(value))
 
 
-def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=None):
+def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=None, trace=None, emit_candidates=False):
     """Collapse verified source replays in a fresh unit merge; return removed node count."""
     nodes = {n['id']: n for n in graph['nodes']}
     stats = {} if diagnostics is None else diagnostics
     physical_sets = []
+    review_sets = [] if emit_candidates else None
     batches, bases = {}, {}
-    for ids, basis in _verified_groups(graph, excluded_types, stats, physical_sets):
+    if trace is not None:
+        trace.evaluated = True
+    for ids, basis in _verified_groups(graph, excluded_types, stats, physical_sets, trace, review_sets):
         winner = min(ids, key=lambda i: (nodes[i]['type'], i))
         batches[winner] = ids
         bases[winner] = basis
     stats['groups_with_matching_roles_and_scope'] = len(batches)
     owners = _compatible_remaps(graph, batches, nodes)
     remap = {nid: winner for nid, winner in owners.items() if nid != winner}
+    if trace is not None:
+        for winner, ids in batches.items():
+            if winner not in owners:
+                trace.record(ids, 'endpoint_remap_rejected')
+        for nid in trace.nodes.keys() & owners.keys():
+            trace.nodes[nid]['output_node_id'] = owners[nid]
     outcomes = Counter((len(ids), len({owners.get(i, i) for i in ids})) for ids in physical_sets)
     stats['physical_set_outcomes'] = [{'input_nodes': before, 'output_nodes': after, 'sets': count}
                                      for (before, after), count in sorted(outcomes.items())]
     stats['accepted_groups'] = len(set(remap.values()))
     stats['collapsed_nodes_by_role_evidence'] = dict(sorted(Counter(bases[w] for w in remap.values()).items()))
     stats['groups_rejected_during_endpoint_remap'] = len(batches) - stats['accepted_groups']
+    if review_sets or remap:
+        _update_review_candidates(graph, nodes, remap, review_sets)
     if not remap:
         return 0
     definitions = {d['type']: d for d in graph['definitions']['entities']}
@@ -745,18 +862,28 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
     used_types.update(rel.get(end) for rel in graph['definitions']['relations'] for end in ('source_type', 'target_type'))
     graph['definitions']['entities'] = [d for d in graph['definitions']['entities']
                                         if d['type'] not in retired_types or d['type'] in used_types]
-    # Suggestions are not identity edges. Remap residual suggestions and
-    # discard those that now describe a single visible object.
+    return len(remap)
+
+
+def _update_review_candidates(graph, nodes, remap, review_sets):
+    """Keep distinct, unresolved groups after determining every member's final ID."""
     candidates = []
+    existing = set()
     for group in graph.get('candidate_identity_merges', []):
         ids = sorted({remap.get(n, n) for n in group['node_ids']})
         if group.get('match_basis') == 'same_typed_identity' and any(n in remap for n in group['node_ids']):
             ids = [i for i in ids if nodes[i]['type'] == group.get('entity_type')
                    and nodes[i]['identity'] == group.get('identity')]
-        if len(ids) > 1:
+        if len(ids) > 1 and tuple(ids) not in existing:
             group['node_ids'] = ids
             if 'entity_types' in group:
                 group['entity_types'] = sorted({nodes[i]['type'] for i in ids})
             candidates.append(group)
+            existing.add(tuple(ids))
+    for group in sorted(sorted(ids) for ids in (review_sets or ())):
+        ids = tuple(sorted({remap.get(n, n) for n in group}))
+        if len(ids) > 1 and ids not in existing:
+            candidates.append({'status': 'candidate_only', 'reason': 'hierarchy_source_key_requires_review',
+                               'match_basis': 'same_physical_hierarchy_key', 'node_ids': list(ids)})
+            existing.add(ids)
     graph['candidate_identity_merges'] = candidates
-    return len(remap)

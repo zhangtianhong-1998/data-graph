@@ -9,6 +9,7 @@ import type { Point } from './graphScene'
 import { invalidatesGraph, newGraphTransfer, transferGraph } from './graphTransfer'
 import type { GraphTransfer } from './graphTransfer'
 import { twoHopNeighborhood } from './graphNeighborhood'
+import { hierarchyLines } from './graphRelationLines'
 import type { NeighborhoodTraversal } from './graphNeighborhood'
 import PropertyTable from './PropertyTable.vue'
 import TechnicalDetails from './TechnicalDetails.vue'
@@ -279,7 +280,19 @@ const points = computed(() => positions.value)
 const bounds = computed(() => sceneBounds(points.value))
 const largeScene = computed(() => visible.value.length > 300)
 const bitmap = ref<HTMLCanvasElement | null>(null)
-const edges = computed(() => graph.value.edges.filter(edge => points.value.has(edge.source) && points.value.has(edge.target)))
+const rawEdges = computed(() => graph.value.edges.filter(edge => points.value.has(edge.source) && points.value.has(edge.target)))
+const rawRelations = ref(false)
+const hierarchyView = computed(() => props.layer === 'business' ? hierarchyLines(rawEdges.value) : null)
+const edges = computed(() => !rawRelations.value && hierarchyView.value ? hierarchyView.value.lines : rawEdges.value)
+const selectedGroup = computed(() => !rawRelations.value && selectedEdge.value?.id
+  ? hierarchyView.value?.byEdgeId.get(selectedEdge.value.id) : undefined)
+function edgeLabel(edge: GraphEdge) {
+  const count = !rawRelations.value && edge.id ? hierarchyView.value?.byEdgeId.get(edge.id)?.length : 0
+  return count && count > 1 ? `层级关系 · ${count} 条原始记录` : relationName(edge.relation)
+}
+function selectedLine(edge: GraphEdge) {
+  return selectedEdge.value === edge || selectedGroup.value?.[0] === edge
+}
 const degree = computed(() => {
   const counts = new Map<string, number>()
   for (const { source, target } of edges.value) {
@@ -298,7 +311,7 @@ const focusedIds = computed(() => {
   const ids = new Set<string>()
   if (selected.value) ids.add(selected.value.id)
   for (const edge of edges.value) {
-    if (edge === selectedEdge.value || edge.source === selected.value?.id || edge.target === selected.value?.id) {
+    if (selectedLine(edge) || edge.source === selected.value?.id || edge.target === selected.value?.id) {
       ids.add(edge.source); ids.add(edge.target)
     }
   }
@@ -349,6 +362,7 @@ const adjacent = computed(() => {
   for (const edge of [...graph.value.edges, ...fromFacts]) if ([edge.source, edge.target].includes(selected.value.id)) found.set(edge.id || `${edge.source}:${edge.relation}:${edge.target}`, edge)
   return [...found.values()]
 })
+const loadedIncidentEdges = computed(() => selected.value ? rawEdges.value.filter(edge => selected.value!.id === edge.source || selected.value!.id === edge.target).length : 0)
 const drawnIncidentEdges = computed(() => selected.value ? edges.value.filter(edge => selected.value!.id === edge.source || selected.value!.id === edge.target).length : 0)
 const knownIncidentEdges = computed(() => details.value?.total_incident_edges ?? (selected.value?.id === graph.value.focus_node_id ? graph.value.focus_total_edges as number | undefined : undefined))
 const display = nodeCaption
@@ -458,7 +472,7 @@ function paint() {
   for (const edge of edges.value) {
     const { a, b, endX, endY } = edgeGeometry(edge)
     if (Math.max(a.x, b.x) < left || Math.min(a.x, b.x) > right || Math.max(a.y, b.y) < top || Math.min(a.y, b.y) > bottom) continue
-    const emphasized = selectedEdge.value === edge || selected.value?.id === edge.source || selected.value?.id === edge.target
+    const emphasized = selectedLine(edge) || selected.value?.id === edge.source || selected.value?.id === edge.target
     ctx.strokeStyle = emphasized ? '#306cc8' : '#99adb9'
     ctx.globalAlpha = emphasized ? 1 : selected.value || selectedEdge.value ? Math.min(.15, backgroundOpacity) : backgroundOpacity
     ctx.lineWidth = (emphasized ? 1.7 : .8) / zoom.value
@@ -492,7 +506,7 @@ function paint() {
   }
   ctx.globalAlpha = 1
 }
-watch([bitmap, positions, zoom, offset, viewport, selected, selectedEdge, search, selectedKind], paint, { flush: 'post' })
+watch([bitmap, positions, edges, zoom, offset, viewport, selected, selectedEdge, search, selectedKind], paint, { flush: 'post' })
 watch([() => props.graph, () => props.layer, () => props.projectId, () => props.includeCandidates, () => props.businessContext, snapshotVersion], () => {
   pendingPreviewRefresh = false
   fullEpoch++; fullController?.abort(); fullTransfer = undefined; fullLoading.value = false; fullPaused.value = false; fullError.value = ''; cameraTouched = false
@@ -564,6 +578,10 @@ onUnmounted(() => {
         <button class="btn small" @click="returnToGraph">返回全图</button>
         <span class="muted small-text neighborhood-explanation">{{ neighborhood.traversal === 'chains' ? '沿关系向前、向后各查两步。' : '包含经共同邻居连接的对象。' }}</span>
       </div>
+      <label v-if="hierarchyView && hierarchyView.lines.length < rawEdges.length" class="graph-relation-toggle">
+        <input type="checkbox" v-model="rawRelations"/>显示原始关系
+        <span class="muted">当前范围<template v-if="hierarchyView.loopCount"> · {{ hierarchyView.loopCount }} 条层级自环</template><template v-if="rawEdges.length > hierarchyView.lines.length + hierarchyView.loopCount"> · {{ rawEdges.length - hierarchyView.loopCount }} 条关系可绘为 {{ hierarchyView.lines.length }} 条连线</template></span>
+      </label>
       <p v-if="neighborhood?.preview" class="note" aria-label="两跳范围补全状态">当前仅显示已加载数据中的关联节点，{{ pageLoading ? '正在读取完整两跳范围。' : '完整两跳范围尚未读取。' }}<button v-if="!pageLoading" class="btn small" @click="showTwoHops(neighborhood.center)">重试读取两跳关联</button></p>
       <p v-if="!neighborhood && (search || selectedKind)" class="note" aria-label="检索局部视图">已突出显示已加载的匹配节点，周边节点作为参照。</p>
       <p v-if="graph.edges_truncated" class="note amber" aria-label="关系截断提示">当前返回的关系有数量上限，画布并未显示此范围内的全部边。请聚焦具体节点，查看来源详情中的完整关系计数。</p>
@@ -585,9 +603,9 @@ onUnmounted(() => {
         <svg v-else :viewBox="`0 0 ${viewport.width} ${viewport.height}`" role="group" :aria-label="layer === 'metadata' ? '元数据关联图' : '业务知识图谱'" @pointerdown="start" @pointermove="move" @pointerup="drag = null" @pointercancel="drag = null" @lostpointercapture="drag = null">
           <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#b6c4da"/></marker></defs>
           <g :transform="`translate(${offset.x} ${offset.y}) scale(${zoom})`">
-            <g v-for="(edge, index) in edges" :key="`${edge.source}-${edge.target}-${index}`" class="graph-edge" :class="{ emphasized: selectedEdge === edge || (selected && (edge.source === selected.id || edge.target === selected.id)), subdued: focusedIds.size && edge !== selectedEdge && edge.source !== selected?.id && edge.target !== selected?.id, candidate: edge.status === 'candidate', unresolved: edge.status === 'unresolved' }" tabindex="0" role="button" :aria-label="`${endpointName(edge.source)} → ${endpointName(edge.target)} · ${relationName(edge.relation)} · ${statusName(edge.status)}`" @click="selectEdge(edge)" @keydown.enter="selectEdge(edge)" @keydown.space.prevent="selectEdge(edge)">
-              <path :d="edgePath(edge)" marker-end="url(#arrow)"/><title>{{ relationName(edge.relation) }} · {{ statusName(edge.status) }}</title>
-              <text v-if="selected && (edge.source === selected.id || edge.target === selected.id)" :x="(points.get(edge.source)!.x + points.get(edge.target)!.x) / 2" :y="(points.get(edge.source)!.y + points.get(edge.target)!.y) / 2 - 7">{{ relationName(edge.relation) }}</text>
+            <g v-for="(edge, index) in edges" :key="`${edge.source}-${edge.target}-${index}`" class="graph-edge" :class="{ emphasized: selectedLine(edge) || (selected && (edge.source === selected.id || edge.target === selected.id)), subdued: focusedIds.size && !selectedLine(edge) && edge.source !== selected?.id && edge.target !== selected?.id, candidate: edge.status === 'candidate', unresolved: edge.status === 'unresolved' }" tabindex="0" role="button" :aria-label="`${endpointName(edge.source)} → ${endpointName(edge.target)} · ${edgeLabel(edge)} · ${statusName(edge.status)}`" @click="selectEdge(edge)" @keydown.enter="selectEdge(edge)" @keydown.space.prevent="selectEdge(edge)">
+              <path :d="edgePath(edge)" marker-end="url(#arrow)"/><title>{{ edgeLabel(edge) }} · {{ statusName(edge.status) }}</title>
+              <text v-if="selected && (edge.source === selected.id || edge.target === selected.id)" :x="(points.get(edge.source)!.x + points.get(edge.target)!.x) / 2" :y="(points.get(edge.source)!.y + points.get(edge.target)!.y) / 2 - 7">{{ edgeLabel(edge) }}</text>
             </g>
             <g v-for="node in visible" :key="node.id" class="graph-node" :class="{ dimmed: ((search || selectedKind) && !filtered.includes(node)) || (focusedIds.size && !focusedIds.has(node.id)), selected: selected?.id === node.id, candidate: node.status === 'candidate', unresolved: node.status === 'unresolved' }" :transform="`translate(${points.get(node.id)!.x} ${points.get(node.id)!.y})`" tabindex="0" role="button" :aria-label="display(node)" @click="nodeClick(node, $event)" @dblclick.stop="nodeDoubleClick(node)" @keydown.enter="selectNode(node)" @keydown.space.prevent="selectNode(node)">
               <circle :r="radius(node.id)" :fill="kindColor(node)" :stroke="kindColor(node)"/><circle :r="radius(node.id) * .55" fill="#fff" fill-opacity=".16"/>
@@ -599,13 +617,17 @@ onUnmounted(() => {
           :class="{ active: selected?.id === label.node.id }" :style="{ left: label.x + 'px', top: label.y + 'px', width: label.width + 'px' }"
           :title="display(label.node)" @click="nodeClick(label.node, $event)" @dblclick.stop="nodeDoubleClick(label.node)">{{ display(label.node) }}</button>
       </div>
-      <div class="panel-footer"><span v-if="!neighborhood">画布已加载 {{ visible.length }} / 全图 {{ graph.total_nodes ?? graph.nodes.length }} 个节点 · 已加载 {{ edges.length }} / 全图 {{ graph.total_edges ?? graph.edges.length }} 条关系</span><span v-else-if="neighborhood.preview">两跳关联当前显示 {{ visible.length }} 个节点 · {{ edges.length }} 条关系，完整范围待补全</span><span v-else>两跳范围已加载 {{ visible.length }} / {{ neighborhoodCount }} 个节点 · {{ edges.length }} 条关系</span><span v-if="search || selectedKind">匹配 {{ matchedCount }} 个节点（已加载范围）</span><span v-if="neighborhoodIncomplete">部分关联尚未完整显示，可继续读取或重试两跳关联。<span v-if="!fullTransport">兼容接口单次最多 1000 个节点。</span></span><span v-else-if="graph.truncated">当前为部分图谱，尚未加载的节点和边不表示不存在</span><span v-else>单击查看详情 · 双击查看两跳关联</span></div>
+      <div class="panel-footer"><span v-if="!neighborhood">画布已加载 {{ visible.length }} / 全图 {{ graph.total_nodes ?? graph.nodes.length }} 个节点 · 已加载 {{ rawEdges.length }} / 全图 {{ graph.total_edges ?? graph.edges.length }} 条关系</span><span v-else-if="neighborhood.preview">两跳关联当前显示 {{ visible.length }} 个节点 · {{ edges.length }} 条连线，完整范围待补全</span><span v-else>两跳范围已加载 {{ visible.length }} / {{ neighborhoodCount }} 个节点 · {{ edges.length }} 条连线</span><span v-if="search || selectedKind">匹配 {{ matchedCount }} 个节点（已加载范围）</span><span v-if="neighborhoodIncomplete">部分关联尚未完整显示，可继续读取或重试两跳关联。<span v-if="!fullTransport">兼容接口单次最多 1000 个节点。</span></span><span v-else-if="graph.truncated">当前为部分图谱，尚未加载的节点和边不表示不存在</span><span v-else>单击查看详情 · 双击查看两跳关联</span></div>
       <details v-if="largeScene || search || selectedKind" class="scene-node-list"><summary>定位节点 · {{ filtered.length }} 个匹配</summary><button v-for="node in accessibleNodes" :key="node.id" class="btn small" @click="nodeClick(node, $event, true)" @dblclick.stop="nodeDoubleClick(node)">{{ display(node) }} · {{ statusName(node.status) }} · {{ scopeLabel(node) }}</button><p v-if="filtered.length > 40">列表展示前 40 个匹配，请搜索缩小范围；画布仍保留已加载节点。</p></details>
     </section>
     <aside v-if="selected || selectedEdge" class="panel graph-detail">
       <div class="panel-head"><h2>{{ selectedEdge ? '关系详情' : '节点详情' }}</h2><button class="close" type="button" aria-label="关闭详情" @click="clearSelection">×</button></div>
       <div class="panel-body">
         <template v-if="selectedEdge">
+          <div v-if="selectedGroup && selectedGroup.length > 1" class="line-evidence">
+            <h3>这条连线的 {{ selectedGroup.length }} 条原始关系</h3>
+            <button v-for="member in selectedGroup" :key="member.id" type="button" class="btn small" :aria-pressed="selectedEdge.id === member.id" @click="selectEdge(member)">{{ relationName(member.relation) }}</button>
+          </div>
           <span class="badge" :class="selectedEdge.status === 'accepted' ? 'green' : 'amber'">{{ statusName(selectedEdge.status) }}</span>
           <h2 :title="relationDescription(selectedEdge.relation)">{{ relationName(selectedEdge.relation) }}</h2>
           <p class="relation-endpoints">{{ endpointName(selectedEdge.source) }} → {{ endpointName(selectedEdge.target) }}</p>
@@ -622,6 +644,7 @@ onUnmounted(() => {
             :details-error="detailsError"
             :adjacent="adjacent"
             :drawn-incident-edges="drawnIncidentEdges"
+            :loaded-incident-edges="loadedIncidentEdges"
             :known-incident-edges="knownIncidentEdges"
             :page-loading="pageLoading"
             :server-paging="serverPaging"
@@ -696,6 +719,9 @@ onUnmounted(() => {
 .neighborhood-explanation { flex-basis: 100%; }
 .kind-overview, .scene-node-list { padding: 8px 16px; display: flex; flex-wrap: wrap; gap: 8px; }
 .graph-edge { cursor: pointer; }
+.graph-relation-toggle, .line-evidence { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.line-evidence { margin-bottom: 12px; }
+.line-evidence h3 { width: 100%; }
 .graph-edge.candidate path, .graph-node.candidate > circle:first-child { stroke-dasharray: 6 4; }
 .graph-edge.unresolved path, .graph-node.unresolved > circle:first-child { stroke-dasharray: 2 4; }
 .relation-selection { display: block; width: 100%; text-align: left; background: transparent; color: inherit; cursor: pointer; border: 0; }

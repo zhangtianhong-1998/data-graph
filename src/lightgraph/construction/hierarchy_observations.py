@@ -5,6 +5,7 @@ from typing import NamedTuple
 
 from lightgraph.contracts import canonical
 from lightgraph.source_values import scalar_kind
+from lightgraph.worksheet_witness import worksheet_row_witness
 
 from .contexts import business_context_identity
 
@@ -77,19 +78,9 @@ def _worksheet_projection(support):
     witness = support.get('source_row_witness')
     if witness is None:
         return None
-    if (not isinstance(witness, dict) or witness.get('kind') != 'excel_rows_v1'
-            or not isinstance(witness.get('snapshot'), str)
-            or not re.fullmatch(r'[0-9a-f]{64}', witness['snapshot'])):
+    if not worksheet_row_witness(witness):
         raise ValueError('invalid worksheet witness')
-    ranges = witness.get('rows')
-    if not isinstance(ranges, list) or not ranges:
-        raise ValueError('missing worksheet rows')
-    previous = 0
-    for span in ranges:
-        if (not isinstance(span, list) or len(span) != 2 or any(type(n) is not int for n in span)
-                or not previous < span[0] <= span[1] <= 1_048_576):
-            raise ValueError('invalid worksheet rows')
-        previous = span[1]
+    ranges = witness['rows']
     row = support.get('row_context') or {}
     values, types = row.get('values', {}), row.get('value_types', {})
     columns = set(support['provenance'].get('context_columns') or ())

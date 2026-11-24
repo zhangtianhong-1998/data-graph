@@ -163,7 +163,7 @@ class EmbeddingCredential(InputModel):
 
 
 class TestEmbeddingRequest(InputModel):
-    provider: Literal['local_hash', 'openai_compatible'] | None = None
+    provider: Literal['none', 'local_hash', 'openai_compatible'] | None = None
     base_url: str | None = None
     model: str | None = None
     api_key: SecretStr | None = None

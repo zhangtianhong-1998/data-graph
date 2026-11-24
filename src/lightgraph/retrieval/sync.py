@@ -20,7 +20,7 @@ from lightgraph.runtime.retention import atomic_text
 from lightgraph.construction.access import filter_graph_scopes
 from lightgraph.construction.contexts import business_context_identity
 from .store_sqlite import SQLiteGraphIndex, normalize_term, observed_text_properties
-from .vector_local import Embedder, LocalHashEmbedder, LocalNumpyVectorStore, embedder_fingerprint
+from .vector_local import Embedder, LocalNumpyVectorStore, embedder_fingerprint
 
 
 def _publish_staging(staging: Path, destination: Path) -> None:
@@ -118,15 +118,32 @@ def active_index(root: Path, expected_generation: str | None = None) -> tuple[Pa
         path = root / 'builds' / build
         if not isinstance(manifest['cohorts'], dict) or not isinstance(manifest['embedder'], str):
             raise ValueError
-        if manifest['format'] != 6 or (expected_generation is not None and manifest['generation'] != expected_generation):
+        generation = manifest['generation']
+        if not isinstance(generation, str) or (expected_generation is not None and generation != expected_generation):
+            raise ValueError
+        if manifest['format'] not in (6, 7) or not isinstance(manifest['embedder_provider'], str):
             raise ValueError
         if not isinstance(manifest['cohort_contexts'], dict) or set(manifest['cohort_contexts']) != set(manifest['cohorts']):
             raise ValueError
-        if not all((path / file).is_file() for file in ('retrieval.sqlite', 'vectors/vectors.npy', 'vectors/vectors_meta.sqlite')):
+        files = ['retrieval.sqlite']
+        if manifest['format'] == 7:
+            if manifest.get('embedder_provider') != 'none' or manifest['embedder'] != embedder_fingerprint(None):
+                raise ValueError
+        elif manifest.get('embedder_provider') != 'local_hash':
+            files.extend(('vectors/vectors.npy', 'vectors/vectors_meta.sqlite'))
+        if not all((path / file).is_file() for file in files):
             raise ValueError
         return path, manifest
     except (OSError, ValueError, KeyError, TypeError):
         raise LightGraphError('retrieval_index_stale') from None
+
+
+def index_matches_embedder(manifest, embedder):
+    # Hash indexes retain their scoped SQLite terms and topology. Their vectors
+    # must never contribute a rank, even if the old files are still on disk.
+    if manifest.get('format') == 6 and manifest.get('embedder_provider') == 'local_hash':
+        return embedder is None
+    return manifest['embedder'] == embedder_fingerprint(embedder)
 
 
 def _embed_cards(embedder, texts, progress):
@@ -165,7 +182,6 @@ def sync_graph_to_retrieval(
     """
     root = Path(retrieval_dir)
     root.mkdir(parents=True, exist_ok=True)
-    embedder = embedder or LocalHashEmbedder()
 
     if graph.get('support_visibility_version') != 1 and (graph.get('nodes') or graph.get('edges')):
         raise LightGraphError('graph_support_visibility_missing')
@@ -215,7 +231,7 @@ def sync_graph_to_retrieval(
             })
             src_node = scoped_nodes.get(e['source'])
             dst_node = scoped_nodes.get(e['target'])
-            if src_node and dst_node:
+            if embedder is not None and src_node and dst_node:
                 neighbors_by_node[e['source']].append(f'{rel} {dst_node.get("display_label") or dst_node.get("label") or ""}')
                 neighbors_by_node[e['target']].append(f'{src_node.get("display_label") or src_node.get("label") or ""} {rel}')
 
@@ -297,6 +313,8 @@ def sync_graph_to_retrieval(
             for alias in aliases:
                 add_term(alias, 'alias', False)
 
+            if embedder is None:
+                continue
             code_str = ' '.join(str(v) for v in (node.get('identity') or {}).values())
             nbr_str = ' ; '.join(sorted(set(neighbors_by_node.get(nid, [])))[:5])
             card_parts = [
@@ -330,33 +348,40 @@ def sync_graph_to_retrieval(
         index = SQLiteGraphIndex(staging / 'retrieval.sqlite')
         index.replace_index(nodes=list(node_rows.values()), scope_views=scope_views, terms=terms, edges=edge_rows,
                             relation_definitions=graph.get('definitions', {}).get('relations', []))
-        vec_store = LocalNumpyVectorStore(staging / 'vectors')
-        # Identical names and descriptions often recur across support slices.
-        # Reuse their model output while retaining every slice's own permissions.
-        positions = {}
-        row_positions = []
-        for item in vector_items:
-            content = item['card_text']
-            if content not in positions:
-                positions[content] = len(positions)
-            row_positions.append(positions[content])
-        vectors = _embed_cards(embedder, list(positions), progress)
-        if vectors.ndim != 2 or vectors.shape[0] != len(positions):
-            raise ValueError('vector_count_mismatch')
-        if len(positions) != len(vector_items):
-            vectors = vectors[row_positions]
+        resolved_dim = 0
+        unique_texts = 0
+        if embedder is not None:
+            vec_store = LocalNumpyVectorStore(staging / 'vectors')
+            # Identical names and descriptions often recur across support slices.
+            # Reuse their model output while retaining every slice's own permissions.
+            positions = {}
+            row_positions = []
+            for item in vector_items:
+                content = item['card_text']
+                if content not in positions:
+                    positions[content] = len(positions)
+                row_positions.append(positions[content])
+            vectors = _embed_cards(embedder, list(positions), progress)
+            if vectors.ndim != 2 or vectors.shape[0] != len(positions):
+                raise ValueError('vector_count_mismatch')
+            if len(positions) != len(vector_items):
+                vectors = vectors[row_positions]
+            vec_store.replace_all(vector_items, vectors)
+            resolved_dim = int(vectors.shape[1]) if vectors.ndim == 2 and vectors.shape[0] else int(embedder.dim or 0)
+            unique_texts = len(positions)
         if progress:
-            progress('publishing', len(positions), len(positions))
-        vec_store.replace_all(vector_items, vectors)
-        resolved_dim = int(vectors.shape[1]) if vectors.ndim == 2 and vectors.shape[0] else int(embedder.dim or 0)
+            progress('publishing', unique_texts, unique_texts)
         _publish_staging(staging, builds / build_id)
         synced_at = datetime.now(timezone.utc).isoformat()
-        embedder_provider = 'openai_compatible' if hasattr(embedder, 'base_url') else 'local_hash'
-        embedder_model = getattr(embedder, 'model', 'local_hash') or 'local_hash'
+        embedder_provider = 'none'
+        embedder_model = None
+        if embedder is not None:
+            embedder_provider = 'openai_compatible' if hasattr(embedder, 'base_url') else 'custom'
+            embedder_model = getattr(embedder, 'model', type(embedder).__name__)
         nodes_indexed = len(node_rows)
         edges_indexed = len({row['edge_id'] for row in edge_rows})
         manifest = {
-            'format': 6,
+            'format': 7 if embedder is None else 6,
             'generation': gen_token,
             'build': build_id,
             'cohorts': cohorts,
@@ -367,7 +392,7 @@ def sync_graph_to_retrieval(
             'vector_dim': resolved_dim,
             'nodes_indexed': nodes_indexed,
             'edges_indexed': edges_indexed,
-            'vector_cards': len(scope_views),
+            'vector_cards': len(scope_views) if embedder is not None else 0,
             'vector_rows': len(vector_items),
             'synced_at': synced_at,
         }
@@ -380,13 +405,14 @@ def sync_graph_to_retrieval(
 
     return {
         'status': 'synced',
-        'vectorized': True,
+        'vectorized': embedder is not None,
+        'indexed': True,
         'generation': gen_token,
         'build': build_id,
         'nodes_indexed': nodes_indexed,
         'edges_indexed': edges_indexed,
         'scope_views': len(scope_views),
-        'vector_cards': len(scope_views),
+        'vector_cards': len(scope_views) if embedder is not None else 0,
         'vector_rows': len(vector_items),
         'vector_dim': resolved_dim,
         'embedder_model': embedder_model,

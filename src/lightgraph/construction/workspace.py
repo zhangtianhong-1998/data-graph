@@ -707,7 +707,7 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False, identi
                 definitions[category][definition['type']] = merge_definition(previous, definition)
         for category in items:
             for item in graph.get(category, []):
-                if fusion_policy:
+                if fusion_policy or retained_global_labels:
                     stamp_execution(item, graph)
                 previous = items[category].get(item['id'])
                 if previous is None:

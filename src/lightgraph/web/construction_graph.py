@@ -12,7 +12,7 @@ from lightgraph.construction.workspace import read_internal_yaml
 from lightgraph.errors import LightGraphError
 from lightgraph.graph_neighborhood import neighborhood_paths
 from lightgraph.web.graph_view_cache import cached_generation, load_graph_view, remember_graph, view_token
-from .graph_payload import listed, canvas_item, canvas_page, MAX_PAGE_BYTES
+from .graph_payload import listed, canvas_item, canvas_page, hierarchy_display, relation_definitions, MAX_PAGE_BYTES
 
 
 def available(config):
@@ -174,8 +174,7 @@ def load_graph(config):
 def retrieval_status(config, *, embedding_api_key=None) -> dict:
     """Inspect whether the current published graph has been vectorized (without running embeddings)."""
     from lightgraph.retrieval import resolve_embedder
-    from lightgraph.retrieval.sync import active_index
-    from lightgraph.retrieval.vector_local import embedder_fingerprint
+    from lightgraph.retrieval.sync import active_index, index_matches_embedder
 
     root = Path(config.output_dir) / 'construction'
     manifest = root / 'manifest.yaml'
@@ -195,15 +194,14 @@ def retrieval_status(config, *, embedding_api_key=None) -> dict:
         generation = digest('no-construction-publication', access_fingerprint(config), _scope_key(config))
 
     emb_cfg = getattr(config, 'embedding', None)
-    configured_provider = getattr(emb_cfg, 'provider', 'local_hash')
-    configured_model = getattr(emb_cfg, 'model', '') or ('local_hash' if configured_provider == 'local_hash' else '')
+    configured_provider = getattr(emb_cfg, 'provider', 'none')
+    configured_model = getattr(emb_cfg, 'model', '') if configured_provider != 'none' else ''
     configured_base_url = getattr(emb_cfg, 'base_url', '')
 
     config_error = None
-    expected_tag = None
+    embedder = None
     try:
         embedder = resolve_embedder(config, api_key=embedding_api_key)
-        expected_tag = embedder_fingerprint(embedder)
     except LightGraphError as exc:
         config_error = exc.code
 
@@ -227,20 +225,21 @@ def retrieval_status(config, *, embedding_api_key=None) -> dict:
     elif config_error:
         status = 'stale'
         stale_reason = 'embedding_config_invalid'
-    elif expected_tag is not None and current_meta.get('embedder') != expected_tag:
+    elif not index_matches_embedder(current_meta, embedder):
         status = 'stale'
         stale_reason = 'embedder_changed'
     else:
-        status = 'vectorized'
+        status = 'indexed' if embedder is None else 'vectorized'
         stale_reason = None
 
     # A stale build can belong to an earlier, broader scope. Only disclose
     # its counts when it matches the current authorized graph.
-    if status != 'vectorized':
+    if status not in {'indexed', 'vectorized'}:
         current_meta = None
     return {
         'status': status,
         'vectorized': status == 'vectorized',
+        'indexed': status in {'indexed', 'vectorized'},
         'stale_reason': stale_reason,
         'has_graph': has_graph,
         'graph_nodes': graph_nodes,
@@ -248,12 +247,12 @@ def retrieval_status(config, *, embedding_api_key=None) -> dict:
         'configured_provider': configured_provider,
         'configured_model': configured_model,
         'configured_base_url': configured_base_url,
-        'vector_dim': current_meta.get('vector_dim') if current_meta else None,
-        'vector_cards': current_meta.get('vector_cards') if current_meta else None,
+        'vector_dim': current_meta.get('vector_dim') if status == 'vectorized' else None,
+        'vector_cards': current_meta.get('vector_cards') if status == 'vectorized' else None,
         'nodes_indexed': current_meta.get('nodes_indexed') if current_meta else None,
         'edges_indexed': current_meta.get('edges_indexed') if current_meta else None,
-        'embedder_model': current_meta.get('embedder_model') if current_meta else None,
-        'embedder_provider': current_meta.get('embedder_provider') if current_meta else None,
+        'embedder_model': current_meta.get('embedder_model') if status == 'vectorized' else None,
+        'embedder_provider': current_meta.get('embedder_provider') if status == 'vectorized' else None,
         'synced_at': current_meta.get('synced_at') if current_meta else None,
         'generation': generation,
         'config_error': config_error,
@@ -427,7 +426,7 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
             else:
                 remaining.append(edge)
         page_edges = backbone + sorted(remaining, key=lambda e: focus not in (e['source'], e['target']))
-    local_edges, _, _ = canvas_page(page_edges, 0, 3000)
+    local_edges, _, _ = canvas_page(page_edges, 0, 3000, definitions=relation_definitions(graph))
     boundary = sum((e["source"] in ids) != (e["target"] in ids) for e in edges)
     return {"nodes": page, "edges": local_edges, "layer": layer,
             "total_nodes": len(nodes), "total_edges": len(edges), "matched_nodes": len(selected),
@@ -569,12 +568,13 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
                                 **({'business_context': context} if context is not None else {})}, provenance=sources)
     if entity_id and not total_facts:
         raise LightGraphError("graph_item_not_found")
+    definitions = relation_definitions(graph)
     for edge in graph["edges"]:
         if edge["id"] == fact_id or entity_id and entity_id in {edge["source"], edge["target"]}:
             if not on_page(edge['id']):
                 continue
             add(edge["id"], "Edge", {"source": edge["source"], "target": edge["target"],
-                "relation": edge["relation"], "qualifiers": edge.get("properties", {}),
+                "relation": edge["relation"], "qualifiers": edge.get("properties", {}), **hierarchy_display(edge, definitions),
                 **({'business_context': edge['business_context']} if 'business_context' in edge else {}),
                 'observations': [{k: s[k] for k in ('business_context', 'properties', 'row_context', 'observation_id') if k in s}
                                  for s in edge.get('supports', [])]}, item=edge)

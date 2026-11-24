@@ -22,8 +22,17 @@ function toggleMember(id: string, event: Event) {
 const channel = (name: string) => ({ name: '名称相似', code: '编码相似', definition: '定义相似',
   same_source_observation: '同源记录', same_typed_identity: '同类型同编码', normalized_label: '名称相近',
   same_source_key_different_identity_domains: '同一来源键值，草稿声明的身份域不同',
+  hierarchy_source_key_requires_review: '层级来源和键值相同，对象身份待核实',
   independent_drafts_unverified_identity: '不同草稿使用相同编码', source_key_requires_role_review: '同一来源键，对象角色待核对' }[name] || name)
-const label = (node: GraphNode) => String(node.label || node.name || node.id)
+function label(node: GraphNode) {
+  const name = String(node.label || node.name || node.id)
+  const identity = node.identity
+  if (!identity || typeof identity !== 'object' || Array.isArray(identity)) return name
+  const fields = Object.entries(identity)
+  if (fields.length === 0) return name
+  const key = fields.map(([field, value]) => fields.length === 1 ? String(value) : `${field}=${value}`).join('，')
+  return key === name ? name : `${name}（${key}）`
+}
 let generation = 0
 async function load(at = offset.value, decisionAt = decisionOffset.value) {
   const epoch = ++generation; busy.value = true; error.value = ''

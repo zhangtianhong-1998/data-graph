@@ -44,6 +44,8 @@ def _unit(kind, *, anchor=('P', 'C'), self_link=False, project='library', anchor
         result = execute_draft(draft, [src], [table])
     assert result['passed'], result['diagnostics']
     published = dict(result['graph'], draft_id=kind, draft_revision=1)
+    if unversioned:
+        published.pop('draft_revision')
     unit = contributor(kind, published)
     if not unversioned:
         unit['graph'] = _merge_graphs([published], fusion_policy=FusionPolicyConfig())

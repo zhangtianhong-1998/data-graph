@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import PropertyTable from './PropertyTable.vue'
+import { isHierarchyLoop } from './graphRelationLines'
 import TechnicalDetails from './TechnicalDetails.vue'
 import { metadataRelationValues, nodeCaption, nodeIdentity, nodeProperties, supportOriginName, vocabularyDescription, vocabularyLabel } from './graphLabels'
 import type { DisplaySchema, MetadataEndpoint } from './graphLabels'
@@ -37,6 +38,7 @@ const props = defineProps<{
   detailsLoading: boolean
   detailsError: string
   adjacent: GraphEdge[]
+  loadedIncidentEdges: number
   drawnIncidentEdges: number
   knownIncidentEdges?: number | null
   pageLoading: boolean
@@ -91,9 +93,11 @@ const endpointName = (id: unknown) => {
   return node ? nodeCaption(node) : '节点名称尚未加载'
 }
 
+const hierarchyLoops = computed(() => props.adjacent.filter(isHierarchyLoop))
 const neighborGroups = computed(() => {
   const groups = new Map<string, GraphEdge[]>()
   for (const edge of props.adjacent) {
+    if (isHierarchyLoop(edge)) continue
     const other = edge.source === props.selected.id ? edge.target : edge.source
     const group = groups.get(other)
     if (group) group.push(edge)
@@ -246,9 +250,9 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
     </section>
 
     <div class="divider"></div>
-    <h3>已加载关联 · {{ neighborGroups.length }} 个对象 / {{ adjacent.length }} 条关系</h3>
+    <h3>已加载关联 · {{ neighborGroups.length }} 个对象 / {{ adjacent.length - hierarchyLoops.length }} 条关系</h3>
     <p class="field-hint" aria-label="节点关联范围">
-      当前画布显示 {{ drawnIncidentEdges }} 条相连关系<template v-if="knownIncidentEdges != null">，当前授权图中共有 {{ knownIncidentEdges }} 条</template><template v-else>；完整关系数量尚未读取</template>。<template v-if="knownIncidentEdges == null || drawnIncidentEdges < knownIncidentEdges">当前是局部视图，不能据此判断节点孤立。</template>
+      当前画布显示 {{ drawnIncidentEdges }} {{ loadedIncidentEdges === drawnIncidentEdges ? '条相连关系' : `条连线，已加载 ${loadedIncidentEdges} 条原始关系` }}<template v-if="knownIncidentEdges != null">，当前授权图中共有 {{ knownIncidentEdges }} 条</template><template v-else>；完整关系数量尚未读取</template>。<template v-if="knownIncidentEdges == null || loadedIncidentEdges < knownIncidentEdges">当前是局部视图，不能据此判断节点孤立。</template>
     </p>
     <button class="btn small" :disabled="pageLoading" @click="emit('showTwoHops', selected)">查看两跳关联</button>
     <button v-if="serverPaging && !fullTransport && !hasNeighborhood" class="btn small" :disabled="pageLoading || expansionOffset === null" @click="emit('expandNode')">
@@ -266,6 +270,10 @@ const descriptionOriginLabel = (origin: StandardNode['business_description_origi
       <button v-if="expandedNeighbors.has(group.id) && group.edges.length > expandedNeighbors.get(group.id)!" class="btn small"
         @click="expandedNeighbors.set(group.id, expandedNeighbors.get(group.id)! + 40)">查看更多关系</button>
     </component>
+    <details v-if="hierarchyLoops.length" class="neighbor-relations">
+      <summary>层级自环 · {{ hierarchyLoops.length }} 条原始记录</summary>
+      <button v-for="edge in hierarchyLoops" :key="edge.id" type="button" class="edge-detail relation-selection" @click="emit('selectEdge', edge)">{{ relationName(edge.relation) }} · {{ endpointName(edge.source) }} → {{ endpointName(edge.target) }}</button>
+    </details>
     <button v-if="neighborGroups.length > neighborLimit" class="btn small" @click="neighborLimit += 40">查看更多关联对象</button>
 
     <section v-if="projectId" aria-label="来源支持">

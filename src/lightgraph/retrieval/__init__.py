@@ -1,7 +1,6 @@
 """Local-first hybrid vector + relational subgraph retrieval MVP."""
 from .vector_local import (
     Embedder,
-    LocalHashEmbedder,
     LocalNumpyVectorStore,
     OpenAIEmbedder,
     resolve_embedder,
@@ -13,7 +12,6 @@ from .retriever import QuerySlot, SubgraphRetriever, decompose_query
 
 __all__ = [
     'Embedder',
-    'LocalHashEmbedder',
     'LocalNumpyVectorStore',
     'OpenAIEmbedder',
     'QuerySlot',

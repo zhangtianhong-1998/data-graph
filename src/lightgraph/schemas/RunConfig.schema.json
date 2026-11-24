@@ -5,9 +5,9 @@
       "description": "Configurable, replaceable semantic embedding service for subgraph retrieval.",
       "properties": {
         "provider": {
-          "default": "local_hash",
+          "default": "none",
           "enum": [
-            "local_hash",
+            "none",
             "openai_compatible"
           ],
           "title": "Provider",

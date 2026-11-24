@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 from contextlib import closing
-import hashlib
 from ipaddress import ip_address
 import os
 from pathlib import Path
 import sqlite3
 import time
 from typing import Protocol, Sequence
-import unicodedata
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -34,8 +32,10 @@ def _is_loopback(url: str) -> bool:
         return False
 
 
-def embedder_fingerprint(embedder: Embedder) -> str:
+def embedder_fingerprint(embedder: Embedder | None) -> str:
     """Index and query must agree on the vector space and query instruction."""
+    if embedder is None:
+        return 'lexical_v1'
     configured_dim = getattr(embedder, 'configured_dim', embedder.dim)
     identity = (
         type(embedder).__module__,
@@ -48,52 +48,6 @@ def embedder_fingerprint(embedder: Embedder) -> str:
     # The original v2 hash and HTTP indexes never used a query instruction.
     # Preserve that identity for projects which can keep using those indexes.
     return digest(*identity, instruction) if instruction else digest(*identity)
-
-
-def _norm_text(value: str) -> str:
-    return ' '.join(unicodedata.normalize('NFKC', value or '').casefold().split())
-
-
-class LocalHashEmbedder:
-    """Offline deterministic char-ngram + token hashed L2-normalized dense embedder."""
-
-    def __init__(self, dim: int = 256):
-        if dim < 16:
-            raise ValueError('embedder_dim_too_small')
-        self.dim = dim
-        self.configured_dim = dim
-        self.query_instruction = ''
-
-    def embed_queries(self, texts: Sequence[str]) -> np.ndarray:
-        return self.embed(texts)
-
-    def embed(self, texts: Sequence[str]) -> np.ndarray:
-        matrix = np.zeros((len(texts), self.dim), dtype=np.float32)
-        for row_idx, raw in enumerate(texts):
-            text = _norm_text(raw)
-            if not text:
-                continue
-            features: list[tuple[str, float]] = []
-            compact = text.replace(' ', '')
-            for size, weight in ((2, 1.0), (3, 1.3)):
-                if len(compact) >= size:
-                    for i in range(len(compact) - size + 1):
-                        features.append((f'c{size}:{compact[i:i + size]}', weight))
-            for tok in text.replace('_', ' ').replace('|', ' ').split():
-                if tok:
-                    features.append((f'w:{tok}', 2.0))
-            if not features:
-                features.append((f'c1:{compact}', 1.0))
-            vec = matrix[row_idx]
-            for feat, weight in features:
-                token_digest = hashlib.blake2b(feat.encode('utf-8'), digest_size=8).digest()
-                bucket = int.from_bytes(token_digest[:4], 'little') % self.dim
-                sign = 1.0 if (token_digest[4] & 1) == 0 else -1.0
-                vec[bucket] += sign * weight
-            norm = float(np.linalg.norm(vec))
-            if norm > 0.0:
-                vec /= norm
-        return matrix
 
 
 class OpenAIEmbedder:
@@ -191,11 +145,11 @@ class OpenAIEmbedder:
         return self.embed(formatted)
 
 
-def resolve_embedder(config, *, api_key: str | None = None) -> Embedder:
-    """Resolve the project's configured Embedding service (replaceable HTTP endpoint or offline fallback)."""
+def resolve_embedder(config, *, api_key: str | None = None) -> Embedder | None:
+    """Return the configured model, or None for lexical and graph retrieval."""
     settings = getattr(config, 'embedding', None)
-    if settings is None or settings.provider == 'local_hash':
-        return LocalHashEmbedder()
+    if settings is None or settings.provider in {'none', 'local_hash'}:
+        return None
     if settings.provider != 'openai_compatible':
         raise LightGraphError('embedding_provider_unsupported')
     if not settings.base_url or not settings.model:
@@ -219,15 +173,17 @@ def resolve_embedder(config, *, api_key: str | None = None) -> Embedder:
 def test_embedding_service(config, *, api_key: str | None = None) -> dict:
     """Verify live reachability and detected vector dimension for the configured embedding service."""
     embedder = resolve_embedder(config, api_key=api_key)
+    if embedder is None:
+        raise LightGraphError('embedding_not_configured')
     started = time.monotonic()
     vec = embedder.embed(['lightgraph embedding health check'])
     elapsed_ms = round(max(0.0, (time.monotonic() - started) * 1000.0), 1)
     dim = int(vec.shape[1]) if vec.ndim == 2 else int(embedder.dim or 0)
     return {
         'status': 'ok',
-        'provider': 'openai_compatible' if isinstance(embedder, OpenAIEmbedder) else 'local_hash',
+        'provider': 'openai_compatible',
         'base_url': getattr(embedder, 'base_url', ''),
-        'model': getattr(embedder, 'model', 'local_hash'),
+        'model': embedder.model,
         'dimensions': dim,
         'latency_ms': elapsed_ms,
     }

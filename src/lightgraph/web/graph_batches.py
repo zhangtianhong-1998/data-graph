@@ -11,7 +11,7 @@ from lightgraph.contracts import digest
 from lightgraph.construction.graph_storage import _graph_digest
 from lightgraph.errors import LightGraphError
 from lightgraph.graph_neighborhood import neighborhood_paths
-from .graph_payload import canvas_page, MAX_PAGE_BYTES
+from .graph_payload import canvas_page, relation_definitions, MAX_PAGE_BYTES
 
 
 def _authorized_view(workspace, pid, config, layer, include_candidates):
@@ -69,7 +69,8 @@ def read_graph_batch(workspace, pid, *, config, layer='business', part='nodes', 
         nodes = [by_id[node] for node in order]
         edges = [edge for edge in edges if edge['source'] in selected and edge['target'] in selected]
     collection = nodes if part == 'nodes' else edges
-    page, next_offset, size = canvas_page(collection, offset, limit)
+    definitions = relation_definitions(graph) if layer == 'business' and part == 'edges' else None
+    page, next_offset, size = canvas_page(collection, offset, limit, definitions=definitions)
     return {'nodes': page if part == 'nodes' else [],
             'edges': page if part == 'edges' else [],
             'item_payload_bytes': size, 'item_payload_limit_bytes': MAX_PAGE_BYTES,

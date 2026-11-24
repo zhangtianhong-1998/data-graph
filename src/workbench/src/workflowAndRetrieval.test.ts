@@ -101,7 +101,7 @@ beforeEach(() => {
     ],
     documents: ['files/f_1_doc_ab.md', 'files/f_2_doc_ac.md'],
     model: { mode: 'disabled' },
-    embedding: { provider: 'local_hash', base_url: '', model: '' },
+    embedding: { provider: 'none', base_url: '', model: '' },
     inherited_graphs: [],
     workflow: null,
   }
@@ -232,7 +232,11 @@ beforeEach(() => {
       return response(vectorizedState)
     }
     if (url.endsWith('/retrieval/jobs')) {
-      if (method === 'GET') return response({ status: vectorizedState.vectorized ? 'completed' : 'idle' })
+      if (method === 'GET') return response({ status: vectorizedState.indexed || vectorizedState.vectorized ? 'completed' : 'idle' })
+      if (vectorizedState.configured_provider === 'none') {
+        Object.assign(vectorizedState, { status: 'indexed', indexed: true, vectorized: false, stale_reason: null })
+        return response({ status: 'completed', job_id: 'lexical-build' })
+      }
       vectorizedState = {
         ...vectorizedState,
         status: 'vectorized',
@@ -515,6 +519,28 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(button('查看运行轨迹')).toBeDefined()
     button('关闭节点轨迹').click(); await nextTick()
     expect(panel()).toBeNull()
+  })
+
+  it('仅建词法索引时启用查询，并隐藏向量匹配', async () => {
+    Object.assign(vectorizedState, { configured_provider: 'none', configured_model: '' })
+    await mountReady()
+    button('运行与结果').click()
+    await nextTick()
+    button('子图召回').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('尚未建立检索索引'))
+    button('建立检索索引').click()
+    await vi.waitFor(() => expect(root.textContent).toContain('关键词与关系索引已就绪'))
+    button('调试检索算子').click()
+    await nextTick()
+    const selector = root.querySelector<HTMLSelectElement>('#retrieval-method')!
+    expect([...selector.options].map(option => option.value)).toEqual(['keyword'])
+    const input = root.querySelector<HTMLInputElement>('#retrieval-query')!
+    input.value = '采购'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    button('检索').click()
+    await vi.waitFor(() => expect(requests.some(r => r.url.endsWith('/retrieval/query')
+      && JSON.parse(r.body || '{}').method === 'keyword')).toBe(true))
   })
 
   it('抽取完成后默认未向量化，用户点击立即向量化后显示已完成向量化并可执行子图召回', async () => {

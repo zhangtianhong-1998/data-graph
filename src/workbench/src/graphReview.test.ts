@@ -17,6 +17,29 @@ beforeEach(() => { api.request.mockReset(); vi.stubGlobal('ResizeObserver', clas
 afterEach(() => { app?.unmount(); root?.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('业务图来源与归并裁决', () => {
+  it('同层级连线可逐条查看原关系，层级自环按需显示', async () => {
+    const record = (id: string, source: string, target: string, slot?: string) =>
+      ({ id, source, target, relation: id, status: 'accepted', hierarchy_direction: 'outgoing', hierarchy_line_key: slot })
+    const edges = [record('rel1', 'a', 'b', 'L1-L2'), record('rel2', 'a', 'b', 'L1-L2'),
+      record('lower-level', 'a', 'b', 'L2-L3'), record('child-to-parent', 'b', 'a', 'L1-L2'), record('tree-loop', 'a', 'a'),
+      { id: 'ordinary-loop', source: 'a', target: 'a', relation: 'owns' }]
+    api.request.mockResolvedValue({ facts: [], supports: [], rules: [], next_offset: null })
+    mount(GraphCanvas, { graph: { nodes: graph.nodes, edges }, layer: 'business', projectId: 'p' })
+    await nextTick()
+    expect(root.querySelectorAll('.graph-edge')).toHaveLength(4)
+    const line = root.querySelector<SVGGElement>('.graph-edge[aria-label*="2 条原始记录"]')!
+    line.dispatchEvent(new MouseEvent('click', { bubbles: true })); await nextTick()
+    const records = root.querySelectorAll<HTMLButtonElement>('.line-evidence button')
+    expect(records).toHaveLength(2)
+    records[1]!.click(); await nextTick()
+    expect(api.request.mock.calls.at(-1)?.[0]).toContain('fact_id=rel2')
+    root.querySelector<HTMLInputElement>('.graph-relation-toggle input')!.click(); await nextTick()
+    expect(root.querySelectorAll('.graph-edge')).toHaveLength(6)
+    expect(root.querySelector('.line-evidence')).toBeNull()
+    root.querySelector('.graph-node')!.dispatchEvent(new MouseEvent('click', { bubbles: true })); await nextTick()
+    expect(root.textContent).toContain('层级自环 · 1 条原始记录')
+    expect(root.textContent).toContain('已加载关联 · 2 个对象 / 5 条关系')
+  })
   it('缩小全图后保留可点击且互不覆盖的节点名称，查看详情后可关闭侧栏', async () => {
     const nodes = Array.from({ length: 160 }, (_, index) => ({ id: String(index), label: `观测资料 ${index}` }))
     const edges = nodes.slice(1).map(node => ({ source: '0', target: node.id }))

@@ -37,7 +37,7 @@ export function useVectorization(projectId: () => string | undefined, completed:
       if (value.status === 'running') timer = setTimeout(() => void poll(pid, version, true), 1500)
     } catch (err) {
       if (alive && version === generation) {
-        error.value = err instanceof Error ? err.message : '向量化状态读取失败，请刷新后查看。'
+        error.value = err instanceof Error ? err.message : '索引状态读取失败，请刷新后查看。'
         if (job.value.status === 'running' || failures < 3) {
           const delay = Math.min(12000, 1500 * 2 ** Math.min(failures, 3))
           timer = setTimeout(() => void poll(pid, version, notify, failures + 1, previousJob), delay)
@@ -67,7 +67,7 @@ export function useVectorization(projectId: () => string | undefined, completed:
       if (value.status === 'running') timer = setTimeout(() => void poll(pid, version, true), 500)
     } catch (err) {
       if (alive && version === generation) {
-        error.value = err instanceof Error ? err.message : '向量化启动失败。'
+        error.value = err instanceof Error ? err.message : '索引任务启动失败。'
         if (err instanceof ApiError && ['network_unavailable', 'request_timeout', 'invalid_response'].includes(err.code)) {
           const previousJob = job.value.job_id || ''
           timer = setTimeout(() => void poll(pid, version, true, 0, previousJob), 1000)

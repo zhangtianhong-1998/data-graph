@@ -176,6 +176,12 @@ def test_retrieval_web_endpoints_and_cli(tmp_path, monkeypatch):
 
         sync_resp = client.post('/api/projects/ret_p/retrieval/sync')
         assert sync_resp.status_code == 200 and sync_resp.json()['nodes_indexed'] == 2
+        assert sync_resp.json()['indexed'] and not sync_resp.json()['vectorized']
+        status = client.get('/api/projects/ret_p/retrieval/status').json()
+        assert status['status'] == 'indexed' and status['indexed'] and not status['vectorized']
+        assert status['configured_provider'] == 'none' and status['vector_dim'] is None
+        vector_only = client.post('/api/projects/ret_p/retrieval/query', json={'query': '营业收入', 'method': 'vector'})
+        assert vector_only.status_code == 400 and 'embedding_not_configured' in vector_only.text
         q_resp = client.post('/api/projects/ret_p/retrieval/query', json={'query': '营业收入和净利润'})
         assert q_resp.status_code == 200
         body = q_resp.json()
@@ -298,13 +304,13 @@ def test_web_query_requires_manual_build_after_publication_and_scope_change(tmp_
 def test_generation_failure_and_same_size_replacement_never_mix_graphs(tmp_path):
     import pytest
     from lightgraph.errors import LightGraphError
-    from lightgraph.retrieval import LocalHashEmbedder
+    from lightgraph.tests.test_retrieval_fields import FixtureEmbedder
 
     graph = _sample_graph()
     before = sync_graph_to_retrieval(graph, tmp_path)['generation']
     old = SubgraphRetriever(tmp_path, expected_generation=before)
 
-    class FailingEmbedder(LocalHashEmbedder):
+    class FailingEmbedder(FixtureEmbedder):
         def embed(self, texts):
             raise ValueError('unavailable')
 
@@ -333,13 +339,13 @@ def test_subgraph_seed_limit_and_shared_candidate_without_path(tmp_path):
 def test_vector_model_binding_and_repeated_sync_publish_separate_builds(tmp_path):
     import pytest
     from lightgraph.errors import LightGraphError
-    from lightgraph.retrieval import LocalHashEmbedder
+    from lightgraph.tests.test_retrieval_fields import FixtureEmbedder
 
     graph = _sample_graph()
     initial = sync_graph_to_retrieval(graph, tmp_path)
     old_reader = SubgraphRetriever(tmp_path)
 
-    class OtherModel(LocalHashEmbedder):
+    class OtherModel(FixtureEmbedder):
         pass
 
     with pytest.raises(LightGraphError, match='retrieval_index_stale'):

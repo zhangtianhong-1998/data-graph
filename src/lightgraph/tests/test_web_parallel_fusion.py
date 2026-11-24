@@ -144,7 +144,10 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
     assert membership['agrees_with_recorded_count']  # These copies folded through the row-identity channel.
     previous = tmp_path / 'audit.json'
     previous.write_text(json.dumps(report), encoding='utf-8-sig')
-    rerun = audit(run_file, 'merged', compare_to=previous, include_edge_lineage=True)
+    rerun = audit(run_file, 'merged', compare_to=previous, include_edge_lineage=True, explain_identity='A')
+    trace = rerun['with_source_replay']['identity_trace']
+    assert trace['identity_value'] == 'A' and len(trace['output_ids']) == 2
+    assert 'identity_trace' not in report['with_source_replay']
     assert rerun['without_source_replay']['edge_lineage']['before_hierarchy_replay']['captured_edges'] is None
     assert rerun['with_source_replay']['edge_lineage']['before_hierarchy_replay']['captured_edges'] == report['with_source_replay']['output_edges']
     assert rerun['with_source_replay']['hierarchy_membership'] == membership
