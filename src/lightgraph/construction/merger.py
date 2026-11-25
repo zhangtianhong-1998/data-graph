@@ -238,6 +238,7 @@ def _merge_contributor_nodes_and_edges(
     independent_outputs: bool = False,
     recognize_source_replays: bool = True,
     observe_before_hierarchy: Callable[[Iterable[dict]], None] | None = None,
+    observe_node_lineage: Callable[[str, str, str, str | None], None] | None = None,
     hierarchy_trace=None,
 ) -> dict[str, Any]:
     """Merge graphs while blocking unverified cross-unit auto-merges & auto-connections."""
@@ -261,6 +262,8 @@ def _merge_contributor_nodes_and_edges(
     if len(key_versions) > 1:
         raise LightGraphError('published_graph_key_semantics_conflict')
     contributor_ids = set()
+    observed_rows = []
+    observed_stage_ids = {}
     upstream_isolations = []
     ordered = sorted(contributors, key=lambda c: (c.get('kind', 'unit'), c['contributor_id']))
     source_namespaces, source_groups = namespace_groups(ordered)
@@ -278,6 +281,10 @@ def _merge_contributor_nodes_and_edges(
             contributor_id=cid,
             evidence_records=item.get('evidence_records'),
         )
+        if observe_node_lineage is not None:
+            # These private row objects are subsequently re-keyed in place by
+            # explicit fusion and definition splitting. Capture their input IDs now.
+            observed_rows.extend((ckind, cid, row['id'], row) for row in rewritten.get('nodes', []))
         if fusion and fusion.entity_rules and not independent_outputs:
             local = (source_namespaces is None or len(source_groups) == 1 and source_namespaces[index] is not None)
             if ckind in {'base', 'merged'}:
@@ -457,6 +464,8 @@ def _merge_contributor_nodes_and_edges(
                 id_remap[orig_id] = orig_id
 
             target_id = node['id']
+            if observe_node_lineage is not None:
+                observed_stage_ids[id(raw_node)] = target_id
             existing = merged_nodes.get(target_id)
             if existing is None:
                 merged_nodes[target_id] = node
@@ -817,6 +826,7 @@ def _merge_contributor_nodes_and_edges(
     hierarchy_collapsed = None
     hierarchy_diagnostics = {}
     review_stats = None
+    final_remap = {} if observe_node_lineage is not None else None
     compatible_namespace = source_namespaces is None or len(source_groups) == 1 and source_namespaces[0] is not None
     if hierarchy_trace is not None:
         hierarchy_trace.start(result)
@@ -832,7 +842,13 @@ def _merge_contributor_nodes_and_edges(
         hierarchy_collapsed = reconcile_hierarchy_projections(
             result, excluded_types=excluded_types, diagnostics=hierarchy_diagnostics, trace=hierarchy_trace,
             emit_candidates=policy.emit_alignment_candidates, reviewed_pairs=reviewed_pairs, review_stats=review_stats,
-            deduplicate_changed=not (fusion or retained_labels))
+            deduplicate_changed=not (fusion or retained_labels), observed_remap=final_remap)
+    if observe_node_lineage is not None:
+        outputs = {n['id'] for n in result['nodes']}
+        for kind, owner, original_id, row in observed_rows:
+            stage_id = observed_stage_ids.get(id(row))
+            final_id = final_remap.get(stage_id, stage_id)
+            observe_node_lineage(kind, owner, original_id, final_id if final_id in outputs else None)
     result['definition_conflicts'] = definition_conflict_diagnostics(result)
     if fusion:
         result['fusion_policy'] = fusion.model_dump(mode='json')
@@ -974,6 +990,7 @@ def merge_construction_graphs(
     independent_outputs: bool = False,
     recognize_source_replays: bool = True,
     observe_before_hierarchy: Callable[[Iterable[dict]], None] | None = None,
+    observe_node_lineage: Callable[[str, str, str, str | None], None] | None = None,
     hierarchy_trace=None,
 ) -> dict[str, Any]:
     """Merge authorized graph contributors.
@@ -981,6 +998,8 @@ def merge_construction_graphs(
     Callers may bind each contributor to the same project with `source_namespace`.
     A complete deterministic hierarchy stage can then recover its verified original
     observations, or accept exact `original_units` on the merged contributor.
+    The optional lineage observer receives each input occurrence as (kind, contributor,
+    original node ID, output ID). An unavailable or quarantined row has no output ID.
     """
     policy = (
         merge_policy if isinstance(merge_policy, MergePolicyConfig)
@@ -995,6 +1014,7 @@ def merge_construction_graphs(
         independent_outputs=independent_outputs,
         recognize_source_replays=recognize_source_replays,
         observe_before_hierarchy=observe_before_hierarchy,
+        observe_node_lineage=observe_node_lineage,
         hierarchy_trace=hierarchy_trace,
     )
 

@@ -17,7 +17,7 @@ def _read(path):
     return json.loads(path.read_text(encoding='utf-8-sig'))
 
 
-def _project(contributor, family, binding):
+def _project(contributor, family, binding, *, include_node_ids=False):
     """Use the same typed evidence check as the merger, with the checkpoint's verified owner."""
     graph = contributor['graph']
     definitions = {d['type']: d for d in graph['definitions']['entities']}
@@ -39,8 +39,11 @@ def _project(contributor, family, binding):
             continue
         key, = node['identity']
         s = supports[0]
-        matches.append((code, observed, {'key_type': node['identity_types'][key], 'key': node['identity'][key],
-                                        'name': s.get('observed_label') or s['label']}))
+        row = {'key_type': node['identity_types'][key], 'key': node['identity'][key],
+               'name': s.get('observed_label') or s['label']}
+        if include_node_ids:
+            row['node_id'] = node['id']
+        matches.append((code, observed, row))
     return {observed: row for code, observed, row in matches if codes[code] == 1}
 
 

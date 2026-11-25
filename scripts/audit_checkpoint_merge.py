@@ -333,8 +333,8 @@ def _graph_row_digests(graph):
     }
 
 
-def edge_lineage(inputs, graph, stage):
-    """Count input edge occurrences by contributor. Separate checkpoint and in-memory addresses."""
+def edge_lineage(inputs, graph, stage, *, observe_input_edge=None):
+    """Optionally report (owner, raw tuple, uniquely verified output ID, possible output IDs) per input."""
     owners = defaultdict(set)
     id_owners = defaultdict(set)
     counts = Counter()
@@ -347,6 +347,8 @@ def edge_lineage(inputs, graph, stage):
             counts[owner, key] += 1
     matches = defaultdict(lambda: defaultdict(set))
     uncertain = defaultdict(set)
+    uncertain_outputs = defaultdict(set)
+    output_id_counts = Counter(edge['id'] for edge in graph['edges']) if observe_input_edge is not None else {}
     qualified = set()
     qualified_results = Counter()
     stage_results = Counter()
@@ -364,6 +366,8 @@ def edge_lineage(inputs, graph, stage):
             for owner in attributed or possible:
                 ambiguous = len(remaining) > 1 or len(attributed or possible) > 1
                 uncertain[owner, key].add('ambiguous_owner' if ambiguous else 'unattributed')
+                if observe_input_edge is not None:
+                    uncertain_outputs[owner, key].add(output[0])
 
     for edge in graph['edges']:
         output = _edge_key(edge, 'id')
@@ -426,6 +430,14 @@ def edge_lineage(inputs, graph, stage):
             unresolved = uncertain.get((owner, key), ())
             status = 'ambiguous_owner' if 'ambiguous_owner' in unresolved else 'unattributed' if unresolved else 'unverified'
         by_owner[owner[1]][status] += count
+        if observe_input_edge is not None:
+            candidates = {out[0] for out in outputs} | uncertain_outputs.get((owner, key), set())
+            verified = None
+            if count == 1 and len(outputs) == 1 and not uncertain.get((owner, key)):
+                eid = next(iter(outputs))[0]
+                if output_id_counts[eid] == 1:
+                    verified = eid
+            observe_input_edge(owner, key, verified, candidates)
     return {'input_edge_counts_by_contributor': by_owner,
             'input_ids_shared_across_contributors': sum(len(v) > 1 for v in id_owners.values()),
             'input_tuples_shared_across_contributors': sum(len(v) > 1 for v in owners.values()),
@@ -666,7 +678,7 @@ def _overlap_checkpoint_report(run, project, state, target, parents, *, prepare=
 
 
 def _simulated_policy(path, run, node_id, target, parents, original_policy):
-    compiled = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    compiled = path if isinstance(path, dict) else json.loads(Path(path).read_text(encoding='utf-8-sig'))
     if not isinstance(compiled, dict) or compiled.get('mode') not in {'compiled', 'simulation_only'}:
         raise ValueError('请选择逐键规则编译器生成的文件。')
     field = 'simulated_key_pairs' if compiled['mode'] == 'simulation_only' else 'reviewed_key_pairs'
@@ -703,6 +715,50 @@ def _simulated_membership(graph):
                 for s in e.get('supports', [])) for e in edges)}
 
 
+def archived_state(run_file):
+    run_file = Path(run_file)
+    run = json.loads(run_file.read_text(encoding="utf-8"))
+    project = run_file.parent.parent
+    if run_file.parent.name != "runs" or run.get("run_id") != run_file.stem:
+        raise ValueError("请选择项目 runs 目录中的父运行 JSON 文件。")
+    output = run_output_path(project, run["output_path"])
+    state = load_workflow_state(output, run["run_id"])
+    if not state or state.get("parent_run_id") != run["run_id"]:
+        raise ValueError("缺少这次运行的工作流状态。")
+    return run, project, state
+
+
+def direct_merge_parents(state, target):
+    artifacts = state["artifacts"]
+    upstream = {r["artifact_id"]: r for r in artifacts.values()}
+    parents = [upstream[key] for key in target["upstream_artifacts"]]
+    if (not parents or target.get("inherited_grants") or
+            any(r["contributor_kind"] != "unit" or r.get("inherited_grants") for r in parents)):
+        raise ValueError("此核查适用于直接合并抽取单元的节点。该节点还依赖其他合并或继承图。")
+    return parents
+
+
+def committed_merge_policy(state, node_id, checkpoint):
+    step = state["merge_nodes"][node_id]
+    committed = checkpoint["graph"]
+    review = checkpoint.get("overlap_review")
+    if step.get("merge_mode") == "overlap_review" and not isinstance(review, dict):
+        raise ValueError("合并检查点缺少已提交的重叠审查记录。")
+    fused = committed.get("fusion_policy")
+    if fused is None:
+        raise ValueError("提交图未记录实际生效的 fusion_policy，无法重放原策略。")
+    plan = state["plan"]
+    node = next((entry for entry in plan["merge_nodes"] if entry["node_id"] == node_id), None)
+    if node is None:
+        raise ValueError("历史工作流缺少该合并节点的配置。")
+    policy = {**(node.get("merge_policy") or plan["merge_policy"]), "fusion_policy": fused}
+    if review is not None:
+        policy = review["effective_merge_policy"]
+        if policy.get("fusion_policy") != fused:
+            raise ValueError("审查记录中的生效规则与提交图不一致。")
+    return review, policy
+
+
 def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False, compare_to=None,
           run_summary=False, include_edge_lineage=False, explain_identity=None, overlap_patterns_only=False,
           prepare_overlap_indexes=False, include_overlap_evidence=False, simulate_reviewed_key_pairs=None):
@@ -719,15 +775,7 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         raise ValueError("--include-edge-lineage 需要执行合并重放")
     if explain_identity is not None and (observations_only or run_summary or not explain_identity.strip()):
         raise ValueError("--explain-identity 需要一个完整的文本键值，并执行合并重放")
-    run_file = Path(run_file)
-    run = json.loads(run_file.read_text(encoding="utf-8"))
-    project = run_file.parent.parent
-    if run_file.parent.name != "runs" or run.get("run_id") != run_file.stem:
-        raise ValueError("请选择项目 runs 目录中的父运行 JSON 文件。")
-    output = run_output_path(project, run["output_path"])
-    state = load_workflow_state(output, run["run_id"])
-    if not state or state.get("parent_run_id") != run["run_id"]:
-        raise ValueError("缺少这次运行的工作流状态。")
+    run, project, state = archived_state(run_file)
     if run_summary:
         return _run_summary(run, state, project, node_id)
     step = state.get("merge_nodes", {}).get(node_id, {})
@@ -750,11 +798,7 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
                 "integrity": output_checks(graph), "recorded_candidates": alignment_counts(graph),
                 **inspect_observations(graph)}
 
-    upstream = {r["artifact_id"]: r for r in artifacts.values()}
-    parents = [upstream[key] for key in target["upstream_artifacts"]]
-    if (not parents or target.get("inherited_grants") or
-            any(r["contributor_kind"] != "unit" or r.get("inherited_grants") for r in parents)):
-        raise ValueError("此核查适用于直接合并抽取单元的节点。该节点还依赖其他合并或继承图。")
+    parents = direct_merge_parents(state, target)
 
     if overlap_patterns_only or prepare_overlap_indexes:
         return _overlap_checkpoint_report(run, project, state, target, parents, prepare=prepare_overlap_indexes,
@@ -762,21 +806,8 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
 
     checkpoint = read(target)
     committed = checkpoint["graph"]
-    review = checkpoint.get("overlap_review")
-    if step.get("merge_mode") == "overlap_review" and not isinstance(review, dict):
-        raise ValueError("合并检查点缺少已提交的重叠审查记录。")
-    fused = committed.get("fusion_policy")
-    if fused is None:
-        raise ValueError("提交图未记录实际生效的 fusion_policy，无法重放原策略。")
-    plan = state["plan"]
-    node = next((entry for entry in plan["merge_nodes"] if entry["node_id"] == node_id), None)
-    if node is None:
-        raise ValueError("历史工作流缺少该合并节点的配置。")
-    policy = {**(node.get("merge_policy") or plan["merge_policy"]), "fusion_policy": fused}
-    if review is not None:
-        policy = review["effective_merge_policy"]
-        if policy.get("fusion_policy") != fused:
-            raise ValueError("审查记录中的生效规则与提交图不一致。")
+    review, policy = committed_merge_policy(state, node_id, checkpoint)
+    fused = committed["fusion_policy"]
     counts = graph_counts(committed)
     if include_edge_lineage:
         counts["row_digests"] = _graph_row_digests(committed)

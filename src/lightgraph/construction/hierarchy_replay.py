@@ -845,7 +845,7 @@ def _merge_members(winner, batch, definitions, *, approval_ref=None):
 
 
 def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=None, trace=None, emit_candidates=False,
-                                    reviewed_pairs=None, review_stats=None, deduplicate_changed=False):
+                                    reviewed_pairs=None, review_stats=None, deduplicate_changed=False, observed_remap=None):
     """Collapse verified source replays in a fresh unit merge; return removed node count."""
     nodes = {n['id']: n for n in graph['nodes']}
     stats = {} if diagnostics is None else diagnostics
@@ -870,6 +870,8 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
             approvals[winner] = ref
     owners = _compatible_remaps(graph, batches, nodes)
     remap = {nid: winner for nid, winner in owners.items() if nid != winner}
+    if observed_remap is not None:
+        observed_remap.update(remap)
     if trace is not None:
         for winner, ids in batches.items():
             if winner not in owners:
