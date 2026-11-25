@@ -10,14 +10,16 @@ from ..errors import LightGraphError
 
 
 def atomic_text(path, text):
-    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
-    fd,tmp=tempfile.mkstemp(prefix=".published-",dir=path.parent)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".published-", dir=path.parent)
     try:
-        os.chmod(tmp,0o600)
-        with os.fdopen(fd,"w",encoding="utf-8") as out:out.write(text)
-        os.replace(tmp,path)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            os.chmod(tmp, 0o600)
+            out.write(text)
+        os.replace(tmp, path)
     finally:
-        if os.path.exists(tmp):os.unlink(tmp)
+        Path(tmp).unlink(missing_ok=True)
 
 
 def write_report(path, report:RunReport):

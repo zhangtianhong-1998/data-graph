@@ -548,7 +548,48 @@ def _run_summary(run, state, project, node_id):
     }
 
 
-def _overlap_checkpoint_report(run, project, state, target, parents, *, prepare=False):
+def _overlap_eligibility_evidence(review, indexes, definitions):
+    """Explain recorded gates from pinned headers. Do not load observations or replay decisions."""
+    from lightgraph.construction.overlap_index import overlap_identity_contract
+
+    family_rows = {(owner, row['type']): row for owner, index in indexes.items() for row in index['families']}
+    decisions = {d['pattern_id']: d['action'] for d in review['decisions']}
+    evidence = []
+    for pattern in review['patterns']:
+        pid = pattern['pattern_id']
+        owners = sorted({m['contributor_id'] for m in pattern['members']})
+        access = [indexes[owner]['access_fingerprint'] for owner in owners]
+        item = {'pattern_id': pid, 'kind': pattern['kind'], 'basis': pattern['basis'],
+                'decision': decisions.get(pid), 'eligible_actions': pattern['eligible_actions'],
+                'recorded_reasons': pattern['reasons'],
+                'access_missing_from': [owner for owner, fp in zip(owners, access) if not fp],
+                'distinct_recorded_access_fingerprints': len({fp for fp in access if fp})}
+        if pattern['kind'] == 'entity':
+            contracts, members = [], []
+            for member in pattern['members']:
+                owner, name = member['contributor_id'], member['type']
+                row = family_rows[owner, name]
+                definition = definitions[owner, name]
+                contract = overlap_identity_contract(definition)
+                if digest(contract) != row['contract_fingerprint']:
+                    raise ValueError("检查点定义与类型索引的契约摘要不符。")
+                contracts.append(contract)
+                members.append({'contributor_id': owner, 'type': name,
+                                'identity_scope': contract['identity_scope'], 'identity_origin': contract['identity_origin'],
+                                'has_context_keys': bool(contract['identity_context_keys']),
+                                'definition_variant': bool(definition.get('definition_variant')),
+                                'original_type': definition.get('original_type'), 'issues': row['problems'],
+                                'source_binding_count': len(row['sources']),
+                                'neighbor_witness_count': row['witness_count']})
+            fields = sorted({field for contract in contracts for field in contract})
+            item['different_contract_fields'] = [field for field in fields if len({
+                canonical([field in contract, contract.get(field)]) for contract in contracts}) > 1]
+            item['members'] = members
+        evidence.append(item)
+    return evidence
+
+
+def _overlap_checkpoint_report(run, project, state, target, parents, *, prepare=False, include_evidence=False):
     from lightgraph.construction.checkpoints import (
         load_checkpoint_overlap_index, prepare_checkpoint_overlap_index,
         read_checkpoint_overlap_review, verify_checkpoint_files,
@@ -585,8 +626,27 @@ def _overlap_checkpoint_report(run, project, state, target, parents, *, prepare=
         if (review["effective_merge_policy"].get("fusion_policy") != fused
                 or review.get("upstream_artifacts") != {p["node_id"]: p["artifact_id"] for p in parents}):
             raise ValueError("审查记录与提交图的上游产物或生效规则不一致。")
-        return {**report, "mode": "committed_overlap_review", "overlap_review": review}
+        report.update(mode="committed_overlap_review", overlap_review=review)
+        if include_evidence:
+            indexes, definitions = {}, {}
+            owners = {m['contributor_id'] for p in review['patterns'] for m in p['members']}
+            for parent in parents:
+                owner = parent['node_id']
+                if owner not in owners:
+                    continue
+                index = load_checkpoint_overlap_index(location(parent), parent)
+                if index is None:
+                    raise ValueError("上游检查点缺少已固定的类型索引。")
+                indexes[owner] = index
+                graph_path = verify_checkpoint_files(location(parent), parent)
+                header = read_graph_record_header(graph_path, expected_digest=parent['graph_digest'])
+                for d in header['graph_metadata'].get('definitions', {}).get('entities', []):
+                    definitions[owner, d['type']] = d
+            report['eligibility_evidence'] = _overlap_eligibility_evidence(review, indexes, definitions)
+        return report
 
+    if include_evidence:
+        raise ValueError("请选择已有模型审查记录的合并运行。")
     inputs = [{"contributor_id": p["node_id"], "kind": p["contributor_kind"], "source_namespace": run["project_id"]}
               for p in parents]
     ids = [p["node_id"] for p in parents]
@@ -607,8 +667,10 @@ def _overlap_checkpoint_report(run, project, state, target, parents, *, prepare=
 
 def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False, compare_to=None,
           run_summary=False, include_edge_lineage=False, explain_identity=None, overlap_patterns_only=False,
-          prepare_overlap_indexes=False):
+          prepare_overlap_indexes=False, include_overlap_evidence=False):
     """Use the run's committed inputs and policy, even when the current project has been edited."""
+    if include_overlap_evidence and not overlap_patterns_only:
+        raise ValueError("--include-overlap-evidence 需与 --overlap-patterns-only 一起使用。")
     if (overlap_patterns_only or prepare_overlap_indexes) and any((
             include_hierarchy_membership, include_edge_lineage, compare_to, explain_identity is not None,
             observations_only, run_summary, overlap_patterns_only and prepare_overlap_indexes)):
@@ -655,7 +717,8 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         raise ValueError("此核查适用于直接合并抽取单元的节点。该节点还依赖其他合并或继承图。")
 
     if overlap_patterns_only or prepare_overlap_indexes:
-        return _overlap_checkpoint_report(run, project, state, target, parents, prepare=prepare_overlap_indexes)
+        return _overlap_checkpoint_report(run, project, state, target, parents, prepare=prepare_overlap_indexes,
+                                          include_evidence=include_overlap_evidence)
 
     checkpoint = read(target)
     committed = checkpoint["graph"]
@@ -769,6 +832,7 @@ def main():
     mode.add_argument("--observations-only", action="store_true", help="只核查已提交图的实际观测，跳过合并重放")
     mode.add_argument("--include-hierarchy-membership", action="store_true", help="在重放报告中列出层级归并前后的节点 ID")
     parser.add_argument("--include-edge-lineage", action="store_true", help="逐单元核对原边来源和层级归并前的边，输出计数与摘要")
+    parser.add_argument("--include-overlap-evidence", action="store_true", help="配合 --overlap-patterns-only 对照已审模式的上游契约、权限指纹和邻接见证数")
     parser.add_argument("--explain-identity", metavar="CODE", help="按完整的单字段文本键值，列出层级合并实际检查的节点、来源和判定")
     parser.add_argument("--compare-hierarchy-audit", type=Path, metavar="AUDIT_JSON",
                         help="与同一批检查点的上一轮完整审计报告逐组比较，并输出本轮成员映射")
@@ -780,7 +844,7 @@ def main():
                        include_hierarchy_membership=args.include_hierarchy_membership, compare_to=args.compare_hierarchy_audit,
                        run_summary=args.run_summary, include_edge_lineage=args.include_edge_lineage,
                        explain_identity=args.explain_identity, overlap_patterns_only=args.overlap_patterns_only,
-                       prepare_overlap_indexes=args.prepare_overlap_indexes)
+                       prepare_overlap_indexes=args.prepare_overlap_indexes, include_overlap_evidence=args.include_overlap_evidence)
     except LightGraphError as exc:
         parser.exit(1, f"检查点或合并未通过校验：{exc.code}\n")
     except (KeyError, OSError, ValueError) as exc:

@@ -8,6 +8,31 @@ import pytest
 compare = runpy.run_path(str(Path(__file__).resolve().parents[3] / "scripts/audit_checkpoint_merge.py"))["compare_hierarchy_audits"]
 
 
+def test_review_evidence_distinguishes_different_contract_fields_and_missing_access():
+    from lightgraph.construction.overlap_index import overlap_identity_contract
+    from lightgraph.contracts import digest
+
+    explain = compare.__globals__['_overlap_eligibility_evidence']
+    members = [{'contributor_id': owner, 'type': 'Member'} for owner in ('a', 'b')]
+    review = {'decisions': [{'pattern_id': 'p', 'action': 'review'}], 'patterns': [{
+        'pattern_id': 'p', 'kind': 'entity', 'basis': 'same_physical_key', 'members': members,
+        'eligible_actions': ['retain'], 'reasons': ['different_identity_contracts', 'unverified_access_fingerprint']}]}
+    indexes, definitions = {}, {}
+    for owner in ('a', 'b'):
+        definition = {'type': 'Member', 'key_names': ['id'], 'identity_scope': 'global', 'identity_domain': owner}
+        definitions[owner, 'Member'] = definition
+        indexes[owner] = {'access_fingerprint': None if owner == 'a' else 'abc', 'families': [{
+            'type': 'Member', 'contract_fingerprint': digest(overlap_identity_contract(definition)),
+            'problems': [], 'sources': [], 'witness_count': 0}]}
+    row, = explain(review, indexes, definitions)
+    assert row['different_contract_fields'] == ['identity_domain']
+    assert row['access_missing_from'] == ['a'] and row['distinct_recorded_access_fingerprints'] == 1
+    assert row['decision'] == 'review' and row['eligible_actions'] == ['retain']
+    definitions['b', 'Member']['identity_domain'] = 'other'
+    with pytest.raises(ValueError, match='契约摘要'):
+        explain(review, indexes, definitions)
+
+
 def test_graph_row_digests_compare_payloads_and_ignore_storage_order():
     row_digests = compare.__globals__['_graph_row_digests']
     nodes = [{'id': 'a', 'supports': [{'label': 'original'}]}, {'id': 'b'}]

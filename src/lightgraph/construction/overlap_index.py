@@ -37,10 +37,15 @@ def relation_binding(raw):
     return source, schema, table, tuple(left), tuple(right)
 
 
-def _family_row(f):
-    contract = definition_contract(f.definition)
+def overlap_identity_contract(definition):
+    contract = definition_contract(definition)
     for field in ('type', 'key_names'):
         contract.pop(field, None)
+    return contract
+
+
+def _family_row(f):
+    contract = overlap_identity_contract(f.definition)
     bindings = sorted(f.by_source)
     catalog = sorted(f.by_catalog)
     aliases = [[cell, obs[0], obs[4]] for cell, obs in sorted(f.observations.items()) if obs[3]]

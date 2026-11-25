@@ -38,7 +38,12 @@ def artifact_step(stage, operation, *args, **kwargs):
             transient = getattr(exc, 'code', None) == 'workflow_checkpoint_busy' or isinstance(exc, OSError) and (
                 getattr(exc, 'winerror', None) in {32, 33}
                 or exc.errno in {errno.EAGAIN, errno.EINTR, errno.EBUSY})
-            if transient and attempt <= len(delays):
+            # Windows can return ACCESS_DENIED while another process holds the
+            # state file. A real ACL denial has the same code. Retry only these
+            # atomic state writes, and keep a persistent denial non-retryable.
+            state_access_denied = (stage in {'state_current_write', 'state_history_write'}
+                                   and isinstance(exc, OSError) and getattr(exc, 'winerror', None) == 5)
+            if (transient or state_access_denied) and attempt <= len(delays):
                 time.sleep(delays[attempt - 1])
                 continue
             code = exc.code if isinstance(exc, LightGraphError) else f'workflow_{stage}_failed'

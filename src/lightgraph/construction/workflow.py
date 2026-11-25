@@ -733,8 +733,8 @@ def archive_workflow_state(project_output_dir, state):
     if state:
         path = _state_path(project_output_dir, state['parent_run_id'])
         if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_text(path, json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2))
+            payload = json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2)
+            artifact_step('state_history_write', atomic_text, path, payload)
 
 
 def save_workflow_state(project_output_dir: str | Path, state: dict[str, Any], *, current_only=False) -> None:

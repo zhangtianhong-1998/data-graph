@@ -107,7 +107,13 @@ def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monk
 
     audit = runpy.run_path(str(Path(__file__).resolve().parents[3] / 'scripts/audit_checkpoint_merge.py'))['audit']
     run_file = project / 'runs' / (run['run_id'] + '.json')
-    assert audit(run_file, 'join', overlap_patterns_only=True)['overlap_review'] == report
+    with monkeypatch.context() as guard:
+        guard.setitem(audit.__globals__, 'load_checkpoint', lambda *_: pytest.fail('read full graph'))
+        explained = audit(run_file, 'join', overlap_patterns_only=True, include_overlap_evidence=True)
+    assert explained['overlap_review'] == report and explained['model_calls'] == 0
+    entity = next(row for row in explained['eligibility_evidence'] if row['decision'] == 'merge')
+    assert entity['distinct_recorded_access_fingerprints'] == 1 and not entity['access_missing_from']
+    assert entity['different_contract_fields'] == [] and 'apply' in entity['eligible_actions']
     replay = audit(run_file, 'join')
     assert replay['with_source_replay']['output_nodes'] == replay['committed']['nodes']
     assert replay['with_source_replay']['output_edges'] == replay['committed']['edges']

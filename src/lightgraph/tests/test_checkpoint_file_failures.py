@@ -1,18 +1,93 @@
 import errno
+import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
-from lightgraph.construction import checkpoints
-from lightgraph.construction.artifact_io import WorkflowPersistenceError
+from lightgraph.construction import checkpoints, workflow
+from lightgraph.construction.artifact_io import WorkflowPersistenceError, artifact_step
 from lightgraph.errors import LightGraphError
 
 
-def locked():
+def locked(code=32):
     exc = PermissionError(errno.EACCES, 'PRIVATE-ROW', 'PRIVATE-PATH')
-    exc.winerror = 32
+    exc.winerror = code
     return exc
+
+
+@pytest.mark.parametrize('location', ['history', 'current'])
+def test_transient_windows_state_denial_retries_the_same_snapshot(tmp_path, monkeypatch, location):
+    rid = 'run_' + 'd' * 24
+    previous = {'parent_run_id': rid, 'status': 'running'}
+    updated = {**previous, 'status': 'completed'}
+    workflow.save_workflow_state(tmp_path, previous)
+    target = (tmp_path / 'workflow-runs' / (rid + '.json') if location == 'history'
+              else tmp_path / 'workflow-state.json')
+    attempts = []
+    replace = os.replace
+
+    def temporarily_deny(staged, dest):
+        if dest == target:
+            assert json.loads(target.read_text('utf-8')) == previous
+            attempts.append(Path(staged).read_bytes())
+            if len(attempts) < 3:
+                raise locked(5)
+        return replace(staged, dest)
+
+    monkeypatch.setattr(os, 'replace', temporarily_deny)
+    workflow.save_workflow_state(tmp_path, updated)
+    assert len(attempts) == 3 and len(set(attempts)) == 1
+    assert workflow.load_workflow_state(tmp_path) == workflow.load_workflow_state(tmp_path, rid) == updated
+    assert not list(tmp_path.rglob('.published-*'))
+
+
+@pytest.mark.parametrize(('stage', 'error', 'attempts'), [
+    ('state_history_write', locked(5), 4),
+    ('state_current_write', PermissionError(errno.EACCES, 'PRIVATE'), 1),
+    ('checkpoint_marker_write', locked(5), 1),
+])
+def test_persistent_access_denial_preserves_error_and_bounds_attempts(stage, error, attempts):
+    seen = []
+
+    def deny():
+        seen.append(True)
+        raise error
+
+    with pytest.raises(WorkflowPersistenceError) as captured:
+        artifact_step(stage, deny)
+    assert len(seen) == attempts
+    assert captured.value.code == f'workflow_{stage}_failed' and not captured.value.retryable
+    detail = {'stage': stage, 'exception_type': 'PermissionError', 'attempts': attempts, 'errno': errno.EACCES}
+    if getattr(error, 'winerror', None) is not None:
+        detail['winerror'] = error.winerror
+    assert captured.value.detail == detail
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows file sharing semantics')
+def test_windows_state_replace_recovers_after_reader_releases_file(tmp_path, monkeypatch):
+    rid = 'run_' + 'b' * 24
+    previous = {'parent_run_id': rid, 'status': 'running'}
+    updated = {**previous, 'status': 'completed'}
+    workflow.save_workflow_state(tmp_path, previous)
+    history = tmp_path / 'workflow-runs' / (rid + '.json')
+    replace = os.replace
+    errors = []
+    with history.open('rb') as reader:
+        def replace_then_release(staged, dest):
+            try:
+                return replace(staged, dest)
+            except PermissionError as exc:
+                if dest == history:
+                    errors.append(exc.winerror)
+                    reader.close()
+                raise
+
+        monkeypatch.setattr(os, 'replace', replace_then_release)
+        workflow.save_workflow_state(tmp_path, updated)
+    assert len(errors) == 1 and errors[0] in {5, 32, 33}
+    assert workflow.load_workflow_state(tmp_path) == workflow.load_workflow_state(tmp_path, rid) == updated
 
 
 def commit(output):
