@@ -4,7 +4,10 @@ Each change replays the active decisions against the same originals. The single
 manifest replacement publishes the graph, the decision ledger and their shared
 version together. History retains both the original graph and all prior views.
 """
+from contextlib import contextmanager
 from copy import deepcopy
+import logging
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -132,6 +135,25 @@ def review(workspace, pid, *, config, offset, decision_offset, version, business
             'next_decision_offset': decision_offset + 50 if decision_offset + 50 < len(decisions) else None}
 
 
+@contextmanager
+def _pending_review_graph(session, publication, graph):
+    """Remove only this writer's unreferenced snapshot if a review cannot commit."""
+    path = _record_path(session.root, publication)
+    write_graph_record(path, graph)
+    try:
+        yield path
+    except BaseException:
+        try:
+            manifest = read_internal_yaml(session.manifest_path)
+            heads = [manifest.get('current_graph') or {}, *manifest.get('graph_history', [])]
+            if not any(head.get('path') == publication for head in heads):
+                shutil.rmtree(path)
+        except (OSError, LightGraphError, ValueError, TypeError, AttributeError):
+            # If the commit cannot be checked, preserve the record and original error.
+            logging.getLogger(__name__).warning('Could not verify unpublished identity review snapshot')
+        raise
+
+
 def change(workspace, pid, config, *, candidate_id, verdict, decision_id, expected_revision, version_id,
            members, business_context):
     if not version_id:
@@ -174,27 +196,26 @@ def change(workspace, pid, config, *, candidate_id, verdict, decision_id, expect
         result.update(storage_layout='parquet_v1', access_fingerprint=session.base['access_fingerprint'])
         ledger['revision'] = next_revision
         publication = 'published/' + uuid4().hex + '.graph'
-        path = _record_path(session.root, publication)
-        write_graph_record(path, result)
-        ledger_path = publication + '/identity-decisions.yaml'
-        write_yaml(_record_path(session.root, ledger_path), ledger)
-        old = session.head
-        head = {k: deepcopy(v) for k, v in old.items() if k not in (
-            'created_at', 'version_id', 'publication_digest', 'path', 'graph_digest', 'identity_review')}
-        head.update(path=publication, created_at=now, graph_digest=read_internal_yaml(path / 'metadata.yaml')['graph_digest'],
-                    storage_layout='parquet_v1', identity_review={'base_version_id': session.base_id,
-                    'parent_version_id': session.version, 'ledger_path': ledger_path, 'ledger_digest': digest(ledger)})
-        # The caller holds the project lock and this transaction holds the output writer lease.
-        # Recheck external source grants and the active generation after building the snapshot.
-        if workspace.result_config(pid) != config:
-            raise LightGraphError('resolution_version_conflict')
-        session.authorize(workspace, config)
-        manifest = read_internal_yaml(session.manifest_path)
-        if snapshot_id(manifest['current_graph'], root=session.root) != session.version:
-            raise LightGraphError('resolution_version_conflict')
-        history = manifest.setdefault('graph_history', [])
-        if not any(snapshot_id(h, root=session.root) == session.version for h in history):
-            history.append(old)
-        manifest['current_graph'] = append_graph_head(manifest, head, root=session.root)
-        write_yaml(session.manifest_path, manifest)
-        return {**decision, 'revision': next_revision, 'version_id': head['version_id'], 'backend': 'publication'}
+        with _pending_review_graph(session, publication, result) as path:
+            ledger_path = publication + '/identity-decisions.yaml'
+            write_yaml(_record_path(session.root, ledger_path), ledger)
+            old = session.head
+            head = {k: deepcopy(v) for k, v in old.items() if k not in (
+                'created_at', 'version_id', 'publication_digest', 'path', 'graph_digest', 'identity_review')}
+            head.update(path=publication, created_at=now, graph_digest=read_internal_yaml(path / 'metadata.yaml')['graph_digest'],
+                        storage_layout='parquet_v1', identity_review={'base_version_id': session.base_id,
+                        'parent_version_id': session.version, 'ledger_path': ledger_path, 'ledger_digest': digest(ledger)})
+            # The caller holds the project lock and this transaction holds the output writer lease.
+            # Recheck external source grants and the active generation after building the snapshot.
+            if workspace.result_config(pid) != config:
+                raise LightGraphError('resolution_version_conflict')
+            session.authorize(workspace, config)
+            manifest = read_internal_yaml(session.manifest_path)
+            if snapshot_id(manifest['current_graph'], root=session.root) != session.version:
+                raise LightGraphError('resolution_version_conflict')
+            history = manifest.setdefault('graph_history', [])
+            if not any(snapshot_id(h, root=session.root) == session.version for h in history):
+                history.append(old)
+            manifest['current_graph'] = append_graph_head(manifest, head, root=session.root)
+            write_yaml(session.manifest_path, manifest)
+            return {**decision, 'revision': next_revision, 'version_id': head['version_id'], 'backend': 'publication'}

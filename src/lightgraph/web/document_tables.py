@@ -6,10 +6,10 @@ from ..errors import LightGraphError
 
 
 @lru_cache(maxsize=32)
-def _workbook_tables(path, revision, header_row, include_hidden, allowed, columns, memory_limit):
+def _workbook_tables(path, revision, schema, header_row, include_hidden, allowed, columns, memory_limit):
     # The revision separates reuploads and file edits. Only names survive this call.
     from ..sources.excel import ExcelSource
-    with ExcelSource(path, metadata_only=True, header_row=header_row, include_hidden=include_hidden,
+    with ExcelSource(path, schema_name=schema, metadata_only=True, header_row=header_row, include_hidden=include_hidden,
                      allowed_tables=list(allowed) or None, allowed_columns=dict(columns) or None,
                      max_memory_bytes=memory_limit) as workbook:
         return tuple(table.name for table in workbook.describe())
@@ -28,15 +28,16 @@ def project_tables(workspace, pid, config) -> set[tuple[str, str, str]]:
                 tables.add((sid, schema, name))
         elif source["kind"] == "excel_workbook":
             path = workspace._path(pid, source["path"])
+            schema = source.get("schema_name", "public")
             try:
                 file_stat = path.stat()
                 columns = tuple(sorted((key, tuple(names)) for key, names in (source.get("allowed_columns") or {}).items()))
                 names = _workbook_tables(path, (file_stat.st_ino, file_stat.st_ctime_ns, file_stat.st_mtime_ns, file_stat.st_size),
-                                         source.get("header_row", 1), source.get("include_hidden", False),
+                                         schema, source.get("header_row", 1), source.get("include_hidden", False),
                                          tuple(sorted(allowed)), columns, config["max_working_bytes"])
             except (OSError, LightGraphError):
                 continue
-            tables.update((sid, "public", name) for name in names)
+            tables.update((sid, schema, name) for name in names)
         else:
             for qualified in allowed:
                 schema, sep, name = qualified.partition(".")

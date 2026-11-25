@@ -159,7 +159,8 @@ def test_changed_catalog_cannot_adopt_new_connection(engine):
         def wrapped(sql, parameters=None):
             result = execute(sql, parameters)
             if 'information_schema.columns' in sql.lower():
-                current.result = [row for row in current.result if row[0] != 'name']
+                column_index = 2 if engine == 'mysql' else 0
+                current.result = [row for row in current.result if row[column_index] != 'name']
             return result
         current.execute = wrapped
         return current

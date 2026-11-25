@@ -1,7 +1,6 @@
 """Reuse authorized graph views across page and detail requests.
 
-Published YAML is immutable aside from an in-place replacement, which changes
-the file size or mtime. Callers must not mutate the returned graph.
+Storage and access fingerprints identify each view. Callers treat its records as immutable.
 """
 from __future__ import annotations
 
@@ -23,7 +22,9 @@ Loader = Callable[[], tuple[dict, str]]
 
 _lock = threading.Lock()
 _views: OrderedDict[str, tuple[dict, str]] = OrderedDict()
-_generations: dict[int, str] = {}
+class _GraphView(dict):
+    generation: str
+
 _inflight: dict[str, tuple[threading.Event, dict]] = {}
 _pending: OrderedDict[str, tuple[Path, dict]] = OrderedDict()
 _writer: threading.Thread | None = None
@@ -34,21 +35,14 @@ def view_token(key: dict) -> str:
     return digest({'graph_view': 1, **key})
 
 
-def remember_graph(graph: dict, generation: str) -> None:
-    with _lock:
-        _generations[id(graph)] = generation
-
-
 def cached_generation(graph: dict) -> str | None:
-    with _lock:
-        return _generations.get(id(graph))
+    return graph.generation if isinstance(graph, _GraphView) else None
 
 
 def clear_graph_views() -> None:
     """Drop memory only. A later read may still reuse a matching disk copy."""
     with _lock:
         _views.clear()
-        _generations.clear()
         _pending.clear()
 
 
@@ -65,7 +59,6 @@ def load_graph_view(directory: Path, key: dict, loader: Loader) -> tuple[dict, s
         cached = _views.get(token)
         if cached is not None:
             _views.move_to_end(token)
-            _generations[id(cached[0])] = cached[1]
             return cached
         flight = _inflight.get(token)
         if flight is None:
@@ -85,10 +78,14 @@ def load_graph_view(directory: Path, key: dict, loader: Loader) -> tuple[dict, s
         from_disk = value is not None
         if not from_disk:
             value = loader()
+        graph, generation = value
+        view = _GraphView(graph)
+        view.generation = generation
+        value = view, generation
         with _lock:
             _store(token, value)
             flight[1]['value'] = value
-            if not from_disk:
+            if not from_disk and token in _views:
                 _write_later(directory, key, token)
         return value
     except BaseException as error:
@@ -101,21 +98,20 @@ def load_graph_view(directory: Path, key: dict, loader: Loader) -> tuple[dict, s
 
 
 def _store(token: str, value: tuple[dict, str]) -> None:
-    _views[token] = value
-    _views.move_to_end(token)
-    graph, generation = value
-    _generations[id(graph)] = generation
+    graph, _ = value
 
     def records(graph):
         return len(graph.get('nodes', ())) + len(graph.get('edges', ()))
 
+    if records(graph) > MAX_CACHED_RECORDS:
+        return
+    _views[token] = value
+    _views.move_to_end(token)
     total = sum(records(view) for view, _ in _views.values())
-    while len(_views) > 1 and (len(_views) > MAX_CACHED_VIEWS or total > MAX_CACHED_RECORDS):
+    while len(_views) > MAX_CACHED_VIEWS or total > MAX_CACHED_RECORDS:
         dropped, (dropped_graph, _generation) = _views.popitem(last=False)
         total -= records(dropped_graph)
         _pending.pop(dropped, None)
-        if dropped_graph is not graph:
-            _generations.pop(id(dropped_graph), None)
 
 
 def _disk_name(key: dict) -> str:
@@ -162,7 +158,7 @@ def _read_disk(directory: Path, key: dict):
 def _write_disk(directory: Path, key: dict, value: tuple[dict, str]) -> None:
     if directory.is_symlink():
         return
-    directory.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(exist_ok=True)
     graph, generation = value
     nodes, edges = graph['nodes'], graph['edges']
     header = {'format': 2, 'key': key, 'generation': generation,
@@ -181,7 +177,21 @@ def _write_disk(directory: Path, key: dict, value: tuple[dict, str]) -> None:
                 stream.write(data)
                 stream.write(b'\n')
             stream.write(b']\n')
-        os.replace(temporary, directory / _disk_name(key))
+        current = directory / _disk_name(key)
+        os.replace(temporary, current)
+        # Only our own content-addressed cache files are eligible for eviction.
+        entries = []
+        for entry in directory.glob('*.json'):
+            if len(entry.stem) == 64 and all(c in '0123456789abcdef' for c in entry.stem) and not entry.is_symlink():
+                info = entry.stat()
+                entries.append((info.st_mtime_ns, entry, info.st_size))
+        retained = current.stat().st_size
+        for _, entry, size in sorted(entries, reverse=True):
+            if entry != current:
+                if retained + size > MAX_CACHE_BYTES:
+                    entry.unlink(missing_ok=True)
+                else:
+                    retained += size
     finally:
         Path(temporary).unlink(missing_ok=True)
 

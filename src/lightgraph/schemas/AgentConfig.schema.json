@@ -116,6 +116,22 @@
           "title": "Timeout Seconds",
           "type": "number"
         },
+        "output_token_field": {
+          "anyOf": [
+            {
+              "enum": [
+                "max_tokens",
+                "max_completion_tokens"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output Token Field"
+        },
         "max_output_tokens": {
           "default": 65536,
           "exclusiveMinimum": 0,

@@ -286,7 +286,8 @@ class MySQLSource(SourceAdapter):
                 self._rollback()
                 self._start_readonly(stage='connection_preflight')
                 cursor = self._cursor()
-                cursor.execute("SELECT VERSION(), @@version_comment, CONNECTION_ID(), @@server_uuid, CURRENT_USER()")
+                cursor.execute("SELECT VERSION(), @@version_comment, CONNECTION_ID(), @@server_uuid, "
+                               "CURRENT_USER(), @@lower_case_table_names")
                 row = cursor.fetchone()
                 self._manifest.product, self._manifest.version = product_version(row[0], row[1])
                 if self._manifest.product != "MySQL":
@@ -305,6 +306,12 @@ class MySQLSource(SourceAdapter):
                         raise LightGraphError("query_cancel_connection_mismatch")
                 finally:
                     cleanup_preserving_error(self._close_cursor, control)
+                if len(row) != 6 or row[5] not in (0, 1, 2):
+                    raise LightGraphError("mysql_catalog_case_policy_unverified")
+                self._ignore_name_case = row[5] in (1, 2)
+                normalized = {self._catalog_name(name) for name in self.allowed_tables}
+                if len(normalized) != len(self.allowed_tables):
+                    raise LightGraphError("duplicate_authorized_table")
                 self._connection_id = row[2]
                 self._manifest.capabilities["read_only_transaction"] = "verified"
                 cursor.execute("SELECT %s", (71,))
@@ -357,40 +364,71 @@ class MySQLSource(SourceAdapter):
                 self.verify_runtime_controls()
             return self.capabilities()
 
+    def _catalog_name(self, name):
+        # Follow the actual server's table-name policy. Leave non-ASCII
+        # spellings exact rather than approximating its identifier collation.
+        return name.lower() if self._ignore_name_case and name.isascii() else name
+
+    def _catalog_rows(self, cursor, names, fields, source, *, where="", order=""):
+        """Read authorized schema/table pairs in bounded batches of bound values."""
+        slots = ", ".join("(%s, %s)" for _ in names)
+        params = tuple(part for qualified in names for part in qualified.split("."))
+        table_fields = "t.TABLE_SCHEMA, t.TABLE_NAME"
+        sql = f"SELECT {table_fields}, {fields} FROM {source} WHERE ({table_fields}) IN ({slots}){where}{order}"
+        self.stats.catalog_queries += 1
+        cursor.execute(sql, params)
+        grouped = {qualified: [] for qualified in names}
+        configured = {self._catalog_name(name): name for name in names}
+        for schema, table, *fields in cursor.fetchall():
+            qualified = configured.get(self._catalog_name(f"{schema}.{table}"))
+            if qualified is not None:
+                grouped[qualified].append(fields)
+        return grouped
+
     def _read_catalog(self, cursor):
         tables = []
         constraints = {}
-        for qualified in self.allowed_tables:
-            schema, name = qualified.split(".")
-            self.stats.catalog_queries += 1
-            cursor.execute("SELECT TABLE_TYPE, ENGINE, TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s", (schema, name))
-            row = cursor.fetchone()
-            if not row or row[0] != "BASE TABLE":
-                raise LightGraphError("authorized_table_unavailable_or_view")
-            if str(row[1]).lower() != "innodb":
-                raise LightGraphError("mysql_storage_engine_unsupported")
-            comment = row[2] or ""
-            if len(comment.encode("utf-8")) > self.limits.max_batch_bytes:
-                raise LightGraphError("metadata_size_limit")
-            self.stats.catalog_queries += 1
-            cursor.execute("SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s ORDER BY ORDINAL_POSITION", (schema, name))
-            columns = []
-            self._physical_column_names[qualified] = set()
-            for cname, dtype, nullable, annotation in cursor.fetchall():
-                self._physical_column_names[qualified].add(cname)
-                if qualified in self.allowed_columns and cname not in self.allowed_columns[qualified]:
-                    continue
-                if len((annotation or "").encode("utf-8")) > self.limits.max_batch_bytes:
+        for start in range(0, len(self.allowed_tables), 64):
+            names = self.allowed_tables[start:start + 64]
+            descriptions = self._catalog_rows(cursor, names, "t.TABLE_TYPE, t.ENGINE, t.TABLE_COMMENT",
+                                              "information_schema.TABLES t")
+            for qualified, rows in descriptions.items():
+                if len(rows) != 1 or rows[0][0] != "BASE TABLE":
+                    raise LightGraphError("authorized_table_unavailable_or_view")
+                if str(rows[0][1]).lower() != "innodb":
+                    raise LightGraphError("mysql_storage_engine_unsupported")
+            columns_by_table = self._catalog_rows(cursor, names,
+                "t.COLUMN_NAME, t.DATA_TYPE, t.IS_NULLABLE, t.COLUMN_COMMENT", "information_schema.COLUMNS t",
+                order=" ORDER BY t.TABLE_SCHEMA,t.TABLE_NAME,t.ORDINAL_POSITION")
+            for qualified in names:
+                schema, name = qualified.split(".")
+                comment = descriptions[qualified][0][2] or ""
+                if len(comment.encode("utf-8")) > self.limits.max_batch_bytes:
                     raise LightGraphError("metadata_size_limit")
-                columns.append(ColumnSpec(name=cname, data_type=dtype, nullable=nullable == "YES", comment=annotation or ""))
-            if not columns or qualified in self.allowed_columns and not set(self.allowed_columns[qualified]) <= {c.name for c in columns}:
-                raise LightGraphError("authorized_column_unavailable")
-            table = TableSpec(source_id=self.source_id, schema=schema, name=name, columns=columns, comment=comment)
-            tables.append(table)
-            self.stats.catalog_queries += 1
-            cursor.execute("SELECT tc.CONSTRAINT_NAME, tc.CONSTRAINT_TYPE, k.COLUMN_NAME, k.ORDINAL_POSITION, k.REFERENCED_TABLE_SCHEMA, k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME FROM information_schema.TABLE_CONSTRAINTS tc JOIN information_schema.KEY_COLUMN_USAGE k ON tc.CONSTRAINT_SCHEMA=k.CONSTRAINT_SCHEMA AND tc.TABLE_NAME=k.TABLE_NAME AND tc.CONSTRAINT_NAME=k.CONSTRAINT_NAME WHERE tc.TABLE_SCHEMA=%s AND tc.TABLE_NAME=%s AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY','UNIQUE','FOREIGN KEY') ORDER BY tc.CONSTRAINT_NAME,k.ORDINAL_POSITION", (schema, name))
-            constraints[qualified] = cursor.fetchall()
-        catalog = {t.qualified_name: t for t in tables}
+                columns = []
+                self._physical_column_names[qualified] = set()
+                for cname, dtype, nullable, annotation in columns_by_table[qualified]:
+                    self._physical_column_names[qualified].add(cname)
+                    if qualified in self.allowed_columns and cname not in self.allowed_columns[qualified]:
+                        continue
+                    if len((annotation or "").encode("utf-8")) > self.limits.max_batch_bytes:
+                        raise LightGraphError("metadata_size_limit")
+                    columns.append(ColumnSpec(name=cname, data_type=dtype, nullable=nullable == "YES",
+                                              comment=annotation or ""))
+                if not columns or not set(self.allowed_columns.get(qualified, ())) <= {c.name for c in columns}:
+                    raise LightGraphError("authorized_column_unavailable")
+                tables.append(TableSpec(source_id=self.source_id, schema=schema, name=name,
+                                        columns=columns, comment=comment))
+            constraints.update(self._catalog_rows(cursor, names,
+                "t.CONSTRAINT_NAME, t.CONSTRAINT_TYPE, k.COLUMN_NAME, k.ORDINAL_POSITION, "
+                "k.REFERENCED_TABLE_SCHEMA, k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME",
+                "information_schema.TABLE_CONSTRAINTS t JOIN information_schema.KEY_COLUMN_USAGE k "
+                "ON t.CONSTRAINT_SCHEMA=k.CONSTRAINT_SCHEMA AND t.TABLE_SCHEMA=k.TABLE_SCHEMA "
+                "AND t.TABLE_NAME=k.TABLE_NAME AND t.CONSTRAINT_NAME=k.CONSTRAINT_NAME "
+                "AND ((t.CONSTRAINT_TYPE='FOREIGN KEY') = (k.REFERENCED_TABLE_NAME IS NOT NULL))",
+                where=" AND t.CONSTRAINT_TYPE IN ('PRIMARY KEY','UNIQUE','FOREIGN KEY')",
+                order=" ORDER BY t.TABLE_SCHEMA,t.TABLE_NAME,t.CONSTRAINT_NAME,k.ORDINAL_POSITION"))
+        catalog = {self._catalog_name(t.qualified_name): t for t in tables}
         for table in tables:
             groups = {}
             for row in constraints[table.qualified_name]:
@@ -412,11 +450,11 @@ class MySQLSource(SourceAdapter):
                     if len(targets) != 1:
                         raise LightGraphError("constraint_metadata_unsupported")
                     schema, remote = next(iter(targets))
-                    target = catalog.get(f"{schema}.{remote}")
+                    target = catalog.get(self._catalog_name(f"{schema}.{remote}"))
                     remote_columns = [r[6] for r in rows]
                     if target is not None and all(c in target.column_names for c in remote_columns):
                         table.foreign_keys.append(ForeignKeySpec(name=name, columns=local,
-                            target_schema=schema, target_table=remote, target_columns=remote_columns))
+                            target_schema=target.schema_name, target_table=target.name, target_columns=remote_columns))
         return tables
 
     def _interrupt(self, *, allow_broken=False, target=None):
@@ -448,10 +486,12 @@ class MySQLSource(SourceAdapter):
 
     def _reconnect(self):
         def adopt(replacement):
+            if self._ignore_name_case != replacement._ignore_name_case:
+                raise LightGraphError('source_catalog_changed')
             for field in ('_connection', '_control', '_connection_id', '_manifest',
                           '_tables', '_physical_column_names', 'compiler'):
                 setattr(self, field, getattr(replacement, field))
-            self._closed = self._broken = self._cancelled = self._data_closed = False
+            self._closed = self._broken = self._data_closed = False
             replacement._closed = replacement._disposed = True
             replacement._reopen = None
         reconnect_at_boundary(self, engine='mysql', discard=self._close_connections, adopt=adopt)
@@ -698,7 +738,6 @@ class MySQLSource(SourceAdapter):
             finished = False
             reconnect_allowed = False
             timed_out = threading.Event()
-            self._cancelled = False
             started = time.monotonic()
             self.stats.queries += 1
             timeout_ms = self._effective_timeout_ms()
@@ -719,7 +758,7 @@ class MySQLSource(SourceAdapter):
                     cursor.execute(sql, query.parameters)
                 columns = tuple(col[0] for col in cursor.description)
                 yield from cursor_batches(cursor, limits=self.limits, columns=columns,
-                    row_limit=row_limit or self.limits.max_result_rows, stats=self.stats,
+                    row_limit=self.limits.max_result_rows if row_limit is None else row_limit, stats=self.stats,
                     deadline=started + timeout_ms / 1000, timeout_ms=timeout_ms,
                     cancelled=lambda: self._cancelled, budget=self.query_budget)
                 if self._cancelled:
@@ -772,6 +811,7 @@ class MySQLSource(SourceAdapter):
             raise LightGraphError("query_cancel_target_forbidden")
         self._cancelled = True
         self._reconnect_allowed = False
+        self._reconnect_blocked = True
         # Revoke reuse before I/O: cancellation can race with query completion.
         self._broken = True
         try:

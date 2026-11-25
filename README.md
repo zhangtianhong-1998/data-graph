@@ -11,12 +11,14 @@
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.lock
-.venv/bin/python -m pip install -e '.[test]'
+.venv/bin/python -m pip install --no-deps -e .
 .venv/bin/python scripts/bootstrap_harness.py
 npm --prefix src/workbench ci
 npm --prefix src/workbench run build
 .venv/bin/lightgraph serve --port 8001
 ```
+
+运行完整回归测试时，先执行 `.venv/bin/python -m pip install -r requirements-test.lock`，再执行 `.venv/bin/python -m pip install --no-deps -e '.[test]'`。维护旧版 AgentScope 发现接口时可单独安装 `.[legacy-discovery]`。
 
 Windows 使用 `.venv\Scripts\python.exe` 和 `.venv\Scripts\lightgraph.exe`。内核启动器按当前 Python 的 scripts 安装目录解析，兼容虚拟环境与全局 Python 的 `Scripts` 布局。跨平台安装、原生内核及模拟模型测试由 GitHub Actions 执行，客户部署仍需单独验证。
 
@@ -248,6 +250,8 @@ output_dir: ./runs/graph
 大工具回复会保存为本地结果材料，模型先接收有上限的摘要，再按字段和页面读取需要的内容；材料读取不重查数据库。每轮模型调用前，还会整理过大的历史结果与已执行草稿参数，保留原始事件和恢复入口。多轮累积继续交给 Harness 原生摘要压缩。这些处理自动生效，无需增加配置；`working_context_tokens: null` 关闭的是原生摘要压缩，单份结果与历史大内容的限制仍保留。详见[工具结果与上下文管理](design/lightweight_graph/CONTEXT_MATERIALS_20261110.md)。
 
 ## 运行与产物
+
+独立 YAML 启用 `workflow.enabled` 后，`run` 和 `build-graph` 按工作流的分支与合并顺序执行。相对路径以 YAML 所在目录为准，运行记录、各分支检查点和发布图写入配置的 `output_dir`。引用另一个工作台项目的图时，请使用已注册的项目配置，以便核对来源项目的当前授权。
 
 `run`、`discover`、`build-graph` 和工作台使用同一个 Harness 入口，没有旧发现引擎回退：
 

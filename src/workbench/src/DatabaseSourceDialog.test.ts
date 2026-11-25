@@ -403,7 +403,8 @@ describe('数据库连接弹窗', () => {
 
 
 const savedSource: SourceConfig = { id: 'saved-source', kind: 'gauss_database', allowed_tables: ['analytics.metrics'], credential_mode: 'session', dsn_env: 'PROJECT_DSN' }
-const savedFields = { kind: 'gauss_database', host: 'saved.example.invalid', port: 8000, database: 'saved_db', username: 'saved_reader', password: ' test @:/password ', schema: 'analytics', sslmode: 'prefer' }
+const savedFields = { kind: 'gauss_database', host: 'saved.example.invalid', port: 8000, database: 'saved_db', username: 'saved_reader', password: '', schema: 'analytics', sslmode: 'prefer' }
+const savedBinding = { store: 'profile', key: 'saved-source', stamp: 'a'.repeat(64) }
 function reopenSource(source = savedSource) { app?.unmount(); root.remove(); mount(source) }
 
 describe('数据库连接本机保存与恢复', () => {
@@ -440,7 +441,7 @@ describe('数据库连接本机保存与恢复', () => {
     expect(api.request.mock.calls[0]![0]).toBe('/projects/dialog-test/database/connections/saved-source')
     expect(element('.dialog-feedback').textContent).toContain('正在加载已保存连接')
     expect(button('测试连接').disabled).toBe(true)
-    loading.resolve({ saved: true, connection: savedFields })
+    loading.resolve({ saved: true, connection: savedFields, saved_binding: savedBinding })
     await vi.waitFor(() => expect(button('测试连接').disabled).toBe(false))
     expect(element<HTMLInputElement>('#database-id').value).toBe('saved-source')
     expect(element<HTMLTextAreaElement>('#database-tables').value).toBe('analytics.metrics')
@@ -449,22 +450,45 @@ describe('数据库连接本机保存与恢复', () => {
     expect(element<HTMLInputElement>('#database-name').value).toBe(savedFields.database)
     expect(element<HTMLInputElement>('#database-schema').value).toBe(savedFields.schema)
     expect(element<HTMLInputElement>('#database-username').value).toBe(savedFields.username)
-    expect(element<HTMLInputElement>('#database-password').value).toBe(savedFields.password)
+    expect(element<HTMLInputElement>('#database-password').value).toBe('')
     expect(element<HTMLSelectElement>('#database-sslmode').value).toBe('prefer')
     expect(button('删除已保存连接')).toBeTruthy()
     expect(onConnected).not.toHaveBeenCalled()
     expect(api.request).toHaveBeenCalledOnce()
   })
 
-  it.each(['jdbc:gaussdb://db.example.invalid:8000/analytics', 'postgresql://reader:fake@db.example.invalid:8000/analytics'])('恢复保存的连接串：%s', async dsn => {
-    api.request.mockResolvedValueOnce({ saved: true, connection: { kind: 'gauss_database', dsn, username: 'reader', password: 'fake', schema: 'analytics', sslmode: 'require' } })
+  it('用已保存的连接串重新选表和提交，不必重新输入连接串', async () => {
+    api.request.mockResolvedValueOnce({ saved: true, format: 'dsn', saved_binding: savedBinding, connection: { kind: 'gauss_database', dsn: '', schema: 'analytics', sslmode: 'require' } })
     reopenSource()
     await vi.waitFor(() => expect(root.querySelector('#database-dsn')).not.toBeNull())
-    expect(element<HTMLInputElement>('#database-dsn').value).toBe(dsn)
+    expect(element<HTMLInputElement>('#database-dsn').value).toBe('')
     expect(element<HTMLInputElement>('#dsn-schema').value).toBe('analytics')
     expect(element<HTMLSelectElement>('#database-sslmode').value).toBe('require')
-    if (dsn.startsWith('jdbc:')) expect(element<HTMLInputElement>('#database-password').value).toBe('fake')
     expect(element<HTMLTextAreaElement>('#database-tables').value).toBe('analytics.metrics')
+    await inputValue('#database-tables', 'analytics.regions')
+    api.request.mockResolvedValueOnce({ config: {}, metadata: {} })
+    element('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await vi.waitFor(() => expect(onConnected).toHaveBeenCalledOnce())
+    const connect = api.request.mock.calls.find(call => call[0].endsWith('/database/connect'))!
+    expect(JSON.parse(connect[1].body)).toMatchObject({ connection: savedBinding, allowed_tables: ['analytics.regions'] })
+  })
+
+  it('编辑已保存的连接后，用新主机和新密码连接', async () => {
+    api.request.mockResolvedValueOnce({ saved: true, format: 'fields', saved_binding: savedBinding, connection: savedFields })
+    reopenSource()
+    await vi.waitFor(() => {
+      expect(element<HTMLInputElement>('#database-host').value).toBe(savedFields.host)
+      expect(button('测试连接').disabled).toBe(false)
+    })
+    await inputValue('#database-host', 'replacement.example.invalid')
+    await inputValue('#database-password', 'replacement-password')
+    api.request.mockResolvedValueOnce({ config: {}, metadata: {} })
+    element('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await vi.waitFor(() => expect(onConnected).toHaveBeenCalledOnce())
+    const connect = api.request.mock.calls.find(call => call[0].endsWith('/database/connect'))!
+    const { connection } = JSON.parse(connect[1].body)
+    expect(connection).toMatchObject({ host: 'replacement.example.invalid', password: 'replacement-password' })
+    expect(connection).not.toHaveProperty('stamp')
   })
 
   it('未保存过的来源仍可填写，不显示删除按钮', async () => {
@@ -582,13 +606,14 @@ describe('未连接成功的数据库草稿', () => {
     await vi.waitFor(() => expect(element('.draft-feedback').textContent).toContain('已保存到本机'))
     const saved = JSON.parse(api.draftRequest.mock.calls.filter(call => call[1]?.method === 'PUT').at(-1)![1].body)
     app?.unmount(); root.remove()
-    api.draftRequest.mockResolvedValueOnce({ saved: true, ...saved })
+    saved.draft.connection.dsn = ''
+    saved.draft.connection.password = ''
+    api.draftRequest.mockResolvedValueOnce({ saved: true, ...saved, saved_binding: { store: 'draft', key: 'new', stamp: 'b'.repeat(64) } })
     mount()
     await vi.waitFor(() => expect(root.querySelector('#database-dsn')).not.toBeNull())
-    expect(element<HTMLInputElement>('#database-dsn').value).toBe('jdbc:gaussdb://partial')
+    expect(element<HTMLInputElement>('#database-dsn').value).toBe('')
     expect(element<HTMLInputElement>('#database-id').value).toBe('new-draft')
-    expect(element<HTMLInputElement>('#database-username').value).toBe('draft-reader')
-    expect(element<HTMLInputElement>('#database-password').value).toBe(' secret :@+= ')
+    expect(root.querySelector('#database-password')).toBeNull()
     expect(element<HTMLTextAreaElement>('#database-tables').value).toContain('public.organizations')
     expect(element<HTMLInputElement>('#database-allow-fact-data').checked).toBe(true)
     expect(api.request).not.toHaveBeenCalled()

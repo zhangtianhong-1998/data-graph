@@ -11,7 +11,7 @@ from .store_sqlite import normalize_term
 _CANDIDATES = 5
 
 
-def _vector_neighbors(retriever, fragments, cohorts):
+def _vector_neighbors(retriever, fragments, cohorts, proposed_ids):
     """Return per-mention neighbors and unique first places in each semantic field."""
     unavailable = [None] * len(fragments)
     if retriever.embedder is None:
@@ -33,10 +33,11 @@ def _vector_neighbors(retriever, fragments, cohorts):
     neighbors = [({}, {}) for _ in valid]
     # Names and descriptions represent the entity itself. A combined card can
     # match a neighboring entity's name and cannot corroborate the link.
+    eligible_names = [proposed_ids[index] for index in valid]
     for field in ('name', 'description'):
         batches = retriever.vectors.search_batch(vectors[valid], scopes=cohorts, top_k=_CANDIDATES + 1,
                                                  field=field, positive_only=False, with_peer_reference=True)
-        for (ranked, leaders), hits in zip(neighbors, batches):
+        for (ranked, leaders), hits, proposals in zip(neighbors, batches, eligible_names):
             # Flat scores in a field, including a singleton, do not distinguish
             # any entity. Never display an arbitrary subset of a tied group.
             if len(hits) < 2 or hits[0]['score'] == hits[-1]['score']:
@@ -46,10 +47,12 @@ def _vector_neighbors(retriever, fragments, cohorts):
                     break
                 # A distant query also has a nearest node. Keep a proposal
                 # only if the query enters its local graph neighborhood.
-                if hit['peer_score'] is None or hit['score'] < hit['peer_score']:
-                    continue
                 nid = hit['node_id']
-                if nid == hits[0]['node_id'] and hit['score'] > hits[1]['score']:
+                is_leader = nid == hits[0]['node_id'] and hit['score'] > max(hits[1]['score'], 0)
+                confirmed_name = is_leader and proposals == {nid}
+                if not confirmed_name and (hit['peer_score'] is None or hit['score'] < hit['peer_score']):
+                    continue
+                if is_leader:
                     leaders.setdefault(nid, []).append(field)
                 if nid not in ranked or ranked[nid]['score'] < hit['score']:
                     ranked[nid] = {'node_id': nid, 'kind': hit['kind'], 'score': hit['score'],
@@ -74,7 +77,9 @@ def link_mentions(retriever, fragments, cohorts, *, paraphrases=None):
                                 if name.strip() and normalize_term(name) != normalize_term(text))) for text in fragments]
     exact = retriever.index.exact_names((name for group in terms for name in group), scopes=cohorts,
                                         limit_per_term=_CANDIDATES)
-    neighbors = _vector_neighbors(retriever, fragments, cohorts)
+    proposed_ids = [{hit['node_id'] for name in names for hit in exact.get(normalize_term(name), ())}
+                    for names in terms]
+    neighbors = _vector_neighbors(retriever, fragments, cohorts, proposed_ids)
     for result, names, vector_hits in zip(results, terms, neighbors):
         ranked, leaders = vector_hits if vector_hits is not None else ({}, {})
         matched_ids = set()

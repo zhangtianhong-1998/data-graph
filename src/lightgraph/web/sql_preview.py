@@ -1,6 +1,7 @@
 """Draft a query with the stock DSH kernel. This module has no source adapter."""
 from __future__ import annotations
 
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from dataclasses import replace
 import json
 import os
@@ -12,14 +13,13 @@ import time
 import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.qualify import qualify
-from sqlglot.optimizer.scope import traverse_scope
 import yaml
 
 from lightgraph.construction.harness import SDK_CORE_IDS, _base_profile, _sdk_factory, model_provider, resolved_options
 from lightgraph.construction.runner import runtime_options
 from lightgraph.discovery.token_estimation import estimate_tokens, prompt_token_limit
 from lightgraph.errors import LightGraphError
-from lightgraph.query.guard import _strict_parser_type
+from lightgraph.query.guard import _strict_parser_type, checked_query_scopes, checked_tokens
 
 
 _INSTRUCTIONS = """Draft one read-only SQL query answering the question in the supplied graph context.
@@ -60,13 +60,14 @@ def _sql_result(text, catalogs):
         dialect, tables = catalogs[value['source_id']]
         dialect_cls = sqlglot.Dialect.get_or_raise(dialect)
         parser = _strict_parser_type(dialect_cls.parser_class)(dialect=dialect_cls)
-        statements = parser.parse(dialect_cls.tokenize(sql), sql)
+        statements = parser.parse(checked_tokens(dialect, sql), sql)
         if len(statements) != 1 or not isinstance(statements[0], exp.Query):
             raise ValueError
         tree = statements[0]
-        if any(isinstance(n, (exp.DML, exp.DDL, exp.Into, exp.Lock, exp.Command, exp.Anonymous)) for n in tree.walk()):
+        if any(isinstance(n, (exp.DML, exp.DDL, exp.Into, exp.Lock, exp.Command, exp.Anonymous,
+                              exp.Parameter, exp.Placeholder)) for n in tree.walk()):
             raise ValueError
-        referenced = [src for scope in traverse_scope(tree) for _, src in scope.selected_sources.values()
+        referenced = [src for scope in checked_query_scopes(tree) for _, src in scope.selected_sources.values()
                       if isinstance(src, exp.Table)]
         if not referenced or any(t.catalog or t.name not in tables.get(t.db, {}) for t in referenced):
             raise ValueError
@@ -74,7 +75,7 @@ def _sql_result(text, catalogs):
             raise ValueError
         qualify(tree, dialect=dialect, schema=tables, infer_schema=False)
         return {'status': 'generated', 'sql': sql, 'source_id': value['source_id'], 'dialect': dialect}
-    except (ValueError, AttributeError, KeyError, TypeError, sqlglot.errors.SqlglotError, RecursionError):
+    except (LightGraphError, ValueError, AttributeError, KeyError, TypeError, sqlglot.errors.SqlglotError, RecursionError):
         raise LightGraphError('sql_preview_invalid_output') from None
 
 
@@ -118,12 +119,22 @@ def draft_sql(config, context, key=None):
             dsh_home=directory, cwd=directory, runtime_cwd=directory, dsh_bin=options.dsh_bin,
             env={options.api_key_env: key}, initialize_timeout_seconds=min(remaining, 60),
             request_timeout_seconds=remaining, shutdown_timeout_seconds=5)
-        # The notification stream may remain idle after SDK initialization.
-        timer = threading.Timer(remaining, runtime.close)
-        timer.daemon = True
-        timer.start()
+        # The SDK notification stream and shutdown can each stall. Bound the
+        # caller's wait independently of whether closing the transport wakes it.
+        completed = Future()
+
+        def run_model():
+            try:
+                completed.set_result(runtime.run(prompt))
+            except Exception as exc:
+                completed.set_exception(exc)
+
+        threading.Thread(target=run_model, daemon=True).start()
         try:
-            result = runtime.run(prompt)
+            try:
+                result = completed.result(timeout=max(0, deadline - time.monotonic()))
+            except FutureTimeout:
+                raise LightGraphError('sql_preview_timeout') from None
             if result.finish_reason != 'completed':
                 raise LightGraphError('sql_preview_model_failed')
             if model.max_response_bytes and len(result.final_response.encode('utf-8')) > model.max_response_bytes:
@@ -136,6 +147,6 @@ def draft_sql(config, context, key=None):
                 raise LightGraphError('sql_preview_timeout') from None
             raise LightGraphError('sql_preview_model_failed') from None
         finally:
-            timer.cancel()
-            timer.join()
-            runtime.close()
+            closer = threading.Thread(target=runtime.close, daemon=True)
+            closer.start()
+            closer.join(timeout=max(0, min(5, deadline - time.monotonic())))

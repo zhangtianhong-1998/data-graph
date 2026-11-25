@@ -4,7 +4,9 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 import json
+from contextlib import closing
 import errno
+import sqlite3
 import shutil
 import tempfile
 import time
@@ -104,6 +106,7 @@ def _observations(item, key_names=()):
                            'aliases', 'row_context', 'source_row_witness', 'provenance',
                            'execution_origins', 'lookup_matches', 'endpoint_origins', 'identity_origins', 'identity_basis',
                            'identity_decision_refs', 'identity_decision_members', 'identity_decision_endpoints',
+                           'identity_approval_ref', 'reviewed_input_node_id',
                            'inherited_from', 'contributor_id', 'required_scope_refs') if key in support}})
     return result
 
@@ -136,6 +139,57 @@ def active_index(root: Path, expected_generation: str | None = None) -> tuple[Pa
         return path, manifest
     except (OSError, ValueError, KeyError, TypeError):
         raise LightGraphError('retrieval_index_stale') from None
+
+
+def pin_active_index(root: Path, expected_generation=None):
+    """Hold a shared read transaction for the lifetime of a reader of this build."""
+    for _ in range(4):
+        path, manifest = active_index(root, expected_generation)
+        if not manifest.get('reader_leases'):
+            return path, manifest, None
+        lease = None
+        try:
+            lease = sqlite3.connect((path / 'readers.sqlite').resolve().as_uri() + '?mode=ro', uri=True,
+                                    check_same_thread=False)
+            lease.execute('BEGIN')
+            lease.execute('SELECT * FROM readers').fetchall()
+            if json.loads((root / 'current.json').read_text(encoding='utf-8')).get('build') == manifest['build']:
+                return path, manifest, lease
+        except sqlite3.OperationalError:
+            pass
+        if lease:
+            lease.close()
+    raise LightGraphError('retrieval_index_stale')
+
+
+def _publish_index(root, staging, manifest):
+    """Publish under a writer lock. Old clients without reader leases keep their legacy builds."""
+    builds = root.resolve() / 'builds'
+    pointer = root / 'current.json'
+    with closing(sqlite3.connect(staging / 'readers.sqlite')) as db:
+        db.execute('CREATE TABLE readers (id INTEGER)')
+    with closing(sqlite3.connect(root / 'publication.sqlite', timeout=30)) as publisher:
+        publisher.execute('BEGIN IMMEDIATE')
+        try:
+            previous = json.loads(pointer.read_text(encoding='utf-8'))
+        except (FileNotFoundError, ValueError):
+            previous = {}
+        _publish_staging(staging, builds / manifest['build'])
+        atomic_text(pointer, canonical(manifest))
+        # Keep the current build and one predecessor for inspection. A running
+        # query can keep any older build alive, including in another process.
+        for path in builds.iterdir():
+            if path.name in {manifest['build'], (previous.get('build') if isinstance(previous, dict) else None)} or len(path.name) != 32:
+                continue
+            marker = path / 'readers.sqlite'
+            if path.is_symlink() or not marker.is_file() or marker.is_symlink():
+                continue
+            try:
+                with closing(sqlite3.connect(marker.as_uri() + '?mode=rw', uri=True, timeout=0)) as marker_db:
+                    marker_db.execute('BEGIN EXCLUSIVE')
+                shutil.rmtree(path)
+            except (sqlite3.Error, OSError):
+                continue
 
 
 def index_matches_embedder(manifest, embedder):
@@ -276,7 +330,7 @@ def sync_graph_to_retrieval(
 
             seen_terms: set[tuple[str, str, int]] = set()
             def add_term(raw: Any, role: str, is_code: bool = False) -> None:
-                raw_str = str(raw or '').strip()
+                raw_str = ('' if raw is None else str(raw)).strip()
                 norm = normalize_term(raw_str)
                 if not norm:
                     return
@@ -299,7 +353,7 @@ def sync_graph_to_retrieval(
             for observation in observations:
                 if observation.get('identity_decision_refs'):
                     for value in (observation.get('source_identity') or {}).get('values', []):
-                        add_term(str(value), 'identity_code', True)
+                        add_term(value, 'identity_code', True)
             for name in cn_names:
                 add_term(name, 'chinese_name')
             for name in en_names:
@@ -316,7 +370,11 @@ def sync_graph_to_retrieval(
             if embedder is None:
                 continue
             code_str = ' '.join(str(v) for v in (node.get('identity') or {}).values())
-            nbr_str = ' ; '.join(sorted(set(neighbors_by_node.get(nid, [])))[:5])
+            nbr_str = ' ; '.join(sorted(set(neighbors_by_node.get(nid, []))))[:512]
+            # Raw attributes can contain source records. Export their field names only;
+            # approved label and description observations already supply semantic values.
+            properties = sorted({str(name) for support in node.get('supports', [])
+                                 for name in support.get('properties', {})})
             card_parts = [
                 f'[{kind}]',
                 chinese_name or disp,
@@ -324,6 +382,7 @@ def sync_graph_to_retrieval(
                 f'编码:{code_str}' if code_str else '',
                 f'别名:{" ".join(aliases)}' if aliases else '',
                 f'描述:{description}' if description else '',
+                '属性:' + '；'.join(properties)[:1024] if properties else '',
                 f'关联:{nbr_str}' if nbr_str else '',
             ]
             card_text = ' | '.join(part for part in card_parts if part)
@@ -331,7 +390,7 @@ def sync_graph_to_retrieval(
             for field, content in [('all', card_text), ('name', ' | '.join(names)), ('description', description)]:
                 if content:
                     vector_items.append({'node_id': nid, 'kind': kind, 'scope_ref': scope_ref,
-                                         'field': field, 'card_text': content})
+                                         'field': field, 'card_text': content[:4096]})
 
     # A failed embedding or an overlapping sync cannot expose a partially
     # replaced matrix or pair it with another generation's SQLite row indices.
@@ -371,7 +430,6 @@ def sync_graph_to_retrieval(
             unique_texts = len(positions)
         if progress:
             progress('publishing', unique_texts, unique_texts)
-        _publish_staging(staging, builds / build_id)
         synced_at = datetime.now(timezone.utc).isoformat()
         embedder_provider = 'none'
         embedder_model = None
@@ -384,6 +442,7 @@ def sync_graph_to_retrieval(
             'format': 7 if embedder is None else 6,
             'generation': gen_token,
             'build': build_id,
+            'reader_leases': True,
             'cohorts': cohorts,
             'cohort_contexts': cohort_contexts,
             'embedder': model_tag,
@@ -396,7 +455,7 @@ def sync_graph_to_retrieval(
             'vector_rows': len(vector_items),
             'synced_at': synced_at,
         }
-        atomic_text(root / 'current.json', canonical(manifest))
+        _publish_index(root, staging, manifest)
     finally:
         if staging.exists():
             # Cleanup must not replace the original publication error if the

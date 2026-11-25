@@ -129,3 +129,16 @@ def test_interrupted_job_is_recovered_for_its_original_version(tmp_path):
             time.sleep(.01)
         assert recovered['nodes'][0]['id'] == 'before'
         assert client.get(api).json() == {'version_id': latest, 'status': 'not_built'}
+
+
+def test_unrecoverable_version_settles_persisted_job_instead_of_staying_running(tmp_path):
+    import json
+    workspace = Workspace(tmp_path / 'workspace')
+    workspace.create('Analysis', 'p')
+    path = workspace.project_path('p') / 'analytics-jobs' / 'stale.json'
+    path.parent.mkdir()
+    path.write_text(json.dumps({'version_id': 'v_does_not_exist', 'status': 'running', 'business_context': None}))
+    with TestClient(create_app(workspace.root)):
+        recorded = json.loads(path.read_text())
+        assert recorded['status'] == 'failed' and recorded['error_code']
+        assert recorded['version_id'] == 'v_does_not_exist'

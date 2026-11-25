@@ -12,7 +12,7 @@ from lightgraph.construction.paths import io_path, logical_path
 from lightgraph.construction.workspace import read_internal_yaml
 from lightgraph.errors import LightGraphError
 from lightgraph.graph_neighborhood import neighborhood_paths
-from lightgraph.web.graph_view_cache import cached_generation, load_graph_view, remember_graph, view_token
+from lightgraph.web.graph_view_cache import cached_generation, load_graph_view, view_token
 from .graph_payload import listed, canvas_item, canvas_page, hierarchy_display, relation_definitions, MAX_PAGE_BYTES
 
 
@@ -169,7 +169,6 @@ def load_prepared(config, *, root=None, head=None, authorization_root=None):
 
 def load_graph(config):
     graph, generation = load_prepared(config)
-    remember_graph(graph, generation)
     return graph
 
 
@@ -393,8 +392,8 @@ def _focused_page(nodes, edges, focus, hops, offset, limit, traversal='all'):
 
 
 def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", focus="", hops=1,
-               include_candidates=False, traversal='all', prepared_graph=None, business_context=None):
-    if traversal not in ('all', 'chains'):
+               include_candidates=False, traversal='all', prepared_graph=None, business_context=None, review_offset=0):
+    if review_offset < 0 or traversal not in ('all', 'chains'):
         raise LightGraphError('graph_page_invalid')
     if layer not in {"business", "metadata", "provenance", "all"} or offset < 0 or not 1 <= limit <= 1000 or hops not in {1, 2}:
         raise LightGraphError("graph_selection_invalid")
@@ -447,14 +446,16 @@ def graph_page(config, *, layer="business", offset=0, limit=240, q="", kind="", 
             "neighborhood_truncated": bool(focus and (len(page) < len(selected) or len(local_edges) < len(page_edges))),
             "business_context": business_context,
             "include_candidates": include_candidates, "candidate_view_available": True,
-            "alignment_candidates": graph.get('candidate_identity_merges', [])[:200] if include_candidates else [],
-            "definition_conflicts": graph.get('definition_conflicts', [])[:200] if include_candidates else [],
+            "alignment_candidates": graph.get('candidate_identity_merges', [])[review_offset:review_offset+200] if include_candidates else [],
+            "definition_conflicts": graph.get('definition_conflicts', [])[review_offset:review_offset+200] if include_candidates else [],
             "merged_observation_nodes": graph.get("merged_observation_nodes", 0),
             "pending_alignment_count": len(graph.get('candidate_identity_merges', [])),
             "pending_definition_count": len(graph.get('definition_conflicts', [])),
-            "unresolved_relations": [_listed(item) for item in graph.get('unresolved_relations', [])[:200]] if include_candidates else [],
+            "unresolved_relations": [_listed(item) for item in graph.get('unresolved_relations', [])[review_offset:review_offset+200]] if include_candidates else [],
+            "review_offset": review_offset, "review_page_size": 200,
+            "pending_cycle_count": len(graph.get('context_cycle_diagnostics', [])),
             "pending_relation_count": len(graph.get('unresolved_relations', [])),
-            "context_cycle_diagnostics": graph.get('context_cycle_diagnostics', [])[:200] if include_candidates else [],
+            "context_cycle_diagnostics": graph.get('context_cycle_diagnostics', [])[review_offset:review_offset+200] if include_candidates else [],
             "display_schema": vocabulary(graph), "semantic_origin": "agent_authored", "complete_batches": True}
 
 
@@ -510,28 +511,27 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
                              "source_binding": location, "binding": source,
                              "scope_ref": source.get('scope_ref', 'public')})
 
-    def property_origins(node, name, value):
-        origins = []
-        fallback_label = not any(support.get('label') is not None for support in node.get('supports', []))
+    def property_origins(node):
+        indexed = {}
+        fallback = not any(s.get('label') is not None for s in node.get('supports', []))
         for support in node.get('supports', []):
-            if name == 'label':
-                matches = support.get('label') == value or fallback_label and node['label'] == value
-            elif name == 'alias':
-                matches = value in support.get('aliases', [])
-            else:
-                matches = canonical(value) in {canonical(item) for item in support.get('properties', {}).get(name, [])}
-            if matches:
-                origin = {**support.get('provenance', {}), 'scope_ref': support['scope_ref']}
-                for key in ('row_context', 'business_context', 'observation_id', 'execution_origins', 'identity_origins'):
-                    if key in support:
-                        origin[key] = support[key]
-                mapped = [obs for obs in support.get('property_observations', [])
-                          if obs['property'] == name and canonical(obs['value']) == canonical(value)]
-                if mapped:
-                    origin['property_observations'] = mapped
-                if origin not in origins:
-                    origins.append(origin)
-        return origins
+            values = {**support.get('properties', {}), 'label': [node['label'] if fallback else support.get('label')],
+                      'alias': support.get('aliases', [])}
+            provenance = {**support.get('provenance', {}), 'scope_ref': support['scope_ref']}
+            for key in ('row_context', 'business_context', 'observation_id', 'execution_origins', 'identity_origins'):
+                if key in support:
+                    provenance[key] = support[key]
+            observations = {}
+            for item in support.get('property_observations', []):
+                observations.setdefault((item['property'], canonical(item['value'])), []).append(item)
+            base_key = canonical(provenance)
+            for name, items in values.items():
+                for value in items:
+                    key = (name, canonical(value))
+                    mapped = observations.get(key)
+                    origin = {**provenance, 'property_observations': mapped} if mapped else provenance
+                    indexed.setdefault(key, {}).setdefault(canonical(origin) if mapped else base_key, origin)
+        return indexed
 
     def support_origin(support):
         return {**support.get('provenance', {}), 'scope_ref': support['scope_ref'],
@@ -551,9 +551,10 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             if not inspect_properties:
                 continue
             properties = {**node.get("properties", {}), "label": node.get("label_variants") or [node["label"]], "alias": node.get("aliases", [])}
+            indexed_origins = property_origins(node)
             for name, values in properties.items():
                 for value in values:
-                    origins = property_origins(node, name, value)
+                    origins = list(indexed_origins.get((name, canonical(value)), {}).values())
                     groups = {}
                     for origin in origins:
                         # Physical column bindings belong to the citation. Equal
@@ -620,8 +621,13 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
     from lightgraph.construction.node_standardizer import standardize_node_details
     catalog_tables = _catalog_tables_for_config(config) if prepared_graph is None else []
     definitions = graph.get("definitions", {})
+    page_values = None
+    if entity_id and total_facts > 50:
+        page_values = {(fact['payload']['name'], canonical(fact['payload']['value']))
+                       for fact in facts if fact['fact_kind'] == 'PropertyValue'}
     standard_nodes = [
-        standardize_node_details(node, definitions=definitions, catalog_tables=catalog_tables)
+        standardize_node_details(node, definitions=definitions, catalog_tables=catalog_tables,
+                                 visible_values=page_values if node['id'] == entity_id else None)
         for node in graph["nodes"] if node["id"] in endpoints
     ]
     return {"version_id": graph.get("version_id"), "business_context": business_context,

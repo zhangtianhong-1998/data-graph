@@ -387,7 +387,7 @@ def test_cancel_probe_cannot_be_satisfied_by_short_statement_timeout(monkeypatch
 
     # Replace only this adapter's timer; QueryBudget has independent deadlines.
     monkeypatch.setattr("lightgraph.sources.gauss.threading", SimpleNamespace(
-        Timer=ProbeTimer, Event=threading.Event, RLock=threading.RLock,
+        Timer=ProbeTimer, Event=threading.Event, Lock=threading.Lock, RLock=threading.RLock,
     ))
 
     class Cancelled(Exception):sqlstate="57014"
@@ -607,7 +607,7 @@ def test_automatic_probe_does_not_wait_forever_for_stuck_cancel(monkeypatch):
             return True
 
     monkeypatch.setattr('lightgraph.sources.gauss.threading', SimpleNamespace(
-        Timer=StuckTimer, Event=threading.Event, RLock=threading.RLock))
+        Timer=StuckTimer, Event=threading.Event, Lock=threading.Lock, RLock=threading.RLock))
     class Cancelled(Exception):
         sqlstate = '57014'
     class ProbeCursor(Cursor):
@@ -629,3 +629,33 @@ def test_automatic_probe_does_not_wait_forever_for_stuck_cancel(monkeypatch):
                     connect_factory=lambda _: db, probe_runtime_limits=True)
     assert db.closed
     assert len(timers) == 1 and 0 < timers[0].join_timeout <= 2
+
+
+def test_driver_binds_only_parameters_and_keeps_percent_in_names_and_text():
+    from lightgraph.query.compiler import postgres_driver_sql
+    from lightgraph.query.guard import ValidatedQuery
+    query = ValidatedQuery("""SELECT "share%(p0)s", '%(p0)s', :p0""", {'p0': 'value'})
+    assert postgres_driver_sql(query) == "SELECT \"share%%(p0)s\", '%%(p0)s', %(p0)s"
+
+
+def test_fixed_width_server_cursor_uses_bounded_fetches():
+    from types import SimpleNamespace
+    from lightgraph.contracts import QueryLimits
+    from lightgraph.sources.base import QueryStats, cursor_batches
+    class FixedCursor:
+        def __init__(self):
+            self.values = iter((i,) for i in range(10000))
+            self.requests = []
+        def fetchmany(self, size):
+            from itertools import islice
+            self.requests.append(size)
+            return list(islice(self.values, size))
+
+    cursor = FixedCursor()
+    width = GaussSource._max_row_bytes([SimpleNamespace(type_code=23)])
+    limits = QueryLimits(max_batch_rows=64, max_batch_bytes=4096)
+    rows = [row[0] for batch in cursor_batches(cursor, limits=limits, columns=('id',),
+            row_limit=10000, stats=QueryStats(), max_row_bytes=width) for row in batch.rows()]
+    assert rows == list(range(10000))
+    assert len(cursor.requests) == 158 and max(cursor.requests) == 64
+    assert GaussSource._max_row_bytes([SimpleNamespace(type_code=25)]) is None

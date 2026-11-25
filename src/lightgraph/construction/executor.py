@@ -163,10 +163,12 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
 
     # Keep a projection only until its last consumer. Lookup indexes retain
     # their backing rows for this snapshot and therefore remain pinned.
-    all_row_mappings = [m for d in draft.entities + draft.relations for m in d.mappings
+    entities_in_goal = [d for d in draft.entities if not goal or not goal.entity_kinds or d.type in goal.entity_kinds]
+    relations_in_goal = [d for d in draft.relations if not goal or not goal.relation_kinds or d.type in goal.relation_kinds]
+    all_row_mappings = [m for d in entities_in_goal + relations_in_goal for m in d.mappings
                         if not is_metadata_mapping(m)]
     remaining_uses = Counter(projection_key(m) for m in all_row_mappings)
-    pinned_projections = {projection_key(lookup) for d in draft.relations for m in d.mappings
+    pinned_projections = {projection_key(lookup) for d in relations_in_goal for m in d.mappings
                           for lookup in (m.source_lookup, m.target_lookup)
                           if lookup is not None and lookup.source_id != '__base_graph__'}
     projection_sizes = {}
@@ -459,6 +461,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         attempted_co_groups.add(gkey)
         valid_peers = {}
         for pkey, peer in peers.items():
+            if blocked_sources(peer):
+                continue
             if pkey in projection_cache or (immutable_projections is not None and immutable_projections.contains(peer.source_id, pkey)):
                 continue
             if remaining_uses.get(pkey, 0) <= 0 and pkey not in pinned_projections:
@@ -647,6 +651,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                 **({'predicate': mapping.predicate} if mapping.predicate else {}),
                 **({'property_columns': dict(mapping.properties)} if mapping.properties else {}),
                 **({'constant_properties': mapping.constant_properties} if mapping.constant_properties else {}),
+                **({'hierarchy_position_roles': mapping.hierarchy_position_roles} if mapping.hierarchy_position_roles else {}),
+                **({'identity_qualifiers': mapping.identity_qualifiers} if mapping.identity_qualifiers else {}),
                 **({'context_columns': mapping.context_columns} if mapping.context_columns else {}),
                 'business_context_mapping': mapping.business_context.model_dump(mode='json')}
         header = workbook_ordinals.get((mapping.source_id, mapping.schema_name, mapping.table), {})

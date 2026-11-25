@@ -196,6 +196,10 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
         'edges_with_missing_definition': 0, 'edges_with_wrong_endpoint_types': 0, 'self_links': 0}
     def unexpected_merge(*args, **kwargs):
         raise AssertionError("observations-only must not replay the merge")
+    # Import the review module before installing either guard. A first import
+    # inside preview would otherwise retain a test stub in the next test.
+    from lightgraph.construction import workflow_overlap
+    monkeypatch.setattr(workflow_overlap, 'merge_construction_graphs', unexpected_merge)
     monkeypatch.setattr('lightgraph.construction.merger.merge_construction_graphs', unexpected_merge)
     def unexpected_rows(*args, **kwargs):
         pytest.fail("type-index preview or reuse opened the graph's Parquet rows")

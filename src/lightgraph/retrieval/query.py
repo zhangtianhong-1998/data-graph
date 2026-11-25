@@ -129,8 +129,8 @@ class RetrieveSubgraphRequest(BaseModel):
                 cohorts = retriever.authorized_cohorts(scopes, self.business_context)
                 names = retriever.index.exact_names([self.query], scopes=cohorts, limit_per_term=1, include_codes=True)
                 if not any(names.values()):
-                    term, direction = question
-                    return retrieve_hierarchy(retriever, self, scopes, term=term, direction=direction)
+                    term, direction, requested_kind = question
+                    return retrieve_hierarchy(retriever, self, scopes, term=term, direction=direction, requested_kind=requested_kind)
         if self.mode in {'auto', 'dimensional'} or (self.mode == 'traverse' and not self.seed_ids):
             from .planned import retrieve_planned
             return retrieve_planned(retriever, self, scopes)

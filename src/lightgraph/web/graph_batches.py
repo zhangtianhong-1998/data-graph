@@ -4,7 +4,8 @@ Node pages cannot carry all cross-page edges. The second pass therefore pages
 the entire edge set of the same authorized generation, without a display cap.
 No source database is opened by this reader.
 """
-from collections import Counter
+from collections import Counter, OrderedDict
+from threading import Lock
 from pathlib import Path
 
 from lightgraph.contracts import digest
@@ -12,6 +13,24 @@ from lightgraph.construction.graph_storage import _graph_digest
 from lightgraph.errors import LightGraphError
 from lightgraph.graph_neighborhood import neighborhood_paths
 from .graph_payload import canvas_page, relation_definitions, MAX_PAGE_BYTES
+
+
+_counts = OrderedDict()
+_counts_lock = Lock()
+
+
+def _kind_counts(generation, nodes):
+    with _counts_lock:
+        counts = _counts.get(generation)
+        if counts is not None:
+            _counts.move_to_end(generation)
+            return counts.copy()
+    counts = dict(Counter(n.get('kind', n.get('layer', '节点')) for n in nodes))
+    with _counts_lock:
+        _counts[generation] = counts
+        if len(_counts) > 64:
+            _counts.popitem(last=False)
+    return counts.copy()
 
 
 def _authorized_view(workspace, pid, config, layer, include_candidates):
@@ -79,7 +98,7 @@ def read_graph_batch(workspace, pid, *, config, layer='business', part='nodes', 
             'total_nodes': total_nodes, 'total_edges': total_edges,
             'matched_nodes': len(nodes), 'matched_edges': len(edges),
             'display_schema': graph.get('display_schema', {}),
-            'kind_counts': dict(Counter(n.get('kind', n.get('layer', '节点')) for n in nodes)),
+            'kind_counts': _kind_counts(version, nodes),
             'focus_node_id': focus or None, 'focus_hops': hops, 'focus_traversal': traversal,
             'focus_neighbor_count': max(0, len(nodes) - 1) if focus else 0,
             'view_scope': 'neighborhood' if focus else 'full_graph',

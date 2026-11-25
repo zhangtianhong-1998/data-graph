@@ -3,6 +3,7 @@ import errno
 import time
 
 from lightgraph.errors import LightGraphError
+from lightgraph.runtime.files import caller_retries_files
 
 
 class WorkflowPersistenceError(LightGraphError):
@@ -31,7 +32,8 @@ def artifact_step(stage, operation, *args, **kwargs):
     delays = (0.05, 0.15, 0.45)
     for attempt in range(1, len(delays) + 2):
         try:
-            return operation(*args, **kwargs)
+            with caller_retries_files():
+                return operation(*args, **kwargs)
         except WorkflowPersistenceError:
             raise
         except (LightGraphError, OSError, ValueError, KeyError, TypeError) as exc:

@@ -187,3 +187,30 @@ def test_concurrent_conflicting_writes_cannot_mix_graph_and_evidence(tmp_path):
     assert len(records) == 1
     data = checkpoints.load_checkpoint(tmp_path, records[0])
     assert data['graph']['nodes'][0]['id'] == data['evidence_records']['ref']
+
+
+@pytest.mark.parametrize('managed', [True, False])
+def test_atomic_text_retries_shared_target_with_one_bounded_policy(tmp_path, monkeypatch, managed):
+    from lightgraph.runtime.retention import atomic_text
+
+    path = tmp_path / 'status.json'
+    atomic_text(path, 'old')
+    attempts = []
+
+    def busy(staged, target):
+        assert target == path
+        assert Path(staged).read_text('utf-8') == 'updated'
+        attempts.append(staged)
+        raise locked(32)
+
+    monkeypatch.setattr(os, 'replace', busy)
+    expected = WorkflowPersistenceError if managed else OSError
+    with pytest.raises(expected):
+        if managed:
+            artifact_step('state_current_write', atomic_text, path, 'updated')
+        else:
+            atomic_text(path, 'updated')
+    assert len(attempts) == 4
+    if not managed:
+        assert len(set(attempts)) == 1
+    assert path.read_text('utf-8') == 'old' and not list(tmp_path.glob('.published-*'))

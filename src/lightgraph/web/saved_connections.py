@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import hmac
 import os
 from pathlib import Path
 import re
@@ -18,6 +19,7 @@ import stat
 import tempfile
 import threading
 
+from lightgraph.runtime.files import system_directory_path
 from cryptography.fernet import Fernet, InvalidToken
 
 from ..errors import LightGraphError
@@ -45,6 +47,7 @@ def _safe_storage_errors():
 
 
 def _safe_path(path: Path) -> None:
+    path = system_directory_path(path)
     for entry in (path, *path.parents):
         if entry.is_symlink():
             raise LightGraphError("saved_connection_path_unsafe")
@@ -121,6 +124,12 @@ class SavedConnections:
         path = self.root / pid / ".connections" / (sid + ".enc")
         _safe_path(path)
         return path
+
+    def edit_stamp(self, pid, kind, key, form):
+        # A durable keyed tag pins the exact form across sessions and restarts.
+        _safe_path(self.key_path)
+        message = json.dumps(['edit-reference-v1', pid, kind, key, form], sort_keys=True).encode()
+        return hmac.digest(_read(self.key_path, 128), message, 'sha256').hex()
 
     def _cipher(self, *, create: bool) -> Fernet:
         _safe_path(self.key_path)

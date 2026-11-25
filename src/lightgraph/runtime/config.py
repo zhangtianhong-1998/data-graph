@@ -77,6 +77,7 @@ class ModelConfig(StrictModel):
     max_tool_calls: int = Field(default=16, ge=1, le=64,
         description="Legacy source-tool allowance; not used by Harness.")
     timeout_seconds: float = Field(default=800, gt=0)
+    output_token_field: Literal["max_tokens", "max_completion_tokens"] | None = None
     max_output_tokens: int = Field(default=65536, gt=0)
     # Read legacy byte settings without presenting them as Harness controls.
     max_prompt_bytes: int | None = Field(default=None, gt=0,
@@ -90,6 +91,13 @@ class ModelConfig(StrictModel):
     max_response_bytes: int | None = Field(default=None, gt=0,
         description="Legacy response-byte guard retained for configuration migration; not applied by Harness.")
     retries: int = Field(default=1, ge=0, le=1)
+
+    @model_serializer(mode='wrap')
+    def serialize_options(self, handler):
+        data = handler(self)
+        if self.output_token_field is None:
+            data.pop('output_token_field', None)  # Keep existing workflow input fingerprints.
+        return data
 
     @field_validator("base_url")
     @classmethod
@@ -292,8 +300,50 @@ class FusionPolicyConfig(StrictModel):
         return self
 
 
+class ReviewedKeyProjection(StrictModel):
+    """One frozen contributor and its two observed columns."""
+    contributor_id: str = Field(min_length=1)
+    graph_digest: str = Field(pattern='^[0-9a-f]{64}$')
+    source_id: str = Field(min_length=1)
+    schema_name: str = Field(alias='schema', min_length=1)
+    table: str = Field(min_length=1)
+    key_column: str = Field(min_length=1)
+    name_column: str = Field(min_length=1)
+
+
+class ReviewedKeyPairRule(StrictModel):
+    """A business approval for individual typed key/name observations in two checkpoints."""
+    approval_ref: str = Field(min_length=1, max_length=256)
+    entity_type: str = Field(min_length=1)
+    projections: tuple[ReviewedKeyProjection, ReviewedKeyProjection]
+    observation_digests: list[str] = Field(min_length=1, max_length=5000)
+
+    @model_validator(mode='after')
+    def bounded_approval(self):
+        a, b = self.projections
+        if (not self.approval_ref.strip() or not self.entity_type.strip() or a.contributor_id == b.contributor_id
+                or any(p.key_column == p.name_column for p in (a, b))
+                or not all(re.fullmatch('[0-9a-f]{64}', token) for token in self.observation_digests)
+                or len(set(self.observation_digests)) != len(self.observation_digests)):
+            raise ValueError('invalid_reviewed_key_pair_rule')
+        return self
+
+
 class MergePolicyConfig(StrictModel):
     """Deterministic safety rules for merging parallel unit and inherited graphs."""
+    reviewed_key_pairs: list[ReviewedKeyPairRule] = Field(default_factory=list, max_length=64)
+
+    @model_serializer(mode='wrap')
+    def serialize_policy(self, handler):
+        data = handler(self)
+        if not self.reviewed_key_pairs:
+            data.pop('reviewed_key_pairs', None)  # Historical checkpoint policy digests.
+        for rule in data.get('reviewed_key_pairs', []):
+            for binding in rule['projections']:
+                if 'schema_name' in binding:
+                    binding['schema'] = binding.pop('schema_name')
+        return data
+
     authority_sources: list[str] = Field(default_factory=list, max_length=64)
     conflict_mode: Literal["strict", "quarantine"] = "quarantine"
     shared_identity_domains: dict[str, list[str]] = Field(default_factory=dict, max_length=128)
@@ -342,6 +392,9 @@ class WorkflowConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_dag(self):
+        policies = [self.merge_policy, *(node.merge_policy for node in self.merge_nodes if node.merge_policy)]
+        if any(rule.approval_ref.strip() == 'simulation_only' for policy in policies for rule in policy.reviewed_key_pairs):
+            raise ValueError('simulated_key_pairs_cannot_be_published')
         unit_ids = [unit.unit_id for unit in self.units]
         merge_ids = [node.node_id for node in self.merge_nodes]
         if len(set(unit_ids)) != len(unit_ids):
@@ -541,7 +594,7 @@ def open_sources(config, *, metadata_only=False, source_credentials=None, isolat
         for s in config.sources:
             if s.kind=="excel_workbook":
                 if not s.path:raise LightGraphError("config_invalid")
-                sources.append(ExcelSource(s.path,source_id=s.id,limits=config.limits,
+                sources.append(ExcelSource(s.path,source_id=s.id,schema_name=s.schema_name,limits=config.limits,
                     header_row=s.header_row,include_hidden=s.include_hidden,query_budget=budget,
                     max_memory_bytes=config.max_working_bytes,metadata_only=metadata_only,
                     allowed_tables=s.allowed_tables or None,allowed_columns=s.allowed_columns))

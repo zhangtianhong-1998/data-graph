@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import threading
 
+from lightgraph.runtime.files import system_directory_path
 from .retention import atomic_text
 
 _sink = ContextVar('lightgraph_run_trace', default=None)
@@ -38,6 +39,7 @@ def _schema_definition(value):
 
 
 def _check_path(path):
+    path = system_directory_path(path)
     for item in (path, *path.parents):
         if item.is_symlink():
             raise OSError('trace_path_invalid')
@@ -87,6 +89,8 @@ class RunTrace:
         self.error_code=None
         self.error_count=0
         self._secrets=set()
+        self._short_tokens=set()
+        self._secret_pattern=None
         self.add_secrets(secrets)
         try:
             _check_path(self.path)
@@ -105,14 +109,44 @@ class RunTrace:
         except (OSError,ValueError,KeyError,TypeError):
             self._failed()
 
-    def add_secrets(self,values):
+    def add_secrets(self,values, *, learned=False):
         """Runtime credentials can be registered without putting them in events."""
         with self.lock:
             if isinstance(values,dict):values=values.values()
             if isinstance(values,str):values=[values]
             for value in values:
                 if hasattr(value,'get_secret_value'):value=value.get_secret_value()
-                if isinstance(value,str) and value:self._secrets.add(value)
+                if not isinstance(value, str) or not value:
+                    continue
+                short = learned and len(value) < 4
+                if value not in self._secrets or (not short and value in self._short_tokens):
+                    if short:
+                        self._short_tokens.add(value)
+                    else:
+                        self._short_tokens.discard(value)
+                    self._secrets.add(value)
+                    self._secret_pattern = None
+
+    def _redact_registered(self, text):
+        if not self._secrets:
+            return text
+        if self._secret_pattern is None:
+            expressions = {}
+            for token in self._secrets:
+                for variant in {token, json.dumps(token, ensure_ascii=False)[1:-1],
+                                json.dumps(token, ensure_ascii=True)[1:-1]}:
+                    literal = re.escape(variant)
+                    # A short value learned from a credential field can be a
+                    # single letter. Its own field and credential syntax are
+                    # redacted separately; redact free-standing matches in prose.
+                    if token in self._short_tokens:
+                        if variant in expressions:
+                            continue
+                        literal = r'(?<!\w)' + literal + r'(?!\w)'
+                    expressions[variant] = literal
+            self._secret_pattern = re.compile('|'.join(
+                expressions[value] for value in sorted(expressions, key=lambda value: (-len(value), value))))
+        return self._secret_pattern.sub(lambda _: _REDACTED, text)
 
     def _learn_credentials(self,value,depth=0):
         # Tool results can themselves contain JSON strings. Learn credential
@@ -121,7 +155,7 @@ class RunTrace:
         if hasattr(value,'model_dump'):value=value.model_dump(mode='json')
         if isinstance(value,dict):
             for key,item in value.items():
-                if _secret_key(key) and isinstance(item,str):self.add_secrets([item])
+                if _secret_key(key) and isinstance(item,str):self.add_secrets([item], learned=True)
                 self._learn_credentials(item,depth+1)
         elif isinstance(value,(list,tuple)):
             for item in value:self._learn_credentials(item,depth+1)
@@ -160,9 +194,7 @@ class RunTrace:
                 joined=''.join(parts)
                 self._learn_credentials(joined)
                 if any(secret in joined for secret in self._secrets):return '[REDACTED: stream contains credentials]'
-            for secret in sorted(self._secrets,key=len,reverse=True):
-                for variant in {secret,json.dumps(secret,ensure_ascii=False)[1:-1]}:
-                    value=value.replace(variant,_REDACTED)
+            value = self._redact_registered(value)
             value=_URI_CREDENTIALS.sub(lambda m:m[1]+_REDACTED+'@',value)
             value=_NAMED_SECRET.sub(lambda m:m[1]+json.dumps(_REDACTED),value)
             return _BEARER.sub(lambda m:m[1]+' '+_REDACTED,value)

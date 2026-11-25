@@ -260,3 +260,26 @@ def test_broader_reviewer_cannot_publish_identity_evidence_into_a_narrower_view(
     ws.save_config('p', config)
     assert 'restricted' not in str(listing(client))
     assert client.get(GRAPH).json()['total_nodes'] == 2
+
+
+def test_late_review_conflict_removes_only_the_uncommitted_graph(client, monkeypatch):
+    from pathlib import Path
+    from lightgraph.errors import LightGraphError
+    from lightgraph.web import publication_identity
+
+    publish(client, [candidate_unit(s, [(s, ['code'])]) for s in ('a', 'b')])
+    original = listing(client)
+    directory = Path(client.app.state.workspace.result_config('p').output_dir) / 'construction' / 'published'
+    before = set(directory.iterdir())
+    authorize = publication_identity.Review.authorize
+
+    def changed_after_prepare(self, workspace, config):
+        if hasattr(self, 'groups'):
+            raise LightGraphError('resolution_version_conflict')
+        return authorize(self, workspace, config)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(publication_identity.Review, 'authorize', changed_after_prepare)
+        response = submit(client, original, original['candidates'][0])
+        assert response.status_code == 409
+    assert listing(client) == original and set(directory.iterdir()) == before

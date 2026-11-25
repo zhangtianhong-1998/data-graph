@@ -45,7 +45,12 @@ def test_incomplete_form_persists_without_connecting_or_changing_config(client,m
     assert client.put(path,headers=headers,json=payload).json()=={'saved':True,'revision':1}
     result=client.get(path,headers=session(client))
     assert result.status_code==200 and result.headers['Cache-Control']=='no-store'
-    assert result.json()=={'saved':True,**payload}
+    restored = result.json()
+    assert restored['revision'] == 1 and restored['draft']['form'] == payload['draft']['form']
+    assert restored['draft']['connection']['dsn'] == restored['draft']['connection']['password'] == ''
+    assert restored['saved_binding']['store'] == 'draft'
+    assert client.put(path, headers=headers, json={'draft':restored['draft'], 'saved_binding':restored['saved_binding'], 'revision':2}).status_code == 200
+    assert client.app.state.saved_connections.load_draft('alpha','new')['draft'] == payload['draft']
     assert client.get('/api/projects/alpha/config').json()==before
     assert client.get('/api/projects/alpha/credentials',headers=headers).json()['database_sources']==[]
     assert client.get('/api/projects/alpha/runs').json()['runs']==[]
@@ -101,7 +106,10 @@ def test_draft_available_after_service_restart(tmp_path):
         first.post('/api/projects',json={'name':'alpha','project_id':'alpha'})
         assert first.put(path,headers=session(first),json=draft_payload()).status_code==200
     with TestClient(create_app(root,frontend_dir=tmp_path/'absent')) as second:
-        assert second.get(path,headers=session(second)).json()=={'saved':True,**draft_payload()}
+        restored = second.get(path,headers=session(second)).json()
+        assert restored['saved'] and restored['saved_binding']['key'] == 'new'
+        assert not restored['draft']['connection']['password'] and not restored['draft']['connection']['dsn']
+        assert second.app.state.saved_connections.load_draft('alpha','new')['draft'] == draft_payload()['draft']
 
 
 @pytest.mark.parametrize('field,value',[('unknown','forbidden'),('rows',[['should not be stored']])])

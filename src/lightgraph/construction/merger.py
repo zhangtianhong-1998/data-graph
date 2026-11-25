@@ -810,6 +810,7 @@ def _merge_contributor_nodes_and_edges(
     # publications retain their decisions; verified stages have already supplied their leaves.
     hierarchy_collapsed = None
     hierarchy_diagnostics = {}
+    review_stats = None
     compatible_namespace = source_namespaces is None or len(source_groups) == 1 and source_namespaces[0] is not None
     if hierarchy_trace is not None:
         hierarchy_trace.start(result)
@@ -818,9 +819,14 @@ def _merge_contributor_nodes_and_edges(
     ):
         if observe_before_hierarchy is not None:
             observe_before_hierarchy([edge_reference(e) for e in result['edges']])
+        reviewed_pairs = None
+        if policy.reviewed_key_pairs:
+            from .reviewed_keys import reviewed_key_groups
+            reviewed_pairs, review_stats = reviewed_key_groups(result, contributors, policy.reviewed_key_pairs, contributor_remaps)
         hierarchy_collapsed = reconcile_hierarchy_projections(
             result, excluded_types=excluded_types, diagnostics=hierarchy_diagnostics, trace=hierarchy_trace,
-            emit_candidates=policy.emit_alignment_candidates)
+            emit_candidates=policy.emit_alignment_candidates, reviewed_pairs=reviewed_pairs, review_stats=review_stats,
+            deduplicate_changed=not (fusion or retained_labels))
     result['definition_conflicts'] = definition_conflict_diagnostics(result)
     if fusion:
         result['fusion_policy'] = fusion.model_dump(mode='json')
@@ -860,6 +866,8 @@ def _merge_contributor_nodes_and_edges(
         counts['hierarchy_replay_collapsed_nodes'] = hierarchy_collapsed
     if hierarchy_diagnostics.get('global_node_inputs'):
         counts['hierarchy_replay_diagnostics'] = hierarchy_diagnostics
+    if review_stats is not None:
+        counts['reviewed_key_pairs'] = dict(review_stats)
     result['fusion_diagnostics'] = counts
     derive_display_graph(result, copy=False)
     record_namespace(result, source_namespaces, source_groups)

@@ -174,3 +174,65 @@ def test_partition_and_user_scope_share_parameter_budget(table):
     original={"all":[{"column":"code","op":"in","values":["a"]*64}]*2}
     with pytest.raises(LightGraphError,match="predicate_values_limit"):
         QueryCompiler([table]).projection(table,["code"],predicate=combine_scope_predicates(original,{"tenant":"x"}))
+
+
+def test_excel_boolean_and_numeric_keys_preserve_types_rows_and_filters(tmp_path):
+    import openpyxl
+    path = tmp_path / 'axes.xlsx'
+    book = openpyxl.Workbook()
+    sheet = book.active
+    sheet.append(['key', 'enabled', 'count'])
+    for value in (True, 1, False, 0):
+        sheet.append([value, type(value) is bool, 7])
+    sheet['C3'].number_format = '0'
+    book.save(path)
+    with ExcelSource(path, schema_name='business', allowed_tables=['business.Sheet']) as source:
+        table, = source.describe()
+        assert [column.data_type for column in table.columns] == ['mixed', 'boolean', 'integer']
+        assert all(not column.comment for column in table.columns)
+        rows = [row[0] for batch in source.project(table, ['key']) for row in batch.rows()]
+        assert [(type(v), v) for v in rows] == [(bool, True), (int, 1), (bool, False), (int, 0)]
+        with source.sheet_row_projection(table, ['key'], predicate={'enabled': True}, limit=8,
+                                         witness_bytes=4096) as (stream, witness):
+            selected = [row[0] for batch in stream for row in batch.rows()]
+            assert [type(value) for value in selected] == [bool, bool]
+            assert [witness({'key': value})['rows'] for value in selected] == [[[2, 2]], [[4, 4]]]
+
+
+def test_excel_streams_rows_past_stale_dimensions(tmp_path):
+    import openpyxl
+    from zipfile import ZipFile
+    original = tmp_path / 'original.xlsx'
+    fixture = tmp_path / 'items.xlsx'
+    book = openpyxl.Workbook()
+    for row in (['key'], ['A'], ['B']):
+        book.active.append(row)
+    book.save(original)
+    with ZipFile(original) as src, ZipFile(fixture, 'w') as out:
+        for info in src.infolist():
+            data = src.read(info)
+            if info.filename == 'xl/worksheets/sheet1.xml':
+                data = data.replace(b'dimension ref="A1:A3"', b'dimension ref="A1:A2"')
+            out.writestr(info, data)
+    with ExcelSource(fixture) as source:
+        table, = source.describe()
+        assert [r for b in source.project(table, ['key']) for r in b.rows()] == [('A',), ('B',)]
+
+
+@pytest.mark.parametrize('dialect', ['postgres', 'mysql'])
+def test_between_checks_temporal_order_before_dialect_binding(dialect):
+    table = TableSpec(source_id='s', name='events', columns=[ColumnSpec(name='at', data_type='timestamptz')])
+    query = QueryCompiler([table], dialect=dialect).projection(table, ['at'], predicate={
+        'column': 'at', 'op': 'between', 'values': ['2026-01-01T09:00:00+08:00', '2026-01-01T02:00:00+00:00']})
+    if dialect == 'postgres':
+        assert query.parameters['p0'] < query.parameters['p1']
+    else:
+        assert query.parameters['p0'] == '2026-01-01T09:00:00+08:00'
+
+
+def test_zero_row_limit_does_not_return_rows(table):
+    with MemorySource([table], {table.qualified_name: [('A', 'one', 1, '2026-01-01')]}) as source:
+        with pytest.raises(LightGraphError, match='invalid_result_limit'):
+            list(source.project(table, ['code'], limit=0))
+        with pytest.raises(LightGraphError, match='result_truncated'):
+            list(source.execute(source.compiler.projection(table, ['code']), row_limit=0))

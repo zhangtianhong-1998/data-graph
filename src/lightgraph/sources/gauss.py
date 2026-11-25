@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from typing import Callable
-import sqlglot
+from lightgraph.query.compiler import postgres_driver_sql
 from lightgraph.contracts import CapabilityManifest, ColumnSpec, ForeignKeySpec, QueryLimits, TableSpec
 from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler
@@ -61,6 +61,7 @@ class GaussSource(SourceAdapter):
         self.metadata_only = metadata_only
         self.allowed_columns = allowed_columns or {}; self.limits = limits or QueryLimits()
         self.stats = _stats if _stats is not None else QueryStats(); self._lock = threading.RLock(); self._depth = 0
+        self._control_lock = threading.Lock()
         self.query_budget = query_budget or QueryBudget()
         self._closed = False; self._cancelled = False; self._tables = []
         self._physical_column_names = {}
@@ -598,20 +599,26 @@ class GaussSource(SourceAdapter):
     def _discard_connection(self, *, reconnect_allowed=False):
         """A failed rollback or late cancellation makes this session unusable."""
         self._manifest.consistent_snapshot = False
-        self._reconnect_allowed = reconnect_allowed
-        if not self._closed:
+        with self._control_lock:
+            self._reconnect_allowed = reconnect_allowed and not self._cancelled
+            if self._closed:
+                return
             self._closed = True
-            try: self._connection.close()
-            except Exception: pass
+            connection = self._connection
+        try: connection.close()
+        except Exception: pass
 
     def _reconnect(self):
         def adopt(replacement):
-            for field in ('_connection', '_manifest', '_tables', '_physical_column_names',
-                          '_lock_timeout_supported', 'compiler'):
-                setattr(self, field, getattr(replacement, field))
-            self._closed = self._cancelled = False
-            replacement._closed = replacement._disposed = True
-            replacement._reopen = None
+            with self._control_lock:
+                if self._cancelled:
+                    raise LightGraphError('query_cancelled')
+                for field in ('_connection', '_manifest', '_tables', '_physical_column_names',
+                              '_lock_timeout_supported', 'compiler'):
+                    setattr(self, field, getattr(replacement, field))
+                self._closed = False
+                replacement._closed = replacement._disposed = True
+                replacement._reopen = None
         reconnect_at_boundary(self, engine='gauss', discard=self._discard_connection, adopt=adopt)
 
     def _begin_snapshot(self):
@@ -703,14 +710,29 @@ class GaussSource(SourceAdapter):
                         finally:
                             self.stats.snapshot_begin_close_seconds += max(0.0, time.monotonic() - close_started)
 
+    @staticmethod
+    def _max_row_bytes(description):
+        """Bound decoded scalar widths from the server cursor's actual types."""
+        # Built-in boolean, int8/int2/int4, oid, float4/8, date, time and timestamps.
+        fixed = {16: 5, 20: 20, 21: 6, 23: 11, 26: 10, 700: 32, 701: 32,
+                 1082: 10, 1083: 16, 1114: 32, 1184: 64}
+        total = 0
+        for column in description:
+            oid = getattr(column, 'type_code', None)
+            width = fixed.get(oid)
+            if oid in {1042, 1043} and getattr(column, 'display_size', None):
+                width = 4 * column.display_size
+            if width is None or width <= 0:
+                return None
+            total += 8 + width
+        return total
+
     def execute(self, query, *, row_limit=None):
         # Reject unauthorized SQL before reconnecting or touching a transaction.
         self.compiler.guard.validate(query.sql, query.parameters)
         with self.snapshot():
-            sql = sqlglot.parse_one(query.sql, read="postgres").sql(dialect="postgres")
-            # psycopg percent escaping applies inside identifiers too.
-            sql = re.sub(r"%(?!\([a-zA-Z0-9_]+\)s)", "%%", sql)
-            start = time.monotonic(); self.stats.queries += 1; self._cancelled = False
+            sql = postgres_driver_sql(query)
+            start = time.monotonic(); self.stats.queries += 1
             cursor = None; timed_out = threading.Event()
             query_connection = self._connection
             timeout_ms = self._effective_timeout_ms()
@@ -729,7 +751,8 @@ class GaussSource(SourceAdapter):
                 with self.stats.measure_sql():
                     cursor.execute(sql, query.parameters)
                 columns = tuple(catalog_value(d.name if hasattr(d, "name") else d[0]) for d in cursor.description)
-                yield from cursor_batches(cursor, limits=self.limits, columns=columns, row_limit=row_limit or self.limits.max_result_rows, stats=self.stats, deadline=start + timeout_ms / 1000, timeout_ms=timeout_ms, cancelled=lambda: self._cancelled, budget=self.query_budget)
+                yield from cursor_batches(cursor, limits=self.limits, columns=columns, row_limit=self.limits.max_result_rows if row_limit is None else row_limit, stats=self.stats, deadline=start + timeout_ms / 1000, timeout_ms=timeout_ms, cancelled=lambda: self._cancelled, budget=self.query_budget,
+                    max_row_bytes=self._max_row_bytes(cursor.description))
                 if self._cancelled: raise LightGraphError('query_cancelled')
                 if timed_out.is_set():
                     raise LightGraphError('query_timeout')
@@ -768,15 +791,29 @@ class GaussSource(SourceAdapter):
                 if stuck_cancel and sys.exc_info()[1] is None:
                     raise LightGraphError('query_cancel_failed')
     def cancel(self, query_id=None):
-        self._cancelled = True
-        self._reconnect_allowed = False
-        self._reconnect_blocked = True
-        if self._closed:
-            return
-        try: self._connection.cancel()
-        except Exception: raise LightGraphError("query_cancel_failed") from None
+        # The snapshot mutex is held during a query. Pin the connection
+        # generation under a separate lock so cancellation can interrupt it.
+        with self._control_lock:
+            self._cancelled = True
+            self._reconnect_allowed = False
+            self._reconnect_blocked = True
+            if self._closed:
+                return
+            connection = self._connection
+        try:
+            connection.cancel()
+        except Exception:
+            with self._control_lock:
+                if self._closed or connection is not self._connection:
+                    return
+            raise LightGraphError("query_cancel_failed") from None
     def close(self):
         with self._lock:
             self._disposed = True
             self._reopen = None
-            if not self._closed: self._connection.close(); self._closed = True
+            with self._control_lock:
+                if self._closed:
+                    return
+                self._closed = True
+                connection = self._connection
+            connection.close()

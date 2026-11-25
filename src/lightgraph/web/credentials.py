@@ -36,7 +36,9 @@ class SessionCredentials:
     def create(self, pid):
         with self._lock:
             self._purge()
-            if len(self._sessions) >= self.max_sessions:
+            # A single project cannot reserve every slot in a shared workspace.
+            project_limit = max(1, self.max_sessions // 4)
+            if len(self._sessions) >= self.max_sessions or sum(s.project_id == pid for s in self._sessions.values()) >= project_limit:
                 raise LightGraphError("credential_session_capacity_reached")
             token = secrets.token_urlsafe(32)
             self._sessions[token] = _Session(pid, self.clock() + self.ttl_seconds)

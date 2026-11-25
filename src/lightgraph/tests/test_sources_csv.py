@@ -161,3 +161,13 @@ def test_mixed_csv_excel_and_database_substitute(tmp_path, monkeypatch):
     finally:
         for source in sources:
             source.close()
+
+
+def test_utf8_bom_does_not_change_authorized_csv_column(tmp_path):
+    path = tmp_path / 'codes.csv'
+    path.write_text('code,label\n01,East\n', encoding='utf-8-sig')
+    with CSVSource(path, **{**FORMAT, 'encoding': 'utf-8'},
+                   allowed_columns={'public.codes': ['code']}) as source:
+        table, = source.describe()
+        assert table.column_names == ['code'] and table.columns[0].comment == ''
+        assert [r for batch in source.project(table, ['code']) for r in batch.rows()] == [('01',)]

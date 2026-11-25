@@ -14,6 +14,19 @@ from lightgraph.web.app import create_app
 from lightgraph.web.graph_batches import read_graph_batch
 
 
+def test_review_page_returns_the_last_unresolved_relation_in_the_same_version():
+    from lightgraph.web.construction_graph import graph_page
+
+    relations = [{'id': str(i), 'reason': 'ambiguous_endpoint'} for i in range(201)]
+    graph = {'nodes': [], 'edges': [], 'unresolved_relations': relations}
+    first = graph_page(None, prepared_graph=graph, include_candidates=True)
+    last = graph_page(None, prepared_graph=graph, include_candidates=True, review_offset=200)
+    assert first['generation'] == last['generation']
+    assert first['pending_relation_count'] == last['pending_relation_count'] == 201
+    assert [r['id'] for r in first['unresolved_relations']] == [str(i) for i in range(200)]
+    assert [r['id'] for r in last['unresolved_relations']] == ['200']
+
+
 def publish_fixture(config, count=5001):
     """Synthetic display fixture only; no source connections or model calls."""
     workspace = GraphWorkspace(Path(config.output_dir) / 'construction', 'synthetic-canvas-check')

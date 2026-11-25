@@ -1,5 +1,6 @@
 """Real CSV/Excel domain tools, with no model calls or legacy proposal runtime."""
 from copy import deepcopy
+from pathlib import Path
 import pytest
 from openpyxl import Workbook
 
@@ -9,6 +10,7 @@ from lightgraph.construction.workspace import dump_yaml, safe_load_yaml
 from lightgraph.runtime.config import RunConfig
 from lightgraph.contracts import ColumnSpec, TableSpec
 from lightgraph.sources import MemorySource
+from lightgraph.errors import LightGraphError
 
 
 def config_for(tmp_path, *, excel=False, **updates):
@@ -356,3 +358,72 @@ def test_mcp_registered_material_arguments_execute_without_dispatch_collision(tm
             assert 'EntityMapping' in encoded
     finally:
         tools.close()
+
+
+@pytest.mark.parametrize('excel', [False, True])
+def test_construction_uses_digest_of_rows_the_adapter_loaded(tmp_path, excel):
+    from lightgraph.runtime.config import open_sources
+    config = config_for(tmp_path, excel=excel)
+    adapters = open_sources(config)
+    try:
+        path = Path(config.sources[0].path)
+        if excel:
+            from openpyxl import load_workbook
+            book = load_workbook(path)
+            book.active['A2'] = 'new'
+            book.save(path)
+        else:
+            with path.open('a', encoding='utf-8') as stream:
+                stream.write('extra,row,at,end\n')
+        tools = ConstructionTools(config, tmp_path / 'work', adapters=adapters)
+        try:
+            with pytest.raises(LightGraphError, match='construction_source_changed'):
+                tools._check_current_inputs()
+        finally:
+            tools.close()
+    finally:
+        for adapter in adapters:
+            adapter.close()
+
+
+def test_readonly_probes_reuse_verified_stamp_but_publication_checks_bytes(tmp_path, monkeypatch):
+    import lightgraph.construction.tools as tooling
+
+    config = config_for(tmp_path)
+    tools = ConstructionTools(config, tmp_path / 'work')
+    try:
+        path = Path(config.sources[0].path)
+        reads = []
+        real_hash = tooling._file_hash
+
+        def record_hash(file):
+            reads.append(file)
+            return real_hash(file)
+
+        monkeypatch.setattr(tooling, '_file_hash', record_hash)
+        tools._check_current_inputs(probe=True)
+        tools._check_current_inputs(probe=True)
+        assert reads.count(path) == 1
+        tools._check_current_inputs()
+        assert reads.count(path) == 2
+        with path.open('a', encoding='utf-8') as stream:
+            stream.write('extra,row,at,end\n')
+        with pytest.raises(LightGraphError, match='construction_source_changed'):
+            tools._check_current_inputs(probe=True)
+    finally:
+        tools.close()
+
+
+@pytest.mark.parametrize('excel', [False, True])
+def test_header_only_snapshot_identifies_the_imported_file(tmp_path, excel):
+    from lightgraph.runtime.config import open_sources
+    config = config_for(tmp_path, excel=excel)
+    adapters = open_sources(config, metadata_only=True)
+    try:
+        path = Path(config.sources[0].path)
+        path.write_bytes(path.read_bytes() + b' ')
+        with pytest.raises(LightGraphError, match='construction_source_changed'):
+            ConstructionTools(config, tmp_path / 'work', adapters=adapters)
+    finally:
+        for adapter in adapters:
+            adapter.close()

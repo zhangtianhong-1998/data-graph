@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 from ..contracts import Coverage, RunReport, RuleSpec
 from ..errors import LightGraphError
+from .files import replace_staged_file
 
 
 def atomic_text(path, text):
@@ -17,7 +18,9 @@ def atomic_text(path, text):
         with os.fdopen(fd, "w", encoding="utf-8") as out:
             os.chmod(tmp, 0o600)
             out.write(text)
-        os.replace(tmp, path)
+            out.flush()
+            os.fsync(out.fileno())
+        replace_staged_file(tmp, path)
     finally:
         Path(tmp).unlink(missing_ok=True)
 

@@ -1,4 +1,5 @@
 """Vectorization survives closing the page, deduplicates clicks and reports interruptions."""
+import json
 from threading import Event
 
 import pytest
@@ -23,7 +24,9 @@ def test_refresh_rejoins_build_and_an_interrupted_or_failed_build_can_be_retried
         raise RuntimeError('private driver details')
 
     try:
+        jobs.recover()
         assert jobs.status('demo')['status'] == 'interrupted'
+        assert json.loads(path.read_text())['finished_at'] and json.loads(path.read_text())['status'] == 'interrupted'
         first, future = jobs.start('demo', 4, build)
         assert entered.wait(5)
         again, duplicate = jobs.start('demo', 4, lambda: pytest.fail('duplicate build'))

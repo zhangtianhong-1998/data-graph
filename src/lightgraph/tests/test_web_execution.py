@@ -244,6 +244,34 @@ def test_restart_marks_old_records_interrupted_without_signalling_pid(workspace,
     manager.shutdown()
 
 
+def test_restart_closes_only_the_interrupted_workflow_archive(workspace):
+    from lightgraph.construction.workflow import load_workflow_state, save_workflow_state
+
+    path = workspace.project_path('alpha')
+    runs = path / 'runs'
+    runs.mkdir()
+    first, current = ('run_' + c * 24 for c in ('b', 'c'))
+    archive = {'parent_run_id': first, 'status': 'running',
+               'units': {'old': {'status': 'completed'}, 'new': {'status': 'running'}},
+               'merge_nodes': {'merge_1': {'status': 'queued'}}}
+    save_workflow_state(path / 'output', archive)
+    head = {'parent_run_id': current, 'status': 'completed'}
+    save_workflow_state(path / 'output', head)
+    (runs / (first + '.json')).write_text(json.dumps({
+        'run_id': first, 'project_id': 'alpha', 'created_at': '2026', 'status': 'running',
+        'workflow': True, 'output_path': 'output',
+    }))
+    manager = RunManager(workspace)
+    try:
+        recovered = load_workflow_state(path / 'output', first)
+        assert recovered['status'] == recovered['units']['new']['status'] == 'interrupted'
+        assert recovered['merge_nodes']['merge_1']['status'] == 'interrupted'
+        assert recovered['units']['old']['status'] == 'completed'
+        assert load_workflow_state(path / 'output') == head
+    finally:
+        manager.shutdown()
+
+
 def test_worker_error_redacts_exception_and_credentials(workspace, monkeypatch):
     config = workspace.configs['alpha']
     monkeypatch.setattr('lightgraph.runtime.config.open_sources', lambda _config, **_kw: (_ for _ in ()).throw(RuntimeError('SOURCE_ROW_SECRET password=secret')))

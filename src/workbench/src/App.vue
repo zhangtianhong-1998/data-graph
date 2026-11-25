@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import type { Ref } from 'vue'
 import GraphCanvas from './GraphCanvas.vue'
-import GraphAnalysis from './GraphAnalysis.vue'
+const GraphAnalysis = defineAsyncComponent(() => import('./GraphAnalysis.vue'))
 import GraphHistory from './GraphHistory.vue'
 import StructurePreview from './StructurePreview.vue'
 import RunIssues from './RunIssues.vue'
@@ -20,11 +20,11 @@ import DiscoveryCandidates from './DiscoveryCandidates.vue'
 import DatabaseSourceDialog from './DatabaseSourceDialog.vue'
 import DataInputs from './DataInputs.vue'
 import DocumentLibrary from './DocumentLibrary.vue'
-import WorkflowEditor from './WorkflowEditor.vue'
+const WorkflowEditor = defineAsyncComponent(() => import('./WorkflowEditor.vue'))
 import BusinessContextSelect from './BusinessContextSelect.vue'
 import GraphAlignmentReview from './GraphAlignmentReview.vue'
 import type { BusinessContext } from './types'
-import RetrievalPanel from './RetrievalPanel.vue'
+const RetrievalPanel = defineAsyncComponent(() => import('./RetrievalPanel.vue'))
 import VectorizationProgress from './VectorizationProgress.vue'
 import RetrievalIndexControls from './RetrievalIndexControls.vue'
 import { useVectorization } from './useVectorization'
@@ -309,10 +309,18 @@ function previewConfig(): RunConfig {
   if (inheritedDirty.value || 'inherited_graphs' in config.value) value.inherited_graphs = JSON.parse(JSON.stringify(inheritedGraphs.value)) as InheritedGraphRef[]
   return value
 }
+const advancedPanel = ref<HTMLDetailsElement | null>(null)
+const advancedOpen = ref(false)
+function toggleAdvanced(event: Event) {
+  advancedOpen.value = (event.currentTarget as HTMLDetailsElement).open
+}
 function resetAdvanced() { advanced.value = advancedBaseline.value = JSON.stringify(previewConfig(), null, 2) }
-watch([purpose, runSeconds, effectiveQueryLimit, resources, constructionTarget, traceRecording, model, embedding, workflowConfig, inheritedGraphs], () => {
-  // The JSON view follows the form until the user edits the JSON itself.
-  if (!advancedDirty.value) resetAdvanced()
+watch(() => advancedPanel.value && advancedOpen.value ? [
+  purpose.value, runSeconds.value, effectiveQueryLimit.value, resources.value, constructionTarget.value,
+  traceRecording.value, model.value, embedding.value, workflowConfig.value, inheritedGraphs.value,
+] : null, values => {
+  // Serialize the editable preview only when it is visible. Preserve independent JSON edits.
+  if (values && !advancedDirty.value) resetAdvanced()
 }, { deep: true })
 const deletionTitle = computed(() => deletion.value?.kind === 'run' ? '删除运行记录' : deletion.value?.kind === 'project' ? '删除项目' : deletion.value?.kind === 'source' ? '删除数据库来源' : deletion.value?.kind === 'table' ? '移除数据表' : '删除文件')
 const deletionDescription = computed(() => {
@@ -376,24 +384,27 @@ async function action(fn: () => Promise<void>) {
   try { await fn() } catch (exception) { report(exception) } finally { busy.value = false }
 }
 async function reloadProjects(select?: string) {
-  const response = await request<{ projects: Project[] }>('/projects')
+  const response = await request<{ projects: Project[] }>('/projects', { headers: { Prefer: 'return=minimal' } })
   projects.value = response.projects
-  if (!select && project.value && response.projects.some(item => item.project_id === project.value?.project_id)) return
-  const next = select || workbenchLocation.preferredProject(response.projects)
+  if (!select && project.value && response.projects.some(item => item.project_id === project.value?.project_id)) {
+    await reconcileRuns(project.value.project_id, generation)
+    return
+  }
+  const next = select || workbenchLocation.preferredProject(response.projects.filter(item => !item.status))
   if (next) await loadProject(next)
   else { project.value = null; databaseOpen.value = false; loading.value = false }
 }
 // Load each tab's inputs on demand. Keep project navigation and run reports usable
 // while an input view is waiting for its metadata or saved connection status.
-function useProjectInput<T>(tabs: WorkbenchTab[], target: Ref<T>, read: (id: string, signal: AbortSignal) => Promise<T>, revision = ref(0)) {
+function useProjectInput<T>(tabs: WorkbenchTab[], target: Ref<T>, read: (id: string, signal: AbortSignal) => Promise<T>, revision = ref(0), followsConfig = false) {
   const pending = ref(false)
-  let loadedGeneration: number | undefined, loadedRevision: number | undefined
-  watch([() => !loading.value && tabs.includes(tab.value) ? project.value?.project_id : undefined, configRevision, revision], async ([id, , version], _, onCleanup) => {
+  let loadedGeneration: number | undefined, loadedRevision: number | undefined, loadedConfig: string | undefined
+  watch([() => !loading.value && tabs.includes(tab.value) ? project.value?.project_id : undefined, configRevision, revision], async ([id, configVersion, version], _, onCleanup) => {
     pending.value = false
-    if (!id || (loadedGeneration === generation && loadedRevision === version)) return
+    if (!id || (loadedGeneration === generation && loadedRevision === version && (!followsConfig || loadedConfig === configVersion))) return
     const epoch = generation, controller = new AbortController()
     onCleanup(() => controller.abort())
-    pending.value = loadedGeneration !== generation
+    pending.value = true
     const previous = target.value
     try {
       const value = await read(id, controller.signal)
@@ -401,6 +412,7 @@ function useProjectInput<T>(tabs: WorkbenchTab[], target: Ref<T>, read: (id: str
         if (target.value === previous) target.value = value
         loadedGeneration = epoch
         loadedRevision = version
+        loadedConfig = configVersion
       }
     } catch (exception) {
       if (!controller.signal.aborted && epoch === generation) report(exception)
@@ -408,8 +420,9 @@ function useProjectInput<T>(tabs: WorkbenchTab[], target: Ref<T>, read: (id: str
   })
   return pending
 }
+watch(configRevision, () => { metadata.value = { tables: [], nodes: [], edges: [] } }, { flush: 'sync' })
 const metadataPending = useProjectInput(['inputs', 'documents', 'goal', 'workflow', 'metadata'], metadata,
-  (id, signal) => request<Metadata>(`${projectPath(id)}/metadata`, { signal }))
+  (id, signal) => request<Metadata>(`${projectPath(id)}/metadata`, { signal }), ref(0), true)
 const credentialSessionRevision = ref(0)
 const stopSessionUpdates = onSessionRenewed(id => {
   if (project.value?.project_id === id) {
@@ -436,19 +449,21 @@ async function loadProject(id: string) {
   try {
     const values = await Promise.all([request<Project>(p), request<RunConfig>(`${p}/config`)])
     if (epoch !== generation) return
-    configRevision.value = undefined; project.value = values[0]; fillForms(values[1]); metadata.value = { tables: [], nodes: [], edges: [] }; business.value = { nodes: [], edges: [] }; runs.value = []
+    configRevision.value = undefined; project.value = values[0]; fillForms(values[1]); metadata.value = { tables: [], nodes: [], edges: [] }; business.value = { nodes: [], edges: [] }; runs.value = values[0].active_run ? [historyRow(values[0].active_run)] : []
+    loading.value = false
     if (tab.value === 'business') void loadBusinessGraph(p, epoch)
+    const initialRuns = runs.value, initialTab = tab.value
     try {
       const list = await request<{ runs: Run[] }>(`${p}/runs?view=summary`)
       if (epoch !== generation) return
-      runs.value = list.runs.map(historyRow)
+      if (runs.value === initialRuns) runs.value = list.runs.map(historyRow)
     } catch (exception) { if (epoch === generation) report(exception) }
     if (epoch !== generation) return
     const previousRun = workbenchLocation.lastRun(id)
     selectedRunId.value = (runs.value.find(run => run.run_id === previousRun) || runs.value[0])?.run_id || ''
     schedulePoll(epoch)
     const restored = workbenchLocation.restoreDatabase(id, config.value.sources || [])
-    if (restored && !activeRun.value) {
+    if (restored && initialTab === tab.value && !activeRun.value) {
       tab.value = 'inputs'; databaseSource.value = restored.source; databaseOpen.value = true
     }
   } catch (exception) { if (epoch === generation) { project.value = null; report(exception) } }
@@ -949,11 +964,27 @@ async function refreshMetadata(saveEdits = true) {
     notify('元数据已更新')
   })
 }
+async function reconcileRuns(id: string, epoch: number) {
+  const result = await request<{ runs: Run[] }>(`${projectPath(id)}/runs?view=summary`)
+  if (generation !== epoch) return
+  runs.value = result.runs.map(historyRow)
+  if (activeRun.value) {
+    selectedRunId.value = activeRun.value.run_id
+    schedulePoll(epoch)
+  }
+}
 async function startRun() {
   await action(async () => {
     await ensureSession(project.value!.project_id)
     await saveDraft()
-    const run = await request<Run>(`${path.value}/runs`, { method: 'POST', headers: revisionHeaders(), body: JSON.stringify({ run_mode: runMode.value }) })
+    const id = project.value!.project_id, epoch = generation
+    let run: Run
+    try {
+      run = await request<Run>(`${path.value}/runs`, { method: 'POST', headers: revisionHeaders(), body: JSON.stringify({ run_mode: runMode.value }) })
+    } catch (error) {
+      await reconcileRuns(id, epoch).catch(() => {})
+      throw error
+    }
     if (run.run_mode === 'fresh' && run.status !== 'failed') {
       if (!selectedGraphVersion.value) { business.value = { nodes: [], edges: [] }; structurePreviewOpen.value = false; void loadBusinessGraph() }
     }
@@ -1024,6 +1055,7 @@ function capabilityUploaded(file: ProjectFile, revision?: string) {
   if (project.value) project.value.files = [...project.value.files.filter(item => item.file_id !== file.file_id), file]
 }
 watch(tab, (value, previous) => {
+  advancedOpen.value = false
   if (value === 'business') void loadBusinessGraph()
   if (previous === 'business') {
     graphRequestEpoch++; graphController?.abort(); graphLoading.value = false; graphOptionsOpen.value = false
@@ -1056,7 +1088,7 @@ onUnmounted(() => { generation++; detailController?.abort(); pollController?.abo
     <aside class="sidebar">
       <div class="brand"><span class="brand-mark"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="m6 6 12 5-8 8L6 6Z" stroke="currentColor" stroke-width="1.4"/><circle cx="6" cy="6" r="3" fill="currentColor"/><circle cx="18" cy="11" r="3" fill="currentColor"/><circle cx="10" cy="19" r="3" fill="currentColor"/></svg></span><span>数据图谱<small>DATA GRAPH</small></span></div>
       <div class="sidebar-label">工作空间 <button class="icon-btn" aria-label="刷新项目列表" :disabled="busy || loading" @click="action(() => reloadProjects())">↻</button></div>
-      <div class="project-list"><button v-for="item in projects" :key="item.project_id" class="project" :class="{ active: project?.project_id === item.project_id }" :disabled="busy || loading" @click="loadProject(item.project_id)"><span class="project-icon">{{ item.name.slice(0, 1) }}</span><span class="project-copy">{{ item.name }}<small>{{ item.project_id }}</small></span></button><p v-if="!projects.length && !loading" class="empty-projects">还没有项目</p></div>
+      <div class="project-list"><button v-for="item in projects" :key="item.project_id" class="project" :class="{ active: project?.project_id === item.project_id }" :disabled="busy || loading || !!item.status" @click="loadProject(item.project_id)"><span class="project-icon">{{ item.name.slice(0, 1) }}</span><span class="project-copy">{{ item.name }}<small>{{ item.status ? '项目配置需要修复' : item.project_id }}</small></span></button><p v-if="!projects.length && !loading" class="empty-projects">还没有项目</p></div>
       <button class="btn create-project" :disabled="busy" @click="newProjectOpen = true">＋ 新建项目</button>
 
     </aside>
@@ -1291,7 +1323,7 @@ onUnmounted(() => { generation++; detailController?.abort(); pollController?.abo
     向量服务连通成功 · 模型：<strong>{{ embeddingTestResult.model }}</strong> · 向量维度：<strong>{{ embeddingTestResult.dimensions }}</strong> · 耗时：{{ embeddingTestResult.latency_ms }} ms
   </p>
 </fieldset>
-</div><div class="panel-footer"><span>API key 加密保存在服务端本机，刷新后无需重填</span><button class="btn primary" :disabled="locked || agentLimitsLoading || !!limitsError" @click="action(saveModelLimits)">保存配置</button></div></section><aside class="panel"><div class="panel-head"><h2>运行前检查</h2></div><div class="panel-body"><div class="setup-check"><strong>{{ config.sources?.length || 0 }} 个数据来源</strong><button class="text-button" @click="tab = 'inputs'">配置数据接入</button></div><div class="setup-check"><strong>{{ documentFiles.length }} 个知识文档</strong><button class="text-button" @click="tab = 'documents'">配置知识文档</button></div><div class="setup-check"><strong>{{ purpose.trim() ? '已填写抽取目标' : '尚未填写抽取目标' }}</strong><button class="text-button" @click="tab = 'goal'">配置抽取目标</button></div><div class="setup-check"><strong>{{ workflowConfig?.enabled ? `并行工作流（${workflowConfig.units.length} 条链路）` : '单链路运行模式' }}</strong><button class="text-button" @click="tab = 'workflow'">编排并行工作流</button></div></div></aside></div><details class="panel advanced-panel"><summary class="panel-head">高级配置（可选）</summary><div class="panel-head"><h2>完整项目配置</h2><span class="badge">JSON 编辑 · 服务端保存 YAML</span></div><div class="panel-body"><p class="field-hint editor-hint">此处与上方表单同步；两处修改不同字段时一并保存，同一字段有冲突时会提示。</p><label class="sr-only" for="advanced-config">完整项目 JSON 配置</label><textarea id="advanced-config" v-model="advanced" class="code-editor" :disabled="locked" spellcheck="false"/></div><div class="panel-footer"><span>完整配置不接受明文密码或 API key，请使用上方连接表单</span><div class="actions"><button v-if="advancedDirty && (formDirty || agentLimitsDirty)" class="btn" :disabled="locked" @click="discardFormEdits">放弃表单修改</button><button v-if="advancedDirty" class="btn" :disabled="locked" @click="resetAdvanced">放弃修改</button><button class="btn" :disabled="locked" @click="action(async () => { advanced = JSON.stringify(advancedConfig(), null, 2) })">格式化 JSON</button><button class="btn primary" :disabled="locked" @click="saveAdvanced">保存完整配置</button></div></div></details></template>
+</div><div class="panel-footer"><span>API key 加密保存在服务端本机，刷新后无需重填</span><button class="btn primary" :disabled="locked || agentLimitsLoading || !!limitsError" @click="action(saveModelLimits)">保存配置</button></div></section><aside class="panel"><div class="panel-head"><h2>运行前检查</h2></div><div class="panel-body"><div class="setup-check"><strong>{{ config.sources?.length || 0 }} 个数据来源</strong><button class="text-button" @click="tab = 'inputs'">配置数据接入</button></div><div class="setup-check"><strong>{{ documentFiles.length }} 个知识文档</strong><button class="text-button" @click="tab = 'documents'">配置知识文档</button></div><div class="setup-check"><strong>{{ purpose.trim() ? '已填写抽取目标' : '尚未填写抽取目标' }}</strong><button class="text-button" @click="tab = 'goal'">配置抽取目标</button></div><div class="setup-check"><strong>{{ workflowConfig?.enabled ? `并行工作流（${workflowConfig.units.length} 条链路）` : '单链路运行模式' }}</strong><button class="text-button" @click="tab = 'workflow'">编排并行工作流</button></div></div></aside></div><details ref="advancedPanel" class="panel advanced-panel" @toggle="toggleAdvanced"><summary class="panel-head">高级配置（可选）</summary><div class="panel-head"><h2>完整项目配置</h2><span class="badge">JSON 编辑 · 服务端保存 YAML</span></div><div class="panel-body"><p class="field-hint editor-hint">此处与上方表单同步；两处修改不同字段时一并保存，同一字段有冲突时会提示。</p><label class="sr-only" for="advanced-config">完整项目 JSON 配置</label><textarea id="advanced-config" v-model="advanced" class="code-editor" :disabled="locked" spellcheck="false"/></div><div class="panel-footer"><span>完整配置不接受明文密码或 API key，请使用上方连接表单</span><div class="actions"><button v-if="advancedDirty && (formDirty || agentLimitsDirty)" class="btn" :disabled="locked" @click="discardFormEdits">放弃表单修改</button><button v-if="advancedDirty" class="btn" :disabled="locked" @click="resetAdvanced">放弃修改</button><button class="btn" :disabled="locked" @click="action(async () => { advanced = JSON.stringify(advancedConfig(), null, 2) })">格式化 JSON</button><button class="btn primary" :disabled="locked" @click="saveAdvanced">保存完整配置</button></div></div></details></template>
         </div>
       </template>
     </main>

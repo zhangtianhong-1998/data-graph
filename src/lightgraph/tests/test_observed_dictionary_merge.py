@@ -150,3 +150,37 @@ def test_checkpoint_replay_publishes_the_dictionary_membership_and_both_edges(tm
     assert {e['target'] for e in visible['edges']} == {member['id']} and len(visible['edges']) == 2
     assert {s['provenance']['catalog_identity_reference']['kind'] for s in member['supports']} == {
         'unique_key', 'foreign_key'}
+
+
+@pytest.mark.parametrize('difference', ['none', 'missing_constraint', 'conflicting_property', 'other_scope'])
+def test_parallel_branches_share_only_proven_master_rows_with_compatible_observations(difference):
+    from lightgraph.tests.test_cross_source_fusion import source_graph
+    units = []
+    for fact, prop in [('orders', 'population'), ('sales', 'timezone')]:
+        g = source_graph('Region', 'code', 'C1', fact, 'Capital', prop, fact)
+        for node in g['nodes']:
+            node['identity_types'] = {'code': 'text'}
+            support = node['supports'][0]
+            prov = support['provenance']
+            source = {'source_id': 'local', 'schema': 'dm', 'table': 'registry'}
+            prov.update(source=source, key_columns=['geo_code'], label_column='geo_name', property_columns={prop: prop},
+                        catalog_identity_reference={'kind': 'unique_key', 'local_columns': ['geo_code'],
+                                                    'target': {**source, 'columns': ['geo_code']}})
+            if difference == 'missing_constraint' and fact == 'sales':
+                prov.pop('catalog_identity_reference')
+            if difference == 'other_scope' and fact == 'sales':
+                support['scope_ref'] = 'private'
+            if difference == 'conflicting_property':
+                prov['property_columns'][prop] = 'population'
+        # Separate fact tables attach their own relationships to the shared C table.
+        edge = g['edges'][0]
+        edge['supports'][0]['provenance'].update(source={'source_id': 'local', 'schema': 'dm', 'table': fact},
+            source_key_columns=['office'], target_key_columns=['region'])
+        units.append({'contributor_id': fact, 'graph': g})
+    merged = merge_construction_graphs(units)
+    expected = 2 if difference == 'none' else 4
+    assert len(merged['nodes']) == expected
+    assert merged['fusion_diagnostics'].get('direct_unique_row_collapsed_nodes', 0) == 4 - expected
+    if difference == 'none':
+        assert all(set(n['properties']) == {'population', 'timezone'} for n in merged['nodes'])
+        assert {s['contributor_id'] for e in merged['edges'] for s in e['supports']} == {'orders', 'sales'}

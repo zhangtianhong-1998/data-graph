@@ -92,17 +92,16 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
 
     def attributes(supports):
         properties = {}
-        provenance = []
+        provenance = {}
         for support in supports:
             for name, values in support.get('properties', {}).items():
                 selected = properties.setdefault(name, {})
                 for value in values:
                     selected.setdefault(canonical(value), value)
             origin = {**support.get('provenance', {}), 'scope_ref': support['scope_ref']}
-            if origin not in provenance:
-                provenance.append(origin)
+            provenance.setdefault(canonical(origin), origin)
         ordered = {name: [values[k] for k in sorted(values)] for name, values in properties.items()}
-        return ordered, sorted(provenance, key=canonical)
+        return ordered, [provenance[key] for key in sorted(provenance)]
 
     nodes = []
     merged_observation_nodes = 0
@@ -110,10 +109,11 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
         supports = supports_for(node)
         if not supports:
             continue
-        if len({origin['contributor_id']
-                for support in supports if support.get('identity_basis') in {
-                    'observed_source_key_v1', 'observed_dictionary_key_v1', 'observed_hierarchy_projection_v1'}
-                for origin in support.get('execution_origins') or [support] if origin.get('contributor_id')}) > 1:
+        contributors = {origin['contributor_id'] for support in supports
+                        for origin in support.get('execution_origins') or [support] if origin.get('contributor_id')}
+        original_members = {(origin.get('contributor_id'), origin['id']) for support in supports
+                            for origin in support.get('identity_origins', []) if origin.get('id')}
+        if len(contributors) > 1 or len(original_members) > 1:
             merged_observation_nodes += 1
         labels = sorted({support['label'] for support in supports if support.get('label') is not None})
         aliases = sorted({alias for support in supports for alias in support.get('aliases', [])})

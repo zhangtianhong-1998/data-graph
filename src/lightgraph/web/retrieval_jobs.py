@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
+import logging
 import threading
 from uuid import uuid4
 
@@ -44,10 +45,20 @@ class RetrievalJobs:
             try:
                 value = json.loads(path.read_text(encoding='utf-8'))
                 if value['status'] in ('queued', 'running'):
-                    value.update(status='interrupted', error_code='retrieval_job_interrupted')
+                    value.update(status='interrupted', error_code='retrieval_job_interrupted', finished_at=_now())
+                    atomic_text(path, json.dumps(value))
                 return value
             except (OSError, ValueError, KeyError, TypeError):
                 raise LightGraphError('retrieval_job_invalid') from None
+
+    def recover(self):
+        # Work callbacks and credentials are process-local. A new service can
+        # settle the old job, but may only rebuild on a new user request.
+        for path in self.workspace.root.glob('*/vectorization-job.json'):
+            try:
+                self.status(path.parent.name)
+            except LightGraphError:
+                logging.getLogger(__name__).warning('Could not recover vectorization status for %s', path.parent.name)
 
     def active(self, pid):
         with self._lock:
@@ -71,7 +82,12 @@ class RetrievalJobs:
                    'progress': {'stage': 'preparing', 'completed': 0, 'total': None}}
             path = self._path(pid)
             atomic_text(path, json.dumps(job))
-            future = self._pool.submit(self._run, pid, path, job, work)
+            try:
+                future = self._pool.submit(self._run, pid, path, job, work)
+            except RuntimeError:
+                atomic_text(path, json.dumps({**job, 'status': 'failed', 'error_code': 'retrieval_build_failed',
+                                              'finished_at': _now()}))
+                raise LightGraphError('retrieval_build_failed') from None
             self._active[pid] = (job, revision, future)
             return job.copy(), future
 

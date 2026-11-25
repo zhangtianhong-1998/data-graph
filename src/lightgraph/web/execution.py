@@ -6,6 +6,7 @@ until the user explicitly clears it; subprocess output is not a run transcript.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 import json
@@ -282,12 +283,17 @@ def _input_manifest(config, project_path):
     return _file_manifest(_dependency_paths(config), project_path)
 
 
+def _dependency_key(path, project_path):
+    resolved = Path(path).resolve()
+    return str(resolved if project_path is None else resolved.relative_to(project_path.resolve()))
+
+
 def _file_manifest(paths, project_path):
     manifest = {}
     for raw in sorted(paths):
         path = Path(raw)
         try:
-            relative = str(path.resolve().relative_to(project_path.resolve()))
+            relative = _dependency_key(path, project_path)
             if path.is_symlink() or not path.is_file():
                 raise ValueError
             before = path.stat()
@@ -304,8 +310,13 @@ def _file_manifest(paths, project_path):
     return manifest
 
 
-def check_dependencies(expected, project_path):
-    current = _file_manifest([project_path / name for name in expected], project_path)
+def check_dependencies(expected, project_path, *, standalone_config=None):
+    if standalone_config is not None:
+        # A CLI configuration grants its own explicit files. Manifest text never
+        # supplies additional paths, even when sources live on different volumes.
+        current = _input_manifest(standalone_config, None)
+    else:
+        current = _file_manifest([project_path / name for name in expected], project_path)
     if current != expected:
         raise LightGraphError("input_dependency_changed")
 
@@ -324,6 +335,8 @@ def _historical_root(raw):
 
 def _input_path_representation(scoped, project, previous):
     def relocated(raw):
+        if project is None:
+            return Path(raw).as_posix()
         try:
             relative = Path(raw).relative_to(project)
         except ValueError:
@@ -350,7 +363,7 @@ def _workflow_node_inputs(config, project, files=None, *, version=2, previous_pr
     plan = resolve_workflow_plan(config.workflow)
     result = {}
     files = _input_manifest(config, project) if files is None else files
-    project = project.resolve()
+    project = project.resolve() if project is not None else None
     if version not in (1, 2) or previous_project_root is not None and version != 1:
         raise ValueError('unsupported workflow input version')
     previous = _historical_root(previous_project_root) if previous_project_root is not None else None
@@ -376,7 +389,7 @@ def _workflow_node_inputs(config, project, files=None, *, version=2, previous_pr
         if nid in plan.merge_order:
             node_data['merge_policy'] = effective_merge_policy(config, node).model_dump(mode='json')
         node_data['enable_co_projection'] = node.enable_co_projection if node.enable_co_projection is not None else config.workflow.enable_co_projection
-        relative_paths = (str(Path(path).resolve().relative_to(project)) for path in _dependency_paths(scoped))
+        relative_paths = (_dependency_key(path, project) for path in _dependency_paths(scoped))
         try:
             node_files = {path: files[path] for path in relative_paths}
         except (KeyError, ValueError):
@@ -462,15 +475,36 @@ def _resolved_payload(config, project_path, *, source_credentials=None, model_ap
     return payload
 
 
+def _deliver_payload(proc, payload):
+    data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    if len(data) > 2 * 1024 * 1024:
+        raise LightGraphError('worker_payload_too_large')
+
+    def write():
+        try:
+            with proc.stdin:
+                proc.stdin.write(data)
+        except (BrokenPipeError, OSError, ValueError):
+            # Cancellation or early worker exit closes the pipe. The watcher
+            # owns the result and terminal status.
+            pass
+
+    threading.Thread(target=write, name='worker-input', daemon=True).start()
+
+
 class RunManager:
     """One child writer per project; no PID restored from disk is ever signalled."""
-    def __init__(self, workspace, *, cancel_timeout=5.0):
+    def __init__(self, workspace, *, cancel_timeout=5.0, standalone=False):
         self.workspace = workspace
+        self._standalone = standalone
         self.cancel_timeout = cancel_timeout
         self.after_publication = None
         self._processes = {}
         self._run_summaries = {}
+        self._summary_lock = threading.Lock()
         self._guard = threading.RLock()
+        self._starting = set()
+        self._launch_condition = threading.Condition(self._guard)
         self._closed = False
         self._service_lock = FileLock(self.workspace.root / ".service.lock",
             busy_code="workspace_service_active", invalid_code="workspace_service_lock_invalid").acquire()
@@ -496,11 +530,11 @@ class RunManager:
     def _recover(self):
         # Service restart has no authority over an old PID; preserve its result
         # as interrupted until a subsequent explicit extraction reconciles it.
-        for project in self.workspace.root.iterdir():
-            if not project.is_dir() or project.is_symlink():
-                continue
+        projects = ([self.workspace.project_id] if self._standalone else
+                    (path.name for path in self.workspace.root.iterdir() if path.is_dir() and not path.is_symlink()))
+        for pid in projects:
             try:
-                _, runs = self._paths(project.name)
+                project, runs = self._paths(pid)
             except LightGraphError:
                 continue
             for path in runs.glob("run_*.json"):
@@ -509,10 +543,13 @@ class RunManager:
                 try:
                     stamp = _file_stamp(path)
                     record = _json_file(path)
-                    self._run_summaries.setdefault(project.name, {})[path.stem] = (stamp, _fields(record, _RUN_HEADER_FIELDS))
+                    self._cache_header(pid, path.stem, stamp, _fields(record, _RUN_HEADER_FIELDS))
                     if record.get("status") in ACTIVE_STATUSES:
                         record.update(status="interrupted", stage="finished", finished_at=_now(),
                                       cleanup_status="unknown", error_code="service_restarted")
+                        if record.get('workflow') and record.get('output_path') and record.get('run_id') == path.stem:
+                            from ..construction.workflow import interrupt_workflow_state
+                            interrupt_workflow_state(self._record_output(project, record['output_path']), path.stem, record['finished_at'])
                         finish_progress(progress_path(path), record.get("run_id"), "interrupted")
                         self._save_run(path, record)
                     # Exclusive service ownership proves no surviving worker
@@ -521,12 +558,26 @@ class RunManager:
                 except (LightGraphError, OSError):
                     continue
 
+    @contextmanager
+    def _launch(self, pid):
+        # Serialize writers for one project. Shutdown waits for launches before
+        # enumerating children and releasing the workspace service lease.
+        with self.workspace.lock(pid):
+            with self._launch_condition:
+                if self._closed:
+                    raise LightGraphError('run_service_stopped')
+                if pid in self._processes or pid in self._starting:
+                    raise LightGraphError('project_run_active')
+                self._starting.add(pid)
+            try:
+                yield
+            finally:
+                with self._launch_condition:
+                    self._starting.remove(pid)
+                    self._launch_condition.notify_all()
+
     def start(self, pid, *, source_credentials=None, model_api_key=None, run_mode="continue"):
-        with self.workspace.lock(pid), self._guard:
-            if self._closed:
-                raise LightGraphError("run_service_stopped")
-            if self.active(pid):
-                raise LightGraphError("project_run_active")
+        with self._launch(pid):
             if run_mode not in {"continue", "fresh"}:
                 raise LightGraphError("invalid_run_mode")
             project, runs = self._paths(pid)
@@ -617,8 +668,7 @@ class RunManager:
                                         "diagnostics": diagnostics, "stderr_collector": None}
                 collector = StderrCollector(proc.stderr)
                 self._processes[pid]['stderr_collector'] = collector
-                proc.stdin.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-                proc.stdin.close()
+                _deliver_payload(proc, payload)
                 record.update(status="running", stage="extracting")
                 self._save_run(runs / (rid + ".json"), record)
             except Exception as exc:
@@ -634,7 +684,7 @@ class RunManager:
                               cleanup_status="unknown", error_code="worker_start_failed")
                 self._save_run(runs / (rid + ".json"), record)
                 return dict(record)
-            threading.Thread(target=self._watch, args=(pid, proc), daemon=True).start()
+            threading.Thread(target=self._watch, args=(pid, proc, config.max_run_seconds), daemon=True).start()
             return dict(record)
 
     def resume(self, pid, source_run_id, *, from_node_id=None, action='rerun_node', artifact_id=None,
@@ -648,11 +698,7 @@ class RunManager:
         from ..construction.workflow import (build_unit_config, committed_unit_output, load_unit_contributor,
             load_workflow_state, resolve_workflow_plan, run_output_path)
 
-        with self.workspace.lock(pid), self._guard:
-            if self._closed:
-                raise LightGraphError('run_service_stopped')
-            if self.active(pid):
-                raise LightGraphError('project_run_active')
+        with self._launch(pid):
             project, source_path = self._paths(pid, source_run_id)
             if not source_path.exists():
                 raise LightGraphError('run_not_found')
@@ -882,7 +928,8 @@ class RunManager:
         if not target_units and resume_state is None:
             raise LightGraphError("workflow_unit_not_found")
         existing_state = resume_state or (load_workflow_state(config.output_dir) if run_mode == "continue" else None)
-        payload_deps = _input_manifest(config, project)
+        input_root = None if self._standalone else project
+        payload_deps = _input_manifest(config, input_root)
         workflow_input = digest(access_fingerprint(config), config.workflow.model_dump(mode="json"),
                                 config.goal_markdown, config.goal.model_dump(mode="json"), payload_deps)
         if resume_state is None and selected_unit_ids is not None and (existing_state or {}).get("workflow_input") != workflow_input:
@@ -924,7 +971,7 @@ class RunManager:
             }
             for m in wf.merge_nodes
         }
-        proofs = _WorkflowInputProofs(config, project, payload_deps)
+        proofs = _WorkflowInputProofs(config, input_root, payload_deps)
         input_digests = dict(proofs.current)
         reused_artifacts = {nid: artifact for nid, artifact in (resume_state or {}).get('artifacts', {}).items()
                             if nid not in (resume_nodes or set())}
@@ -1013,12 +1060,15 @@ class RunManager:
             node_rid = "run_" + uuid.uuid4().hex[:24]
             node_result = runs / (node_rid + ".result.json")
             node_payload = _resolved_payload(
-                node_config, project,
+                node_config, input_root,
                 source_credentials={k: v for k, v in (source_credentials or {}).items()
                                     if any(s.id == k for s in node_config.sources)},
                 model_api_key=model_api_key,
             )
             node_payload['scoped_workflow_run'] = True
+            if input_root is None:
+                node_payload['standalone_workflow'] = True
+                node_payload['agent_dependency'] = node_config.agent_config
             with entry["state_lock"]:
                 if cancel_event.is_set():
                     state_bucket[node_key].update(status="cancelled", error_code="run_cancelled", updated_at=_now())
@@ -1041,8 +1091,7 @@ class RunManager:
                 entry["unit_procs"][node_key] = (proc, node_result)
             collector = StderrCollector(proc.stderr)
             try:
-                proc.stdin.write(json.dumps(node_payload, ensure_ascii=False).encode("utf-8"))
-                proc.stdin.close()
+                _deliver_payload(proc, node_payload)
                 try:
                     proc.wait(timeout=max(0.0, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
@@ -1102,7 +1151,7 @@ class RunManager:
             return run_worker_config(unit.unit_id, units_state, unit_config)
 
         def check_publication_inputs():
-            check_dependencies(payload_deps, project)
+            check_dependencies(payload_deps, project, standalone_config=config if input_root is None else None)
             if self.workspace.config_revision(pid) != record["config_revision"]:
                 raise LightGraphError("input_dependency_changed")
             if config.inherited_graphs:
@@ -1562,11 +1611,7 @@ class RunManager:
 
     def retry_unit(self, pid, unit_id, *, source_credentials=None, model_api_key=None):
         """Re-run one workflow unit and deterministically replace only its contribution."""
-        with self.workspace.lock(pid), self._guard:
-            if self._closed:
-                raise LightGraphError("run_service_stopped")
-            if self.active(pid):
-                raise LightGraphError("project_run_active")
+        with self._launch(pid):
             project, runs = self._paths(pid)
             config = self.workspace.resolved_config(pid).model_copy(deep=True)
             if not config.workflow or not config.workflow.enabled:
@@ -1628,11 +1673,7 @@ class RunManager:
 
     def merge_workflow(self, pid):
         """Re-run deterministic merge across currently published workflow units and inherited graphs."""
-        with self.workspace.lock(pid), self._guard:
-            if self._closed:
-                raise LightGraphError("run_service_stopped")
-            if self.active(pid):
-                raise LightGraphError("project_run_active")
+        with self._launch(pid):
             config = self.workspace.resolved_config(pid).model_copy(deep=True)
             if not config.workflow or not config.workflow.enabled:
                 raise LightGraphError("workflow_not_enabled")
@@ -1675,14 +1716,31 @@ class RunManager:
                 self.after_publication(pid, config)
             return summary
 
-    def _watch(self, pid, proc):
-        proc.wait()
-        with self.workspace.lock(pid), self._guard:
-            entry = self._processes.get(pid)
+    def _watch(self, pid, proc, run_seconds):
+        expired = False
+        try:
+            proc.wait(timeout=run_seconds + self.cancel_timeout)
+        except subprocess.TimeoutExpired:
+            # Includes workers stuck before reading their input or installing
+            # their own deadline handler.
+            proc.kill()
+            proc.wait()
+            expired = True
+        with self.workspace.lock(pid):
+            with self._guard:
+                entry = self._processes.get(pid)
             if entry and entry["process"] is proc:
+                entry['deadline_expired'] = expired
                 self._finish(pid, entry)
 
     def _finish(self, pid, entry):
+        try:
+            self._finish_record(pid, entry)
+        finally:
+            with self._guard:
+                self._processes.pop(pid, None)
+
+    def _finish_record(self, pid, entry):
         record = entry["record"]
         diagnostics = entry.get('diagnostics') or WorkerDiagnostics(entry['result'])
         if entry.get('stderr_collector') is not None:
@@ -1707,6 +1765,8 @@ class RunManager:
             record.update(status="cancelled", error_code="run_cancelled")
         if entry["forced"]:
             record.update(cleanup_status="unknown", error_code="run_force_stopped")
+        if entry.get('deadline_expired') and not entry['cancel_requested']:
+            record.update(status='failed', cleanup_status='unknown', error_code='run_time_budget_exhausted')
         if not entry["cancel_requested"]:
             try:
                 changed = (_input_manifest(entry["config"], self.workspace.project_path(pid)) != record["dependencies"]
@@ -1728,11 +1788,15 @@ class RunManager:
             _cancel_path(entry["result"]).unlink(missing_ok=True)
         except OSError:
             pass
-        self._processes.pop(pid, None)
 
     def active(self, pid):
         with self._guard:
-            return pid in self._processes
+            return pid in self._processes or pid in self._starting
+
+    def active_summary(self, pid):
+        with self._guard:
+            entry = self._processes.get(pid)
+            return _fields(entry['record'], _RUN_SUMMARY_FIELDS) if entry else None
 
     def _save_run(self, path, record):
         _save(path, record)
@@ -1742,10 +1806,20 @@ class RunManager:
             # The run JSON was committed successfully. The next read can
             # rebuild the optional summary if a concurrent restore moved it.
             return
-        self._run_summaries.setdefault(path.parent.parent.name, {})[path.stem] = (stamp, _fields(record, _RUN_HEADER_FIELDS))
+        self._cache_header(path.parent.parent.name, path.stem, stamp, _fields(record, _RUN_HEADER_FIELDS))
+
+    def _cache_header(self, pid, rid, stamp, row):
+        with self._summary_lock:
+            key = (pid, rid)
+            self._run_summaries.pop(key, None)
+            self._run_summaries[key] = (stamp, row)
+            if len(self._run_summaries) > 2048:
+                self._run_summaries.pop(next(iter(self._run_summaries)))
 
     def forget_run_summaries(self, pid):
-        self._run_summaries.pop(pid, None)
+        with self._summary_lock:
+            for key in [k for k in self._run_summaries if k[0] == pid]:
+                self._run_summaries.pop(key)
 
     def _header(self, path):
         # The service writes run records atomically. Also detect histories restored
@@ -1754,11 +1828,11 @@ class RunManager:
             stamp = _file_stamp(path)
         except OSError:
             raise LightGraphError('run_record_invalid') from None
-        summaries = self._run_summaries.setdefault(path.parent.parent.name, {})
-        cached = summaries.get(path.stem)
+        with self._summary_lock:
+            cached = self._run_summaries.get((path.parent.parent.name, path.stem))
         if cached is None or cached[0] != stamp:
             row = _fields(_json_file(path), _RUN_HEADER_FIELDS)
-            summaries[path.stem] = (stamp, row)
+            self._cache_header(path.parent.parent.name, path.stem, stamp, row)
         else:
             row = cached[1]
         if row.get('run_id') != path.stem or row.get('project_id') != path.parent.parent.name:
@@ -1830,8 +1904,15 @@ class RunManager:
                           'current_workflow_run_id': (current or {}).get('parent_run_id')}
             return self._with_progress(record, path, workbench=view == 'workbench')
 
-    @staticmethod
-    def _with_progress(record, path, *, workbench=False):
+    def _record_output(self, project, relative):
+        if self._standalone:
+            if project != self.workspace.root or relative != '.':
+                raise LightGraphError('invalid_output_generation')
+            return project
+        from ..construction.workflow import run_output_path
+        return run_output_path(project, relative)
+
+    def _with_progress(self, record, path, *, workbench=False):
         # A worker owns only its sibling progress file. Optional telemetry cannot
         # break old records or override the authoritative terminal run status.
         if record.get("run_id") != path.stem:
@@ -1846,8 +1927,8 @@ class RunManager:
             record = dict(record, worker_diagnostics={key: diagnostics[key] for key in ('status', 'incomplete')},
                           worker_diagnostic_events=len(diagnostics['events']))
         if record.get("workflow") and record.get("output_path"):
-            from ..construction.workflow import load_workflow_state, run_output_path
-            out_dir = run_output_path(path.parent.parent, record['output_path'])
+            from ..construction.workflow import load_workflow_state
+            out_dir = self._record_output(path.parent.parent, record['output_path'])
             wf_state = (deepcopy(_workbench_workflow(out_dir, record["run_id"])) if workbench
                         else load_workflow_state(out_dir, record["run_id"]))
             if wf_state is not None and wf_state.get("parent_run_id") == record.get("run_id"):
@@ -1857,11 +1938,15 @@ class RunManager:
     def list(self, pid, *, view='full'):
         with self.workspace.lock(pid):
             _, directory = self._paths(pid)
-            records = []
-            for path in directory.glob("run_*.json"):
-                if _RUN_ID.fullmatch(path.stem):
-                    records.append(self._summary(path) if view == 'summary' else self._with_progress(_json_file(path), path))
-            return sorted(records, key=lambda r: r["created_at"], reverse=True)
+            paths = [path for path in directory.glob("run_*.json") if _RUN_ID.fullmatch(path.stem)]
+        records = []
+        for path in paths:
+            try:
+                records.append(self._summary(path) if view == 'summary' else self._with_progress(_json_file(path), path))
+            except LightGraphError:
+                if path.exists():
+                    raise
+        return sorted(records, key=lambda r: r["created_at"], reverse=True)
 
     def delete_record(self, pid, rid):
         """Remove the history entry and its run-local logs. Output snapshots have their own lifecycle."""
@@ -1880,7 +1965,8 @@ class RunManager:
             for suffix in ('.progress.json', '.result.json', '.trace.cleared.json'):
                 path.with_suffix(suffix).unlink(missing_ok=True)
             path.unlink()
-            self._run_summaries.get(pid, {}).pop(rid, None)
+            with self._summary_lock:
+                self._run_summaries.pop((pid, rid), None)
             return {'deleted': True, 'run_id': rid}
 
     def cancel(self, pid, rid):
@@ -1934,8 +2020,9 @@ class RunManager:
             return self.get(pid, rid)
 
     def shutdown(self):
-        with self._guard:
+        with self._launch_condition:
             self._closed = True
+            self._launch_condition.wait_for(lambda: not self._starting)
             entries = [(pid, e["record"]["run_id"]) for pid, e in self._processes.items()]
         for pid, rid in entries:
             self.cancel(pid, rid)
@@ -1990,7 +2077,7 @@ def read_graph_consistently(workspace, pid, reader, **options):
     return result
 
 
-def read_graph(workspace, pid, layer="business", *, include_candidates=False,offset=0,limit=240,q='',kind='',focus='',hops=1,traversal='all',config=None,business_context=None):
+def read_graph(workspace, pid, layer="business", *, include_candidates=False,review_offset=0,offset=0,limit=240,q='',kind='',focus='',hops=1,traversal='all',config=None,business_context=None):
     """Publication heads, not stale graph.json exports, determine current results."""
     from ..store import GraphStore
     if layer == "metadata":
@@ -1998,7 +2085,7 @@ def read_graph(workspace, pid, layer="business", *, include_candidates=False,off
     config = config if config is not None else workspace.resolved_config(pid)
     from . import construction_graph
     if construction_graph.available(config):
-        return construction_graph.graph_page(config, layer=layer, offset=offset, limit=limit,
+        return construction_graph.graph_page(config, layer=layer, review_offset=review_offset, offset=offset, limit=limit,
             q=q, kind=kind, focus=focus, hops=hops, traversal=traversal, include_candidates=include_candidates, business_context=business_context)
     if business_context is not None:
         return {**_bounded_view({}, layer), "include_candidates": include_candidates, "business_context": business_context}
@@ -2154,7 +2241,7 @@ def _metadata_context(config, project_path):
     return {"source_revision": digest(list(declarations.values())),
             "file_revisions": files,
             "source_revisions": {source.id: digest(declarations[source.id],
-                {str(Path(p).resolve().relative_to(project_path.resolve())): files[str(Path(p).resolve().relative_to(project_path.resolve()))]
+                {_dependency_key(p, project_path): files[_dependency_key(p, project_path)]
                  for p in (source.path, source.capability_manifest) if p}) for source in config.sources}}
 
 

@@ -182,3 +182,10 @@ def test_coverage_review_requires_complete_disjoint_partition_of_original_spans(
     answer = items
     assert resolve_mention_extractor(configured(response_format='json_object'), api_key='x').review_coverage(question, spans) == ['那台', '牵涉到']
     assert extract.review_coverage(question, spans) is None
+
+
+def test_fullwidth_quoted_span_maps_to_its_unique_original_spelling():
+    question = '请查设备Ａ－７（备用）。'
+    result = QueryMentions(mentions=['设备A-7(备用)'], constraints=[], target=None, framing=['请查'],
+        intent='search', overview_metric=None, scopes=[], background=[], exclusions=[], equivalents=[]).verified(question)
+    assert result['mentions'] == ['设备Ａ－７（备用）']

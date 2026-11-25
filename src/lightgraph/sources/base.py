@@ -139,7 +139,7 @@ class SourceAdapter:
     def capabilities(self): raise NotImplementedError
     def execute(self, query: ValidatedQuery, *, row_limit: int | None = None): raise NotImplementedError
     def project(self, table: TableSpec, columns: list[str], predicate: dict | None = None, distinct: bool = True, limit: int | None = None) -> Iterator[EphemeralBatch]:
-        cap = min(limit or self.limits.max_result_rows, self.limits.max_result_rows)
+        cap = min(self.limits.max_result_rows if limit is None else limit, self.limits.max_result_rows)
         yield from self.execute(self.compiler.projection(table, columns, predicate=predicate, distinct=distinct, limit=cap), row_limit=cap)
     def _aggregate(self, query: ValidatedQuery) -> dict[str, int | None]:
         if query.operator not in COUNT_AGGREGATE_OPERATORS:
@@ -228,10 +228,10 @@ class SourceAdapter:
     def __exit__(self, *args): self.close()
 
 
-def cursor_batches(cursor, *, limits: QueryLimits, columns: tuple[str, ...], row_limit: int, stats: QueryStats, deadline: float | None = None, timeout_ms: int | None = None, cancelled=None, budget=None) -> Iterator[EphemeralBatch]:
+def cursor_batches(cursor, *, limits: QueryLimits, columns: tuple[str, ...], row_limit: int, stats: QueryStats, deadline: float | None = None, timeout_ms: int | None = None, cancelled=None, budget=None, max_row_bytes=None) -> Iterator[EphemeralBatch]:
     batches = _read_cursor_batches(cursor, limits=limits, columns=columns, row_limit=row_limit,
         stats=stats, deadline=deadline, ttl_seconds=(timeout_ms or limits.timeout_ms) / 1000,
-        cancelled=cancelled, budget=budget)
+        cancelled=cancelled, budget=budget, max_row_bytes=max_row_bytes)
     try:
         while True:
             # The consumer may build the graph while holding a yielded batch.
@@ -245,14 +245,28 @@ def cursor_batches(cursor, *, limits: QueryLimits, columns: tuple[str, ...], row
         batches.close()
 
 
-def _read_cursor_batches(cursor, *, limits, columns, row_limit, stats, deadline, ttl_seconds, cancelled, budget):
+def _read_cursor_batches(cursor, *, limits, columns, row_limit, stats, deadline, ttl_seconds, cancelled, budget, max_row_bytes):
+    fetched = iter(())
     total_rows = total_bytes = 0; pending = []; pending_bytes = 0
     while True:
         if budget is not None: budget.check_time()
         if cancelled is not None and cancelled(): raise LightGraphError("query_cancelled")
         if deadline is not None and time.monotonic() > deadline: raise LightGraphError("query_timeout")
-        # fetchone avoids a driver-side fetchmany allocation exceeding byte cap.
-        raw = cursor.fetchone()
+        # Batch server-cursor fetches only when the descriptor bounds every
+        # returned cell. Unknown-width values still get one-row lookahead.
+        raw = next(fetched, None)
+        if raw is None and max_row_bytes:
+            count = max(1, min(limits.max_batch_rows, row_limit - total_rows + 1,
+                               limits.max_batch_bytes // max_row_bytes,
+                               (limits.max_result_bytes - total_bytes) // max_row_bytes))
+            if budget is not None and budget.max_returned_rows is not None:
+                count = min(count, max(1, budget.max_returned_rows - budget.returned_rows + 1))
+            if budget is not None and budget.max_returned_bytes is not None:
+                count = min(count, max(1, (budget.max_returned_bytes - budget.returned_bytes) // max_row_bytes))
+            fetched = iter(cursor.fetchmany(count))
+            raw = next(fetched, None)
+        elif raw is None:
+            raw = cursor.fetchone()
         if raw is None: break
         row = tuple(source_scalar(v) for v in raw); size = row_bytes(row)
         total_rows += 1; total_bytes += size

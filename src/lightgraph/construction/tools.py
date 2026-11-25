@@ -22,6 +22,7 @@ from lightgraph.discovery.tools import ToolExecutor
 from lightgraph.documents import DocumentCorpus, load_documents
 from lightgraph.errors import LightGraphError
 from lightgraph.source_values import SOURCE_KEY_SEMANTICS_VERSION
+from lightgraph.runtime.files import file_stamp
 from lightgraph.runtime.config import install_run_query_budget, open_sources
 
 from .models import DraftRecord, GraphDraft, draft_evidence_refs
@@ -49,6 +50,22 @@ METADATA_REQUALIFICATION_ACTION = (
 def _file_hash(path):
     with Path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _imported_source_hash(source, adapter):
+    recorded = getattr(adapter, "input_revision", None)
+    if recorded is not None:
+        return recorded
+    # Header-only imports omit the content digest. Confirm the live bytes
+    # still belong to the file from which the adapter obtained its schema.
+    path = Path(source.path)
+    before = file_stamp(path)
+    if before != getattr(adapter, "input_stamp", before):
+        raise LightGraphError('construction_source_changed')
+    result = _file_hash(path)
+    if before != file_stamp(path):
+        raise LightGraphError('construction_source_changed')
+    return result
 
 
 def _drop_unbound_documents(corpus: DocumentCorpus, tables) -> DocumentCorpus:
@@ -109,7 +126,8 @@ class ConstructionTools:
         self.projection_counts = Counter()
         try:
             self.query_budget = install_run_query_budget(config, self.adapters)
-            self.documents = DocumentCorpus([document for document in load_documents(config.documents)
+            loaded_documents = load_documents(config.documents)
+            self.documents = DocumentCorpus([document for document in loaded_documents
                 if document.document_id not in config.removed_document_ids])
             mapping = {t.source_id: adapter for adapter in self.adapters for t in adapter.describe()}
             if drop_unbound_documents:
@@ -137,13 +155,17 @@ class ConstructionTools:
             self.tables = {key: table for executor in self.executors.values()
                            for key, table in executor.tables.items()}
             self._sections = self.documents.contexts_for(list(self.tables.values()))
-            self._source_hashes = [(s.id, _file_hash(s.path)) for s in config.sources if s.path]
+            self._source_hashes = [
+                (s.id, _imported_source_hash(s, mapping.get(s.id)))
+                for s in config.sources if s.path]
             from .projection_reuse import ImmutableProjections
             file_sources = {s.id for s in config.sources if s.kind in {'csv_file', 'excel_workbook'}}
             self._immutable_projections = ImmutableProjections(
                 [(sid, sha) for sid, sha in self._source_hashes if sid in file_sources] if self._own_adapters else [],
                 min(8 * 1024**2, config.max_working_bytes // 8))
-            self._material_hashes = [(path, _file_hash(path)) for path in config.documents]
+            self._verified_probe_stamps = {}
+            self._material_hashes = [(path, doc._file_sha256)
+                                     for path, doc in zip(config.documents, loaded_documents, strict=True)]
             from .inheritance import load_frozen_base_graph
             self.base_graph, self.inherited_summary = load_frozen_base_graph(workspace, config=config)
             if self.base_graph:
@@ -543,7 +565,7 @@ class ConstructionTools:
 
     def inspect_source(self, table: str, operation: str, arguments: dict | None = None):
         """Run a named read-only probe using physical names, not guessed IDs."""
-        self._check_current_inputs()
+        self._check_current_inputs(probe=True)
         unavailable = self._unavailable_table_source(table)
         if unavailable:
             if operation in {'get_metadata', 'search_knowledge'}:
@@ -1152,14 +1174,25 @@ class ConstructionTools:
                 'conflicts_material': 'publication_conflicts',
                 "statistics": graph_statistics(merged), "semantic_assessment": "agent_authored"}
 
-    def _check_current_inputs(self):
+    def _check_current_inputs(self, *, probe=False):
+        """Reuse a verified file stamp for repeated probes within this worker.
+
+        Validation and publication always hash the current bytes. On each cache
+        miss the stat before and after the read must identify the same file.
+        """
+        source_paths = {source.id: source.path for source in self.config.sources if source.path}
+        files = [(source_paths[sid], expected) for sid, expected in self._source_hashes] + self._material_hashes
         try:
-            changed = (self._source_hashes != [(s.id, _file_hash(s.path)) for s in self.config.sources if s.path]
-                       or self._material_hashes != [(path, _file_hash(path)) for path in self.config.documents])
+            for path, expected in files:
+                path = Path(path)
+                before = file_stamp(path)
+                if probe and self._verified_probe_stamps.get(path) == before:
+                    continue
+                if _file_hash(path) != expected or file_stamp(path) != before:
+                    raise LightGraphError('construction_source_changed')
+                self._verified_probe_stamps[path] = before
         except OSError:
             raise LightGraphError('construction_source_unavailable') from None
-        if changed:
-            raise LightGraphError('construction_source_changed')
 
     def read_workspace(self, draft_id: str | None = None, *, summary_only=False, offset=0):
         if summary_only:

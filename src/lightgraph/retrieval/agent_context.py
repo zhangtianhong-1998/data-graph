@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import deque
 import json
 
+from lightgraph.discovery.token_estimation import estimate_tokens
 from .joint_evidence import worksheet_row_witness
 from .path_evidence import BINDING_FIELDS
 
@@ -54,21 +55,31 @@ def agent_context(answer, *, version=None, sources=()):
                        for s in plan.get('conditions', [])],
         'excluded_terms': plan.get('excluded_terms', []), 'partial_status': partial.get('status'),
         'truncated': bool(answer.get('truncated') or partial.get('truncated')),
-        'nodes': [], 'edges': [], 'bindings': [], 'paths': [], 'joint_witnesses': [], 'source_passages': [],
+        'nodes': [], 'edges': [], 'bindings': [], 'paths': [], 'bridge_nodes': [], 'joint_witnesses': [], 'source_passages': [],
     }
     # Separate budgets keep a large entity list from crowding out paths and physical mappings.
-    remaining = dict(nodes=6000, edges=6000, bindings=_BINDING_BYTES, paths=4000, joint_witnesses=3000, source_passages=1200)
+    remaining = dict(nodes=12000, edges=12000, bindings=_BINDING_BYTES, paths=8000, joint_witnesses=6000,
+                     source_passages=3600, bridge_nodes=6000, hierarchy_items=6000)
 
-    def add(section, row, *, replace=None):
-        size = len(_compact(row).encode('utf-8')) + 1
+    tokens = {section: max(1, limit // 2) for section, limit in remaining.items()}
+
+    tokens['bindings'] = _BINDING_BYTES
+
+    def add(section, row, *, replace=None, target=None):
+        serialized = _compact(row)
+        size = len(serialized.encode('utf-8')) + 1
+        token_cost = estimate_tokens(serialized) + 1
         if replace is not None:
-            size -= len(_compact(replace).encode('utf-8')) + 1
-        if size > remaining[section]:
+            original = _compact(replace)
+            size -= len(original.encode('utf-8')) + 1
+            token_cost -= estimate_tokens(original) + 1
+        if size > remaining[section] or token_cost > tokens[section]:
             context['truncated'] = True
             return False
         remaining[section] -= size
+        tokens[section] -= token_cost
         if replace is None:
-            context[section].append(row)
+            (context[section] if target is None else target).append(row)
         else:
             replace.update(row)
         return True
@@ -149,7 +160,7 @@ def agent_context(answer, *, version=None, sources=()):
                 retained = add('bindings', binding)
             if retained:
                 retained_bindings.append((binding, citations))
-                pending.append(stream)
+            pending.append(stream)
     if pending:
         context['truncated'] = True
     # Reserve the existing mappings first. Distinct observations of the same
@@ -180,6 +191,18 @@ def agent_context(answer, *, version=None, sources=()):
                 retained = add('bindings', {**base, 'observation_id': citation['observation_id']}, replace=replace)
             if retained:
                 emitted.add(key)
+    for bridge in answer.get('bridge_nodes', []):
+        if bridge['node_id'] not in node_ids:
+            context['truncated'] = True
+            continue
+        for group in bridge.get('path_groups', []):
+            slots = {slot: [s['edge_id'] for s in steps] for slot, steps in group['paths_by_slot'].items()}
+            if any(eid not in edge_ids for ids in slots.values() for eid in ids):
+                context['truncated'] = True
+                continue
+            add('bridge_nodes', {**_fields(bridge, ('node_id', 'bridge_role')),
+                                 **_fields(group, ('context_status', 'business_context', 'path_semantics')),
+                                 'observed_path': False, 'edge_ids_by_slot': slots})
     hierarchy = answer.get('hierarchy')
     if hierarchy is not None:
         direct = _fields(hierarchy, ('status', 'direction', 'anchor_id'))
@@ -191,7 +214,7 @@ def agent_context(answer, *, version=None, sources=()):
             if len(visible) != len(item['edge_ids']):
                 context['truncated'] = True
             if item['node_id'] in node_ids and visible:
-                direct['items'].append({'node_id': item['node_id'], 'edge_ids': visible})
+                add('hierarchy_items', {'node_id': item['node_id'], 'edge_ids': visible}, target=direct['items'])
     for path in paths:
         if set(path.get('node_ids', [])) <= node_ids and set(path.get('edge_ids', [])) <= edge_ids:
             add('paths', path)

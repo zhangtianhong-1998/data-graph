@@ -198,6 +198,11 @@ describe('visible model limits', () => {
   })
   it('keeps JSON in sync with model edits and accepts formatting without a false conflict', async () => {
     await mount(); await edit('model-name', 'new-model'); await edit('model-output-tokens', '65536')
+    const panel = root.querySelector<HTMLDetailsElement>('.advanced-panel')!
+    expect(panel.open).toBe(false)
+    panel.open = true
+    panel.dispatchEvent(new Event('toggle'))
+    await nextTick()
     const draft = JSON.parse(root.querySelector<HTMLTextAreaElement>('#advanced-config')!.value)
     expect(draft.model).toMatchObject({ model: 'new-model', max_output_tokens: 65536 })
     await edit('advanced-config', JSON.stringify(draft))

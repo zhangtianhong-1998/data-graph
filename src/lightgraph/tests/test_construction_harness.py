@@ -96,7 +96,7 @@ def test_run_uses_sdk_sessions_without_legacy_loop(tmp_path):
     assert seen["profile"] == "sdk-minimal"
     assert seen["provider"] == "graph-model"
     assert seen["dsh_home"] == str(tmp_path / "harness")
-    assert seen["prompt"].startswith("/build-graph\n")
+    assert seen["prompt"] == "发现目标涉及的实体和关系"
     assert result["session_id"] == "resume-1"
     assert result["graph_acceptance"] == "read_published_artifact"
     assert seen["closed"] and events == [{"method": "session.event"}]

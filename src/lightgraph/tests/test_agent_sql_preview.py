@@ -97,3 +97,47 @@ def test_long_descriptions_do_not_hide_a_visible_physical_binding():
     assert context['truncated'] and context['nodes'][0]['description_omitted']
     assert context['bindings'][0]['properties_omitted']
     assert _catalogs(context)['museum'][1]['archive']['finds'] == {'tag': 'UNKNOWN'}
+
+
+def test_preview_and_guard_require_complete_scopes(monkeypatch):
+    from lightgraph.query import SQLGuard
+    from lightgraph.query import guard as guard_module
+    from lightgraph.contracts import ColumnSpec, TableSpec
+    original = guard_module.traverse_scope
+    monkeypatch.setattr(guard_module, 'traverse_scope', lambda tree: list(original(tree))[1:])
+    sql = 'WITH selected AS (SELECT tag FROM archive.finds) SELECT tag FROM selected'
+    table = TableSpec(source_id='museum', schema='archive', name='finds', columns=[ColumnSpec(name='tag')])
+    with pytest.raises(LightGraphError, match='unsupported_query_scope'):
+        SQLGuard([table]).validate(sql)
+    _, context = _fixture()
+    with pytest.raises(LightGraphError, match='sql_preview_invalid_output'):
+        _sql_result(json.dumps({'source_id': 'museum', 'sql': sql}), _catalogs(context))
+
+
+def test_slow_runtime_shutdown_cannot_hold_preview_past_deadline(monkeypatch):
+    from threading import Event
+    from lightgraph.runtime.config import ModelConfig
+    from lightgraph.web import sql_preview
+
+    config, context = _fixture()
+    config.model = ModelConfig(mode='in_environment', model='local-fixture',
+        base_url='http://127.0.0.1:8123', timeout_seconds=0.2)
+    close_started, release = Event(), Event()
+
+    class WaitingRuntime:
+        def run(self, prompt):
+            release.wait(5)
+
+        def close(self):
+            close_started.set()
+            release.wait(5)
+
+    monkeypatch.setattr(sql_preview, 'resolved_options', lambda options: options)
+    monkeypatch.setattr(sql_preview, '_base_profile', lambda *args: ())
+    monkeypatch.setattr(sql_preview, '_sdk_factory', lambda options: lambda **kwargs: WaitingRuntime())
+    try:
+        with pytest.raises(LightGraphError, match='sql_preview_timeout'):
+            draft_sql(config, context, 'local-fixture')
+        assert close_started.wait(1)
+    finally:
+        release.set()

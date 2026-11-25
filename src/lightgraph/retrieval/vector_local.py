@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from ipaddress import ip_address
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -275,13 +276,13 @@ class LocalNumpyVectorStore:
             raise LightGraphError('retrieval_index_stale')
         norms = np.linalg.norm(q, axis=1, keepdims=True)
         q = q / np.where(norms == 0, 1.0, norms)
-        placeholders = ','.join('?' for _ in scope_list)
+        placeholders = 'SELECT value FROM json_each(?)'
         hits = [{} for _ in q]
         with closing(self._connect()) as conn:
             cursor = conn.execute(
                 f'SELECT row_idx, node_id, kind, scope_ref FROM vec_items '
                 f'WHERE scope_ref IN ({placeholders}) AND field = ? ORDER BY row_idx',
-                [*scope_list, field],
+                [json.dumps(scope_list), field],
             )
             # Exact scoring, bounded dense working set. Reduce by node before
             # choosing top K so multiple authorized cards cannot crowd out peers.
@@ -302,15 +303,14 @@ class LocalNumpyVectorStore:
                         hits[col] = {nid: best[nid] for nid in ranked}
         batches = [sorted(best.values(), key=lambda hit: (-hit['score'], hit['node_id'])) for best in hits]
         if with_peer_reference:
-            # Measure how close the same field of *another permitted node*
-            # normally gets to each candidate. Batch only the returned cards.
-            cards = {hit['row_idx']: hit['node_id'] for batch in batches for hit in batch}
-            if cards:
-                peers = self.search_batch(matrix[list(cards)], scopes=scope_list, top_k=2,
-                                          field=field, positive_only=False)
-                references = {row: next((h['score'] for h in group if h['node_id'] != node_id), None)
-                              for (row, node_id), group in zip(cards.items(), peers)}
-                for batch in batches:
-                    for hit in batch:
-                        hit['peer_score'] = references[hit.pop('row_idx')]
+            # Query-local reference among the actual ranked competitors. This uses
+            # at most top_k rows, without rescoring the whole authorized cohort.
+            for batch in batches:
+                if not batch:
+                    continue
+                references = matrix[[hit.pop('row_idx') for hit in batch]]
+                similarity = references @ references.T
+                np.fill_diagonal(similarity, -np.inf)
+                for hit, row in zip(batch, similarity):
+                    hit['peer_score'] = float(row.max()) if len(batch) > 1 else None
         return batches

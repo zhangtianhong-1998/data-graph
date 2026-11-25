@@ -7,16 +7,23 @@ Then point the project's Embedding config in the Workbench UI at:
     base_url: http://127.0.0.1:8002/v1
     model:    Qwen/Qwen3-Embedding-0.6B
 
+For remote clients set LIGHTGRAPH_EMBEDDING_SERVER_KEY and configure the same Bearer token on the client.
+Without a key only loopback clients can access model inference.
+
 Any OpenAI /v1/embeddings-compatible service (Ollama, vLLM, LM Studio, TEI, cloud API)
 can replace this server with zero changes to LightGraph code.
 """
 from __future__ import annotations
 
+import hmac
+from ipaddress import ip_address
+import os
 import threading
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from starlette.responses import JSONResponse
 
 
 class LocalEmbeddingBackend(Protocol):
@@ -126,14 +133,62 @@ def load_local_backend(
         return TransformersLastTokenBackend(model_name, device=device, trust_remote_code=trust_remote_code)
 
 
+_Text = Annotated[str, Field(max_length=32768)]
+_MAX_BODY_BYTES = 2 * 1024 * 1024
+
+
 class EmbeddingRequest(BaseModel):
-    input: str | list[str]
+    input: _Text | Annotated[list[_Text], Field(max_length=512)]
     model: str | None = None
     dimensions: int | None = Field(default=None, gt=0)
 
 
+    @model_validator(mode='after')
+    def bound_batch(self):
+        texts = [self.input] if isinstance(self.input, str) else self.input
+        if sum(map(len, texts)) > 131072:
+            raise ValueError('embedding_batch_too_large')
+        return self
+
+
+class _InferenceGuard:
+    """Bound the incoming body, including chunked requests, before parsing or inference."""
+    def __init__(self, app, key):
+        self.app, self.key = app, key
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http' or not scope['path'].startswith('/v1/'):
+            return await self.app(scope, receive, send)
+        headers = dict(scope.get('headers', []))
+        host = (scope.get('client') or ('',))[0]
+        try:
+            local = ip_address(host).is_loopback
+        except ValueError:
+            local = False
+        if (self.key and not hmac.compare_digest(headers.get(b'authorization', b''), b'Bearer ' + self.key)
+                or not self.key and not local):
+            return await JSONResponse({'detail': 'embedding_auth_required'}, 401)(scope, receive, send)
+        if scope['path'] != '/v1/embeddings':
+            return await self.app(scope, receive, send)
+        data = bytearray()
+        while True:
+            message = await receive()
+            if message['type'] != 'http.request':
+                return
+            chunk = message.get('body', b'')
+            if len(data) + len(chunk) > _MAX_BODY_BYTES:
+                return await JSONResponse({'detail': 'embedding_batch_too_large'}, 413)(scope, receive, send)
+            data.extend(chunk)
+            if not message.get('more_body'):
+                break
+        async def read():
+            return {'type': 'http.request', 'body': bytes(data), 'more_body': False}
+        await self.app(scope, read, send)
+
+
 def create_embedding_app(backend: LocalEmbeddingBackend) -> FastAPI:
     app = FastAPI(title='LightGraph Local Embedding Server', version='1.0.0')
+    app.add_middleware(_InferenceGuard, key=os.environ.get('LIGHTGRAPH_EMBEDDING_SERVER_KEY', '').encode())
     # FastAPI runs synchronous handlers in a thread pool; serialize inference
     # against the single loaded model to bound memory and avoid device races.
     inference_lock = threading.Lock()

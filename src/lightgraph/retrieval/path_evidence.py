@@ -50,7 +50,10 @@ def evidence_preview(witness):
                 if _fits_preview(located):
                     return located
             return mapped
-    return preview
+    if _fits_preview(preview):
+        return preview
+    reference = {'projection': 'reference_only', 'observation_id': witness.get('observation_id')}
+    return reference if _fits_preview(reference) else {'projection': 'reference_only'}
 
 
 def path_node(node, witness, slots, is_seed):

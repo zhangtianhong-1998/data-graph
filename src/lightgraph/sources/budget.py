@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from lightgraph.errors import BudgetExceeded, LightGraphError
 
 class QueryBudget:
@@ -11,12 +12,37 @@ class QueryBudget:
                 for value in (max_queries, max_returned_rows, max_returned_bytes))
                 or max_run_seconds <= 0):
             raise LightGraphError("invalid_query_budget")
+        self._scope_deadline = ContextVar("source_scope_deadline", default=None)
+        self._scope_queries = ContextVar("source_scope_queries", default=None)
         self.max_queries=max_queries;self.max_returned_rows=max_returned_rows;self.max_returned_bytes=max_returned_bytes
         self.deadline=min(deadline, time.monotonic()+max_run_seconds) if deadline else time.monotonic()+max_run_seconds
         self.queries=0;self.returned_rows=0;self.returned_bytes=0;self._lock=threading.RLock()
         self._cancelled = threading.Event()
-        # Hold references so Python cannot reuse an absorbed object's id.
-        self._absorbed_budgets: dict[int, QueryBudget] = {}
+        self._origin = object()
+        # Each original counter is monotonic and contributes at most once, even
+        # when two adapters have already absorbed the same initialization cost.
+        self._absorbed_budgets: dict[object, tuple[int, int, int]] = {}
+
+    @property
+    def deadline(self):
+        scoped = self._scope_deadline.get()
+        return self._deadline if scoped is None else min(self._deadline, scoped)
+
+    @deadline.setter
+    def deadline(self, value):
+        self._deadline = value
+
+    @property
+    def max_queries(self):
+        scoped = self._scope_queries.get()
+        if self._max_queries is None:
+            return scoped
+        return self._max_queries if scoped is None else min(self._max_queries, scoped)
+
+    @max_queries.setter
+    def max_queries(self, value):
+        self._max_queries = value
+
     def check_time(self):
         if time.monotonic() > self.deadline: raise BudgetExceeded("run_time_budget_exhausted")
         if self._cancelled.is_set(): raise LightGraphError('query_cancelled')
@@ -31,11 +57,11 @@ class QueryBudget:
     def deadline_scope(self, deadline: float):
         """Borrow a shorter deadline until the query iterator closes.
 
-        Source orchestration is sequential. A task timeout must not lower the
-        next task's ceiling or masquerade as exhaustion of the enclosing phase.
+        A task timeout must not lower another task's ceiling or masquerade
+        as exhaustion of the enclosing phase.
         """
         previous_deadline = self.deadline
-        self.deadline = min(previous_deadline, deadline)
+        token = self._scope_deadline.set(min(previous_deadline, deadline))
         try:
             self.check_time()
             yield
@@ -49,19 +75,18 @@ class QueryBudget:
                     raise BudgetExceeded('wall_time_budget_exhausted') from None
             raise
         finally:
-            self.deadline = previous_deadline
+            self._scope_deadline.reset(token)
     @contextmanager
     def exploration(self, *, deadline: float, query_limit: int | None):
         """Apply a smaller phase ceiling without resetting consumed resources.
 
-        The run orchestrator is sequential. All source adapters share this
-        object, so tool queries and database cancellation see the same deadline.
-        Restoring the ceiling releases the reserved capacity to validation.
+        All participating adapters share the run counters. The phase's tighter
+        ceilings belong to the calling execution context.
         """
         previous_deadline, previous_limit = self.deadline, self.max_queries
-        self.deadline = min(previous_deadline, deadline)
+        token = self._scope_deadline.set(min(previous_deadline, deadline))
         limits = [limit for limit in (previous_limit, query_limit) if limit is not None]
-        self.max_queries = min(limits) if limits else None
+        query_token = self._scope_queries.set(min(limits) if limits else None)
         try:
             self.check_time()
             if self.max_queries is not None and self.queries >= self.max_queries:
@@ -74,7 +99,8 @@ class QueryBudget:
                 raise BudgetExceeded('discovery_query_budget_exhausted') from None
             raise
         finally:
-            self.deadline, self.max_queries = previous_deadline, previous_limit
+            self._scope_queries.reset(query_token)
+            self._scope_deadline.reset(token)
     def charge_query(self):
         with self._lock:
             self.check_time()
@@ -104,13 +130,25 @@ class QueryBudget:
         raise error
     def absorb(self, previous: "QueryBudget"):
         if previous is self: return
+        with previous._lock:
+            contributions = previous._absorbed_budgets.copy()
+            totals = (previous.queries, previous.returned_rows, previous.returned_bytes)
+            contributions[previous._origin] = tuple(
+                total - sum(cost[i] for cost in contributions.values()) for i, total in enumerate(totals))
+            deadline = previous._deadline
+            cancelled = previous._cancelled.is_set()
         with self._lock:
-            self.deadline=min(self.deadline,previous.deadline)
-            if id(previous) not in self._absorbed_budgets:
-                prior=previous.snapshot()
-                self._absorbed_budgets[id(previous)]=previous
-                self.queries+=prior["queries"];self.returned_rows+=prior["returned_rows"];self.returned_bytes+=prior["returned_bytes"]
-            if previous._cancelled.is_set():
+            self._deadline = min(self._deadline, deadline)
+            for origin, current in contributions.items():
+                if origin is self._origin:
+                    continue
+                known = self._absorbed_budgets.get(origin, (0, 0, 0))
+                queries, rows, size = (max(0, new - old) for new, old in zip(current, known))
+                self.queries += queries
+                self.returned_rows += rows
+                self.returned_bytes += size
+                self._absorbed_budgets[origin] = tuple(max(new, old) for new, old in zip(current, known))
+            if cancelled:
                 self._cancelled.set()
             self.check_time()
             if self.max_queries is not None and self.queries > self.max_queries: self._raise_exhausted("query_budget_exhausted")

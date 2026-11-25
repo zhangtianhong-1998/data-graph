@@ -11,6 +11,7 @@ import stat
 import subprocess
 import threading
 
+from lightgraph.runtime.files import system_directory_path
 from ..errors import LightGraphError
 
 
@@ -24,6 +25,7 @@ def _platform():
 
 def _check_path(path: Path):
     """Reject links in the requested path without resolving them away first."""
+    path = system_directory_path(path)
     for part in reversed((path, *path.parents)):
         try:
             info = part.lstat()

@@ -70,6 +70,8 @@ class _GraphYamlDumper(yaml.SafeDumper):
         return True
 
 
+# Authorized graph views carry their cache generation outside the published mapping.
+_GraphYamlDumper.add_multi_representer(dict, yaml.SafeDumper.represent_dict)
 _GraphYamlLoader.add_implicit_resolver("tag:yaml.org,2002:null", re.compile(r"^(?:null|Null|NULL|~|)$"), ["n", "N", "~", ""])
 _GraphYamlLoader.add_implicit_resolver("tag:yaml.org,2002:bool", re.compile(r"^(?:true|false|True|False|TRUE|FALSE)$"), list("tTfF"))
 # Leading-zero values such as business code 0012 remain strings, even unquoted.
@@ -239,7 +241,9 @@ class GraphWorkspace:
         return record
 
     def read_evidence(self, ref: str) -> EvidenceRecord:
-        relative = self._manifest()["evidence"].get(ref)
+        return self._read_evidence_entry(ref, self._manifest()["evidence"].get(ref))
+
+    def _read_evidence_entry(self, ref, relative):
         if relative is None:
             raise LightGraphError("unknown_construction_evidence")
         record = EvidenceRecord.model_validate(self._read_record(relative))
@@ -548,9 +552,9 @@ class GraphWorkspace:
         manifest = self._manifest()
         current_refs = []
         stale_count = 0
-        for ref in manifest["evidence"]:
+        for ref, relative in manifest["evidence"].items():
             try:
-                self.read_evidence(ref)
+                self._read_evidence_entry(ref, relative)
                 current_refs.append(ref)
             except LightGraphError as error:
                 if error.code != "stale_construction_evidence":
@@ -568,7 +572,7 @@ class GraphWorkspace:
                             "validation": item.validation.model_dump(mode="json") if item.validation else None,
                             "last_successful_validation": item.last_successful_validation.model_dump(mode='json')
                                 if item.last_successful_validation else None}
-                           for item in self.list_drafts()],
+                           for item in (self._read_draft_entry(key, entry) for key, entry in manifest["drafts"].items())],
                 "evidence_refs": current_refs, "stale_evidence_count": stale_count,
                 "structure_checks": manifest.get('structure_checks', {}),
                 "structure_publications": manifest.get('structure_publications', {}),

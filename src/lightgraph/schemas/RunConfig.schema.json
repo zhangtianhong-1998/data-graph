@@ -157,6 +157,15 @@
           "maxProperties": 128,
           "title": "Property Normalizers",
           "type": "object"
+        },
+        "source_bindings": {
+          "description": "Optional approved tables and complete physical keys for this rule.",
+          "items": {
+            "$ref": "#/$defs/FusionSourceBinding"
+          },
+          "maxItems": 512,
+          "title": "Source Bindings",
+          "type": "array"
         }
       },
       "required": [
@@ -334,6 +343,44 @@
       "title": "FusionPolicyConfig",
       "type": "object"
     },
+    "FusionSourceBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "schema": {
+          "minLength": 1,
+          "title": "Schema",
+          "type": "string"
+        },
+        "table": {
+          "minLength": 1,
+          "title": "Table",
+          "type": "string"
+        },
+        "key_columns": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Existing logical identity key name to the physical column in this table.",
+          "maxProperties": 32,
+          "minProperties": 1,
+          "title": "Key Columns",
+          "type": "object"
+        }
+      },
+      "required": [
+        "source_id",
+        "schema",
+        "table",
+        "key_columns"
+      ],
+      "title": "FusionSourceBinding",
+      "type": "object"
+    },
     "GraphScopeBinding": {
       "additionalProperties": false,
       "description": "Operator-owned visibility mapping; never accepted from an Agent draft.",
@@ -441,6 +488,14 @@
       "additionalProperties": false,
       "description": "Deterministic safety rules for merging parallel unit and inherited graphs.",
       "properties": {
+        "reviewed_key_pairs": {
+          "items": {
+            "$ref": "#/$defs/ReviewedKeyPairRule"
+          },
+          "maxItems": 64,
+          "title": "Reviewed Key Pairs",
+          "type": "array"
+        },
         "authority_sources": {
           "items": {
             "type": "string"
@@ -613,6 +668,22 @@
           "exclusiveMinimum": 0,
           "title": "Timeout Seconds",
           "type": "number"
+        },
+        "output_token_field": {
+          "anyOf": [
+            {
+              "enum": [
+                "max_tokens",
+                "max_completion_tokens"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output Token Field"
         },
         "max_output_tokens": {
           "default": 65536,
@@ -862,6 +933,106 @@
         "target_kinds"
       ],
       "title": "RelationDefinition",
+      "type": "object"
+    },
+    "ReviewedKeyPairRule": {
+      "additionalProperties": false,
+      "description": "A business approval for individual typed key/name observations in two checkpoints.",
+      "properties": {
+        "approval_ref": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Approval Ref",
+          "type": "string"
+        },
+        "entity_type": {
+          "minLength": 1,
+          "title": "Entity Type",
+          "type": "string"
+        },
+        "projections": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/ReviewedKeyProjection"
+            },
+            {
+              "$ref": "#/$defs/ReviewedKeyProjection"
+            }
+          ],
+          "title": "Projections",
+          "type": "array"
+        },
+        "observation_digests": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 5000,
+          "minItems": 1,
+          "title": "Observation Digests",
+          "type": "array"
+        }
+      },
+      "required": [
+        "approval_ref",
+        "entity_type",
+        "projections",
+        "observation_digests"
+      ],
+      "title": "ReviewedKeyPairRule",
+      "type": "object"
+    },
+    "ReviewedKeyProjection": {
+      "additionalProperties": false,
+      "description": "One frozen contributor and its two observed columns.",
+      "properties": {
+        "contributor_id": {
+          "minLength": 1,
+          "title": "Contributor Id",
+          "type": "string"
+        },
+        "graph_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Graph Digest",
+          "type": "string"
+        },
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "schema": {
+          "minLength": 1,
+          "title": "Schema",
+          "type": "string"
+        },
+        "table": {
+          "minLength": 1,
+          "title": "Table",
+          "type": "string"
+        },
+        "key_column": {
+          "minLength": 1,
+          "title": "Key Column",
+          "type": "string"
+        },
+        "name_column": {
+          "minLength": 1,
+          "title": "Name Column",
+          "type": "string"
+        }
+      },
+      "required": [
+        "contributor_id",
+        "graph_digest",
+        "source_id",
+        "schema",
+        "table",
+        "key_column",
+        "name_column"
+      ],
+      "title": "ReviewedKeyProjection",
       "type": "object"
     },
     "RuntimeGuidance": {
@@ -1294,6 +1465,7 @@
           "default": "deterministic",
           "enum": [
             "deterministic",
+            "overlap_review",
             "merge_and_extract"
           ],
           "title": "Merge Mode",

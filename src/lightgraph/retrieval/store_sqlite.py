@@ -28,7 +28,7 @@ _TERM_ROLES = {
 
 
 def normalize_term(value: Any) -> str:
-    return ' '.join(unicodedata.normalize('NFKC', str(value or '')).casefold().split())
+    return ' '.join(unicodedata.normalize('NFKC', '' if value is None else str(value)).casefold().split())
 
 
 def _endpoint_specializations(definitions):
@@ -109,6 +109,11 @@ class SQLiteGraphIndex:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self._init_db()
+        with closing(self._connect()) as conn:
+            indexes = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE name IN ('kg_lexemes','kg_term_grams')")}
+            self._indexed_substrings = 'kg_lexemes' in indexes
+            self._short_terms = 'kg_term_grams' in indexes
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, isolation_level=None)
@@ -164,6 +169,7 @@ class SQLiteGraphIndex:
                     PRIMARY KEY (edge_id, scope_ref)
                 );
                 CREATE INDEX IF NOT EXISTS idx_terms_norm_scope ON kg_node_terms(term_norm, scope_ref);
+                CREATE INDEX IF NOT EXISTS idx_terms_prefix2 ON kg_node_terms(substr(term_norm,1,2),scope_ref);
                 CREATE INDEX IF NOT EXISTS idx_terms_node ON kg_node_terms(node_id);
                 CREATE INDEX IF NOT EXISTS idx_edges_out ON kg_edges(src_id, rel_type, dst_id);
                 CREATE INDEX IF NOT EXISTS idx_edges_in ON kg_edges(dst_id, rel_type, src_id);
@@ -240,6 +246,28 @@ class SQLiteGraphIndex:
                         for e in edges
                     ],
                 )
+                # The FTS trigram tokenizer cannot serve one- and two-character
+                # questions. Index each distinct spelling once, including CJK.
+                conn.execute("CREATE TABLE IF NOT EXISTS kg_term_grams (gram TEXT NOT NULL, term_id INTEGER NOT NULL, "
+                             "PRIMARY KEY (gram,term_id)) WITHOUT ROWID")
+                conn.execute("DELETE FROM kg_term_grams")
+                words = conn.execute("SELECT term_norm, MIN(term_id) FROM kg_node_terms GROUP BY term_norm")
+                for word, term_id in words:
+                    grams = set(word)
+                    grams.update(word[pos:pos + 2] for pos in range(len(word) - 1))
+                    conn.executemany("INSERT INTO kg_term_grams VALUES (?,?)", ((g, term_id) for g in grams))
+                self._short_terms = True
+                # Optional accelerator. Older SQLite builds can still serve the exact same results.
+                try:
+                    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS kg_lexemes USING fts5(term_norm, tokenize='trigram')")
+                except sqlite3.OperationalError as error:
+                    if 'no such module' not in str(error) and 'no such tokenizer' not in str(error):
+                        raise
+                else:
+                    conn.execute("DELETE FROM kg_lexemes")
+                    conn.execute("INSERT INTO kg_lexemes SELECT DISTINCT term_norm FROM kg_node_terms")
+                self._indexed_substrings = bool(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='kg_lexemes'").fetchone())
                 conn.execute('COMMIT')
             except BaseException:
                 conn.execute('ROLLBACK')
@@ -249,22 +277,22 @@ class SQLiteGraphIndex:
         tokens = sorted(set(scopes))
         if not tokens:
             return []
-        marks = ','.join('?' for _ in tokens)
+        marks = 'SELECT value FROM json_each(?)'
         with closing(self._connect()) as conn:
             return [row[0] for row in conn.execute(
                 f'SELECT DISTINCT n.kind FROM kg_nodes n JOIN kg_node_scope_views v ON v.node_id=n.node_id '
-                f'WHERE v.scope_ref IN ({marks}) ORDER BY n.kind', tokens)]
+                f'WHERE v.scope_ref IN ({marks}) ORDER BY n.kind', [json.dumps(tokens)])]
 
     def authorized_relation_signatures(self, scopes):
         tokens = sorted(set(scopes))
         if not tokens:
             return []
-        marks = ','.join('?' for _ in tokens)
+        marks = 'SELECT value FROM json_each(?)'
         with closing(self._connect()) as conn:
             return list(conn.execute(
                 f'SELECT DISTINCT a.kind, e.rel_type, b.kind FROM ({self._authorized_edges_sql(marks)}) e '
                 'JOIN kg_nodes a ON a.node_id=e.src_id JOIN kg_nodes b ON b.node_id=e.dst_id',
-                tokens * 3))
+                [json.dumps(tokens)] * 3))
 
     def authorized_hierarchies(self, scopes):
         return self.hierarchy_directions(scopes)[0]
@@ -274,7 +302,7 @@ class SQLiteGraphIndex:
         tokens = sorted(set(scopes))
         if not tokens:
             return {}, {}
-        marks = ','.join('?' for _ in tokens)
+        marks = 'SELECT value FROM json_each(?)'
         orientations_by_signature = defaultdict(set)
         with closing(self._connect()) as conn:
             # Existing immutable format-5 indexes predate orientation metadata.
@@ -289,7 +317,7 @@ class SQLiteGraphIndex:
             rows = conn.execute(
                 f'SELECT DISTINCT a.kind, e.rel_type, b.kind, {field} FROM ({self._authorized_edges_sql(marks)}) e '
                 f'JOIN kg_nodes a ON a.node_id=e.src_id JOIN kg_nodes b ON b.node_id=e.dst_id{join}{incident}',
-                tokens * 3 + ([anchor, anchor] if anchor is not None else []))
+                [json.dumps(tokens)] * 3 + ([anchor, anchor] if anchor is not None else []))
             for src, rel, dst, orientation in rows:
                 orientations_by_signature[src, rel, dst].add(orientation)
         result, mapped = {}, {}
@@ -317,11 +345,11 @@ class SQLiteGraphIndex:
         tokens = sorted(set(scopes))
         if not tokens:
             return []
-        marks = ','.join('?' for _ in tokens)
+        marks = 'SELECT value FROM json_each(?)'
         with closing(self._connect()) as conn:
             return [row[0] for row in conn.execute(
                 f'SELECT DISTINCT rel_type FROM ({self._authorized_edges_sql(marks)}) ORDER BY rel_type',
-                tokens * 3)]
+                [json.dumps(tokens)] * 3)]
 
     def expand_endpoint_relation_types(self, names, scopes):
         """Keep exact filters; add endpoint specializations backed by a visible edge and endpoints."""
@@ -336,26 +364,51 @@ class SQLiteGraphIndex:
                 raise LightGraphError('retrieval_index_stale')
             if not tokens:
                 return requested
-            scopes_sql = ','.join('?' for _ in tokens)
+            scopes_sql = 'SELECT value FROM json_each(?)'
             names_sql = ','.join('?' for _ in requested)
             matches = conn.execute(
                 f'SELECT DISTINCT e.rel_type FROM ({self._authorized_edges_sql(scopes_sql)}) e '
                 f'JOIN kg_endpoint_specializations s ON s.rel_type=e.rel_type WHERE s.base_type IN ({names_sql})',
-                [*tokens, *tokens, *tokens, *requested])
+                [json.dumps(tokens), json.dumps(tokens), json.dumps(tokens), *requested])
             return sorted(set(requested).union(row[0] for row in matches))
+
+    def terms_in_text(self, text, scopes, *, field='all'):
+        """Find dictionary substrings using only two-character prefixes present in this question."""
+        term = normalize_term(text)
+        tokens = sorted(set(scopes))
+        if not tokens or not term or field == 'description':
+            return []
+        prefixes = sorted({term[i:i + 2] for i in range(len(term) - 1)})
+        roles = [role for role in _TERM_ROLES[field] if role != 'description']
+        with closing(self._connect()) as conn:
+            return [row[0] for row in conn.execute(
+                'SELECT DISTINCT term_raw FROM kg_node_terms WHERE substr(term_norm,1,2) IN '
+                '(SELECT value FROM json_each(?)) AND instr(?,term_norm)>0 '
+                'AND scope_ref IN (SELECT value FROM json_each(?)) AND role IN (SELECT value FROM json_each(?))',
+                (json.dumps(prefixes), term, json.dumps(tokens), json.dumps(roles)))]
+
+    def _contains(self, norm, column='term_norm'):
+        """Compile a literal substring filter. An FTS phrase preserves CJK and punctuation."""
+        if len(norm) in (1, 2) and self._short_terms:
+            return (f'{column} IN (SELECT t.term_norm FROM kg_term_grams g '
+                    'JOIN kg_node_terms t ON t.term_id=g.term_id WHERE g.gram=?)', norm)
+        if len(norm) >= 3 and '\x00' not in norm and self._indexed_substrings:
+            return (f'{column} IN (SELECT term_norm FROM kg_lexemes WHERE kg_lexemes MATCH ?)',
+                    '"' + norm.replace('"', '""') + '"')
+        return f'instr({column},?)>0', norm
 
     def authorized_terms(self, scopes: Sequence[str] | set[str], *, field: str = 'all') -> list[str]:
         scope_list = sorted({str(s) for s in scopes})
         if not scope_list or field == 'description':
             return []
-        placeholders = ','.join('?' for _ in scope_list)
+        placeholders = 'SELECT value FROM json_each(?)'
         roles = tuple(role for role in _TERM_ROLES[field] if role != 'description')
         role_marks = ','.join('?' for _ in roles)
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 f'SELECT DISTINCT term_raw FROM kg_node_terms '
                 f'WHERE scope_ref IN ({placeholders}) AND role IN ({role_marks})',
-                [*scope_list, *roles],
+                [json.dumps(scope_list), *roles],
             ).fetchall()
         return [str(r['term_raw']) for r in rows if r['term_raw']]
 
@@ -371,12 +424,14 @@ class SQLiteGraphIndex:
         scope_list = sorted({str(s) for s in scopes})
         if not norm or not scope_list:
             return []
-        placeholders = ','.join('?' for _ in scope_list)
+        placeholders = 'SELECT value FROM json_each(?)'
         if field == 'description':
             # Keep a sentence intact for semantic ranking. The lexical branch
             # also recognizes explicit terms separated by whitespace or punctuation.
             words = list(dict.fromkeys(re.findall(r'[\w]+', norm)))[:32] or [norm]
             word_marks = ','.join('(?)' for _ in words)
+            clauses = [self._contains(word) for word in (norm, *words)]
+            matching = ' OR '.join(clause for clause, _ in clauses)
             with closing(self._connect()) as conn:
                 rows = conn.execute(
                     f"""
@@ -386,10 +441,10 @@ class SQLiteGraphIndex:
                         WHEN instr(term_norm, ?) > 0 THEN 2.0
                         ELSE (SELECT COUNT(*) FROM words WHERE instr(term_norm, word) > 0) * 1.0 / ?
                     END) AS score
-                    FROM kg_node_terms WHERE scope_ref IN ({placeholders}) AND role = 'description'
+                    FROM kg_node_terms WHERE scope_ref IN ({placeholders}) AND role = 'description' AND ({matching})
                     GROUP BY node_id, kind HAVING score > 0 ORDER BY score DESC, node_id LIMIT ?
                     """,
-                    [*words, norm, norm, len(words), *scope_list, limit],
+                    [*words, norm, norm, len(words), json.dumps(scope_list), *(value for _, value in clauses), limit],
                 ).fetchall()
             return [{'node_id': row['node_id'], 'kind': row['kind'], 'score': row['score'],
                      'match_type': 'exact_description' if row['score'] == 3 else 'description_keywords'}
@@ -397,6 +452,8 @@ class SQLiteGraphIndex:
         roles = _TERM_ROLES[field]
         role_marks = ','.join('?' for _ in roles)
         with closing(self._connect()) as conn:
+            contains, needle = self._contains(norm)
+            prefixes = sorted({norm[i:i + 2] for i in range(len(norm) - 1)})
             rows = conn.execute(
                 f"""
                 SELECT node_id, kind, role, scope_ref, is_exact_code, term_norm,
@@ -409,9 +466,10 @@ class SQLiteGraphIndex:
                 FROM kg_node_terms
                 WHERE scope_ref IN ({placeholders})
                   AND role IN ({role_marks})
-                  AND (term_norm = ? OR instr(term_norm, ?) > 0 OR instr(?, term_norm) > 0)
+                  AND (term_norm = ? OR {contains} OR (substr(term_norm,1,2) IN
+                       (SELECT value FROM json_each(?)) AND instr(?, term_norm) > 0))
                 """,
-                [norm, norm, norm, *scope_list, *roles, norm, norm, norm],
+                [norm, norm, norm, json.dumps(scope_list), *roles, norm, needle, json.dumps(prefixes), norm],
             ).fetchall()
 
         best_by_node: dict[str, dict[str, Any]] = {}
@@ -446,22 +504,23 @@ class SQLiteGraphIndex:
         tokens = sorted(set(scopes))
         if not tokens or not surfaces or limit <= 0:
             return []
-        marks = ','.join('?' for _ in tokens)
+        marks = 'SELECT value FROM json_each(?)'
         excerpts = []
         with closing(self._connect()) as conn:
             for text in dict.fromkeys(surfaces):
                 norm = normalize_term(text)
                 if not norm:
                     continue
+                contains, needle = self._contains(norm, 't.term_norm')
                 rows = conn.execute(f"""
                     SELECT t.node_id, t.role, v.display_name, v.observations_json
                     FROM kg_node_terms t JOIN kg_node_scope_views v
                       ON v.node_id = t.node_id AND v.scope_ref = t.scope_ref
                     WHERE t.scope_ref IN ({marks}) AND t.role IN ('description','source_property')
-                      AND instr(t.term_norm, ?) > 0
+                      AND {contains}
                     GROUP BY t.node_id, t.scope_ref, t.role
                     ORDER BY t.node_id, t.scope_ref, t.role LIMIT ?
-                    """, [*tokens, norm, limit - len(excerpts)])
+                    """, [json.dumps(tokens), needle, limit - len(excerpts)])
                 for row in rows:
                     for obs in json.loads(row['observations_json']):
                         values = ([(None, obs.get('description'))] if row['role'] == 'description'
@@ -490,13 +549,13 @@ class SQLiteGraphIndex:
         if not ids or not scope_list:
             return {}
         id_marks = ','.join('?' for _ in ids)
-        scope_marks = ','.join('?' for _ in scope_list)
+        scope_marks = 'SELECT value FROM json_each(?)'
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 f"""SELECT node_id, COALESCE(MIN(NULLIF(chinese_name,'')), MIN(NULLIF(display_name,'')), node_id)
                     FROM kg_node_scope_views
                     WHERE node_id IN ({id_marks}) AND scope_ref IN ({scope_marks}) GROUP BY node_id""",
-                [*ids, *scope_list],
+                [*ids, json.dumps(scope_list)],
             )
             return dict(rows)
 
@@ -506,7 +565,7 @@ class SQLiteGraphIndex:
         scopes = sorted(set(scopes))
         if not terms or not scopes:
             return {}
-        scope_marks = ','.join('?' for _ in scopes)
+        scope_marks = 'SELECT value FROM json_each(?)'
         roles = (*_NAME_ROLES, 'identity_code') if include_codes else _NAME_ROLES
         role_marks = ','.join('?' for _ in roles)
         filters = [] if kind is None else [kind]
@@ -517,7 +576,7 @@ class SQLiteGraphIndex:
                   GROUP BY node_id, kind ORDER BY MAX(is_exact_code) DESC, node_id LIMIT ?"""
         with closing(self._connect()) as conn:
             return {term: [dict(row) for row in conn.execute(
-                sql, (term, *scopes, *roles, *filters, max(2, limit_per_term)))] for term in terms}
+                sql, (term, json.dumps(scopes), *roles, *filters, max(2, limit_per_term)))] for term in terms}
 
     def load_authorized_nodes(
         self,
@@ -530,7 +589,7 @@ class SQLiteGraphIndex:
         if not ids or not scope_list:
             return {}
         id_ph = ','.join('?' for _ in ids)
-        sc_ph = ','.join('?' for _ in scope_list)
+        sc_ph = 'SELECT value FROM json_each(?)'
         # Both endpoints must be visible, even if the relationship has a
         # separate grant. Count each visible edge once across overlapping views.
         authorized_edges = self._authorized_edges_sql(sc_ph)
@@ -540,7 +599,7 @@ class SQLiteGraphIndex:
                 f'SELECT id, COUNT(*) AS degree FROM ('
                 f'SELECT DISTINCT src_id AS id, edge_id FROM authorized_edges WHERE src_id IN ({id_ph}) UNION ALL '
                 f'SELECT DISTINCT dst_id AS id, edge_id FROM authorized_edges WHERE dst_id IN ({id_ph})) GROUP BY id',
-                [*scope_list, *scope_list, *scope_list, *ids, *ids],
+                [json.dumps(scope_list), json.dumps(scope_list), json.dumps(scope_list), *ids, *ids],
             )
             degrees_by_node = {row['id']: row['degree'] for row in degrees}
             base_rows = conn.execute(
@@ -550,7 +609,7 @@ class SQLiteGraphIndex:
             view_rows = conn.execute(
                 f'SELECT node_id, scope_ref, chinese_name, english_name, display_name, aliases_json, description, source_tables_json, scopes_json, observations_json '
                 f'FROM kg_node_scope_views WHERE node_id IN ({id_ph}) AND scope_ref IN ({sc_ph})',
-                [*ids, *scope_list],
+                [*ids, json.dumps(scope_list)],
             ).fetchall()
         views_by_node: dict[str, list[sqlite3.Row]] = defaultdict(list)
         for v in view_rows:
@@ -612,9 +671,10 @@ class SQLiteGraphIndex:
         tokens = sorted(set(scopes))
         if not tokens or not surface:
             return []
-        marks = ','.join('?' for _ in tokens)
+        marks = 'SELECT value FROM json_each(?)'
         names = ','.join('?' for _ in _NAME_ROLES)
         norm = normalize_term(surface)
+        contains, needle = self._contains(norm)
         # Compute adjacency from small endpoint records; observations are verified later.
         # When a subject has many exact matches, its output shortlist is not its search space.
         sql = f"""
@@ -629,10 +689,10 @@ class SQLiteGraphIndex:
             ), adjacent AS (SELECT DISTINCT seed,dst FROM subjects JOIN adjacency ON src=seed AND dst!=seed),
             matches AS (
                 SELECT node_id, MIN(CASE WHEN term_norm=? THEN 0 ELSE 1 END) AS rank
-                FROM kg_node_terms WHERE scope_ref IN ({marks}) AND role IN ({names}) AND instr(term_norm,?)>0
+                FROM kg_node_terms WHERE scope_ref IN ({marks}) AND role IN ({names}) AND {contains}
                 GROUP BY node_id
-                UNION ALL SELECT DISTINCT node_id,2 FROM kg_node_terms
-                          WHERE scope_ref IN ({marks}) AND instr(lower(kind),?)>0
+                UNION ALL SELECT n.node_id,2 FROM kg_nodes n WHERE instr(lower(n.kind),?)>0
+                          AND EXISTS (SELECT 1 FROM kg_node_scope_views v WHERE v.node_id=n.node_id AND v.scope_ref IN ({marks}))
                 UNION ALL SELECT value,3 FROM json_each(?)
             ), routes(seed,target,bridge,rank) AS (
                 SELECT i.seed,i.dst,NULL,m.rank FROM adjacent i JOIN matches m ON m.node_id=i.dst
@@ -648,8 +708,8 @@ class SQLiteGraphIndex:
         """
         return self._route_rows(sql, [
             json.dumps(seeds), normalize_term(subject_term) if subject_term else None,
-            *tokens, *_NAME_ROLES, *tokens, *tokens, *tokens, norm,
-            *tokens, *_NAME_ROLES, norm, *tokens, norm, json.dumps(list(suggested_ids)), max_depth, limit,
+            json.dumps(tokens), *_NAME_ROLES, json.dumps(tokens), json.dumps(tokens), json.dumps(tokens), norm,
+            json.dumps(tokens), *_NAME_ROLES, needle, norm, json.dumps(tokens), json.dumps(list(suggested_ids)), max_depth, limit,
         ], truncation)
 
     def exact_association_links(self, terms, *, scopes, limit, truncation=None):
@@ -658,7 +718,7 @@ class SQLiteGraphIndex:
         terms = sorted({normalize_term(term) for term in terms})
         if not tokens or len(terms) < 2:
             return []
-        marks = ','.join('?' for _ in tokens)
+        marks = 'SELECT value FROM json_each(?)'
         sql = f"""
             WITH matches(term,id,kind) AS (
                 SELECT DISTINCT term_norm,node_id,kind FROM kg_node_terms
@@ -680,7 +740,7 @@ class SQLiteGraphIndex:
             SELECT src,lt,sk,dst,rt,dk FROM ranked ORDER BY terms DESC,n,lt,rt,src,dst LIMIT ?
         """
         return self._route_rows(sql, [
-            json.dumps(terms), *tokens, json.dumps([*_NAME_ROLES, 'identity_code']), *tokens, limit,
+            json.dumps(terms), json.dumps(tokens), json.dumps([*_NAME_ROLES, 'identity_code']), json.dumps(tokens), limit,
         ], truncation)
 
     def expand_neighborhood(
@@ -712,7 +772,7 @@ class SQLiteGraphIndex:
         edges_by_id: dict[str, dict[str, Any]] = {}
         truncation_reasons = {'max_nodes_reached'} if len(seed_ids) > max_nodes else set()
         hub_skipped: set[str] = set()
-        sc_ph = ','.join('?' for _ in scope_list)
+        sc_ph = 'SELECT value FROM json_each(?)'
         if direction not in {'both', 'outgoing', 'incoming'}:
             raise ValueError('invalid_traversal_direction')
         relations = sorted(set(relation_types or []))
@@ -800,9 +860,10 @@ class SQLiteGraphIndex:
                     f'WITH authorized AS ({self._authorized_edges_sql(sc_ph)}) '
                     f'SELECT * FROM authorized WHERE ({frontier_sql}){rel_sql} '
                     f'ORDER BY {priority_sql}weight DESC, edge_id, scope_ref',
-                    [*scope_list, *scope_list, *scope_list, *frontier_params,
+                    [json.dumps(scope_list), json.dumps(scope_list), json.dumps(scope_list), *frontier_params,
                      *relations, *priority_params],
                 )
+                frontier_ids = set(active_frontier)
                 per_rel_counts: dict[tuple[str, str, str], int] = defaultdict(int)
                 candidate_edges = []
                 retained_endpoints = set(nodes)
@@ -811,22 +872,20 @@ class SQLiteGraphIndex:
                         continue
                     row = next(versions)
                     src, dst, rel = row['src_id'], row['dst_id'], row['rel_type']
-                    admitted = False
-                    if direction != 'incoming' and src in active_frontier:
+                    accepted_keys = []
+                    if direction != 'incoming' and src in frontier_ids:
                         key = (src, rel, 'out')
                         if per_rel_counts[key] < max_per_rel:
-                            per_rel_counts[key] += 1
-                            admitted = True
+                            accepted_keys.append(key)
                         else:
                             truncation_reasons.add('per_relation_limit_reached')
-                    if direction != 'outgoing' and dst in active_frontier:
+                    if direction != 'outgoing' and dst in frontier_ids:
                         key = (dst, rel, 'in')
                         if per_rel_counts[key] < max_per_rel:
-                            per_rel_counts[key] += 1
-                            admitted = True
+                            accepted_keys.append(key)
                         else:
                             truncation_reasons.add('per_relation_limit_reached')
-                    if not admitted:
+                    if not accepted_keys:
                         continue
                     new_ids = {src, dst} - retained_endpoints
                     if len(retained_endpoints) + len(new_ids) > max_nodes:
@@ -835,6 +894,8 @@ class SQLiteGraphIndex:
                     if len(edges_by_id) + len(candidate_edges) >= max_edges:
                         truncation_reasons.add('max_edges_reached')
                         break
+                    for key in accepted_keys:
+                        per_rel_counts[key] += 1
                     retained_endpoints.update(new_ids)
                     qualifiers = defaultdict(list)
                     refs, tables = set(), set()

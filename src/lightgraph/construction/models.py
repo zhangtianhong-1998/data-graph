@@ -42,6 +42,11 @@ class SourceMapping(StrictModel):
         description='Business property name -> physical column carrying the value in this table. Omit a property when this table does not provide it; another mapping may supply it.')
     constant_properties: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=32,
         description='Agent-declared mapping annotations, distinct from source values. Source table, key columns, and endpoint columns are already recorded in provenance.')
+    identity_qualifiers: dict[str, str] = Field(default_factory=dict, max_length=32,
+        description='Entity property name -> documented identity qualifier (e.g. measurement unit). Contradictory observed values block reviewed merges.')
+    hierarchy_position_roles: dict[str, Literal['node', 'source', 'target', 'parent', 'child']] = Field(
+        default_factory=dict, max_length=32,
+        description='Constant property -> endpoint whose physical hierarchy position the constant encodes. Use node on entities.')
     context_columns: list[str] = Field(default_factory=list, max_length=32,
         description='Authorized columns that identify a source-row context shared across mappings. Retained on each support, never added to entity identity. Use the same column set for related mappings.')
     # Existing snapshots and draft fingerprints use business_context on output.
@@ -53,9 +58,26 @@ class SourceMapping(StrictModel):
     def unambiguous_property_sources(self):
         if set(self.properties) & set(self.constant_properties):
             raise ValueError('property_source_conflict')
+        if (self.identity_qualifiers and not isinstance(self, EntityMapping)
+                or set(self.identity_qualifiers) - (self.properties.keys() | self.constant_properties.keys())
+                or any(not role.strip() for role in self.identity_qualifiers.values())):
+            raise ValueError('invalid_identity_qualifier')
+        if (set(self.hierarchy_position_roles) - self.constant_properties.keys()
+                or any((role == 'node') != isinstance(self, EntityMapping)
+                       for role in self.hierarchy_position_roles.values())):
+            raise ValueError('invalid_hierarchy_position_annotation')
         if len(set(self.context_columns)) != len(self.context_columns):
             raise ValueError('duplicate_context_column')
         return self
+
+    @model_serializer(mode='wrap')
+    def serialize_mapping(self, handler):
+        data = handler(self)
+        if not self.hierarchy_position_roles:
+            data.pop('hierarchy_position_roles', None)
+        if not self.identity_qualifiers:
+            data.pop('identity_qualifiers', None)
+        return data
 
 
 class EntityMapping(SourceMapping):

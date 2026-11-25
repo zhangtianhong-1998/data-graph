@@ -254,3 +254,13 @@ def test_output_budget_does_not_turn_natural_query_into_unscoped_search(run):
     result = run(data={'query': '只看 M 项目，查华东的路由器销售收入。', 'max_nodes': 12})
     assert result['plan']['business_context'] == {'project': 'M'}
     assert result['dimensional']['fact_ids'] == ['fact']
+
+
+def test_structured_nodes_do_not_prove_additional_predicate_in_question(run):
+    params = {'mode': 'dimensional', 'query': '华东的销售收入，要求金额大于 1000000',
+              'conditions': [{'node_id': 'east'}, {'node_id': 'rev'}]}
+    out = run(data=params)
+    assert out['plan']['intent'] == 'clarify' and '1000000' in str(out['plan']['unresolved'])
+    assert not out.get('dimensional', {}).get('witnesses') and not out['edges']
+    params['query'] = '华东的销售收入'
+    assert run(data=params)['dimensional']['status'] == 'matched'

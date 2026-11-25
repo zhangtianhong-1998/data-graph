@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { databaseFactDataAllowed, updateDatabaseSources } from './database'
 import { ConnectionDraftWriter } from './connectionDraft'
-import type { ConnectionDraft, DraftResult, DraftStatus } from './connectionDraft'
+import type { ConnectionDraft, DraftResult, DraftStatus, SavedBinding } from './connectionDraft'
 import type { DatabaseForm } from './database'
 import { connectionFormFromPayload, connectionPayload, isGaussJdbcDsn, selectedTables, validateSourceId } from './onboarding'
 import type { ConnectionForm, ConnectionPayload, DatabaseTable } from './onboarding'
@@ -44,6 +44,8 @@ const tableCount = computed(() => new Set([...checked.value, ...form.value.table
 const draftStatus = ref<DraftStatus>('idle'), draftError = ref(''), draftRecoverable = ref(false)
 const draftKey = props.source ? `source-${props.source.id}` : 'new'
 const draftPath = `${path.value}/database/drafts/${encodeURIComponent(draftKey)}`
+const savedBinding = ref<SavedBinding>()
+function executableConnection() { return savedBinding.value || connectionPayload(connection.value) }
 let restoring = true, ending = false
 const draftWriter = new ConnectionDraftWriter(props.projectId, draftPath, (status, error = '') => {
   draftStatus.value = status; draftError.value = error
@@ -52,11 +54,12 @@ function draftSnapshot(): ConnectionDraft {
   return { form: { ...form.value }, connection: { ...connection.value }, mode: mode.value, retention: retention.value, checked: [...checked.value] }
 }
 function saveDraft() {
-  if (!restoring && !ending && rememberConnection.value) draftWriter.update(draftSnapshot())
+  if (!restoring && !ending && rememberConnection.value) draftWriter.update(draftSnapshot(), savedBinding.value)
 }
 watch(() => form.value.kind, kind => { if (!restoring) { connection.value.kind = kind; connection.value.port = kind === 'mysql_database' ? '3306' : '5432' } }, { flush: 'sync' })
 watch(connection, () => {
   if (restoring) return
+  savedBinding.value = undefined
   tested.value = false; tableLoaded.value = false; tables.value = []; checked.value = []; truncated.value = false; skippedCount.value = 0; importedOnly.value = false
 }, { deep: true, flush: 'sync' })
 watch([form, connection, mode, retention, checked], saveDraft, { deep: true })
@@ -98,7 +101,7 @@ onMounted(async () => {
         // Old drafts never granted this permission. Preserve an existing source's
         // effective setting, but leave new sources metadata-only until selected.
         form.value = { ...draft.form, allowFactData: draft.form.allowFactData ?? databaseFactDataAllowed(props.source, props.retentionVerified) }
-        connection.value = draft.connection; mode.value = draft.mode
+        connection.value = draft.connection; savedBinding.value = result.saved_binding; mode.value = draft.mode
         retention.value = draft.retention; checked.value = draft.checked
         draftStatus.value = 'saved'; restoredDraft = true; savedConnection.value = !!props.source
       }
@@ -110,12 +113,14 @@ onMounted(async () => {
     }
     if (!props.source || restoredDraft || mode.value === 'environment') return
     try {
-      const result = await request<{ saved: boolean; connection?: ConnectionPayload }>(`${path.value}/database/connections/${encodeURIComponent(props.source.id)}`, { signal: controller.signal })
+      const result = await request<{ saved: boolean; connection?: ConnectionPayload; saved_binding?: SavedBinding; format?: ConnectionForm['format'] }>(`${path.value}/database/connections/${encodeURIComponent(props.source.id)}`, { signal: controller.signal })
       if (controller.signal.aborted) return
       savedConnection.value = result.saved
       if (result.saved && result.connection) {
         if (result.connection.kind !== form.value.kind) throw new Error('保存的连接与数据源类型不一致，请重新填写。')
         connection.value = connectionFormFromPayload(result.connection)
+        if (result.format) connection.value.format = result.format
+        savedBinding.value = result.saved_binding
         rememberConnection.value = true
       }
     } catch (error) {
@@ -129,6 +134,7 @@ onMounted(async () => {
 })
 async function forgetConnection() {
   await draftWriter.erase()
+  savedBinding.value = undefined
   if (props.source) {
     try {
       await request(`${path.value}/database/connections/${encodeURIComponent(props.source.id)}`, { method: 'DELETE' })
@@ -162,15 +168,15 @@ async function perform(operation: () => Promise<void>, message = '正在处理�
 async function testConnection() {
   await perform(async () => {
     tested.value = false
-    await request(`${path.value}/database/test`, { method: 'POST', body: json({ connection: connectionPayload(connection.value) }), signal: controller.signal, timeoutMs: 30000 })
+    await request(`${path.value}/database/test`, { method: 'POST', body: json({ connection: executableConnection() }), signal: controller.signal, timeoutMs: 30000 })
     if (controller.signal.aborted) return
     tested.value = true
     await loadTables()
-  }, '正在测试连接…', () => { connectionPayload(connection.value) })
+  }, '正在测试连接…', () => { executableConnection() })
 }
 async function loadTables() {
   progress.value = '正在读取表清单…'
-  const result = await request<{ tables: DatabaseTable[]; truncated: boolean; skipped_count?: number }>(`${path.value}/database/tables`, { method: 'POST', body: json({ connection: connectionPayload(connection.value) }), signal: controller.signal, timeoutMs: 45000 })
+  const result = await request<{ tables: DatabaseTable[]; truncated: boolean; skipped_count?: number }>(`${path.value}/database/tables`, { method: 'POST', body: json({ connection: executableConnection() }), signal: controller.signal, timeoutMs: 45000 })
   if (controller.signal.aborted) return
   if (!tableLoaded.value) {
     const manual = form.value.tables.split('\n').map(name => name.trim()).filter(Boolean)
@@ -184,7 +190,7 @@ async function loadTables() {
   importedOnly.value = false; truncated.value = result.truncated; skippedCount.value = result.skipped_count || 0; tableLoaded.value = true
 }
 async function discoverTables() {
-  await perform(loadTables, '正在读取表清单…', () => { connectionPayload(connection.value) })
+  await perform(loadTables, '正在读取表清单…', () => { executableConnection() })
 }
 async function uploadManifest(event: Event) {
   const input = event.target as HTMLInputElement, file = input.files?.[0]
@@ -212,7 +218,7 @@ async function importYamlSelection(event: Event) {
   await perform(async () => {
     if (!/\.ya?ml$/i.test(file.name)) throw new Error('请选择 .yaml 或 .yml 表清单。')
     const direct = mode.value === 'direct'
-    const payload = direct ? connectionPayload(connection.value) : null
+    const payload = direct ? executableConnection() : null
     const body = new FormData()
     body.append('file', file)
     const parsed = await request<{ tables: string[] }>(`${path.value}/database/table-list`, {
@@ -265,10 +271,10 @@ async function submit() {
   await perform(async () => {
     validateSourceId(form.value.id.trim(), props.source, props.sources)
     const allowedTables = selectedTables(form.value.tables, checked.value)
-    connectionPayload(connection.value)
+    executableConnection()
     await ensureSession(props.projectId)
     if (controller.signal.aborted) return
-    const result = await request<{ config: RunConfig; metadata: Metadata }>(`${path.value}/database/connect`, { method: 'POST', headers: revisionHeaders(), body: json({ source_id: form.value.id.trim(), remember_connection: rememberConnection.value, connection: connectionPayload(connection.value), allowed_tables: allowedTables, allow_fact_data: form.value.allowFactData === true, deployment_retention_verified: retention.value, capability_manifest: savedManifest.value || null }), signal: controller.signal, timeoutMs: 120000 })
+    const result = await request<{ config: RunConfig; metadata: Metadata }>(`${path.value}/database/connect`, { method: 'POST', headers: revisionHeaders(), body: json({ source_id: form.value.id.trim(), remember_connection: rememberConnection.value, connection: executableConnection(), allowed_tables: allowedTables, allow_fact_data: form.value.allowFactData === true, deployment_retention_verified: retention.value, capability_manifest: savedManifest.value || null }), signal: controller.signal, timeoutMs: 120000 })
     if (controller.signal.aborted) return
     await finalizeDraft()
     clearSecrets(); emit('connected', result.config, result.metadata, responseRevision(result))
@@ -288,7 +294,7 @@ async function submit() {
             <section class="connection-step"><h3><span>1</span>填写连接信息</h3><div class="radio-line connection-format"><label><input v-model="connection.format" type="radio" value="fields" :disabled="locked"/>分项填写</label><label><input v-model="connection.format" type="radio" value="dsn" :disabled="locked"/>连接串</label></div>
               <template v-if="connection.format === 'fields'"><div class="host-port"><div class="field"><label for="database-host">主机地址</label><input id="database-host" v-model="connection.host" :disabled="locked" placeholder="db.example.com" autocomplete="off"/></div><div class="field"><label for="database-port">端口</label><input id="database-port" v-model="connection.port" :disabled="locked" inputmode="numeric"/></div></div><div class="two-fields"><div class="field"><label for="database-name">数据库名</label><input id="database-name" v-model="connection.database" :disabled="locked" autocomplete="off"/></div><div class="field"><label for="database-schema">Schema（可选）</label><input id="database-schema" v-model="connection.schema" :disabled="locked" :placeholder="form.kind === 'mysql_database' ? '默认使用数据库名' : '例如：public'"/></div></div></template>
               <template v-else><div class="field"><label for="database-dsn">连接串</label><input id="database-dsn" v-model="connection.dsn" :disabled="locked" autocomplete="off" :placeholder="form.kind === 'mysql_database' ? 'mysql://用户名:密码@主机:3306/数据库' : 'jdbc:gaussdb://主机:8000/数据库'"/></div><div class="field"><label for="dsn-schema">Schema（可选）</label><input id="dsn-schema" v-model="connection.schema" :disabled="locked"/></div></template>
-              <template v-if="connection.format === 'fields' || jdbcConnection"><div class="two-fields"><div class="field"><label for="database-username">用户名</label><input id="database-username" v-model="connection.username" :disabled="locked" autocomplete="off"/></div><div class="field"><label for="database-password">密码</label><input id="database-password" v-model="connection.password" :disabled="locked" type="password" autocomplete="new-password"/></div></div></template>
+              <template v-if="connection.format === 'fields' || jdbcConnection"><div class="two-fields"><div class="field"><label for="database-username">用户名</label><input id="database-username" v-model="connection.username" :disabled="locked" autocomplete="off"/></div><div class="field"><label for="database-password">密码</label><input :placeholder="savedBinding ? '已保存，更换连接时请重新输入' : ''" id="database-password" v-model="connection.password" :disabled="locked" type="password" autocomplete="new-password"/></div></div></template>
               <div v-if="form.kind === 'gauss_database'" class="field">
                 <label for="database-sslmode">SSL 模式</label>
                 <select id="database-sslmode" v-model="connection.sslmode" :disabled="locked" :aria-describedby="sslHint ? 'database-sslmode-hint' : undefined">

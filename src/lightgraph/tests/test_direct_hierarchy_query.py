@@ -231,3 +231,24 @@ def test_canvas_line_distinguishes_predicates_properties_and_physical_rows():
         actual = projected(witness=malformed)
         assert actual['id'] == edge['id'] and 'hierarchy_line_key' not in actual
         assert 'hierarchy_direction' not in actual
+
+
+def test_qualified_direct_hierarchy_filters_target_before_applying_page_limits(tmp_path):
+    raw = publication()
+    raw['nodes'][2]['type'] = '部门'
+    raw['definitions']['entities'].append({'type': '部门', 'key_names': ['code']})
+    raw['definitions']['relations'].append({'type': 'has_department', 'source_type': '科目',
+        'target_type': '部门', 'hierarchy_orientation': 'parent_to_child'})
+    raw['edges'] = [e for e in raw['edges'] if e['id'] == 'a'] + [
+        {'id': '0', 'type': 'has_department', 'source': 'p', 'target': 'd', 'supports': [support(None)]}]
+    for item in [*raw['nodes'], *raw['edges']]:
+        for obs in item['supports']:
+            obs['business_context'] = {'status': 'scoped', 'dimensions': {'project_id': 'M', 'project_name': 'K'}}
+    sync_graph_to_retrieval(raw, tmp_path)
+    reader = SubgraphRetriever(tmp_path)
+    scoped = ask(reader, query='project_id=M 中总成本的直接下级科目有哪些？', max_edges=1)
+    assert scoped['hierarchy']['items'] == [{'node_id': 'c', 'edge_ids': ['a']}]
+    assert scoped['plan']['business_context'] == {'project_id': 'M'} and not scoped['truncated']
+    for question in ['M 项目中总成本的直接下级有哪些？', '总成本的直接下级未知类型有哪些？']:
+        answer = ask(reader, query=question)
+        assert answer['plan']['intent'] == 'clarify' and not answer['edges']

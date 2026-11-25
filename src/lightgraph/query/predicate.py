@@ -45,7 +45,9 @@ def compile_predicate(table,predicate,params,*,column_sql,dialect):
     nodes=0
     def bind(value):
         if len(params)>=MAX_VALUES:raise LightGraphError('predicate_values_limit')
-        key=f'p{len(params)}';params[key]=value;return ':'+key
+        key=f'p{len(params)}'
+        params[key] = value.isoformat() if isinstance(value, date) and dialect != 'postgres' else value
+        return ':'+key
     def scalar(value,datatype):
         if value is None:raise LightGraphError('predicate_null_requires_explicit_operator')
         if type(value) not in (str,int,float,bool):raise LightGraphError('predicate_value_type_mismatch')
@@ -65,7 +67,7 @@ def compile_predicate(table,predicate,params,*,column_sql,dialect):
             if type(value) is not str:raise LightGraphError('predicate_value_type_mismatch')
             try:parsed=date.fromisoformat(value) if datatype=='date' else datetime.fromisoformat(value)
             except (ValueError,TypeError):raise LightGraphError('predicate_date_invalid') from None
-            return parsed if dialect=='postgres' else parsed.isoformat()
+            return parsed
         raise LightGraphError('predicate_type_unsupported')
     def visit(node,depth):
         nonlocal nodes

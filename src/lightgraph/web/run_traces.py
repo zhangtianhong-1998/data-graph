@@ -219,6 +219,12 @@ def export_run_trace(manager, pid, rid):
     return TraceDownload(trace,end)
 
 
+def ensure_no_project_downloads(directory):
+    with _reader_lock:
+        if any(path.is_relative_to(directory) for path in _readers):
+            raise LightGraphError('run_trace_export_active')
+
+
 class TraceDownload:
     """A reader lease makes concurrent deletion safe on Windows as well."""
     def __init__(self,path,end):

@@ -22,6 +22,7 @@ from ..catalog import CATALOG_VERSION, DeclaredCatalog, SemanticCatalog, semanti
 from ..contracts import digest
 from ..documents.core import load_document
 from ..errors import LightGraphError
+from ..sources.workbook_xml import forbidden_xml_declaration
 from .workspace import _identifier, _no_symlinks
 
 DB_KINDS = {'gauss_database', 'mysql_database'}
@@ -36,6 +37,8 @@ def delete_project(workspace, pid):
             _no_symlinks(item)
             if getattr(item, 'is_junction', lambda: False)():
                 raise LightGraphError('workspace_symlink_forbidden')
+    from .run_traces import ensure_no_project_downloads
+    ensure_no_project_downloads(path)
     shutil.rmtree(path)
     return {'deleted': True, 'project_id': pid}
 
@@ -48,7 +51,7 @@ def _excel_sheet_names(path, *, include_hidden=False):
             raise ValueError('workbook_metadata_too_large')
         with archive.open('xl/workbook.xml') as stream:
             xml = stream.read(limit + 1)
-        if len(xml) > limit or b'<!DOCTYPE' in xml.upper() or b'<!ENTITY' in xml.upper():
+        if len(xml) > limit or forbidden_xml_declaration(xml):
             raise ValueError('workbook_metadata_invalid')
         root = ET.fromstring(xml)
         return [sheet.attrib['name'] for sheet in root.iter() if sheet.tag.split('}')[-1] == 'sheet'
@@ -248,7 +251,7 @@ def delete_input(workspace, pid, *, fid=None, sid=None, table=None):
             # Sheet names are declarations in an uploaded file; no cell samples
             # or database queries are needed to resolve legacy short doc scopes.
             try:
-                names.extend(('public', name) for name in _excel_sheet_names(
+                names.extend((source.get('schema_name', 'public'), name) for name in _excel_sheet_names(
                     workspace._path(pid, source['path']), include_hidden=source.get('include_hidden', False)))
             except (OSError, ValueError, KeyError, zipfile.BadZipFile, ET.ParseError):
                 # A malformed upload must remain deletable. Deactivate scoped

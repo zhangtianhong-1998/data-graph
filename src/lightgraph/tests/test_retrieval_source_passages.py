@@ -69,3 +69,14 @@ def test_description_remains_readable_in_pre_property_index(tmp_path):
     p, = old.index.source_passages(['误报'], scopes=scopes, limit=1)
     assert p['field'] == 'description' and p['evidence_refs'] == ['e_manual']
     assert not old.index.source_passages(['仅属性'], scopes=scopes, limit=1)
+
+
+def test_short_chinese_terms_use_index_with_the_same_scope_and_substring_semantics(tmp_path):
+    r = build(tmp_path, [support('public_note', '高压流量校准'), support('restricted', '低压流量', scope='secret')])
+    visible = r.authorized_cohorts(['public'])
+    for word in ('压', '流量', '流量校准'):
+        assert [p['observation_id'] for p in r.index.source_passages([word], scopes=visible, limit=5)] == ['public_note']
+        with closing(sqlite3.connect(r.index.path)) as conn:
+            sql, arg = r.index._contains(word)
+            plan = str(conn.execute(f'EXPLAIN QUERY PLAN SELECT term_id FROM kg_node_terms WHERE {sql}', (arg,)).fetchall())
+            assert 'idx_terms_norm_scope' in plan

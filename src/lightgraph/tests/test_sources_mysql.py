@@ -61,7 +61,7 @@ class Cursor:
         elif sql.startswith('SELECT @@session.transaction_read_only'):
             self.result = [(db.readonly, db.isolation, db.timeout, db.sql_mode)]
         elif sql.startswith('SELECT VERSION()'):
-            self.result = [(db.version, db.version_comment, 42, db.server_uuid, db.current_user)]
+            self.result = [(db.version, db.version_comment, 42, db.server_uuid, db.current_user, 0)]
         elif sql == 'SELECT @@server_uuid, CURRENT_USER()':
             self.result = [(db.server_uuid, db.current_user)]
         elif sql == 'SELECT %s':
@@ -71,10 +71,11 @@ class Cursor:
         elif sql.startswith('WITH p AS'):
             self.result = [(1,), (2,)]
         elif 'FROM information_schema.TABLES' in sql:
-            self.result = [(db.table_type, db.engine, 'Business registry')]
+            self.result = [('analytics', 'items', db.table_type, db.engine, 'Business registry')]
         elif 'FROM information_schema.COLUMNS' in sql:
             self.result = [('tenant', 'varchar', 'NO', '租户'), ('code', 'varchar', 'NO', '业务编码'),
                            ('name', 'varchar', 'YES', '名称'), ('parent_code', 'varchar', 'YES', '')]
+            self.result = [('analytics', 'items', *row) for row in self.result]
         elif 'FROM information_schema.TABLE_CONSTRAINTS' in sql:
             self.result = [
                 ('PRIMARY', 'PRIMARY KEY', 'tenant', 1, None, None, None),
@@ -83,6 +84,7 @@ class Cursor:
                 ('uq_name', 'UNIQUE', 'name', 2, None, None, None),
                 ('fk_parent', 'FOREIGN KEY', 'tenant', 1, 'analytics', 'items', 'tenant'),
                 ('fk_parent', 'FOREIGN KEY', 'parent_code', 2, 'analytics', 'items', 'code')]
+            self.result = [('analytics', 'items', *row) for row in self.result]
         elif sql.startswith('SELECT SLEEP('):
             if db.timeout == 50:
                 if db.timeout_works:
@@ -586,3 +588,37 @@ def test_cancel_after_last_batch_does_not_report_query_success():
         with pytest.raises(LightGraphError, match='query_cancelled'):
             next(iterator)
         assert driver.main.closed
+
+
+@pytest.mark.parametrize('ignore_case', [False, True])
+def test_two_authorized_mysql_tables_use_three_catalog_requests(ignore_case):
+    from types import SimpleNamespace
+    class CatalogCursor:
+        def __init__(self):
+            self.commands = []
+        def execute(self, sql, params):
+            assert params == (('Sales', 'orders', 'other', 'orders') if ignore_case else ('sales', 'orders', 'other', 'orders'))
+            self.commands.append(sql)
+        def fetchall(self):
+            sql = self.commands[-1]
+            if 'information_schema.TABLES' in sql:
+                return [(schema, 'orders', 'BASE TABLE', 'InnoDB', '') for schema in ('sales', 'other')]
+            if 'information_schema.COLUMNS' in sql:
+                return [(schema, 'orders', name, 'varchar', 'NO', '') for schema in ('sales', 'other')
+                        for name in ('code', 'description')]
+            return [(schema, 'orders', 'PRIMARY', 'PRIMARY KEY', 'code', 1, None, None, None)
+                    for schema in ('sales', 'other')]
+
+    cursor = CatalogCursor()
+    source = MySQLSource.__new__(MySQLSource)
+    source.stats = SimpleNamespace(catalog_queries=0)
+    source.source_id = 'catalog'
+    source._ignore_name_case = ignore_case
+    source.allowed_tables = ('Sales.orders' if ignore_case else 'sales.orders', 'other.orders')
+    source.allowed_columns = {'other.orders': ['code']}
+    source._physical_column_names = {}
+    source.limits = QueryLimits()
+    tables = source._read_catalog(cursor)
+    assert [table.column_names for table in tables] == [['code', 'description'], ['code']]
+    assert [table.unique_keys for table in tables] == [[['code']], [['code']]]
+    assert source.stats.catalog_queries == len(cursor.commands) == 3

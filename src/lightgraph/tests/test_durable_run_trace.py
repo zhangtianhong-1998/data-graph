@@ -219,3 +219,15 @@ def test_secrets_split_across_sse_deltas_are_withheld(tmp_path):
         emit_trace('model_wire_response',{'body':stream})
     body=events(path)[0]['data']['body']
     assert body=='[REDACTED: stream contains credentials]'
+
+
+def test_short_learned_credentials_preserve_ordinary_words_and_schema(tmp_path):
+    path = tmp_path / 'work.trace.jsonl'
+    sink = RunTrace(path)
+    sink('tool', {'password': 'a', 'note': 'asset batch', 'separate': 'value a.'})
+    item = events(path)[0]['data']
+    assert item['password'] == '[REDACTED]' and item['note'] == 'asset batch'
+    assert item['separate'] == 'value [REDACTED].'
+    sink.add_secrets(['a'])
+    sink('tool', {'note': 'asset'})
+    assert events(path)[1]['data']['note'] == '[REDACTED]sset'

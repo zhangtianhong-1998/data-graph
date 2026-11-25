@@ -10,6 +10,7 @@ from .context_topology import detect_context_cycles
 from .contexts import business_context_identity
 from .fusion import definition_conflict_diagnostics, remap_graph_endpoints
 from .hierarchy_replay import _update_endpoint_contracts
+from .observed_identity import contradictory_qualifiers
 
 
 def candidate_key(base_id, candidate):
@@ -164,11 +165,8 @@ def project(raw, decisions, base_id):
                    for n in members):
                 raise LightGraphError('resolution_type_conflict')
             batch = [nodes[n] for n in sorted(members)]
-            for prop in ('unit', 'definition', 'granularity', 'formula', 'caliber'):
-                values = {canonical(v) for node in batch for s in node['supports']
-                          for v in s.get('properties', {}).get(prop, [])}
-                if len(values) > 1:
-                    raise LightGraphError('resolution_attribute_conflict')
+            if contradictory_qualifiers(batch):
+                raise LightGraphError('resolution_attribute_conflict')
             supports = []
             for node in batch:
                 origin = {k: deepcopy(node[k]) for k in (

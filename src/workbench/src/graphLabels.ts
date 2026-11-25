@@ -79,7 +79,7 @@ export function vocabularyLabel(category: keyof DisplaySchema, raw: unknown, sch
   // Descriptions are definitions, not invented translations. Long definitions
   // remain available as tooltips and in the detail panel.
   const builtin = (category === 'relations' ? relations : category === 'entity_types' ? kinds : properties)[name]
-  const declared = entry?.display_label || builtin || (chinese(name) ? name : entry?.description)
+  const declared = entry?.display_label || (chinese(name) ? name : entry?.description) || builtin
   if (declared && chinese(declared)) {
     // Prefer the definition's own opening name/clause, without inventing a translation.
     const opening = declared.split(/[：:，,；;。\n]/, 1)[0].trim()

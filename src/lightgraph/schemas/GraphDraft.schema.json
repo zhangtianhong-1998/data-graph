@@ -1,5 +1,54 @@
 {
   "$defs": {
+    "ApplicabilityMapping": {
+      "additionalProperties": false,
+      "description": "Where a statement holds, when supported by source evidence. Dimensions are open-ended.",
+      "properties": {
+        "status": {
+          "default": "unknown",
+          "enum": [
+            "unknown",
+            "global",
+            "scoped"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "columns": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Map a dimension named by the source to an authorized column. No particular dimension is required.",
+          "maxProperties": 32,
+          "title": "Columns",
+          "type": "object"
+        },
+        "values": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ]
+          },
+          "description": "Explicitly declared constant applicability dimensions; these are not observed source values.",
+          "maxProperties": 32,
+          "title": "Values",
+          "type": "object"
+        }
+      },
+      "title": "ApplicabilityMapping",
+      "type": "object"
+    },
     "ColumnEndpoint": {
       "additionalProperties": false,
       "description": "A fixed column object attached only to observed rows of its own table.",
@@ -151,6 +200,50 @@
           "title": "Key Names",
           "type": "array"
         },
+        "identity_scope": {
+          "default": "unknown",
+          "description": "Whether the complete key identifies an object throughout its identifier system or only within declared dimensions. A global key requires a documented identity domain and evidence.",
+          "enum": [
+            "unknown",
+            "global",
+            "scoped"
+          ],
+          "title": "Identity Scope",
+          "type": "string"
+        },
+        "identity_domain": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Documented identifier system or shared identity authority. A matching label alone does not establish a shared identifier.",
+          "title": "Identity Domain"
+        },
+        "identity_evidence_refs": {
+          "description": "Issued evidence supporting the declared identity domain and grain; global identity requires at least one reference.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Identity Evidence Refs",
+          "type": "array"
+        },
+        "identity_context_keys": {
+          "description": "For scoped identities, the subset of key_names within which the rest of the key is unique. Include these parts in mapping keys and relation endpoint keys.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Identity Context Keys",
+          "type": "array"
+        },
         "mappings": {
           "items": {
             "anyOf": [
@@ -225,6 +318,7 @@
             "type": "string"
           },
           "maxProperties": 128,
+          "description": "Business property name -> physical column carrying the value in this table. Omit a property when this table does not provide it; another mapping may supply it.",
           "title": "Properties"
         },
         "constant_properties": {
@@ -244,9 +338,34 @@
               }
             ]
           },
-          "description": "Agent-declared mapping annotations, such as the observed slot or endpoint positions. Not identity keys or source-verified values.",
+          "description": "Agent-declared mapping annotations, distinct from source values. Source table, key columns, and endpoint columns are already recorded in provenance.",
           "maxProperties": 32,
           "title": "Constant Properties",
+          "type": "object"
+        },
+        "identity_qualifiers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Entity property name -> documented identity qualifier (e.g. measurement unit). Contradictory observed values block reviewed merges.",
+          "maxProperties": 32,
+          "title": "Identity Qualifiers",
+          "type": "object"
+        },
+        "hierarchy_position_roles": {
+          "additionalProperties": {
+            "enum": [
+              "node",
+              "source",
+              "target",
+              "parent",
+              "child"
+            ],
+            "type": "string"
+          },
+          "description": "Constant property -> endpoint whose physical hierarchy position the constant encodes. Use node on entities.",
+          "maxProperties": 32,
+          "title": "Hierarchy Position Roles",
           "type": "object"
         },
         "context_columns": {
@@ -257,6 +376,10 @@
           "maxItems": 32,
           "title": "Context Columns",
           "type": "array"
+        },
+        "applicability": {
+          "$ref": "#/$defs/ApplicabilityMapping",
+          "description": "Optional applicability of this observation. Omit when no scope is documented; omitted scope is unknown. Row provenance and read permissions have separate fields."
         },
         "kind": {
           "const": "row",
@@ -461,6 +584,24 @@
           "title": "Target Type",
           "type": "string"
         },
+        "hierarchy_orientation": {
+          "anyOf": [
+            {
+              "enum": [
+                "parent_to_child",
+                "child_to_parent",
+                "none"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Direction of a documented parent/child relationship relative to source_type and target_type. Use none for ordinary associations. Directedness or acyclicity alone does not establish a hierarchy.",
+          "title": "Hierarchy Orientation"
+        },
         "allow_self_links": {
           "default": false,
           "title": "Allow Self Links",
@@ -528,6 +669,7 @@
             "type": "string"
           },
           "maxProperties": 128,
+          "description": "Business property name -> physical column carrying the value in this table. Omit a property when this table does not provide it; another mapping may supply it.",
           "title": "Properties"
         },
         "constant_properties": {
@@ -547,9 +689,34 @@
               }
             ]
           },
-          "description": "Agent-declared mapping annotations, such as the observed slot or endpoint positions. Not identity keys or source-verified values.",
+          "description": "Agent-declared mapping annotations, distinct from source values. Source table, key columns, and endpoint columns are already recorded in provenance.",
           "maxProperties": 32,
           "title": "Constant Properties",
+          "type": "object"
+        },
+        "identity_qualifiers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Entity property name -> documented identity qualifier (e.g. measurement unit). Contradictory observed values block reviewed merges.",
+          "maxProperties": 32,
+          "title": "Identity Qualifiers",
+          "type": "object"
+        },
+        "hierarchy_position_roles": {
+          "additionalProperties": {
+            "enum": [
+              "node",
+              "source",
+              "target",
+              "parent",
+              "child"
+            ],
+            "type": "string"
+          },
+          "description": "Constant property -> endpoint whose physical hierarchy position the constant encodes. Use node on entities.",
+          "maxProperties": 32,
+          "title": "Hierarchy Position Roles",
           "type": "object"
         },
         "context_columns": {
@@ -560,6 +727,10 @@
           "maxItems": 32,
           "title": "Context Columns",
           "type": "array"
+        },
+        "applicability": {
+          "$ref": "#/$defs/ApplicabilityMapping",
+          "description": "Optional applicability of this observation. Omit when no scope is documented; omitted scope is unknown. Row provenance and read permissions have separate fields."
         },
         "source_key_columns": {
           "items": {
@@ -678,7 +849,7 @@
       "type": "boolean"
     },
     "inherited_entity_types": {
-      "description": "Explicitly inherited entity type names available as relation endpoints without re-scanning old sources.",
+      "description": "Explicitly reused frozen types. They can be relation endpoints or receive new property mappings under their existing identity contract. See inherited_graph_summary.entity_contracts.",
       "items": {
         "type": "string"
       },

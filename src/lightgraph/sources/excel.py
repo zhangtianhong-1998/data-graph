@@ -7,18 +7,22 @@ from pathlib import Path
 from datetime import date, datetime, time as daytime
 import re
 import sqlite3
+import sqlglot
+from sqlglot import exp
 import time
 import zipfile
 from xml.etree import ElementTree as ET
 import openpyxl
+from lightgraph.runtime.files import file_stamp
 from lightgraph.contracts import TableSpec, ColumnSpec, QueryLimits
 from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler, SQLGuard
-from lightgraph.query.compiler import ident
+from lightgraph.query.compiler import ident, render_select
 from lightgraph.query.predicate import ScopeConjunction
 from .base import row_bytes
 from .memory import MemorySource
 from .budget import BudgetedCursor
+from .workbook_xml import workbook_has_declarations
 
 
 def _cell_value(cell, cached):
@@ -31,13 +35,23 @@ def _cell_value(cell, cached):
     return cell.value
 
 
+def _sqlite_cell(value):
+    # XLSX cells have no binary scalar type. A BLOB retains boolean identity
+    # through SQLite DISTINCT, grouping and joins, including mixed columns.
+    if type(value) is bool:
+        return b"1\0b" if value else b"0\0b"
+    return value
+
+
 class ExcelSource(MemorySource):
-    def __init__(self, path: str | Path, *, source_id: str = "excel", limits: QueryLimits | None = None, header_row: int = 1, include_hidden: bool = False, max_file_bytes: int = 200 * 1024 * 1024, max_rows: int = 200000, max_columns: int = 2000, max_memory_bytes: int = 128 * 1024 * 1024, query_budget=None, metadata_only: bool = False, allowed_tables: list[str] | None = None, allowed_columns: dict[str, list[str]] | None = None):
+    def __init__(self, path: str | Path, *, source_id: str = "excel", schema_name: str = "public", limits: QueryLimits | None = None, header_row: int = 1, include_hidden: bool = False, max_file_bytes: int = 200 * 1024 * 1024, max_rows: int = 200000, max_columns: int = 2000, max_memory_bytes: int = 128 * 1024 * 1024, query_budget=None, metadata_only: bool = False, allowed_tables: list[str] | None = None, allowed_columns: dict[str, list[str]] | None = None):
         path = Path(path)
         self._sheet_rows = {}
+        self._has_boolean = False
         self._position_bytes = 0
         self._witness_table = None
         self.workbook_snapshot = None
+        self.input_revision = None
         selected_tables = set(allowed_tables) if allowed_tables is not None else None
         selected_columns = allowed_columns or {}
         if allowed_tables is not None and len(allowed_tables) != len(selected_tables):
@@ -51,44 +65,44 @@ class ExcelSource(MemorySource):
         if not path.is_file() or path.stat().st_size > max_file_bytes: raise LightGraphError("excel_file_limit")
         if path.suffix.lower() != ".xlsx": raise LightGraphError("excel_format_unsupported")
         if header_row < 1 or header_row > 100: raise LightGraphError("excel_header_invalid")
-        before = path.stat()
+        before = file_stamp(path)
+        book = None
         try:
             if not metadata_only:
                 with path.open("rb") as source_file:
-                    self.workbook_snapshot = hashlib.file_digest(source_file, "sha256").hexdigest()
+                    self.input_revision = self.workbook_snapshot = hashlib.file_digest(source_file, "sha256").hexdigest()
             with zipfile.ZipFile(path) as archive:
                 members = archive.infolist()
                 if sum(x.file_size for x in members) > max_memory_bytes * 4 or len(members) > 10000:
                     raise LightGraphError("excel_expansion_limit")
                 if any("vbaproject" in x.filename.lower() or "externallinks/" in x.filename.lower() for x in members):
                     raise LightGraphError("excel_active_content_forbidden")
-                # Reject XML entity declarations before XML readers see them.
-                for member in members:
-                    if member.filename.endswith(".xml"):
-                        with archive.open(member) as stream:
-                            tail = b""
-                            while block := stream.read(65536):
-                                data = tail + block
-                                if b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
-                                    raise LightGraphError("excel_xml_entities_forbidden")
-                                tail = data[-32:]
+                if workbook_has_declarations(archive):
+                    raise LightGraphError("excel_xml_entities_forbidden")
             book = openpyxl.load_workbook(path, read_only=True, data_only=False, keep_links=False)
             values_book = None if metadata_only else openpyxl.load_workbook(path, read_only=True, data_only=True, keep_links=False)
         except LightGraphError: raise
-        except Exception: raise LightGraphError("excel_parse_failed") from None
+        except Exception:
+            if book is not None:
+                book.close()
+            raise LightGraphError("excel_parse_failed") from None
         tables, rows, physical_columns = [], {}, {}
         try:
             for ws in book.worksheets:
-                if selected_tables is not None and f"public.{ws.title}" not in selected_tables:
+                if selected_tables is not None and f"{schema_name}.{ws.title}" not in selected_tables:
                     continue
                 if ws.sheet_state != "visible" and not include_hidden: continue
                 if (ws.max_column or 0) > max_columns: raise LightGraphError("excel_column_limit")
-                # Count while reading too: dimensions in source files may lie.
+                # A producer's dimension can omit real cells. Stream actual records.
+                ws.reset_dimensions()
+                if values_book is not None:
+                    values_book[ws.title].reset_dimensions()
                 source_rows = ws.iter_rows(min_row=header_row, max_row=header_row if metadata_only else None)
                 value_rows = iter(()) if values_book is None else values_book[ws.title].iter_rows(min_row=header_row)
                 header = next(source_rows, ()); next(value_rows, ())
                 if metadata_only:
                     source_rows.close()
+                if len(header) > max_columns: raise LightGraphError("excel_column_limit")
                 if not header: continue
                 if any(c.data_type == "f" for c in header): raise LightGraphError("excel_formula_header")
                 last = max((i for i,c in enumerate(header) if c.value is not None), default=-1)
@@ -96,8 +110,8 @@ class ExcelSource(MemorySource):
                 names = [str(c.value) if c.value is not None else "" for c in header[:last+1]]
                 if any(not n for n in names): raise LightGraphError("excel_merged_or_missing_header_requires_schema")
                 if len(names) != len(set(names)): raise LightGraphError("excel_duplicate_header")
-                table = TableSpec(source_id=source_id, schema="public", name=ws.title, columns=[ColumnSpec(name=n, data_type="unknown" if metadata_only else "text", comment="Uploaded Excel header") for n in names])
-                hidden_rows, hidden_columns = self._hidden_positions(path, ws, include_hidden, columns_only=metadata_only)
+                table = TableSpec(source_id=source_id, schema=schema_name, name=ws.title, columns=[ColumnSpec(name=n, data_type="unknown" if metadata_only else "text") for n in names])
+                hidden_rows, hidden_columns = self._hidden_positions(path, ws, include_hidden, column_count=len(names), columns_only=metadata_only)
                 visible = [i for i in range(len(names)) if i + 1 not in hidden_columns]
                 physical_columns[table.qualified_name] = list(names)
                 requested_columns = selected_columns.get(table.qualified_name)
@@ -128,12 +142,12 @@ class ExcelSource(MemorySource):
                             cache = cached[i] if i < len(cached) else None
                             value = _cell_value(cell, cache)
                             if cell is not None and cell.data_type == "f" and value is None:
-                                self._pending_formula_columns.setdefault(f"public.{sheet.title}", set()).add(column_names[i])
+                                self._pending_formula_columns.setdefault(f"{schema_name}.{sheet.title}", set()).add(column_names[i])
                                 self.issue_counts["formula_cache_missing"] = self.issue_counts.get("formula_cache_missing", 0) + 1
                                 if len(self.issues) < 32:
                                     self.issues.append({"code": "formula_cache_missing", "sheet": sheet.title, "row": index, "column": i + 1})
                             if isinstance(value, (date, datetime, daytime)): value = value.isoformat()
-                            if isinstance(value, int) and not isinstance(value, bool) and cell is not None and re.fullmatch("0+", cell.number_format or ""):
+                            if isinstance(value, int) and not isinstance(value, bool) and cell is not None and re.fullmatch("0{2,}", cell.number_format or ""):
                                 value = str(value).zfill(len(cell.number_format))
                             converted.append(value)
                         populated = any(v is not None for v in converted)
@@ -144,6 +158,8 @@ class ExcelSource(MemorySource):
                                             is not None for i in excluded_columns if i < len(raw))
                         if populated:
                             record = tuple(converted)
+                            if not self._has_boolean:
+                                self._has_boolean = any(type(v) is bool for v in record)
                             if self.workbook_snapshot:
                                 # Mirror the ordinary imported-row charge before yielding.
                                 # At the existing limit, retain input data and discard the
@@ -158,7 +174,7 @@ class ExcelSource(MemorySource):
                                     self.workbook_snapshot = None
                                 else:
                                     positions.append(index)
-                            yield record
+                            yield tuple(_sqlite_cell(value) for value in record)
                 rows[table.qualified_name] = iterate()
             available_tables = {table.qualified_name for table in tables}
             if selected_tables is not None and selected_tables - available_tables:
@@ -168,11 +184,13 @@ class ExcelSource(MemorySource):
             if not tables: raise LightGraphError("excel_no_visible_tables")
             super().__init__(tables, rows, limits=limits, max_memory_bytes=max_memory_bytes, query_budget=query_budget)
             if not metadata_only:
+                self._db.row_factory = lambda cursor, row: tuple(
+                    value == b"1\0b" if type(value) is bytes and value in (b"1\0b", b"0\0b")
+                    else value for value in row)
                 self._infer_loaded_types()
-                after = path.stat()
-                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-                        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-                    raise LightGraphError("excel_input_changed")
+            if before != file_stamp(path):
+                raise LightGraphError("excel_input_changed")
+            self.input_stamp = before
             self.compiler = QueryCompiler(self._tables, dialect="sqlite", physical_columns=physical_columns)
         except LightGraphError:
             if hasattr(self, "_db"): self.close()
@@ -210,6 +228,7 @@ class ExcelSource(MemorySource):
                     for i, column in enumerate(columns):
                         present = {shape for shape, count in zip(shapes, counts[i * 4:i * 4 + 4]) if count}
                         if not present or present == {"text"}: column.data_type = "text"
+                        elif present == {"blob"}: column.data_type = "boolean"
                         elif present == {"integer"}: column.data_type = "integer"
                         elif present <= {"integer", "real"}: column.data_type = "real"
                         else: column.data_type = "mixed"
@@ -271,6 +290,29 @@ class ExcelSource(MemorySource):
     def execute(self, query, *, row_limit=None):
         self._check_formula_query(query)
         yield from super().execute(query, row_limit=row_limit)
+
+    def _read_cursor(self, sql, parameters, derived_count_sources, row_limit):
+        bindings = {key: _sqlite_cell(value) for key, value in parameters.items()}
+        if self._has_boolean and re.search(r"\b(?:true|false)\b", sql, re.I):
+            # Generated predicates bind Python booleans. Free-form authorized SQL
+            # may instead compare a cell with a boolean literal. Keep SQLite's
+            # separate IS TRUE/FALSE truth test intact.
+            tree = sqlglot.parse_one(sql, read="sqlite")
+            literals = []
+            for value in tree.find_all(exp.Boolean):
+                comparison = value.parent
+                if isinstance(comparison, (exp.EQ, exp.NEQ, exp.In, exp.GT, exp.LT, exp.GTE, exp.LTE)):
+                    if any(isinstance(operand, exp.Column) for operand in comparison.iter_expressions()):
+                        literals.append(value)
+            for value in literals:
+                key = "_excel_bool"
+                while key in bindings:
+                    key += "_"
+                bindings[key] = _sqlite_cell(value.this)
+                value.replace(exp.Placeholder(this=key))
+            if literals:
+                sql = render_select(tree, "sqlite")
+        yield from super()._read_cursor(sql, bindings, derived_count_sources, row_limit)
 
     def _authorize(self, action, arg1, arg2, db, trigger):
         if self._witness_table:
@@ -341,7 +383,7 @@ class ExcelSource(MemorySource):
             return 1
 
         def witness(row):
-            group = members.get(tuple(row[c] for c in columns))
+            group = members.get(tuple(_sqlite_cell(row[c]) for c in columns))
             if group is None:
                 return None
             ranges = []
@@ -366,13 +408,14 @@ class ExcelSource(MemorySource):
                 self._db.create_function('lg_capture_row', -1, None)
 
     @staticmethod
-    def _hidden_positions(path, ws, include_hidden, *, columns_only=False):
+    def _hidden_positions(path, ws, include_hidden, *, column_count, columns_only=False):
         if include_hidden: return set(), set()
         hidden_rows, hidden_columns = set(), set()
         # read_only worksheets omit dimension metadata. Inspect XML without
         # materializing the sheet, using the internal path supplied by openpyxl.
         with zipfile.ZipFile(path) as archive:
             with archive.open(ws._worksheet_path) as stream:
+                row_index = 0
                 for event, elem in ET.iterparse(stream, events=("start", "end")):
                     tag = elem.tag.rsplit("}",1)[-1]
                     # Column dimensions precede sheetData in worksheet XML. A
@@ -381,10 +424,13 @@ class ExcelSource(MemorySource):
                         break
                     if event != "end":
                         continue
-                    if tag == "row" and elem.attrib.get("hidden") in ("1", "true"):
-                        hidden_rows.add(int(elem.attrib["r"]))
+                    if tag == "row":
+                        row_index = int(elem.attrib.get("r", row_index + 1))
+                        if elem.attrib.get("hidden") in ("1", "true"):
+                            hidden_rows.add(row_index)
                     elif tag == "col" and elem.attrib.get("hidden") in ("1", "true"):
-                        hidden_columns.update(range(int(elem.attrib["min"]), int(elem.attrib["max"]) + 1))
+                        hidden_columns.update(range(max(1, int(elem.attrib["min"])),
+                                                    min(column_count, int(elem.attrib["max"])) + 1))
                     elem.clear()
         return hidden_rows, hidden_columns
     def capabilities(self):

@@ -593,6 +593,7 @@ def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatc
     config_path.write_text(dump_yaml(config.model_dump(mode="json")))
     tools = None if through_runner else ConstructionTools(config, tmp_path / "work")
     calls = []
+    model_messages = []
     failures = []
     observed = []
     events = []
@@ -612,6 +613,7 @@ def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatc
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             try:
                 index = len(calls)
+                model_messages.append(request["messages"])
                 if index == 0:
                     name, arguments = "describe_sources", {}
                 elif index == 1:
@@ -723,10 +725,16 @@ def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatc
         assert list(tmp_path.rglob("*.yaml"))
         (tmp_path / "notifications.json").write_text(json.dumps(events, ensure_ascii=False), encoding="utf-8")
         assert any(event["method"] == "session.event" for event in events)
-        skill_messages = [e["payload"]["event"]["data"] for e in events
-                          if e.get("payload", {}).get("event", {}).get("type") == "user/message"]
-        assert any('<skill_content name="build-graph">' in json.dumps(m, ensure_ascii=False).replace('\\"', '"')
-                   for m in skill_messages)
+        skill_path = Path(__file__).resolve().parents[1] / "construction/skills/build-graph/SKILL.md"
+        skill = skill_path.read_text(encoding="utf-8").rstrip()
+        assert len(model_messages) == len(calls)
+        for messages in model_messages:
+            system_text = "\n".join(m["content"] for m in messages if m["role"] == "system")
+            assert system_text.count(skill) == 1
+            user_text = "\n".join(m["content"] for m in messages if m["role"] == "user")
+            assert config.goal.purpose in user_text
+            assert skill not in user_text
+            assert '<skill_content name="build-graph">' not in user_text
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=5)
         if tools is not None:

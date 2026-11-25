@@ -70,7 +70,7 @@ class _LiveEmbedHTTPServer:
     def __init__(self, backend: _FakeSemanticBackend):
         self.backend = backend
         self.fastapi_app = create_embedding_app(backend)
-        self.client = TestClient(self.fastapi_app)
+        self.client = TestClient(self.fastapi_app, client=('127.0.0.1', 50123))
         self.seen_auth: list[str] = []
 
         outer = self
@@ -116,7 +116,7 @@ class _LiveEmbedHTTPServer:
 
 def test_local_embed_server_app_supports_matryoshka_and_models():
     backend = _FakeSemanticBackend(dim=1024, model_name="Qwen/Qwen3-Embedding-0.6B")
-    client = TestClient(create_embedding_app(backend))
+    client = TestClient(create_embedding_app(backend), client=('127.0.0.1', 50123))
 
     assert client.get("/health").json() == {"status": "ok", "model": "Qwen/Qwen3-Embedding-0.6B", "dimensions": 1024}
     assert client.get("/v1/models").json()["data"][0]["id"] == "Qwen/Qwen3-Embedding-0.6B"

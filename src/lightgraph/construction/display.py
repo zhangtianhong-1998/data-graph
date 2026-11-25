@@ -87,7 +87,9 @@ def derive_display_graph(graph, *, copy=True):
     for node_id, node in by_id.items():
         text, origin = base[node_id]
         mode = definitions.get(node['type'], {}).get('display_mode', 'auto')
-        if origin == 'identity' and mode != 'identity' and outgoing[node_id]:
+        # A hub has a stable complete identity and a pageable neighborhood.
+        # Expanding hundreds of neighbors into its name multiplies index and UI payloads.
+        if origin == 'identity' and mode != 'identity' and 0 < len(outgoing[node_id]) <= 32:
             pieces, covered = [], set()
             for edge in sorted(outgoing[node_id], key=lambda e: (e['type'], base[e['target']][0], e['target'])):
                 target = by_id[edge['target']]

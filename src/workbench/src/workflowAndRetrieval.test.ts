@@ -321,7 +321,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
   it('可在画布编排抽取节点（直出）与添加合并节点（合并抽取），分别配置 A+B / A+C 表与各自知识库', async () => {
     await mountReady()
     button('并行工作流').click()
-    await nextTick()
+    await vi.waitFor(() => expect(root.querySelector('.wf-canvas')).not.toBeNull())
 
     const addButtons = [...root.querySelectorAll<HTMLButtonElement>('.palette-item button')]
     expect(addButtons).toHaveLength(2)
@@ -428,7 +428,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
   it('真正拖入节点和拖线，保存当前修订后启动运行', async () => {
     await mountReady()
     button('并行工作流').click()
-    await nextTick()
+    await vi.waitFor(() => expect(root.querySelector('.wf-canvas')).not.toBeNull())
     const canvas = root.querySelector<HTMLElement>('.wf-canvas')!
     const transfer = new DataTransfer()
     const dragStart = new Event('dragstart', { bubbles: true })
@@ -578,6 +578,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     // 切换到子图召回页：初始状态是「未向量化」，点击「立即向量化」后变成「已完成向量化」
     button('子图召回').click()
     await vi.waitFor(() => expect(root.textContent).toContain('未向量化'))
+    await vi.waitFor(() => expect(button('立即向量化')).toBeTruthy())
     button('立即向量化').click()
     await vi.waitFor(() => expect(root.textContent).toContain('已完成向量化'))
     expect(root.textContent).toContain('Qwen/Qwen3-Embedding-0.6B')

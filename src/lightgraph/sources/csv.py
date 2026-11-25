@@ -7,6 +7,7 @@ import hashlib
 import io
 from pathlib import Path
 
+from lightgraph.runtime.files import file_stamp
 from lightgraph.contracts import ColumnSpec, TableSpec
 from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler
@@ -94,7 +95,7 @@ class CSVSource(MemorySource):
         if min(max_file_bytes, max_rows, max_columns, max_memory_bytes) <= 0:
             raise LightGraphError("csv_format_config_invalid")
         try:
-            codecs.lookup(encoding)
+            codec = codecs.lookup(encoding)
         except (LookupError, TypeError):
             raise LightGraphError("csv_encoding_invalid") from None
         if not path.is_file() or path.stat().st_size > max_file_bytes:
@@ -106,11 +107,11 @@ class CSVSource(MemorySource):
             "type_inference": "text", "table_name": table_name or path.stem,
             "schema_name": schema_name,
         }
-        before = path.stat()
+        before = file_stamp(path)
         null_tokens = set(null_values)
         try:
             bounded = _BoundedInput(path.open("rb"), max_file_bytes)
-            with io.TextIOWrapper(io.BufferedReader(bounded), encoding=encoding,
+            with io.TextIOWrapper(io.BufferedReader(bounded), encoding='utf-8-sig' if codec.name == 'utf-8' else encoding,
                                   errors="strict", newline="") as stream:
                 lines = _BoundedLines(stream, max(1, max_memory_bytes // 8))
                 reader = csv.reader(lines, delimiter=delimiter, strict=True)
@@ -137,8 +138,7 @@ class CSVSource(MemorySource):
                 table = TableSpec(
                     source_id=source_id, schema=schema_name,
                     name=table_name or path.stem,
-                    columns=[ColumnSpec(name=n, data_type="text",
-                                        comment="CSV field parsed as text; no declared type")
+                    columns=[ColumnSpec(name=n, data_type="text")
                              for n in (names[i] for i in kept)],
                 )
 
@@ -166,11 +166,11 @@ class CSVSource(MemorySource):
                 self.compiler = QueryCompiler(self._tables, dialect="sqlite",
                     physical_columns={qualified_name: names})
                 if not metadata_only:
-                    self.format_metadata["input_revision"] = bounded.hasher.hexdigest()
-            after = path.stat()
-            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-                    after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                    self.input_revision = bounded.hasher.hexdigest()
+                    self.format_metadata["input_revision"] = self.input_revision
+            if before != file_stamp(path):
                 raise LightGraphError("csv_input_changed")
+            self.input_stamp = before
         except LightGraphError:
             if hasattr(self, "_db") and not getattr(self, "_closed", False):
                 self.close()

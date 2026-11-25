@@ -26,6 +26,23 @@ class _Projection:
     complete: bool
 
 
+def contradictory_qualifiers(nodes):
+    """Compare documented property roles across physical aliases on reviewed entities."""
+    values = defaultdict(set)
+    for node in nodes:
+        for support in node.get('supports', []):
+            declared = (support.get('provenance') or {}).get('identity_qualifiers') or {}
+            for prop, observations in (support.get('properties') or {}).items():
+                role = declared.get(prop)
+                if not role and prop in ('unit', 'definition', 'granularity', 'formula', 'caliber'):
+                    role = prop  # Existing published mappings predate explicit qualifiers.
+                if role:
+                    values[role].update(canonical(value) for value in observations)
+                    if len(values[role]) > 1:
+                        return True
+    return False
+
+
 def _physical_source(provenance):
     source = provenance.get('source', {})
     parts = [source.get(name) for name in ('source_id', 'schema', 'table')]
@@ -233,6 +250,70 @@ def _dictionary_binding(node, definition):
     return (address, roles, member) if address is not None else None
 
 
+def _unique_row_projection(node, definition, address):
+    """A declared unique key identifies a concrete source row even with unknown business scope.
+
+    The key proves identity only inside its own table. Check the name, selection,
+    read audience, applicability and every overlapping physical value independently.
+    """
+    observations = set()
+    cells = {}
+    for support in node['supports']:
+        prov = support['provenance']
+        primary = prov.get('label_column')
+        label = support.get('observed_label') or support.get('label')
+        if (not primary or not isinstance(label, str) or not label.strip() or support.get('lookup_matches')
+                or support.get('identity_decision_refs') or prov.get('constant_properties')):
+            return None
+        context = business_context_identity(support)
+        observations.add(canonical([support['scope_ref'], sorted(support.get('required_scope_refs', [])),
+                                    context, prov.get('predicate'), sorted(prov.get('scope_columns', [])), primary, label]))
+        row = support.get('row_context') or {}
+        columns = prov.get('property_columns') or {}
+        actual = list((row.get('values') or {}).items())
+        for prop, values in (support.get('properties') or {}).items():
+            if prop not in columns or len(values) != 1:
+                return None
+            actual.append((columns[prop], values[0]))
+        actual.append((primary, label))
+        actual.extend(zip(address[-1], (node['identity'][name] for name in definition['key_names']), strict=True))
+        for column, value in actual:
+            token = canonical(value)
+            if cells.setdefault(column, token) != token:
+                return None
+        for column, kind in (row.get('value_types') or {}).items():
+            if cells.setdefault(('driver_type', column), kind) != kind:
+                return None
+    if len(observations) != 1:
+        return None
+    keys = tuple(identity_cell(node, name) for name in definition['key_names'])
+    return (node['type'], canonical(definition_contract(definition)), address, keys, observations.pop()), cells
+
+
+def _align_unique_rows(groups, same_codes, observed_ids, overrides):
+    collapsed = 0
+    for key, entries in groups.items():
+        kind, _, address, identity, _ = key
+        if (len(entries) < 2 or any(same_codes[i, kind, address, identity] != 1 for i, _, _ in entries)
+                or any(n['id'] in observed_ids[i] or n['id'] in overrides[i] for i, n, _ in entries)):
+            continue
+        cells = defaultdict(set)
+        for _, _, observed in entries:
+            for column, value in observed.items():
+                cells[column].add(value)
+        if any(len(values) > 1 for values in cells.values()) or contradictory_qualifiers(n for _, n, _ in entries):
+            continue
+        target = 'n_' + digest('observed_unique_row_v1', key)
+        for i, node, _ in entries:
+            overrides[i][node['id']] = target
+            for support in node['supports']:
+                support['identity_basis'] = 'observed_dictionary_key_v1'
+                support.setdefault('identity_origins', [{k: deepcopy(node[k]) for k in (
+                    'id', 'type', 'identity', 'identity_types')}])
+        collapsed += len(entries) - 1
+    return collapsed
+
+
 def align_dictionary_nodes(prepared, observed_ids, *, local_bases, excluded_types):
     """Join complete FK projections only with an actual row of the referenced unique key.
 
@@ -241,6 +322,8 @@ def align_dictionary_nodes(prepared, observed_ids, *, local_bases, excluded_type
     an earlier source-replay pass must move as a whole or stay as it was.
     """
     overrides = [{} for _ in prepared]
+    unique_rows = defaultdict(list)
+    same_codes = Counter()
     groups = defaultdict(list)
     source_group_sizes = Counter(target for remap in observed_ids for target in remap.values())
     for index, (cid, kind, graph) in enumerate(prepared):
@@ -258,8 +341,17 @@ def align_dictionary_nodes(prepared, observed_ids, *, local_bases, excluded_type
                 continue
             address, roles, member = binding
             evidence = _node_evidence(node, definition, dictionary=address)
+            if member and not roles and set(definition.get('key_names', [])) == node.get('identity', {}).keys():
+                raw_keys = tuple(identity_cell(node, name) for name in definition['key_names'])
+                same_codes[index, node['type'], address, raw_keys] += 1
             if evidence:
                 groups[node['type'], address, evidence].append((index, node, roles, member))
+                if (member and not roles and kind == 'unit' and not graph.get('extends_base_graph')
+                        and (graph.get('conflict_isolation') or {}).get('coverage') != 'incomplete'):
+                    projected = _unique_row_projection(node, definition, address)
+                    if projected:
+                        key, cells = projected
+                        unique_rows[key].append((index, node, cells))
 
     counts = {'dictionary_eligible_inputs': sum(len(entries) for entries in groups.values()),
               'dictionary_groups_without_observed_member': 0, 'observed_dictionary_collapsed_nodes': 0}
@@ -300,6 +392,10 @@ def align_dictionary_nodes(prepared, observed_ids, *, local_bases, excluded_type
                 support.setdefault('identity_basis', 'observed_dictionary_key_v1')
                 if 'identity_origins' not in support:
                     support['identity_origins'] = [{k: deepcopy(node[k]) for k in ('id', 'type', 'identity', 'identity_types')}]
+    unique_collapses = _align_unique_rows(unique_rows, same_codes, observed_ids, overrides)
+    if unique_collapses:
+        counts['direct_unique_row_collapsed_nodes'] = unique_collapses
+        counts['observed_dictionary_collapsed_nodes'] += unique_collapses
     return overrides, counts
 
 

@@ -27,7 +27,9 @@ _EDGE_DIRECTIONS = {'incoming': re.compile(r'入边|\bincoming\b', re.I),
 _NEG = re.compile(r'不要(?:再)?(?:看|分析|查)?|不看|排除|忽略|不考虑|不包括|不包含|不含|不关注|无需考虑|不关心|除外')
 _HISTORY = re.compile(r'^(?:(?:背景|例如|举例)\s*[:：]|(?:上次|此前|之前)(?:讨论|查询|看过))')
 _FOCUS = re.compile(r'(?:本次|这次|现在)(?:请|要|只)')
-_PROJECT_NAMES = {'project', 'project_id', 'project_name', '项目', '项目名', '项目名称'}
+_PROJECT_ALIASES = (
+    {'project', '项目'}, {'project_id', '项目编号'}, {'project_name', '项目名', '项目名称'},
+)
 _RESTRICT = re.compile(r'限定|过滤|要求|约束|须为|必须|条件|只要|只统计|只看|仅看|'
                        r'大于|小于|超过|至多|至少|低于|高于|不超过|不少于|[<>≥≤=]|且|尚未|已经')
 
@@ -49,15 +51,25 @@ def _clauses(query):
     return active, exclusions
 
 
-def _dimension_pattern(name):
-    names = _PROJECT_NAMES if name.casefold() in _PROJECT_NAMES else {name}
-    return '(?:' + '|'.join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + ')'
+def _dimension_aliases(name, known):
+    name = normalize_term(name)
+    group = next((g for g in _PROJECT_ALIASES if name in g), {name})
+    aliases = {name, *(a for a in group if a not in known)}
+    if group in _PROJECT_ALIASES and len(known.intersection(set.union(*_PROJECT_ALIASES))) == 1:
+        aliases.update(_PROJECT_ALIASES[0])
+    return aliases
+
+
+def _dimension_pattern(name, known):
+    return '(?:' + '|'.join(re.escape(n) for n in sorted(_dimension_aliases(name, known), key=len, reverse=True)) + ')'
 
 
 def _scope_matches(text, authorized):
+    names = {normalize_term(key) for key, _ in authorized}
+    patterns = {name: _dimension_pattern(name, names) for name in names}
     for name, value in authorized:
         escaped = re.escape(str(value))
-        key = _dimension_pattern(name)
+        key = patterns[normalize_term(name)]
         # Include a boundary for Latin identifiers so "M" cannot select "AM".
         pattern = rf'(?P<value_first>(?<![a-zA-Z0-9_]){escaped}\s*{key}(?![a-zA-Z0-9_]))|(?<![a-zA-Z0-9_]){key}\s*[=:：]?\s*{escaped}(?![a-zA-Z0-9_])'
         for match in re.finditer(pattern, text, re.I):
@@ -99,11 +111,12 @@ def _scope_scan_text(retriever, scopes, selection, text, dimensions, is_path):
     """Hide indexed endpoints from the scope parser, preserving source offsets."""
     if not dimensions or not (is_path or _PATH_OPERATION.search(text)):
         return text
-    keys = {_dimension_pattern(name) for name, _ in dimensions}
+    names = {normalize_term(name) for name, _ in dimensions}
+    keys = {_dimension_pattern(name, names) for name in names}
     if not any(re.search(key, text, re.I) for key in keys):
         return text
     cohorts = retriever.authorized_cohorts(scopes, selection)
-    terms = retriever.index.authorized_terms(cohorts)
+    terms = retriever.index.terms_in_text(text, cohorts)
     result = list(text)
     for term in decompose_query(text, known_terms=terms):
         if term.source != 'exact_term' or not any(re.search(key, term.surface, re.I) for key in keys):
@@ -133,9 +146,10 @@ def _resolve_scope(retriever, scopes, requested, clauses, excluded, *, is_path=F
     names = {normalize_term(name) for name, _ in dimensions}
     # Detect an unmatched qualifier using dimension names actually present
     # in this index. Bare words in another domain are not scope declarations.
-    if any(re.search(rf'(?<![a-zA-Z0-9_]){key}\s*(?:[=:：]\s*\S|\s+[a-z\d_-]+)|'
+    if any(re.search(rf'(?<![a-zA-Z0-9_]){key}\s*(?:[=:：]\s*\S|[a-z\d_-]+)|'
                      rf'[\w-]+\s*{key}(?=的|中|里|查|看|\s|[，,。]|$)', scan, re.I)
-           for key in {_dimension_pattern(name) for name in names}):
+           for key in ({_dimension_pattern(name, names) for name in names}
+                                | (_PROJECT_ALIASES[0] if names & set.union(*_PROJECT_ALIASES) else set()))):
         unresolved.append('所提范围无法在当前可见资料中确认。')
     for clause in excluded:
         matches = list(_scope_matches(clause, dimensions))
@@ -160,7 +174,7 @@ _GAP_SYNTAX = (
     r'请问|帮我|我想(?:知道|了解)|本次|这次|现在|只看|仅看|查询|分析|'
     r'看看|节点|本身|详情|返回|同时满足|这个|这(?:一块|部分)|'
     r'究竟|分别|对应|哪(?:些|几种|几个)|有哪(?:些|几种|几个)|是什么|'
-    r'拆开|细分|展开|分组|数据|结果|内容'
+    r'拆开|细分|展开|分组|数据|结果|内容|共同记录|同时出现|交集'
 )
 _CLAUSE_BOUNDARY = re.compile(r'[，,。；;、：:“”「」（）()？?!！\n]+')
 _POLITE_REQUEST = re.compile(r'^(?:请(?:问|查(?:询)?|查看)|帮我(?:查询|查看))\s+')
@@ -349,6 +363,7 @@ def _model_scope(retriever, scopes, requested, query, parsed, *, is_path=False):
 
     focus = ''.join(masked)
     scan = _scope_scan_text(retriever, scopes, selection, focus, available, is_path)
+    visible_names = {normalize_term(name) for name, _ in available}
     for scope in parsed.get('scopes', ()):
         phrase = scope['text']
         dimension, value = scope['dimension'], scope['value']
@@ -363,8 +378,7 @@ def _model_scope(retriever, scopes, requested, query, parsed, *, is_path=False):
             if slices - {phrase, '，' * len(phrase)}:
                 return selection, '', ['范围限定与路径中的对象重叠，无法分别确认。']
         keys = [(key, v) for key, v in available if normalize_term(v) == normalize_term(value) and
-                (normalize_term(key) == normalize_term(dimension) or
-                 normalize_term(key) in _PROJECT_NAMES and normalize_term(dimension) in _PROJECT_NAMES)]
+                normalize_term(dimension) in _dimension_aliases(key, visible_names)]
         if len(keys) != 1:
             return selection, '', ['所提范围无法与当前可见的适用范围唯一对应。']
         key, v = keys[0]
@@ -530,7 +544,7 @@ def _compile_interpretation(retriever, scopes, requested, query, parsed, *, forc
     # Models can put a categorical operand in a filter, or combine a name
     # with its qualifier. Recover the actual operands, leaving every other
     # part of the filter to be checked below.
-    known = retriever.index.authorized_terms(cohorts)
+    known = retriever.index.terms_in_text(focus, cohorts)
     exact_terms = [s for s in decompose_query(focus, known_terms=known) if s.source == 'exact_term']
     if traverse:
         # An explicit, exact endpoint can be recovered even if the model
@@ -741,13 +755,12 @@ def build_plan(retriever, scopes, query, business_context, conditions=(), drill_
     if unresolved:
         plan.update(intent='clarify', scope_unresolved=True, focus='')
         return plan
-    terms = retriever.index.authorized_terms(cohorts)
     structured = bool(conditions)
     kinds = retriever.index.authorized_kinds(cohorts)
     plan['requested_level'] = _target_kind(focus, kinds) if not structured else None
     path_requested = force_traverse or not force_joint and not structured and bool(_PATH_OPERATION.search(focus))
     if not structured and focus.strip():
-        _ground_index_query(retriever, cohorts, focus, terms, plan, path=path_requested)
+        _ground_index_query(retriever, cohorts, focus, retriever.index.terms_in_text(focus, cohorts), plan, path=path_requested)
     level = _LEVEL.search(focus) if not structured else None
     if level and not plan['requested_level'] and level.group(1) not in {'底', '最底层', '最后一级', '叶子节点', '叶节点'}:
         unresolved.append('目标层级尚未对应到当前图谱的节点类型。')
@@ -834,9 +847,18 @@ def build_plan(retriever, scopes, query, business_context, conditions=(), drill_
     if (not structured and plan['intent'] == 'dimensional' and len(roles) < len(slots)
             and all(s['role'] for s in slots) and not re.search('同时|共同|一起', focus)):
         unresolved.append('同一维度出现多个取值，请说明要分别查询还是求交集。')
-    if not structured and (plan['intent'] in {'drilldown', 'dimensional'}
-                           or _RESTRICT.search(focus) or _PREDICATE.search(focus)):
-        residual = _residuals(focus, slots, plan['requested_level'])
+    if focus.strip() and (plan['intent'] in {'drilldown', 'dimensional'} or _RESTRICT.search(focus) or _PREDICATE.search(focus)):
+        by_id = [c['node_id'] for slot in slots if slot['match'] == 'node_id' for c in slot['candidates']]
+        if by_id:
+            labels = retriever.index.authorized_labels(by_id, scopes=cohorts)
+            # A name stated alongside a selected ID must be witnessed by the
+            # actual observation used in the joint fact, even for a shared ID.
+            for slot in slots:
+                if slot['match'] == 'node_id' and slot['candidates']:
+                    label = labels.get(slot['candidates'][0]['node_id'])
+                    if label and _contains_name(focus, label):
+                        slot.update(text=label, match='exact')
+        residual = _residuals(focus, slots, plan['requested_level'], framing=by_id)
         if residual:
             if not plan['suggestions']:
                 plan['suggestions'] = _lexical_suggestions(retriever, scopes, selection, residual)

@@ -13,7 +13,6 @@ from lightgraph.construction.snapshot_registry import (snapshot_id, authorize_sn
 from lightgraph.construction.workspace import read_internal_yaml
 from lightgraph.runtime.config import RunConfig
 from . import construction_graph
-from .graph_view_cache import remember_graph
 
 
 @dataclass
@@ -228,7 +227,6 @@ def _prepared(workspace, pid, config, version):
     effective = _authorize_entry(workspace, entry, config)
     graph, generation = construction_graph.load_prepared(
         effective, root=entry.root, head=entry.head, authorization_root=entry.auth_root)
-    remember_graph(graph, generation)
     return effective, graph, generation
 
 

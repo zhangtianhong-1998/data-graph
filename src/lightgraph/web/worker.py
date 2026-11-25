@@ -90,7 +90,9 @@ def execute(payload, result_path):
         trace_context.__enter__()
         emit_trace('run_started', {'run_id':result_path.name.removesuffix('.result.json')})
         project = result_path.parent.parent
-        check_dependencies(payload["dependencies"], project)
+        standalone = (config.model_copy(update={"agent_config": payload.get("agent_dependency")})
+                      if payload.get("standalone_workflow") is True else None)
+        check_dependencies(payload["dependencies"], project, standalone_config=standalone)
         check_cancelled()
         from ..construction.access import ensure_supported_access
         ensure_supported_access(config)
@@ -119,9 +121,9 @@ def execute(payload, result_path):
         status = {"COMPLETED": "completed", "COMPLETED_WITH_GAPS": "completed_with_gaps",
                   "PARTIAL": "partial", "FAILED": "failed"}[report.status]
         try:
-            check_dependencies(payload["dependencies"], project)
+            check_dependencies(payload["dependencies"], project, standalone_config=standalone)
             if metadata_path.exists() and metadata_path.stat().st_mtime_ns != metadata_before:
-                write_metadata_context(config, project)
+                write_metadata_context(config, None if standalone is not None else project)
         except LightGraphError:
             status = "partial"
             error_code = "input_dependency_changed"

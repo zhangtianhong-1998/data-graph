@@ -78,3 +78,13 @@ def test_no_worksheet_citation_without_its_own_complete_source(missing_field):
     observation = _observation(1, [[9, 9]])
     del observation['provenance']['source'][missing_field]
     assert all('source_row_witness' not in b for b in _context(observation)['bindings'])
+
+
+def test_an_oversized_binding_does_not_hide_later_observations():
+    first = _observation(1, [[1, 1]])
+    first['provenance']['context_columns'] = ['long_column' * 1500]
+    second = _observation(2, [[2, 2]])
+    for observations in ((first, second), (second, first)):
+        context = _context(*observations)
+        assert context['truncated']
+        assert [b['observation_id'] for b in context['bindings']] == ['obs-2']

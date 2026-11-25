@@ -686,7 +686,7 @@ function updateWorkers(raw: string) {
 // --- Inherited Base Graphs ---
 const selectedInheritProject = ref('')
 const customInheritId = ref('')
-const customInheritScopes = ref('public')
+const customInheritScopes = ref('')
 const otherProjects = computed(() => props.projects.filter(p => p.project_id !== props.projectId))
 
 function addInheritedGraph() {
@@ -704,7 +704,7 @@ function addInheritedGraph() {
       inherit_id: uniqueId,
       source_project_id: pid,
       snapshot_path: null,
-      allowed_scopes: scopesList.length ? scopesList : (props.scopes.length ? [...props.scopes] : ['public']),
+      allowed_scopes: scopesList.length ? scopesList : [...props.scopes],
       expected_graph_digest: null,
     },
   ])
@@ -1104,7 +1104,7 @@ const topologySummary = computed(() => {
                 </div>
                 <div class="field">
                   <label for="inherit-scopes">作用域</label>
-                  <input id="inherit-scopes" v-model="customInheritScopes" :disabled="locked" placeholder="public" />
+                  <input id="inherit-scopes" v-model="customInheritScopes" :disabled="locked" :placeholder="scopes.join('，')" />
                 </div>
               </div>
               <button

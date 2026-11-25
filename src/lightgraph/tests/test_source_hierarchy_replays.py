@@ -13,7 +13,7 @@ from lightgraph.sources import MemorySource
 
 def draft_graph(number, kind, *, inverse=False, source_id='file', project=None, alternate_role=False,
                 declare_direction=True, self_policy=None, collection=None, positions=None, code_prefix='',
-                edge_constants=None):
+                edge_constants=None, position_name='slot', declare_position=False):
     logical_key = 'accession' if number % 2 else 'item_code'
     columns = ['section', 'caption', 'leaf', 'heading', 'cross_reference']
     table = TableSpec(source_id=source_id, name='vocabulary', columns=[ColumnSpec(name=c) for c in columns])
@@ -37,7 +37,8 @@ def draft_graph(number, kind, *, inverse=False, source_id='file', project=None, 
                       'mappings': [{**binding, 'key_columns': [key], 'label_column': label,
                                     'constant_properties': {
                                         **({'collection': collection} if collection is not None else {}),
-                                        **({'slot': positions[i]} if positions is not None else {})}}
+                                        **({position_name: positions[i]} if positions is not None else {})},
+                                    **({'hierarchy_position_roles': {position_name: 'node'}} if declare_position else {})}
                                    for i, (key, label) in enumerate([('section', 'caption'), ('leaf', 'heading')])]}],
         'relations': [{'type': f'link{number}', 'source_type': kind, 'target_type': kind,
                        **({'hierarchy_orientation': 'child_to_parent' if inverse else 'parent_to_child'}
@@ -191,3 +192,15 @@ def test_unrelated_pending_relation_does_not_prevent_reconciling_the_clean_hiera
     record, = graph['unresolved_relations']
     assert record['id'] == 'r_pending'
     assert set(record['node_ids']) <= {n['id'] for n in graph['nodes'] if n['type'] == 'Edition'}
+
+
+@pytest.mark.parametrize('declare,positions,count', [(True, ['section', 'leaf'], 3), (False, ['section', 'leaf'], 6),
+                                                   (True, ['leaf', 'section'], 6)])
+def test_declared_chinese_position_in_real_extraction_and_merge(declare, positions, count):
+    unit = draft_graph(1, 'Heading', positions=positions, position_name='层级位置', declare_position=declare)
+    graph = merge_construction_graphs([contributor('first', unit),
+                                       contributor('second', draft_graph(2, 'Term', inverse=True))])
+    assert len(graph['nodes']) == count and len(graph['edges']) == 4
+    positions = [s['provenance'].get('hierarchy_position_roles') for n in graph['nodes'] for s in n['supports']
+                 if '层级位置' in s.get('properties', {})]
+    assert positions and all(p == ({'层级位置': 'node'} if declare else None) for p in positions)

@@ -1,5 +1,6 @@
 """Exercise storage through publication, DAG merge and authorized web readers."""
 from copy import deepcopy
+from pathlib import Path
 import json
 
 import pytest
@@ -253,3 +254,15 @@ def test_inherited_snapshot_retry_preserves_old_summary_and_leaves_no_partial_gr
     assert frozen_contributors(target, config=cfg)[0] == original_graph
     assert summary_path.read_bytes() != original_summary
     assert all(len(p.name) <= 38 for p in (target / 'inherited').glob('*.graph'))
+
+
+def test_empty_merge_keeps_prior_publication(tmp_path):
+    cfg = config(tmp_path / "project")
+    store = GraphWorkspace(Path(cfg.output_dir) / "construction", 'existing')
+    publish(store, cfg, node="existing")
+    previous = store._manifest()["current_graph"]
+    with pytest.raises(LightGraphError, match='workflow_no_committed_contributors'):
+        publish_merged_contributors(cfg.output_dir, cfg, contributors=[], included_units=[],
+                                    skipped_units=['missing'], unit_attempts={})
+    assert store._manifest()["current_graph"] == previous
+    assert store.read_published_graph()['nodes'][0]['id'] == 'existing'

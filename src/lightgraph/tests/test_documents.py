@@ -90,3 +90,11 @@ def test_parent_conditions_are_kept_with_child_claim():
     d=load_document('a.md',text='---\npurpose: analysis_knowledge\n---\n# 方法\n适用条件：同一统计期间。\n## 影响\n价格可能影响收入。')
     claims=extract_claims(d)
     assert '适用条件：同一统计期间。' in claims[0].conditions
+
+
+def test_bom_keeps_document_identity_and_table_scope(tmp_path):
+    path = tmp_path / 'instructions.md'
+    path.write_text('---\nid: sales_data\napplies_to: [acct.sales]\n---\n# Sales\nQuarterly.\n',
+                    encoding='utf-8-sig')
+    doc = load_document(path)
+    assert doc.document_id == 'sales_data' and doc.scope.tables == ['acct.sales']

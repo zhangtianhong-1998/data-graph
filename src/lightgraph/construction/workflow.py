@@ -591,6 +591,8 @@ def publish_merged_contributors(
     independent_terminals: bool = False,
 ) -> dict[str, Any]:
     """Deterministically combine prepared contributors and publish sharded root construction graph."""
+    if not contributors:
+        raise LightGraphError('workflow_no_committed_contributors')
     # Independent outputs must not inherit a cross-unit identity merge policy.
     direct = independent_terminals or mode in {'direct_output', 'direct_multi_output'}
     policy = (MergePolicyConfig(emit_alignment_candidates=False)
@@ -744,6 +746,27 @@ def save_workflow_state(project_output_dir: str | Path, state: dict[str, Any], *
         path = _state_path(project_output_dir, rid)
         artifact_step('state_history_write', atomic_text, path, payload)
     artifact_step('state_current_write', atomic_text, _state_path(project_output_dir), payload)
+
+
+def interrupt_workflow_state(output, run_id, finished_at):
+    """Close active stages in this run's archive without moving another run's head."""
+    state = load_workflow_state(output, run_id)
+    if not state or state.get('parent_run_id') != run_id or state.get('status') != 'running':
+        return
+    state.update(status='interrupted', error_code='service_restarted', finished_at=finished_at)
+    nodes = [state.get('merge')]
+    for key in ('units', 'merge_nodes'):
+        bucket = state.get(key)
+        if isinstance(bucket, dict):
+            nodes.extend(bucket.values())
+    for item in nodes:
+        if isinstance(item, dict) and item.get('status') in ('queued', 'running', 'pending'):
+            item.update(status='interrupted', error_code='service_restarted', updated_at=finished_at)
+    payload = json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2)
+    artifact_step('state_history_write', atomic_text, _state_path(output, run_id), payload)
+    head = load_workflow_state(output)
+    if head and head.get('parent_run_id') == run_id:
+        artifact_step('state_current_write', atomic_text, _state_path(output), payload)
 
 
 def load_workflow_state(project_output_dir: str | Path, run_id: str | None = None) -> dict[str, Any] | None:

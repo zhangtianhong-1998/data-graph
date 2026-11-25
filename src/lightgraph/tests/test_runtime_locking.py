@@ -253,3 +253,16 @@ def test_windows_open_errors_have_safe_codes(tmp_path, monkeypatch, winerror, co
     with pytest.raises(LightGraphError, match=f'^{code}$'):
         FileLock(tmp_path / 'lease').acquire()
     assert api.closed == []
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='Darwin system temporary directory')
+def test_system_tmp_alias_supports_real_project_locks_and_traces():
+    from tempfile import TemporaryDirectory
+    from lightgraph.runtime.trace import RunTrace
+
+    with TemporaryDirectory(dir='/tmp') as directory:
+        path = Path(directory)
+        with run_lock(path):
+            writer = RunTrace(path / 'run.trace.jsonl')
+            writer('stage', {'status': 'ready'})
+            assert writer.error_code is None and writer.sequence == 1

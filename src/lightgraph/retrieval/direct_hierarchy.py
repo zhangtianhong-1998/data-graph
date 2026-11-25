@@ -5,19 +5,19 @@ import re
 from lightgraph.construction.contexts import business_context_identity, normalize_context_selection
 from lightgraph.contracts import canonical
 from .dimensional import empty_answer
-from .intent import _new_plan, _resolve_text
+from .intent import _new_plan, _resolve_scope, _resolve_text
 from .path_evidence import MAX_WITNESS_PAIRS, evidence_preview, grounds_slot, path_node
 from .retriever import _join_contexts
 from .traversal import _context_witnesses
 
 
-_QUESTION = re.compile(r'(?:请问\s*)?(.+?)\s*的\s*直接(上|下)级(?:科目|节点)?(?:有哪(?:些|几个)|是什么|是谁)?[？?。]?')
+_QUESTION = re.compile(r'(?:请问\s*)?(.+?)\s*的\s*直接(上|下)级([^，。？?]*?)(?:有哪(?:些|几个)|是什么|是谁)?[？?。]?')
 
 
 def hierarchy_question(text):
     match = _QUESTION.fullmatch(text.strip())
     if match:
-        return match[1].strip(), 'children' if match[2] == '下' else 'parents'
+        return match[1].strip(), 'children' if match[2] == '下' else 'parents', match[3].strip()
     return None
 
 
@@ -70,9 +70,31 @@ def _compatible_endpoints(seeds, edge_context, neighbors, remaining):
     return None, remaining
 
 
-def retrieve_hierarchy(retriever, request, scopes, *, term, direction):
+def retrieve_hierarchy(retriever, request, scopes, *, term, direction, requested_kind=None):
     selection = normalize_context_selection(request.business_context)
+    issues = []
+    if request.mode == 'auto':
+        selection, remainder, issues = _resolve_scope(retriever, scopes, selection, [term], [])
+        if remainder != term:
+            visible = retriever.authorized_cohorts(scopes, selection)
+            anchor = remainder.strip()
+            # Prefer a literal object whose name starts with 中/在. Only remove
+            # scope grammar if the full remaining phrase has no visible match.
+            if anchor and not _resolve_text(retriever.index, anchor, visible)[0]:
+                anchor = re.sub(r'^\s*(?:在\s+)?[中里的内]?[，,\s]*', '', anchor).strip()
+            term = anchor or term
     cohorts = retriever.authorized_cohorts(scopes, selection)
+    kind = None
+    if requested_kind and requested_kind != '节点':
+        kinds = [k for k in retriever.index.authorized_kinds(cohorts) if k.casefold() == requested_kind.casefold()]
+        if len(kinds) == 1:
+            kind = kinds[0]
+        else:
+            issues.append('请指定图中可见的目标类型：“' + requested_kind + '”。')
+    if issues:
+        plan = _new_plan(selection, request.query, 'hierarchy')
+        plan.update(intent='clarify', unresolved=issues)
+        return empty_answer(request.query, scopes, plan)
     candidates, capped = [], False
     if request.node_id:
         candidates = [{'node_id': n['id'], 'kind': n['kind']} for n in
@@ -104,6 +126,10 @@ def retrieve_hierarchy(retriever, request, scopes, *, term, direction):
         def reverse(directions):
             return {key: 'incoming' if flow == 'outgoing' else 'outgoing' for key, flow in directions.items()}
         declared, mapped = reverse(declared), reverse(mapped)
+    if kind:
+        def targets(directions):
+            return {k: flow for k, flow in directions.items() if k[2 if flow == 'outgoing' else 0] == kind}
+        declared, mapped = targets(declared), targets(mapped)
     page = retriever.index.expand_neighborhood([anchor], scopes=cohorts, hops=1, hierarchies=declared,
         mapped_hierarchies=mapped, max_nodes=request.max_nodes, max_edges=request.max_edges,
         max_per_rel=request.max_edges)
@@ -153,7 +179,7 @@ def retrieve_hierarchy(retriever, request, scopes, *, term, direction):
         if supported:
             grouped[other].append(edge['id'])
             answer['edges'].append({**{k: edge[k] for k in ('id', 'relation', 'source', 'target')},
-                'observations': supported,
+                'observations': [evidence_preview(obs) for obs in supported],
                 'evidence_refs': sorted({r for obs in supported for r in obs['evidence_refs']}),
                 'source_tables': sorted({t for obs in supported for t in obs['source_tables']})})
         if remaining < 0:

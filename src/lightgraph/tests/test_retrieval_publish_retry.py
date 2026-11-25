@@ -49,3 +49,26 @@ def test_failed_publish_preserves_active_generation(tmp_path, monkeypatch, error
     assert (tmp_path / 'current.json').read_bytes() == before
     path, manifest = active_index(tmp_path, 'original')
     assert path.is_dir() and manifest['build'] == original['build']
+
+
+def test_retention_pins_active_reader_while_replacing_idle_generations(tmp_path):
+    from lightgraph.retrieval import SubgraphRetriever
+    from lightgraph.retrieval.query import RetrieveSubgraphRequest
+
+    graph = {'support_visibility_version': 1, 'nodes': [
+        {'id': nid, 'type': 'Object', 'identity': {'code': value}, 'supports': [
+            {'scope_ref': 'public', 'label': nid}]} for nid, value in [('zero', 0), ('boolean', False)]], 'edges': []}
+    sync_graph_to_retrieval(graph, tmp_path, generation='original')
+    reader = SubgraphRetriever(tmp_path)
+    old_root = reader.root
+    for i in range(4):
+        sync_graph_to_retrieval(graph, tmp_path, generation=str(i))
+    assert len(list((tmp_path / 'builds').iterdir())) == 3
+    for term, expected in [('0', 'zero'), ('false', 'boolean')]:
+        answer = RetrieveSubgraphRequest(mode='hierarchy', query=term).run(reader, ['public'])
+        assert answer['hierarchy']['anchor_id'] == expected
+    del reader
+    import gc
+    gc.collect()
+    sync_graph_to_retrieval(graph, tmp_path)
+    assert not old_root.exists() and len(list((tmp_path / 'builds').iterdir())) == 2

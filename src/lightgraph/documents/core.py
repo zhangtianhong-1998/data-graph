@@ -1,10 +1,11 @@
 """Versioned Markdown knowledge with distinct data-context and analytical channels."""
 from __future__ import annotations
 import re
+import hashlib
 from pathlib import Path
 from typing import Literal
 import yaml
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 from lightgraph.contracts import StrictModel, SourceRef, TableSpec, digest
 from lightgraph.errors import LightGraphError
 
@@ -27,6 +28,7 @@ class DocumentSection(StrictModel):
     @property
     def locator(self): return f'line:{self.line_start}-{self.line_end}'
 class KnowledgeDocument(StrictModel):
+    _file_sha256: str | None = PrivateAttr(default=None)
     document_id: str
     revision: str
     content_hash: str
@@ -80,10 +82,16 @@ def load_document(path: str | Path, *, text: str | None = None, max_bytes: int =
     path = Path(path)
     if path.suffix.lower() not in ('.md','.markdown'):
         raise LightGraphError('unsupported_document_format')
+    file_hash = None
     if text is None:
         if path.stat().st_size > max_bytes: raise LightGraphError('document_too_large')
         try:
-            text = path.read_text(encoding='utf-8')
+            with path.open('rb') as stream:
+                raw = stream.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise LightGraphError('document_too_large')
+            file_hash = hashlib.sha256(raw).hexdigest()
+            text = raw.decode('utf-8-sig')
         except (OSError,UnicodeError): raise LightGraphError('document_read_failed') from None
     if len(text.encode()) > max_bytes: raise LightGraphError('document_too_large')
     text = text.replace('\r\n','\n').replace('\r','\n')
@@ -185,9 +193,11 @@ def load_document(path: str | Path, *, text: str | None = None, max_bytes: int =
     if not isinstance(derived,bool) or not isinstance(dependencies,list) or not all(isinstance(d,str) for d in dependencies):
         raise LightGraphError('invalid_document_provenance')
     if derived and not dependencies: warnings.append('derived_document_dependencies_missing')
-    return KnowledgeDocument(document_id=document_id,revision=revision,content_hash=content_hash,
+    doc = KnowledgeDocument(document_id=document_id,revision=revision,content_hash=content_hash,
         title=str(meta.get('title',headings[0][2] if headings else path.stem)),purpose=purpose,scope=scope,
         derived=derived,dependency_refs=dependencies,sections=sections,source_path=str(path),warnings=warnings)
+    doc._file_sha256 = file_hash
+    return doc
 
 def load_documents(paths) -> list[KnowledgeDocument]:
     return [load_document(p) for p in paths]

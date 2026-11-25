@@ -272,7 +272,9 @@ def test_saved_connection_loads_into_new_session_and_can_be_forgotten(client, mo
     endpoint='/api/projects/alpha/database/connections/warehouse'
     loaded=client.get(endpoint,headers=other)
     assert loaded.status_code==200 and loaded.headers['Cache-Control']=='no-store'
-    assert loaded.json()['connection']['password']==body['connection']['password']
+    assert loaded.json()['connection']['password'] == ''
+    assert client.post('/api/projects/alpha/database/connect', headers=other,
+                       json={**body,'connection':loaded.json()['saved_binding']}).status_code == 200
     assert client.get('/api/projects/alpha/credentials',headers=other).json()['database_sources']==['warehouse']
     assert client.get(endpoint).status_code==400
     assert client.get(endpoint,headers=session(client,'beta')).status_code==400
@@ -287,6 +289,38 @@ def test_saved_connection_loads_into_new_session_and_can_be_forgotten(client, mo
     scan_no_secrets(client,body['connection']['password'])
 
 
+def test_redacted_new_draft_becomes_profile_then_source_draft_for_the_same_connection(client, monkeypatch):
+    from lightgraph.tests.test_web_connection_drafts import draft_payload
+
+    headers = session(client)
+    prefix = '/api/projects/alpha/database'
+    calls = []
+    monkeypatch.setattr('lightgraph.runtime.config.open_sources', fake_open(calls))
+    payload = draft_payload()
+    form = payload['draft']
+    form['form'].update(id='warehouse', kind='mysql_database')
+    form['connection'].update(db_body()['connection'], format='fields', dsn='', port='3306')
+    assert client.put(f'{prefix}/drafts/new', headers=headers, json=payload).status_code == 200
+    new = client.get(f'{prefix}/drafts/new', headers=headers).json()
+    assert new['draft']['connection']['password'] == ''
+    body = {**db_body(), 'remember_connection': True, 'connection': new['saved_binding']}
+    assert client.post(f'{prefix}/connect', headers=headers, json=body).status_code == 200
+
+    profile = client.get(f'{prefix}/connections/warehouse', headers=headers).json()
+    edit = new['draft']
+    edit['form']['tables'] = 'metrics\nregions'
+    payload = {'draft': edit, 'saved_binding': profile['saved_binding'], 'revision': 2}
+    assert client.put(f'{prefix}/drafts/source-warehouse', headers=headers, json=payload).status_code == 200
+    restored = client.get(f'{prefix}/drafts/source-warehouse', headers=headers).json()
+    assert restored['draft']['form']['tables'] == edit['form']['tables']
+    assert restored['draft']['connection']['password'] == ''
+    body.update(connection=restored['saved_binding'], allowed_tables=['metrics', 'regions'])
+    result = client.post(f'{prefix}/connect', headers=headers, json=body)
+    assert result.status_code == 200, result.text
+    assert result.json()['config']['sources'][0]['allowed_tables'] == ['business.metrics', 'business.regions']
+    assert calls[-1][2]['warehouse'] == calls[0][2]['warehouse']
+
+
 def test_failed_replacement_does_not_overwrite_saved_connection(client, monkeypatch):
     headers=session(client)
     monkeypatch.setattr('lightgraph.runtime.config.open_sources',fake_open([]))
@@ -299,7 +333,8 @@ def test_failed_replacement_does_not_overwrite_saved_connection(client, monkeypa
     assert client.post('/api/projects/alpha/database/connect',headers=headers,json=changed).status_code==500
     assert client.get('/api/projects/alpha/config').json()==before
     loaded=client.get('/api/projects/alpha/database/connections/warehouse',headers=session(client)).json()
-    assert loaded['connection']['password']==body['connection']['password']
+    assert loaded['connection']['password'] == '' and loaded['saved_binding']['store'] == 'profile'
+    assert client.app.state.saved_connections.load('alpha',client.app.state.workspace.resolved_config('alpha').sources[0])['connection']['password'] == body['connection']['password']
     scan_no_secrets(client,body['connection']['password'],'FAILED_NEW_PASSWORD')
 
 
@@ -313,7 +348,7 @@ def test_saved_connection_survives_service_restart_and_binding_change_invalidate
         headers=session(second)
         assert second.get('/api/projects/alpha/credentials',headers=headers).json()['database_sources']==['warehouse']
         saved=second.get('/api/projects/alpha/database/connections/warehouse',headers=headers).json()
-        assert saved['connection']['password']==db_body()['connection']['password']
+        assert saved['connection']['password'] == '' and saved['saved_binding']['key'] == 'warehouse'
         config=second.get('/api/projects/alpha/config').json()
         config['sources'][0]['credential_revision']='changed'
         assert second.put('/api/projects/alpha/config',json=config).status_code==200

@@ -6,6 +6,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.dialects.mysql import MySQL
 from sqlglot.dialects.sqlite import SQLite
+from sqlglot.dialects.postgres import Postgres
 from lightgraph.contracts import TableSpec
 from lightgraph.errors import LightGraphError
 from .guard import SQLGuard, ValidatedQuery
@@ -36,15 +37,17 @@ def render_select(tree: exp.Expression, dialect: str) -> str:
     return CTEColumnsGenerator(dialect="sqlite").generate(tree)
 
 
-def mysql_driver_sql(query: ValidatedQuery) -> str:
-    """Render named binds for PyMySQL without interpolating source values.
+def _driver_sql(query: ValidatedQuery, dialect: str) -> str:
+    """Render named binds for database drivers without interpolating source values.
 
     MySQL's SQLGlot generator retains ``:name``. Converting an entire SQL string
     with a regex would mistake identifiers or literals for bind parameters.
     This generator changes only placeholder AST nodes and escapes percent signs
     in data-bearing SQL tokens for PyMySQL's pyformat protocol.
     """
-    class DriverGenerator(MySQL.Generator):
+    base = MySQL.Generator if dialect == "mysql" else Postgres.Generator
+
+    class DriverGenerator(base):
         def placeholder_sql(self, expression):
             name = expression.name
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) or name not in query.parameters:
@@ -58,12 +61,20 @@ def mysql_driver_sql(query: ValidatedQuery) -> str:
             return super().literal_sql(expression).replace("%", "%%")
 
     try:
-        tree = sqlglot.parse_one(query.sql, read="mysql")
-        return DriverGenerator(dialect="mysql", identify=True, comments=False).generate(tree)
+        tree = sqlglot.parse_one(query.sql, read=dialect)
+        return DriverGenerator(dialect=dialect, identify=dialect == "mysql", comments=False).generate(tree)
     except LightGraphError:
         raise
     except Exception:
         raise LightGraphError("unsafe_sql") from None
+
+def mysql_driver_sql(query: ValidatedQuery) -> str:
+    return _driver_sql(query, "mysql")
+
+
+def postgres_driver_sql(query: ValidatedQuery) -> str:
+    return _driver_sql(query, "postgres")
+
 
 class QueryCompiler:
     def __init__(self, tables: Iterable[TableSpec], *, dialect: str = "postgres",

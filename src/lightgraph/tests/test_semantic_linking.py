@@ -160,3 +160,14 @@ def test_private_peer_does_not_change_public_name_corroboration(tmp_path):
     [with_team] = link_mentions(reader, ['弱关联'], reader.authorized_cohorts(['public', 'team'], None),
                                 paraphrases={'弱关联': ['设备甲']})
     assert with_team['status'] == 'related'
+
+
+def test_close_sibling_does_not_veto_a_unique_first_choice_with_exact_paraphrase(tmp_path):
+    class DenseEmbeddings(Embeddings):
+        def embed(self, texts):
+            coords = {'设备甲': [1, 0, 0], '设备乙': [.93, -.368, 0], '口语': [.88, .475, 0]}
+            return np.array([coords.get(t, [0, 0, 1]) for t in texts], dtype=np.float32)
+    reader = reader_at(tmp_path, [node('a', support('设备甲')), node('b', support('设备乙'))], DenseEmbeddings())
+    cohorts = reader.authorized_cohorts(['public'], None)
+    result, = link_mentions(reader, ['口语'], cohorts, paraphrases={'口语': ['设备甲']})
+    assert result['status'] == 'linked' and result['candidates'][0]['node_id'] == 'a'

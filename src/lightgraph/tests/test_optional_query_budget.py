@@ -121,3 +121,38 @@ def test_workbench_save_reload_and_run_payload_preserve_target_and_unlimited(tmp
             assert parsed.max_db_queries == limit and parsed.construction_target == target
             payload = _resolved_payload(parsed, tmp_path / 'work' / 'projects' / 'budget')['config']
             assert payload['max_db_queries'] == limit and payload['construction_target'] == target
+
+
+def test_absorb_accounts_for_each_origin_once_through_two_adapters():
+    a, b, c = QueryBudget(), QueryBudget(), QueryBudget()
+    a.charge_query(); a.charge_return(1, 7)
+    b.charge_query(); b.absorb(a)
+    c.absorb(a); c.absorb(b)
+    assert (c.queries, c.returned_rows, c.returned_bytes) == (2, 1, 7)
+    a.charge_query(); a.absorb(c)
+    b.absorb(a); c.absorb(b)
+    assert (c.queries, c.returned_rows, c.returned_bytes) == (3, 1, 7)
+
+
+def test_concurrent_scopes_do_not_restore_a_different_tasks_limits():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    budget = QueryBudget(max_queries=25)
+    original = budget.deadline
+    entered = Event()
+    resume = Event()
+    def concurrent_read():
+        with budget.exploration(deadline=original-10, query_limit=4):
+            entered.set()
+            assert resume.wait(3)
+            assert (budget.deadline, budget.max_queries) == (original-10, 4)
+    with ThreadPoolExecutor(1) as executor:
+        task = executor.submit(concurrent_read)
+        assert entered.wait(3)
+        try:
+            with budget.deadline_scope(original-5):
+                assert (budget.deadline, budget.max_queries) == (original-5, 25)
+        finally:
+            resume.set()
+        task.result()
+    assert (budget.deadline, budget.max_queries) == (original, 25)

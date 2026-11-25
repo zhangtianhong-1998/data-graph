@@ -68,13 +68,14 @@ const neighborhoodCount = computed(() => Number(graph.value.focus_neighbor_count
 const neighborhoodIncomplete = computed(() => neighborhood.value && (visible.value.length < neighborhoodCount.value || graph.value.truncated === true || graph.value.next_offset != null))
 let savedScene: { positions: Map<string, Point>; zoom: number; offset: Point; generation: unknown } | null = null
 let resettingSearch = false
+let searchPreview: Graph | null | undefined
 const serverPaging = computed(() => !!props.projectId && props.graph.page_size !== undefined)
 let pageGeneration = 0, searchTimer: ReturnType<typeof setTimeout> | undefined
-const searchMatches = ref<string[] | null>(null)
+const searchMatches = shallowRef<Set<string> | null>(null)
 const searchMatchCount = ref<number | null>(null)
 const expansionOffsets = ref(new Map<string, number | null>())
 let sceneController: AbortController | undefined
-const matchedCount = computed(() => searchMatches.value ? searchMatchCount.value ?? searchMatches.value.length : filtered.value.length)
+const matchedCount = computed(() => searchMatches.value ? searchMatchCount.value ?? searchMatches.value.size : filtered.value.length)
 const overview = computed(() => graph.value.kind_counts as Record<string, number> | undefined)
 async function loadScene(options: { focus?: string; q?: string; kind?: string; more?: boolean; replace?: boolean } = {}) {
   const epoch = ++pageGeneration
@@ -95,7 +96,7 @@ async function loadScene(options: { focus?: string; q?: string; kind?: string; m
     } else remote.value = options.replace ? value : mergeScene(graph.value, value)
     if (options.replace) { clearSelection(); positions.value = placeNodes(value); expansionOffsets.value.clear() }
     if (focus) expansionOffsets.value.set(focus, value.next_offset as number | null)
-    if (options.q || options.kind) { searchMatches.value = value.nodes.map(n => n.id); searchMatchCount.value = Number(value.matched_nodes ?? value.nodes.length) }
+    if (options.q || options.kind) { searchMatches.value = new Set(value.nodes.map(n => n.id)); searchMatchCount.value = Number(value.matched_nodes ?? value.nodes.length) }
     if (options.q && value.nodes[0]) {
       const center = value.nodes[0]
       if (!graph.value.nodes.some(n => n.id === center.id)) { remote.value = value; positions.value = placeNodes(value); expansionOffsets.value.clear() }
@@ -134,9 +135,10 @@ const relationName = (value: unknown) => vocabularyLabel('relations', value, voc
 const kindName = (value: unknown) => vocabularyLabel('entity_types', value, vocabulary.value)
 const propertyName = (value: string) => vocabularyLabel('properties', value, vocabulary.value)
 const relationDescription = (value: unknown) => vocabularyDescription('relations', value, vocabulary.value)
+const nodesById = computed(() => new Map(graph.value.nodes.map(node => [node.id, node])))
 const endpointName = (id: unknown) => {
   const key = String(id || '')
-  const node = graph.value.nodes.find(item => item.id === key) || detailNodes.value[key]
+  const node = nodesById.value.get(key) || detailNodes.value[key]
   return node ? nodeCaption(node) : '节点名称尚未加载'
 }
 const factTitle = (fact: Provenance['facts'][number]) => fact.fact_kind === 'PropertyValue' ? propertyName(String(fact.payload.name || '')) : fact.fact_kind === 'Edge' ? relationName(fact.payload.relation) : fact.fact_kind === 'UnresolvedRelation' ? '待确认关系' : '对象存在'
@@ -149,6 +151,21 @@ const mappingValues = (rule: Record<string, unknown>) => Object.fromEntries(['id
 let detailGeneration = 0
 let detailController: AbortController | undefined
 const statusName = (value?: unknown) => ({ accepted: '已接受', candidate: '候选', unresolved: '未决', conflict: '冲突' }[String(value)] || '状态未提供')
+function mergeNodePages(previous: StandardNode[], page: StandardNode[]) {
+  const nodes = new Map(previous.map(node => [node.id, node]))
+  const combined = <T,>(a: T[], b: T[]) => [...new Map([...a, ...b].map(item => [JSON.stringify(item), item])).values()]
+  for (const node of page) {
+    const attributes = new Map(nodes.get(node.id)?.attributes.map(item => [item.key, item]))
+    for (const item of node.attributes) {
+      const prior = attributes.get(item.key)
+      attributes.set(item.key, prior ? { ...item, values: combined(prior.values, item.values),
+        observations: combined(prior.observations || [], item.observations || []),
+        origin_tables: combined(prior.origin_tables, item.origin_tables) } : item)
+    }
+    nodes.set(node.id, { ...node, attributes: [...attributes.values()] })
+  }
+  return [...nodes.values()]
+}
 async function loadDetails(more = false) {
   const selector = selectedEdge.value?.id ? `fact_id=${encodeURIComponent(String(selectedEdge.value.id))}` : selected.value ? `entity_id=${encodeURIComponent(selected.value.id)}` : ''
   const epoch = ++detailGeneration
@@ -170,8 +187,7 @@ async function loadDetails(more = false) {
     const previous = more ? details.value : null
     details.value = previous ? {
       ...value,
-      standard_nodes: [...new Map([...(previous.standard_nodes || []), ...(value.standard_nodes || [])]
-        .map(node => [node.id, node])).values()],
+      standard_nodes: mergeNodePages(previous.standard_nodes || [], value.standard_nodes || []),
       facts: [...previous.facts, ...value.facts],
       supports: [...previous.supports, ...value.supports],
       rules: [...previous.rules, ...value.rules],
@@ -271,14 +287,15 @@ let drag: { x: number; y: number; ox: number; oy: number; factor: number; moved:
 const kinds = computed(() => serverPaging.value && Array.isArray(graph.value.kinds) ? graph.value.kinds as string[] : [...new Set(graph.value.nodes.map(n => String(n.kind || n.layer || '节点')))].sort())
 const filtered = computed(() => graph.value.nodes.filter(n =>
   (!selectedKind.value || (n.kind || n.layer || '节点') === selectedKind.value) &&
-  (!search.value || (serverPaging.value && searchMatches.value ? searchMatches.value.includes(n.id) :
+  (!search.value || (serverPaging.value && searchMatches.value ? searchMatches.value.has(n.id) :
     nodeSearchText(n).includes(search.value.toLocaleLowerCase())))))
+const filteredIds = computed(() => new Set(filtered.value.map(node => node.id)))
 // Searching highlights and locates without removing the surrounding graph.
 const visible = computed(() => graph.value.nodes)
 const positions = shallowRef<Map<string, Point>>(new Map())
 const points = computed(() => positions.value)
 const bounds = computed(() => sceneBounds(points.value))
-const largeScene = computed(() => visible.value.length > 300)
+const largeScene = computed(() => visible.value.length > 300 || graph.value.edges.length > 1000)
 const bitmap = ref<HTMLCanvasElement | null>(null)
 const rawEdges = computed(() => graph.value.edges.filter(edge => points.value.has(edge.source) && points.value.has(edge.target)))
 const rawRelations = ref(false)
@@ -427,8 +444,8 @@ function bitmapNode(event: MouseEvent) {
   if (circle) return circle
   // Canvas text is painted without DOM hit targets; make visible labels clickable too.
   const ctx = bitmap.value.getContext('2d')
+  if (zoom.value < .65) return
   return [...visible.value].reverse().find(node => {
-    if (zoom.value < .65) return false
     const p = points.value.get(node.id)!
     const labels: Array<[string, number, number]> = labelLines(node).map((line, index) => [line, 43 + index * 16, 13])
     labels.push([`${kindName(node.kind || node.layer)} · ${statusName(node.status)}`, metadataY(node), 11])
@@ -488,7 +505,7 @@ function paint() {
     if (zoom.value < .2 && !emphasized) continue
     ctx.beginPath(); ctx.moveTo(tx,ty); ctx.lineTo(tx-8*Math.cos(angle-.5),ty-8*Math.sin(angle-.5)); ctx.moveTo(tx,ty); ctx.lineTo(tx-8*Math.cos(angle+.5),ty-8*Math.sin(angle+.5)); ctx.stroke()
   }
-  const matches = new Set(filtered.value.map(n => n.id))
+  const matches = filteredIds.value
   for (const node of visible.value) {
     const p = points.value.get(node.id)!
     if (p.x < left-110 || p.x > right+110 || p.y < top-90 || p.y > bottom+90) continue
@@ -536,13 +553,19 @@ watch(() => props.loading, loading => {
   if (!loading && !deferFullGraph.value && fullTransport.value && !fullTransfer && !fullPaused.value && !fullLoading.value && !loadedGraphIsComplete(baseGraph.value)) void loadFullGraph()
 })
 watch([search, selectedKind], () => {
-  if (resettingSearch) return
+  if (resettingSearch) { searchPreview = undefined; return }
   if (neighborhood.value) { if (filtered.value[0]) focusNode(filtered.value[0]); return }
   pageGeneration++; sceneController?.abort(); clearTimeout(searchTimer); pageLoading.value = false; searchMatches.value = null; searchMatchCount.value = null
   if (serverPaging.value && (!fullTransport.value || (deferFullGraph.value && !fullComplete.value && !fullLoading.value)) && (search.value || selectedKind.value)) {
+    if (deferFullGraph.value && searchPreview === undefined) searchPreview = remote.value
     searchTimer = setTimeout(() => { void loadScene({ q: search.value, kind: selectedKind.value, replace: deferFullGraph.value }) }, 200)
   }
-  else if (filtered.value[0]) focusNode(filtered.value[0])
+  else if (!search.value && !selectedKind.value && searchPreview !== undefined) {
+    remote.value = searchPreview
+    searchPreview = undefined
+    clearSelection()
+    positions.value = placeNodes(baseGraph.value)
+  } else if (filtered.value[0]) focusNode(filtered.value[0])
 }, { flush: 'sync' })
 watch(canvas, element => {
   observer?.disconnect()
@@ -607,7 +630,7 @@ onUnmounted(() => {
               <path :d="edgePath(edge)" marker-end="url(#arrow)"/><title>{{ edgeLabel(edge) }} · {{ statusName(edge.status) }}</title>
               <text v-if="selected && (edge.source === selected.id || edge.target === selected.id)" :x="(points.get(edge.source)!.x + points.get(edge.target)!.x) / 2" :y="(points.get(edge.source)!.y + points.get(edge.target)!.y) / 2 - 7">{{ edgeLabel(edge) }}</text>
             </g>
-            <g v-for="node in visible" :key="node.id" class="graph-node" :class="{ dimmed: ((search || selectedKind) && !filtered.includes(node)) || (focusedIds.size && !focusedIds.has(node.id)), selected: selected?.id === node.id, candidate: node.status === 'candidate', unresolved: node.status === 'unresolved' }" :transform="`translate(${points.get(node.id)!.x} ${points.get(node.id)!.y})`" tabindex="0" role="button" :aria-label="display(node)" @click="nodeClick(node, $event)" @dblclick.stop="nodeDoubleClick(node)" @keydown.enter="selectNode(node)" @keydown.space.prevent="selectNode(node)">
+            <g v-for="node in visible" :key="node.id" class="graph-node" :class="{ dimmed: ((search || selectedKind) && !filteredIds.has(node.id)) || (focusedIds.size && !focusedIds.has(node.id)), selected: selected?.id === node.id, candidate: node.status === 'candidate', unresolved: node.status === 'unresolved' }" :transform="`translate(${points.get(node.id)!.x} ${points.get(node.id)!.y})`" tabindex="0" role="button" :aria-label="display(node)" @click="nodeClick(node, $event)" @dblclick.stop="nodeDoubleClick(node)" @keydown.enter="selectNode(node)" @keydown.space.prevent="selectNode(node)">
               <circle :r="radius(node.id)" :fill="kindColor(node)" :stroke="kindColor(node)"/><circle :r="radius(node.id) * .55" fill="#fff" fill-opacity=".16"/>
               <text class="node-label" y="43"><tspan v-for="(line, index) in labelLines(node)" :key="index" x="0" :dy="index ? 16 : 0">{{ line }}</tspan></text><text class="node-kind" :y="metadataY(node)">{{ kindName(node.kind || node.layer) }} · {{ statusName(node.status) }}</text><text v-if="scopeLabel(node)" class="node-kind node-scope" :y="metadataY(node) + 16">{{ shortScope(node) }}</text><title>{{ display(node) }} · {{ statusName(node.status) }} · {{ scopeLabel(node) }}</title>
             </g>

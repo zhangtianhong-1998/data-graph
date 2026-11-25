@@ -9,14 +9,15 @@ export interface ConnectionDraft {
   retention: boolean
   checked: string[]
 }
-export interface DraftResult { saved: boolean; draft?: ConnectionDraft; revision: number }
+export type SavedBinding = { store: 'draft' | 'profile'; key: string; stamp: string }
+export interface DraftResult { saved_binding?: SavedBinding; saved: boolean; draft?: ConnectionDraft; revision: number }
 export type DraftStatus = 'idle' | 'saving' | 'saved' | 'failed' | 'off'
 
 /** Keep credentials in memory until the backend encrypts them; never use browser storage. */
 export class ConnectionDraftWriter {
   private revision = 0
   private acknowledged = 0
-  private latest: { draft: ConnectionDraft; revision: number } | undefined
+  private latest: { draft: ConnectionDraft; revision: number; saved_binding?: SavedBinding } | undefined
   private timer: ReturnType<typeof setTimeout> | undefined
   private queue: Promise<unknown> = Promise.resolve()
   private enabled = true
@@ -33,11 +34,11 @@ export class ConnectionDraftWriter {
   private nextRevision() { this.revision = Math.max(Date.now(), this.revision + 1); return this.revision }
   private cancelTimer() { if (this.timer) clearTimeout(this.timer); this.timer = undefined }
 
-  update(draft: ConnectionDraft) {
+  update(draft: ConnectionDraft, binding?: SavedBinding) {
     if (!this.enabled) return
     this.conflicted = false
     // Freeze the form now so later edits/secret cleanup cannot mutate an in-flight write.
-    this.latest = { draft: structuredClone(draft), revision: this.nextRevision() }
+    this.latest = { draft: structuredClone(draft), revision: this.nextRevision(), ...(binding ? { saved_binding: { ...binding } } : {}) }
     this.report('saving')
     this.cancelTimer()
     this.timer = setTimeout(() => { void this.flush().catch(() => {}) }, 250)

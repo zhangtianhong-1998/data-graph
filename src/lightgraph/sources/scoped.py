@@ -86,7 +86,7 @@ class GoalScopedSource(SourceAdapter):
         # The adapter still owns execution and its database security boundary.
         self._check_open()
         columns = list(columns)
-        cap = min(limit or self.limits.max_result_rows, self.limits.max_result_rows)
+        cap = min(self.limits.max_result_rows if limit is None else limit, self.limits.max_result_rows)
         self._validate(self.compiler.projection(table, columns, predicate=predicate,
                                                distinct=distinct, limit=cap))
         stream = self._adapter.project(table, columns, predicate=predicate, distinct=distinct, limit=cap)

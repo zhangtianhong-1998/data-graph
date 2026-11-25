@@ -235,7 +235,7 @@ const mappingValues = (rule: Record<string, unknown>) => Object.fromEntries([
 
     <section v-if="sources.length" class="node-section" aria-label="物理表与列">
       <h3>数据来源</h3>
-      <div v-for="ev in sources" :key="JSON.stringify([ev.source_id,ev.qualified_table])" class="source-evidence-card">
+      <div v-for="ev in sources" :key="JSON.stringify([ev.source_id,ev.qualified_table,ev.inherited_from])" class="source-evidence-card">
         <div class="source-heading"><strong>{{ ev.qualified_table }}</strong> <span>{{ ev.source_id }}</span></div>
         <dl v-if="sourceColumns(ev).length" class="source-columns">
           <template v-for="field in sourceColumns(ev)" :key="field.column">

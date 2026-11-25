@@ -31,6 +31,32 @@ def _strict_parser_type(parser_type):
 
     return StrictParser
 
+def checked_query_scopes(tree):
+    """Require a scope for every SELECT, including expressions on set operations."""
+    scopes = list(traverse_scope(tree))
+    covered = {id(scope.expression) for scope in scopes}
+    if any(id(node) not in covered for node in tree.find_all(exp.Select, exp.SetOperation)):
+        raise LightGraphError("unsupported_query_scope")
+    sources = {id(node) for scope in scopes for node, _ in scope.selected_sources.values()}
+    columns = {id(column) for scope in scopes for column in scope.find_all(exp.Column)}
+    if (any(id(table) not in sources for table in tree.find_all(exp.Table))
+            or any(id(column) not in columns for column in tree.find_all(exp.Column))):
+        raise LightGraphError("unsupported_query_scope")
+    return scopes
+
+
+def checked_tokens(dialect, sql):
+    implementation = sqlglot.Dialect.get_or_raise(dialect)
+    tokens = implementation.tokenize(sql)
+    if dialect == "mysql" and any(
+        token.token_type == sqlglot.tokens.TokenType.HINT
+        or any(comment.lstrip().upper().startswith(("!", "M!")) for comment in token.comments)
+        for token in tokens
+    ):
+        raise LightGraphError("unsafe_sql")
+    return tokens
+
+
 @dataclass(frozen=True, repr=False)
 class ValidatedQuery:
     sql: str = field(repr=False)
@@ -95,15 +121,7 @@ class SQLGuard:
     def validate(self, sql: str, parameters: dict[str, Any] | None = None, *, operator: str = "select", result_columns: Iterable[str] = ()) -> ValidatedQuery:
         try:
             dialect = sqlglot.Dialect.get_or_raise(self.dialect)
-            tokens = dialect.tokenize(sql)
-            if self.dialect == "mysql":
-                # MySQL executes version comments that a generic SQL parser
-                # treats as inert text. Hints may also alter session settings.
-                for token in tokens:
-                    if (token.token_type == sqlglot.tokens.TokenType.HINT or
-                            any(comment.lstrip().upper().startswith(("!", "M!"))
-                                for comment in token.comments)):
-                        raise LightGraphError("unsafe_sql")
+            tokens = checked_tokens(self.dialect, sql)
             parser = _strict_parser_type(dialect.parser_class)(
                 dialect=dialect, error_level=sqlglot.ErrorLevel.RAISE,
             )
@@ -114,9 +132,8 @@ class SQLGuard:
             for node in tree.walk():
                 if type(node).__name__ not in SAFE_NODES:
                     raise ValueError
-                if self.dialect == "mysql" and isinstance(node, exp.Parameter):
-                    # @user variables can read/write mutable connection state;
-                    # they are not the compiler's named parameter placeholders.
+                if isinstance(node, exp.Parameter):
+                    # This interface accepts named compiler binds only.
                     raise ValueError
                 if isinstance(node, exp.With) and node.args.get("recursive"):
                     raise ValueError
@@ -148,7 +165,7 @@ class SQLGuard:
     def _authorize(self, tree: exp.Expression) -> None:
         validated_joins = set()
         validated_columns = set()
-        for scope in traverse_scope(tree):
+        for scope in checked_query_scopes(tree):
             from_clause = scope.expression.args.get("from_") or scope.expression.args.get("from")
             bound = {from_clause.this.alias_or_name} if from_clause is not None else set()
             for join in scope.expression.args.get("joins", []):

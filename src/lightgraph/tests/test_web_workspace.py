@@ -361,3 +361,27 @@ def test_literal_dotted_name_cannot_collide_with_an_automatic_qualified_selector
     file = workspace.add_file(pid, "object.md", b"# Dictionary")
     assert file["inactive_reason"] == "pending_assignment"
     assert not workspace.resolved_config(pid).documents
+
+
+def test_corrupt_project_isolated_from_project_list_and_startup(workspace):
+    from fastapi.testclient import TestClient
+    from lightgraph.web.app import create_app
+
+    (workspace.root / 'project_a' / 'project.yaml').write_text('[', encoding='utf-8')
+    with TestClient(create_app(workspace.root)) as client:
+        rows = client.get('/api/projects', headers={'Prefer':'return=minimal'}).json()['projects']
+        assert {row['project_id']: row.get('status') for row in rows} == {
+            'project_a':'invalid_project_metadata', 'project_b':None}
+        assert client.get('/api/projects/project_b').status_code == 200
+
+
+def test_nested_yaml_uses_same_credential_policy_on_upload_and_preview(workspace):
+    rule = b'rules:\n- attributes:\n    single_valued: {password: password_column}\n    multi_valued: {token: token_column}\n'
+    file = workspace.add_file('project_a', 'fields.yaml', rule)
+    assert workspace.text_content('project_a', file['file_id']) == rule.decode()
+    settings = b'settings:\n  providers:\n  - settings: {api_key: LOCAL_TEST_VALUE}\n'
+    with pytest.raises(LightGraphError, match='use_credential_environment_variable'):
+        workspace.add_file('project_a', 'settings.yaml', settings)
+    workspace.file_path('project_a', file['file_id']).write_bytes(settings)
+    with pytest.raises(LightGraphError, match='use_credential_environment_variable'):
+        workspace.text_content('project_a', file['file_id'])

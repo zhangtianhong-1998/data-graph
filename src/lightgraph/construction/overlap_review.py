@@ -63,7 +63,8 @@ class _CallCounter(httpx.BaseTransport):
 
     def handle_request(self, request):
         self.budget.check_deadline()
-        self.transport = httpx.HTTPTransport()
+        if self.transport is None:
+            self.transport = httpx.HTTPTransport()
         self.calls += 1
         if self.on_model_call:
             self.on_model_call()
@@ -179,7 +180,7 @@ def review_overlap_patterns(config, patterns, *, api_key=None, check_cancelled=N
     limits = model.model_copy(update={'max_output_tokens': min(model.max_output_tokens, _MAX_OUTPUT_TOKENS),
                                       'max_response_bytes': min(model.max_response_bytes or 131072, 131072)})
     payload = {'model': model.model, 'stream': limits.stream,
-               output_token_field(model.model): limits.max_output_tokens,
+               (model.output_token_field or output_token_field(model.model)): limits.max_output_tokens,
                'response_format': response_format_for(_Batch.model_json_schema(), model.response_format),
                'messages': [{'role': 'system', 'content': _INSTRUCTIONS}, {'role': 'user', 'content': ''}]}
     if limits.stream and limits.stream_options_include_usage:

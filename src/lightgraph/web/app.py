@@ -23,6 +23,7 @@ from starlette.exceptions import HTTPException
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 
 from lightgraph.errors import LightGraphError
 from lightgraph.retrieval.query import RetrieveSubgraphRequest
@@ -33,6 +34,7 @@ from .execution import RunManager, read_graph, read_graph_details, read_graph_co
 from .credentials import SessionCredentials
 from .saved_connections import SavedConnections
 from .connection_drafts import SaveConnectionDraft
+from .connection_edit import ConnectionReference, public_form, resolve_form, connection_from_form, restore_draft_secrets
 from .database_access import (ConnectionSpec, build_dsn, test_connection,
                               discover_tables, parse_table_list_excel, parse_table_list_yaml, normalize_selected_tables)
 
@@ -203,8 +205,12 @@ class DiscoveryDecision(IdentityRevision):
     action: Literal['dismiss','retry','reopen']
 
 
+class EditDraft(SaveConnectionDraft):
+    saved_binding: ConnectionReference | None = None
+
+
 class DatabaseRequest(InputModel):
-    connection: ConnectionSpec
+    connection: ConnectionSpec | ConnectionReference
 
 
 class TableDiscoveryRequest(DatabaseRequest):
@@ -235,6 +241,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
 
     @asynccontextmanager
     async def lifespan(app):
+        await run_in_threadpool(retrieval_jobs.recover)
         await run_in_threadpool(analytics.recover)
         try:
             yield
@@ -253,7 +260,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     app.state.analytics_jobs=analytics
     app.add_middleware(CORSMiddleware,allow_origins=sorted(ALLOWED_ORIGINS),
         allow_methods=['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-        allow_headers=['Content-Type','X-Workbench-Session','If-Match'],expose_headers=['ETag','X-Workbench-Session-Rejected'],allow_credentials=False)
+        allow_headers=['Content-Type','X-Workbench-Session','If-Match','Prefer'],expose_headers=['ETag','X-Workbench-Session-Rejected'],allow_credentials=False)
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver'])
     app.add_middleware(RequestBoundary)
 
@@ -381,8 +388,8 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return {'status':'ok','service':'data-graph','version':'1.1.0'}
 
     @app.get('/api/projects')
-    def projects():
-        return {'projects':workspace.list_projects()}
+    def projects(view: Literal['full','summary']='full', prefer: str | None = Header(default=None)):
+        return {'projects':workspace.list_projects(summary=view=='summary' or prefer=='return=minimal')}
 
     @app.post('/api/projects',status_code=201)
     def create_project(data:NewProject):
@@ -390,7 +397,9 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
 
     @app.get('/api/projects/{pid}')
     def project(pid:str):
-        return workspace.get(pid)
+        value = workspace.get(pid)
+        active = manager.active_summary(pid)
+        return {**value, "active_run": active} if active else value
 
     @app.patch('/api/projects/{pid}')
     def rename_project(pid:str,data:RenameProject):
@@ -503,17 +512,26 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             saved_connections.delete_embedding(pid)
             return embedding_credential_status(pid)
 
+    def executable_connection(pid, value, *, draft_key=None):
+        if isinstance(value, ConnectionReference):
+            return connection_from_form(resolve_form(saved_connections, workspace, pid, value, draft_key=draft_key))
+        return value
+
     @app.post('/api/projects/{pid}/database/test')
-    def database_test(pid:str,data:DatabaseRequest):
+    def database_test(pid:str,data:DatabaseRequest,x_workbench_session:str|None=Depends(project_session)):
         with workspace.lock(pid):
+            credentials.require(pid,x_workbench_session)
             mutable(pid)
-            return test_connection(data.connection)
+            connection = executable_connection(pid, data.connection)
+        return test_connection(connection)
 
     @app.post('/api/projects/{pid}/database/tables')
-    def database_tables(pid:str,data:TableDiscoveryRequest):
+    def database_tables(pid:str,data:TableDiscoveryRequest,x_workbench_session:str|None=Depends(project_session)):
         with workspace.lock(pid):
+            credentials.require(pid,x_workbench_session)
             mutable(pid)
-            return discover_tables(data.connection) if data.exact_names is None else discover_tables(data.connection, data.exact_names)
+            connection = executable_connection(pid, data.connection)
+        return discover_tables(connection) if data.exact_names is None else discover_tables(connection, data.exact_names)
 
     @app.post('/api/projects/{pid}/database/table-list')
     async def database_table_list(pid:str,file:UploadFile=File(...)):
@@ -540,24 +558,25 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             workspace.require_config_revision(pid,if_match)
             old_config=workspace.get_config(pid)
             old_resolved=workspace.resolved_config(pid)
-            old_secrets,_=credentials.resolve(pid,x_workbench_session,old_resolved)
             existing=next((s for s in old_resolved.sources if s.id==data.source_id),None)
+            connection = executable_connection(pid, data.connection, draft_key='source-' + existing.id if existing else 'new')
+            old_secrets,_=credentials.resolve(pid,x_workbench_session,old_resolved)
             if existing is None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}',data.source_id):
                 raise LightGraphError('source_id_invalid')
             if any(s.id==data.source_id and s.kind not in {'gauss_database','mysql_database'} for s in old_resolved.sources):
                 raise LightGraphError('source_id_conflict')
-            if existing is not None and existing.kind!=data.connection.kind:
+            if existing is not None and existing.kind!=connection.kind:
                 raise LightGraphError('source_kind_conflict')
             # The metadata adapter validates these exact names. Manual choices
             # must also work beyond the bounded table-discovery first page.
-            selected=normalize_selected_tables(data.connection,data.allowed_tables)
-            dsn=build_dsn(data.connection)
+            selected=normalize_selected_tables(connection,data.allowed_tables)
+            dsn=build_dsn(connection)
             config={**old_config,'sources':[s for s in old_config['sources'] if s['id']!=data.source_id]}
             previous=next((s for s in old_config['sources'] if s['id']==data.source_id),None)
-            source_config=dict(previous) if previous and previous['kind']==data.connection.kind else {}
+            source_config=dict(previous) if previous and previous['kind']==connection.kind else {}
             if set(source_config.get('allowed_columns') or {})-set(selected):
                 raise LightGraphError('source_column_scope_conflict')
-            source_config.update({'id':data.source_id,'kind':data.connection.kind,'dsn_env':None,
+            source_config.update({'id':data.source_id,'kind':connection.kind,'dsn_env':None,
                 'credential_mode':'session','credential_revision':uuid.uuid4().hex,
                 'allowed_tables':selected})
             if 'capability_manifest' in data.model_fields_set:
@@ -578,7 +597,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
                     # Commit the profile only after metadata succeeds. A failed
                     # replacement must keep the previously saved connection usable.
                     if data.remember_connection:
-                        saved_connections.save(pid,source,data.connection,dsn)
+                        saved_connections.save(pid,source,connection,dsn)
                     else:
                         saved_connections.delete(pid,source.id)
                 except Exception:
@@ -611,12 +630,15 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             draft_source(pid,key)
             saved=saved_connections.load_draft(pid,key)
             if saved is not None:
-                return {'saved':True,**saved}
+                draft = saved['draft']
+                form, binding = public_form(saved_connections, pid, 'draft', key, draft['connection'])
+                return {'saved':True, 'revision':saved['revision'], 'draft':{**draft, 'connection':form},
+                        'saved_binding':binding}
             revision=saved_connections.load_draft_revision(pid,key)
             return {'saved':False,**({'revision':revision} if revision else {})}
 
     @app.put('/api/projects/{pid}/database/drafts/{key}')
-    def save_connection_draft(pid:str,key:str,data:SaveConnectionDraft,x_workbench_session:str|None=Depends(project_session)):
+    def save_connection_draft(pid:str,key:str,data:EditDraft,x_workbench_session:str|None=Depends(project_session)):
         # Incomplete forms are drafts, not live credentials or extraction config.
         # Saving never tests the connection or changes an active run's inputs.
         with workspace.lock(pid):
@@ -625,7 +647,13 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             source=draft_source(pid,key)
             if source and (data.draft.form.id!=source.id or data.draft.form.kind!=source.kind):
                 raise LightGraphError('saved_connection_invalid')
-            revision=saved_connections.save_draft(pid,key,data.draft,data.revision)
+            draft = data.draft
+            if data.saved_binding:
+                saved = resolve_form(saved_connections, workspace, pid, data.saved_binding, draft_key=key)
+                if saved['kind'] != draft.form.kind:
+                    raise LightGraphError('saved_connection_invalid')
+                draft = restore_draft_secrets(draft, saved)
+            revision=saved_connections.save_draft(pid,key,draft,data.revision)
             return {'saved':True,'revision':revision}
 
     @app.delete('/api/projects/{pid}/database/drafts/{key}')
@@ -646,9 +674,11 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
             if source is None or source.kind not in {'gauss_database','mysql_database'}:
                 raise LightGraphError('source_not_found')
             saved=saved_connections.load(pid,source)
-            # The explicit edit form needs the saved input. Other config,
-            # status, metadata and run endpoints never return these values.
-            return {'saved':False} if saved is None else {'saved':True,'connection':saved['connection']}
+            if saved is None:
+                return {'saved':False}
+            form, binding = public_form(saved_connections, pid, 'profile', sid, saved['connection'])
+            return {'saved':True, 'connection':form, 'format':'dsn' if saved['connection'].get('dsn') else 'fields',
+                    'saved_binding':binding}
 
     @app.delete('/api/projects/{pid}/database/connections/{sid}')
     def forget_database_connection(pid:str,sid:str,x_workbench_session:str|None=Depends(project_session)):
@@ -878,12 +908,14 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
                                               version=version, offset=offset, limit=limit)
 
     @app.get('/api/projects/{pid}/graph')
-    def graph(pid:str,layer:str='business',include_candidates:bool=False,offset:int=0,limit:int=240,q:str='',kind:str='',focus:str='',hops:int=1,traversal:str='all',version:str|None=None,business_context:str|None=None):
+    def graph(pid:str,layer:str='business',include_candidates:bool=False,review_offset:int=0,offset:int=0,limit:int=240,q:str='',kind:str='',focus:str='',hops:int=1,traversal:str='all',version:str|None=None,business_context:str|None=None):
         if layer not in ('business','metadata'):raise LightGraphError('graph_layer_invalid')
         if hops not in (1,2) or traversal not in ('all','chains'):raise LightGraphError('graph_page_invalid')
         selection = dict(layer=layer, include_candidates=include_candidates, offset=offset, limit=limit,
                          q=q, kind=kind, focus=focus, hops=hops, traversal=traversal,
                          business_context=parse_business_context(business_context))
+        if review_offset:
+            selection['review_offset'] = review_offset
         if version is not None:
             return graph_history.read_consistently(workspace, pid, graph_history.read_page, version=version, **selection)
         reader = graph_history.read_consistently if layer == 'business' else read_graph_consistently
@@ -1063,6 +1095,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         from ..retrieval import test_embedding_service
         with workspace.lock(pid):
             workspace.get(pid)
+            credentials.require(pid, x_workbench_session)
             config = workspace.resolved_config(pid).model_copy(deep=True)
             saved_binding = (config.embedding.base_url, config.embedding.model, config.embedding.api_key_env)
         if data is not None:
@@ -1129,7 +1162,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         def read(_workspace, _pid, *, config):
             emb_key = resolve_api_key(pid, x_workbench_session, config)
             model_key = None
-            if (data.mode in {'auto', 'dimensional', 'traverse'} and not data.conditions and not data.seed_ids
+            if ((sql_preview or data.mode in {'auto', 'dimensional', 'traverse'} and not data.conditions and not data.seed_ids)
                     and config.resolved_model.mode in {'in_environment', 'approved_external'}):
                 model_key = resolve_api_key(pid, x_workbench_session, config, model=True)
             retriever, _ = project_retriever(config, embedding_api_key=emb_key, model_api_key=model_key,
@@ -1226,7 +1259,7 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
     assets=Path(frontend_dir) if frontend_dir else ROOT/'src/workbench/dist'
     if (assets/'index.html').is_file():
         # Vue keeps its page tabs in state; no catch-all filesystem lookup.
-        app.mount('/',StaticFiles(directory=assets,html=True),name='workbench')
+        app.mount('/',GZipMiddleware(StaticFiles(directory=assets,html=True), minimum_size=1024),name='workbench')
     else:
         @app.get('/')
         def build_missing():

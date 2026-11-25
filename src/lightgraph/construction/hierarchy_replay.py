@@ -6,7 +6,7 @@ from itertools import combinations
 
 from lightgraph.contracts import canonical, digest
 from lightgraph.source_values import identity_cell
-from .fusion import definition_contract, edge_reference, record_input_edge, relation_identity, remap_graph_endpoints
+from .fusion import deduplicate_supports, definition_contract, edge_reference, record_input_edge, relation_identity, remap_graph_endpoints
 from .hierarchy_captions import HierarchyCaptions
 from .hierarchy_neighborhood import neighborhood_difference_counts
 from .hierarchy_observations import (edge_observation_properties, observation_boundary, observation_properties,
@@ -518,12 +518,7 @@ def _verified_groups(graph, excluded_types, stats, physical_sets, trace=None, re
     isolation = graph.get('conflict_isolation') or {}
     incomplete = {c['contributor_id'] for c in isolation.get('contributors_with_gaps', []) if c.get('contributor_id')}
     blocked.update(nid for nid, member in members.items() if member.unit in incomplete)
-    for issue in (*isolation.get('details', []), *graph.get('context_cycle_diagnostics', []),
-                  *graph.get('unresolved_relations', [])):
-        blocked.update(issue.get('node_ids') or [])
-        blocked.update(issue.get(k) for k in ('node_id', 'source', 'target'))
-        for choices in (issue.get('candidate_endpoints') or {}).values():
-            blocked.update(choices)
+    blocked.update(_unresolved_members(graph))
     # A single key must identify exactly the same set of occurrences at every
     # observed level. Never take a transitive closure across overlapping sets.
     sets = {frozenset(ids) for ids in physical_groups.values() if len(ids) > 1}
@@ -690,6 +685,18 @@ def _verified_groups(graph, excluded_types, stats, physical_sets, trace=None, re
                 trace.record({nid}, role_index.results[nid], stage='isolated_role')
 
 
+def _unresolved_members(graph):
+    blocked = set()
+    isolation = graph.get('conflict_isolation') or {}
+    for issue in (*isolation.get('details', []), *graph.get('context_cycle_diagnostics', []),
+                  *graph.get('unresolved_relations', [])):
+        blocked.update(issue.get('node_ids') or [])
+        blocked.update(issue.get(k) for k in ('node_id', 'source', 'target'))
+        for choices in (issue.get('candidate_endpoints') or {}).values():
+            blocked.update(choices)
+    return blocked
+
+
 def _compatible_remaps(graph, batches, nodes):
     """Retain groups whose edges keep distinct identities and do not introduce new self-links."""
     owners = {nid: winner for winner, ids in batches.items() for nid in ids}
@@ -716,6 +723,22 @@ def _compatible_remaps(graph, batches, nodes):
             if new == old and edge['id'] != key:
                 # Unchanged historical edges retain their published ID.
                 ids_by_edge[edge['id']].append(changed)
+        acyclic = {d['type'] for d in graph['definitions']['relations'] if d.get('acyclic')}
+        affected = {e['type'] for e in graph['edges'] if e['type'] in acyclic and
+                    any(owners.get(e[end], e[end]) != e[end] for end in ('source', 'target'))}
+        if affected:
+            from .context_topology import detect_context_cycles
+            by_type = defaultdict(list)
+            for edge in graph['edges']:
+                if edge['type'] in affected:
+                    by_type[edge['type']].append(edge)
+            for edges in by_type.values():
+                result = detect_context_cycles([{**e, 'source': owners.get(e['source'], e['source']),
+                                                'target': owners.get(e['target'], e['target'])} for e in edges])
+                cyclic = set(result['cycle_edge_ids'])
+                for edge in edges:
+                    if not result['complete'] or edge['id'] in cyclic:
+                        rejected.update(owners[edge[end]] for end in ('source', 'target') if edge[end] in owners)
         for colliding in ids_by_edge.values():
             if len(colliding) > 1:
                 rejected.update(set.union(*colliding))
@@ -777,7 +800,7 @@ def _update_endpoint_contracts(graph, nodes, touched):
     graph['definitions']['relations'] = [definitions[name] for name in sorted(definitions)]
 
 
-def _merge_members(winner, batch, definitions):
+def _merge_members(winner, batch, definitions, *, approval_ref=None):
     for node in batch:
         original = {k: deepcopy(node[k]) for k in ('id', 'type', 'identity', 'identity_types', 'identity_domain',
                     'original_type', 'definition_variant') if k in node}
@@ -786,11 +809,19 @@ def _merge_members(winner, batch, definitions):
             origins = support.setdefault('identity_origins', [])
             if origin not in origins:
                 origins.append(origin)
-            support['identity_basis'] = 'observed_hierarchy_projection_v1'
+            support['identity_basis'] = 'reviewed_key_name_v1' if approval_ref else 'observed_hierarchy_projection_v1'
+            if approval_ref:
+                ref, decision_id, input_nodes = approval_ref
+                support['identity_approval_ref'] = ref
+                support['reviewed_input_node_id'] = input_nodes[node['id']]
+                support.setdefault('identity_decision_members', {})[decision_id] = node['id']
+                support['identity_decision_refs'] = sorted(set(support.get('identity_decision_refs', [])) | {decision_id})
             # A composite key may use different logical names in each projection.
             keys = support['provenance']['key_columns']
             names = definitions[node['type']]['key_names']
             support['original_key_values'] = dict(zip(keys, (node['identity'][k] for k in names), strict=True))
+            if approval_ref:
+                support['original_key_types'] = dict(zip(keys, (node['identity_types'][k] for k in names), strict=True))
     for node in batch:
         if node is winner:
             continue
@@ -813,7 +844,8 @@ def _merge_members(winner, batch, definitions):
                     seen.add(canonical(value))
 
 
-def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=None, trace=None, emit_candidates=False):
+def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=None, trace=None, emit_candidates=False,
+                                    reviewed_pairs=None, review_stats=None, deduplicate_changed=False):
     """Collapse verified source replays in a fresh unit merge; return removed node count."""
     nodes = {n['id']: n for n in graph['nodes']}
     stats = {} if diagnostics is None else diagnostics
@@ -827,6 +859,15 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
         batches[winner] = ids
         bases[winner] = basis
     stats['groups_with_matching_roles_and_scope'] = len(batches)
+    approvals = {}
+    hierarchy_ids = {i for ids in batches.values() for i in ids}
+    if reviewed_pairs:
+        hierarchy_ids.update(_unresolved_members(graph))
+    for ids, ref in (reviewed_pairs or {}).items():
+        if hierarchy_ids.isdisjoint(ids):
+            winner = min(ids, key=lambda i: (nodes[i]['type'], i))
+            batches[winner] = ids
+            approvals[winner] = ref
     owners = _compatible_remaps(graph, batches, nodes)
     remap = {nid: winner for nid, winner in owners.items() if nid != winner}
     if trace is not None:
@@ -838,9 +879,11 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
     outcomes = Counter((len(ids), len({owners.get(i, i) for i in ids})) for ids in physical_sets)
     stats['physical_set_outcomes'] = [{'input_nodes': before, 'output_nodes': after, 'sets': count}
                                      for (before, after), count in sorted(outcomes.items())]
-    stats['accepted_groups'] = len(set(remap.values()))
-    stats['collapsed_nodes_by_role_evidence'] = dict(sorted(Counter(bases[w] for w in remap.values()).items()))
-    stats['groups_rejected_during_endpoint_remap'] = len(batches) - stats['accepted_groups']
+    stats['accepted_groups'] = len(set(remap.values()) - approvals.keys())
+    stats['collapsed_nodes_by_role_evidence'] = dict(sorted(Counter(bases[w] for w in remap.values() if w in bases).items()))
+    stats['groups_rejected_during_endpoint_remap'] = len(bases) - stats['accepted_groups']
+    if review_stats is not None:
+        review_stats['collapsed_nodes'] = sum(w in approvals for w in remap.values())
     if review_sets or remap:
         _update_review_candidates(graph, nodes, remap, review_sets)
     if not remap:
@@ -848,21 +891,34 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
     definitions = {d['type']: d for d in graph['definitions']['entities']}
     for winner in sorted(set(remap.values())):
         batch = [nodes[i] for i in sorted(batches[winner])]
-        _merge_members(nodes[winner], batch, definitions)
+        _merge_members(nodes[winner], batch, definitions, approval_ref=approvals.get(winner))
+        if deduplicate_changed:
+            deduplicate_supports(nodes[winner])
     touched = {e['type'] for e in graph['edges'] if e['source'] in remap or e['target'] in remap}
     before = [(e, edge_reference(e)) for e in graph['edges'] if e['type'] in touched]
+    if approvals:
+        for edge in graph['edges']:
+            for end in ('source', 'target'):
+                member = edge[end]
+                approval = approvals.get(owners.get(member))
+                if approval:
+                    for support in edge['supports']:
+                        bindings = support.setdefault('identity_decision_endpoints', {})
+                        bindings.setdefault(end, {})[approval[1]] = member
     remap_graph_endpoints(graph, remap, self_contained=True)
     graph['nodes'] = [n for n in graph['nodes'] if n['id'] not in remap]
     _update_endpoint_contracts(graph, nodes, touched)
     for edge, original in before:
         record_input_edge(edge, original, stage='before_hierarchy_replay')
+        if deduplicate_changed and edge_reference(edge) != original:
+            deduplicate_supports(edge)
     graph['edges'].sort(key=lambda e: e['id'])
     retired_types = {nodes[i]['type'] for i in remap}
     used_types = {n['type'] for n in graph['nodes']}
     used_types.update(rel.get(end) for rel in graph['definitions']['relations'] for end in ('source_type', 'target_type'))
     graph['definitions']['entities'] = [d for d in graph['definitions']['entities']
                                         if d['type'] not in retired_types or d['type'] in used_types]
-    return len(remap)
+    return sum(w not in approvals for w in remap.values())
 
 
 def _update_review_candidates(graph, nodes, remap, review_sets):

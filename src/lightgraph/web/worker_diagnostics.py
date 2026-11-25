@@ -13,6 +13,7 @@ import select
 import threading
 import time
 
+from lightgraph.runtime.files import system_directory_path
 from lightgraph.construction.paths import io_path
 from lightgraph.errors import LightGraphError
 from lightgraph.sources.database_errors import PROBE_CODES
@@ -71,6 +72,7 @@ def check_worker_log_paths(record_path):
 
 
 def _check_path(path):
+    path = system_directory_path(path)
     for item in (path, *path.parents):
         if io_path(item).is_symlink():
             raise OSError('worker_log_path_invalid')

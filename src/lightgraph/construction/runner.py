@@ -35,7 +35,7 @@ def runtime_options(config):
     if settings.context_window_tokens:
         available = settings.context_window_tokens - settings.max_output_tokens
         capacity = min(capacity, available) if capacity is not None else available
-    return HarnessOptions(model=settings.model, base_url=settings.base_url,
+    return HarnessOptions(output_token_field=settings.output_token_field, model=settings.model, base_url=settings.base_url,
         api_key_env=settings.api_key_env, max_input_tokens=capacity,
         max_output_tokens=settings.max_output_tokens,
         working_context_tokens=settings.working_context_tokens,

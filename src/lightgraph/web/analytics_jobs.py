@@ -82,7 +82,8 @@ class AnalyticsJobs:
                         self._pool.submit(self._run, pid, path, job_path, job)
                     except RuntimeError:
                         self._pending.discard(job_path)
-                        raise
+                        atomic_text(job_path, json.dumps({**job, 'status': 'failed', 'error_code': 'graph_analytics_failed'}))
+                        raise LightGraphError('graph_analytics_failed') from None
             return job
 
     def _run(self, pid, path, job_path, job):
@@ -114,7 +115,9 @@ class AnalyticsJobs:
             logging.getLogger(__name__).warning('Unable to enqueue graph analytics for %s', pid)
 
     def recover(self):
-        for project in self.workspace.list_projects():
+        for project in self.workspace.list_projects(summary=True):
+            if project.get("status") == "invalid_project_metadata":
+                continue
             pid = project['project_id']
             directory = self.workspace.project_path(pid) / 'analytics-jobs'
             if directory.is_symlink():
@@ -124,14 +127,24 @@ class AnalyticsJobs:
                     continue
                 try:
                     job = json.loads(path.read_text(encoding='utf-8'))
-                    if job.get('status') in {'queued', 'running'}:
-                        config = self.workspace.result_config(pid)
-                        view = self._view(pid, config, job['version_id'], job['business_context'])
-                        if view and view[-1].stem == path.stem:
-                            self.start(self.workspace, pid, config=config, version=job['version_id'],
-                                       selection=job['business_context'], force=True)
-                except (LightGraphError, OSError, ValueError, KeyError):
+                except (OSError, ValueError):
                     continue
+                if not isinstance(job, dict) or job.get('status') not in {'queued', 'running'}:
+                    continue
+                try:
+                    config = self.workspace.result_config(pid)
+                    view = self._view(pid, config, job['version_id'], job['business_context'])
+                    if view and view[-1].stem == path.stem:
+                        self.start(self.workspace, pid, config=config, version=job['version_id'],
+                                   selection=job['business_context'], force=True)
+                        continue
+                    reason = 'graph_read_conflict'
+                except (LightGraphError, OSError, ValueError, KeyError, TypeError) as exc:
+                    reason = exc.code if isinstance(exc, LightGraphError) else 'graph_analytics_failed'
+                try:
+                    atomic_text(path, json.dumps({**job, 'status': 'failed', 'error_code': reason}))
+                except OSError:
+                    logging.getLogger(__name__).warning('Could not settle interrupted graph analytics for %s', pid)
 
     def active(self, pid):
         directory = self.workspace.project_path(pid) / 'analytics-jobs'

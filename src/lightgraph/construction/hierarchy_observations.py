@@ -275,9 +275,7 @@ _POSITION_NAME = re.compile(r'(?:(?:tree|hierarchy|source|target|parent|child|ph
                             r'(?:level|depth|position|slot|ordinal|locator|location|level_source|source_column)$', re.I)
 
 
-def _matches_position(name, value, columns, positions, prov, column_ordinals):
-    if not _POSITION_NAME.fullmatch(name):
-        return False
+def _matches_position(value, columns, positions, prov, column_ordinals):
     if isinstance(value, str) and value in columns:
         return True  # Direct citation of a mapped endpoint, also supported by older outputs.
     if not columns or not all(c in positions for c in columns):
@@ -341,18 +339,26 @@ def observation_properties(support, key_columns, positions, *, column_ordinals=N
     constants = prov.get('constant_properties') or {}
     observed = support.get('properties') or {}
     positions_only = set()
+    declared = prov.get('hierarchy_position_roles') or {}
     for name, value in constants.items():
+        role = declared.get(name)
+        if role is None and not _POSITION_NAME.fullmatch(name):
+            continue
         columns = key_columns
         if endpoint_roles is not None:
             # On a relationship a position annotation must name its endpoint.
             # A parent annotation citing the child column is not redundant.
-            roles = set(name.lower().split('_')).intersection(endpoint_roles)
+            roles = set(name.lower().split('_')).intersection(endpoint_roles) if role is None else {role}
+            if not roles.issubset(endpoint_roles):
+                continue
             resolved = {endpoint_roles[role] for role in roles}
             columns = next(iter(resolved)) if len(resolved) == 1 else ()
             if len(columns) != 1:
                 continue
+        elif role not in (None, 'node'):
+            continue
         if (canonical(observed.get(name)) == canonical([value]) and
-                _matches_position(name, value, columns, positions, prov, column_ordinals)):
+                _matches_position(value, columns, positions, prov, column_ordinals)):
             positions_only.add(name)
     # One directly projected source cell can also have been recorded as a
     # typed value on this very row. Compare it once through the row boundary.

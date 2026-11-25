@@ -232,7 +232,7 @@ def test_gauss_query_cancellation_join_is_bounded_and_connection_discarded(monke
                 assert timeout == 2
             def is_alive(self): return True
         monkeypatch.setattr('lightgraph.sources.gauss.threading', SimpleNamespace(
-            Timer=StuckTimer, Event=threading.Event, RLock=threading.RLock))
+            Timer=StuckTimer, Event=threading.Event, Lock=threading.Lock, RLock=threading.RLock))
         with pytest.raises(LightGraphError, match='^query_cancel_failed$'):
             list(source.project(source.describe()[0], ['code']))
         assert len(timers) == 1 and db.closed

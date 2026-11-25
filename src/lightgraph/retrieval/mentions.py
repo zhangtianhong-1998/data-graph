@@ -13,6 +13,16 @@ from lightgraph.errors import LightGraphError
 from lightgraph.runtime.model_endpoint import output_token_field
 
 
+def _verbatim_spelling(question, span):
+    """Undo only full-width ASCII formatting when it identifies a unique original spelling."""
+    if not span or span in question:
+        return span
+    def narrow(text):
+        return ''.join(chr(ord(ch) - 0xfee0) if '！' <= ch <= '～' else ' ' if ch == '　' else ch for ch in text)
+    hits = {question[m.start():m.end()] for m in re.finditer(re.escape(narrow(span)), narrow(question))}
+    return hits.pop() if len(hits) == 1 else span
+
+
 class Equivalents(StrictModel):
     text: str
     names: list[str]
@@ -72,6 +82,25 @@ class QueryMentions(StrictModel):
         return value
 
     def verified(self, question):
+        data = self.model_dump()
+        def literal(value):
+            return _verbatim_spelling(question, value)
+
+        for key in ('mentions', 'constraints', 'framing', 'background', 'exclusions'):
+            data[key] = [literal(span) for span in data[key]]
+        data['target'] = literal(self.target)
+        for item in data['scopes']:
+            item.update({k: literal(v) for k, v in item.items()})
+        for item in data['equivalents']:
+            item['text'] = literal(item['text'])
+        if data['traversal']:
+            path = data['traversal']
+            for key in ('start', 'end', 'relation', 'direction_text'):
+                path[key] = literal(path[key])
+            path['via'] = [literal(span) for span in path['via']]
+        return QueryMentions.model_validate(data)._verified_literal(question)
+
+    def _verified_literal(self, question):
         """Reject invented names and conflicting role assignments as a whole."""
         if (len(self.mentions) > 12 or len(self.constraints) > 12 or len(self.framing) > 16
                 or len(self.equivalents) > 12 or len(self.scopes) > 12):
@@ -259,7 +288,7 @@ def resolve_mention_extractor(config, *, api_key=None):
             'max_output_tokens': min(model.max_output_tokens, 1024),
         })
         payload = {'model': model.model, 'stream': limits.stream,
-                   output_token_field(model.model): limits.max_output_tokens,
+                   (model.output_token_field or output_token_field(model.model)): limits.max_output_tokens,
                    'response_format': response_format_for(response_model.model_json_schema(), model.response_format),
                    'messages': [{'role': 'system', 'content': instructions},
                                 {'role': 'user', 'content': content}]}

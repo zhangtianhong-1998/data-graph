@@ -9,7 +9,7 @@ export interface ProjectFile {
   binding_origin?: 'filename' | 'explicit' | null
   manifest_path?: string | null
 }
-export interface Project { project_id: string; name: string; created_at: string; updated_at: string; files: ProjectFile[] }
+export interface Project { status?: string; active_run?: Run; project_id: string; name: string; created_at: string; updated_at: string; files: ProjectFile[] }
 export interface SourceConfig { id: string; kind: string; [key: string]: unknown }
 export interface InheritedGraphRef {
   inherit_id: string
@@ -46,6 +46,13 @@ export interface FusionPolicy {
   entity_rules: EntityFusionRule[]
 }
 export interface MergePolicyConfig {
+  reviewed_key_pairs?: Array<{
+    approval_ref: string
+    entity_type: string
+    projections: Array<{ contributor_id: string; graph_digest: string; source_id: string; schema: string;
+      table: string; key_column: string; name_column: string }>
+    observation_digests: string[]
+  }>
   fusion_policy?: FusionPolicy | null
   shared_entity_types: string[]
   authority_sources: string[]

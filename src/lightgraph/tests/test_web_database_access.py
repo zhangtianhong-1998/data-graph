@@ -328,9 +328,10 @@ def test_discovery_marks_truncation_without_returning_lookahead(monkeypatch):
 @pytest.mark.parametrize("schema", ["mysql", "pg_catalog", "pg_temp_12", "information_schema", "bad\x00name", "bad.name"])
 def test_schema_rejected_before_driver_is_opened(monkeypatch, schema):
     db = Connection()
-    calls = install_driver(monkeypatch, "mysql", db)
+    kind = "gauss" if schema.startswith("pg_") else "mysql"
+    calls = install_driver(monkeypatch, kind, db)
     with pytest.raises(DatabaseAccessError):
-        discover_tables(spec(schema=schema))
+        discover_tables(spec(kind, schema=schema))
     assert not calls
 
 
@@ -569,3 +570,6 @@ def test_exact_table_selection_keeps_case_and_suffix(monkeypatch, kind, schema):
 def test_yaml_import_rejects_malformed_table_lists(invalid):
     with pytest.raises(DatabaseAccessError):
         parse_table_list_yaml(invalid.encode())
+
+def test_mysql_accepts_user_schema_with_pg_prefix():
+    assert normalize_selected_tables(spec("mysql", schema="pg_sales"), ["items"]) == ["pg_sales.items"]

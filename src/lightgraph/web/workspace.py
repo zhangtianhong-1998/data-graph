@@ -16,8 +16,10 @@ import stat
 import tempfile
 import threading
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
+
+from weakref import WeakValueDictionary
 
 import yaml
 from pydantic import Field, ValidationError
@@ -26,6 +28,7 @@ from ..contracts import StrictModel
 from ..documents.core import DocumentScope, load_document
 from ..errors import LightGraphError
 from ..runtime.config import AgentConfig, RunConfig
+from ..runtime.files import system_directory_path
 
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -91,6 +94,7 @@ def _name(value: str) -> str:
 
 def _no_symlinks(path: Path) -> None:
     """Reject symlinks before resolve/open, including parent directory links."""
+    path = system_directory_path(path)
     for entry in (path, *path.parents):
         if entry.is_symlink():
             raise LightGraphError("workspace_symlink_forbidden")
@@ -128,35 +132,50 @@ def safe_yaml(text: str):
         raise LightGraphError("invalid_yaml") from None
 
 
-def _no_credentials(data) -> None:
-    """Inspect credential-bearing config locations, never arbitrary rule attributes."""
-    if isinstance(data, list):
-        for item in data:
-            _no_credentials(item)
-        return
-    if not isinstance(data, dict):
-        return
+_CREDENTIAL_FIELDS = frozenset({
+    'apikey', 'password', 'passwd', 'pwd', 'token', 'accesstoken', 'refreshtoken', 'clientsecret',
+    'authorization', 'proxyauthorization', 'privatekey', 'secret', 'dsn', 'connectionstring',
+})
 
-    def check(value):
+
+def _no_credentials(data) -> None:
+    """Validate editable YAML, including configuration nested in lists or wrappers."""
+    def credential_field(key):
+        return str(key).lower().replace('_', '').replace('-', '')
+
+    def visit(value, path):
+        if isinstance(value, str) and value:
+            is_endpoint = bool(path and credential_field(path[-1]) == 'baseurl')
+            if is_endpoint or re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', value.lstrip()):
+                try:
+                    url = urlsplit(value)
+                    has_secret_parameter = any(credential_field(k) in _CREDENTIAL_FIELDS and v
+                                               for k, v in parse_qsl(url.query, max_num_fields=1024))
+                    if (url.username is not None or url.password is not None or has_secret_parameter
+                            or is_endpoint and (url.query or url.fragment)):
+                        raise LightGraphError('credential_bearing_url_forbidden')
+                except ValueError:
+                    raise LightGraphError('invalid_model_url' if is_endpoint else 'invalid_yaml_url') from None
+            return
+        if isinstance(value, list):
+            for item in value:
+                visit(item, path)
+            return
         if not isinstance(value, dict):
             return
-        for key in ("api_key", "password", "token", "secret", "dsn"):
-            if value.get(key) not in (None, ""):
-                raise LightGraphError("use_credential_environment_variable")
-        if isinstance(value.get("base_url"), str) and value["base_url"]:
-            try:
-                parsed = urlsplit(value["base_url"])
-                if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
-                    raise LightGraphError("credential_bearing_url_forbidden")
-            except ValueError:
-                raise LightGraphError("invalid_model_url") from None
-        for key in ("llm", "model", "embedding", "credentials", "connection"):
-            check(value.get(key))
+        # Rule and draft mapping keys describe the business property. Their
+        # string values name physical columns; neither is a connector setting.
+        column_map = (path[-2:] in {('attributes', 'single_valued'), ('attributes', 'multi_valued'),
+                                     ('mappings', 'properties'), ('mappings', 'identity_qualifiers')})
+        for field, item in value.items():
+            key = str(field)
+            normalized = credential_field(key)
+            if (normalized in _CREDENTIAL_FIELDS and item not in (None, '')
+                    and not (column_map and isinstance(item, str))):
+                raise LightGraphError('use_credential_environment_variable')
+            visit(item, (path + (key,))[-2:])
 
-    if set(data) & {"llm", "model", "embedding", "sources", "base_url", "api_key_env", "api_key"}:
-        check(data)
-    for source in data.get("sources", []) if isinstance(data.get("sources", []), list) else []:
-        check(source)
+    visit(data, ())
 
 
 def _frontmatter(text: str) -> tuple[dict, str]:
@@ -188,7 +207,7 @@ class Workspace:
         self.root.mkdir(parents=True, exist_ok=True)
         if not self.root.is_dir():
             raise LightGraphError("invalid_workspace_root")
-        self._locks: dict[str, threading.RLock] = {}
+        self._locks = WeakValueDictionary()
         self._locks_guard = threading.Lock()
 
     @contextmanager
@@ -334,14 +353,24 @@ class Workspace:
             self._write_config(project_id, config)
             return self.get(project_id)
 
-    def list_projects(self) -> list[dict]:
+    def list_projects(self, *, summary=False) -> list[dict]:
         _no_symlinks(self.root)
         projects = []
         for path in sorted(self.root.iterdir()):
-            if path.is_symlink():
-                raise LightGraphError("workspace_symlink_forbidden")
-            if path.is_dir() and _ID.fullmatch(path.name) and (path / "project.yaml").exists():
-                projects.append(self.get(path.name))
+            if path.is_symlink() or not _ID.fullmatch(path.name) or not (path / "project.yaml").is_file():
+                continue
+            try:
+                if summary:
+                    metadata = self._read(self.project_path(path.name) / "project.yaml")
+                    project = _Project.model_validate({**metadata, "files": []}).model_dump(mode="json")
+                    if project["project_id"] != path.name:
+                        raise LightGraphError("invalid_project_metadata")
+                    projects.append(project)
+                else:
+                    projects.append(self.get(path.name))
+            except (LightGraphError, OSError, ValidationError, TypeError):
+                projects.append({"project_id": path.name, "name": path.name, "updated_at": "",
+                                 "status": "invalid_project_metadata", "files": []})
         return sorted(projects, key=lambda p: p["updated_at"], reverse=True)
 
     def get(self, project_id: str) -> dict:

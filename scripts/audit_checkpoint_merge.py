@@ -12,7 +12,7 @@ from lightgraph.construction.contexts import business_context_identity
 from lightgraph.construction.workflow import load_workflow_state, run_output_path
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
-from lightgraph.runtime.config import MergePolicyConfig
+from lightgraph.runtime.config import MergePolicyConfig, ReviewedKeyPairRule
 from lightgraph.source_values import identity_cell, persisted_identity_key
 
 
@@ -665,10 +665,50 @@ def _overlap_checkpoint_report(run, project, state, target, parents, *, prepare=
     return {**preview, "patterns": analysis.patterns, "summary": analysis.summary}
 
 
+def _simulated_policy(path, run, node_id, target, parents, original_policy):
+    compiled = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    if not isinstance(compiled, dict) or compiled.get('mode') not in {'compiled', 'simulation_only'}:
+        raise ValueError('请选择逐键规则编译器生成的文件。')
+    field = 'simulated_key_pairs' if compiled['mode'] == 'simulation_only' else 'reviewed_key_pairs'
+    count_field = 'simulated_count' if compiled['mode'] == 'simulation_only' else 'approved_count'
+    expected = {'version': 1, 'run_id': run['run_id'], 'project_id': run['project_id'],
+                'node_id': node_id, 'merge_artifact_id': target['artifact_id'],
+                'upstream_artifacts': target['upstream_artifacts']}
+    if (compiled.keys() != {*expected, 'mode', count_field, field}
+            or any(compiled.get(k) != v for k, v in expected.items())):
+        raise ValueError('模拟规则文件与项目、运行或合并检查点不一致。')
+    rules = compiled[field]
+    if not isinstance(rules, list) or len(rules) != 1:
+        raise ValueError('需要本次预览编译的一条逐键规则。')
+    rule = ReviewedKeyPairRule.model_validate(rules[0])
+    digests = {r['node_id']: r['graph_digest'] for r in parents}
+    if (any(digests.get(p.contributor_id) != p.graph_digest for p in rule.projections)
+            or len(rule.observation_digests) != compiled[count_field]):
+        raise ValueError('模拟规则的检查点摘要或批准数量不一致。')
+    policy = {**original_policy, 'reviewed_key_pairs': [*original_policy.get('reviewed_key_pairs', []), rules[0]]}
+    MergePolicyConfig.model_validate(policy)
+    return policy
+
+
+def _simulated_membership(graph):
+    groups = {}
+    for node in graph['nodes']:
+        members = {(s['contributor_id'], s['reviewed_input_node_id']) for s in node.get('supports', [])
+                   if s.get('identity_basis') == 'reviewed_key_name_v1' and s.get('reviewed_input_node_id')}
+        if members:
+            groups[node['id']] = sorted(members)
+    edges = [e for e in graph['edges'] if e['source'] in groups or e['target'] in groups]
+    return {'groups_by_output_id': groups, 'incident_output_edges': len(edges),
+            'incident_edges_with_reviewed_endpoints': sum(any(s.get('identity_decision_endpoints')
+                for s in e.get('supports', [])) for e in edges)}
+
+
 def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False, compare_to=None,
           run_summary=False, include_edge_lineage=False, explain_identity=None, overlap_patterns_only=False,
-          prepare_overlap_indexes=False, include_overlap_evidence=False):
+          prepare_overlap_indexes=False, include_overlap_evidence=False, simulate_reviewed_key_pairs=None):
     """Use the run's committed inputs and policy, even when the current project has been edited."""
+    if simulate_reviewed_key_pairs and any((run_summary, observations_only, overlap_patterns_only, prepare_overlap_indexes)):
+        raise ValueError('逐键规则模拟需要执行合并重放。')
     if include_overlap_evidence and not overlap_patterns_only:
         raise ValueError("--include-overlap-evidence 需与 --overlap-patterns-only 一起使用。")
     if (overlap_patterns_only or prepare_overlap_indexes) and any((
@@ -767,7 +807,13 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
     if include_edge_lineage:
         report['lineage_input_artifacts'] = {r['node_id']: r['artifact_id'] for r in parents}
     control_ids = set()
-    for enabled, label in [(False, "without_source_replay"), (True, "with_source_replay")]:
+    passes = [(False, "without_source_replay", policy), (True, "with_source_replay", policy)]
+    if simulate_reviewed_key_pairs:
+        simulated = _simulated_policy(simulate_reviewed_key_pairs, run, node_id, target, parents, policy)
+        report.update(mode='simulated_reviewed_key_pairs', model_calls=0,
+                      simulated_policy_sha256=hashlib.sha256(canonical(simulated).encode('utf-8')).hexdigest())
+        passes.append((True, 'simulated_reviewed_key_pairs', simulated))
+    for enabled, label, replay_policy in passes:
         stage = None
 
         def capture_stage(refs):
@@ -779,9 +825,13 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
             from lightgraph.construction.hierarchy_trace import HierarchyTrace
             options['hierarchy_trace'] = HierarchyTrace(explain_identity)
         graph = merger.merge_construction_graphs(inputs, target_access_fingerprint=target["access_fingerprint"],
-                                                merge_policy=policy, recognize_source_replays=enabled, **options)
+                                                merge_policy=replay_policy, recognize_source_replays=enabled, **options)
         report[label] = {**merger.merge_accounting(inputs, graph), **alignment_counts(graph),
                          "integrity": output_checks(graph)}
+        if label == 'simulated_reviewed_key_pairs':
+            diag = graph['fusion_diagnostics'].get('reviewed_key_pairs', {})
+            report[label].update(reviewed_key_pairs=diag, reviewed_membership=_simulated_membership(graph),
+                                 node_reduction_vs_current_code_baseline=report['with_source_replay']['output_nodes'] - len(graph['nodes']))
         if 'hierarchy_trace' in options:
             report[label]['identity_trace'] = options['hierarchy_trace'].report(graph)
         if include_edge_lineage:
@@ -789,12 +839,13 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
             if enabled:
                 row_digests = _graph_row_digests(graph)
                 report[label]['row_digests'] = row_digests
-                report[label]['rows_match_committed'] = {
+                match_label = 'simulated_rows_equal_original_commit' if label == 'simulated_reviewed_key_pairs' else 'rows_match_committed'
+                report[label][match_label] = {
                     kind: value == counts['row_digests'][kind] for kind, value in row_digests.items()}
         if include_hierarchy_membership or compare_to is not None:
             if enabled:
                 report[label]["hierarchy_membership"] = hierarchy_membership(graph, control_ids)
-                if compare_to is not None:
+                if compare_to is not None and label == "with_source_replay":
                     previous = json.loads(Path(compare_to).read_text(encoding="utf-8-sig"))
                     if not isinstance(previous, dict):
                         raise ValueError("请选择上一轮完整的 audit.json。")
@@ -811,6 +862,8 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         module = sys.modules.get('lightgraph.construction.' + name)
         if module is not None:
             modules.append(module)
+    if simulate_reviewed_key_pairs:
+        modules.append(sys.modules['lightgraph.construction.reviewed_keys'])
     if explain_identity is not None:
         modules.append(sys.modules['lightgraph.construction.hierarchy_trace'])
     source_files = {m.__name__: Path(m.__file__).read_bytes() for m in modules}
@@ -831,6 +884,8 @@ def main():
     mode.add_argument("--run-summary", action="store_true", help="只读正式运行记录、检查点标记和 Parquet 行数，不加载图或重放合并")
     mode.add_argument("--observations-only", action="store_true", help="只核查已提交图的实际观测，跳过合并重放")
     mode.add_argument("--include-hierarchy-membership", action="store_true", help="在重放报告中列出层级归并前后的节点 ID")
+    parser.add_argument("--simulate-reviewed-key-pairs", type=Path, metavar="COMPILED_JSON",
+                        help="保留原策略对照，额外在内存中重放一份绑定本次检查点的逐键批准清单。")
     parser.add_argument("--include-edge-lineage", action="store_true", help="逐单元核对原边来源和层级归并前的边，输出计数与摘要")
     parser.add_argument("--include-overlap-evidence", action="store_true", help="配合 --overlap-patterns-only 对照已审模式的上游契约、权限指纹和邻接见证数")
     parser.add_argument("--explain-identity", metavar="CODE", help="按完整的单字段文本键值，列出层级合并实际检查的节点、来源和判定")
@@ -844,7 +899,8 @@ def main():
                        include_hierarchy_membership=args.include_hierarchy_membership, compare_to=args.compare_hierarchy_audit,
                        run_summary=args.run_summary, include_edge_lineage=args.include_edge_lineage,
                        explain_identity=args.explain_identity, overlap_patterns_only=args.overlap_patterns_only,
-                       prepare_overlap_indexes=args.prepare_overlap_indexes, include_overlap_evidence=args.include_overlap_evidence)
+                       prepare_overlap_indexes=args.prepare_overlap_indexes, include_overlap_evidence=args.include_overlap_evidence,
+                       simulate_reviewed_key_pairs=args.simulate_reviewed_key_pairs)
     except LightGraphError as exc:
         parser.exit(1, f"检查点或合并未通过校验：{exc.code}\n")
     except (KeyError, OSError, ValueError) as exc:

@@ -13,6 +13,7 @@ import logging
 import re
 import sys
 from typing import Literal
+from ..sources.workbook_xml import workbook_has_declarations
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 from zipfile import ZipFile
 
@@ -84,9 +85,14 @@ def _identifier(value: str) -> str:
     return value
 
 
-def _schema(value: str) -> str:
+def _schema(value: str, kind: str | None = None) -> str:
     value = _identifier(value)
-    if value.casefold() in _SYSTEM_SCHEMAS or value.casefold().startswith("pg_"):
+    reserved = _SYSTEM_SCHEMAS
+    if kind == "mysql_database":
+        reserved = {"mysql", "sys", "information_schema", "performance_schema"}
+    elif kind == "gauss_database":
+        reserved = {"information_schema", "pg_catalog", "pg_toast"}
+    if value.casefold() in reserved or kind == "gauss_database" and value.casefold().startswith("pg_"):
         raise DatabaseAccessError("system_catalog_forbidden")
     return value
 
@@ -147,6 +153,9 @@ def _resolved(spec: ConnectionSpec) -> dict:
         if spec.kind == "mysql_database":
             if spec.dsn is not None:
                 dsn = spec.dsn.get_secret_value()
+                if any(name in {"ssl_ca", "ssl_cert", "ssl_key"}
+                       for name, _ in parse_qsl(urlsplit(dsn).query, keep_blank_values=True)):
+                    raise DatabaseAccessError("database_connection_option_forbidden")
             else:
                 host, _ = _host(spec.host)
                 host = "[" + host + "]" if ":" in host else host
@@ -157,7 +166,7 @@ def _resolved(spec: ConnectionSpec) -> dict:
             options = _connect_options(dsn, QueryLimits(timeout_ms=5000))
             try:
                 host, _ = _host(options["host"])
-                schema = _schema(spec.schema_name or options["database"])
+                schema = _schema(spec.schema_name or options["database"], spec.kind)
                 _identifier(options["database"])
                 return {"dsn": dsn, "host": host, "port": options["port"],
                         "database": options["database"], "username": options["user"], "schema": schema}
@@ -183,7 +192,7 @@ def _resolved(spec: ConnectionSpec) -> dict:
             if not 1 <= port <= 65535:
                 raise DatabaseAccessError("database_connection_invalid")
             _identifier(options["dbname"])
-            schema = _schema(spec.schema_name or "public")
+            schema = _schema(spec.schema_name or "public", spec.kind)
             # An explicit form choice overrides the URL; omission preserves the
             # URL mode or the existing defaults. Never retry with weaker TLS.
             if options.get("sslmode") and options["sslmode"] not in _GAUSS_SSL_MODES:
@@ -223,7 +232,7 @@ def normalize_selected_tables(spec: ConnectionSpec, names: list[str]) -> list[st
         parts = name.split(".")
         if len(parts) == 1:
             parts = [schema, parts[0]]
-        if len(parts) != 2 or _schema(parts[0]) != schema:
+        if len(parts) != 2 or _schema(parts[0], spec.kind) != schema:
             raise DatabaseAccessError("database_table_schema_mismatch")
         qualified = parts[0] + "." + _identifier(parts[1])
         if qualified not in result:
@@ -392,17 +401,8 @@ def parse_table_list_excel(content: bytes) -> list[str]:
                 raise DatabaseAccessError("table_list_size_limit")
             if any("vbaproject" in entry.filename.lower() or "externallinks/" in entry.filename.lower() for entry in entries):
                 raise DatabaseAccessError("table_list_active_content_forbidden")
-            for entry in entries:
-                if entry.filename.lower().endswith((".xml", ".rels")):
-                    with archive.open(entry) as stream:
-                        tail = b""
-                        while block := stream.read(65536):
-                            # NUL stripping also catches UTF-16/UTF-32 entity
-                            # declarations before the XML parser can expand them.
-                            normalized = (tail + block).replace(b"\x00", b"").upper()
-                            if b"<!DOCTYPE" in normalized or b"<!ENTITY" in normalized:
-                                raise DatabaseAccessError("table_list_xml_entities_forbidden")
-                            tail = (tail + block)[-64:]
+            if workbook_has_declarations(archive):
+                raise DatabaseAccessError("table_list_xml_entities_forbidden")
         from openpyxl import load_workbook
         workbook = load_workbook(BytesIO(content), read_only=True, data_only=False, keep_links=False)
         if not workbook.worksheets:

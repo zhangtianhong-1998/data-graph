@@ -25,9 +25,13 @@ def write(path, value):
 
 
 def environment():
-    return {'python': sys.version.split()[0], 'packages': {
-        name: importlib.metadata.version(name) for name in
-        ('agentscope','openai','pydantic','httpx','PyYAML','sqlglot','openpyxl','jsonschema')}}
+    packages = {}
+    for name in ('agentscope','openai','pydantic','httpx','PyYAML','sqlglot','openpyxl','jsonschema'):
+        try:
+            packages[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            packages[name] = None
+    return {'python': sys.version.split()[0], 'packages': packages}
 
 
 def files_under(directory):

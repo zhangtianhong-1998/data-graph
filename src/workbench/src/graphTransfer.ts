@@ -56,7 +56,10 @@ export async function transferGraph(projectId: string, selection: { layer: strin
     if (page.next_offset !== null) state.offset = page.next_offset
     else if (state.part === 'nodes' && page.matched_edges > 0) { state.part = 'edges'; state.offset = 0 }
     state.complete = complete
-    state.graph = { ...page, display_schema: mergeDisplaySchema(state.graph.display_schema, page.display_schema), nodes: [...state.nodes.values()], edges: [...state.edges.values()], next_offset: null, truncated: !state.complete, edges_truncated: false, neighborhood_truncated: !!selection.focus && !state.complete, fully_loaded: state.complete }
+    const nodes = state.graph.nodes, edges = state.graph.edges
+    for (const node of newNodes.values()) nodes.push(node)
+    for (const edge of newEdges.values()) edges.push(edge)
+    state.graph = { ...page, display_schema: mergeDisplaySchema(state.graph.display_schema, page.display_schema), nodes, edges, next_offset: null, truncated: !state.complete, edges_truncated: false, neighborhood_truncated: !!selection.focus && !state.complete, fully_loaded: state.complete }
     onPage(state.graph)
   }
   return state.graph

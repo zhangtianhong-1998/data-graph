@@ -58,6 +58,7 @@ def standardize_node_details(
     definitions: dict[str, Any] | None = None,
     catalog_tables: list[dict[str, Any]] | None = None,
     property_labels: dict[str, str] | None = None,
+    visible_values: set[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Build a clean, normalized node detail payload strictly from authorized supports."""
     catalog = _catalog_index(catalog_tables)
@@ -116,7 +117,7 @@ def standardize_node_details(
 
     # Collect attribute provenance and metadata column types dynamically from physical catalog.
     attr_origins: dict[str, dict[tuple[str, str, str, str], dict[str, Any]]] = defaultdict(dict)
-    source_groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    source_groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     catalog_notes_map: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     observations = defaultdict(list)
@@ -150,7 +151,7 @@ def standardize_node_details(
                 })
                 note['column_comments'].update({item['column']: item for item in col_comments})
 
-        group = source_groups.setdefault(tkey, {
+        group = source_groups.setdefault((*tkey, canonical(support.get('inherited_from'))), {
             'source_id': source_id,
             'source_kind': table_meta['source_kind'] if table_meta and table_meta['source_kind'] else (
                 prov.get('source_kind') or ''),
@@ -216,6 +217,8 @@ def standardize_node_details(
                        for name, values in (support.get('properties') or {}).items() for value in values]
         for entry in entries:
             attr_key = entry['property']
+            if visible_values is not None and (attr_key, canonical(entry['value'])) not in visible_values:
+                continue
             col_name = prop_col_map.get(entry['original_property'], '')
             col_meta = (table_meta or {}).get('columns', {}).get(col_name, {})
             dtype = col_meta.get('data_type') or 'unknown'
@@ -246,6 +249,10 @@ def standardize_node_details(
     for key in sorted(raw_props):
         values = raw_props[key]
         norm_values = list(values) if isinstance(values, list) else [values]
+        if visible_values is not None:
+            norm_values = [v for v in norm_values if (key, canonical(v)) in visible_values]
+            if not norm_values:
+                continue
         origins = list(attr_origins.get(key, {}).values())
         dtypes = sorted({o['data_type'] for o in origins if o.get('data_type') and o['data_type'] != 'unknown'})
         attributes.append({

@@ -97,7 +97,9 @@ class MemorySource(SourceAdapter):
         """Execute an already authorized statement under the source lock and ordinary budgets."""
         with self._lock:
             self.query_budget.charge_query()
-            start = time.monotonic(); self._cancelled = False; cursor = self._db.cursor()
+            if self._cancelled:
+                raise LightGraphError("query_cancelled")
+            start = time.monotonic(); cursor = self._db.cursor()
             self.stats.queries += 1
             timeout_ms = self._effective_timeout_ms()
             self._db.set_progress_handler(lambda: int(self._cancelled or (time.monotonic() - start) * 1000 > timeout_ms or time.monotonic() > self.query_budget.deadline), 500)
@@ -107,7 +109,7 @@ class MemorySource(SourceAdapter):
                 with self.stats.measure_sql():
                     cursor.execute(sql, parameters)
                 columns = tuple(d[0] for d in cursor.description)
-                yield from cursor_batches(cursor, limits=self.limits, columns=columns, row_limit=row_limit or self.limits.max_result_rows, stats=self.stats, deadline=start + timeout_ms / 1000, timeout_ms=timeout_ms, cancelled=lambda: self._cancelled, budget=self.query_budget)
+                yield from cursor_batches(cursor, limits=self.limits, columns=columns, row_limit=self.limits.max_result_rows if row_limit is None else row_limit, stats=self.stats, deadline=start + timeout_ms / 1000, timeout_ms=timeout_ms, cancelled=lambda: self._cancelled, budget=self.query_budget)
             except LightGraphError as exc:
                 if exc.code == "query_timeout":
                     self.stats.query_timeout_count += 1

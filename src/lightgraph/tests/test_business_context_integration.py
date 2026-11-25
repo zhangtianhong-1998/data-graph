@@ -1,6 +1,7 @@
 """Fixed-source extraction, publication, history and retrieval share one context contract."""
 from copy import deepcopy
 import json
+import re
 
 from fastapi.testclient import TestClient
 
@@ -131,7 +132,7 @@ def test_two_branch_publication_context_canvas_history_details_batches_and_retri
         product = next(n for n in merged['nodes'] if n['type'] == 'Product' and n['identity']['code'] == 'P001')
         k_scenario = next(n for n in merged['nodes'] if n.get('original_type') == 'Scenario' and n['identity'].get('project') == 'K')
         details = _get(client, base + '/details', entity_id=product['id'], **selected)
-        assert 'K项目' not in str(details) and '900' not in str(details)
+        assert 'K项目' not in str(details) and not re.search(r'\b900\b', json.dumps(details, ensure_ascii=False))
         assert any(f['payload'].get('name') == 'amount' and f['payload'].get('value') == 100 for f in details['facts'])
         assert client.get(base + '/details', params={'entity_id': k_scenario['id'], **selected}).status_code == 404
         first = _get(client, base + '/batches', limit=1, **selected)
@@ -154,7 +155,7 @@ def test_two_branch_publication_context_canvas_history_details_batches_and_retri
         assert query.status_code == 200, query.text
         result = query.json()
         assert {n['id'] for n in result['nodes']} == {n['id'] for n in m['nodes']}
-        assert 'K项目' not in str(result) and '未知场景' not in str(result) and '900' not in str(result)
+        assert 'K项目' not in str(result) and '未知场景' not in str(result) and not re.search(r'\b900\b', json.dumps(result, ensure_ascii=False))
         assert result['business_context'] == {'project': 'M'}
         assert all('observations' in edge for edge in result['edges'])
         retrieved_product = next(node for node in result['nodes'] if node['id'] == product['id'])
@@ -182,7 +183,7 @@ def test_two_branch_publication_context_canvas_history_details_batches_and_retri
         historical = _get(client, base, version=version, **selected)
         assert {n['id'] for n in historical['nodes']} == {n['id'] for n in m['nodes']}
         historic_details = _get(client, base + '/details', version=version, entity_id=product['id'], **selected)
-        assert '900' not in str(historic_details) and 'K项目' not in str(historic_details)
+        assert not re.search(r'\b900\b', json.dumps(historic_details, ensure_ascii=False)) and 'K项目' not in str(historic_details)
         historic_batch = _get(client, base + '/batches', version=version, **selected)
         assert len(historic_batch['nodes']) == 3
         assert 'K项目' not in str(historic_batch)

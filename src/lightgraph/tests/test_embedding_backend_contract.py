@@ -30,7 +30,7 @@ class StubBackend:
 
 def test_server_rejects_wrong_model_before_inference():
     backend = StubBackend()
-    with TestClient(server.create_embedding_app(backend)) as client:
+    with TestClient(server.create_embedding_app(backend), client=('127.0.0.1', 50123)) as client:
         wrong = client.post('/v1/embeddings', json={'model': 'another-model', 'input': 'document'})
         assert wrong.status_code == 404
         assert not backend.calls
@@ -48,7 +48,7 @@ def test_server_rejects_wrong_model_before_inference():
 def test_server_does_not_publish_invalid_backend_vectors(vectors):
     backend = StubBackend()
     backend.encode = lambda texts: vectors
-    with TestClient(server.create_embedding_app(backend)) as client:
+    with TestClient(server.create_embedding_app(backend), client=('127.0.0.1', 50123)) as client:
         response = client.post('/v1/embeddings', json={'input': 'document'})
         assert response.status_code == 500
         assert response.json()['detail'] == 'embedding_backend_response_invalid'
@@ -183,3 +183,15 @@ def test_manual_rebuild_replaces_vectors_after_service_changes_in_place(tmp_path
     assert np.load(old_root / 'vectors/vectors.npy').shape == (2, 2)
     assert np.load(new_root / 'vectors/vectors.npy').shape == (2, 3)
     assert manifest['vector_dim'] == 3
+
+
+def test_server_token_and_batch_limits_apply_before_encoding(monkeypatch):
+    backend = StubBackend()
+    monkeypatch.setenv('LIGHTGRAPH_EMBEDDING_SERVER_KEY', 'only-for-test')
+    with TestClient(server.create_embedding_app(backend), client=('127.0.0.1', 50123)) as client:
+        assert client.post('/v1/embeddings', json={'input': 'a'}).status_code == 401
+        headers = {'Authorization': 'Bearer only-for-test'}
+        assert client.post('/v1/embeddings', headers=headers, json={'input': ['x'] * 513}).status_code == 422
+        assert client.post('/v1/embeddings', headers=headers, json={'input': 'x' * 33000}).status_code == 422
+        assert not backend.calls
+        assert client.post('/v1/embeddings', headers=headers, json={'input': 'a'}).status_code == 200

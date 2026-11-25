@@ -131,6 +131,48 @@ def _analyze_after_build(config_path, config):
         logging.getLogger(__name__).warning('Graph published; offline graph analytics require a retry with analyze-graph')
 
 
+def _run_workflow(config_path, config):
+    """Use the same scheduler, checkpoints and publication contract as the workbench."""
+    import time
+    from .web.execution import RunManager, TERMINAL_STATUSES
+    from .web.saved_connections import SavedConnections
+    from .web.workspace import Workspace
+
+    path = Path(config_path).resolve()
+    managed = path.name == 'config.yaml' and (path.parent / 'project.yaml').is_file()
+    if managed:
+        pid = path.parent.name
+        workspace = Workspace(path.parent.parent)
+    else:
+        from .standalone_workflow import StandaloneWorkflow
+        workspace = StandaloneWorkflow(path, config)
+        pid = workspace.project_id
+
+    manager = RunManager(workspace, standalone=not managed)
+    try:
+        credentials = {}
+        model_api_key = None
+        if managed:
+            config = workspace.resolved_config(pid)
+            vault = SavedConnections(workspace.root)
+            for source in config.sources:
+                if source.credential_mode == 'session':
+                    saved = vault.load(pid, source)
+                    if saved:
+                        credentials[source.id] = saved['dsn']
+            model_api_key = vault.load_model(pid, config)
+        record = manager.start(pid, source_credentials=credentials, model_api_key=model_api_key)
+        while record['status'] not in TERMINAL_STATUSES:
+            time.sleep(0.2)
+            record = manager.get(pid, record['run_id'])
+        if (record.get('workflow_state', {}).get('merge') or {}).get('publication_status') == 'published':
+            _analyze_after_build(path, config)
+        emit(record)
+        return 0 if record['status'] in ('completed', 'completed_with_gaps') else 2 if record['status'] == 'partial' else 1
+    finally:
+        manager.shutdown()
+
+
 def run(args):
     if args.command=='serve':
         if not 1<=args.port<=65535:raise LightGraphError('invalid_port')
@@ -159,6 +201,8 @@ def run(args):
         emit({'status':'created','directory':str(Path(args.directory).resolve()),'synthetic':True});return 0
     if args.command in ('run','discover','build-graph','connect-check'):
         config=load_config(args.config)
+        if args.command in ('run', 'build-graph') and config.workflow and config.workflow.enabled:
+            return _run_workflow(args.config, config)
         if args.command != 'connect-check':
             from .construction.access import ensure_supported_access
             ensure_supported_access(config)

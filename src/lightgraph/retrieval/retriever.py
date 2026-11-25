@@ -5,13 +5,14 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import weakref
 from typing import Any, Callable, Sequence
 from itertools import combinations
 
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
 from lightgraph.construction.contexts import business_context_matches, normalize_context_selection, support_business_context
-from .sync import active_index, index_matches_embedder
+from .sync import pin_active_index, index_matches_embedder
 from .path_evidence import grounds_slot
 from .store_sqlite import SQLiteGraphIndex, normalize_term
 from .vector_local import Embedder, LocalNumpyVectorStore
@@ -299,7 +300,9 @@ class SubgraphRetriever:
 
     def __init__(self, retrieval_dir: str | Path, *, embedder: Embedder | None = None,
                  expected_generation: str | None = None, analytics_loader=None, mention_extractor=None):
-        self.root, manifest = active_index(Path(retrieval_dir), expected_generation)
+        self.root, manifest, self._build_lease = pin_active_index(Path(retrieval_dir), expected_generation)
+        if self._build_lease is not None:
+            weakref.finalize(self, self._build_lease.close)
         self.cohorts = manifest['cohorts']
         self.cohort_contexts = manifest['cohort_contexts']
         self.generation = manifest['generation']
@@ -360,7 +363,7 @@ class SubgraphRetriever:
             # Splitting them on names found in another field changes their meaning.
             slots = [QuerySlot(query.strip(), normalize_term(query), source='full_query')] if query.strip() else []
         else:
-            terms = self.index.authorized_terms(cohorts, field=field)
+            terms = self.index.terms_in_text(query, cohorts, field=field)
             slots = decompose_query(query, known_terms=terms, extractor=extractor)
         if not slots:
             return {
