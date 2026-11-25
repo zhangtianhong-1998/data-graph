@@ -488,6 +488,14 @@
       "additionalProperties": false,
       "description": "Deterministic safety rules for merging parallel unit and inherited graphs.",
       "properties": {
+        "verified_projection_rules": {
+          "items": {
+            "$ref": "#/$defs/VerifiedProjectionRule"
+          },
+          "maxItems": 32,
+          "title": "Verified Projection Rules",
+          "type": "array"
+        },
         "reviewed_key_pairs": {
           "items": {
             "$ref": "#/$defs/ReviewedKeyPairRule"
@@ -770,6 +778,87 @@
         }
       },
       "title": "ModelConfig",
+      "type": "object"
+    },
+    "ProjectionBinding": {
+      "additionalProperties": false,
+      "description": "A model can select only an issued member, source and incident relation role.",
+      "properties": {
+        "contributor_id": {
+          "minLength": 1,
+          "title": "Contributor Id",
+          "type": "string"
+        },
+        "graph_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Graph Digest",
+          "type": "string"
+        },
+        "entity_type": {
+          "minLength": 1,
+          "title": "Entity Type",
+          "type": "string"
+        },
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "schema_name": {
+          "minLength": 1,
+          "title": "Schema Name",
+          "type": "string"
+        },
+        "table": {
+          "minLength": 1,
+          "title": "Table",
+          "type": "string"
+        },
+        "key_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Key Columns",
+          "type": "array"
+        },
+        "relation_type": {
+          "minLength": 1,
+          "title": "Relation Type",
+          "type": "string"
+        },
+        "end": {
+          "enum": [
+            "source",
+            "target"
+          ],
+          "title": "End",
+          "type": "string"
+        },
+        "opposite_key_columns": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Opposite Key Columns",
+          "type": "array"
+        }
+      },
+      "required": [
+        "contributor_id",
+        "graph_digest",
+        "entity_type",
+        "source_id",
+        "schema_name",
+        "table",
+        "key_columns",
+        "relation_type",
+        "end",
+        "opposite_key_columns"
+      ],
+      "title": "ProjectionBinding",
       "type": "object"
     },
     "PropertyDefinition": {
@@ -1335,6 +1424,42 @@
         "kind"
       ],
       "title": "SourceConfig",
+      "type": "object"
+    },
+    "VerifiedProjectionRule": {
+      "additionalProperties": false,
+      "description": "Finite same-batch observations, checked again during deterministic replay.",
+      "properties": {
+        "pattern_id": {
+          "pattern": "^pattern_[0-9a-f]{24}$",
+          "title": "Pattern Id",
+          "type": "string"
+        },
+        "bindings": {
+          "items": {
+            "$ref": "#/$defs/ProjectionBinding"
+          },
+          "maxItems": 24,
+          "minItems": 2,
+          "title": "Bindings",
+          "type": "array"
+        },
+        "observation_digests": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 5000,
+          "minItems": 1,
+          "title": "Observation Digests",
+          "type": "array"
+        }
+      },
+      "required": [
+        "pattern_id",
+        "bindings",
+        "observation_digests"
+      ],
+      "title": "VerifiedProjectionRule",
       "type": "object"
     },
     "WorkflowConfig": {

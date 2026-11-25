@@ -19,7 +19,8 @@ dependencies = [
 
 [project.optional-dependencies]
 legacy-discovery = ["agentscope==1.0.21", "greenlet>=3,<4"]
-test = ["pytest>=8,<9", "ict-lightgraph[legacy-discovery]==1.0.0"]
+test-harness = ["pytest>=8,<9"]
+test = ["ict-lightgraph[test-harness,legacy-discovery]==1.0.0"]
 embedding = ["torch>=2.3,<3", "transformers>=4.51,<5", "sentence-transformers>=3,<5"]
 
 [project.scripts]

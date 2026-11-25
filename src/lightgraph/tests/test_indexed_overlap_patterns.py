@@ -156,3 +156,105 @@ def test_alias_pairs_need_identical_shared_witnesses_and_compatible_scope_to_gro
     assert len(result.patterns) == pair_count
     assert all(len(p['members']) == 2 and p['eligible_actions'] == ['retain'] for p in result.patterns)
     assert not result.rules_by_pattern
+
+
+def _recoded_unit(owner, pairs):
+    branch = unit(owner, owner + '_axis', owner + '_id', table=owner + '_wide', column=owner + '_no')
+    graph = branch['graph']
+    template = graph['nodes'][0]
+    graph['nodes'] = []
+    for i, (key, name) in enumerate(pairs):
+        row = deepcopy(template)
+        row['id'] = f'{owner}_{i}'
+        row['identity'][owner + '_id'] = key
+        row['label'] = row['supports'][0]['label'] = name
+        graph['nodes'].append(row)
+    return branch
+
+
+def test_different_codes_with_distinct_source_names_and_directed_roles_form_one_review_card():
+    from lightgraph.construction.overlap_review import _structural_profile
+
+    branches = [indexed(_recoded_unit(owner, [(owner + '_01', '北区'), (owner + '_02', '南区')]))
+                for owner in ('buyer', 'office', 'service')]
+    plan = overlap.analyze_indexed_overlap_patterns(branches)
+    card, = plan.patterns
+    assert card['basis'] == 'same_observed_names_with_different_keys'
+    assert len(card['members']) == 3
+    assert card['overlapping_names'] == 2 and card['overlapping_keys'] == 0
+    assert card['eligible_actions'] == ['retain'] and not plan.rules_by_pattern
+    assert card['reasons'] == ['cross_code_correspondence_unverified']
+    assert '北区' not in json.dumps(card, ensure_ascii=False)
+    assert 'buyer_01' not in str(card)
+    profile = _structural_profile(card)
+    assert (profile['overlapping_names'], profile['overlapping_keys']) == (2, 0)
+    assert overlap.analyze_indexed_overlap_patterns(branches[::-1]).patterns == plan.patterns
+
+
+def test_recoded_family_counts_full_typed_key_intersection_independently_of_names():
+    a = _recoded_unit('billing', [('A', '北区'), ('B', '南区'), ('shared', '旧目录')])
+    b = _recoded_unit('office', [('C', '北区'), ('D', '南区'), ('shared', '新口径')])
+    result = overlap.analyze_indexed_overlap_patterns([indexed(a), indexed(b)])
+    card, = result.patterns
+    assert (card['overlapping_keys'], card['overlapping_names']) == (1, 2)
+    assert card['eligible_actions'] == ['retain']
+
+
+@pytest.mark.parametrize('block', ['homonym', 'role', 'same_codes', 'frequency', 'budget', 'comparison'])
+def test_recoded_weak_name_candidates_cannot_override_conflicts_or_consume_unbounded_pages(block, monkeypatch):
+    left = _recoded_unit('left', [('A', '北区'), ('B', '南区')])
+    right = _recoded_unit('right', [('C', '北区'), ('D', '南区')])
+    branches = [left, right]
+    if block == 'homonym':
+        branches[1] = _recoded_unit('right', [('C', '北区'), ('D', '南区'), ('E', '南区')])
+    elif block == 'role':
+        right['graph']['edges'][0]['supports'][0]['provenance']['target_key_columns'] = ['another_dimension']
+    elif block == 'same_codes':
+        branches[1] = _recoded_unit('right', [('A', '北区'), ('B', '南区')])
+    elif block == 'frequency':
+        monkeypatch.setattr(overlap, 'MAX_ALIAS_FANOUT', 2)
+        branches.append(_recoded_unit('third', [('E', '北区'), ('F', '南区')]))
+    elif block == 'budget':
+        monkeypatch.setattr(overlap, 'MAX_ALIAS_OBSERVATIONS', 1)
+    elif block == 'comparison':
+        monkeypatch.setattr(overlap, 'MAX_ALIAS_COMPARISONS', 1)
+    result = overlap.analyze_indexed_overlap_patterns([indexed(c) for c in branches])
+    assert not any(p['basis'] == 'same_observed_names_with_different_keys' for p in result.patterns)
+    assert not result.rules_by_pattern
+    stats = result.summary['cross_table_different_key_name_search']
+    if block == 'homonym':
+        assert stats['ambiguous_names_suppressed'] == 1
+    if block == 'frequency':
+        assert stats['high_frequency_names_suppressed'] == 2
+    if block == 'budget':
+        assert stats['status'] == 'observation_budget_exceeded' and stats['alias_sections'] == 0
+    if block == 'comparison':
+        assert stats['status'] == 'comparison_budget_exceeded' and result.summary['truncated']
+
+
+def test_name_crosswalk_clues_can_come_from_two_drafts_within_a_contributor():
+    a = _recoded_unit('a', [('r1', '北区'), ('r2', '南区')])
+    b = _recoded_unit('b', [('a1', '北区'), ('a2', '南区')])
+    b['graph']['definitions']['relations'][0]['type'] = b['graph']['edges'][0]['type'] = 'b_parent'
+    for rows in ('entities', 'relations'):
+        a['graph']['definitions'][rows].extend(b['graph']['definitions'][rows])
+    for rows in ('nodes', 'edges'):
+        a['graph'][rows].extend(b['graph'][rows])
+    unrelated = unit('c', 'Period', 'period', table='calendar')
+    unrelated['graph']['edges'] = []
+    result = overlap.analyze_indexed_overlap_patterns([indexed(a), indexed(unrelated)])
+    card, = [p for p in result.patterns if p['basis'] == 'same_observed_names_with_different_keys']
+    assert {m['contributor_id'] for m in card['members']} == {'a'}
+    assert card['overlapping_names'] == 2 and 'competing_roles_in_one_unit' in card['reasons']
+
+
+def test_name_only_patterns_cannot_crowd_out_an_eligible_pattern(monkeypatch):
+    east = regions('east', 'OfficialRegion', 'region_id')
+    west = regions('west', 'CoverageRegion', 'area_id')
+    recoded = [_recoded_unit('aa', [('a', '北区'), ('b', '南区')]),
+               _recoded_unit('bb', [('c', '北区'), ('d', '南区')])]
+    monkeypatch.setattr(overlap, 'MAX_PATTERNS', 1)
+    result = overlap.analyze_indexed_overlap_patterns([indexed(c) for c in [east, west, *recoded]])
+    card, = result.patterns
+    assert 'apply' in card['eligible_actions'] and card['basis'] == 'same_physical_key'
+    assert result.summary['omitted_patterns'] >= 1

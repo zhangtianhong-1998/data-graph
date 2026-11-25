@@ -55,6 +55,7 @@ def test_parallel_archived_census_and_scoring_without_new_publication(tmp_path):
         return json.loads((out/name).read_text(encoding='utf8'))
     report = data('summary.json')
     assert report['status'] == 'completed' and len(report['stages']) == 5
+    assert report['committed_merge_mode'] == 'deterministic' and report['model_calls'] == 0
     assert report['scenarios']['reference']['delta']['nodes_removed'] == 1
     assert report['scenarios']['exploratory']['delta']['nodes_removed'] == 4
     assert data('hypotheses.json')['hypothesized_pairs'] == 3

@@ -86,8 +86,13 @@ def run_stages(tasks, workers):
 def _report(out, report):
     stages = report['stages']
     lines = ['# 全图节点与关系消歧实验', '', f"运行 `{report['run_id']}`，合并产物 `{report['artifact_id']}`。",
-             '', '|检查点|节点|原始边|涉及候选的节点|分组后的画布连线|',
-             '|---|---:|---:|---:|---:|']
+             '', f"这次离线普查调用模型 {report['model_calls']} 次。归档合并模式为 `{report['committed_merge_mode']}`。"]
+    historical = report.get('historical_pattern_review', {}).get('summary')
+    if historical:
+        lines.append(f"归档合并调用模型 {historical.get('model_calls', '未记录')} 次，"
+                     f"完成审查 {historical.get('reviewed_patterns', '未记录')} 个模式，"
+                     f"新增生效实体规则 {historical.get('added_entity_rules', '未记录')} 条。")
+    lines += ['', '|检查点|节点|原始边|涉及候选的节点|分组后的画布连线|', '|---|---:|---:|---:|---:|']
     for key, stage in stages.items():
         lines.append(f"|{key}|{stage['rows']['nodes']}|{stage['rows']['edges']}|"
                      f"{stage['nodes']['candidate_nodes']}|{stage['edges']['default_canvas_lines']}|")
@@ -157,6 +162,7 @@ def campaign(run_file, node_id, output, workers, specs, excluded, families=(), c
         return run_output_path(project, state.get('artifact_outputs', {}).get(r['node_id'], run['output_path']))
     output.mkdir(parents=True, exist_ok=False)
     report = {'run_id': run['run_id'], 'artifact_id': record['artifact_id'], 'node_id': node_id,
+              'committed_merge_mode': state['merge_nodes'][node_id]['merge_mode'],
               'upstream_artifacts': record['upstream_artifacts'], 'workers': workers, 'model_calls': 0,
               'stages': {}, 'errors': {}, 'scenarios': {}}
     files = []
@@ -177,13 +183,20 @@ def campaign(run_file, node_id, output, workers, specs, excluded, families=(), c
         stages, errors = run_stages(tasks, workers)
         report['stages'] = {item['node_id']: stages[item['node_id']] for item in [*parents, record] if item['node_id'] in stages}
         report['errors'].update(errors)
-        if not errors and not census_only:
+        if node_id in stages:
             checkpoint = json.loads(read(output/'committed'/'replay-input.json'))
-            review, policy = committed_merge_policy(state, node_id, checkpoint)
-            report['merge_policy_sha256'] = hashlib.sha256(canonical(policy).encode('utf-8')).hexdigest()
+            review = checkpoint.get('overlap_review')
             if review:
                 report['historical_pattern_review'] = {k: review[k] for k in ('summary', 'model_review') if k in review}
+        if not errors and not census_only:
+            _, policy = committed_merge_policy(state, node_id, checkpoint)
+            report['merge_policy_sha256'] = hashlib.sha256(canonical(policy).encode('utf-8')).hexdigest()
             inputs = [load_checkpoint(location(parent), parent) for parent in parents]
+            if policy.get('verified_projection_rules'):
+                from lightgraph.construction.projection_proposals import attach_checkpoint_grant
+                from lightgraph.construction.source_namespaces import project_checkpoint_inputs
+                inputs = project_checkpoint_inputs(inputs, run['project_id'])
+                inputs = [attach_checkpoint_grant(c, location(p), p) for p, c in zip(parents, inputs, strict=True)]
             totals = {k: sum(len(i['graph'][k]) for i in inputs) for k in ('nodes', 'edges')}
             saved = state['merge_nodes'][node_id].get('merge_counts') or {}
             if any(saved.get('input_'+k, v) != v for k, v in totals.items()):

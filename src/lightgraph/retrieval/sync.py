@@ -106,7 +106,7 @@ def _observations(item, key_names=()):
                            'aliases', 'row_context', 'source_row_witness', 'provenance',
                            'execution_origins', 'lookup_matches', 'endpoint_origins', 'identity_origins', 'identity_basis',
                            'identity_decision_refs', 'identity_decision_members', 'identity_decision_endpoints',
-                           'identity_approval_ref', 'reviewed_input_node_id',
+                           'identity_approval_ref', 'reviewed_input_node_id', 'overlap_pattern_id',
                            'inherited_from', 'contributor_id', 'required_scope_refs') if key in support}})
     return result
 

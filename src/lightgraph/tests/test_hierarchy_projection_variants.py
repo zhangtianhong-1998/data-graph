@@ -20,7 +20,8 @@ ROWS = [('CAT', 'Catalogue', 'S01', 'Supplies', 'A'),
 
 
 def _projection(index, *, conflict=False, business_filter=False, other_context=False,
-                constants=None, repeated_position=False, disputed_position=False):
+                constants=None, repeated_position=False, disputed_position=False, mapped_properties=None,
+                qualifiers=None, applicability=None):
     table = TableSpec(source_id='file', name='vocabulary', columns=[
         ColumnSpec(name=c) for c in ('collection', KEYS[0], NAMES[0], KEYS[1], NAMES[1])])
     rows = ROWS.copy()
@@ -50,6 +51,12 @@ def _projection(index, *, conflict=False, business_filter=False, other_context=F
         m = {'source_id': 'file', 'table': 'vocabulary', 'key_columns': [key],
              'label_column': label, 'context_columns': context,
              'constant_properties': {**location, **(constants or {})}}
+        if mapped_properties:
+            m['properties'] = mapped_properties
+        if qualifiers:
+            m['identity_qualifiers'] = qualifiers
+        if applicability:
+            m['applicability'] = applicability
         guard = {'column': key, 'op': 'is_not_null'}
         if index == 0:
             m['predicate'] = guard
@@ -62,6 +69,8 @@ def _projection(index, *, conflict=False, business_filter=False, other_context=F
     edge_mapping = {'source_id': 'file', 'table': 'vocabulary', 'source_key_columns': [src],
                     'target_key_columns': [dst], 'equal_endpoints': 'omit',
                     'context_columns': list(node_mappings[0]['context_columns'])}
+    if applicability:
+        edge_mapping['applicability'] = applicability
     if index == 2:
         edge_mapping['predicate'] = {'all': [{'column': src, 'op': 'is_not_null'},
                                             {'column': dst, 'op': 'is_not_null'}]}
@@ -147,15 +156,64 @@ def test_multiple_names_on_one_member_only_block_its_own_identity():
     assert {(c['category'], c['original_type']) for c in republished['definition_conflicts']} == old_conflicts
 
 
-def test_label_conflict_across_snapshots_stays_visible_even_if_two_copies_agree(monkeypatch):
-    first = [contributor(f'u{i}', _projection(i)) for i in (0, 1)]
-    alternate = [(p, parent, c, 'Different name' if c == 'S01' else name, project)
+def test_complete_code_partitions_by_exact_source_name_across_four_branches(monkeypatch):
+    from lightgraph.construction.hierarchy_trace import HierarchyTrace
+
+    scope = {'status': 'scoped', 'values': {'catalogue': 'finance'}}
+    first = contributor('first', _projection(0, applicability=scope), _projection(1, applicability=scope))
+    second = contributor('second', _projection(2, applicability=scope, mapped_properties={'collection_name': 'collection'}))
+    alternate = [(p, parent, c, name + '13' if c == 'S01' else name, project)
                  for p, parent, c, name, project in ROWS]
     monkeypatch.setitem(globals(), 'ROWS', alternate)
-    units = [*first, contributor('u2', _projection(2))]
+    units = [first, second, contributor('third', _projection(3, applicability=scope)),
+             contributor('fourth', _projection(4, applicability=scope))]
+    control = merge_construction_graphs(units, recognize_source_replays=False)
+    trace = HierarchyTrace('S01')
+    graph = merge_construction_graphs(units, hierarchy_trace=trace)
+    outputs = [n for n in graph['nodes'] if code(n) == 'S01']
+    assert len(outputs) == 2
+    assert {n['label']: {s['contributor_id'] for s in n['supports']} for n in outputs} == {
+        'Supplies': {'first', 'second'}, 'Supplies13': {'third', 'fourth'}}
+    assert next(n for n in outputs if n['label'] == 'Supplies')['properties']['collection_name'] == ['A']
+    assert sorted(len(e['node_ids']) for e in trace.events if e['result'] == 'exact_observed_name_partition') == [2, 3]
+    assert graph == merge_construction_graphs(list(reversed(units)))
+    assert _facts(control) == _facts(graph)
+    assert len(graph['edges']) == len(control['edges'])
+
+
+def test_mixed_name_member_cannot_bridge_uniform_name_members():
+    units = [contributor('first', _projection(0, conflict=True)),
+             contributor('second', _projection(1)), contributor('third', _projection(2))]
     graph = merge_construction_graphs(units)
-    assert sum(code(n) == 'S01' for n in graph['nodes']) == 3
-    assert graph['fusion_diagnostics']['hierarchy_replay_diagnostics']['rejected_physical_sets']['multiple_labels'] == 1
+    outputs = [n for n in graph['nodes'] if code(n) == 'S01']
+    assert len(outputs) == 2
+    assert {frozenset(s['contributor_id'] for s in n['supports']) for n in outputs} == {
+        frozenset({'first'}), frozenset({'second', 'third'})}
+    assert graph['fusion_diagnostics']['hierarchy_replay_diagnostics']['endpoint_only_multilabel_nodes'] == 1
+
+
+def test_missing_mapped_property_cannot_bridge_conflicting_observations(monkeypatch):
+    scope = {'status': 'global'}
+    units = [contributor('first', _projection(0, applicability=scope, mapped_properties={'edition': 'collection'})),
+             contributor('second', _projection(1, applicability=scope))]
+    changed = [(p, parent, c, name, 'B') for p, parent, c, name, _ in ROWS]
+    monkeypatch.setitem(globals(), 'ROWS', changed)
+    units.append(contributor('third', _projection(2, applicability=scope, mapped_properties={'series': 'collection'})))
+    graph = merge_construction_graphs(units)
+    assert all(count == 3 for count in Counter(map(code, graph['nodes'])).values())
+
+
+@pytest.mark.parametrize('scope,property_name,qualifiers', [
+    (None, 'edition', None),
+    ({'status': 'global'}, 'edition', {'edition': 'catalog edition'}),
+    ({'status': 'global'}, 'caliber', None),
+])
+def test_unknown_applicability_or_one_sided_identity_qualifier_blocks_enrichment(scope, property_name, qualifiers):
+    units = [contributor('first', _projection(0, applicability=scope, qualifiers=qualifiers,
+                                             mapped_properties={property_name: 'collection', 'series': 'collection'})),
+             contributor('second', _projection(1, applicability=scope))]
+    graph = merge_construction_graphs(units)
+    assert all(count == 2 for count in Counter(map(code, graph['nodes'])).values())
 
 
 @pytest.mark.parametrize('options', [

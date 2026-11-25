@@ -15,7 +15,7 @@ from lightgraph.construction.workflow_overlap import overlap_review_skip_reason
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import FusionPolicyConfig, MergePolicyConfig, RunConfig, WorkflowMergeNodeConfig
 from lightgraph.tests.construction_worker_fixture import (install_scripted_worker, overlapping_metric_proposal,
-                                                         regional_proposal, replace_worker_launch)
+                                                         partial_role_proposal, regional_proposal, replace_worker_launch)
 from lightgraph.tests.test_web_api import client, create, upload
 from lightgraph.tests.test_web_execution import wait_run
 
@@ -84,6 +84,7 @@ def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monk
     else:
         assert report['summary']['status'] == 'reviewed'
     assert node['overlap_review'] == report['summary']
+    assert node['overlap_review']['eligible_patterns'] == sum('apply' in p['eligible_actions'] for p in report['patterns'])
     assert node['overlap_review']['added_entity_rules'] == 2, report
     assert state['reused_nodes'] == ['first', 'second']
     assert {name: state['artifacts'][name] for name in state['reused_nodes']} == {
@@ -146,6 +147,63 @@ def test_review_requires_same_batch_direct_extract_checkpoints():
     assert overlap_review_skip_reason(inputs, ids, artifacts, False) == 'incomplete_extract_inputs'
 
 
+def test_merge_node_checks_an_agent_proposal_and_replays_only_the_supported_members(client, monkeypatch):
+    install_scripted_worker(monkeypatch, draft_factory=partial_role_proposal)
+    create(client)
+    base = '/api/projects/alpha'
+    upload(client, 'facts.csv', b'metric_code,metric_name,class_code,class_name,unit,currency,extra_class\n'
+           b'X,Stock,C,Class A,kg,EUR,\nY,Freight,D,Class B,t,USD,C\n')
+    cfg = client.get(base + '/config').json()
+    cfg['goal']['purpose'] = 'Compare the overlapping metric projections of the two workers'
+    cfg['model'].update(mode='in_environment', model='scripted', base_url='http://localhost:9999/v1',
+                        api_key_env='LIGHTGRAPH_TEST_REVIEW_KEY')
+    monkeypatch.setenv('LIGHTGRAPH_TEST_REVIEW_KEY', 'test-only')
+    cfg['workflow'] = {'enabled': True, 'units': [
+        {'unit_id': owner, 'goal_markdown': kind, 'source_ids': [cfg['sources'][0]['id']]}
+        for owner, kind in [('sales', 'IncomeMetric'), ('ledger', 'LedgerItem')]],
+        'merge_nodes': [{'node_id': 'join', 'merge_mode': 'overlap_review'}],
+        'edges': [{'edge_id': owner, 'source': owner, 'target': 'join'} for owner in ('sales', 'ledger')]}
+    assert client.put(base + '/config', json=cfg).is_success
+    issued = []
+
+    def decide(request):
+        patterns = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
+        decisions = []
+        for p in patterns:
+            decision = {'pattern_id': p['pattern_id'], 'action': 'keep'}
+            if {m['type'] for m in p['members']} == {'IncomeMetric', 'LedgerItem'}:
+                assert 'apply' not in p['eligible_actions']
+                assert 'propose' in p['review_actions'] and 'merge' not in p['review_actions']
+                issued.append(p['pattern_id'])
+                decision.update(action='propose', alignment=[
+                    {'member_index': i, 'source_index': m['source_indexes'][0],
+                     'role_index': next(j for j, r in enumerate(m['roles']) if r['relation_type'] == 'belongs_to')}
+                    for i, m in enumerate(p['members'])])
+            decisions.append(decision)
+        return httpx.Response(200, json={'choices': [{'message': {'role': 'assistant', 'content':
+                              json.dumps({'decisions': decisions})}, 'finish_reason': 'stop'}]})
+
+    monkeypatch.setattr(overlap_review.httpx, 'HTTPTransport', lambda: httpx.MockTransport(decide))
+    response = client.post(base + '/runs')
+    assert response.status_code == 202, response.text
+    run = wait_run(client.app.state.manager, 'alpha', response.json()['run_id'])
+    state = run['workflow_state']
+    assert run['status'] in {'completed', 'completed_with_gaps'}, state
+    project = client.app.state.workspace.project_path('alpha')
+    artifact = load_checkpoint(project / run['output_path'], state['artifacts']['join'])
+    report = artifact['overlap_review']
+    assert len(issued) == 1 and state['merge_nodes']['join']['model_calls'] == 1
+    assert report['summary']['added_entity_rules'] == 0
+    assert report['summary']['proposed_patterns'] == 1
+    assert report['summary']['proposal_collapsed_nodes'] == report['summary']['applied_proposal_groups'] == 1, report['proposal_checks']
+    assert len([n for n in artifact['graph']['nodes'] if n['label'] == 'Stock']) == 1
+    assert len([n for n in artifact['graph']['nodes'] if n['label'] == 'Freight']) == 2
+    audit = runpy.run_path(str(Path(__file__).resolve().parents[3] / 'scripts/audit_checkpoint_merge.py'))['audit']
+    replay = audit(project / 'runs' / (run['run_id'] + '.json'), 'join', include_edge_lineage=True)
+    assert replay['with_source_replay']['rows_match_committed'] == {'nodes': True, 'edges': True}
+    assert replay['model_calls'] == 0
+
+
 @pytest.mark.parametrize('rejection', ['overlap_pattern_policy_conflict', 'published_relation_cycle', 'merge_requires_isolation'])
 def test_invalid_combined_rules_revert_to_existing_policy_without_second_request(monkeypatch, rejection):
     config = RunConfig(sources=[])
@@ -158,7 +216,7 @@ def test_invalid_combined_rules_revert_to_existing_policy_without_second_request
     artifacts = {uid: {'artifact_id': uid, 'artifact_status': 'committed', 'graph_kind': 'node_delta',
                        'status': 'completed', 'source_attempt': 'batch'} for uid in ids}
     monkeypatch.setattr(workflow_overlap, 'analyze_indexed_overlap_patterns',
-                        lambda *args: SimpleNamespace(patterns=[{'pattern_id': 'pair'}], summary={}))
+                        lambda *args: SimpleNamespace(patterns=[{'pattern_id': 'pair', 'kind': 'entity'}], summary={}))
     requests = []
 
     def review(*args, **kwargs):

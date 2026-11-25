@@ -8,6 +8,8 @@ from .access import access_fingerprint
 from .merger import merge_construction_graphs
 from .overlap_patterns import analyze_indexed_overlap_patterns, apply_overlap_decisions
 from .overlap_review import review_overlap_patterns
+from .relation_proposals import annotate_relation_meanings, verify_relation_proposals
+from .source_namespaces import project_checkpoint_inputs
 
 
 def overlap_review_skip_reason(inputs, input_ids, artifacts, inherited):
@@ -38,22 +40,25 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
     if node.max_run_seconds is not None:
         deadline = min(deadline, time.monotonic() + node.max_run_seconds)
     effective = policy
+    local_inputs = inputs
     reason = overlap_review_skip_reason(inputs, input_ids, artifacts, inherited)
     fallback = None
     patterns = []
     pattern_summary = {}
+    proposal_checks = []
     result = {'status': 'skipped', 'reason': reason, 'model_calls': 0,
               'selected_pattern_ids': [], 'decisions': [], 'reviewed_patterns': 0, 'omitted_patterns': 0}
     check_cancelled()
     if reason is None:
-        # Pattern discovery has no access to instance graphs. These are needed below
-        # only for materializing the output under the selected policy.
+        # The reviewer sees projection descriptors. Proposal checks and output
+        # materialization use the frozen instances locally.
         indexed_inputs = [{'contributor_id': c['contributor_id'], 'kind': c['kind'],
                            'source_namespace': source_namespace,
                            'overlap_index': load_overlap_index(c) if load_overlap_index else c.get('overlap_index')}
                           for c in inputs]
         analysis = analyze_indexed_overlap_patterns(indexed_inputs, policy)
-        patterns, pattern_summary = analysis.patterns, analysis.summary
+        patterns = annotate_relation_meanings(analysis.patterns, inputs)
+        pattern_summary = analysis.summary
         check_cancelled()
         if not patterns and pattern_summary.get('reason'):
             result['reason'] = pattern_summary['reason']
@@ -65,6 +70,13 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
             check_cancelled()
             try:
                 effective = apply_overlap_decisions(policy, analysis, result['selected_pattern_ids'])
+                if any(d['action'] == 'propose' for d in result['decisions']):
+                    from .projection_proposals import attach_runtime_grants, verify_projection_proposals
+                    local_inputs = attach_runtime_grants(project_checkpoint_inputs(inputs, source_namespace),
+                                                         config, artifacts)
+                    effective, proposal_checks = verify_projection_proposals(
+                        effective, local_inputs, patterns, result['decisions'])
+                    check_cancelled()
             except LightGraphError as exc:
                 if exc.code not in {'invalid_overlap_pattern_decision', 'overlap_pattern_policy_conflict'}:
                     raise
@@ -74,7 +86,8 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
 
     access = access_fingerprint(config)
     try:
-        merged = merge_construction_graphs(inputs, target_access_fingerprint=access, merge_policy=effective)
+        materialized_inputs = local_inputs if effective.verified_projection_rules else inputs
+        merged = merge_construction_graphs(materialized_inputs, target_access_fingerprint=access, merge_policy=effective)
     except LightGraphError as exc:
         if effective == policy or exc.code in {'run_cancelled', 'input_dependency_changed'}:
             raise
@@ -89,12 +102,23 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
         effective = policy
         merged = merge_construction_graphs(inputs, target_access_fingerprint=access, merge_policy=effective)
     check_cancelled()
+    applied = merged.get('fusion_diagnostics', {}).get('model_verified_projections', {})
+    relation_checks = verify_relation_proposals(merged, patterns, result['decisions'])
+    check_cancelled()
+    applied_by_pattern = applied.get('applied_by_pattern', {}) if not fallback else {}
+    for row in proposal_checks:
+        impact = applied_by_pattern.get(row['pattern_id'], {})
+        row['applied_groups'] = impact.get('applied_groups', 0)
+        row['collapsed_nodes'] = impact.get('collapsed_nodes', 0)
+        row['not_applied_by_reason'] = (applied.get('not_applied_by_pattern', {}).get(row['pattern_id'], {})
+                                        if not fallback else {'merge_fallback': row['verified_groups']})
     summary = {
         'status': 'fallback' if fallback else result['status'],
         'reason': fallback or result.get('reason'),
         **{field: pattern_summary[field] for field in ('missing_index_contributors', 'incompatible_index_contributors')
            if pattern_summary.get(field)},
         'pattern_count': len(patterns),
+        'eligible_patterns': pattern_summary.get('eligible_patterns', 0),
         'analysis_omitted_patterns': pattern_summary.get('omitted_patterns', 0),
         'model_omitted_patterns': result['omitted_patterns'],
         'oversized_patterns': len(result.get('oversized_pattern_ids', [])),
@@ -107,6 +131,13 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
                           or 0 < result.get('submitted_patterns', 0) < len(patterns)
                           or result.get('reason') == 'model_prompt_budget_exhausted'),
         'selected_patterns': len(result['selected_pattern_ids']),
+        'proposed_patterns': sum(d['action'] == 'propose' for d in result['decisions']),
+        'verified_proposal_groups': sum(row['verified_groups'] for row in proposal_checks),
+        'applied_proposal_groups': sum(row['applied_groups'] for row in proposal_checks),
+        'proposal_collapsed_nodes': sum(row['collapsed_nodes'] for row in proposal_checks),
+        'proposed_relation_patterns': len(relation_checks),
+        'verified_relation_facts': sum(row['confirmed_fact_groups'] for row in relation_checks),
+        'grouped_relation_edges': sum(row['grouped_output_edges'] for row in relation_checks),
         'added_entity_rules': len(effective.fusion_policy.entity_rules) - len(policy.fusion_policy.entity_rules),
         'model_calls': result['model_calls'],
     }
@@ -114,6 +145,8 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
         'format_version': 1, 'summary': summary, 'patterns': patterns, 'pattern_summary': pattern_summary,
         'model_review': {key: value for key, value in result.items() if key not in {'decisions', 'selected_pattern_ids'}},
         'decisions': result['decisions'], 'selected_pattern_ids': result['selected_pattern_ids'],
+        'proposal_checks': proposal_checks,
+        'relation_proposal_checks': relation_checks,
         'upstream_artifacts': {key: artifacts[key]['artifact_id'] for key in input_ids},
         'configured_merge_policy': policy.model_dump(mode='json'),
         'effective_merge_policy': effective.model_dump(mode='json'),

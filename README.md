@@ -18,7 +18,7 @@ npm --prefix src/workbench run build
 .venv/bin/lightgraph serve --port 8001
 ```
 
-运行完整回归测试时，先执行 `.venv/bin/python -m pip install -r requirements-test.lock`，再执行 `.venv/bin/python -m pip install --no-deps -e '.[test]'`。维护旧版 AgentScope 发现接口时可单独安装 `.[legacy-discovery]`。
+仅测试当前构图、合并或工作台时，安装 `python -m pip install -e '.[test-harness]'`，再向 pytest 指定相应测试文件。这个配置只在运行依赖上增加 pytest。公开的旧版 Python 发现接口 `lightgraph.discovery.discover(..., model=...)` 仍可通过 `.[legacy-discovery]` 调用 AgentScope。运行包括该接口在内的完整回归时，先执行 `.venv/bin/python -m pip install -r requirements-test.lock`，再执行 `.venv/bin/python -m pip install --no-deps -e '.[test]'`。
 
 Windows 使用 `.venv\Scripts\python.exe` 和 `.venv\Scripts\lightgraph.exe`。内核启动器按当前 Python 的 scripts 安装目录解析，兼容虚拟环境与全局 Python 的 `Scripts` 布局。跨平台安装、原生内核及模拟模型测试由 GitHub Actions 执行，客户部署仍需单独验证。
 
@@ -38,7 +38,9 @@ Windows 使用 `.venv\Scripts\python.exe` 和 `.venv\Scripts\lightgraph.exe`。�
 
 ## 并行工作流和按需向量化
 
-在「项目配置 → 并行工作流」启用工作流。把两个抽取节点拖到画布，分别选择 A+C、B+C 及各自的知识文档。保存后运行，两个节点按并发数独立抽取。只有抽取节点时，各分支直接输出。新建合并节点默认只归并已提交的上游图，不再调用模型或读取源表。需要发现上游尚未抽出的关系时，再选择「合并后用模型补充跨分支关系」，说明要补哪类关系。已有工作流保留原来的执行方式。
+在「项目配置 → 并行工作流」启用工作流，给各抽取节点选择业务表及可用的知识文档。每个抽取 Agent 可在写草稿时调用 `inspect_branch_overlap`，核对本分支重复定义的实体和关系，修订后重新验证。运行轨迹记录实际检查过的草稿。
+
+在画布中新建合并节点，默认选中「由模型审查重叠模式，再按证据合并」。模型按模式审查上游表列、实体及关系角色，能为一类记录提出对应方案。本地合并逐键验证并报告实际减少的节点数。关系提议核实成组后，每条来源边都能按 ID 查回。已有工作流按保存的模式执行；要比较模型带来的增益，复用相同检查点，分别执行确定性合并和模型审查合并。两项对照的测试机操作见[分支和合并节点验收说明](scripts/agent_fusion_test_guide.md)。
 
 编排画布支持缩放按钮、Ctrl/⌘ + 滚轮缩放、拖动空白处平移和“适应画布”。侧栏按可用宽度调整位置。工作流单元只加载能绑定到当前表目录的知识文档；项目级运行仍严格检查文档绑定。上游未完成或发布记录无法读取时，下游合并跳过，并保留具体错误码。
 
@@ -264,7 +266,7 @@ output_dir: ./runs/graph
 
 `run` 构建并允许发布，`build-graph` 是同一过程的别名；`discover` 只探索和验证，不发布。`validate` 仅检查新 YAML 草稿格式，不代替数据验证或语义验收。旧固定规则输入会明确拒绝；历史结果库的只读 `inspect`、`search`、`export` 保留，不会重新启动旧发现流程。
 
-Agent 自主调用 `describe_sources`、`inspect_source`、`read_material`、`save_graph_draft`、`validate_graph_draft`、`publish_graph_draft` 和 `read_workspace`。系统不按表名或列名预建业务规则，不强制对象与关系分时完成。执行器根据 Agent 保存的通用映射，验证来源、键、标签、端点、关系约束和完整性。
+Agent 自主调用 `describe_sources`、`inspect_source`、`read_material`、`inspect_branch_overlap`、`save_graph_draft`、`validate_graph_draft`、`publish_graph_draft` 和 `read_workspace`。其中 `inspect_branch_overlap` 对照本分支各草稿的身份键、名称列和关系角色。系统不按表名或列名预建业务规则，不强制对象与关系分时完成。执行器根据 Agent 保存的通用映射，验证来源、键、标签、端点、关系约束和完整性。
 
 主要产物位于运行目录：
 

@@ -1,16 +1,10 @@
 """End-to-end orchestration with safe, outcome-oriented reports."""
 from __future__ import annotations
-import time
-import uuid
 import json
 from pathlib import Path
 import yaml
-from .contracts import RuleSpec, RunReport, GraphFact, SupportSpec, PartitionCompletion, digest, canonical
-from .errors import LightGraphError, BudgetExceeded
-from .rules import RuleEngine
-from .metadata import publish_metadata
-from .runtime.retention import write_report,write_rules,atomic_text
-from .runtime.progress import emit_progress
+from .contracts import RuleSpec, GraphFact, SupportSpec, PartitionCompletion, digest, canonical
+from .errors import LightGraphError
 
 _TIME_DEFERRALS=frozenset({
     'discovery_time_budget_exhausted','wall_time_budget_exhausted','run_time_budget_exhausted'})
@@ -27,22 +21,6 @@ DISCOVERY_WORKFLOW_VERSION='goal_driven_iterations/25'
 # Share of the discovery window held back from object discovery so relation
 # discovery and its follow-up still run after entities exist.
 RELATION_WINDOW_FRACTION=0.35
-
-
-def _missing_hierarchy_foundation(table, endpoints, knowledge):
-    """Defer this path table's relations while it has no validated local object.
-
-    Independent definition/bridge tables and usable local objects remain eligible.
-    A remembered multi-position mapping is a dependency, never an approved rule.
-    """
-    from .contracts import SourceRef
-    from .discovery.schema_knowledge import hierarchy_field_models
-    if knowledge is None:
-        return False
-    source=SourceRef(source_id=table.source_id,schema=table.schema_name,table=table.name)
-    if any(rule.source==source for rule in endpoints):
-        return False
-    return bool(hierarchy_field_models(knowledge.current_objects(table)))
 
 
 def _relation_context_rules(endpoints, rules, failed):
@@ -78,34 +56,6 @@ def _discovery_outcome(issues):
                 or any(token in code for token in partial_tokens)):
             return 'PARTIAL'
     return 'COMPLETED_WITH_GAPS'
-
-
-def _context_versions(marker):
-    """Source-version values stay flat references, never arbitrary dictionaries."""
-    result={}
-    for entry in marker.get('contexts',[]):
-        try:
-            name,version=json.loads(entry)
-            if isinstance(name,str) and isinstance(version,str):result[name]=version
-        except (ValueError,TypeError):
-            continue
-    return result
-
-
-def _unfinished_metadata_tables(ledger):
-    """Published rules do not prove that their interrupted investigation ended."""
-    return {(item.source.source_id,item.source.schema_name+'.'+item.source.table)
-        for item in ledger.items() if item.task=='metadata_discovery'
-        and item.state in {'pending','running','deferred'}}
-
-
-def _abort_staging(store, publications):
-    # Later reporting failures must not attempt to undo a committed publication.
-    for publication in publications:
-        try:
-            if store._publication(publication)['state'] in ('staging','ready'):store.abort(publication)
-        except LightGraphError:
-            pass
 
 
 def _deferred_tables(result, selected=()):
@@ -145,17 +95,6 @@ def _relation_work_issue(report, table, state):
     if state in ('deferred','unresolved'):
         report.issues.append({'code':'relation_discovery_pending' if state=='deferred'
             else 'relation_discovery_unresolved','table':table,'status':state})
-
-
-def _discovery_counts(report, result):
-    for key in ('compile_repair_rounds', 'recovered_proposals', 'deferred_proposals', 'rejected_proposals', 'unresolved_proposals',
-                'discovery_invalid_drafts', 'discovery_pending_submissions', 'semantic_revision_attempts',
-                'compatible_rule_merges','rule_conflict_revision_attempts','rule_conflict_revisions_compiled',
-                'field_model_resume_tasks','field_model_rule_attempts','field_model_recheck_probes',
-                'field_model_recovery_obligations','table_time_deferrals'):
-        value = result.stats.get(key, 0)
-        if type(value) is int:
-            report.counts[key] = report.counts.get(key, 0) + value
 
 
 def _graph_outcome(report, store, config, *, discover_only):
@@ -315,13 +254,6 @@ def _model_protocol_issues(usage):
     return issues
 
 
-def _latest(rules):
-    latest={}
-    for rule in rules:
-        if rule.rule_id not in latest or rule.revision>latest[rule.rule_id].revision:latest[rule.rule_id]=rule
-    return list(latest.values())
-
-
 def _goal_violation(rule,goal,projected):
     from .discovery.goal import source_in_goal, column_is_excluded, column_is_evidence_only
     if not source_in_goal(goal,rule.source):
@@ -379,88 +311,3 @@ def _run(config, adapters, *, rules, documents, model, discover_only):
     if model is not None and not isinstance(model, HarnessOptions):
         raise LightGraphError("legacy_model_runtime_removed")
     return run_construction(config, adapters, options=model, discover_only=discover_only)
-
-
-def _write_understanding(output,understandings):
-    from .discovery.models import DataUnderstanding
-    for u in understandings:
-        if not isinstance(u,DataUnderstanding):raise LightGraphError('typed_understanding_required')
-        lines=['---','purpose: data_description','derived: true','dependencies: '+str([u.dependency_hash]+u.rule_refs+u.document_refs),'---',
-            '# 自动生成的数据说明',f'来源：{u.source.source_id}.{u.source.schema_name}.{u.source.table}',
-            f'覆盖：{u.coverage}；样本不能证明全量语义。','',
-            '| 列 | 注释质量 | 角色假设 | 冲突代码 |','|---|---|---|---|']
-        for c in u.columns:
-            values=[c.name,c.comment_quality,c.inferred_role,', '.join(c.conflicts)]
-            lines.append('| '+' | '.join(v.replace('|',r'\|').replace('\n',' ') for v in values)+' |')
-        path=output/'understanding'/('table_'+digest(u.source.model_dump())[:16]+'.md')
-        atomic_text(path,'\n'.join(lines)+'\n')
-
-
-def _publish_alignments(store,tables,config,report):
-    from .metadata_alignment import discover_metadata_alignments
-    rules=store.get_rules(scopes=set(config.scopes),domain=config.isolation_domain)
-    result=discover_metadata_alignments(rules,tables,domain=config.isolation_domain)
-    _issues(report,result.issues)
-    report.counts['column_alignment_candidates']=len(result.candidates)
-    report.counts['column_alignment_deferred']=result.deferred_count
-    rid='metadata-alignments';version={'alignment':result.version}
-    if not result.complete:
-        if store.current_versions(rid)!=version:store.invalidate_rule(rid,'alignment_dependencies_changed')
-        return
-    if store.current_versions(rid)==version:return
-    pub=store.begin_publication(rid,1,'all',version)
-    try:
-        for item in result.candidates:
-            store.stage_fact(pub,item.fact(config.isolation_domain),item.support(rid))
-        store.publish_partition(PartitionCompletion(publication_id=pub,complete=True,consistent=True,dependencies_valid=True))
-    except BaseException:
-        store.abort(pub);raise
-
-
-def _publish_document_alignments(store,documents,config):
-    """Align accepted visible labels to existing claims; never re-call the model."""
-    graph=store.view(set(config.scopes)&set(config.document_scopes),domain=config.isolation_domain,include_candidates=True)
-    known={}
-    for node in graph['nodes']:
-        if node['layer']=='business' and node['status']=='accepted':
-            for label in [node['label']]+node['aliases']:known.setdefault(label,set()).add(node['id'])
-    support_by_id={s['id']:s for s in graph['supports']}
-    from types import SimpleNamespace
-    current=[]
-    for head in store.heads():
-        if head['valid'] and head['logical_rule_id'].startswith('document:'):
-            versions=store.current_versions(head['logical_rule_id'])
-            if versions and '@' in versions.get('document',''):
-                did,revision=versions['document'].rsplit('@',1)
-                current.append(SimpleNamespace(document_id=did,revision=revision))
-    for document in current:
-        ref=document.document_id+'@'+document.revision
-        claims=[c for c in graph['claims'] if any((support_by_id.get(s,{}).get('document_ref') or '').startswith(ref+'#') for s in c['support_ids'])]
-        bindings=[]
-        for claim in claims:
-            targets=known.get(claim['subject'],set())
-            if not targets:
-                # A unique longest accepted label inside the subject provides a
-                # reviewable alignment only. It never upgrades the claim's truth.
-                matches=[label for label in known if len(label)>=2 and label in claim['subject']]
-                if matches:
-                    longest=max(map(len,matches))
-                    targets=set().union(*(known[label] for label in matches if len(label)==longest))
-            if len(targets)!=1:continue
-            method='analysis:'+digest(config.isolation_domain,claim['predicate'],claim['object'])[:24]
-            if not any(n['id']==method for n in graph['nodes']):continue
-            bindings.append((method,next(iter(targets)),claim['modality']))
-        rid='document-alignment:'+document.document_id
-        version={'document':ref,'bindings':digest(sorted(bindings)),'scopes':sorted(config.document_scopes)}
-        if store.current_versions(rid)==version:continue
-        pub=store.begin_publication(rid,1,'all',version)
-        try:
-            for method,target,modality in bindings:
-                for scope in config.document_scopes:
-                    support=SupportSpec(origin='document_claim',source_binding=ref,scope_ref=scope,
-                        partition_id='all',rule_id=rid,rule_revision=1,document_ref=ref,status='candidate')
-                    store.stage_fact(pub,GraphFact(isolation_domain=config.isolation_domain,fact_kind='Edge',
-                        payload={'source':method,'relation':'analyzes','target':target,'qualifiers':{'modality':modality}}),support)
-            store.publish_partition(PartitionCompletion(publication_id=pub,complete=True,consistent=True,dependencies_valid=True))
-        except BaseException:
-            store.abort(pub);raise

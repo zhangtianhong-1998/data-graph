@@ -260,7 +260,7 @@ class ConstructionTools:
 
     def call(self, tool_name, **arguments):
         """Serialize mutations and return actionable errors without raw values."""
-        methods = {key: getattr(self, key) for key in ("describe_sources", "inspect_source",
+        methods = {key: getattr(self, key) for key in ("describe_sources", "inspect_source", "inspect_branch_overlap",
                    "read_material", "save_graph_draft", "validate_graph_draft", "read_workspace",
                    "publish_graph_draft")}
         with self._lock:
@@ -877,18 +877,50 @@ class ConstructionTools:
         from .revision_advice import revision_loss_advice
         advice = revision_loss_advice(previous.draft, record.draft) if previous and (
             previous.context_fingerprint == record.context_fingerprint) else []
+        from .branch_overlap import inspect_projections
+        records = self.workspace.list_drafts()
+        overlap = inspect_projections(records, self.tables.values(), self.workspace.context_fingerprint,
+                                      selected=record.draft.draft_id, limit=1)
+        preview = {'pattern_count': overlap['pattern_count'], 'basis_counts': overlap['basis_counts']}
+        if overlap['patterns']:
+            first = overlap['patterns'][0]
+            preview.update(first_pattern={'basis': first['basis'], 'member_count': first['member_count'],
+                                'draft_types': [[m['draft_id'], m['entity_type']] for m in first['members'][:2]]},
+                           inspect={'tool': 'inspect_branch_overlap', 'draft_id': record.draft.draft_id})
         return {"status": "ok", "draft_id": record.draft.draft_id,
                 "revision": record.revision, "state": record.status,
                 "previous_revision": previous.revision if previous else None,
-                "revision_advice": advice,
+                "revision_advice": advice, "branch_overlap_preview": preview,
                 **({'derived_from': {'draft_id': parent.draft.draft_id, 'revision': parent.revision,
                                      'fingerprint': parent.fingerprint},
                     'scope': 'metadata_definitions_only', 'fact_data_validation': 'not_run'}
                    if metadata_from_draft is not None else {}),
-                "retained_failed_work": self._retained_failed_work(excluding=record.draft.draft_id),
-                "next_action": "Validate this draft, or revise it as new evidence arrives."}
+                "retained_failed_work": self._retained_failed_work(excluding=record.draft.draft_id, existing=records),
+                "next_action": ("Inspect the overlapping mappings in branch_overlap_preview. "
+                                "Use source evidence to revise or retain them, then validate this draft."
+                                if preview['pattern_count'] else
+                                "Validate this draft, or revise it as new evidence arrives.")}
 
-    def _retained_failed_work(self, *, excluding=None):
+    def inspect_branch_overlap(self, yaml_text: str | None = None, draft_id: str | None = None, offset: int = 0):
+        """Return only schema and mappings visible to this worker, without reading rows."""
+        from .branch_overlap import inspect_projections
+        from .workspace import parse_graph_draft
+        if yaml_text is not None and draft_id is not None:
+            raise LightGraphError('graph_draft_input_selection_required')
+        if type(offset) is not int or offset < 0:
+            raise LightGraphError('invalid_page')
+        records = self.workspace.list_drafts()
+        if draft_id is not None:
+            selected = next((r for r in records if r.draft.draft_id == draft_id), None)
+            if selected is None:
+                raise LightGraphError('unknown_graph_draft')
+            if selected.status == 'stale' or selected.context_fingerprint != self.workspace.context_fingerprint:
+                raise LightGraphError('stale_graph_draft')
+        return inspect_projections(records, self.tables.values(), self.workspace.context_fingerprint,
+                                   proposed=parse_graph_draft(yaml_text) if yaml_text is not None else None,
+                                   selected=draft_id, offset=offset)
+
+    def _retained_failed_work(self, *, excluding=None, existing=None):
         """Keep execution-blocked candidates visible even when a new draft ID is used.
 
         This is a pointer to retained work, not an automatic goal-completeness
@@ -897,7 +929,7 @@ class ConstructionTools:
         from .failures import SOURCE_FAILURES
         from .models import iter_source_mappings
         records = []
-        for item in self.workspace.list_drafts():
+        for item in self.workspace.list_drafts() if existing is None else existing:
             if (item.draft.draft_id == excluding or item.status != 'needs_revision'
                     or item.context_fingerprint != self.workspace.context_fingerprint
                     or item.validation is None):

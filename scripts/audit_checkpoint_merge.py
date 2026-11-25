@@ -552,6 +552,10 @@ def _run_summary(run, state, project, node_id):
         'merge_mode': step.get('merge_mode'), 'plan_mode': state.get('plan_mode'), 'terminal_ids': state.get('terminal_ids'),
         'configured_inputs': [e['source'] for e in (state.get('plan') or {}).get('edges', []) if e['target'] == node_id],
         'reported_nodes': step.get('nodes'), 'reported_edges': step.get('edges'),
+        'merge_node_model_calls_this_run': step.get('model_calls'),
+        'committed_merge_model_calls': (step.get('model_calls') if target and target.get('run_id') == run['run_id']
+                                        and target.get('artifact_status') == 'committed' else None),
+        'overlap_review': step.get('overlap_review'),
         'merge_counts': step.get('merge_counts'), 'delta_merge_counts': step.get('delta_merge_counts'),
         'inputs': inputs,
         'output': footer(target) if target else None,
@@ -761,7 +765,8 @@ def committed_merge_policy(state, node_id, checkpoint):
 
 def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False, compare_to=None,
           run_summary=False, include_edge_lineage=False, explain_identity=None, overlap_patterns_only=False,
-          prepare_overlap_indexes=False, include_overlap_evidence=False, simulate_reviewed_key_pairs=None):
+          prepare_overlap_indexes=False, include_overlap_evidence=False, simulate_reviewed_key_pairs=None,
+          explain_identity_key=None, explain_name=None):
     """Use the run's committed inputs and policy, even when the current project has been edited."""
     if simulate_reviewed_key_pairs and any((run_summary, observations_only, overlap_patterns_only, prepare_overlap_indexes)):
         raise ValueError('逐键规则模拟需要执行合并重放。')
@@ -775,6 +780,11 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         raise ValueError("--include-edge-lineage 需要执行合并重放")
     if explain_identity is not None and (observations_only or run_summary or not explain_identity.strip()):
         raise ValueError("--explain-identity 需要一个完整的文本键值，并执行合并重放")
+    if explain_identity_key is not None and (explain_identity is None or not explain_identity_key.strip()):
+        raise ValueError("--explain-identity-key 需要配合 --explain-identity 指定身份字段和文本键值")
+    if explain_name is not None and (not explain_name.strip() or run_summary or observations_only
+                                     or overlap_patterns_only or prepare_overlap_indexes):
+        raise ValueError("--explain-name 需要完整名称和合并重放。")
     run, project, state = archived_state(run_file)
     if run_summary:
         return _run_summary(run, state, project, node_id)
@@ -786,9 +796,12 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
     if target["run_id"] != run["run_id"]:
         raise ValueError("此节点复用了旧合并结果，请选择实际提交该结果的原运行。")
 
+    def location(record):
+        path = state.get("artifact_outputs", {}).get(record["node_id"], run["output_path"])
+        return run_output_path(project, path)
+
     def read(record):
-        location = state.get("artifact_outputs", {}).get(record["node_id"], run["output_path"])
-        return load_checkpoint(run_output_path(project, location), record)
+        return load_checkpoint(location(record), record)
 
     if observations_only:
         graph = read(target)["graph"]
@@ -809,6 +822,9 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
     review, policy = committed_merge_policy(state, node_id, checkpoint)
     fused = committed["fusion_policy"]
     counts = graph_counts(committed)
+    if explain_name is not None:
+        from lightgraph.construction.merge_name_audit import MergeNameAudit, name_population, name_rows
+        counts['name_accounting'] = name_population(name_rows(committed, explain_name), explain_name)
     if include_edge_lineage:
         counts["row_digests"] = _graph_row_digests(committed)
     counts["integrity"] = output_checks(committed)
@@ -817,6 +833,11 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         counts["merge_counts"] = committed["fusion_diagnostics"]
     del committed, checkpoint
     inputs = [read(r) for r in parents]
+    if policy.get('verified_projection_rules'):
+        from lightgraph.construction.projection_proposals import attach_checkpoint_grant
+        from lightgraph.construction.source_namespaces import project_checkpoint_inputs
+        inputs = project_checkpoint_inputs(inputs, run['project_id'])
+        inputs = [attach_checkpoint_grant(c, location(r), r) for r, c in zip(parents, inputs, strict=True)]
     saved_counts = step.get("merge_counts") or {}
     totals = {f"input_{kind}": sum(len(c["graph"][kind]) for c in inputs) for kind in ("nodes", "edges")}
     if any(key in saved_counts and saved_counts[key] != count for key, count in totals.items()):
@@ -824,6 +845,8 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
     report = {
         "run_id": run["run_id"], "node_id": node_id,
         "artifact_id": target["artifact_id"], "upstream_artifacts": target["upstream_artifacts"],
+        "committed_merge_mode": step["merge_mode"], "model_calls": 0,
+        "committed_merge_model_calls": step.get("model_calls"),
         "explicit_entity_rules": len(fused.get("entity_rules", [])),
         "merge_policy_sha256": hashlib.sha256(canonical(policy).encode("utf-8")).hexdigest(),
         "merger_path": str(Path(merger.__file__).resolve()),
@@ -837,6 +860,10 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         report["added_entity_rules"] = report["effective_entity_rules"] - report["explicit_entity_rules"]
     if include_edge_lineage:
         report['lineage_input_artifacts'] = {r['node_id']: r['artifact_id'] for r in parents}
+    name_audit = None
+    if explain_name is not None:
+        name_audit = MergeNameAudit(inputs, explain_name)
+        report['name_accounting_inputs'] = name_audit.inputs()
     control_ids = set()
     passes = [(False, "without_source_replay", policy), (True, "with_source_replay", policy)]
     if simulate_reviewed_key_pairs:
@@ -852,9 +879,17 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
             stage = {_edge_key(ref, 'edge_id') for ref in refs}
 
         options = {'observe_before_hierarchy': capture_stage} if include_edge_lineage else {}
+        if name_audit is not None:
+            named_input_lineage = {}
+
+            def capture_named_input(kind, owner, original_id, output_id):
+                if kind == 'unit' and (owner, original_id) in name_audit.input_rows:
+                    named_input_lineage[owner, original_id] = output_id
+
+            options['observe_node_lineage'] = capture_named_input
         if enabled and explain_identity is not None:
             from lightgraph.construction.hierarchy_trace import HierarchyTrace
-            options['hierarchy_trace'] = HierarchyTrace(explain_identity)
+            options['hierarchy_trace'] = HierarchyTrace(explain_identity, key_field=explain_identity_key)
         graph = merger.merge_construction_graphs(inputs, target_access_fingerprint=target["access_fingerprint"],
                                                 merge_policy=replay_policy, recognize_source_replays=enabled, **options)
         report[label] = {**merger.merge_accounting(inputs, graph), **alignment_counts(graph),
@@ -865,6 +900,12 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
                                  node_reduction_vs_current_code_baseline=report['with_source_replay']['output_nodes'] - len(graph['nodes']))
         if 'hierarchy_trace' in options:
             report[label]['identity_trace'] = options['hierarchy_trace'].report(graph)
+        if name_audit is not None:
+            report[label]['name_accounting'] = name_audit.replay(graph, named_input_lineage)
+        if label == 'with_source_replay' and review and 'relation_proposal_checks' in review:
+            from lightgraph.construction.relation_proposals import verify_relation_proposals
+            relations = verify_relation_proposals(graph, review['patterns'], review['decisions'])
+            report[label]['relation_proposals_match_committed'] = relations == review['relation_proposal_checks']
         if include_edge_lineage:
             report[label]['edge_lineage'] = edge_lineage(inputs, graph, stage)
             if enabled:
@@ -888,8 +929,10 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
     # Some modules are loaded only by branches exercised during the replay.
     modules = [merger, observed_identity, executor, fusion, metadata_columns, workspace]
     for name in ('catalog_identity', 'hierarchy_replay', 'hierarchy_observations', 'hierarchy_captions',
-                 'hierarchy_role_witnesses', 'hierarchy_neighborhood', 'hierarchy_worksheet_properties', 'hierarchy_stage',
-                 'identity_authority', 'source_namespaces'):
+                 'hierarchy_role_witnesses', 'hierarchy_neighborhood', 'hierarchy_worksheet_properties',
+                 'hierarchy_complementary_properties', 'hierarchy_stage',
+                 'identity_authority', 'source_namespaces', 'projection_proposals', 'projection_access',
+                 'relation_proposals', 'relation_assertions'):
         module = sys.modules.get('lightgraph.construction.' + name)
         if module is not None:
             modules.append(module)
@@ -897,6 +940,8 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         modules.append(sys.modules['lightgraph.construction.reviewed_keys'])
     if explain_identity is not None:
         modules.append(sys.modules['lightgraph.construction.hierarchy_trace'])
+    if name_audit is not None:
+        modules.append(sys.modules['lightgraph.construction.merge_name_audit'])
     source_files = {m.__name__: Path(m.__file__).read_bytes() for m in modules}
     report["source_sha256"] = {name: hashlib.sha256(content).hexdigest() for name, content in source_files.items()}
     source_files["audit_checkpoint_merge.py"] = Path(__file__).read_bytes()
@@ -920,6 +965,8 @@ def main():
     parser.add_argument("--include-edge-lineage", action="store_true", help="逐单元核对原边来源和层级归并前的边，输出计数与摘要")
     parser.add_argument("--include-overlap-evidence", action="store_true", help="配合 --overlap-patterns-only 对照已审模式的上游契约、权限指纹和邻接见证数")
     parser.add_argument("--explain-identity", metavar="CODE", help="按完整的单字段文本键值，列出层级合并实际检查的节点、来源和判定")
+    parser.add_argument("--explain-identity-key", metavar="FIELD", help="按指定逻辑身份字段查找该值，适用于由编码和名称组成的复合键")
+    parser.add_argument("--explain-name", metavar="NAME", help="按精确名称核对各抽取单元、草稿、已提交图和重放图，列出每个原节点的去向")
     parser.add_argument("--compare-hierarchy-audit", type=Path, metavar="AUDIT_JSON",
                         help="与同一批检查点的上一轮完整审计报告逐组比较，并输出本轮成员映射")
     args = parser.parse_args()
@@ -929,7 +976,9 @@ def main():
         report = audit(args.run_file, args.node, observations_only=args.observations_only,
                        include_hierarchy_membership=args.include_hierarchy_membership, compare_to=args.compare_hierarchy_audit,
                        run_summary=args.run_summary, include_edge_lineage=args.include_edge_lineage,
-                       explain_identity=args.explain_identity, overlap_patterns_only=args.overlap_patterns_only,
+                       explain_identity=args.explain_identity, explain_identity_key=args.explain_identity_key,
+                       explain_name=args.explain_name,
+                       overlap_patterns_only=args.overlap_patterns_only,
                        prepare_overlap_indexes=args.prepare_overlap_indexes, include_overlap_evidence=args.include_overlap_evidence,
                        simulate_reviewed_key_pairs=args.simulate_reviewed_key_pairs)
     except LightGraphError as exc:

@@ -327,7 +327,7 @@ def edge_observation_properties(support, columns, positions, orientation, *, wor
 
 
 def observation_properties(support, key_columns, positions, *, column_ordinals=None, endpoint_roles=None,
-                           worksheet_properties=()):
+                           worksheet_properties=(), complementary_columns=()):
     """Omit a materialized position annotation only when its physical role is verified.
 
     Optional source ordinals are 1-based physical positions in the full original
@@ -372,6 +372,8 @@ def observation_properties(support, key_columns, positions, *, column_ordinals=N
         if name in positions_only or name in worksheet_properties:
             continue
         column = bindings.get(name)
+        if column in complementary_columns and name not in constants:
+            continue
         if name not in constants and column in projected and column in row_values and column in row_types:
             value, kind = row_values[column], row_types[column]
             if isinstance(value, (str, bool, int, float)) and canonical(values) == canonical([value]):

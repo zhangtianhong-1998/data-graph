@@ -180,7 +180,14 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
     assert membership['agrees_with_recorded_count']  # These copies folded through the row-identity channel.
     previous = tmp_path / 'audit.json'
     previous.write_text(json.dumps(report), encoding='utf-8-sig')
-    rerun = audit(run_file, 'merged', compare_to=previous, include_edge_lineage=True, explain_identity='A')
+    rerun = audit(run_file, 'merged', compare_to=previous, include_edge_lineage=True, explain_identity='A',
+                  explain_name='First')
+    assert 'name_accounting_inputs' not in report
+    assert rerun['name_accounting_inputs']['exact_label_nodes'] == 3
+    assert rerun['committed']['name_accounting']['exact_label_nodes'] == 2
+    named = rerun['with_source_replay']['name_accounting']
+    assert named['exact_label_nodes'] == named['distinct_outputs_of_matching_inputs'] == 2
+    assert [row['status'] for row in named['input_mapping']] == ['mapped'] * 3
     assert rerun['with_source_replay']['rows_match_committed'] == {'nodes': True, 'edges': True}
     trace = rerun['with_source_replay']['identity_trace']
     assert trace['identity_value'] == 'A' and len(trace['output_ids']) == 2

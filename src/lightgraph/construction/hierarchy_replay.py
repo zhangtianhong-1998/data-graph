@@ -8,6 +8,7 @@ from lightgraph.contracts import canonical, digest
 from lightgraph.source_values import identity_cell
 from .fusion import deduplicate_supports, definition_contract, edge_reference, record_input_edge, relation_identity, remap_graph_endpoints
 from .hierarchy_captions import HierarchyCaptions
+from .hierarchy_complementary_properties import complementary_columns
 from .hierarchy_neighborhood import neighborhood_difference_counts
 from .hierarchy_observations import (edge_observation_properties, observation_boundary, observation_properties,
                                      worksheet_edge_boundaries)
@@ -117,7 +118,7 @@ def _row_matches_endpoint(row, columns, raw_key):
                for key, (kind, value) in zip(columns, raw_key, strict=True))
 
 
-def _member(node, definition, layouts, captions=None):
+def _member(node, definition, layouts, captions=None, complementary=None):
     names = definition.get('key_names') or []
     identity = node.get('identity') or {}
     types = node.get('identity_types') or {}
@@ -158,7 +159,9 @@ def _member(node, definition, layouts, captions=None):
         addresses.add(table)
         units.add(unit)
         labels.add(label)
-        observations.add((keys, prov['label_column'], label, boundary, observation_properties(support, keys, positions)))
+        optional = complementary.get((keys, prov['label_column']), ()) if complementary else ()
+        props = observation_properties(support, keys, positions, complementary_columns=optional)
+        observations.add((keys, prov['label_column'], label, boundary, props))
     if len(addresses) != 1 or len(units) != 1 or not labels:
         return None
     # Each edge declares exactly which key columns it observed. Facts about
@@ -330,7 +333,7 @@ def _complementary_paths_agree(left, right):
     return True
 
 
-def _ancestor_paths_agree(batch, nodes, layouts, edge_rows, *, members=None, captions=None):
+def _ancestor_paths_agree(batch, nodes, layouts, edge_rows, *, members=None, captions=None, complementary=None):
     """Compare observed ancestor tuples within the same applicability and row context."""
     views = []
     comparing_worksheet_rows = any(
@@ -351,8 +354,9 @@ def _ancestor_paths_agree(batch, nodes, layouts, edge_rows, *, members=None, cap
             display = (captions.witnessed(support, node['type'], address, layout,
                                           dict(zip(keys, members[nid].raw_key)))
                        if captions is not None else ())
+            optional = (complementary or {}).get(nid, {}).get((keys, prov.get('label_column')), ())
             observation = (observation_boundary(support, keys, layout, witnessed_captions=display),
-                           observation_properties(support, keys, layout))
+                           observation_properties(support, keys, layout, complementary_columns=optional))
             rows_to_compare.append((keys, None, row, layout, observation))
         for keys, neighbor, row, layout, observation in rows_to_compare:
             if not layout or not row.get('values'):
@@ -506,12 +510,14 @@ def _verified_groups(graph, excluded_types, stats, physical_sets, trace=None, re
         return
     # Caption witnesses come only from members which passed the original
     # identity checks. Recompare only nodes whose rows actually project them.
+    optional = complementary_columns(nodes, members, physical_groups)
+    stats['nodes_with_complementary_source_properties'] = len(optional)
     for nid, member in members.items():
         node = nodes[nid]
         roles = captions.columns.get((member.address, member.unit, node['type']), {})
-        if roles and any(roles.keys() & ((s.get('row_context') or {}).get('values') or {}).keys()
-                         for s in node['supports']):
-            members[nid] = _member(node, definitions[node['type']], layouts, captions)
+        if nid in optional or (roles and any(roles.keys() & ((s.get('row_context') or {}).get('values') or {}).keys()
+                                            for s in node['supports'])):
+            members[nid] = _member(node, definitions[node['type']], layouts, captions, optional.get(nid))
     incidents, invalid_roles, missing_orientation, edge_rows, original_boundaries = _neighborhoods(
         graph, nodes, members, relations, layouts, captions, stats)
     blocked = set()
@@ -531,14 +537,24 @@ def _verified_groups(graph, excluded_types, stats, physical_sets, trace=None, re
     drafts = _draft_witnesses(graph, nodes, same_unit_members) if same_unit_members else {}
     physical_sets.extend(sets)
     rejected_sets, observation_differences = Counter(), Counter()
-    partial_sets = retained_members = 0
+    partial_sets = retained_members = multi_label_sets = 0
     equal_node_pairs = Counter()
     neighborhood_differences = Counter()
     row_context_differences = Counter()
     role_index = None
     for ids in sets:
         first = members[next(iter(ids))]
-        labels = {label for i in ids for _, _, label, _, _ in members[i].observations}
+        name_groups = defaultdict(set)
+        for i in ids:
+            names = frozenset(label for _, _, label, _, _ in members[i].observations)
+            name_groups[names].add(i)
+        multiple_labels = len(name_groups) > 1 or first.has_label_conflict
+        if multiple_labels:
+            multi_label_sets += 1
+            if trace is not None:
+                for names, peers in name_groups.items():
+                    trace.record(peers, 'mixed_observed_names' if len(names) > 1 else 'exact_observed_name_partition',
+                                 observed_names=sorted(names))
         complete_key = all(physical_groups[first.address, k, first.value] == ids for i in ids for k in members[i].bindings)
         # A complete physical key can identify a focused review group even
         # when labels or roles differ. All contributing observations must be
@@ -546,20 +562,23 @@ def _verified_groups(graph, excluded_types, stats, physical_sets, trace=None, re
         if (review_sets is not None and complete_key and
                 any((nodes[i]['type'], first.address, k) in layouts for i in ids for k in members[i].bindings)
                 and len({boundary.scope for i in ids for _, _, _, boundary, _ in members[i].observations}) == 1):
-            review_sets.append(ids)
-        if len(labels) > 1:
-            reason = 'multiple_labels'
-        elif not complete_key:
+            review_sets.extend(peers for peers in name_groups.values() if len(peers) > 1)
+        single_name = [peers for names, peers in name_groups.items() if len(names) == 1 and len(peers) > 1]
+        eligible_groups = [peers for peers in single_name if len({nodes[i]['type'] for i in peers}) == len(peers)]
+        if not complete_key:
             reason = 'overlapping_projection_sets'
-        elif len({nodes[i]['type'] for i in ids}) != len(ids):
+        elif not single_name:
+            reason = 'multiple_labels'
+        elif not eligible_groups:
             reason = 'competing_instances_in_one_type'
         else:
             # Within a complete physical bucket, only identical independently
             # witnessed signatures share an ID. An unrecognized fifth draft
             # cannot veto the first four or act as a bridge between signatures.
             signatures = defaultdict(set)
-            for i in ids:
-                signatures[members[i].observations].add(i)
+            for group in eligible_groups:
+                for i in group:
+                    signatures[members[i].observations].add(i)
             if len(signatures) > 1:
                 fields = _observation_differences(signatures)
                 observation_differences.update(fields)
@@ -625,7 +644,8 @@ def _verified_groups(graph, excluded_types, stats, physical_sets, trace=None, re
                         if basis != 'direct_neighbors':
                             continue
                         basis = 'same_unit_versioned_drafts'
-                    if not _ancestor_paths_agree(batch, nodes, layouts, edge_rows, members=members, captions=captions):
+                    if not _ancestor_paths_agree(batch, nodes, layouts, edge_rows, members=members,
+                                                 captions=captions, complementary=optional):
                         inconsistent_path = True
                         equal_node_pairs['ancestor_path'] += joint
                         if trace is not None:
@@ -671,6 +691,7 @@ def _verified_groups(graph, excluded_types, stats, physical_sets, trace=None, re
         rejected_sets[reason] += 1
         if trace is not None:
             trace.record(ids, reason, stage='physical_set')
+    stats['physical_sets_with_multiple_observed_names'] = multi_label_sets
     stats['partitioned_physical_sets'] = partial_sets
     stats['unmatched_nodes_in_partitioned_sets'] = retained_members
     stats['rejected_physical_sets'] = dict(sorted(rejected_sets.items()))
@@ -809,10 +830,15 @@ def _merge_members(winner, batch, definitions, *, approval_ref=None):
             origins = support.setdefault('identity_origins', [])
             if origin not in origins:
                 origins.append(origin)
-            support['identity_basis'] = 'reviewed_key_name_v1' if approval_ref else 'observed_hierarchy_projection_v1'
+            support['identity_basis'] = 'observed_hierarchy_projection_v1'
             if approval_ref:
                 ref, decision_id, input_nodes = approval_ref
-                support['identity_approval_ref'] = ref
+                if ref is not None:
+                    support['identity_basis'] = 'reviewed_key_name_v1'
+                    support['identity_approval_ref'] = ref
+                else:
+                    support['identity_basis'] = 'verified_projection_alignment_v1'
+                    support['overlap_pattern_id'] = decision_id
                 support['reviewed_input_node_id'] = input_nodes[node['id']]
                 support.setdefault('identity_decision_members', {})[decision_id] = node['id']
                 support['identity_decision_refs'] = sorted(set(support.get('identity_decision_refs', [])) | {decision_id})
@@ -845,7 +871,8 @@ def _merge_members(winner, batch, definitions, *, approval_ref=None):
 
 
 def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=None, trace=None, emit_candidates=False,
-                                    reviewed_pairs=None, review_stats=None, deduplicate_changed=False, observed_remap=None):
+                                    reviewed_pairs=None, review_stats=None, model_groups=None, projection_stats=None,
+                                    deduplicate_changed=False, observed_remap=None):
     """Collapse verified source replays in a fresh unit merge; return removed node count."""
     nodes = {n['id']: n for n in graph['nodes']}
     stats = {} if diagnostics is None else diagnostics
@@ -861,13 +888,23 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
     stats['groups_with_matching_roles_and_scope'] = len(batches)
     approvals = {}
     hierarchy_ids = {i for ids in batches.values() for i in ids}
-    if reviewed_pairs:
+    if reviewed_pairs or model_groups:
         hierarchy_ids.update(_unresolved_members(graph))
     for ids, ref in (reviewed_pairs or {}).items():
         if hierarchy_ids.isdisjoint(ids):
             winner = min(ids, key=lambda i: (nodes[i]['type'], i))
             batches[winner] = ids
             approvals[winner] = ref
+    model_winners = {}
+    reserved = hierarchy_ids | {i for ids in (reviewed_pairs or ()) for i in ids}
+    for ids, ref in (model_groups or {}).items():
+        if reserved.isdisjoint(ids):
+            winner = min(ids, key=lambda i: (nodes[i]['type'], i))
+            batches[winner] = ids
+            approvals[winner] = ref
+            model_winners[winner] = ref[1]
+        else:
+            projection_stats['not_applied_by_pattern'][ref[1]]['prior_identity_group_or_unresolved_member'] += 1
     owners = _compatible_remaps(graph, batches, nodes)
     remap = {nid: winner for nid, winner in owners.items() if nid != winner}
     if observed_remap is not None:
@@ -885,7 +922,21 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
     stats['collapsed_nodes_by_role_evidence'] = dict(sorted(Counter(bases[w] for w in remap.values() if w in bases).items()))
     stats['groups_rejected_during_endpoint_remap'] = len(bases) - stats['accepted_groups']
     if review_stats is not None:
-        review_stats['collapsed_nodes'] = sum(w in approvals for w in remap.values())
+        review_stats['collapsed_nodes'] = sum(w in approvals and w not in model_winners for w in remap.values())
+    if projection_stats is not None:
+        by_pattern = {}
+        for winner, pid in model_winners.items():
+            if winner in owners:
+                summary = by_pattern.setdefault(pid, {'applied_groups': 0, 'collapsed_nodes': 0})
+                summary['applied_groups'] += 1
+                summary['collapsed_nodes'] += len(batches[winner]) - 1
+            else:
+                projection_stats['not_applied_by_pattern'][pid]['incompatible_endpoint_remap'] += 1
+        projection_stats['not_applied_by_pattern'] = {
+            pid: dict(sorted(counts.items())) for pid, counts in sorted(projection_stats['not_applied_by_pattern'].items())}
+        projection_stats.update(eligible_groups=len(model_groups or {}), applied_by_pattern=by_pattern,
+                                applied_groups=sum(v['applied_groups'] for v in by_pattern.values()),
+                                collapsed_nodes=sum(v['collapsed_nodes'] for v in by_pattern.values()))
     if review_sets or remap:
         _update_review_candidates(graph, nodes, remap, review_sets)
     if not remap:

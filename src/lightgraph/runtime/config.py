@@ -329,13 +329,45 @@ class ReviewedKeyPairRule(StrictModel):
         return self
 
 
+class ProjectionBinding(StrictModel):
+    """A model can select only an issued member, source and incident relation role."""
+    contributor_id: str = Field(min_length=1)
+    graph_digest: str = Field(pattern=r'^[0-9a-f]{64}$')
+    entity_type: str = Field(min_length=1)
+    source_id: str = Field(min_length=1)
+    schema_name: str = Field(min_length=1)
+    table: str = Field(min_length=1)
+    key_columns: tuple[str, ...] = Field(min_length=1, max_length=32)
+    relation_type: str = Field(min_length=1)
+    end: Literal['source', 'target']
+    opposite_key_columns: tuple[str, ...] = Field(min_length=1, max_length=32)
+
+
+class VerifiedProjectionRule(StrictModel):
+    """Finite same-batch observations, checked again during deterministic replay."""
+    pattern_id: str = Field(pattern=r'^pattern_[0-9a-f]{24}$')
+    bindings: tuple[ProjectionBinding, ...] = Field(min_length=2, max_length=24)
+    observation_digests: tuple[str, ...] = Field(min_length=1, max_length=5000)
+
+    @model_validator(mode='after')
+    def bound_members(self):
+        if (len(set((p.contributor_id, p.entity_type) for p in self.bindings)) != len(self.bindings)
+                or len(set(self.observation_digests)) != len(self.observation_digests)
+                or not all(re.fullmatch('[0-9a-f]{64}', token) for token in self.observation_digests)):
+            raise ValueError('invalid_verified_projection_rule')
+        return self
+
+
 class MergePolicyConfig(StrictModel):
     """Deterministic safety rules for merging parallel unit and inherited graphs."""
+    verified_projection_rules: list[VerifiedProjectionRule] = Field(default_factory=list, max_length=32)
     reviewed_key_pairs: list[ReviewedKeyPairRule] = Field(default_factory=list, max_length=64)
 
     @model_serializer(mode='wrap')
     def serialize_policy(self, handler):
         data = handler(self)
+        if not self.verified_projection_rules:
+            data.pop('verified_projection_rules', None)
         if not self.reviewed_key_pairs:
             data.pop('reviewed_key_pairs', None)  # Historical checkpoint policy digests.
         for rule in data.get('reviewed_key_pairs', []):
@@ -393,6 +425,8 @@ class WorkflowConfig(StrictModel):
     @model_validator(mode="after")
     def validate_dag(self):
         policies = [self.merge_policy, *(node.merge_policy for node in self.merge_nodes if node.merge_policy)]
+        if any(policy.verified_projection_rules for policy in policies):
+            raise ValueError('projection_proposals_require_merge_review')
         if any(rule.approval_ref.strip() == 'simulation_only' for policy in policies for rule in policy.reviewed_key_pairs):
             raise ValueError('simulated_key_pairs_cannot_be_published')
         unit_ids = [unit.unit_id for unit in self.units]

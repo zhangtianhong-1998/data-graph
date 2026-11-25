@@ -219,6 +219,7 @@ files:
   - test_graph_yaml_workspace.py
   - test_construction_entrypoints.py
 - file: src/lightgraph/tests/test_frozen_resume.py
+  file_removed: true
   removed_tests:
   - test_frozen_resume_reuses_state_and_leaves_parent_untouched
   - test_resume_rebinds_only_the_same_verified_candidate_scope
@@ -370,8 +371,10 @@ files:
   - test_graph_yaml_workspace.py
   - test_construction_harness_integration.py
 - file: src/lightgraph/tests/test_relation_foundation_wait.py
+  file_removed: true
   removed_tests:
   - test_pipeline_does_not_spend_relation_calls_on_missing_path_endpoint
+  - test_only_missing_local_foundations_wait_and_ready_endpoint_releases_them
   reason: 绑定旧 RuleSpec 自动执行、ProposalBatch/独立语义复核或固定 T1/T2/coverage 调度的入口断言已退役；当前 Agent
     自主选择工具，不恢复旧路径来满足用例。
   current_contract_tests:
@@ -418,6 +421,7 @@ files:
   - test_graph_yaml_workspace.py
   - test_construction_harness_integration.py
 - file: src/lightgraph/tests/test_resume_pipeline.py
+  file_removed: true
   removed_tests:
   - test_failed_requested_retry_does_not_drop_existing_rule_from_same_table
   - test_manual_rule_is_not_mutated_to_project_an_excluded_name

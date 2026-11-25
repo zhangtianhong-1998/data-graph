@@ -204,7 +204,16 @@ function workflowRelationSummary(node: WorkflowMergeNodeState) {
   const lines = []
   const review = node.overlap_review
   if (review) {
-    lines.push(`列出 ${review.pattern_count} 种重叠模式，模型审查 ${review.reviewed_patterns} 种、建议合并 ${review.selected_patterns} 种，生效的新规则 ${review.added_entity_rules} 条`)
+    lines.push(`列出 ${review.pattern_count} 种重叠模式，合并节点的模型审查 ${review.reviewed_patterns} 种，选用整类合并 ${review.selected_patterns} 种，生效规则 ${review.added_entity_rules} 条`)
+    if (review.eligible_patterns != null && review.pattern_count) {
+      lines.push(`其中 ${review.eligible_patterns} 种符合整类合并条件`)
+    }
+    if (review.proposed_patterns != null) {
+      lines.push(`模型另提出 ${review.proposed_patterns} 个字段与角色对应方案，逐键核实 ${review.verified_proposal_groups} 组，实际合并 ${review.applied_proposal_groups} 组，减少 ${review.proposal_collapsed_nodes} 个节点`)
+    }
+    if (review.proposed_relation_patterns != null) {
+      lines.push(`模型提出 ${review.proposed_relation_patterns} 个关系对应方案，核实 ${review.verified_relation_facts} 组同一层级事实，共有 ${review.grouped_relation_edges} 条原始关系作依据`)
+    }
     if (review.submitted_patterns != null) {
       lines.push(`模型请求 ${review.model_calls} 次，送审 ${review.submitted_patterns} 种，已列出但未送审 ${review.pattern_count - review.submitted_patterns} 种`)
       if (review.failed_patterns) lines.push(`${review.failed_patterns} 种已送审的模式未取得有效裁决`)

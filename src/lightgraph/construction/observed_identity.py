@@ -26,16 +26,23 @@ class _Projection:
     complete: bool
 
 
+def identity_qualifier(provenance, prop):
+    declared = provenance.get('identity_qualifiers') or {}
+    if role := declared.get(prop):
+        return role
+    if prop in ('unit', 'definition', 'granularity', 'formula', 'caliber'):
+        return prop  # Existing published mappings predate explicit qualifiers.
+    return None
+
+
 def contradictory_qualifiers(nodes):
     """Compare documented property roles across physical aliases on reviewed entities."""
     values = defaultdict(set)
     for node in nodes:
         for support in node.get('supports', []):
-            declared = (support.get('provenance') or {}).get('identity_qualifiers') or {}
+            provenance = support.get('provenance') or {}
             for prop, observations in (support.get('properties') or {}).items():
-                role = declared.get(prop)
-                if not role and prop in ('unit', 'definition', 'granularity', 'formula', 'caliber'):
-                    role = prop  # Existing published mappings predate explicit qualifiers.
+                role = identity_qualifier(provenance, prop)
                 if role:
                     values[role].update(canonical(value) for value in observations)
                     if len(values[role]) > 1:

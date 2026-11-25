@@ -1,4 +1,4 @@
-"""HTTP/stdio MCP bridge exposing only graph construction's seven domain tools."""
+"""HTTP/stdio MCP bridge exposing graph construction tools."""
 from __future__ import annotations
 
 import argparse
@@ -73,6 +73,15 @@ def create_server(tools):
     async def inspect_source(table: str, operation: str, arguments: dict | None = None) -> dict:
         """Probe data read-only. Get operation arguments from read_material(source_operations)."""
         return await dispatch("inspect_source", table=table, operation=operation, arguments=arguments)
+
+    @server.tool()
+    async def inspect_branch_overlap(yaml_text: str | None = None, draft_id: str | None = None, offset: int = 0) -> dict:
+        """Compare source keys, name columns and relationship roles in this extract workspace.
+        Pass an unsaved YAML draft, a saved draft_id, or omit both to inspect current drafts or
+        the initial schema. Results are structural candidates with counts and an inspection_id;
+        no facts are read or identities changed. Use next_offset for additional patterns.
+        """
+        return await dispatch("inspect_branch_overlap", yaml_text=yaml_text, draft_id=draft_id, offset=offset)
 
     @server.tool()
     async def read_material(name: str, page: int = 0, section: str = "") -> dict:

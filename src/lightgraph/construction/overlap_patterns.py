@@ -257,7 +257,8 @@ def _cross_table_name_candidates(families, family_rows, read_counts, inputs_by_o
     sources = [(f, next(iter(f.by_source))) for f in families.values()
                if len(f.by_source) == 1 and not f.problems]
     sources.sort(key=lambda entry: (entry[0].owner, entry[0].name))
-    stats = {'status': 'complete', 'high_frequency_keys_suppressed': 0, 'comparisons': 0, 'omitted_patterns': 0}
+    stats = {'status': 'complete', 'high_frequency_keys_suppressed': 0, 'observations_read': 0,
+             'comparisons': 0, 'omitted_patterns': 0}
     from .overlap_index import possibly_overlapping
     widths = defaultdict(list)
     for i, (family, _) in enumerate(sources):
@@ -284,7 +285,9 @@ def _cross_table_name_candidates(families, family_rows, read_counts, inputs_by_o
         if i not in selected:
             continue
         read_counts['alias_sections'] += 1
-        for cell, label, scope in family_rows[family.owner, family.name]['aliases']:
+        aliases = family_rows[family.owner, family.name]['aliases']
+        stats['observations_read'] += len(aliases)
+        for cell, label, scope in aliases:
             postings_for_key = postings[len(family.names), cell]
             if len(postings_for_key) <= MAX_ALIAS_FANOUT:
                 postings_for_key.append((i, label, scope))
@@ -497,14 +500,23 @@ def analyze_indexed_overlap_patterns(contributors, policy=None):
         if family_rows[f.owner, f.name]['key_count']:
             buckets['same_logical_keys_across_sources', f.names].append(f)
 
-    def record(kind, basis, members, sources, overlap, reasons, candidates=(), witness_binding=None, pair_coverage=None):
+    def record(kind, basis, members, sources, overlap, reasons, candidates=(), witness_binding=None, pair_coverage=None,
+               overlapping_names=None):
         if len(members) > MAX_MEMBERS or len(sources) > MAX_MEMBERS:
             summary['omitted_patterns'] += 1
             return
         pid = 'pattern_' + digest(kind, basis, members, sources, witness_binding)[:24]
+        # Keep archived pattern IDs stable. A shared column spelling does not
+        # tell the reviewer which table actually supplied it to each branch.
+        if kind == 'entity':
+            bindings = [(s['source_id'], s['schema'], s['table'], tuple(s['key_columns'])) for s in sources]
+            members = [{**m, 'source_indexes': [i for i, b in enumerate(bindings)
+                                                if b in families[m['contributor_id'], m['type']].by_source]}
+                       for m in members]
         patterns.append({'pattern_id': pid, 'kind': kind, 'basis': basis, 'members': members, 'sources': sources,
                          **({'witness_binding': witness_binding} if witness_binding else {}),
                          **({'pair_coverage': pair_coverage} if pair_coverage else {}),
+                         **({'overlapping_names': overlapping_names} if overlapping_names is not None else {}),
                          'overlapping_keys': overlap, 'reasons': reasons,
                          'eligible_actions': ['apply', 'retain'] if candidates else ['retain']})
         if candidates:
@@ -578,13 +590,37 @@ def analyze_indexed_overlap_patterns(contributors, policy=None):
                 reasons = _authority_issues({owner for owner, _ in group}, inputs_by_owner)
                 reasons.add('preserve_relation_observations')
                 record('relation', 'same_directed_source_columns', members, [source], len(overlap), sorted(reasons))
+    # Existing key, catalog and directed-relation searches take precedence for I/O.
+    # A family pair already routed by a stronger pattern needs no second review card.
+    from .overlap_name_candidates import different_key_name_candidates
+    covered = {frozenset(pair) for p in patterns if p['kind'] == 'entity'
+               for pair in combinations(((m['contributor_id'], m['type']) for m in p['members']), 2)}
+    name_matches, name_stats = different_key_name_candidates(
+        families, family_rows, covered, inputs_by_owner=inputs_by_owner, group_pairs=_group_alias_pairs,
+        max_rows=min(MAX_ALIAS_OBSERVATIONS - alias_stats['observations_read'],
+                     MAX_RECORDS - peaks['member_keys_or_endpoint_pairs']),
+        max_comparisons=MAX_ALIAS_COMPARISONS - alias_stats['comparisons'], fanout=MAX_ALIAS_FANOUT,
+        max_patterns=MAX_ALIAS_PATTERNS)
+    summary['cross_table_different_key_name_search'] = name_stats
+    counts['alias_sections'] += name_stats['alias_sections']
+    summary['omitted_patterns'] += name_stats['omitted_patterns']
+    for peers, name_count, key_count in name_matches:
+        owners = {f.owner for f, _ in peers}
+        reasons = _authority_issues(owners, inputs_by_owner)
+        reasons.update(reason for f, _ in peers for reason in f.problems)
+        if len(owners) != len(peers):
+            reasons.add('competing_roles_in_one_unit')
+        reasons.add('cross_code_correspondence_unverified')
+        record('entity', 'same_observed_names_with_different_keys', [f.descriptor() for f, _ in peers],
+               [_public_source(b) for _, b in peers], key_count, sorted(reasons), overlapping_names=name_count)
     patterns.sort(key=lambda p: ('apply' not in p['eligible_actions'], p['pattern_id']))
     summary['omitted_patterns'] += max(0, len(patterns) - MAX_PATTERNS)
     for p in patterns[MAX_PATTERNS:]:
         rules.pop(p['pattern_id'], None)
     del patterns[MAX_PATTERNS:]
     summary.update(reported_patterns=len(patterns), eligible_patterns=len(rules),
-                   truncated=bool(summary['omitted_patterns']) or alias_stats['status'] != 'complete')
+                   truncated=bool(summary['omitted_patterns']) or alias_stats['status'] != 'complete'
+                   or name_stats['status'] != 'complete')
     return result
 
 

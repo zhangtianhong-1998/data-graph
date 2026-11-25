@@ -7,6 +7,12 @@ from lightgraph.contracts import digest
 BINDING = 'physical_source_namespace_binding'
 
 
+def project_checkpoint_inputs(inputs, project_id):
+    """Bind checkpoint-local source addresses using the owning run's project."""
+    return [{**c, 'source_namespace': project_id if c.get('source_namespace', project_id) == project_id else None}
+            for c in inputs]
+
+
 def source_namespace(inputs):
     """A caller binds a local project. A prior publication can rule that binding out."""
     if not inputs or not all(isinstance(c, dict) and isinstance(c.get('graph'), dict)

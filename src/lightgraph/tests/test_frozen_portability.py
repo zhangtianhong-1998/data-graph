@@ -1,12 +1,9 @@
 """Frozen manifests use portable paths without relaxing integrity checks."""
-import sqlite3
-
 import pytest
 
 from lightgraph.errors import LightGraphError
 from lightgraph.evaluation import frozen
 from lightgraph.tests.test_evaluation import inputs
-from lightgraph.tests.test_frozen_resume import parent_run
 
 
 def windows_keys(bundle, manifest):

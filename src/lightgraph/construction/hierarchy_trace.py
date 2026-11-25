@@ -1,13 +1,14 @@
 """Opt-in evidence for an exact identity value in an offline checkpoint replay."""
-from collections import Counter
+from collections import Counter, defaultdict
 
 from lightgraph.contracts import canonical
 from lightgraph.worksheet_witness import worksheet_row_witness
 
 
 class HierarchyTrace:
-    def __init__(self, code):
+    def __init__(self, code, *, key_field=None):
         self.code = code
+        self.key_field = key_field
         self.nodes = {}
         self.events = []
         self.evaluated = False
@@ -16,7 +17,11 @@ class HierarchyTrace:
         definitions = {d['type']: d for d in graph['definitions']['entities']}
         catalog = graph.get('evidence_catalog') or {}
         for node in graph['nodes']:
-            if list((node.get('identity') or {}).values()) != [self.code]:
+            identity = node.get('identity') or {}
+            if self.key_field is not None:
+                if identity.get(self.key_field) != self.code:
+                    continue
+            elif list(identity.values()) != [self.code]:
                 continue
             bindings = {}
             for support in node.get('supports', ()):
@@ -63,6 +68,24 @@ class HierarchyTrace:
 
     def report(self, graph):
         output_ids = {n['output_node_id'] for n in self.nodes.values()}
+        final_ids = {n['id'] for n in graph['nodes'] if n['id'] in output_ids}
+        observed_name_sets = defaultdict(list)
+        for nid, node in self.nodes.items():
+            names = set()
+            incomplete = not node['source_bindings']
+            for binding in node['source_bindings']:
+                label = binding['observed_label']
+                if binding['label_column'] and isinstance(label, str) and label.strip():
+                    names.add(label)
+                else:
+                    incomplete = True
+            observed_name_sets[tuple(sorted(names)), incomplete].append(nid)
+        by_name = []
+        for (names, incomplete), ids in sorted(observed_name_sets.items()):
+            mapped = {self.nodes[i]['output_node_id'] for i in ids}
+            by_name.append({'observed_names': list(names), 'incomplete_name_evidence': incomplete,
+                            'input_node_ids': sorted(ids), 'output_node_ids': sorted(mapped & final_ids),
+                            'unverified_input_node_count': sum(self.nodes[i]['output_node_id'] not in final_ids for i in ids)})
         candidates = []
         for group in graph.get('candidate_identity_merges', ()):
             selected = sorted(output_ids.intersection(group['node_ids']))
@@ -70,5 +93,7 @@ class HierarchyTrace:
                 candidates.append({'reason': group.get('reason'), 'match_basis': group.get('match_basis'),
                                    'matching_output_ids': selected, 'member_count': len(group['node_ids'])})
         return {'identity_value': self.code, 'hierarchy_stage_ran': self.evaluated,
+                **({'identity_field': self.key_field} if self.key_field is not None else {}),
                 'nodes_before_hierarchy': self.nodes, 'events': sorted(self.events, key=canonical),
-                'output_ids': sorted(output_ids), 'candidate_groups': sorted(candidates, key=canonical)}
+                'output_ids': sorted(output_ids), 'observed_name_sets': by_name,
+                'candidate_groups': sorted(candidates, key=canonical)}

@@ -826,6 +826,7 @@ def _merge_contributor_nodes_and_edges(
     hierarchy_collapsed = None
     hierarchy_diagnostics = {}
     review_stats = None
+    projection_stats = None
     final_remap = {} if observe_node_lineage is not None else None
     compatible_namespace = source_namespaces is None or len(source_groups) == 1 and source_namespaces[0] is not None
     if hierarchy_trace is not None:
@@ -839,9 +840,15 @@ def _merge_contributor_nodes_and_edges(
         if policy.reviewed_key_pairs:
             from .reviewed_keys import reviewed_key_groups
             reviewed_pairs, review_stats = reviewed_key_groups(result, contributors, policy.reviewed_key_pairs, contributor_remaps)
+        model_groups = None
+        if policy.verified_projection_rules:
+            from .projection_proposals import verified_projection_groups
+            projection_stats = {}
+            model_groups = verified_projection_groups(result, contributors, policy, contributor_remaps, projection_stats)
         hierarchy_collapsed = reconcile_hierarchy_projections(
             result, excluded_types=excluded_types, diagnostics=hierarchy_diagnostics, trace=hierarchy_trace,
             emit_candidates=policy.emit_alignment_candidates, reviewed_pairs=reviewed_pairs, review_stats=review_stats,
+            model_groups=model_groups, projection_stats=projection_stats,
             deduplicate_changed=not (fusion or retained_labels), observed_remap=final_remap)
     if observe_node_lineage is not None:
         outputs = {n['id'] for n in result['nodes']}
@@ -890,6 +897,8 @@ def _merge_contributor_nodes_and_edges(
         counts['hierarchy_replay_diagnostics'] = hierarchy_diagnostics
     if review_stats is not None:
         counts['reviewed_key_pairs'] = dict(review_stats)
+    if projection_stats is not None:
+        counts['model_verified_projections'] = projection_stats
     result['fusion_diagnostics'] = counts
     derive_display_graph(result, copy=False)
     record_namespace(result, source_namespaces, source_groups)

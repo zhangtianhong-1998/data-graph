@@ -74,6 +74,86 @@ def test_one_project_request_for_whole_patterns_and_structural_metadata_only(mon
     assert result['decisions'][1]['action'] == 'review'
 
 
+def alignment_card():
+    pattern = profile(7, eligible=False)
+    pattern['basis'] = 'same_typed_keys_and_names_across_sources'
+    pattern['reasons'] = ['cross_source_identity_unverified']
+    pattern['members'][0]['source_indexes'] = [0]
+    pattern['members'].append({'contributor_id': 'u2', 'type': 'sales_axis', 'key_names': ['axis_code'],
+                               'source_indexes': [1], 'roles': [{'relation_type': 'axis_in_catalog', 'end': 'source',
+                                  'key_columns': ['axis'], 'opposite_key_columns': ['catalog_id']}]})
+    pattern['sources'].append({'source_id': 'warehouse', 'schema': 'public', 'table': 'sales',
+                               'key_columns': ['axis']})
+    return pattern
+
+
+def test_agent_proposes_a_bounded_alignment_for_a_retain_only_pattern(monkeypatch):
+    pattern = alignment_card()
+
+    def reply(request):
+        assert b'PRIVATE_' not in request.content
+        issued, = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
+        assert issued['eligible_actions'] == ['retain']
+        assert [member['source_indexes'] for member in issued['members']] == [[0], [1]]
+        alignment = [{'member_index': i, 'source_index': i, 'role_index': 0} for i in (1, 0)]
+        return respond(json.dumps({'decisions': [{'pattern_id': issued['pattern_id'], 'action': 'propose',
+                                                  'alignment': alignment}]}))
+
+    requests = setup_provider(monkeypatch, reply)
+    result = review_overlap_patterns(configured(), [pattern], api_key='key')
+    assert result['model_calls'] == len(requests) == result['reviewed_patterns'] == 1
+    assert result['selected_pattern_ids'] == []
+    assert result['decisions'] == [{'pattern_id': pattern['pattern_id'], 'action': 'propose',
+        'alignment': [{'member_index': i, 'source_index': i, 'role_index': 0} for i in (0, 1)]}]
+
+
+@pytest.mark.parametrize('failure', [
+    'bounds', 'wrong_owner', 'wrong_role', 'key', 'arity', 'direction', 'relation', 'singleton',
+    'duplicate_member', 'duplicate_projection', 'boolean_handle', 'string_handle', 'raw_value', 'merge_with_alignment',
+])
+def test_invalid_model_alignment_grants_no_decision(monkeypatch, failure):
+    pattern = alignment_card()
+    alignment = [{'member_index': i, 'source_index': i, 'role_index': 0} for i in (0, 1)]
+    decision = {'pattern_id': pattern['pattern_id'], 'action': 'propose', 'alignment': alignment}
+    if failure == 'bounds':
+        alignment[1]['member_index'] = -1
+    elif failure == 'wrong_owner':
+        pattern['members'][1]['roles'][0]['key_columns'] = ['id']
+        alignment[1]['source_index'] = 0
+    elif failure == 'wrong_role':
+        alignment[1]['role_index'] = 1
+    elif failure == 'key':
+        pattern['sources'][1]['key_columns'] = ['different_key']
+    elif failure == 'arity':
+        pattern['members'][1]['key_names'].append('context')
+        pattern['members'][1]['roles'][0]['key_columns'].append('context')
+        pattern['sources'][1]['key_columns'].append('context')
+    elif failure == 'direction':
+        pattern['members'][1]['roles'][0]['end'] = 'target'
+    elif failure == 'relation':
+        pattern['kind'] = 'relation'
+    elif failure == 'singleton':
+        alignment.pop()
+    elif failure == 'duplicate_member':
+        alignment[1] = alignment[0]
+    elif failure == 'duplicate_projection':
+        pattern['members'][1].update(contributor_id='u1', type='dimension')
+    elif failure == 'boolean_handle':
+        alignment[1]['member_index'] = True
+    elif failure == 'string_handle':
+        alignment[1]['member_index'] = '1'
+    elif failure == 'raw_value':
+        alignment[1]['accept_values'] = ['some-row']
+    elif failure == 'merge_with_alignment':
+        decision['action'] = 'merge'
+        pattern['eligible_actions'] = ['apply', 'retain']
+
+    setup_provider(monkeypatch, lambda _: respond(json.dumps({'decisions': [decision]})))
+    result = review_overlap_patterns(configured(), [pattern], api_key='key')
+    assert result['status'] == 'fallback' and result['failed_patterns'] == 1
+    assert result['decisions'] == [] and result['selected_pattern_ids'] == []
+
+
 @pytest.mark.parametrize('failure', ['missing', 'duplicate', 'unissued', 'new_rule', 'ineligible',
                                       'malformed', 'duplicate_json_key', 'truncated', 'server', 'timeout'])
 def test_unusable_batch_grants_nothing_and_performs_one_attempt(monkeypatch, failure):

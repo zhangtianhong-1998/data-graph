@@ -653,9 +653,13 @@ def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatc
                                 "metadata_basis": "observed_non_null"}]}])
                     name, arguments = "save_graph_draft", {"yaml_text": dump_yaml(draft)}
                 elif index == 3:
-                    decode_result(request)
-                    name, arguments = "validate_graph_draft", {"draft_id": "设备组织"}
+                    assert decode_result(request)["branch_overlap_preview"]["pattern_count"] >= 1
+                    name, arguments = "inspect_branch_overlap", {"draft_id": "设备组织"}
                 elif index == 4:
+                    review = decode_result(request)
+                    assert review["stage"] == "draft_projections" and len(review["inspection_id"]) == 64
+                    name, arguments = "validate_graph_draft", {"draft_id": "设备组织"}
+                elif index == 5:
                     assert decode_result(request)["passed"]
                     name, arguments = "publish_graph_draft", {"draft_id": "设备组织"}
                 else:
@@ -695,8 +699,15 @@ def test_real_kernel_drives_yaml_validation_and_publication(tmp_path, monkeypatc
                     environment={"GRAPH_TEST_TOKEN": token, "OPENAI_API_KEY": "local-test-only"},
                     on_event=events.append)
         assert not failures, failures
-        assert calls == ["describe_sources", "inspect_source", "save_graph_draft", "validate_graph_draft",
+        assert calls == ["describe_sources", "inspect_source", "save_graph_draft", "inspect_branch_overlap",
+                         "validate_graph_draft",
                          "publish_graph_draft", "final"]
+        from lightgraph.construction.trace import project_harness_event
+        projected = [project_harness_event(event) for event in events]
+        inspect_call, = [data['call_id'] for kind, data in projected if kind == 'tool_call'
+                         and data['name'] == 'mcp__graph__inspect_branch_overlap']
+        receipt, = [data for kind, data in projected if kind == 'tool_result' and data['call_id'] == inspect_call]
+        assert next(item['inspection_id'] for item in observed if 'inspection_id' in item) in str(receipt['content'])
         assert result["finish_reason"] == "completed"
         graph = tools.workspace.read_published_graph()
         assert len(graph["nodes"]) == expected_nodes and len(graph["edges"]) == 2

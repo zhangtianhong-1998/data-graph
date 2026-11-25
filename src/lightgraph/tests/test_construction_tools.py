@@ -334,7 +334,10 @@ def test_mcp_registered_material_arguments_execute_without_dispatch_collision(tm
         server = create_server(tools)
         registered = asyncio.run(server.list_tools())
         assert {tool.name for tool in registered} == {'describe_sources', 'inspect_source', 'read_material',
-            'read_workspace', 'save_graph_draft', 'validate_graph_draft', 'publish_graph_draft'}
+            'read_workspace', 'inspect_branch_overlap', 'save_graph_draft', 'validate_graph_draft', 'publish_graph_draft'}
+        inspection = asyncio.run(server.call_tool('inspect_branch_overlap', {}))
+        receipt = json.loads(inspection[0].text)
+        assert receipt['stage'] == 'source_schema' and len(receipt['inspection_id']) == 64
         result = asyncio.run(server.call_tool('read_material', {'name': 'draft_schema'}))
         # FastMCP validates and serializes the real wrapper; this exercises the
         # parameter named `name` that previously collided with dispatch itself.

@@ -74,7 +74,7 @@ jobs:
         with:
           node-version: '24'
       - run: npm install --global pnpm@11.7.0
-      - run: python -m pip install -e ".[test]"
+      - run: python -m pip install -e ".[test-harness]"
       - name: Install locked kernel and persistence support
         run: python scripts/bootstrap_harness.py
       - name: Exercise actual kernel with loopback model only

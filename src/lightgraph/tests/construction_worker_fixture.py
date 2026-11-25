@@ -51,6 +51,17 @@ def regional_proposal(tools, table):
                                      'target_key_columns': ['country_code']}]}]}
 
 
+def partial_role_proposal(tools, table):
+    draft = overlapping_metric_proposal(tools, table)
+    if draft['entities'][0]['type'] == 'LedgerItem':
+        mapping = draft['relations'][0]['mappings'][0]
+        draft['relations'].append({'type': 'alternate_class', 'source_type': 'LedgerItem',
+                                   'target_type': 'MetricCategory', 'mappings': [
+                                       {**mapping, 'target_key_columns': ['extra_class'],
+                                        'predicate': {'op': 'eq', 'column': 'extra_class', 'value': 'C'}}]})
+    return draft
+
+
 def hierarchy_proposal(tools, table):
     kind = tools.config.goal_markdown.splitlines()[-1]
     binding = {'source_id': table['source'], 'schema': table['schema'], 'table': table['name']}

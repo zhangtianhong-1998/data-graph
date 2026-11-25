@@ -28,7 +28,7 @@ _REF = re.compile(r"result:([0-9a-f]{64})\Z")
 _CONTROL = frozenset({"status", "code", "cause_code", "passed", "complete",
     "result_complete", "truncated", "retryable", "queries_stopped",
     "finalization_model_calls", "source_blocked", "new_snapshot_recovery_available",
-    "evidence_ref", "validation_id", "draft_id", "revision", "state",
+    "evidence_ref", "inspection_id", "validation_id", "draft_id", "revision", "state",
     "validation_material", "draft_material", "failure_class", "recovery"})
 _PRIORITY = _CONTROL | {"query_budget", "coverage", "errors", "diagnostics",
     "evidence_refs", "document_refs", "next_action", "source_circuits",

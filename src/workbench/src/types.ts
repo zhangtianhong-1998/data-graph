@@ -125,6 +125,14 @@ export interface WorkflowMergeNodeState {
     status: string
     reason?: string | null
     pattern_count: number
+    eligible_patterns?: number
+    proposed_patterns?: number
+    verified_proposal_groups?: number
+    applied_proposal_groups?: number
+    proposal_collapsed_nodes?: number
+    proposed_relation_patterns?: number
+    verified_relation_facts?: number
+    grouped_relation_edges?: number
     submitted_patterns?: number
     failed_patterns?: number
     analysis_omitted_patterns?: number
