@@ -1,10 +1,12 @@
 """Preview a pair of physical projections, or compile an existing business approval for those checkpoints."""
 import argparse
 import json
-from collections import Counter, defaultdict
+from collections import Counter
+from copy import deepcopy
 from pathlib import Path
 
 from lightgraph.construction.checkpoints import load_checkpoint
+from lightgraph.construction.merger import bind_support_contributor
 from lightgraph.construction.reviewed_keys import _observations, _physical_code, reviewed_observation_digest
 from lightgraph.construction.workflow import load_workflow_state, run_output_path
 from lightgraph.contracts import canonical, digest
@@ -24,7 +26,9 @@ def _project(contributor, family, binding):
     for node in graph['nodes']:
         if node.get('original_type', node['type']) != family:
             continue
-        supports = [{'contributor_id': binding.contributor_id, **s} for s in node.get('supports', [])]
+        supports = deepcopy(node.get('supports', []))
+        for support in supports:
+            bind_support_contributor(support, contributor['contributor_id'])
         node = {**node, 'supports': supports}
         code = _physical_code(node, binding)
         if code is None:

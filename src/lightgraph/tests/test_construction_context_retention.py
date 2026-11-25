@@ -232,6 +232,6 @@ console.log(JSON.stringify({replay:true,pages,calls}))
 '''.replace('SESSION', json.dumps((vendor / 'packages/core/session/src/index.ts').as_uri()))
         .replace('ESTIMATE', json.dumps((vendor / 'packages/llm/token-meter/src/estimate.ts').as_uri()))
         .replace('RETENTION', json.dumps((repo / 'src/lightgraph/construction/runtime/context-retention.mjs').as_uri())))
-    result = subprocess.run(['node', '--import', str(loader), str(script)],
+    result = subprocess.run(['node', '--import', loader.as_uri(), str(script)],
                             cwd=vendor, capture_output=True, text=True, timeout=30, check=True)
     assert json.loads(result.stdout)['replay'] is True

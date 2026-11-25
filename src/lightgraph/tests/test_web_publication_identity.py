@@ -274,7 +274,7 @@ def test_late_review_conflict_removes_only_the_uncommitted_graph(client, monkeyp
     authorize = publication_identity.Review.authorize
 
     def changed_after_prepare(self, workspace, config):
-        if hasattr(self, 'groups'):
+        if set(directory.iterdir()) != before:
             raise LightGraphError('resolution_version_conflict')
         return authorize(self, workspace, config)
 
@@ -283,3 +283,54 @@ def test_late_review_conflict_removes_only_the_uncommitted_graph(client, monkeyp
         response = submit(client, original, original['candidates'][0])
         assert response.status_code == 409
     assert listing(client) == original and set(directory.iterdir()) == before
+
+
+def test_review_summary_pages_reuse_visible_base_and_defer_one_groups_evidence(client, monkeypatch):
+    from lightgraph.web import publication_identity as api, construction_graph
+
+    units = [candidate_unit(side, [(side, ['code'])]) for side in ('a', 'b')]
+    for unit in units:
+        prototype, = unit['graph']['nodes']
+        rows = []
+        for i in range(120):
+            node = deepcopy(prototype)
+            node.update(id=f"original-{i}", identity={'code': str(i)})
+            node['supports'][0].update(label='同名地区', properties={'note': ['detail only']})
+            rows.append(node)
+        unit['graph']['nodes'] = rows
+    publish(client, units)
+    load = construction_graph.read_publication_record
+    reads = []
+
+    def counted(*args, **kwargs):
+        reads.append(args[1]['path'])
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(construction_graph, 'read_publication_record', counted)
+    # Starting at the real canvas entry point should warm the same original data.
+    graph = client.get(GRAPH).json()
+    assert graph['total_nodes'] == 240
+    first = listing(client, view='summary', version=graph['version_id'])
+    with monkeypatch.context() as guard:
+        guard.setattr(api.CandidateIndex, 'incident', property(lambda _self: pytest.fail('list scanned edges')))
+        next_page = listing(client, view='summary', offset=first['next_offset'])
+        last = listing(client, view='summary', offset=next_page['next_offset'])
+    assert len(reads) == 1
+    assert first['total_candidates'] == 121 and last['next_offset'] is None
+    rows = first['candidates'] + next_page['candidates'] + last['candidates']
+    assert len({row['candidate_id'] for row in rows}) == len(rows) == 121
+    assert sorted(row['member_count'] for row in rows) == [2] * 120 + [240]
+    assert all(len(row['nodes']) <= 3 and 'supports' not in row and 'facts' not in row for row in rows)
+    assert all(node['label'] == '同名地区' for row in rows for node in row['nodes'])
+    assert {node['identity']['code'] for row in rows for node in row['nodes']} == {str(i) for i in range(120)}
+    assert 'detail only' not in str(rows)
+    key = next_page['candidates'][0]['candidate_id']
+    detail = listing(client, version=first['version_id'], candidate_id=key)
+    assert len(detail['candidates']) == 1 and 'detail only' in str(detail['candidates'][0]['supports'])
+    assert detail['candidates'][0] == listing(client, offset=50)['candidates'][0]
+    assert len(reads) == 1
+    assert client.get(REVIEW, params={'candidate_id': 'missing'}).status_code == 404
+    limited = {'business_context': '{"project":"another"}'}
+    assert listing(client, view='summary', **limited)['total_candidates'] == 0
+    assert client.get(REVIEW, params={'candidate_id': key, **limited}).status_code == 404
+    assert listing(client, view='summary')['candidates'] == first['candidates']

@@ -106,6 +106,9 @@ def test_fold_cannot_close_a_two_step_path_of_an_acyclic_relation():
 def test_compile_from_committed_checkpoints_requires_approved_preview(tmp_path):
     import importlib.util
     import json
+    import subprocess
+    import sys
+    from copy import deepcopy
     from pathlib import Path
 
     from lightgraph.construction.checkpoints import commit_checkpoint
@@ -119,6 +122,21 @@ def test_compile_from_committed_checkpoints_requires_approved_preview(tmp_path):
     output = tmp_path / 'output'
     output.mkdir()
     inputs = _inputs()
+    for item in inputs:
+        unit = item['contributor_id']
+        for node in item['graph']['nodes']:
+            node['supports'][0]['execution_origins'] = [{'draft_id': unit, 'revision': 1},
+                {'draft_id': unit, 'revision': 2, 'contributor_id': unit}]
+        for foreign_level in ('support', 'origin'):
+            other = deepcopy(item['graph']['nodes'][0])
+            other.update(id=f'{unit}_{foreign_level}', identity={'code': foreign_level})
+            support = other['supports'][0]
+            if support.get('business_context'):
+                support['business_context']['dimensions'] = dict(other['identity'])
+            if unit == 'east':
+                record = support if foreign_level == 'support' else support['execution_origins'][0]
+                record['contributor_id'] = 'another_unit'
+            item['graph']['nodes'].append(other)
     artifacts = {unit['contributor_id']: commit_checkpoint(output, run_id, unit['contributor_id'], unit,
                  input_digest='x', graph_kind='node_delta', status='completed_with_gaps') for unit in inputs}
     artifacts['merge_1'] = commit_checkpoint(output, run_id, 'merge_1', {'kind': 'merged',
@@ -135,7 +153,13 @@ def test_compile_from_committed_checkpoints_requires_approved_preview(tmp_path):
                   'table': p['table'], 'key_column': p['key_column'], 'name_column': p['name_column']}
                  for p in rule['projections']]
     criteria = {'entity_type': rule['entity_type'], 'projections': selectors, 'excluded_keys': ['B']}
-    preview = script.prepare(run_file, 'merge_1', criteria)
+    selectors_file = tmp_path / 'selectors.json'
+    selectors_file.write_text(json.dumps(criteria), encoding='utf-8')
+    prepare_cmd = [sys.executable, '-X', 'utf8', str(entry), str(run_file), '--node', 'merge_1',
+                   '--spec', str(selectors_file)]
+    preview_file = tmp_path / 'preview.json'
+    subprocess.run([*prepare_cmd, '--output', str(preview_file)], check=True)
+    preview = json.loads(preview_file.read_text(encoding='utf-8'))
     assert preview['observations'] == [{'key_type': 'text', 'key': 'W7', 'name': 'West'}]
     assert 'reviewed_key_pairs' not in preview
     decision = {'approval_ref': rule['approval_ref'], 'preview_digest': preview['preview_digest'],
@@ -143,17 +167,20 @@ def test_compile_from_committed_checkpoints_requires_approved_preview(tmp_path):
     compiled = script.prepare(run_file, 'merge_1', criteria, decision)
     assert compiled['reviewed_key_pairs'] == [rule]
     sim_file = tmp_path / 'compiled.json'
-    simulated_only = script.prepare(run_file, 'merge_1', criteria, simulate=True)
+    subprocess.run([*prepare_cmd, '--simulate', '--output', str(sim_file)], check=True)
+    simulated_only = json.loads(sim_file.read_text(encoding='utf-8'))
     assert simulated_only['mode'] == 'simulation_only' and 'reviewed_key_pairs' not in simulated_only
     assert simulated_only['simulated_count'] == 1 and 'approved_count' not in simulated_only
     from lightgraph.runtime.config import WorkflowConfig
     with pytest.raises(ValueError, match='simulated_key_pairs_cannot_be_published'):
         WorkflowConfig(merge_policy={'reviewed_key_pairs': simulated_only['simulated_key_pairs']})
-    sim_file.write_text(json.dumps(simulated_only))
     audit_spec = importlib.util.spec_from_file_location('audit_checkpoint_merge', entry.with_name('audit_checkpoint_merge.py'))
     audit = importlib.util.module_from_spec(audit_spec)
     audit_spec.loader.exec_module(audit)
-    report = audit.audit(run_file, 'merge_1', simulate_reviewed_key_pairs=sim_file, include_edge_lineage=True)
+    audited = subprocess.run([sys.executable, '-X', 'utf8', str(entry.with_name('audit_checkpoint_merge.py')),
+                              str(run_file), '--node', 'merge_1', '--simulate-reviewed-key-pairs', str(sim_file),
+                              '--include-edge-lineage'], check=True, stdout=subprocess.PIPE)
+    report = json.loads(audited.stdout)
     assert report['with_source_replay']['rows_match_committed'] == {'nodes': True, 'edges': True}
     simulation = report['simulated_reviewed_key_pairs']
     assert simulation['node_reduction_vs_current_code_baseline'] == 1

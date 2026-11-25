@@ -2168,35 +2168,53 @@ def read_graph_details(workspace, pid, *, entity_id=None, fact_id=None, include_
             "include_candidates": include_candidates}
 
 
-def identity_review(workspace, pid, *, offset=0, decision_offset=0, version=None, business_context=None):
+def identity_review(workspace, pid, *, config=None, offset=0, decision_offset=0, version=None, business_context=None,
+                    view="full", candidate_id=None):
     """Show original endpoints and authorized evidence before identity decisions."""
+    if config is None:
+        from .graph_history import read_consistently
+        return read_consistently(workspace, pid, identity_review, offset=offset, decision_offset=decision_offset,
+                                 version=version, business_context=business_context, view=view, candidate_id=candidate_id)
     from ..store import GraphStore
     from ..identity.reconciliation import list_candidates
     if offset < 0 or decision_offset < 0:
         raise LightGraphError("graph_selection_invalid")
-    config = workspace.result_config(pid)
-    from . import construction_graph, publication_identity, graph_history
+    from . import construction_graph, publication_identity
     if construction_graph.available(config):
-        return graph_history.read_consistently(workspace, pid, publication_identity.review, offset=offset,
-            decision_offset=decision_offset, version=version, business_context=business_context)
+        return publication_identity.review(workspace, pid, config=config, offset=offset, decision_offset=decision_offset,
+            version=version, business_context=business_context, view=view, candidate_id=candidate_id)
     if version or business_context is not None:
         raise LightGraphError("resolution_version_conflict")
     path = Path(config.output_dir) / "graph.sqlite"
     if path.is_symlink():
         raise LightGraphError("workspace_path_invalid")
     if not path.exists():
+        if candidate_id is not None:
+            raise LightGraphError("identity_candidate_not_found")
         return {"revision": 0, "candidates": [], "decisions": [], "total_candidates": 0, "next_offset": None, "total_decisions": 0, "next_decision_offset": None}
-    with GraphStore(path) as store:
+    with workspace.lock(pid), GraphStore(path) as store:
         scopes = set(config.scopes)
         listing = list_candidates(store, scopes, config.isolation_domain)
         graph = store.view(scopes, domain=config.isolation_domain, include_candidates=True, apply_resolutions=False)
         nodes = {n["id"]: n for n in graph["nodes"]}
-        facts = {f["id"]: f for f in graph["facts"]}
+        facts = {f["id"]: f for f in graph["facts"]} if view != "summary" else {}
         candidates = []
-        for item in listing["candidates"][offset:offset + 50]:
+        items = listing["candidates"][offset:offset + 50]
+        if candidate_id is not None:
+            items = [item for item in listing["candidates"] if item["candidate_id"] == candidate_id]
+            if not items:
+                raise LightGraphError("identity_candidate_not_found")
+        active = {d["candidate_id"] for d in listing["decisions"] if d["status"] == "active"}
+        for item in items:
+            if view == "summary":
+                summary = {key: item[key] for key in ("candidate_id", "channels", "status")}
+                summary.update(has_active_decision=item["candidate_id"] in active, member_count=len(item["members"]),
+                               nodes=[publication_identity.member_caption(nodes[m]) for m in item["members"][:3] if m in nodes])
+                candidates.append(summary)
+                continue
             evidence = set(item["evidence"])
             supports = [s for s in graph["supports"] if s["fact_id"] in evidence]
-            candidates.append({**item, "has_active_decision": any(d["candidate_id"] == item["candidate_id"] and d["status"] == "active" for d in listing["decisions"]), "supports_truncated": len(supports) > 500, "nodes": [nodes[e] for e in item["members"] if e in nodes],
+            candidates.append({**item, "has_active_decision": item["candidate_id"] in active, "supports_truncated": len(supports) > 500, "nodes": [nodes[e] for e in item["members"] if e in nodes],
                 "facts": [facts[f] for f in item["evidence"] if f in facts],
                 "supports": supports[:500]})
         decisions = [{**d, "nodes": [nodes[e] for e in d["members"] if e in nodes]}

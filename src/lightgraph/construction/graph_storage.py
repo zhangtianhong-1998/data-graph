@@ -235,7 +235,7 @@ def read_graph_record_header(path: Path, *, expected_digest: str | None = None) 
         if metadata_path.stat().st_size > INTERNAL_YAML_MAX_BYTES:
             raise LightGraphError("yaml_document_too_large")
         metadata = safe_load_yaml(metadata_path.read_text(encoding="utf-8"),
-                                  max_bytes=INTERNAL_YAML_MAX_BYTES)
+                                  max_bytes=INTERNAL_YAML_MAX_BYTES, graph_header=True)
         if (not isinstance(metadata, dict) or metadata.get("format_version") != 1
                 or metadata.get("storage_layout") != _FORMAT
                 or not isinstance(metadata.get("graph_metadata"), dict)
@@ -252,11 +252,16 @@ def read_graph_record_header(path: Path, *, expected_digest: str | None = None) 
         raise LightGraphError("invalid_graph_parquet_record") from None
 
 
-def read_graph_record(path: Path, *, expected_digest: str | None = None) -> dict:
+def read_graph_record(path: Path, *, expected_digest: str | None = None,
+                      expected_access_fingerprint: str | None = None) -> dict:
     """Read and verify one snapshot; the caller enforces its workspace boundary."""
     path = io_path(path)
-    metadata = read_graph_record_header(path, expected_digest=expected_digest)
+    metadata = read_graph_record_header(path)
     graph = metadata["graph_metadata"]
+    if expected_access_fingerprint is not None and graph.get("access_fingerprint") != expected_access_fingerprint:
+        raise LightGraphError("graph_access_context_changed")
+    if expected_digest is not None and metadata.get("graph_digest") != expected_digest:
+        raise LightGraphError("graph_parquet_checksum_mismatch")
     try:
         for category in ("nodes", "edges"):
             entry = metadata["collections"][category]

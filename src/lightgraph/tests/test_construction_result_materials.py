@@ -1,5 +1,6 @@
 """Model views are bounded; retained tool values remain exact and scoped."""
 import json
+import os
 import pytest
 
 from lightgraph.construction.result_materials import ResultMaterialStore, token_size, result_token_limit
@@ -29,7 +30,8 @@ def restore(materials, ref, section="", budget=None):
         page = current["next_page"]
 
 
-@pytest.mark.parametrize("value", ["中文说明" * 8000, 'quote\\\"\n' * 5000])
+@pytest.mark.parametrize("value", ["中文说明" * 8000, 'quote\\\"\n' * 5000],
+                         ids=["unicode-cell", "escaped-cell"])
 def test_oversized_single_cell_is_exact_and_every_wrapper_is_token_bounded(tmp_path, value):
     materials = store(tmp_path)
     original = {"status": "ok", "coverage": {"result_complete": False, "truncated": True},
@@ -86,8 +88,10 @@ def test_reference_is_deterministic_private_retained_and_session_bound(tmp_path)
     assert view["result_ref"] == materials.bound(result, "describe_sources")["result_ref"]
     files = list(materials.root.glob("*.json"))
     assert len(files) == 1
-    assert files[0].stat().st_mode & 0o777 == 0o600
-    assert materials.root.stat().st_mode & 0o777 == 0o700
+    assert restore(materials, view["result_ref"])[0] == result
+    if os.name == "posix":
+        assert files[0].stat().st_mode & 0o777 == 0o600
+        assert materials.root.stat().st_mode & 0o777 == 0o700
     other = store(tmp_path)
     with pytest.raises(LightGraphError, match="unknown_result_material"):
         other.read(view["result_ref"], 0, "", access="access", query_budget={})

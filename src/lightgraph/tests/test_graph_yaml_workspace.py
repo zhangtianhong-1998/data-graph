@@ -33,18 +33,20 @@ def with_source_keys(graph):
     return graph
 
 
-def test_yaml_preserves_codes_without_implicit_dates_or_booleans():
-    value = safe_load_yaml("code: 0012\nword: yes\ndate: 2026-11-03\nflag: true\ncount: 12\n")
+@pytest.mark.parametrize('graph_header', [False, True])
+def test_yaml_preserves_codes_without_implicit_dates_or_booleans(graph_header):
+    value = safe_load_yaml("code: 0012\nword: yes\ndate: 2026-11-03\nflag: true\ncount: 12\n", graph_header=graph_header)
     assert value == {'code': '0012', 'word': 'yes', 'date': '2026-11-03', 'flag': True, 'count': 12}
-    assert safe_load_yaml(dump_yaml(value)) == value
+    assert safe_load_yaml(dump_yaml(value), graph_header=graph_header) == value
 
 
 @pytest.mark.parametrize('text', ["status: candidate\nstatus: published", "x: !!python/object/apply:os.system ['echo unexpected']",
     'x: .nan', 'x: .inf', 'x: !!float .nan', 'x: !!timestamp 2026-11-03',
     'x: !!binary YWJj', 'x: &a [1]\ny: *a', 'x: 1\n---\nx: 2'])
-def test_unsafe_yaml_is_rejected(text):
+@pytest.mark.parametrize('graph_header', [False, True])
+def test_unsafe_yaml_is_rejected(text, graph_header):
     with pytest.raises(LightGraphError):
-        safe_load_yaml(text)
+        safe_load_yaml(text, graph_header=graph_header)
 
 
 def test_no_legacy_rule_or_self_approval_fields():

@@ -80,29 +80,30 @@ def derive_display_graph(graph, *, copy=True):
     # Distinct objects are allowed to share a source name. Disambiguate only
     # references inside generated labels, never rewrite the source names.
     names = Counter((node['type'], base[node['id']][0]) for node in by_id.values())
-    outgoing = defaultdict(list)
+    outgoing = {
+        node_id: [] for node_id, (_, origin) in base.items()
+        if origin == 'identity' and definitions.get(by_id[node_id]['type'], {}).get('display_mode') != 'identity'
+    }
     for edge in result.get('edges', []):
-        if edge['source'] in by_id and edge['target'] in by_id and edge['source'] != edge['target']:
+        if edge['source'] in outgoing and edge['target'] in by_id and edge['source'] != edge['target']:
             outgoing[edge['source']].append(edge)
     for node_id, node in by_id.items():
         text, origin = base[node_id]
-        mode = definitions.get(node['type'], {}).get('display_mode', 'auto')
-        # A hub has a stable complete identity and a pageable neighborhood.
-        # Expanding hundreds of neighbors into its name multiplies index and UI payloads.
-        if origin == 'identity' and mode != 'identity' and 0 < len(outgoing[node_id]) <= 32:
-            pieces, covered = [], set()
+        if outgoing.get(node_id):
+            # Preserve the persisted name at every degree. Index membership by
+            # text so a large set of dimensions does not need a quadratic scan.
+            relation_pieces, covered = {}, set()
             for edge in sorted(outgoing[node_id], key=lambda e: (e['type'], base[e['target']][0], e['target'])):
                 target = by_id[edge['target']]
                 label = base[target['id']][0]
                 if names[(target['type'], label)] > 1:
                     label += f"〔{_parts(target.get('identity', {}))}〕"
-                piece = f"{edge['type']}：{label}"
-                if piece not in pieces:
-                    pieces.append(piece)
-                for name, value in target.get('identity', {}).items():
+                relation_pieces[f"{edge['type']}：{label}"] = None
+                for name in target.get('identity', {}):
                     if name in node.get('identity', {}) and identity_cell(node, name) == identity_cell(target, name):
                         covered.add(name)
             remaining = {name: value for name, value in node.get('identity', {}).items() if name not in covered}
+            pieces = list(relation_pieces)
             if remaining:
                 pieces.append(_parts(remaining))
             text, origin = f"{node['type']}（{'；'.join(pieces)}）", 'relations'

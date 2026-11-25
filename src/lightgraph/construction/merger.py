@@ -39,6 +39,13 @@ def _scope_ref_token(kind: str, contributor_id: str, ref: str) -> str:
     return f'{kind}:{contributor_id}:{text}'
 
 
+def bind_support_contributor(support: dict[str, Any], contributor_id: str) -> None:
+    """Fill missing owners on a checkpoint support and its execution records, preserving explicit ownership."""
+    support.setdefault('contributor_id', contributor_id)
+    for origin in support.get('execution_origins', []):
+        origin.setdefault('contributor_id', contributor_id)
+
+
 def _rewrite_evidence_in_graph(
     graph: dict[str, Any],
     *,
@@ -82,9 +89,8 @@ def _rewrite_evidence_in_graph(
         for support in item.get('supports', []):
             if not isinstance(support, dict):
                 continue
-            support.setdefault('contributor_id', contributor_id)
+            bind_support_contributor(support, contributor_id)
             for origin in support.get('execution_origins', []):
-                origin.setdefault('contributor_id', contributor_id)
                 if origin.get('evidence_refs'):
                     origin['evidence_refs'] = [register(r) for r in origin['evidence_refs']]
             prov = support.get('provenance')

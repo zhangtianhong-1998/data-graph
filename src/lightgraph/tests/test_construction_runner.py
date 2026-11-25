@@ -359,6 +359,7 @@ def test_http_publication_capability_is_enforced(tmp_path):
     import anyio
     import httpx
     import json
+    from datetime import timedelta
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
     from lightgraph.construction.mcp_server import serve_local_tools
@@ -367,13 +368,19 @@ def test_http_publication_capability_is_enforced(tmp_path):
     try:
         with serve_local_tools(tools) as (url, token):
             async def request():
-                async with httpx.AsyncClient(headers={'Authorization': 'Bearer ' + token}, trust_env=False) as http:
+                headers = {'Authorization': 'Bearer ' + token}
+                # SSE heartbeats can keep a socket open without delivering an RPC result.
+                # Bound the session response as well as transport setup and teardown.
+                async with httpx.AsyncClient(headers=headers, trust_env=False, timeout=10) as http:
                     async with streamable_http_client(url, http_client=http) as (read, write, _):
-                        async with ClientSession(read, write) as session:
+                        async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=10)) as session:
                             await session.initialize()
                             response = await session.call_tool('publish_graph_draft', {'draft_id': 'anything'})
                             value = response.structuredContent or json.loads(response.content[0].text)
                             assert value['code'] == 'construction_publication_disabled'
-            anyio.run(request)
+            async def check_with_deadline():
+                with anyio.fail_after(25):
+                    await request()
+            anyio.run(check_with_deadline)
     finally:
         tools.close()

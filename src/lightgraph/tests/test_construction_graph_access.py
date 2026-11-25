@@ -170,9 +170,9 @@ def test_repeated_pages_and_two_hops_read_the_published_file_once(published, mon
     calls = {'n': 0}
     original = graph_storage.read_graph_record
 
-    def wrapped(self):
+    def wrapped(path, **options):
         calls['n'] += 1
-        return original(self)
+        return original(path, **options)
 
     monkeypatch.setattr(graph_storage, 'read_graph_record', wrapped)
     graph = load_graph(config)
@@ -202,9 +202,9 @@ def test_replacing_the_published_file_drops_the_cached_view(published, monkeypat
     calls = {'n': 0}
     original = graph_storage.read_graph_record
 
-    def wrapped(self):
+    def wrapped(path, **options):
         calls['n'] += 1
-        return original(self)
+        return original(path, **options)
 
     monkeypatch.setattr(graph_storage, 'read_graph_record', wrapped)
     assert load_graph(config)['nodes']

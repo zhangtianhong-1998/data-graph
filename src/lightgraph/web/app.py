@@ -961,11 +961,12 @@ def create_app(workspace_root: str|Path|None=None, *, frontend_dir: str|Path|Non
         return read_graph_consistently(workspace,pid,read_structure,draft_id=draft_id,revision=revision)
 
     @app.get('/api/projects/{pid}/graph/identity-candidates')
-    def identity_candidates(pid:str,offset:int=0,decision_offset:int=0,version:str|None=None,business_context:str|None=None):
-        with workspace.lock(pid):
-            workspace.get(pid)
-            return identity_review(workspace,pid,offset=offset,decision_offset=decision_offset,version=version,
-                                   business_context=parse_business_context(business_context))
+    def identity_candidates(pid: str, offset: int = 0, decision_offset: int = 0, version: str | None = None,
+                            business_context: str | None = None, view: Literal['full', 'summary'] = 'full',
+                            candidate_id: str | None = None):
+        return graph_history.read_consistently(workspace, pid, identity_review, offset=offset,
+            decision_offset=decision_offset, version=version, business_context=parse_business_context(business_context),
+            view=view, candidate_id=candidate_id)
 
     @app.post('/api/projects/{pid}/graph/identity-decisions')
     def identity_decision(pid:str,data:IdentityDecision,if_match:str|None=Header(default=None)):

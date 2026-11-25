@@ -19,13 +19,14 @@ def test_process_killed_before_manifest_replace_keeps_old_publication(tmp_path):
     script = '''
 from pathlib import Path
 import os, sys, time
+from lightgraph.construction.paths import logical_path
 from lightgraph.construction.workspace import GraphWorkspace
 from lightgraph.tests.test_graph_yaml_workspace import graph
 root, marker = map(Path, sys.argv[1:])
 store = GraphWorkspace(root, 'ctx')
 replace = os.replace
 def pause_before_commit(source, target):
-    if Path(target) == store.manifest_path:
+    if logical_path(target) == logical_path(store.manifest_path):
         marker.write_text('pending replacement', encoding='utf-8')
         time.sleep(60)
     return replace(source, target)

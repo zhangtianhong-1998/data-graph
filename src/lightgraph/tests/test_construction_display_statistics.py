@@ -64,6 +64,23 @@ def test_duplicate_neighbor_names_are_disambiguated_without_relabeling_source_no
     assert '零件号：01' in output['nodes'][2]['label']
 
 
+@pytest.mark.parametrize('mode', ['auto', 'relations'])
+def test_dense_relation_label_replays_each_visible_dimension_in_stable_order(mode):
+    item = node('item', '报表项', {'编码': 'X'})
+    dimensions = [node(f'd{i}', '维度', {'编号': i}, f'维度{i:02d}') for i in range(36)]
+    hidden = node('hidden', '维度', {'编号': 36}, '内部名称', scope='B')
+    links = [edge('item', n['id']) for n in reversed(dimensions)]
+    links.extend([dict(links[0], id='another-observation'), edge('item', 'hidden', scope='B')])
+    original = graph([item, hidden, *dimensions], links,
+                     {'entities': [{'type': '报表项', 'display_mode': mode}], 'relations': []})
+    visible = filter_graph_scopes(original, ['A'])
+    expected = '报表项（' + '；'.join(f'关联：维度{i:02d}' for i in range(36)) + '；编码：X）'
+    rendered = next(n for n in visible['nodes'] if n['id'] == 'item')
+    assert rendered['label'] == rendered['display_label'] == expected
+    assert rendered['label_origin'] == 'relations'
+    assert derive_display_graph(visible) == visible
+
+
 def test_display_uses_only_visible_edges_neighbor_labels_and_declared_supports():
     shared = node('x', '安排', {'编号': 'X'})
     hidden = node('secret', '地点', {'编号': 'S'}, '秘密地点', scope='B')

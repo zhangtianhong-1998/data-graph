@@ -52,7 +52,7 @@ def _record_path(root: Path, relative):
 
 def _view_key(kind, path: Path, stat, access, scopes):
     # Nanosecond timestamps do not survive a JSON number round trip.
-    return {'version': 5, 'kind': kind, 'path': str(logical_path(path)), 'size': stat.st_size,
+    return {'version': 6, 'kind': kind, 'path': str(logical_path(path)), 'size': stat.st_size,
             'mtime_ns': str(stat.st_mtime_ns), 'access': access, 'scopes': scopes}
 
 
@@ -61,7 +61,8 @@ def read_publication_record(root, head, config, *, compose_base, pinned_summary,
     published = _record_path(root, head.get('path'))
     if published.is_dir():
         from lightgraph.construction.graph_storage import read_graph_record
-        graph = read_graph_record(published)
+        graph = read_graph_record(published, expected_digest=head.get('graph_digest'),
+                                  expected_access_fingerprint=head.get('access_fingerprint'))
     else:
         graph = read_internal_yaml(published)
     if graph.get('storage_layout') == 'sharded_v1':
@@ -69,9 +70,6 @@ def read_publication_record(root, head, config, *, compose_base, pinned_summary,
         graph = load_sharded_graph(root, graph)
     if graph.get('access_fingerprint') != head.get('access_fingerprint'):
         raise LightGraphError('graph_access_context_changed')
-    if head.get('graph_digest') and published.is_dir():
-        if read_internal_yaml(published / 'metadata.yaml').get('graph_digest') != head['graph_digest']:
-            raise LightGraphError('graph_parquet_checksum_mismatch')
     if compose_base and graph.get('storage_layout') not in {'sharded_v1', 'parquet_v1'}:
         from lightgraph.construction.inheritance import compose_published_graph, load_frozen_base_graph
         base_graph, _ = load_frozen_base_graph(root, config=config, summary=pinned_summary,

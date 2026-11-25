@@ -1,14 +1,15 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { json, projectPath, request } from './api'
 import type { BusinessContext, Graph, GraphNode } from './types'
-type Candidate = { candidate_id: string; members: string[]; channels: string[]; evidence: string[]; status: string; has_active_decision: boolean; supports_truncated: boolean; facts_truncated?: boolean; nodes: GraphNode[]; facts: unknown[]; supports: unknown[] }
+type CandidateSummary = { candidate_id: string; channels: string[]; status: string; has_active_decision: boolean; nodes: GraphNode[]; member_count: number }
+type Candidate = CandidateSummary & { members: string[]; evidence: string[]; supports_truncated: boolean; facts_truncated?: boolean; facts: unknown[]; supports: unknown[] }
 type Decision = { decision_id: string; candidate_id: string; verdict: 'same' | 'different'; revision: number; active: boolean; status: string; members: string[]; nodes: GraphNode[] }
-type Review = { revision: number; backend?: string; version_id?: string; candidates: Candidate[]; decisions: Decision[]; total_candidates: number; next_offset: number | null; total_decisions: number; next_decision_offset: number | null }
+type Review<Row = CandidateSummary> = { revision: number; backend?: string; version_id?: string; candidates: Row[]; decisions: Decision[]; total_candidates: number; next_offset: number | null; total_decisions: number; next_decision_offset: number | null }
 const props = defineProps<{ projectId: string; configRevision?: string; graph: Graph; businessContext?: BusinessContext | null; disabled?: boolean }>()
 const emit = defineEmits<{ changed: [] }>()
-const review = ref<Review | null>(null), selectedId = ref(''), busy = ref(false), error = ref(''), offset = ref(0), decisionOffset = ref(0)
-const selected = computed(() => review.value?.candidates.find(c => c.candidate_id === selectedId.value))
+const review = shallowRef<Review | null>(null), selectedId = ref(''), busy = ref(false), error = ref(''), offset = ref(0), decisionOffset = ref(0)
+const selected = shallowRef<Candidate | null>(null), detailLoading = ref(false), evidenceOpen = ref(false)
 const members = ref<string[]>([])
 watch(selected, candidate => {
   members.value = candidate && (candidate.members.length === 2 || review.value?.backend !== 'publication') ? [...candidate.members] : []
@@ -33,20 +34,49 @@ function label(node: GraphNode) {
   const key = fields.map(([field, value]) => fields.length === 1 ? String(value) : `${field}=${value}`).join('，')
   return key === name ? name : `${name}（${key}）`
 }
-let generation = 0
-async function load(at = offset.value, decisionAt = decisionOffset.value) {
-  const epoch = ++generation; busy.value = true; error.value = ''
-  try {
-    const params = new URLSearchParams({ offset: String(at), decision_offset: String(decisionAt) })
-    if (typeof props.graph.version_id === 'string' && props.graph.version_id) params.set('version', props.graph.version_id)
-    if (props.businessContext != null) params.set('business_context', JSON.stringify(props.businessContext))
-    const value = await request<Review>(`${projectPath(props.projectId)}/graph/identity-candidates?${params}`)
-    if (epoch !== generation) return
-    review.value = value; offset.value = at; decisionOffset.value = decisionAt
-    if (!value.candidates.some(c => c.candidate_id === selectedId.value)) selectedId.value = ''
-  } catch (e) { if (epoch === generation) { review.value = null; error.value = e instanceof Error ? e.message : '候选读取失败' } }
-  finally { if (epoch === generation) busy.value = false }
+let pageRequest: AbortController | undefined
+function reviewUrl(params: URLSearchParams, version?: string) {
+  if (version) params.set('version', version)
+  if (props.businessContext != null) params.set('business_context', JSON.stringify(props.businessContext))
+  return `${projectPath(props.projectId)}/graph/identity-candidates?${params}`
 }
+async function load(at = offset.value, decisionAt = decisionOffset.value) {
+  pageRequest?.abort()
+  const controller = pageRequest = new AbortController()
+  busy.value = true; error.value = ''; selected.value = null
+  if (at !== offset.value) selectedId.value = ''
+  try {
+    const params = new URLSearchParams({ view: 'summary', offset: String(at), decision_offset: String(decisionAt) })
+    const version = typeof props.graph.version_id === 'string' ? props.graph.version_id : undefined
+    const value = await request<Review>(reviewUrl(params, version), { signal: controller.signal })
+    if (controller.signal.aborted) return
+    if (!value.candidates.some(row => row.candidate_id === selectedId.value)) selectedId.value = ''
+    review.value = value; offset.value = at; decisionOffset.value = decisionAt
+  } catch (e) {
+    if (!controller.signal.aborted) { review.value = null; error.value = e instanceof Error ? e.message : '候选读取失败' }
+  } finally { if (!controller.signal.aborted) busy.value = false }
+}
+onBeforeUnmount(() => pageRequest?.abort())
+watch([selectedId, review], async ([id, page], _, onCleanup) => {
+  selected.value = null; detailLoading.value = false; evidenceOpen.value = false
+  if (!id || !page) return
+  const controller = new AbortController()
+  onCleanup(() => controller.abort())
+  detailLoading.value = true; error.value = ''
+  try {
+    const params = new URLSearchParams({ candidate_id: id })
+    const detail = await request<Review<Candidate>>(reviewUrl(params, page.version_id), { signal: controller.signal })
+    if (controller.signal.aborted) return
+    const row = detail.candidates.find(item => item.candidate_id === id)
+    if (detail.revision !== page.revision || detail.version_id !== page.version_id || !row) {
+      error.value = '候选已更新，请刷新候选。'
+      return
+    }
+    selected.value = row
+  } catch (e) {
+    if (!controller.signal.aborted) error.value = e instanceof Error ? e.message : '候选依据读取失败'
+  } finally { if (!controller.signal.aborted) detailLoading.value = false }
+})
 async function decide(verdict: 'same' | 'different') {
   if (!selected.value || !review.value || !canDecide.value) return
   const candidate = selected.value
@@ -74,7 +104,8 @@ async function mutate(endpoint: string, value: Record<string, unknown>) {
   } catch (e) { error.value = e instanceof Error ? e.message : '裁决未保存' }
   finally { busy.value = false }
 }
-watch([() => props.projectId, () => props.graph, () => props.businessContext], () => {
+watch([() => props.projectId, () => props.graph.version_id || props.graph.generation || props.graph,
+       () => props.configRevision, () => props.businessContext], () => {
   selectedId.value = ''; review.value = null; void load(0, 0)
 }, { immediate: true })
 </script>
@@ -87,10 +118,11 @@ watch([() => props.projectId, () => props.graph, () => props.businessContext], (
       <p v-if="disabled" class="field-hint">运行结束并保存配置后可进行裁决。</p>
       <p v-if="error" role="alert" class="note amber">{{ error }}</p>
       <p v-if="busy" role="status">正在读取或保存…</p>
+      <p v-if="detailLoading" role="status">正在读取所选候选的依据…</p>
       <p v-if="review && !review.total_candidates" class="muted">当前没有归并候选。</p>
       <template v-if="review?.total_candidates">
         <label for="identity-candidate">对象候选（共 {{ review.total_candidates }} 组）</label>
-        <select id="identity-candidate" v-model="selectedId" :disabled="busy"><option value="">选择一组候选</option><option v-for="item in review.candidates" :key="item.candidate_id" :value="item.candidate_id">{{ item.nodes.map(label).join(' / ') }} · {{ item.channels.map(channel).join('、') }}{{ item.status === 'needs_review' ? ' · 依据已变化' : item.has_active_decision ? ' · 已裁决' : '' }}</option></select>
+        <select id="identity-candidate" v-model="selectedId" :disabled="busy"><option value="">选择一组候选</option><option v-for="item in review.candidates" :key="item.candidate_id" :value="item.candidate_id">{{ item.nodes.map(label).join(' / ') }}{{ item.member_count > item.nodes.length ? ` 等 ${item.member_count} 个对象` : '' }} · {{ item.channels.map(channel).join('、') }}{{ item.status === 'needs_review' ? ' · 依据已变化' : item.has_active_decision ? ' · 已裁决' : '' }}</option></select>
         <div class="actions"><button v-if="offset" class="btn small" :disabled="busy" @click="load(Math.max(0, offset - 50))">上一页</button><button v-if="review.next_offset !== null" class="btn small" :disabled="busy" @click="load(review.next_offset!)">下一页</button></div>
       </template>
       <div v-if="selected" class="candidate-detail">
@@ -100,7 +132,7 @@ watch([() => props.projectId, () => props.graph, () => props.businessContext], (
         </fieldset>
         <div class="candidate-nodes"><article v-for="node in selected.nodes" :key="node.id"><h3>{{ label(node) }}</h3><p>{{ node.kind }} · {{ node.status === 'accepted' ? '已接受' : '候选 / 未决' }}</p><pre>{{ JSON.stringify(node, null, 2) }}</pre></article></div>
         <p v-if="selected.supports_truncated" class="note amber">来源支持超过 500 条，当前显示前 500 条。</p><p>候选依据：{{ selected.channels.map(channel).join('、') }}</p>
-        <details><summary>查看字段事实与来源支持（{{ selected.facts_truncated ? '前 ' : '' }}{{ selected.evidence.length }} 条事实）</summary><pre>{{ JSON.stringify({ facts: selected.facts, supports: selected.supports }, null, 2) }}</pre></details>
+        <details @toggle="evidenceOpen = ($event.currentTarget as HTMLDetailsElement).open"><summary>查看字段事实与来源支持（{{ selected.facts_truncated ? '前 ' : '' }}{{ selected.evidence.length }} 条事实）</summary><pre v-if="evidenceOpen">{{ JSON.stringify({ facts: selected.facts, supports: selected.supports }, null, 2) }}</pre></details>
         <div class="actions"><button class="btn primary" :disabled="!canDecide" @click="decide('same')">确认为同一对象</button><button class="btn" :disabled="!canDecide" @click="decide('different')">确认为不同对象</button></div>
         <p v-if="selected.status === 'needs_review'" class="note amber">支持依据已变化，请重新运行抽取后检查。</p>
         </div>

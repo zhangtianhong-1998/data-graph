@@ -455,8 +455,14 @@ describe('业务图来源与归并裁决', () => {
     api.request.mockImplementation(async (_path, options) => { if (options?.method === 'POST') { revision++; return { revision } }; return listing() })
     const changed = vi.fn(); mount(IdentityCandidates, { projectId: 'p', configRevision: '"7"', graph, onChanged: changed })
     await vi.waitFor(() => expect(root.querySelector('#identity-candidate')).not.toBeNull())
-    expect(api.request.mock.calls.every(call => !call[1])).toBe(true)
+    expect(api.request.mock.calls).toHaveLength(1)
+    expect(api.request.mock.calls[0][0]).toContain('view=summary')
     const select = root.querySelector<HTMLSelectElement>('#identity-candidate')!; select.value = 'pair'; select.dispatchEvent(new Event('change', { bubbles: true })); await nextTick()
+    await vi.waitFor(() => expect(root.querySelector('.candidate-detail')).not.toBeNull())
+    expect(api.request.mock.calls[1][0]).toContain('candidate_id=pair')
+    const evidence = root.querySelector<HTMLDetailsElement>('.candidate-detail details')!
+    expect(evidence.querySelector('pre')).toBeNull()
+    evidence.open = true; evidence.dispatchEvent(new Event('toggle')); await nextTick()
     expect(root.textContent).toContain('source_columns'); expect(root.textContent).toContain('Shared')
     const confirm = vi.fn().mockReturnValue(false); vi.stubGlobal('confirm', confirm); button('确认为同一对象').click(); await nextTick()
     expect(api.request.mock.calls.filter(call => call[1]?.method === 'POST')).toHaveLength(0)
@@ -484,6 +490,7 @@ describe('业务图来源与归并裁决', () => {
     expect(JSON.parse(url.searchParams.get('business_context')!)).toEqual({ project: 'M' })
     const select = root.querySelector<HTMLSelectElement>('#identity-candidate')!
     select.value = 'group'; select.dispatchEvent(new Event('change')); await nextTick()
+    await vi.waitFor(() => expect(root.querySelector('fieldset input')).not.toBeNull())
     expect(button('确认为同一对象').disabled).toBe(true)
     const boxes = root.querySelectorAll<HTMLInputElement>('fieldset input')
     boxes[0].click(); boxes[2].click(); await nextTick()
@@ -495,11 +502,40 @@ describe('业务图来源与归并裁决', () => {
     expect(JSON.parse(write[1].body)).toEqual({ revision: 3, version_id: 'v-old', candidate_id: 'group',
       verdict: 'different', members: ['a', 'c'], business_context: { project: 'M' } })
   })
+  it('只请求所选候选的来源，切换后迟到的上一组详情不覆盖当前组', async () => {
+    const summaries = ['first', 'second'].map(id => ({ candidate_id: id, nodes: graph.nodes,
+      channels: ['name'], status: 'candidate', member_count: 2, has_active_decision: false }))
+    const page = { revision: 2, version_id: 'v1', backend: 'publication', candidates: summaries,
+      decisions: [], total_candidates: 2, total_decisions: 0, next_offset: null, next_decision_offset: null }
+    const detail = (id: string) => ({ ...page, candidates: [{ ...summaries.find(r => r.candidate_id === id),
+      nodes: [{ id: 'a', label: id + '原节点' }, { id: 'b', label: '另一个对象' }], members: ['a', 'b'],
+      evidence: [], facts: [], supports: [] }] })
+    let finishFirst!: (value: unknown) => void
+    api.request.mockImplementation(async path => {
+      const params = new URL(path, 'http://localhost').searchParams
+      if (params.get('view') === 'summary') return page
+      expect(params.get('version')).toBe('v1')
+      if (params.get('candidate_id') === 'first') return new Promise(resolve => { finishFirst = resolve })
+      expect(params.get('candidate_id')).toBe('second')
+      return detail('second')
+    })
+    mount(IdentityCandidates, { projectId: 'p', graph })
+    await vi.waitFor(() => expect(root.querySelector('#identity-candidate')).not.toBeNull())
+    const select = root.querySelector<HTMLSelectElement>('#identity-candidate')!
+    select.value = 'first'; select.dispatchEvent(new Event('change')); await nextTick()
+    select.value = 'second'; select.dispatchEvent(new Event('change'))
+    await vi.waitFor(() => expect(root.querySelector('.candidate-detail h3')?.textContent).toBe('second原节点'))
+    expect(api.request.mock.calls[1][1].signal.aborted).toBe(true)
+    finishFirst(detail('first')); await nextTick(); await nextTick()
+    expect(root.querySelector('.candidate-detail h3')?.textContent).toBe('second原节点')
+    expect(api.request.mock.calls).toHaveLength(3)
+  })
   it('运行或配置未保存期间不能提交裁决', async () => {
     api.request.mockResolvedValue({ revision: 0, candidates: [{ candidate_id: 'pair', members: ['a', 'b'], nodes: graph.nodes, evidence: [], facts: [], supports: [], channels: ['name'], status: 'candidate' }], decisions: [], total_candidates: 1, next_offset: null })
     mount(IdentityCandidates, { projectId: 'p', configRevision: '"7"', graph, disabled: true })
     await vi.waitFor(() => expect(root.querySelector('#identity-candidate')).not.toBeNull())
     const select = root.querySelector<HTMLSelectElement>('#identity-candidate')!; select.value = 'pair'; select.dispatchEvent(new Event('change', { bubbles: true })); await nextTick()
+    await vi.waitFor(() => expect(root.querySelector('.candidate-detail')).not.toBeNull())
     expect(button('确认为同一对象').disabled).toBe(true); expect(button('确认为不同对象').disabled).toBe(true)
   })
 })

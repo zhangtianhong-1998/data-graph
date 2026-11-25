@@ -17,6 +17,7 @@ from typing import Any
 
 import yaml
 from pydantic import BaseModel
+from yaml.composer import Composer
 from yaml.nodes import MappingNode
 
 from lightgraph.contracts import canonical, digest
@@ -41,10 +42,8 @@ SNAPSHOT_RETRY_FAILURES = frozenset({
 })
 
 
-class _GraphYamlLoader(yaml.SafeLoader):
-    """JSON-like scalar semantics with duplicate keys and aliases forbidden."""
-
-    yaml_implicit_resolvers = {}
+class _GraphYamlRules:
+    """Use the same mapping and alias checks with either YAML event reader."""
 
     def compose_node(self, parent, index):
         if self.check_event(yaml.AliasEvent):
@@ -65,6 +64,10 @@ class _GraphYamlLoader(yaml.SafeLoader):
         return result
 
 
+class _GraphYamlLoader(_GraphYamlRules, yaml.SafeLoader):
+    yaml_implicit_resolvers = {}
+
+
 class _GraphYamlDumper(yaml.SafeDumper):
     def ignore_aliases(self, data):
         return True
@@ -79,6 +82,19 @@ _GraphYamlLoader.add_implicit_resolver("tag:yaml.org,2002:int", re.compile(r"^[-
 _GraphYamlLoader.add_implicit_resolver("tag:yaml.org,2002:float", re.compile(
     r"^[-+]?(?:(?:0|[1-9][0-9]*)\.[0-9]*(?:[eE][-+]?[0-9]+)?|(?:0|[1-9][0-9]*)[eE][-+]?[0-9]+|\.[0-9]+|\.(?:inf|Inf|INF|nan|NaN|NAN))$"
 ), list("-+0123456789."))
+
+
+if hasattr(yaml, 'CSafeLoader'):
+    class _GraphHeaderLoader(_GraphYamlRules, Composer, yaml.CSafeLoader):
+        # libyaml reads events. The Python composer still visits every alias,
+        # and applies the same scalar resolution as the original graph writer.
+        yaml_implicit_resolvers = _GraphYamlLoader.yaml_implicit_resolvers
+
+        def __init__(self, stream):
+            yaml.CSafeLoader.__init__(self, stream)
+            Composer.__init__(self)
+else:
+    _GraphHeaderLoader = _GraphYamlLoader
 
 
 def _check_yaml_tree(value: Any, depth: int = 0) -> None:
@@ -103,12 +119,19 @@ def _check_yaml_tree(value: Any, depth: int = 0) -> None:
     raise LightGraphError("unsupported_yaml_value")
 
 
-def safe_load_yaml(text: str, *, max_bytes: int = 8 * 1024 * 1024) -> Any:
+def safe_load_yaml(text: str, *, max_bytes: int = 8 * 1024 * 1024, graph_header: bool = False) -> Any:
     """Parse one bounded YAML document without arbitrary tags or implicit dates."""
     if not isinstance(text, str) or len(text.encode("utf-8")) > max_bytes:
         raise LightGraphError("yaml_document_too_large")
     try:
-        value = yaml.load(text, Loader=_GraphYamlLoader)
+        loader = _GraphHeaderLoader if graph_header else _GraphYamlLoader
+        try:
+            value = yaml.load(text, Loader=loader)
+        except yaml.YAMLError:
+            if loader is _GraphYamlLoader:
+                raise
+            # Some legacy scalar spellings are accepted only by the Python reader.
+            value = yaml.load(text, Loader=_GraphYamlLoader)
         _check_yaml_tree(value)
         return value
     except (yaml.YAMLError, RecursionError, ValueError, TypeError):
