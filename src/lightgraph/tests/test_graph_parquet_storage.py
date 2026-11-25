@@ -1,5 +1,7 @@
 """Parquet snapshots retain exact graph rows and never publish partial writes."""
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from threading import Barrier
 
 import pyarrow.parquet as pq
 import pytest
@@ -76,6 +78,33 @@ def test_immutable_record_cannot_be_replaced(tmp_path):
     assert {file.name: file.read_bytes() for file in path.iterdir()} == before
 
 
+def test_concurrent_record_install_has_one_complete_winner(tmp_path, monkeypatch):
+    destination = tmp_path / "contended.graph"
+    ready = Barrier(2)
+    write_metadata = graph_storage._write_metadata
+
+    def finish_staging(path, text):
+        write_metadata(path, text)
+        assert not destination.exists()
+        ready.wait(timeout=10)
+
+    monkeypatch.setattr(graph_storage, "_write_metadata", finish_staging)
+
+    def submit(label):
+        value = {"nodes": [{"id": label}], "edges": []}
+        try:
+            write_graph_record(destination, value)
+        except LightGraphError as exc:
+            assert exc.code == "graph_parquet_record_exists"
+            return None
+        return value
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = list(workers.map(submit, ("one", "two")))
+    assert [value for value in results if value] == [read_graph_record(destination)]
+    assert list(tmp_path.iterdir()) == [destination]
+
+
 def test_interrupted_write_never_publishes_metadata(tmp_path, monkeypatch):
     path = tmp_path / "interrupted"
     real_write = graph_storage._write_rows
@@ -88,23 +117,29 @@ def test_interrupted_write_never_publishes_metadata(tmp_path, monkeypatch):
     monkeypatch.setattr(graph_storage, "_write_rows", fail_edges)
     with pytest.raises(OSError, match="simulated interruption"):
         write_graph_record(path, graph())
-    assert (path / "nodes.parquet").is_file()
-    assert not (path / "metadata.yaml").exists()
+    assert not path.exists()
+    assert list(tmp_path.iterdir()) == []
     with pytest.raises(LightGraphError, match="invalid_graph_parquet_record"):
         read_graph_record(path)
 
 
-def test_metadata_publish_failure_never_exposes_partial_record(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure_point", ["_write_metadata", "rename"])
+def test_failed_install_can_be_retried_at_same_path(tmp_path, monkeypatch, failure_point):
     path = tmp_path / "interrupted"
 
-    def fail_replace(*args):
-        raise OSError("simulated metadata interruption")
+    def fail(*args):
+        assert not path.exists()
+        raise OSError("simulated install failure")
 
-    monkeypatch.setattr(graph_storage.os, "replace", fail_replace)
-    with pytest.raises(OSError, match="simulated metadata interruption"):
-        write_graph_record(path, graph())
-    assert not (path / "metadata.yaml").exists()
-    assert not list(path.glob(".metadata-*"))
+    with monkeypatch.context() as patch:
+        owner = graph_storage if failure_point == "_write_metadata" else graph_storage.os
+        patch.setattr(owner, failure_point, fail)
+        with pytest.raises(OSError, match="simulated install failure"):
+            write_graph_record(path, graph())
+    assert list(tmp_path.iterdir()) == []
+    write_graph_record(path, graph())
+    assert read_graph_record(path) == graph()
+
 
 
 def test_file_and_metadata_corruption_are_detected(tmp_path):
@@ -183,6 +218,8 @@ def test_rows_are_not_subject_to_the_yaml_record_limit(tmp_path, monkeypatch):
     path = tmp_path / "record"
     write_graph_record(path, value)
     assert read_graph_record(path) == value
+
+
 def test_parquet_fsync_uses_writable_descriptor(tmp_path, monkeypatch):
     """Enforce Windows _commit semantics even on POSIX test hosts."""
     import errno

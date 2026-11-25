@@ -8,6 +8,7 @@ from pathlib import Path, PureWindowsPath
 from lightgraph.contracts import digest, canonical
 from lightgraph.construction.access import access_fingerprint, ensure_supported_access, filter_graph_scopes
 from lightgraph.construction.graph_storage import _graph_digest
+from lightgraph.construction.paths import io_path, logical_path
 from lightgraph.construction.workspace import read_internal_yaml
 from lightgraph.errors import LightGraphError
 from lightgraph.graph_neighborhood import neighborhood_paths
@@ -16,7 +17,7 @@ from .graph_payload import listed, canvas_item, canvas_page, hierarchy_display, 
 
 
 def available(config):
-    root = Path(config.output_dir) / 'construction'
+    root = io_path(config.output_dir) / 'construction'
     manifest = root / 'manifest.yaml'
     if not manifest.exists():
         return False
@@ -38,6 +39,7 @@ def _record_path(root: Path, relative):
     name = PureWindowsPath(relative)
     if name.anchor or not name.parts or '..' in name.parts:
         raise LightGraphError('invalid_graph_workspace_record')
+    root = io_path(root)
     if root.is_symlink():
         raise LightGraphError('invalid_graph_workspace_record')
     path = root
@@ -50,7 +52,7 @@ def _record_path(root: Path, relative):
 
 def _view_key(kind, path: Path, stat, access, scopes):
     # Nanosecond timestamps do not survive a JSON number round trip.
-    return {'version': 5, 'kind': kind, 'path': str(path), 'size': stat.st_size,
+    return {'version': 5, 'kind': kind, 'path': str(logical_path(path)), 'size': stat.st_size,
             'mtime_ns': str(stat.st_mtime_ns), 'access': access, 'scopes': scopes}
 
 
@@ -82,7 +84,7 @@ def load_prepared(config, *, root=None, head=None, authorization_root=None):
     """Return the authorized display graph and the token that identifies it."""
     ensure_supported_access(config)
     selected_head = head is not None
-    root = Path(root) if root is not None else Path(config.output_dir) / 'construction'
+    root = io_path(root) if root is not None else io_path(config.output_dir) / 'construction'
     manifest_path = root / 'manifest.yaml'
     if root.is_symlink() or manifest_path.is_symlink():
         raise LightGraphError('workspace_path_invalid')
@@ -176,7 +178,7 @@ def retrieval_status(config, *, embedding_api_key=None) -> dict:
     from lightgraph.retrieval import resolve_embedder
     from lightgraph.retrieval.sync import active_index, index_matches_embedder
 
-    root = Path(config.output_dir) / 'construction'
+    root = io_path(config.output_dir) / 'construction'
     manifest = root / 'manifest.yaml'
     if root.is_symlink() or manifest.is_symlink():
         raise LightGraphError('workspace_path_invalid')
@@ -264,7 +266,7 @@ def project_retriever(config, *, refresh=False, embedding_api_key=None, model_ap
     """Bind both indexes to the active publication and its current access scope."""
     from lightgraph.retrieval import SubgraphRetriever, resolve_embedder, sync_graph_to_retrieval
     from lightgraph.retrieval.mentions import resolve_mention_extractor
-    root = Path(config.output_dir) / 'construction'
+    root = io_path(config.output_dir) / 'construction'
     manifest = root / 'manifest.yaml'
     if root.is_symlink() or manifest.is_symlink():
         raise LightGraphError('workspace_path_invalid')

@@ -23,7 +23,7 @@ def test_scripted_worker_preserves_unrelated_subprocesses(monkeypatch, tmp_path)
 
 
 def test_rerun_deterministic_merge_via_http_replays_four_checkpoints_before_publication(client, monkeypatch):
-    from lightgraph.construction import checkpoints, merger
+    from lightgraph.construction import checkpoints, merger, workflow
 
     install_scripted_worker(monkeypatch, draft_factory=hierarchy_proposal)
     create(client)
@@ -71,6 +71,17 @@ def test_rerun_deterministic_merge_via_http_replays_four_checkpoints_before_publ
 
     monkeypatch.setattr(checkpoints, 'load_checkpoint', load_once)
 
+    publishing = threading.Event()
+    release_publication = threading.Event()
+    publish = workflow.publish_premerged_graph
+
+    def pause_publication(*args, **kwargs):
+        publishing.set()
+        assert release_publication.wait(30), 'test did not release publication'
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, 'publish_premerged_graph', pause_publication)
+
     def unexpected_worker(*args, **kwargs):
         raise AssertionError('merge-only rerun started an extract worker')
     replace_worker_launch(monkeypatch, unexpected_worker)
@@ -79,6 +90,20 @@ def test_rerun_deterministic_merge_via_http_replays_four_checkpoints_before_publ
         assert accepted.status_code == 202, accepted.text
     finally:
         release.set()
+    try:
+        assert publishing.wait(30), 'merge did not reach publication'
+        # A committed merge checkpoint can coexist with a still-running parent.
+        # Poll the same record the workbench uses before publication can finish.
+        run_url = api + '/runs/' + accepted.json()['run_id']
+        for view in ('full', 'workbench', 'summary'):
+            response = client.get(run_url, params={'view': view})
+            assert response.is_success, response.text
+            status = response.json()
+            assert status['status'] == 'running' and status['finished_at'] is None
+            if view == 'full':
+                assert status['workflow_state']['merge_nodes']['merge_1']['artifact_status'] == 'committed'
+    finally:
+        release_publication.set()
     rerun = finish(accepted)
     state = rerun['workflow_state']
     assert sorted(reads) == units and rerun['status'] == 'completed', state
@@ -156,6 +181,7 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
     previous = tmp_path / 'audit.json'
     previous.write_text(json.dumps(report), encoding='utf-8-sig')
     rerun = audit(run_file, 'merged', compare_to=previous, include_edge_lineage=True, explain_identity='A')
+    assert rerun['with_source_replay']['rows_match_committed'] == {'nodes': True, 'edges': True}
     trace = rerun['with_source_replay']['identity_trace']
     assert trace['identity_value'] == 'A' and len(trace['output_ids']) == 2
     assert 'identity_trace' not in report['with_source_replay']

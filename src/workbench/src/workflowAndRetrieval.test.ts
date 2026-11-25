@@ -179,7 +179,9 @@ beforeEach(() => {
                 output_directed_endpoint_pairs: 10, output_multi_edge_pairs: 3, output_endpoint_pair_excess: 4, output_self_loop_edges: 1 } },
             merge_2: { node_id: 'merge_2', label: '确定性合并', merge_mode: 'deterministic', status: 'completed', run_id: null },
             reviewed: { node_id: 'reviewed', label: '并行子图融合', merge_mode: 'overlap_review', status: 'completed',
-              overlap_review: { status: 'reviewed', pattern_count: 7, reviewed_patterns: 5, omitted_patterns: 2, selected_patterns: 1, added_entity_rules: 2, model_calls: 1 } },
+              overlap_review: { status: 'partial', reason: 'model_response_truncated', pattern_count: 7, submitted_patterns: 6, reviewed_patterns: 5,
+                failed_patterns: 1, omitted_patterns: 3, analysis_omitted_patterns: 2, selected_patterns: 1,
+                added_entity_rules: 2, model_calls: 2 } },
             merge_3: { node_id: 'merge_3', label: '从产物恢复', merge_mode: 'merge_and_extract', status: 'completed', run_id: 'run_old' },
           },
           recomposed_nodes: ['merge_3'],
@@ -559,7 +561,12 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     const current = rows.find(row => row.textContent?.includes('全节点合并抽取'))!
     expect(current.textContent).toContain('补充抽取后合并关系记录 15 → 14 条')
     expect(current.textContent).toContain('有向端点对 10 组，其中 3 组有多条关系')
-    expect(rows.find(row => row.textContent?.includes('并行子图融合'))?.textContent).toContain('7 种重叠模式，模型审查 5 种、建议合并 1 种，生效的新规则 2 条')
+    const review = rows.find(row => row.textContent?.includes('并行子图融合'))?.textContent
+    expect(review).toContain('7 种重叠模式，模型审查 5 种、建议合并 1 种，生效的新规则 2 条')
+    expect(review).toContain('模型请求 2 次，送审 6 种，已列出但未送审 1 种')
+    expect(review).toContain('1 种已送审的模式未取得有效裁决')
+    expect(review).toContain('索引分析另省略 2 种模式')
+    expect(review).toContain('部分模式未完成审查（模型回复被截断）')
     expect(current.textContent).toContain('每对端点只计一次，记录数相差 4 条。自环 1 条')
     expect(rows.find(row => row.textContent?.includes('确定性合并'))?.textContent).toContain('此运行未记录有向端点统计')
 

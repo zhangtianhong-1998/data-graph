@@ -8,6 +8,18 @@ import pytest
 compare = runpy.run_path(str(Path(__file__).resolve().parents[3] / "scripts/audit_checkpoint_merge.py"))["compare_hierarchy_audits"]
 
 
+def test_graph_row_digests_compare_payloads_and_ignore_storage_order():
+    row_digests = compare.__globals__['_graph_row_digests']
+    nodes = [{'id': 'a', 'supports': [{'label': 'original'}]}, {'id': 'b'}]
+    edges = [{'id': 'r', 'source': 'a', 'target': 'b'}]
+    saved = row_digests({'nodes': nodes, 'edges': edges})
+    assert row_digests({'nodes': list(reversed(nodes)), 'edges': edges}) == saved
+    nodes[0]['supports'][0]['label'] = 'changed'
+    changed = row_digests({'nodes': nodes, 'edges': edges})
+    assert changed['nodes'] != saved['nodes'] and changed['edges'] == saved['edges']
+    assert row_digests({'nodes': nodes, 'edges': edges * 2})['edges'] != saved['edges']
+
+
 def test_run_summary_reads_only_the_requested_generation_and_parquet_footers(tmp_path, monkeypatch):
     from lightgraph.construction.checkpoints import commit_checkpoint
     from lightgraph.construction.workflow import save_workflow_state

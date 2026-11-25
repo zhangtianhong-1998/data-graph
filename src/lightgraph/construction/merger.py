@@ -993,7 +993,8 @@ def write_sharded_graph(construction_dir: str | Path, merged: dict[str, Any], *,
                         unit_attempts: dict[str, str] | None = None, result_policy_id: str | None = None) -> dict[str, Any]:
     """Publish an immutable Parquet snapshot (name retained for API compatibility)."""
     from .graph_storage import write_graph_record
-    root = Path(construction_dir)
+    from .paths import io_path
+    root = io_path(construction_dir)
     (root / 'published').mkdir(parents=True, exist_ok=True)
     publication = 'published/' + uuid.uuid4().hex + '.graph'
     graph = {**merged, 'storage_layout': 'parquet_v1'}

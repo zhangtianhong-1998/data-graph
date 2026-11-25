@@ -7,6 +7,7 @@ import pytest
 from lightgraph.construction import graph_storage, workspace
 from lightgraph.construction.access import access_fingerprint
 from lightgraph.construction.merger import _shard_bucket, write_sharded_graph
+from lightgraph.construction.paths import io_path
 from lightgraph.construction.workflow import load_unit_contributor, publish_merged_contributors
 from lightgraph.construction.workspace import GraphWorkspace, parse_graph_draft, read_internal_yaml, write_yaml
 from lightgraph.errors import LightGraphError
@@ -44,10 +45,10 @@ def publish(store, cfg, name="draft", node="n1"):
     store.save_draft(draft(name))
     expected = graph(cfg, node)
     receipt = store.record_validation(name, revision=1, passed=True, graph=expected).validation
-    assert (store.root / receipt.graph_path / "nodes.parquet").is_file()
+    assert io_path(store.root / receipt.graph_path / "nodes.parquet").is_file()
     assert store.read_validation_graph(name, receipt) == expected
     entry = store.publish(name, revision=1, graph=expected)
-    assert (store.root / entry["graph"] / "edges.parquet").is_file()
+    assert io_path(store.root / entry["graph"] / "edges.parquet").is_file()
     return expected
 
 
@@ -84,6 +85,24 @@ def test_preview_publication_unit_contributors_and_dag_merge_use_parquet(tmp_pat
     visible = load_graph(cfg)
     assert len(visible["nodes"]) == 2
     assert all(node["supports"][0]["scope_ref"] == "public" for node in visible["nodes"])
+    flush_graph_views()
+
+
+def test_validate_publish_and_reopen_graphs_beyond_windows_max_path(tmp_path):
+    root = tmp_path
+    while len(str(root)) < 265:
+        root = root / "nested-project-directory"
+    cfg = config(root)
+    store = GraphWorkspace(root / "construction", "ctx")
+    publish(store, cfg)
+    restored = GraphWorkspace(store.root, "ctx")
+    head = restored._manifest()["current_graph"]
+    assert head["graph_digest"] == graph_storage._graph_digest(restored.read_published_graph())
+    assert head["path"].startswith("published/")
+    contributor = load_unit_contributor(root, "unit")
+    assert contributor["graph"] == restored.read_published_graph()
+    assert contributor["evidence_records"]["e1"]["kind"] == "schema"
+    assert [row["id"] for row in load_graph(cfg)["nodes"]] == ["n1"]
     flush_graph_views()
 
 
@@ -154,7 +173,7 @@ def test_failed_publication_does_not_advance_head_or_prior_records(tmp_path, mon
     def fail_metadata(*args):
         raise OSError("simulated publish interruption")
 
-    monkeypatch.setattr(graph_storage, "_publish_metadata", fail_metadata)
+    monkeypatch.setattr(graph_storage, "_write_metadata", fail_metadata)
     with pytest.raises(OSError, match="simulated publish interruption"):
         store.publish("next", revision=1, graph=expected)
     assert store.manifest_path.read_bytes() == manifest_before
@@ -195,7 +214,7 @@ def test_parquet_web_view_preserves_scope_filter_and_rejects_changed_access(tmp_
 
 
 @pytest.mark.parametrize('operation', ['freeze', 'copy'])
-def test_inherited_snapshot_retry_preserves_old_summary_and_ignores_orphans(tmp_path, monkeypatch, operation):
+def test_inherited_snapshot_retry_preserves_old_summary_and_leaves_no_partial_graphs(tmp_path, monkeypatch, operation):
     from lightgraph.construction.inheritance import freeze_inherited_graphs, frozen_contributors
     from lightgraph.construction.workflow import copy_frozen_inheritance
     cfg = config(tmp_path / 'project')
@@ -228,10 +247,9 @@ def test_inherited_snapshot_retry_preserves_old_summary_and_ignores_orphans(tmp_
     assert summary_path.read_bytes() == original_summary
     assert frozen_contributors(target, config=cfg)[0] == original_graph
     orphans = [p for p in (target / 'inherited').glob('*.graph') if not (p / 'metadata.yaml').exists()]
-    assert len(orphans) == 1
+    assert orphans == []
     monkeypatch.setattr(graph_storage, '_write_rows', write_rows)
     run()
     assert frozen_contributors(target, config=cfg)[0] == original_graph
     assert summary_path.read_bytes() != original_summary
-    assert orphans[0].exists()
     assert all(len(p.name) <= 38 for p in (target / 'inherited').glob('*.graph'))

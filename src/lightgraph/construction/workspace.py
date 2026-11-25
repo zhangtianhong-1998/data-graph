@@ -24,6 +24,7 @@ from lightgraph.errors import LightGraphError
 from lightgraph.runtime.retention import atomic_text
 
 from .models import DataValidation, DraftRecord, EvidenceRecord, GraphDraft, draft_evidence_refs
+from .paths import io_path
 
 # Only legacy/internal records use this compatibility limit. Agent-authored YAML
 # remains bounded at 8 MiB; instance graphs are stored in Parquet, not YAML.
@@ -122,14 +123,14 @@ def dump_yaml(value: Any) -> str:
 
 def read_internal_yaml(path: str | Path) -> Any:
     """Read existing internal YAML with a bound checked before allocating text."""
-    path = Path(path)
+    path = io_path(path)
     if path.stat().st_size > INTERNAL_YAML_MAX_BYTES:
         raise LightGraphError('yaml_document_too_large')
     return safe_load_yaml(path.read_text(encoding='utf-8'), max_bytes=INTERNAL_YAML_MAX_BYTES)
 
 
 def write_yaml(path: str | Path, value: Any) -> None:
-    atomic_text(path, dump_yaml(value))
+    atomic_text(io_path(path), dump_yaml(value))
 
 
 def parse_graph_draft(text: str) -> GraphDraft:
@@ -146,9 +147,9 @@ class GraphWorkspace:
         self.root = Path(root)
         self.context_fingerprint = context_fingerprint
         self.write_seconds = 0.0
-        self.root.mkdir(parents=True, exist_ok=True)
+        io_path(self.root).mkdir(parents=True, exist_ok=True)
         self.manifest_path = self.root / "manifest.yaml"
-        if not self.manifest_path.exists():
+        if not io_path(self.manifest_path).exists():
             self._save_manifest({"format_version": 1, "target": "graph", "drafts": {},
                                  "evidence": {}, "evidence_history": {}, "publications": {}})
         self._manifest()
@@ -172,8 +173,9 @@ class GraphWorkspace:
     def _read_record(self, relative: str) -> dict:
         if not isinstance(relative, str):
             raise LightGraphError("invalid_graph_workspace_record")
-        path = (self.root / relative).resolve()
-        if not path.is_relative_to(self.root.resolve()) or path == self.root.resolve():
+        root = io_path(self.root).resolve()
+        path = (root / relative).resolve()
+        if not path.is_relative_to(root) or path == root:
             raise LightGraphError("invalid_graph_workspace_record")
         try:
             if path.is_dir():
@@ -189,14 +191,14 @@ class GraphWorkspace:
             if folder in {'previews', 'published'} and isinstance(value, dict):
                 from .graph_storage import write_graph_record
                 relative = f'{folder}/{uuid.uuid4().hex}.graph'
-                (self.root / folder).mkdir(parents=True, exist_ok=True)
+                io_path(self.root / folder).mkdir(parents=True, exist_ok=True)
                 write_graph_record(self.root / relative, value)
                 return relative
             serialized = dump_yaml(value)
             if len(serialized.encode('utf-8')) > INTERNAL_YAML_MAX_BYTES:
                 raise LightGraphError('yaml_document_too_large')
             relative = f"{folder}/{uuid.uuid4().hex}.yaml"
-            path = self.root / relative
+            path = io_path(self.root / relative)
             path.parent.mkdir(parents=True, exist_ok=True)
             # Exclusive creation protects snapshots even if a caller ignores the
             # single-writer contract. The manifest moves only after fsync succeeds.

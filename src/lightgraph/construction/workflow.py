@@ -26,6 +26,7 @@ from .graph_storage import _graph_digest
 from .inheritance import freeze_inherited_graphs, frozen_contributors
 from .intent import effective_goal_markdown
 from .merger import identity_candidate_node_counts, merge_construction_graphs, write_sharded_graph
+from .paths import io_path
 from .workspace import GraphWorkspace, read_internal_yaml, write_yaml
 
 
@@ -442,7 +443,7 @@ def _read_workspace_evidence_map(construction_dir: Path) -> dict[str, dict[str, 
 
 
 def load_unit_contributor(unit_output_dir: str | Path, unit_id: str) -> dict[str, Any] | None:
-    construction_dir = Path(unit_output_dir) / 'construction'
+    construction_dir = io_path(unit_output_dir) / 'construction'
     manifest_path = construction_dir / 'manifest.yaml'
     if not manifest_path.is_file():
         return None
@@ -471,7 +472,7 @@ def publish_premerged_graph(
     mode: str = 'dag_merge',
 ) -> dict[str, Any]:
     """Persist an already-merged graph dict as the sharded root construction publication."""
-    root_output = Path(project_output_dir)
+    root_output = io_path(project_output_dir)
     root_construction = root_output / 'construction'
     root_construction.mkdir(parents=True, exist_ok=True)
     from .snapshot_registry import register_access_context

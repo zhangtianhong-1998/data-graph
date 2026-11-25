@@ -1,9 +1,8 @@
-"""Ask the configured project model to review one bounded batch of schema overlaps."""
+"""Ask the configured project model to review bounded batches of schema overlaps."""
 from __future__ import annotations
 
 import os
 import re
-from collections import Counter
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -14,9 +13,13 @@ from lightgraph.discovery.budget import BudgetAllocator, Cost
 from lightgraph.discovery.token_estimation import estimate_tokens, prompt_token_limit
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.model_endpoint import output_token_field
+from .overlap_patterns import MAX_PATTERNS
 
 
-_MAX_PATTERNS = 32
+_MAX_BATCH_PATTERNS = 4
+# Leave room for provider reasoning as well as the small structured decision.
+_OUTPUT_TOKENS_PER_PATTERN = 1024
+_MAX_OUTPUT_TOKENS = 8192
 _MAX_PROMPT_BYTES = 64 * 1024
 _PATTERN_ID = re.compile(r'pattern_[0-9a-f]{24}')
 _INSTRUCTIONS = """Review overlapping schema projections in a single graph construction batch.
@@ -98,7 +101,12 @@ def _structural_profile(pattern):
 def _decisions(reply, issued):
     from lightgraph.discovery.llm import _strict_json_loads
 
-    message = reply['choices'][0]['message']
+    choice = reply['choices'][0]
+    if choice.get('finish_reason') == 'length':
+        raise LightGraphError('model_response_truncated')
+    if choice.get('finish_reason') != 'stop':
+        raise ValueError('invalid_decisions')
+    message = choice['message']
     if message.get('tool_calls') or not isinstance(message.get('content'), str):
         raise ValueError('invalid_decisions')
     result = _Batch.model_validate(_strict_json_loads(message['content']))
@@ -111,9 +119,35 @@ def _decisions(reply, issued):
     return [{'pattern_id': pid, 'action': decisions[pid]} for pid in issued]
 
 
+def _plan_batches(patterns, payload, limits):
+    max_bytes = min(limits.max_prompt_bytes or _MAX_PROMPT_BYTES, _MAX_PROMPT_BYTES)
+    token_limit = prompt_token_limit(limits)
+    max_count = min(_MAX_BATCH_PATTERNS, max(1, limits.max_output_tokens // _OUTPUT_TOKENS_PER_PATTERN))
+
+    def fits(profiles):
+        payload['messages'][1]['content'] = canonical({'patterns': profiles})
+        packet = canonical(payload)
+        return len(packet.encode()) <= max_bytes and (token_limit is None or estimate_tokens(packet) <= token_limit)
+
+    ordered = sorted(patterns, key=lambda p: ('apply' not in p['eligible_actions'], p['pattern_id']))
+    batches, current, oversized = [], [], []
+    for pattern in ordered[:MAX_PATTERNS]:
+        profile = _structural_profile(pattern)
+        if not fits([profile]):
+            oversized.append(profile['pattern_id'])
+            continue
+        if current and (len(current) >= max_count or not fits([*current, profile])):
+            batches.append(current)
+            current = []
+        current.append(profile)
+    if current:
+        batches.append(current)
+    return batches, oversized
+
+
 def review_overlap_patterns(config, patterns, *, api_key=None, check_cancelled=None, remaining_seconds=None,
-                            on_model_call=None):
-    """Review structural patterns once. A failed batch never authorizes new equivalences."""
+                            on_model_call=None, max_calls=None):
+    """Each issued pattern belongs to one batch. Only complete, valid batches grant decisions."""
     from lightgraph.discovery.llm import response_format_for
     from lightgraph.discovery.sdk_transport import request_completion
 
@@ -121,13 +155,15 @@ def review_overlap_patterns(config, patterns, *, api_key=None, check_cancelled=N
         check_cancelled()
     audit = {'status': 'skipped', 'reason': 'no_patterns', 'model_calls': 0,
              'total_patterns': len(patterns), 'reviewed_patterns': 0, 'omitted_patterns': len(patterns),
-             'submitted_patterns': 0, 'decisions': [], 'selected_pattern_ids': []}
+             'submitted_patterns': 0, 'failed_patterns': 0, 'oversized_pattern_ids': [], 'batches': [],
+             'decisions': [], 'selected_pattern_ids': []}
     if not patterns:
         return audit
     model = config.resolved_model
     if model.mode not in {'in_environment', 'approved_external'} or not model.base_url or not model.model:
         return {**audit, 'reason': 'model_not_configured'}
-    if model.max_calls == 0:
+    call_limit = min(v for v in (MAX_PATTERNS, model.max_calls, max_calls) if v is not None)
+    if not call_limit:
         return {**audit, 'reason': 'model_call_budget_exhausted'}
     url = urlsplit(model.base_url)
     if url.scheme == 'http' and url.hostname not in {'localhost', '127.0.0.1', '::1'} and not model.allow_insecure_http:
@@ -136,57 +172,77 @@ def review_overlap_patterns(config, patterns, *, api_key=None, check_cancelled=N
         model.api_key.get_secret_value() if model.api_key else os.getenv(model.api_key_env))
     if not key:
         return {**audit, 'reason': 'model_credentials_unavailable'}
-    timeout = min(model.timeout_seconds, 60, remaining_seconds if remaining_seconds is not None else config.max_run_seconds)
-    if timeout <= 0:
+    seconds = config.max_run_seconds if remaining_seconds is None else min(remaining_seconds, config.max_run_seconds)
+    if seconds <= 0:
         return {**audit, 'reason': 'wall_time_budget_exhausted'}
-    limits = model.model_copy(update={'timeout_seconds': timeout, 'max_output_tokens': min(model.max_output_tokens, 4096),
-                                      'max_response_bytes': min(model.max_response_bytes or 32768, 32768)})
-    budget = _ReviewBudget(timeout, check_cancelled)
+    budget = _ReviewBudget(seconds, check_cancelled)
+    limits = model.model_copy(update={'max_output_tokens': min(model.max_output_tokens, _MAX_OUTPUT_TOKENS),
+                                      'max_response_bytes': min(model.max_response_bytes or 131072, 131072)})
     payload = {'model': model.model, 'stream': limits.stream,
                output_token_field(model.model): limits.max_output_tokens,
                'response_format': response_format_for(_Batch.model_json_schema(), model.response_format),
                'messages': [{'role': 'system', 'content': _INSTRUCTIONS}, {'role': 'user', 'content': ''}]}
     if limits.stream and limits.stream_options_include_usage:
         payload['stream_options'] = {'include_usage': True}
-    id_counts = Counter(pattern['pattern_id'] for pattern in patterns)
-    if any(count != 1 or not _PATTERN_ID.fullmatch(pid) for pid, count in id_counts.items()):
+    ids = [p['pattern_id'] for p in patterns]
+    if len(set(ids)) != len(ids) or any(not _PATTERN_ID.fullmatch(pid) for pid in ids):
         return {**audit, 'status': 'fallback', 'reason': 'invalid_pattern_identity'}
-    profiles = []
-    max_bytes = min(model.max_prompt_bytes or _MAX_PROMPT_BYTES, _MAX_PROMPT_BYTES)
-    token_limit = prompt_token_limit(limits)
-    # Give executable evidence priority. Never truncate the columns or conflict
-    # reasons in one profile. Omitted IDs cannot be authorized by the model.
-    ordered = sorted(patterns, key=lambda p: ('apply' not in p['eligible_actions'], p['pattern_id']))
-    for pattern in ordered[:4 * _MAX_PATTERNS]:
-        profile = _structural_profile(pattern)
-        payload['messages'][1]['content'] = canonical({'patterns': [*profiles, profile]})
-        packet = canonical(payload)
-        if len(packet.encode()) > max_bytes or (token_limit is not None and estimate_tokens(packet) > token_limit):
-            continue
-        profiles.append(profile)
-        if len(profiles) == _MAX_PATTERNS:
-            break
-    if not profiles:
+    batches, oversized = _plan_batches(patterns, payload, limits)
+    audit['oversized_pattern_ids'] = oversized
+    if not batches:
         return {**audit, 'reason': 'model_prompt_budget_exhausted'}
-    payload['messages'][1]['content'] = canonical({'patterns': profiles})
-    issued = {row['pattern_id']: row for row in profiles}
-    audit.update(submitted_patterns=len(issued), omitted_patterns=len(patterns) - len(issued))
-    counter = _CallCounter(budget, on_model_call)
-    try:
-        reply = request_completion(limits, budget, counter, key, payload)
-        budget.check_deadline()
-        decisions = _decisions(reply, issued)
-    except LightGraphError as exc:
-        # Cancellations may originate inside the transport while consuming a chunk.
-        if check_cancelled:
-            check_cancelled()
-        if exc.code in {'query_cancelled', 'run_cancelled'}:
-            raise
-        return {**audit, 'status': 'fallback', 'reason': exc.code, 'model_calls': counter.calls}
-    except (ValueError, KeyError, IndexError, TypeError, RecursionError):
-        return {**audit, 'status': 'fallback', 'reason': 'invalid_decisions', 'model_calls': counter.calls}
-    finally:
-        counter.close()
-    return {**audit, 'status': 'reviewed', 'reason': 'pattern_decisions_validated', 'model_calls': counter.calls,
-            'reviewed_patterns': len(decisions), 'decisions': decisions,
-            'selected_pattern_ids': [item['pattern_id'] for item in decisions if item['action'] == 'merge']}
+
+    failure = None
+    for profiles in batches:
+        if audit['model_calls'] >= call_limit:
+            failure = 'model_call_budget_exhausted'
+            break
+        issued = {p['pattern_id']: p for p in profiles}
+        payload['messages'][1]['content'] = canonical({'patterns': profiles})
+        counter = _CallCounter(budget, on_model_call)
+        reason = None
+        try:
+            reply = request_completion(limits, budget, counter, key, payload)
+            budget.check_deadline()
+            decisions = _decisions(reply, issued)
+        except LightGraphError as exc:
+            if check_cancelled:
+                check_cancelled()
+            if exc.code in {'query_cancelled', 'run_cancelled'}:
+                raise
+            reason = exc.code
+        except (ValueError, KeyError, IndexError, TypeError, RecursionError):
+            reason = 'invalid_decisions'
+        finally:
+            counter.close()
+        audit['model_calls'] += counter.calls
+        if not counter.calls:
+            failure = reason or 'model_request_not_dispatched'
+            break
+        audit['batches'].append({'pattern_ids': list(issued), 'output_token_limit': limits.max_output_tokens,
+                                 'status': 'failed' if reason else 'reviewed', 'reason': reason})
+        audit['submitted_patterns'] += len(issued)
+        if reason:
+            audit['failed_patterns'] += len(issued)
+            failure = reason
+            # A malformed/truncated batch has no authority. Independent batches can
+            # still be reviewed. Stop contacting an unavailable endpoint.
+            if reason not in {'invalid_decisions', 'model_response_invalid', 'model_response_truncated',
+                              'model_response_too_large', 'model_response_refused', 'model_stream_transport_too_large'}:
+                break
+        else:
+            audit['decisions'].extend(decisions)
+
+    audit['reviewed_patterns'] = len(audit['decisions'])
+    audit['omitted_patterns'] = len(patterns) - audit['submitted_patterns']
+    audit['selected_pattern_ids'] = [d['pattern_id'] for d in audit['decisions'] if d['action'] == 'merge']
+    if audit['reviewed_patterns']:
+        audit['status'] = 'partial' if failure or audit['omitted_patterns'] else 'reviewed'
+        audit['reason'] = 'pattern_decisions_validated'
+        if audit['omitted_patterns']:
+            audit['reason'] = 'model_prompt_budget_exhausted' if oversized else 'pattern_count_limit'
+        if failure:
+            audit['reason'] = failure
+    else:
+        audit.update(status='fallback', reason=failure)
+    return audit

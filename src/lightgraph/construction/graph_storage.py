@@ -17,6 +17,8 @@ from typing import Any
 from lightgraph.contracts import canonical
 from lightgraph.errors import LightGraphError
 
+from .paths import io_path
+
 _FORMAT = "parquet_v1"
 _FIELDS = ("id", "type", "source", "target", "label")
 _BATCH_ROWS = 4096
@@ -109,46 +111,43 @@ def _projection(row: dict) -> dict:
 def _write_rows(path: Path, rows: list[dict]) -> None:
     pa, pq = _arrow()
     schema = _schema(pa)
-    with pq.ParquetWriter(path, schema, compression="zstd", use_dictionary=list(_FIELDS)) as writer:
-        batch, size = [], 0
-        for row in rows:
-            payload = canonical(row)
-            batch.append({**_projection(row), "payload": payload})
-            size += len(payload.encode("utf-8"))
-            if len(batch) >= _BATCH_ROWS or size >= _BATCH_BYTES:
+    # Arrow receives a file handle opened by Python, including for extended
+    # Windows paths on hosts where the default Win32 path limit is enabled.
+    with path.open("wb") as stream:
+        with pq.ParquetWriter(stream, schema, compression="zstd", use_dictionary=list(_FIELDS)) as writer:
+            batch, size = [], 0
+            for row in rows:
+                payload = canonical(row)
+                batch.append({**_projection(row), "payload": payload})
+                size += len(payload.encode("utf-8"))
+                if len(batch) >= _BATCH_ROWS or size >= _BATCH_BYTES:
+                    writer.write_table(pa.Table.from_pylist(batch, schema=schema))
+                    batch, size = [], 0
+            if batch:
                 writer.write_table(pa.Table.from_pylist(batch, schema=schema))
-                batch, size = [], 0
-        if batch:
-            writer.write_table(pa.Table.from_pylist(batch, schema=schema))
-    os.chmod(path, 0o600)
-    # Windows _commit (used by fsync) requires a writable descriptor.
-    with path.open("rb+") as stream:
+        stream.flush()
         os.fsync(stream.fileno())
+    os.chmod(path, 0o600)
 
 
-def _publish_metadata(path: Path, text: str) -> None:
-    fd, temporary = tempfile.mkstemp(prefix=".metadata-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(text)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+def _write_metadata(path: Path, text: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def write_graph_record(path: Path, graph: dict) -> None:
     """Create a new snapshot directory; never overwrite an existing record.
 
     JSON object keys in node/edge rows must be strings. Metadata retains the
-    existing workspace YAML scalar rules. Failure leaves an unpublished orphan,
-    which must never be installed in the owning workspace manifest.
+    existing workspace YAML scalar rules. Install the complete directory in one
+    rename so a failed or interrupted write cannot expose a partial record.
     """
     from .workspace import INTERNAL_YAML_MAX_BYTES, _check_yaml_tree, dump_yaml
 
-    path = Path(path)
+    path = io_path(path)
     if not isinstance(graph, dict):
         raise LightGraphError("invalid_graph_parquet_record")
     _check_yaml_tree(graph)
@@ -165,22 +164,30 @@ def write_graph_record(path: Path, graph: dict) -> None:
     if len(dump_yaml(metadata).encode("utf-8")) > INTERNAL_YAML_MAX_BYTES:
         raise LightGraphError("yaml_document_too_large")
     _arrow()
-    try:
-        path.mkdir(mode=0o700)
-    except FileExistsError:
-        raise LightGraphError("graph_parquet_record_exists") from None
-    for category in ("nodes", "edges"):
-        file = path / f"{category}.parquet"
-        rows = graph.get(category, [])
-        _write_rows(file, rows)
-        metadata["collections"][category] = {
-            "file": file.name, "present": category in graph,
-            "rows": len(rows), "sha256": _file_digest(file),
-        }
-    serialized = dump_yaml(metadata)
-    if len(serialized.encode("utf-8")) > INTERNAL_YAML_MAX_BYTES:
-        raise LightGraphError("yaml_document_too_large")
-    _publish_metadata(path / "metadata.yaml", serialized)
+    if os.path.lexists(path):
+        raise LightGraphError("graph_parquet_record_exists")
+    with tempfile.TemporaryDirectory(prefix=".graph-", dir=path.parent) as scratch:
+        staged = Path(scratch) / "g"
+        staged.mkdir(mode=0o700)
+        for category in ("nodes", "edges"):
+            file = staged / f"{category}.parquet"
+            rows = graph.get(category, [])
+            _write_rows(file, rows)
+            metadata["collections"][category] = {
+                "file": file.name, "present": category in graph,
+                "rows": len(rows), "sha256": _file_digest(file),
+            }
+        serialized = dump_yaml(metadata)
+        if len(serialized.encode("utf-8")) > INTERNAL_YAML_MAX_BYTES:
+            raise LightGraphError("yaml_document_too_large")
+        _write_metadata(staged / "metadata.yaml", serialized)
+        try:
+            os.rename(staged, path)
+        except OSError:
+            # An immutable snapshot installed by another writer wins.
+            if os.path.lexists(path):
+                raise LightGraphError("graph_parquet_record_exists") from None
+            raise
 
 
 def _unique_object(pairs):
@@ -195,7 +202,7 @@ def _unique_object(pairs):
 def _read_rows(path: Path, expected_rows: int) -> list[dict]:
     pa, pq = _arrow()
     result = []
-    with pq.ParquetFile(path) as parquet:
+    with path.open("rb") as stream, pq.ParquetFile(stream) as parquet:
         if (not parquet.schema_arrow.equals(_schema(pa))
                 or parquet.metadata.num_rows != expected_rows):
             raise LightGraphError("invalid_graph_parquet_record")
@@ -220,7 +227,7 @@ def read_graph_record_header(path: Path, *, expected_digest: str | None = None) 
     """Read the stored manifest and check its declared snapshot ID without opening row files."""
     from .workspace import INTERNAL_YAML_MAX_BYTES, safe_load_yaml
 
-    path = Path(path)
+    path = io_path(path)
     try:
         metadata_path = path / "metadata.yaml"
         if path.is_symlink() or metadata_path.is_symlink() or not path.is_dir():
@@ -247,7 +254,7 @@ def read_graph_record_header(path: Path, *, expected_digest: str | None = None) 
 
 def read_graph_record(path: Path, *, expected_digest: str | None = None) -> dict:
     """Read and verify one snapshot; the caller enforces its workspace boundary."""
-    path = Path(path)
+    path = io_path(path)
     metadata = read_graph_record_header(path, expected_digest=expected_digest)
     graph = metadata["graph_metadata"]
     try:

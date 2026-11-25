@@ -57,11 +57,10 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
         check_cancelled()
         if not patterns and pattern_summary.get('reason'):
             result['reason'] = pattern_summary['reason']
-        elif node.max_calls == 0:
-            result.update(reason='model_call_budget_exhausted', omitted_patterns=len(patterns))
         else:
             result = review_overlap_patterns(config, patterns, api_key=model_api_key,
                                              check_cancelled=check_cancelled, on_model_call=on_model_call,
+                                             max_calls=node.max_calls,
                                              remaining_seconds=deadline - time.monotonic())
             check_cancelled()
             try:
@@ -96,6 +95,12 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
         **{field: pattern_summary[field] for field in ('missing_index_contributors', 'incompatible_index_contributors')
            if pattern_summary.get(field)},
         'pattern_count': len(patterns),
+        'analysis_omitted_patterns': pattern_summary.get('omitted_patterns', 0),
+        'model_omitted_patterns': result['omitted_patterns'],
+        'oversized_patterns': len(result.get('oversized_pattern_ids', [])),
+        'submitted_patterns': result.get('submitted_patterns', result['reviewed_patterns']),
+        'failed_patterns': result.get('failed_patterns', 0),
+        'batch_count': len(result.get('batches', [])),
         'reviewed_patterns': result['reviewed_patterns'],
         'omitted_patterns': result['omitted_patterns'] + pattern_summary.get('omitted_patterns', 0),
         'truncated': bool(pattern_summary.get('truncated')

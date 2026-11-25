@@ -6,13 +6,14 @@ records only authorize reading immutable results; they never validate a rerun.
 from contextvars import ContextVar
 from copy import deepcopy
 from datetime import datetime, timezone
-from pathlib import Path, PureWindowsPath
+from pathlib import PureWindowsPath
 import re
 
 from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
 from .access import access_fingerprint
 from .artifact_io import artifact_step
+from .paths import io_path
 from .workspace import read_internal_yaml, write_yaml
 
 
@@ -47,10 +48,11 @@ def _context_path(root, fingerprint, policy_id):
     if not isinstance(fingerprint, str) or not re.fullmatch(r'[a-f0-9]{64}', fingerprint) or (
             policy_id is not None and (not isinstance(policy_id, str) or not re.fullmatch(r'[a-f0-9]{64}', policy_id))):
         raise LightGraphError('graph_access_context_changed')
-    directory = Path(root) / 'access-contexts'
+    root = io_path(root)
+    directory = root / 'access-contexts'
     name = (digest(fingerprint, policy_id)[:32] if policy_id else fingerprint) + '.yaml'
     path = directory / name
-    if directory.is_symlink() or path.is_symlink() or Path(root).is_symlink():
+    if directory.is_symlink() or path.is_symlink() or root.is_symlink():
         raise LightGraphError('workspace_path_invalid')
     return path
 
@@ -102,7 +104,7 @@ def authorize_snapshot(root, head, config):
 def snapshot_id(head, *, root):
     # Copies in different generations are distinct selectable versions. Keep the
     # location project-relative so a drive or workspace move preserves the ID.
-    root = Path(root)
+    root = io_path(root)
     output = next((p for p in root.parents if p.name == 'output' and (p.parent / 'project.yaml').is_file()), None)
     location = root.relative_to(output).as_posix() if output is not None else None
     if head.get('publication_digest'):
@@ -114,7 +116,7 @@ def snapshot_id(head, *, root):
 def inherited_grants(root, *, summary=None):
     """Small authorization witnesses for external projects whose results were frozen."""
     if summary is None:
-        path = Path(root) / 'inherited' / 'summary.yaml'
+        path = io_path(root) / 'inherited' / 'summary.yaml'
         if path.is_symlink() or path.parent.is_symlink():
             raise LightGraphError('workspace_path_invalid')
         if not path.is_file():
@@ -161,7 +163,7 @@ def authorize_inherited_grants(references, grants, resolve_config):
 
 def record_graph_head(manifest, head, *, root, graph_kind=None, coverage=None):
     """Commit the exact head and its frozen base alongside the manifest pointer."""
-    root = Path(root)
+    root = io_path(root)
     kind = graph_kind or head.get('graph_kind', 'workspace_publication')
     if publication_run_id.get():
         head.setdefault('run_id', publication_run_id.get())

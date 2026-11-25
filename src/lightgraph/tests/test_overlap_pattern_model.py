@@ -133,10 +133,13 @@ def test_bounds_reviewed_profile_count_and_preserves_configured_endpoint_key(mon
         items = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
         return respond(json.dumps({'decisions': [{'pattern_id': p['pattern_id'], 'action': 'keep'} for p in items]}))
 
-    setup_provider(monkeypatch, reply)
+    requests = setup_provider(monkeypatch, reply)
     result = review_overlap_patterns(configured(), patterns)
-    assert result['status'] == 'reviewed' and result['reviewed_patterns'] == 32
-    assert result['omitted_patterns'] == 8 and result['model_calls'] == 1
+    assert result['status'] == 'partial' and result['reviewed_patterns'] == 32
+    assert result['omitted_patterns'] == 8 and result['reason'] == 'pattern_count_limit'
+    assert result['model_calls'] == len(requests) == 8
+    assert [pid for batch in result['batches'] for pid in batch['pattern_ids']] == [
+        p['pattern_id'] for p in patterns[:32]]
 
 
 def test_transport_cancellation_during_review_propagates_without_decision(monkeypatch):
@@ -179,3 +182,83 @@ def test_oversized_pattern_does_not_hide_later_complete_relation(monkeypatch):
     setup_provider(monkeypatch, reply)
     result = review_overlap_patterns(configured(), [oversized, relation], api_key='project-key')
     assert result['reviewed_patterns'] == result['omitted_patterns'] == 1
+
+
+@pytest.mark.parametrize('size', [22, 32])
+def test_complete_batches_survive_one_truncated_batch(monkeypatch, size):
+    patterns = [profile(i) for i in range(size)]
+    def reply(request):
+        packet = json.loads(request.content)
+        items = json.loads(packet['messages'][1]['content'])['patterns']
+        assert 1 <= len(items) <= 4
+        assert packet['max_tokens'] == 8192
+        decisions = [{'pattern_id': item['pattern_id'], 'action': 'merge'} for item in items]
+        return respond(json.dumps({'decisions': decisions}), 'length' if items[0]['pattern_id'] == patterns[4]['pattern_id'] else 'stop')
+
+    requests = setup_provider(monkeypatch, reply)
+    result = review_overlap_patterns(configured(), patterns[::-1], api_key='secret')
+    assert result['model_calls'] == len(requests) == (size + 3) // 4
+    assert result['status'] == 'partial' and result['reason'] == 'model_response_truncated'
+    assert result['failed_patterns'] == 4 and result['submitted_patterns'] == size
+    assert result['reviewed_patterns'] == size - 4 and result['omitted_patterns'] == 0
+    assert result['selected_pattern_ids'] == [p['pattern_id'] for p in patterns[:4] + patterns[8:]]
+    assert result['batches'][1] == {'pattern_ids': [p['pattern_id'] for p in patterns[4:8]],
+        'output_token_limit': 8192, 'status': 'failed', 'reason': 'model_response_truncated'}
+
+
+@pytest.mark.parametrize('model_calls,node_calls,limit', [(1, 3, 1), (None, 2, 2)])
+def test_call_and_output_limits_bound_transport(monkeypatch, model_calls, node_calls, limit):
+    def reply(request):
+        payload = json.loads(request.content)
+        items = json.loads(payload['messages'][1]['content'])['patterns']
+        assert len(items) == 1 and payload['max_tokens'] == 1024
+        return respond(json.dumps({'decisions': [{'pattern_id': items[0]['pattern_id'], 'action': 'keep'}]}))
+
+    requests = setup_provider(monkeypatch, reply)
+    result = review_overlap_patterns(configured(max_calls=model_calls, max_output_tokens=1024),
+                                     [profile(i) for i in range(8)], api_key='key', max_calls=node_calls)
+    assert len(requests) == result['model_calls'] == result['submitted_patterns'] == limit
+    assert result['failed_patterns'] == 0 and result['omitted_patterns'] == 8 - limit
+    assert result['reason'] == 'model_call_budget_exhausted' and result['status'] == 'partial'
+
+
+def test_split_prompt_byte_budget_keeps_later_patterns(monkeypatch):
+    patterns = [profile(i) for i in range(7)]
+    for item in patterns:
+        item['sources'][0]['table'] = 'large_structural_field_' * 100
+
+    def reply(request):
+        assert len(request.content) <= 8100
+        issued = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
+        return respond(json.dumps({'decisions': [{'pattern_id': p['pattern_id'], 'action': 'keep'} for p in issued]}))
+
+    requests = setup_provider(monkeypatch, reply)
+    result = review_overlap_patterns(configured(max_prompt_bytes=8100), patterns, api_key='key')
+    assert result['status'] == 'reviewed' and result['submitted_patterns'] == len(patterns)
+    assert result['oversized_pattern_ids'] == [] and result['omitted_patterns'] == 0
+    assert len(requests) > 2
+
+
+def test_all_batches_share_one_workflow_deadline(monkeypatch):
+    from lightgraph.discovery import sdk_transport
+    from lightgraph.errors import BudgetExceeded
+
+    dispatch = sdk_transport.request_completion
+    budgets = []
+    def limited(config, budget, *args):
+        budgets.append(budget)
+        if len(budgets) == 2:
+            raise BudgetExceeded('wall_time_budget_exhausted')
+        assert budget.remaining_seconds() > 60 and config.timeout_seconds == 10
+        return dispatch(config, budget, *args)
+    monkeypatch.setattr(sdk_transport, 'request_completion', limited)
+    def reply(request):
+        issued = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
+        return respond(json.dumps({'decisions': [{'pattern_id': p['pattern_id'], 'action': 'keep'} for p in issued]}))
+    requests = setup_provider(monkeypatch, reply)
+    result = review_overlap_patterns(configured(timeout_seconds=10), [profile(i) for i in range(10)],
+                                     api_key='key', remaining_seconds=90)
+    assert len(budgets) == 2 and budgets[0] is budgets[1]
+    assert result['status'] == 'partial' and result['reason'] == 'wall_time_budget_exhausted'
+    assert result['reviewed_patterns'] == 4 and result['failed_patterns'] == 0
+    assert result['omitted_patterns'] == 6 and result['model_calls'] == len(requests) == 1

@@ -324,6 +324,15 @@ def _rows_hash(rows):
     return h.hexdigest()
 
 
+def _graph_row_digests(graph):
+    """Compare complete row payloads independent of their order in storage."""
+    return {
+        category: _rows_hash(hashlib.sha256(canonical(row).encode('utf-8')).hexdigest()
+                             for row in graph[category])
+        for category in ('nodes', 'edges')
+    }
+
+
 def edge_lineage(inputs, graph, stage):
     """Count input edge occurrences by contributor. Separate checkpoint and in-memory addresses."""
     owners = defaultdict(set)
@@ -666,6 +675,8 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         if policy.get("fusion_policy") != fused:
             raise ValueError("审查记录中的生效规则与提交图不一致。")
     counts = graph_counts(committed)
+    if include_edge_lineage:
+        counts["row_digests"] = _graph_row_digests(committed)
     counts["integrity"] = output_checks(committed)
     counts.update(inspect_observations(committed))
     if "fusion_diagnostics" in committed:
@@ -712,6 +723,11 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
             report[label]['identity_trace'] = options['hierarchy_trace'].report(graph)
         if include_edge_lineage:
             report[label]['edge_lineage'] = edge_lineage(inputs, graph, stage)
+            if enabled:
+                row_digests = _graph_row_digests(graph)
+                report[label]['row_digests'] = row_digests
+                report[label]['rows_match_committed'] = {
+                    kind: value == counts['row_digests'][kind] for kind, value in row_digests.items()}
         if include_hierarchy_membership or compare_to is not None:
             if enabled:
                 report[label]["hierarchy_membership"] = hierarchy_membership(graph, control_ids)

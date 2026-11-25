@@ -205,8 +205,14 @@ function workflowRelationSummary(node: WorkflowMergeNodeState) {
   const review = node.overlap_review
   if (review) {
     lines.push(`列出 ${review.pattern_count} 种重叠模式，模型审查 ${review.reviewed_patterns} 种、建议合并 ${review.selected_patterns} 种，生效的新规则 ${review.added_entity_rules} 条`)
-    if (review.omitted_patterns) lines.push(`另有 ${review.omitted_patterns} 种模式未送审`)
-    if (review.status === 'skipped' || review.status === 'fallback') {
+    if (review.submitted_patterns != null) {
+      lines.push(`模型请求 ${review.model_calls} 次，送审 ${review.submitted_patterns} 种，已列出但未送审 ${review.pattern_count - review.submitted_patterns} 种`)
+      if (review.failed_patterns) lines.push(`${review.failed_patterns} 种已送审的模式未取得有效裁决`)
+      if (review.analysis_omitted_patterns) lines.push(`索引分析另省略 ${review.analysis_omitted_patterns} 种模式`)
+    } else if (review.omitted_patterns) {
+      lines.push(`另有 ${review.omitted_patterns} 种模式未送审`)
+    }
+    if (['skipped', 'fallback', 'partial'].includes(review.status)) {
       const reasons: Record<string, string> = {
         no_patterns: '未发现可审查的重叠模式', model_not_configured: '未配置审查模型',
         model_credentials_unavailable: '未取得模型密钥', mixed_extraction_batches: '抽取结果来自不同批次',
@@ -214,13 +220,18 @@ function workflowRelationSummary(node: WorkflowMergeNodeState) {
         insufficient_extract_units: '只有一个抽取分支', incomplete_extract_inputs: '上游抽取结果不完整',
         model_call_budget_exhausted: '模型调用额度已用完', wall_time_budget_exhausted: '审查时间已用完',
         model_prompt_budget_exhausted: '模式说明超出模型输入上限', invalid_decisions: '模型回复未通过校验',
+        model_response_truncated: '模型回复被截断', model_response_too_large: '模型回复超出大小限制',
         overlap_index_missing: '上游抽取检查点缺少类型索引，请先为这些检查点补建索引',
         overlap_index_incompatible: '上游类型索引版本不兼容',
         analysis_budget_exceeded: '输入超出模式分析上限', overlap_pattern_policy_conflict: '建议的规则相互冲突',
         merge_requires_isolation: '采用新规则会隔离来源数据',
       }
       const reason = review.reason && (reasons[review.reason] ?? review.reason)
-      lines.push(reason ? `沿用原合并规则（${reason}）` : '沿用原合并规则')
+      if (review.status === 'partial') {
+        if (reason) lines.push(`部分模式未完成审查（${reason}）`)
+      } else {
+        lines.push(reason ? `沿用原合并规则（${reason}）` : '沿用原合并规则')
+      }
     }
   }
   if (counts?.input_edges != null && counts.output_edges != null) {

@@ -20,7 +20,8 @@ from lightgraph.tests.test_web_api import client, create, upload
 from lightgraph.tests.test_web_execution import wait_run
 
 
-def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monkeypatch):
+@pytest.mark.parametrize('split_batches', [False, True])
+def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monkeypatch, split_batches):
     install_scripted_worker(monkeypatch, draft_factory=overlapping_metric_proposal)
     create(client)
     base = '/api/projects/alpha'
@@ -29,6 +30,8 @@ def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monk
     cfg['goal']['purpose'] = 'Combine metric projections'
     cfg['model'].update(mode='in_environment', model='scripted', base_url='http://localhost:9999/v1',
                         api_key_env='LIGHTGRAPH_TEST_REVIEW_KEY')
+    if split_batches:
+        cfg['model']['max_output_tokens'] = 1024
     monkeypatch.setenv('LIGHTGRAPH_TEST_REVIEW_KEY', 'test-only')
     units = [{'unit_id': uid, 'goal_markdown': kind, 'source_ids': [cfg['sources'][0]['id']]}
              for uid, kind in [('first', 'IncomeMetric'), ('second', 'LedgerItem')]]
@@ -52,8 +55,9 @@ def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monk
         requests.append(patterns)
         decisions = [{'pattern_id': p['pattern_id'], 'action': 'merge' if 'apply' in p['eligible_actions'] else 'keep'}
                      for p in patterns]
+        finish = 'length' if split_batches and patterns[0]['kind'] == 'relation' else 'stop'
         return httpx.Response(200, json={'choices': [{'message': {'role': 'assistant', 'content':
-                                               json.dumps({'decisions': decisions})}, 'finish_reason': 'stop'}]})
+                                               json.dumps({'decisions': decisions})}, 'finish_reason': finish}]})
 
     monkeypatch.setattr(overlap_review.httpx, 'HTTPTransport', lambda: httpx.MockTransport(decide))
     def unexpected_worker(*args, **kwargs):
@@ -70,7 +74,15 @@ def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monk
     artifact = state['artifacts']['join']
     committed = load_checkpoint(output, artifact)
     report = committed['overlap_review']
-    assert len(requests) == 1 and node['model_calls'] == 1
+    expected_calls = len(report['patterns']) if split_batches else 1
+    assert node['model_calls'] == len(requests) == expected_calls
+    if split_batches:
+        assert expected_calls > 1 and report['summary']['status'] == 'partial'
+        assert report['summary']['failed_patterns'] == 1
+        assert report['summary']['reviewed_patterns'] == expected_calls - 1
+        assert report['summary']['reason'] == 'model_response_truncated'
+    else:
+        assert report['summary']['status'] == 'reviewed'
     assert node['overlap_review'] == report['summary']
     assert node['overlap_review']['added_entity_rules'] == 2, report
     assert state['reused_nodes'] == ['first', 'second']
@@ -104,7 +116,7 @@ def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monk
                                      json={'action': 'publish_artifact', 'artifact_id': artifact['artifact_id']},
                                      headers=headers))
     assert promotion['workflow_state']['merge']['published_artifact_id'] == artifact['artifact_id']
-    assert promotion['workflow_state']['merge_nodes']['join']['model_calls'] == 0 and len(requests) == 1
+    assert promotion['workflow_state']['merge_nodes']['join']['model_calls'] == 0 and len(requests) == expected_calls
     sidecar = (output / artifact['relative_path']).parent / 'overlap_review.json'
     sidecar.write_text('{}', encoding='utf-8')
     with pytest.raises(LightGraphError, match='workflow_checkpoint_invalid'):
