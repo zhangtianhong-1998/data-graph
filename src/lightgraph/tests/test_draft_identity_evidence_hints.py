@@ -61,11 +61,16 @@ def test_save_points_to_authorized_field_material_without_issuing_or_citing_it(d
 
 
 @pytest.mark.parametrize('scope,column', [('unknown', 'code'), ('global', 'extra_code')])
-def test_save_silent_for_local_identity_or_unmentioned_key(draft_tools, scope, column):
+def test_unknown_scope_offers_available_material_but_unmentioned_keys_stay_silent(draft_tools, scope, column):
     tools, probe = draft_tools
     result = tools.call('save_graph_draft', yaml_text=dump_yaml(_draft([probe], column=column, scope=scope)))
     assert result['status'] == 'ok'
-    assert 'identity_evidence_hints' not in result
+    if scope == 'unknown':
+        hint, = result['identity_evidence_hints']['fields']
+        assert hint['reason'] == 'material_available_identity_unexplained'
+        assert hint['key_columns'] == ['code']
+    else:
+        assert 'identity_evidence_hints' not in result
 
 
 def test_undeclared_scope_points_to_the_authored_full_key_without_inheriting_another_types_domain(draft_tools, tmp_path):

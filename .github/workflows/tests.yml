@@ -46,6 +46,8 @@ jobs:
         run: python -m pytest -q src/lightgraph/tests/test_web_credentials.py
       - name: Check construction persistence and source safety
         run: python -m pytest -q src/lightgraph/tests/test_graph_yaml_workspace.py src/lightgraph/tests/test_graph_construction_executor.py src/lightgraph/tests/test_construction_process_lifecycle.py src/lightgraph/tests/test_construction_publication_lifecycle.py src/lightgraph/tests/test_construction_entrypoints.py src/lightgraph/tests/test_web_execution.py
+      - name: Check identity semantics with positive and negative evidence
+        run: python -m pytest -q scripts/acceptance/test_identity_contract_semantics.py
       - name: Run complete test suite
         # End a stalled suite before the job deadline, leaving cleanup time.
         timeout-minutes: ${{ startsWith(matrix.os, 'windows') && 55 || 17 }}

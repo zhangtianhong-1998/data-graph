@@ -178,11 +178,14 @@ def test_graph_budget_prioritizes_the_complete_preexisting_graph(tmp_path, monke
         draft = hierarchy(['region'])
         with monkeypatch.context() as no_locator:
             no_locator.setattr(source, 'sheet_row_snapshot', lambda table: None)
+            no_locator.setattr(source, 'observation_binding', lambda: None)
             baseline = execute_draft(draft, [source], source.describe())
         assert baseline['passed']
         cap = baseline['metrics']['working_memory_estimated_peak_bytes']
         actual = execute_draft(draft, [source], source.describe(), max_working_bytes=cap)
         assert actual['passed'] and actual['graph'] == baseline['graph']
+        assert actual['evidence_diagnostics'] == [{'code': 'optional_relation_witnesses_dropped',
+            'reason': 'memory_budget', 'original_relations_retained': True}]
 
 
 def test_tight_excel_import_budget_discards_all_positions_and_keeps_rows(tmp_path):

@@ -15,7 +15,7 @@ import time
 import uuid
 from typing import Callable
 from lightgraph.query.compiler import postgres_driver_sql
-from lightgraph.contracts import CapabilityManifest, ColumnSpec, ForeignKeySpec, QueryLimits, TableSpec
+from lightgraph.contracts import CapabilityManifest, ColumnSpec, ForeignKeySpec, QueryLimits, TableSpec, digest
 from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler
 from .base import SourceAdapter, QueryStats, cursor_batches
@@ -58,6 +58,7 @@ class GaussSource(SourceAdapter):
         if allowed_columns is not None and set(allowed_columns) - set(allowed_tables):
             raise LightGraphError("unauthorized_column_scope")
         self.source_id = source_id; self.allowed_tables = tuple(allowed_tables)
+        self._observation_source_digest = digest('gauss', dsn)
         self.metadata_only = metadata_only
         self.allowed_columns = allowed_columns or {}; self.limits = limits or QueryLimits()
         self.stats = _stats if _stats is not None else QueryStats(); self._lock = threading.RLock(); self._depth = 0

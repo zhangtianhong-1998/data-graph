@@ -54,6 +54,7 @@ def agent_context(answer, *, version=None, sources=()):
                        for s in plan.get('conditions', [])],
         'excluded_terms': plan.get('excluded_terms', []), 'partial_status': partial.get('status'),
         'truncated': bool(answer.get('truncated') or partial.get('truncated') or answer.get('type_definitions_truncated')),
+        'evidence_truncated': False,
         'nodes': [], 'edges': [], 'bindings': [], 'paths': [], 'bridge_nodes': [], 'joint_witnesses': [], 'source_passages': [],
     }
     # Separate budgets keep a large entity list from crowding out paths and physical mappings.
@@ -73,7 +74,7 @@ def agent_context(answer, *, version=None, sources=()):
             size -= len(original.encode('utf-8')) + 1
             token_cost -= estimate_tokens(original) + 1
         if size > remaining[section] or token_cost > tokens[section]:
-            context['truncated'] = True
+            context['truncated'] = context['evidence_truncated'] = True
             return False
         remaining[section] -= size
         tokens[section] -= token_cost
@@ -89,7 +90,10 @@ def agent_context(answer, *, version=None, sources=()):
             prov = obs.get('provenance') or {}
             source = prov.get('source') or {}
             mapping = _fields(prov, BINDING_FIELDS)
-            row = _fields(obs, ('business_context', 'scopes', 'required_scope_refs', 'source_tables', 'evidence_refs', 'properties'))
+            row = _fields(obs, ('business_context', 'scopes', 'required_scope_refs', 'source_tables', 'evidence_refs',
+                               'properties', 'projection', 'evidence_ref_count'))
+            if obs.get('projection') in {'reference_only', 'source_binding'}:
+                context['truncated'] = context['evidence_truncated'] = True
             if obs.get('identity_decision_refs') or obs.get('identity_reviewed'):
                 row['identity_reviewed'] = True
                 if obs.get('source_identity') and mapping.get('key_columns'):
@@ -160,7 +164,7 @@ def agent_context(answer, *, version=None, sources=()):
                 retained_bindings.append((binding, citations))
             pending.append(stream)
     if pending:
-        context['truncated'] = True
+        context['truncated'] = context['evidence_truncated'] = True
     # Reserve the existing mappings first. Distinct observations of the same
     # mapping may cite different rows; each citation stays with its own ID.
     for binding, citations in retained_bindings:
@@ -176,7 +180,7 @@ def agent_context(answer, *, version=None, sources=()):
             locator = citation.get('source_row_witness')
             # Even the shortest JSON interval uses six bytes including its delimiter.
             if locator and len(locator['rows']) * 6 > _BINDING_BYTES:
-                context['truncated'] = True
+                context['truncated'] = context['evidence_truncated'] = True
                 del citation['source_row_witness']
             if not citation:
                 continue

@@ -1,6 +1,8 @@
 """Score independent, version-pinned judgments against saved outputs, without another replay."""
 from collections import Counter, defaultdict
 
+from lightgraph.evaluation.fusion import pair_metrics, repeated_zero_positive_check
+
 
 def _pair_state(mapping, left, right):
     a, b = mapping.get(left), mapping.get(right)
@@ -73,17 +75,22 @@ def score(truth, run_id, artifact_id, node_ids, node_maps, edge_lines, input_map
             coverage[kind, stratum][bucket] += 1
         for scenario, mapping in scenarios.items():
             verdict = _verdict(expected, _pair_state(mapping, left, right))
-            evaluated[kind, scenario, stratum].append(verdict)
+            evaluated[kind, scenario, stratum].append((expected, verdict))
             if verdict in {'fp', 'fn', 'unverified_output'}:
                 missed.append({**row, 'scenario': scenario, 'result': verdict})
     table = []
+    by_scenario = defaultdict(list)
     for (kind, scenario, stratum), outcomes in sorted(evaluated.items()):
-        counts = {k: outcomes.count(k) for k in ('tp', 'fp', 'fn', 'tn', 'unknown_truth', 'unverified_output')}
+        by_scenario[kind, scenario].extend(outcomes)
+        counts = {k: sum(verdict == k for _, verdict in outcomes)
+                  for k in ('tp', 'fp', 'fn', 'tn', 'unknown_truth', 'unverified_output')}
         tp, fp, fn = (counts[k] for k in ('tp', 'fp', 'fn'))
         table.append({'kind': kind, 'scenario': scenario, 'stratum': stratum, 'labeled_pairs': len(outcomes),
                       **counts, 'precision': tp/(tp+fp) if tp+fp else None,
-                      'recall': tp/(tp+fn) if tp+fn else None})
+                      'recall': tp/(tp+fn) if tp+fn else None, **pair_metrics(outcomes)})
     return {'basis': 'version_pinned_supplied_truth_pairs_only', 'pairs': len(rows), 'strata': table,
+            'scenario_assessments': [{'kind': kind, 'scenario': scenario, **pair_metrics(outcomes)}
+                                     for (kind, scenario), outcomes in sorted(by_scenario.items())],
             'disagreements_or_unverified': missed, 'positive_entity_candidate_coverage': [
                 {'kind': k, 'stratum': label, **counts} for (k, label), counts in sorted(coverage.items())]}
 
@@ -117,5 +124,8 @@ def compare_input_pairs(truth, first, first_mapping, second_mapping):
     strata = [{**row, 'scenario': 'first' if row['scenario'] == 'committed' else 'second'}
               for row in result['strata']]
     return {'labeled_pairs': len(pairs), 'strata': strata,
+            'scenario_assessments': [{**row, 'scenario': 'first' if row['scenario'] == 'committed' else 'second'}
+                                     for row in result['scenario_assessments']],
+            'satisfiability_review': repeated_zero_positive_check(pairs),
             'transition_counts': {key: counts[key] for key in (
                 *changed.values(), 'unchanged', 'unknown_truth', 'unverified_output')}, 'pair_results': pairs}

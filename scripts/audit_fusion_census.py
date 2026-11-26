@@ -10,6 +10,7 @@ import time
 from lightgraph.construction.checkpoints import load_checkpoint
 from lightgraph.construction.workflow import run_output_path
 from lightgraph.contracts import canonical
+from lightgraph.evaluation.fusion import analysis_code_fingerprint, fusion_measurements
 
 from audit_checkpoint_merge import (
     _graph_row_digests, _simulated_policy, archived_state, committed_merge_policy, direct_merge_parents,
@@ -55,6 +56,7 @@ def census_stage(location, record, directory, unit, excluded_values, families):
     write(directory, 'relation-facts.json', facts)
     print(f"完成 {record['node_id']} 全图普查", flush=True)
     return {'node_id': record['node_id'], 'artifact_id': record['artifact_id'], 'graph_digest': record['graph_digest'],
+            'input_digest': record.get('input_digest'),
             'checkpoint_run_id': record['run_id'], 'artifact_status': record['artifact_status'],
             'kind': 'unit' if unit else 'committed', 'directory': directory.name,
             'rows': {'nodes': len(graph['nodes']), 'edges': len(graph['edges'])},
@@ -92,7 +94,17 @@ def _report(out, report):
     if historical:
         lines.append(f"归档合并调用模型 {historical.get('model_calls', '未记录')} 次，"
                      f"完成审查 {historical.get('reviewed_patterns', '未记录')} 个模式，"
-                     f"新增生效实体规则 {historical.get('added_entity_rules', '未记录')} 条。")
+                     f"加入合并策略的实体规则 {historical.get('added_entity_rules', '未记录')} 条。")
+    measurements = report.get('measurements')
+    if measurements:
+        delta = measurements['committed_input_output_delta']
+        lines.extend(['', '本次复用冻结检查点，没有执行新抽取，抽取 Agent 的本轮收益为“不适用”。',
+                      '完成普查、重放一致与业务验收分别记录；未提供独立应合、应分真值时，不给出业务通过结论。',
+                      f"归档提交相对输入累计净减 {delta['nodes_removed'] if delta['nodes_removed'] is not None else '未核实'} 个节点、"
+                      f"{delta['raw_edges_removed'] if delta['raw_edges_removed'] is not None else '未核实'} 条原始边。"
+                      '该差额包括全部归档合并操作，不能单独归因于模型。',
+                      '模型建议、验证通过、执行生效及实际提交对照分别保存在 summary.json 的 measurements 中；'
+                      '历史缺失的字段记未记录，不补成零。'])
     lines += ['', '|检查点|节点|原始边|涉及候选的节点|分组后的画布连线|', '|---|---:|---:|---:|---:|']
     for key, stage in stages.items():
         lines.append(f"|{key}|{stage['rows']['nodes']}|{stage['rows']['edges']}|"
@@ -155,6 +167,8 @@ def _report(out, report):
 
 def _finish_campaign(output, report):
     report['status'] = 'incomplete' if report['errors'] else 'completed'
+    report['execution_status'] = report['status']
+    report['measurements'] = fusion_measurements(report)
     write(output, 'summary.json', report)
     _report(output, report)
     return report
@@ -308,6 +322,11 @@ def score_saved(output, truth_path, result_file):
     result = score(json.loads(read(truth_path)), summary['run_id'], summary['artifact_id'],
                    set(baseline_ids), node_maps, edges['edge_to_canvas_line'], input_maps, facts['edge_to_fact'],
                    relation_maps, json.loads(read(output/'committed'/'nodes.json'))['groups'])
+    result['provenance'] = {'run_id': summary['run_id'], 'artifact_id': summary['artifact_id'],
+                            'stage': 'independent_pair_scoring', 'analysis_code': analysis_code_fingerprint(),
+                            'truth_sha256': hashlib.sha256(truth_path.read_bytes()).hexdigest(),
+                            'census_measurement_provenance': (summary.get('measurements') or {}).get('provenance'),
+                            'legacy_census_metadata_missing': 'measurements' not in summary}
     write(result_file.parent, result_file.name, result)
 
 
@@ -356,6 +375,7 @@ def _verified_commit(directory):
     summary_fields = ('run_id', 'node_id', 'artifact_id', 'committed_merge_mode')
     identity = {key: summary[key] for key in summary_fields}
     identity.update(graph_digest=merged['graph_digest'], row_digests=row_digests, rows=merged['rows'])
+    identity['measurement_provenance'] = (summary.get('measurements') or {}).get('provenance')
     return identity, parents, mapping
 
 
@@ -369,6 +389,22 @@ def compare_committed(first_dir, second_dir, truth_path, result_file):
     pairs = compare_input_pairs(json.loads(read(truth_path)), first, first_map, second_map)
     result = {'basis': 'two_committed_merges_same_inputs', 'model_calls': 0, 'first': first, 'second': second,
               'upstream_artifacts': parents, 'qualified_input_ids': len(first_map), **pairs}
+    result['measurements'] = {
+        'provenance': {'analysis_code': analysis_code_fingerprint(), 'stage': 'committed_comparison',
+                       'truth_sha256': hashlib.sha256(truth_path.read_bytes()).hexdigest(),
+                       'source_snapshot': 'not_established_by_graph_digest'},
+        'extraction_effect_this_experiment': {'status': 'not_applicable', 'value': None,
+                                             'reason': 'same_frozen_extraction_checkpoints'},
+        'final_committed_change_vs_control': {
+            'status': 'measured', 'basis': 'two_verified_commits_same_inputs',
+            'first_run_id': first['run_id'], 'second_run_id': second['run_id'],
+            'input_denominators': first['rows'],
+            'nodes_removed': first['rows']['nodes'] - second['rows']['nodes'],
+            'raw_edges_removed': first['rows']['edges'] - second['rows']['edges'],
+            'attribution': 'committed_policy_difference_not_model_only_without_controlled_policies'},
+        'limitations': ['Unknown truth pairs never count as correct separations.',
+                        'A node-count reduction alone does not establish correct identity resolution.',
+                        'Legacy census files may not record the code that executed the archived run.']}
     write(result_file.parent, result_file.name, result)
 
 

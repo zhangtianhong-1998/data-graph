@@ -628,6 +628,8 @@ def install_run_query_budget(config, adapters):
 
 
 def open_sources(config, *, metadata_only=False, source_credentials=None, isolate_database_failures=False):
+    from .source_identity import validate_environment_credentials
+    validate_environment_credentials(config.sources, source_credentials)
     from ..sources import ExcelSource, CSVSource, GaussSource, MySQLSource
     from ..sources.base import QueryStats
     from ..sources.reconnect import open_database_source

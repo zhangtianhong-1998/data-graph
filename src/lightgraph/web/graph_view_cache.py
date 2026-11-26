@@ -86,8 +86,16 @@ def load_graph_view(directory: Path, key: dict, loader: Loader) -> tuple[dict, s
         with _lock:
             _store(token, value)
             flight[1]['value'] = value
-            if not from_disk and token in _views:
+            resident = token in _views
+            if not from_disk and resident:
                 _write_later(directory, key, token)
+        if not from_disk and not resident:
+            # The request already owns this graph. Persist it before releasing
+            # the shared flight; never queue an unbounded second retained view.
+            try:
+                _write_disk(directory, key, value)
+            except (OSError, TypeError, ValueError, RecursionError):
+                pass
         return value
     except BaseException as error:
         flight[1]['error'] = error

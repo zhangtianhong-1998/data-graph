@@ -6,7 +6,7 @@ import re
 from .dimensional import empty_answer
 from .intent import _ACTION, _EDGE_DIRECTIONS, _NEG, _PATH_OPERATION, _PREDICATE
 from .retriever import is_literal_span
-from .path_evidence import PathCollection, witness_names, matches_operand
+from .path_evidence import PathCollection, evidence_preview, grounds_slot, path_node, witness_names, matches_operand
 from .semantic_grounding import link_mentions
 from .store_sqlite import normalize_term
 from .traversal import retrieve_traversal
@@ -157,14 +157,21 @@ def retrieve_grouping(retriever, request, scopes, plan):
     if filters or not choices:
         # A region or other independent filter can be a confirmed object even
         # when no visible record jointly supports it and the grouping path.
-        ids = list(seeds) if len(seeds) == 1 else []
-        ids.extend(slot['candidates'][0]['node_id'] for slot in filter_slots if len(slot['candidates']) == 1)
-        for nid, label in retriever.index.authorized_labels(ids, scopes=cohorts).items():
-            if nid not in collection.nodes:
+        partial_slots = ([bound] if len(seeds) == 1 else []) + [
+            slot for slot in filter_slots if len(slot['candidates']) == 1]
+        ids = [slot['candidates'][0]['node_id'] for slot in partial_slots]
+        partial_nodes = retriever.index.load_authorized_nodes(ids, scopes=cohorts)
+        retained = set(collection.nodes)
+        for slot, nid in zip(partial_slots, ids):
+            if nid not in retained and nid in partial_nodes:
                 if len(visible_nodes) >= request.max_nodes:
                     reasons.add('output_limit')
                     break
-                visible_nodes.append({'id': nid, 'display_name': label})
+                node = partial_nodes[nid]
+                witness = next((obs for obs in node['observations'] if grounds_slot(node, obs, slot)), None)
+                if witness is not None:
+                    visible_nodes.append(path_node(node, evidence_preview(witness), [slot['text']], True))
+                    retained.add(nid)
         answer.update(truncated=bool(reasons), truncation_reasons=sorted(reasons))
         answer['available_context'] = {'status': 'partial', 'nodes': visible_nodes, 'edges': visible_edges,
                                        'witnesses': [], 'passages': [], 'truncated': bool(reasons)}

@@ -46,6 +46,16 @@ def _repair_frozen_references(graph, inherit_id):
             definition['identity_evidence_refs'] = [missing.get(ref, ref) for ref in refs]
 
 
+def inherited_semantics_digest(graph):
+    """Fingerprint the authorized facts and their effective identity constraints."""
+    return digest('inherited_semantics_v2', {
+        'nodes': graph.get('nodes', []),
+        'edges': graph.get('edges', []),
+        'definitions': graph.get('definitions', {}),
+        'identity_separations': graph.get('identity_separations', []),
+    })
+
+
 def load_inherited_source_graph(ref, *, workspace=None, grant_evidence=None) -> tuple[dict[str, Any], str]:
     """Read an authorized, scope-filtered published graph without relying on isolation_domain."""
     if ref.source_project_id:
@@ -77,11 +87,9 @@ def load_inherited_source_graph(ref, *, workspace=None, grant_evidence=None) -> 
         graph = filter_graph_scopes(raw, ref.allowed_scopes)
     if graph.get('status') != 'published' or graph.get('target') != 'graph':
         raise LightGraphError('inherited_publication_required')
-    actual_digest = digest({
-        'nodes': graph.get('nodes', []),
-        'edges': graph.get('edges', []),
-        'definitions': graph.get('definitions', {}),
-    })
+    # Legacy topology-only digests cannot prove whether a cannot-link decision
+    # was added or revoked. Do not accept them as a pin for a new inheritance.
+    actual_digest = inherited_semantics_digest(graph)
     if ref.expected_graph_digest and actual_digest != ref.expected_graph_digest:
         raise LightGraphError('inherited_graph_digest_mismatch')
     return graph, actual_digest
@@ -110,7 +118,8 @@ def freeze_inherited_graphs(config, construction_dir: str | Path, *, workspace=N
         summaries.append({
             'inherit_id': ref.inherit_id, 'source_project_id': ref.source_project_id,
             'source_access': graph.get('access_fingerprint'), **grant_evidence,
-            'source_graph_digest': actual_digest, 'allowed_scopes': list(ref.allowed_scopes),
+            'source_graph_digest': actual_digest, 'source_digest_version': 2,
+            'allowed_scopes': list(ref.allowed_scopes),
             'frozen_digest': frozen_digest, 'snapshot_file': snapshot_file,
             'nodes': len(tagged['nodes']), 'edges': len(tagged['edges']),
             'entity_types': [{'type': e['type'], 'key_names': list(e.get('key_names', []))}

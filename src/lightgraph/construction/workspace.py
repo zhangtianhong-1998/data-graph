@@ -700,6 +700,8 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False, identi
     definitions = {category: {} for category in ('entities', 'relations')}
     items = {category: {} for category in ('nodes', 'edges')}
     property_keys = {}
+    list_keys = {}
+    from .list_merge import merge_list_values
     retained_global_labels = not fusion_policy and any(
         definition.get('identity_scope') == 'global' and definition.get('identity_domain')
         and definition.get('identity_evidence_refs')
@@ -779,10 +781,7 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False, identi
                                     raise LightGraphError('published_graph_identity_conflict')
                 for key in ('aliases', 'provenance', 'supports', 'english_names', 'descriptions'):
                     if key in item:
-                        values = previous.setdefault(key, [])
-                        for value in item[key]:
-                            if value not in values:
-                                values.append(deepcopy(value))
+                        merge_list_values(previous, item, key, list_keys, (category, item['id']))
                 merge_property_values(previous, item, property_keys.setdefault((category, item['id']), {}))
     result['definitions'] = {key: [value[name] for name in sorted(value)] for key, value in definitions.items()}
     result.update({key: sorted(value.values(), key=lambda item: item['id']) for key, value in items.items()})
@@ -817,10 +816,7 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False, identi
         edges = [edge for edge in result['edges'] if edge['type'] == relation['type']]
         topology = detect_context_cycles(edges)
         if not topology['complete']:
-            result['context_cycle_diagnostics'].append({'status': 'unresolved',
-                'reason': 'context_cycle_analysis_incomplete', 'relation': relation['type'],
-                'node_ids': sorted({edge[end] for edge in edges for end in ('source', 'target')}),
-                'edge_ids': sorted(edge['id'] for edge in edges)})
+            raise LightGraphError('published_relation_constraint_unverified')
         if topology['cycle_edge_ids']:
             raise LightGraphError('published_relation_cycle')
     from .display import derive_display_graph

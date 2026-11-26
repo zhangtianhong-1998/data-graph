@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from pydantic import AliasChoices, Field, field_validator, model_serializer, model_validator
 from lightgraph.contracts import StrictModel, canonical
+from lightgraph.documents.identity_explanations import IdentityExplanation
 
 
 class ApplicabilityMapping(StrictModel):
@@ -138,11 +139,21 @@ class EntityDefinition(StrictModel):
         description='Documented identifier system or shared identity authority. A matching label alone does not establish a shared identifier.')
     identity_evidence_refs: list[str] = Field(default_factory=list, max_length=128,
         description='Issued evidence supporting the declared identity domain and grain; global identity requires at least one reference.')
+    identity_explanations: list[IdentityExplanation] = Field(default_factory=list, max_length=128,
+        description='Source-bound interpretations of fully read business text. Bind the complete ordered key and '
+                    'quoted semantic roles to an exact issued reference; contrary/local numbering remains separate.')
     identity_context_keys: list[str] = Field(default_factory=list, max_length=32,
         description='For scoped identities, the subset of key_names within which the rest of the key is unique. Include these parts in mapping keys and relation endpoint keys.')
     mappings: list[EntityMapping | MetadataColumnMapping] = Field(min_length=1, max_length=128)
     display_mode: Literal['auto', 'identity', 'relations'] = Field(default='auto',
         description='For objects without a source label: derive from visible relations or the complete identity. Explicit source labels always take precedence.')
+
+    @model_serializer(mode='wrap')
+    def omit_unused_identity_interpretations(self, handler):
+        result = handler(self)
+        if not self.identity_explanations:
+            result.pop('identity_explanations', None)
+        return result
 
     @model_validator(mode="after")
     def consistent_key_arity(self):

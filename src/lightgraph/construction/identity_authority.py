@@ -36,7 +36,9 @@ def shared_key_sections(marker, domain, address, columns):
 
 def _shared_proofs(marker, domain, address, columns):
     sections = shared_key_sections(marker, domain, address, columns)
-    proofs = {('document', ref) for ref in sections}
+    interpreted_sections = {claim.get('section') for claim in marker.get('interpreted_key_claims_v1') or ()
+                            if isinstance(claim, dict) and isinstance(claim.get('section'), str)}
+    proofs = {('document', ref) for ref in sections - interpreted_sections}
     registries = set()
     for claim in marker.get('registry_key_claims_v1') or ():
         if not isinstance(claim, dict) or not isinstance(claim.get('section'), str) or claim['section'] not in sections:
@@ -49,7 +51,21 @@ def _shared_proofs(marker, domain, address, columns):
             registries.add(('registry', digest('document_key_registry_v1', identity, roles)))
     if len(registries) > 1:
         return set()
-    return proofs | registries
+    interpretations = set()
+    for claim in marker.get('interpreted_key_claims_v1') or ():
+        if (not isinstance(claim, dict) or claim.get('section') not in sections
+                or claim.get('domain') != domain or claim.get('key_columns') != list(columns)
+                or not isinstance(claim.get('quote'), str) or claim.get('quote_digest') != digest(claim['quote'])
+                or not all(claim.get(field) for field in ('document_id', 'document_revision', 'section_id'))):
+            continue
+        roles = claim.get('key_roles')
+        if (isinstance(roles, list) and len(roles) == len(columns) and len(set(roles)) == len(roles)
+                and all(isinstance(role, str) and role and role in claim['quote'] for role in roles)):
+            interpretations.add(('interpretation', digest('interpreted_identity_axis_v1', domain,
+                                                         claim.get('version'), roles)))
+    if len(interpretations) > 1:
+        return set()
+    return proofs | registries | interpretations
 
 
 def cross_table_identity_issues(graph, draft, authorities, fusion):
@@ -95,8 +111,12 @@ def cross_table_identity_issues(graph, draft, authorities, fusion):
         collisions[entity.type, tuple(sorted(mapping_numbers))] += 1
     return issues + [{'code': 'cross_table_identity_unverified', 'entity_type': name, 'mappings': list(numbers),
              'affected_nodes': count,
+             'material_checks': [{'mapping': number, 'status': authorities.get((name, number), {}).get(
+                                  'identity_material_status', 'material_missing_or_not_cited')}
+                                 for number in numbers],
              'guidance': 'Use separate types or add the source scope to the key. To share identities, cite '
-                         'a field definition common to the complete keys or configure an explicit fusion rule.'}
+                         'the actual key definition. For ordinary business text, record an exact, source-bound '
+                         'identity_explanation; read missing material or resolve contrary statements before retrying.'}
             for (name, numbers), count in sorted(collisions.items())]
 
 

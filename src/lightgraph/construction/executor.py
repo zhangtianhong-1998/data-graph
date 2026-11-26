@@ -144,6 +144,16 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                     sheet_snapshots[id(mapping)] = revision
 
     collect_sheet_rows = bool(sheet_snapshots)
+    projection_bindings = {}
+    if draft.relations:
+        for source_id, adapter in by_source.items():
+            binding_fn = getattr(adapter, 'observation_binding', None)
+            binding = binding_fn() if binding_fn else None
+            if binding:
+                projection_bindings[source_id] = binding
+    collect_projection_witnesses = bool(draft.relations) and (
+        bool(projection_bindings) or draft.extends_base_graph and bool(inherited.contracts))
+    dropped_witnesses = False
 
     def projection_key(mapping):
         adapter = by_source.get(mapping.source_id)
@@ -284,8 +294,9 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             unavailable_sources[source_id] = error.code
 
     def drop_sheet_witnesses():
-        nonlocal collect_sheet_rows, cache_bytes, graph_bytes, accumulation_index_bytes
+        nonlocal collect_sheet_rows, collect_projection_witnesses, dropped_witnesses, cache_bytes, graph_bytes, accumulation_index_bytes
         collect_sheet_rows = False
+        collect_projection_witnesses = False
         # The immutable cache can share these row objects. Discard its optional
         # copies before changing local accounting or reusing a degraded tuple.
         if immutable_projections is not None:
@@ -293,10 +304,26 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         for key, cached_rows in projection_cache.items():
             for row in cached_rows:
                 if isinstance(row, _SheetRow) and row.witness is not None:
+                    dropped_witnesses = True
                     projection_sizes[key] -= row.witness_bytes
                     cache_bytes -= row.witness_bytes
                     row.witness = None
         saved, indexes = accumulation.drop_support_field(edges.values(), 'source_row_witness')
+        dropped_witnesses = dropped_witnesses or saved > 0
+        graph_bytes -= saved
+        accumulation_index_bytes -= indexes
+        saved, indexes = accumulation.drop_support_field(edges.values(), 'source_projection_witness')
+        dropped_witnesses = dropped_witnesses or saved > 0
+        graph_bytes -= saved
+        accumulation_index_bytes -= indexes
+        saved, indexes = accumulation.drop_support_field(edges.values(), 'source_projection_witness',
+                                                         nested_list='lookup_matches')
+        dropped_witnesses = dropped_witnesses or saved > 0
+        graph_bytes -= saved
+        accumulation_index_bytes -= indexes
+        saved, indexes = accumulation.drop_support_field(edges.values(), 'inherited_observation_witness',
+                                                         nested_list='lookup_matches')
+        dropped_witnesses = dropped_witnesses or saved > 0
         graph_bytes -= saved
         accumulation_index_bytes -= indexes
 
@@ -304,7 +331,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         nonlocal peak_working_bytes
         required = (graph_bytes + cache_bytes + lookup_bytes + accumulation_index_bytes
                     + pending_projection_bytes)
-        if collect_sheet_rows and required > max_working_bytes:
+        if (collect_sheet_rows or collect_projection_witnesses) and required > max_working_bytes:
             drop_sheet_witnesses()
             required = graph_bytes + cache_bytes + lookup_bytes + accumulation_index_bytes + pending_projection_bytes
         if immutable_projections is not None:
@@ -609,7 +636,8 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         if ((lookup is not None and lookup.source_id == '__base_graph__') or
                 (lookup is None and kind not in local_types)):
             answers = inherited.resolve(kind, lookup, columns, key_for(row, columns), end,
-                                        clock=clock, charge=charge_lookup, business_context=business_context)
+                                        clock=clock, charge=charge_lookup, business_context=business_context,
+                                        collect_witness=lambda: collect_projection_witnesses)
             lookup_matches += len(answers)
             lookup_omitted += int(not answers)
             return answers
@@ -642,7 +670,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         return [(key, lookup_support(lookup, end, columns, values, key, candidate))
                 for key, candidate in resolved]
 
-    def lookup_support(lookup, end, columns, values, key, candidate, *, joint_columns=None):
+    def lookup_support(lookup, end, columns, values, key, candidate, *, joint_mapping=None):
         origin = {'source_id': lookup.source_id, 'schema': lookup.schema_name, 'table': lookup.table}
         details = {'endpoint': end, 'source': origin, 'match_columns': lookup.match_columns,
                    'key_columns': lookup.key_columns, 'input_columns': columns,
@@ -650,9 +678,16 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                    'input_value_types': [scalar_kind(value) for value in values],
                    'resolved_key_types': [scalar_kind(value) for value in key],
                    'scope_ref': support_scope(candidate, scope_columns(lookup))}
-        content = {c: candidate[c] for c in sorted(set((joint_columns or _projection_columns(lookup)) + scope_columns(lookup)))}
+        observed_mapping = joint_mapping or lookup
+        content = {c: candidate[c] for c in sorted(set(_projection_columns(observed_mapping) + scope_columns(observed_mapping)))}
         details['row_context'] = {'id': 'ctx_' + digest(origin, typed_value(content)), 'values': content,
                                  'value_types': {name: scalar_kind(value) for name, value in content.items()}}
+        binding = projection_bindings.get(lookup.source_id)
+        if binding and collect_projection_witnesses:
+            details['source_projection_witness'] = {
+                'kind': 'source_projection_v1', 'basis': 'complete_distinct_projection', 'complete': True,
+                'source_binding': binding, 'projection': digest(projection_key(observed_mapping)),
+                'columns': sorted(content), 'tuple': digest(typed_value(content))}
         return details
 
     joint_indexes = {}
@@ -710,9 +745,9 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             source = key_for(detail, left.key_columns)
             target = key_for(detail, right.key_columns)
             source_match = lookup_support(left, 'source', mapping.source_key_columns, source_values, source, detail,
-                                          joint_columns=_projection_columns(joint))
+                                          joint_mapping=joint)
             target_match = lookup_support(right, 'target', mapping.target_key_columns, target_values, target, detail,
-                                          joint_columns=_projection_columns(joint))
+                                          joint_mapping=joint)
             lookup_matches += 2
             yield (source, source_match), (target, target_match)
 
@@ -789,7 +824,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
             if value is not None:
                 accumulation.append(item, 'properties', value, property_name=name)
 
-    definitions = {'entities': [{**e.model_dump(mode='json', exclude={'mappings'}, exclude_none=True),
+    definitions = {'entities': [{**e.model_dump(mode='json', exclude={'mappings', 'identity_explanations'}, exclude_none=True),
                     'identity_origin': 'physical_column' if is_metadata_mapping(e.mappings[0]) else 'row'}
                     for e in draft.entities],
                    'relations': [r.model_dump(mode='json', exclude={'mappings'}) for r in draft.relations]}
@@ -926,6 +961,9 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                         if lookup is not None:
                             support[end + '_lookup'] = lookup.model_dump(mode='json', by_alias=True)
                     metadata_end, column_endpoint = metadata_endpoint(mapping)
+                    binding = projection_bindings.get(mapping.source_id)
+                    witness_columns = sorted(set(_projection_columns(mapping) + scope_columns(mapping)))
+                    projection_fingerprint = digest(projection_key(mapping))
                     if column_endpoint is not None:
                         support['metadata_endpoint'] = {
                             'endpoint': metadata_end,
@@ -999,6 +1037,17 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                             accumulation.append(edge, 'provenance', support)
                             if collect_sheet_rows and isinstance(row, _SheetRow) and row.witness:
                                 current_support['source_row_witness'] = row.witness
+                            elif collect_projection_witnesses and column_endpoint is None:
+                                if binding:
+                                    current_support['source_projection_witness'] = {
+                                        'kind': 'source_projection_v1', 'basis': 'complete_distinct_projection',
+                                        'complete': True, 'source_binding': binding,
+                                        'projection': projection_fingerprint, 'columns': witness_columns,
+                                        'tuple': digest(typed_value({c: row[c] for c in witness_columns}))}
+                            if not collect_projection_witnesses:
+                                for match in current_support.get('lookup_matches', []):
+                                    match.pop('source_projection_witness', None)
+                                    match.pop('inherited_observation_witness', None)
                             accumulation.append(edge, 'supports', current_support)
                         if inherited_pair and not compatible_context_pairs:
                             diagnostic('inherited_lookup_context_conflict', **location)
@@ -1064,7 +1113,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
     rendered = derive_display_graph(graph, copy=False)
     display_seconds = max(0.0, time.monotonic() - disp_started)
     rendered_bytes = len(canonical(rendered).encode())
-    if collect_sheet_rows and rendered_bytes > max_working_bytes:
+    if (collect_sheet_rows or collect_projection_witnesses) and rendered_bytes > max_working_bytes:
         drop_sheet_witnesses()
         for edge in rendered['edges']:
             edge['supports'].sort(key=canonical)
@@ -1080,6 +1129,10 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         edges.clear()
         passed = False
     return {'passed': passed, 'diagnostics': diagnostics,
+            'evidence_diagnostics': ([{'code': 'optional_relation_witnesses_dropped',
+                'reason': 'memory_budget', 'original_relations_retained': not any(
+                    d['code'] in {'memory_budget_exhausted', 'construction_cancelled'} for d in diagnostics)}]
+                if dropped_witnesses else []),
             'source_read_windows': source_read_windows,
             'phase_timings': {
                 'sql_count_seconds': sql_count_seconds,

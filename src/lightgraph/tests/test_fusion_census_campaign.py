@@ -56,6 +56,12 @@ def test_parallel_archived_census_and_scoring_without_new_publication(tmp_path):
     report = data('summary.json')
     assert report['status'] == 'completed' and len(report['stages']) == 5
     assert report['committed_merge_mode'] == 'deterministic' and report['model_calls'] == 0
+    measurements = report['measurements']
+    assert measurements['extraction_effect_this_experiment']['status'] == 'not_applicable'
+    assert measurements['business_acceptance']['status'] == 'not_scored'
+    assert measurements['final_committed_change_vs_control']['status'] == 'not_measured'
+    assert measurements['simulation_deltas']['exploratory']['basis'] == 'in_memory_simulation_not_committed'
+    assert measurements['provenance']['analysis_code']['sha256']
     assert report['scenarios']['reference']['delta']['nodes_removed'] == 1
     assert report['scenarios']['exploratory']['delta']['nodes_removed'] == 4
     assert data('hypotheses.json')['hypothesized_pairs'] == 3
@@ -85,6 +91,9 @@ def test_parallel_archived_census_and_scoring_without_new_publication(tmp_path):
     assert sum(r['unknown_truth'] for r in scored['strata'] if r['kind'] == 'relation_fact') == 3
     assert any(row.get('candidate_block_found') for row in scored['positive_entity_candidate_coverage'])
     assert stats['reference']['tp'] == stats['exploratory']['tp'] == stats['committed']['fn'] == 1
+    assert stats['committed']['business_acceptance']['status'] == 'failed'
+    assert stats['committed']['denominators']['known_positive_pairs'] == 1
+    assert scored['provenance']['truth_sha256'] and scored['provenance']['analysis_code']['sha256']
     # Exercise the saved alias when JSON keys sort exploratory before reference.
     alias_output = tmp_path/'alias'
     call('run', run_file, '--output', alias_output, '--workers', 1, '--simulation', sim,

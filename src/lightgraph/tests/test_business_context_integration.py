@@ -36,6 +36,8 @@ def _extract_branch(config, directory, project):
     registry.write_text(
         '---\nid: product-registry\npurpose: data_description\n'
         'scope: {tables: [A.public.facts_M, B.public.facts_K, C.public.catalog], columns: [product, code]}\n'
+        'sections:\n  Product keys:\n    identity_contract:\n      domain: C_product_catalog\n      scope: shared\n'
+        '      key_columns: {"A:public.facts_M": [product], "B:public.facts_K": [product], "C:public.catalog": [code]}\n'
         '---\n# Product keys\nThe product column in both fact tables stores the globally unique code '
         'from the shared C catalog. All three columns use the C_product_catalog registry.\n',
         encoding='utf-8')

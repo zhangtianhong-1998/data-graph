@@ -193,3 +193,28 @@ def test_physical_rows_must_match_per_observation_not_just_globally():
 def test_overlapping_relation_families_never_double_count(bad):
     with pytest.raises(ValueError):
         census.analyze_relation_facts(_publication([]), bad)
+
+
+def test_projection_tuple_facts_never_claim_a_physical_row_or_database_snapshot():
+    edges = [_verified_edge('a', 'area_parent_child', [[2, 4]]),
+             _verified_edge('b', 'area_parent_of_area', [[2, 4]])]
+    for edge in edges:
+        support = edge['supports'][0]
+        del support['source_row_witness']
+        del support['provenance']['source_column_ordinals']
+        support['provenance']['columns'] = ['AREA_L1_ID', 'AREA_L2_ID']
+        support['source_projection_witness'] = {
+            'kind': 'source_projection_v1', 'basis': 'complete_distinct_projection', 'complete': True,
+            'source_binding': 'a' * 64, 'projection': 'b' * 64, 'tuple': 'c' * 64,
+            'columns': ['AREA_L1_ID', 'AREA_L2_ID']}
+    graph = _publication(edges)
+    before = deepcopy(graph)
+    result = census.analyze_relation_facts(graph, FAMILIES)
+    assert graph == before and result['summary']['confirmed_reduction'] == 1
+    group, = result['confirmed_groups']
+    assert group['physical_row_proofs'] == []
+    proof, = group['source_proofs']
+    assert proof['kind'] == 'source_projection_v1' and proof['tuple'] == 'c' * 64
+    assert 'rows' not in proof and 'snapshot' not in proof
+    edges[1]['supports'][0]['source_projection_witness']['tuple'] = 'd' * 64
+    assert census.analyze_relation_facts(graph, FAMILIES)['summary']['confirmed_reduction'] == 0

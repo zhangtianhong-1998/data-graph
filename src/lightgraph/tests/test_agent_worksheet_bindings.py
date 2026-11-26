@@ -42,9 +42,39 @@ def test_projected_observation_keeps_exact_reference_without_borrowing_rows(proj
     second['projection'] = projection
     if projection == 'reference_only':
         del second['provenance']
-    by_id = {b['observation_id']: b for b in _context(first, second)['bindings']}
+    context = _context(first, second)
+    by_id = {b['observation_id']: b for b in context['bindings']}
     assert by_id['obs-1']['source_row_witness']['rows'] == [[9, 9]]
     assert 'source_row_witness' not in by_id['obs-2']
+    assert by_id['obs-2']['projection'] == projection
+    assert 'projection' not in by_id['obs-1']
+    assert context['truncated'] and context['evidence_truncated']
+
+
+def test_natural_language_path_carries_an_oversized_predicates_reference_only_marker(tmp_path):
+    from lightgraph.retrieval import SubgraphRetriever, sync_graph_to_retrieval
+    from lightgraph.retrieval.query import RetrieveSubgraphRequest
+
+    source = {'source_id': 's', 'schema': 'public', 'table': 'citations'}
+    def support(label, oid):
+        return {'scope_ref': 'public', 'label': label, 'observation_id': oid, 'properties': {},
+                'business_context': {'status': 'global'},
+                'provenance': {'source': source, 'key_columns': ['code']}}
+    edge_support = support('', 'edge-observation')
+    edge_support['provenance'].update(source_key_columns=['from_code'], target_key_columns=['to_code'],
+        predicate={'all': [{'column': f'qualifier_{i}', 'op': 'eq', 'value': 'long-value' * 10} for i in range(80)]})
+    graph = {'support_visibility_version': 1, 'definitions': {}, 'nodes': [
+        {'id': nid, 'type': '书目', 'identity': {'code': nid}, 'supports': [support(label, nid)]}
+        for nid, label in [('a', '甲册'), ('b', '乙册')]],
+        'edges': [{'id': 'e', 'type': '引用', 'source': 'a', 'target': 'b', 'supports': [edge_support]}]}
+    sync_graph_to_retrieval(graph, tmp_path)
+    answer = RetrieveSubgraphRequest(query='从甲册到乙册的路径').run(SubgraphRetriever(tmp_path), ['public'])
+    assert answer['traverse']['status'] == 'found'
+    assert not answer['truncated']  # Search is complete; the evidence projection is smaller.
+    context = agent_context(answer)
+    binding = next(b for b in context['bindings'] if b['ref'] == 'e')
+    assert binding['projection'] == 'reference_only' and binding['observation_id'] == 'edge-observation'
+    assert 'mapping' not in binding and context['truncated'] and context['evidence_truncated']
 
 
 def test_excessive_rows_keep_id_and_mapping_without_truncating_the_locator():

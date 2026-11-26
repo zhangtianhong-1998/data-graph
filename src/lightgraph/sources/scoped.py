@@ -58,6 +58,10 @@ class GoalScopedSource(SourceAdapter):
         self._check_open()
         return self._adapter.capabilities()
 
+    def observation_binding(self):
+        self._check_open()
+        return self._adapter.observation_binding()
+
     def _validate(self, query):
         from lightgraph.discovery.goal import source_in_goal, column_is_excluded
 

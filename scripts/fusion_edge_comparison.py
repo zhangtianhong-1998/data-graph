@@ -6,10 +6,13 @@ from lightgraph.construction.checkpoints import load_checkpoint
 from lightgraph.construction.fusion import definition_contract
 from lightgraph.construction.hierarchy_replay import _row_matches_endpoint
 from lightgraph.construction.merge_name_audit import _typed_key
-from lightgraph.construction.relation_assertions import assertion_signature, support_address
+from lightgraph.construction.relation_assertions import assertion_signature, support_address, support_assertion_checks
+from lightgraph.construction.contexts import business_context_identity
 from lightgraph.construction.source_namespaces import BINDING
 from lightgraph.construction.workflow import run_output_path
 from lightgraph.contracts import digest
+from lightgraph.evaluation.fusion import analysis_code_fingerprint
+from lightgraph.hierarchy_bindings import mapped_direction
 
 from audit_checkpoint_merge import archived_state
 from fusion_census_nodes import _physical_values
@@ -64,7 +67,92 @@ def _endpoint_attested(support, side, endpoint):
             and _row_matches_endpoint(support.get('row_context') or {}, columns, endpoint.raw_key))
 
 
-def _index(graph):
+def _edge_checks(edge, definition, source, target, first_failure):
+    checks = []
+    def check(name, passed, reason):
+        checks.append({'check': name, 'status': 'passed' if passed else 'failed',
+                       **({} if passed else {'reason': reason})})
+    check('accepted_definition', bool(definition) and edge.get('status', 'accepted') == 'accepted',
+          'missing_accepted_definition')
+    check('non_self_loop', edge['source'] != edge['target'], 'self_loop_retained')
+    check('supports', bool(edge.get('supports')), 'no_supports')
+    if definition:
+        flow = definition.get('hierarchy_orientation')
+        mapped = mapped_direction(edge['type'])
+        reason = None
+        if flow in ('parent_to_child', 'child_to_parent'):
+            direction = 'outgoing' if flow == 'parent_to_child' else 'incoming'
+            if mapped and mapped != direction:
+                reason = 'conflicting_hierarchy_direction'
+        elif flow not in (None, 'none'):
+            reason = 'unknown_direction'
+        check('direction', reason is None, reason)
+    else:
+        checks.append({'check': 'direction', 'status': 'not_checked', 'reason': 'definition_unavailable'})
+    if 'business_context' in edge:
+        check('aggregate_scope', business_context_identity(edge)['status'] != 'unknown', 'unknown_aggregate_business_scope')
+    else:
+        checks.append({'check': 'aggregate_scope', 'status': 'not_checked', 'reason': 'not_declared_at_edge_level'})
+    check('typed_endpoints', source is not None and target is not None, 'missing_typed_endpoint')
+    if source is not None and target is not None and definition:
+        check('endpoint_types', source.entity_type == definition.get('source_type')
+              and target.entity_type == definition.get('target_type'), 'inconsistent_endpoint_type')
+    else:
+        checks.append({'check': 'endpoint_types', 'status': 'not_checked', 'reason': 'endpoint_or_definition_unavailable'})
+    supports = []
+    for position, support in enumerate(edge.get('supports') or []):
+        detail = {'support_index': position, **support_assertion_checks(support)}
+        prov = support.get('provenance') if isinstance(support, dict) else None
+        ready = (source is not None and target is not None and isinstance(prov, dict)
+                 and all(isinstance(prov.get(side + '_key_columns'), list) and prov[side + '_key_columns']
+                         and all(isinstance(c, str) for c in prov[side + '_key_columns']) for side in ('source', 'target')))
+        if ready:
+            passed = all(_endpoint_attested(support, side, endpoint)
+                         for side, endpoint in (('source', source), ('target', target)))
+            detail['checks'].append({'check': 'physical_endpoint_attestation',
+                                     'status': 'passed' if passed else 'failed',
+                                     **({} if passed else {'reason': 'unverified_physical_endpoint'})})
+            if not passed:
+                detail['blockers'] = sorted(set(detail['blockers']) | {'unverified_physical_endpoint'})
+        else:
+            detail['checks'].append({'check': 'physical_endpoint_attestation', 'status': 'not_checked',
+                                     'reason': 'endpoint_binding_prerequisites_missing'})
+        supports.append(detail)
+    blockers = {item['reason'] for item in checks if item['status'] == 'failed'}
+    blockers.update(reason for support in supports for reason in support['blockers'])
+    if first_failure:
+        blockers.add(first_failure)
+    return {'edge_id': edge['id'], 'first_failure': first_failure,
+            'checks': checks, 'supports': supports, 'all_blockers': sorted(blockers),
+            'assessable': first_failure is None}
+
+
+def _diagnostic_summary(rows):
+    blockers, support_blockers, checks, kinds = Counter(), Counter(), defaultdict(Counter), Counter()
+    for row in rows:
+        blockers.update(row['all_blockers'])
+        for check in row['checks']:
+            checks['edge.' + check['check']][check['status']] += 1
+        for support in row['supports']:
+            support_blockers.update(set(support['blockers']))
+            kinds[support.get('witness_kind') or 'unverified'] += 1
+            for check in support['checks']:
+                checks['support.' + check['check']][check['status']] += 1
+    assessed = sum(row['assessable'] for row in rows)
+    return {'raw_edge_denominator': len(rows), 'assessable_edges': assessed,
+            'unassessable_edges': len(rows) - assessed, 'assessable_coverage': assessed / len(rows) if rows else None,
+            'status': 'no_assessable_evidence' if rows and not assessed else 'partial' if assessed < len(rows) else 'complete',
+            'all_blocker_edge_counts': dict(sorted(blockers.items())),
+            'all_blocker_support_counts': dict(sorted(support_blockers.items())),
+            'support_denominator': sum(len(row['supports']) for row in rows),
+            'witness_kind_support_counts': dict(sorted(kinds.items())),
+            'check_counts': {name: {status: counts[status] for status in ('passed', 'failed', 'not_checked')}
+                             for name, counts in sorted(checks.items())},
+            'blocker_counts_overlap': True,
+            'note': 'First-failure buckets partition edges; all-blocker counts can overlap and must not be summed.'}
+
+
+def _index(graph, *, with_diagnostics=False):
     entities = {d['type']: d for d in graph['definitions']['entities']}
     relations = {d['type']: d for d in graph['definitions']['relations']}
     endpoints = {}
@@ -75,6 +163,7 @@ def _index(graph):
     groups = defaultdict(lambda: defaultdict(list))
     unverified = defaultdict(list)
     seen = set()
+    diagnostics = []
     for edge in graph['edges']:
         eid = edge['id']
         if eid in seen:
@@ -92,6 +181,8 @@ def _index(graph):
             elif any(not _endpoint_attested(support, side, endpoint)
                      for support in edge['supports'] for side, endpoint in (('source', source), ('target', target))):
                 reason = 'unverified_physical_endpoint'
+        if with_diagnostics:
+            diagnostics.append(_edge_checks(edge, definition, source, target, reason))
         if reason:
             unverified[reason].append(eid)
             continue
@@ -100,7 +191,8 @@ def _index(graph):
         observed = digest(source.cells, target.cells, witness)
         meaning = digest(definition_contract(definition), definition.get('description'), [source.meaning, target.meaning])
         groups[observed][meaning].append(eid)
-    return len(seen), groups, unverified
+    result = (len(seen), groups, unverified)
+    return (*result, diagnostics) if with_diagnostics else result
 
 
 def _load(run_file, node):
@@ -115,7 +207,7 @@ def _load(run_file, node):
         raise ValueError('检查点来源命名空间无法与运行项目对齐。')
     return {'project_id': run['project_id'], 'run_id': run['run_id'], 'node_id': node,
             'checkpoint_run_id': checkpoint['run_id'], 'artifact_id': checkpoint['artifact_id'],
-            'graph_digest': checkpoint['graph_digest']}, _index(graph)
+            'graph_digest': checkpoint['graph_digest'], 'input_digest': checkpoint.get('input_digest')}, _index(graph, with_diagnostics=True)
 
 
 def compare_source_relations(old_run, new_run, node):
@@ -141,14 +233,22 @@ def compare_source_relations(old_run, new_run, node):
                            'old_edge_ids': ids[0], 'new_edge_ids': ids[1]})
 
     def summarize(index, tally):
-        raw, _, unverified = index
+        raw, _, unverified, diagnostics = index
         reasons = {reason: sorted(edges) for reason, edges in sorted(unverified.items())}
         tally['insufficient_evidence_or_self_loop'] = sum(map(len, reasons.values()))
         if sum(tally.values()) != raw:
             raise ValueError('原始关系条数未闭合。')
         return {'raw_edges': raw, 'raw_edges_by_status': dict(tally),
                 'unverified_counts_by_reason': {reason: len(edges) for reason, edges in reasons.items()},
-                'unverified_edge_ids_by_reason': reasons}
+                'unverified_edge_ids_by_reason': reasons,
+                'first_failure_counts': {reason: len(edges) for reason, edges in reasons.items()},
+                'evidence_coverage': _diagnostic_summary(diagnostics), 'edge_checks': diagnostics}
 
-    return {'basis': 'committed_qualified_worksheet_observations', 'old': {**old, **summarize(first, counts[0])},
-            'new': {**new, **summarize(second, counts[1])}, 'groups': groups}
+    return {'basis': 'committed_qualified_source_observations',
+            'legacy_basis': 'committed_qualified_worksheet_observations',
+            'analysis_code': analysis_code_fingerprint(), 'stage': 'source_relation_comparison',
+            'old': {**old, **summarize(first, counts[0])}, 'new': {**new, **summarize(second, counts[1])},
+            'groups': groups,
+            'limitations': ['Observed on one side only does not establish that a business fact was lost.',
+                            'Unassessable observations are neither correct nor absent relations.',
+                            'The archived execution code and source snapshots must be verified independently.']}

@@ -71,6 +71,7 @@ const messages: Record<string, string> = {
   config_path_must_be_unambiguous_project_file: '配置中的文件未在当前项目注册，请从数据接入或知识文档页面上传后再选择。',
   config_path_must_be_project_file: '配置路径必须指向当前项目已上传的文件。',
   model_credential_missing: '请在模型配置中保存 API key，或配置服务器环境变量。', source_credential_missing: '请重新连接数据库，或检查服务器的连接环境变量。',
+  source_environment_override_requires_session: '环境变量模式不能使用另一条数据库连接。请切换为会话凭据模式（session）后重新连接。',
   session_required: '页面会话已失效。请核对刚才的操作结果后重试。', session_invalid: '页面会话已失效。请核对刚才的操作结果后重试。',
   credential_session_invalid: '页面会话已失效。请核对刚才的操作结果后重试。', credential_session_capacity_reached: '服务当前会话已满，请稍后重试。',
   model_endpoint_required: '请先填写并保存模型服务地址和模型名称。',

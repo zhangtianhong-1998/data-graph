@@ -28,6 +28,7 @@ from ..errors import LightGraphError
 from ..runtime.locking import FileLock
 from ..runtime.retention import atomic_text
 from ..runtime.progress import finish_progress, progress_path, read_progress
+from ..runtime.source_identity import environment_source_bindings, validate_environment_credentials
 from .worker_diagnostics import WorkerDiagnostics, StderrCollector, read_worker_log
 from .workspace import _no_symlinks
 
@@ -357,8 +358,9 @@ def _input_path_representation(scoped, project, previous):
     return scoped
 
 
-def _workflow_node_inputs(config, project, files=None, *, version=2, previous_project_root=None):
-    """Node semantics exclude layout, display labels, budgets and credentials."""
+def _workflow_node_inputs(config, project, files=None, *, version=2, previous_project_root=None,
+                          connection_bindings=None):
+    """Exclude layout and budgets; bind source identity without storing credentials."""
     from ..construction.workflow import _apply_scoped_inputs, effective_merge_policy, resolve_workflow_plan
     plan = resolve_workflow_plan(config.workflow)
     result = {}
@@ -385,6 +387,11 @@ def _workflow_node_inputs(config, project, files=None, *, version=2, previous_pr
         config_data = serialized.model_dump(mode='json', exclude={
             'workflow', 'model', 'agent_config', 'output_dir', 'max_run_seconds', 'embedding', 'record_trace',
             'max_working_bytes', 'max_db_queries', 'max_returned_rows', 'max_returned_bytes'})
+        bindings = (environment_source_bindings(scoped.sources) if connection_bindings is None else
+                    {source.id: connection_bindings[source.id] for source in scoped.sources
+                     if source.id in connection_bindings})
+        if bindings:
+            config_data['environment_source_bindings_v1'] = bindings
         node_data = node.model_dump(mode='json', exclude={'label', 'position', 'max_calls', 'max_run_seconds'})
         if scoped._document_table_bindings:
             # Older checkpoints could omit sections even when the document bytes match.
@@ -409,17 +416,19 @@ def _workflow_node_inputs(config, project, files=None, *, version=2, previous_pr
 
 class _WorkflowInputProofs:
     """Match immutable checkpoints against independently calculated complete node inputs."""
-    def __init__(self, config, project, files):
+    def __init__(self, config, project, files, *, source_credentials=None):
         self.config = config
         self.project = project
         self.files = files
-        self.current = _workflow_node_inputs(config, project, files)
+        self.connection_bindings = environment_source_bindings(config.sources, source_credentials)
+        self.current = _workflow_node_inputs(config, project, files, connection_bindings=self.connection_bindings)
         self.older = {}
 
     def legacy_at(self, root):
         if root not in self.older:
             self.older[root] = _workflow_node_inputs(
-                self.config, self.project, self.files, version=1, previous_project_root=root)
+                self.config, self.project, self.files, version=1, previous_project_root=root,
+                connection_bindings=self.connection_bindings)
         return self.older[root]
 
     def match(self, nid, archived, artifact, roots):
@@ -662,6 +671,7 @@ class RunManager:
                 raise LightGraphError("invalid_run_mode")
             project, runs = self._paths(pid)
             config = self.workspace.resolved_config(pid).model_copy(deep=True)
+            validate_environment_credentials(config.sources, source_credentials)
             if config.workflow and config.workflow.enabled and not config.workflow.units:
                 raise LightGraphError("workflow_units_required")
             from ..construction.intent import effective_goal_markdown
@@ -791,6 +801,7 @@ class RunManager:
             if not state or state.get('parent_run_id') != source_run_id:
                 raise LightGraphError('workflow_resume_state_missing')
             config = self.workspace.resolved_config(pid).model_copy(deep=True)
+            validate_environment_credentials(config.sources, source_credentials)
             if not config.workflow or not config.workflow.enabled:
                 raise LightGraphError('workflow_not_enabled')
             if config.inherited_graphs:
@@ -837,7 +848,8 @@ class RunManager:
                     required.update(plan.merge_inputs[mid])
             if previous_project_root is not None:
                 _historical_root(previous_project_root)
-            proofs = _WorkflowInputProofs(config, project, _input_manifest(config, project))
+            proofs = _WorkflowInputProofs(config, project, _input_manifest(config, project),
+                                          source_credentials=source_credentials)
             current_inputs = proofs.current
             verified_roots = {}
             units = {u.unit_id: u for u in config.workflow.units}
@@ -858,7 +870,8 @@ class RunManager:
                         policy.pop('fusion_policy', None)
                 legacy_input = digest(access_fingerprint(config), legacy_plan, config.goal_markdown,
                                       config.goal.model_dump(mode='json'), _input_manifest(config, project))
-                if (source.get('config_revision') != self.workspace.config_revision(pid)
+                if (environment_source_bindings(config.sources)
+                        or source.get('config_revision') != self.workspace.config_revision(pid)
                         or state.get('workflow_input') != legacy_input or config.inherited_graphs):
                     raise LightGraphError('workflow_resume_input_changed')
             for nid in [*plan.extract_ids, *plan.merge_order]:
@@ -1014,8 +1027,10 @@ class RunManager:
         existing_state = resume_state or (load_workflow_state(config.output_dir) if run_mode == "continue" else None)
         input_root = None if self._standalone else project
         payload_deps = _input_manifest(config, input_root)
+        connection_bindings = environment_source_bindings(config.sources, source_credentials)
         workflow_input = digest(access_fingerprint(config), config.workflow.model_dump(mode="json"),
-                                config.goal_markdown, config.goal.model_dump(mode="json"), payload_deps)
+                                config.goal_markdown, config.goal.model_dump(mode="json"), payload_deps,
+                                *([{'environment_source_bindings_v1': connection_bindings}] if connection_bindings else []))
         if resume_state is None and selected_unit_ids is not None and (existing_state or {}).get("workflow_input") != workflow_input:
             raise LightGraphError("workflow_input_changed")
         previous_attempts = {}
@@ -1055,7 +1070,7 @@ class RunManager:
             }
             for m in wf.merge_nodes
         }
-        proofs = _WorkflowInputProofs(config, input_root, payload_deps)
+        proofs = _WorkflowInputProofs(config, input_root, payload_deps, source_credentials=source_credentials)
         input_digests = dict(proofs.current)
         reused_artifacts = {nid: artifact for nid, artifact in (resume_state or {}).get('artifacts', {}).items()
                             if nid not in (resume_nodes or set())}
@@ -1249,6 +1264,8 @@ class RunManager:
 
         def check_publication_inputs():
             check_dependencies(payload_deps, project, standalone_config=config if input_root is None else None)
+            if environment_source_bindings(config.sources, source_credentials) != connection_bindings:
+                raise LightGraphError('input_dependency_changed')
             if self.workspace.config_revision(pid) != record["config_revision"]:
                 raise LightGraphError("input_dependency_changed")
             if config.inherited_graphs:
@@ -2328,6 +2345,8 @@ def _metadata_context(config, project_path):
     files = _file_manifest(paths, project_path)
     declarations = {source.id: {**source.model_dump(mode="json"), **source.file_scope_revision}
                     for source in config.sources}
+    for source_id, binding in environment_source_bindings(config.sources).items():
+        declarations[source_id]['environment_source_binding_v1'] = binding
     return {"source_revision": digest(list(declarations.values())),
             "file_revisions": files,
             "source_revisions": {source.id: digest(declarations[source.id],
@@ -2424,6 +2443,7 @@ def read_metadata(workspace, pid, refresh=False, *, source_credentials=None, sou
     from ..runtime.config import open_sources
     from ..store import GraphStore
     config = config if config is not None else workspace.resolved_config(pid)
+    validate_environment_credentials(config.sources, source_credentials)
     output = Path(config.output_dir)
     path = output / "metadata.yaml"
     adapters = []

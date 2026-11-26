@@ -26,7 +26,8 @@ def archived_csv_workflow(tmp_path, monkeypatch):
         install_scripted_worker(patch, draft_factory=overlapping_metric_proposal)
         current = execution._workflow_node_inputs
         patch.setattr(execution, '_workflow_node_inputs',
-                      lambda config, project, files: current(config, project, files, version=1))
+                      lambda config, project, files, **options:
+                          current(config, project, files, **{**options, 'version': 1}))
         create(client)
         upload(client, 'metrics.csv', b'metric_code,metric_name,class_code,class_name,unit,currency\nK,A,C,Group,kg,EUR\n')
         upload(client, 'analysis.md', b'# Metrics documentation')

@@ -9,7 +9,14 @@ from lightgraph.sources.gauss import GaussSource
 from lightgraph.sources.unavailable import UnavailableSource
 from lightgraph.tests.test_database_reconnect import Factory
 from lightgraph.tests.test_database_runtime_probe_recovery import RuntimeConnection
-from lightgraph.tests.test_source_initialization_isolation import configuration
+from lightgraph.tests.test_source_initialization_isolation import configuration as source_configuration
+
+
+def configuration(tmp_path):
+    config = source_configuration(tmp_path)
+    config.sources[1].credential_mode = 'session'
+    config.sources[1].dsn_env = None
+    return config
 
 
 @pytest.mark.parametrize('kind,adapter', [('gauss_database', 'GaussSource'), ('mysql_database', 'MySQLSource')])

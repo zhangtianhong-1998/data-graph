@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import os
 import re
-from collections import deque
+from collections import Counter, deque
 from typing import Literal
 from urllib.parse import urlsplit
 
 import httpx
 from pydantic import Field, StrictInt, TypeAdapter, ValidationError
 
-from lightgraph.contracts import StrictModel, canonical
+from lightgraph.contracts import StrictModel, canonical, digest
 from lightgraph.discovery.budget import BudgetAllocator, Cost
 from lightgraph.discovery.token_estimation import estimate_tokens, prompt_token_limit
 from lightgraph.errors import BudgetExceeded, LightGraphError
@@ -22,8 +22,6 @@ from .overlap_binding_evidence import review_priority
 _MAX_BATCH_PATTERNS = 4
 # Leave room for provider reasoning as well as the small structured decision.
 _OUTPUT_TOKENS_PER_PATTERN = 1024
-_MAX_OUTPUT_TOKENS = 8192
-_MAX_PROMPT_BYTES = 64 * 1024
 _SPLITTABLE = {'model_response_truncated', 'model_response_too_large', 'model_stream_transport_too_large',
                'model_stream_event_too_large'}
 _PATTERN_ID = re.compile(r'pattern_[0-9a-f]{24}')
@@ -54,6 +52,9 @@ For a relation pattern sharing directed columns, use propose_relation with membe
 the selected members share a declared meaning_group and could be observations of the same directed
 relationship or direct hierarchy fact. Local row, scope and declaration checks verify the grouping.
 Choose keep for distinct meanings or levels and review if the schema does not support an alignment.
+Prefer binding_ids from binding_choices for propose, or member_ids from member_choices for propose_relation.
+These IDs already bind the member, source and role; copy them exactly, without computing indexes.
+When protocol_feedback is present, correct only that card using its reason and allowed bindings.
 Never infer an entire namespace from similar names or codes. Supply only the issued references."""
 
 
@@ -80,7 +81,19 @@ class _MemberSelection(StrictModel):
     member_indexes: list[StrictInt] = Field(min_length=2, max_length=MAX_MEMBERS)
 
 
-_ResponseDecision = _Decision | _AlignmentProposal | _MemberSelection
+class _BindingSelection(StrictModel):
+    pattern_id: str
+    action: Literal['propose']
+    binding_ids: list[str] = Field(min_length=2, max_length=MAX_MEMBERS)
+
+
+class _RelationSelection(StrictModel):
+    pattern_id: str
+    action: Literal['propose_relation']
+    member_ids: list[str] = Field(min_length=2, max_length=MAX_MEMBERS)
+
+
+_ResponseDecision = _Decision | _AlignmentProposal | _MemberSelection | _BindingSelection | _RelationSelection
 _response_decision = TypeAdapter(_ResponseDecision)
 
 
@@ -170,7 +183,7 @@ def _structural_profile(pattern):
     if previous:
         actions = [action for action in actions if action in ('keep', 'review', 'propose')]
     unique = _unique_projection_sources(members, pattern['sources']) if 'propose' in actions else {}
-    return {
+    result = {
         **({'previous_check': {'reason': previous['reason'], 'alignment': [
             {k: row[k] for k in ('member_index', 'source_index', 'role_index')}
             for row in previous['alignment']]}} if previous else {}),
@@ -197,11 +210,35 @@ def _structural_profile(pattern):
            if pattern.get('witness_binding') else {}),
         'sources': [{key: source[key] for key in source_fields if key in source} for source in pattern['sources']],
     }
+    if 'propose' in actions:
+        choices = []
+        for mi, member in enumerate(members):
+            for ri, role in enumerate(member['roles']):
+                for si in member.get('source_indexes', range(len(result['sources']))):
+                    if (si not in role.get('source_indexes', range(len(result['sources'])))
+                            or not 0 <= si < len(result['sources'])
+                            or role.get('key_columns') != result['sources'][si].get('key_columns')):
+                        continue
+                    choices.append({'binding_id': 'binding_' + digest(pattern['pattern_id'], member['contributor_id'],
+                        member['type'], result['sources'][si], role)[:24],
+                        'member_index': mi, 'source_index': si, 'role_index': ri})
+        result['binding_choices'] = choices
+    if 'propose_relation' in actions:
+        result['member_choices'] = [{'member_id': 'member_' + digest(pattern['pattern_id'], member)[:24],
+                                      'member_index': i} for i, member in enumerate(members)]
+    return result
 
 
 def _alignment_members(proposal, profile):
     if profile['kind'] != 'entity':
         raise ValueError('invalid_proposal_kind')
+    if isinstance(proposal, _BindingSelection):
+        choices = {row['binding_id']: row for row in profile.get('binding_choices', [])}
+        if any(binding not in choices for binding in proposal.binding_ids):
+            raise ValueError('unknown_proposal_binding_id')
+        proposal = _AlignmentProposal(pattern_id=proposal.pattern_id, action='propose', alignment=[
+            {k: choices[binding][k] for k in ('member_index', 'source_index', 'role_index')}
+            for binding in proposal.binding_ids])
     if isinstance(proposal, _Decision):
         if len(profile['members']) != 2 or profile.get('unique_binding_members') != [0, 1]:
             raise ValueError('ambiguous_proposal_binding')
@@ -258,12 +295,24 @@ def _decisions(reply, issued, *, invalid_proposals=None):
     if not isinstance(decoded, dict) or set(decoded) != {'decisions'} or not isinstance(decoded['decisions'], list):
         raise ValueError('invalid_decisions')
     rows = decoded['decisions']
-    if any(not isinstance(row, dict) or not isinstance(row.get('pattern_id'), str) for row in rows):
-        raise ValueError('invalid_decisions')
-    by_id = {row['pattern_id']: row for row in rows}
-    if not by_id or len(rows) != len(by_id) or not by_id.keys() <= issued.keys():
-        raise ValueError('invalid_decisions')
-    missing = issued.keys() - by_id.keys()
+    by_id, duplicates = {}, set()
+    for row in rows:
+        if (not isinstance(row, dict) or not isinstance(row.get('pattern_id'), str)
+                or row['pattern_id'] not in issued):
+            if invalid_proposals is None:
+                raise ValueError('invalid_decisions')
+            continue
+        pid = row['pattern_id']
+        if pid in by_id:
+            duplicates.add(pid)
+        by_id[pid] = row
+    for pid in duplicates:
+        del by_id[pid]
+    if duplicates:
+        if invalid_proposals is None:
+            raise ValueError('invalid_decisions')
+        invalid_proposals.update(dict.fromkeys(sorted(duplicates), 'duplicate_decision'))
+    missing = issued.keys() - by_id.keys() - duplicates
     if missing:
         if invalid_proposals is None:
             raise ValueError('invalid_decisions')
@@ -276,7 +325,7 @@ def _decisions(reply, issued, *, invalid_proposals=None):
         action = row.get('action')
         if action in ('review', 'keep'):
             # Some JSON-only providers echo the selection while explicitly abstaining.
-            for key in ('alignment', 'member_indexes'):
+            for key in ('alignment', 'member_indexes', 'binding_ids', 'member_ids'):
                 if isinstance(row.get(key), list):
                     del row[key]
         try:
@@ -287,6 +336,12 @@ def _decisions(reply, issued, *, invalid_proposals=None):
             if item.action == 'propose':
                 decision['alignment'] = _alignment_members(item, profile)
             elif item.action == 'propose_relation':
+                if isinstance(item, _RelationSelection):
+                    choices = {r['member_id']: r['member_index'] for r in profile.get('member_choices', [])}
+                    if any(mid not in choices for mid in item.member_ids):
+                        raise ValueError('unknown_relation_member_id')
+                    item = _MemberSelection(pattern_id=pid, action='propose_relation',
+                                            member_indexes=[choices[mid] for mid in item.member_ids])
                 indexes = sorted(item.member_indexes)
                 if (profile['kind'] != 'relation' or profile['basis'] != 'same_directed_source_columns'
                         or len(profile['sources']) != 1 or not profile['sources'][0].get('source_key_columns')
@@ -295,7 +350,7 @@ def _decisions(reply, issued, *, invalid_proposals=None):
                     raise ValueError('invalid_relation_proposal')
                 decision['member_indexes'] = indexes
         except ValueError as exc:
-            if invalid_proposals is None or action not in ('propose', 'propose_relation'):
+            if invalid_proposals is None:
                 raise
             invalid_proposals[pid] = 'invalid_proposal_shape' if isinstance(exc, ValidationError) else str(exc)
             continue
@@ -304,10 +359,10 @@ def _decisions(reply, issued, *, invalid_proposals=None):
 
 
 def _prompt_fits(payload, limits):
-    max_bytes = min(limits.max_prompt_bytes or _MAX_PROMPT_BYTES, _MAX_PROMPT_BYTES)
+    max_bytes = limits.max_prompt_bytes
     token_limit = prompt_token_limit(limits)
     packet = canonical(payload)
-    return len(packet.encode()) <= max_bytes and (token_limit is None or estimate_tokens(packet) <= token_limit)
+    return (max_bytes is None or len(packet.encode()) <= max_bytes) and (token_limit is None or estimate_tokens(packet) <= token_limit)
 
 
 def _plan_batches(ordered, payload, limits, oversized, budget):
@@ -379,9 +434,17 @@ def review_overlap_patterns(config, patterns, *, api_key=None, check_cancelled=N
     if seconds <= 0:
         return {**audit, 'reason': 'wall_time_budget_exhausted'}
     budget = _ReviewBudget(seconds, check_cancelled)
-    limits = model.model_copy(update={'max_output_tokens': min(model.max_output_tokens, _MAX_OUTPUT_TOKENS),
-                                      'max_response_bytes': min(model.max_response_bytes or 131072, 131072)})
+    limits = model
     output_field = model.output_token_field or output_token_field(model.model)
+    audit['effective_model_budget'] = {
+        'model': model.model, 'configuration_source': 'agent_config' if config.agent_config else 'project.model',
+        'output_token_field': output_field, 'max_output_tokens': limits.max_output_tokens,
+        'max_prompt_bytes': limits.max_prompt_bytes, 'max_response_bytes': limits.max_response_bytes,
+        'max_prompt_tokens': limits.max_prompt_tokens, 'context_window_tokens': limits.context_window_tokens,
+        'max_calls': call_limit, 'remaining_seconds': seconds,
+        'timeout_seconds': model.timeout_seconds, 'response_format': model.response_format,
+        'stream': model.stream, 'retries': model.retries,
+    }
     payload = {'model': model.model, 'stream': limits.stream, output_field: limits.max_output_tokens,
                'response_format': response_format_for(_Batch.model_json_schema(), model.response_format),
                'messages': [{'role': 'system', 'content': _INSTRUCTIONS}, {'role': 'user', 'content': ''}]}
@@ -390,14 +453,12 @@ def review_overlap_patterns(config, patterns, *, api_key=None, check_cancelled=N
     ids = [p['pattern_id'] for p in patterns]
     if len(set(ids)) != len(ids) or any(not _PATTERN_ID.fullmatch(pid) for pid in ids):
         return {**audit, 'status': 'fallback', 'reason': 'invalid_pattern_identity'}
-    # Finish first attempts before recovery so that one expensive card cannot
-    # use up the remaining calls for independent batches. Split down to a
-    # singleton, then allow one length-only retry inside the configured window.
-    singleton_limits = limits.model_copy(update={'max_output_tokens': min(model.max_output_tokens, 2 * _MAX_OUTPUT_TOKENS)})
+    # Independent cards get their first attempt before bounded correction retries.
     ordered = sorted(patterns, key=review_priority)
     first_attempts = _plan_batches(ordered, payload, limits, audit['oversized_pattern_ids'], budget)
     retries = deque()
-    validated, failed = {}, {}
+    validated, failed, protocol_retries = {}, {}, set()
+    transport_retries = Counter()
     stop_reason = None
     while True:
         try:
@@ -419,10 +480,13 @@ def review_overlap_patterns(config, patterns, *, api_key=None, check_cancelled=N
         payload['messages'][1]['content'] = canonical({'patterns': profiles})
         counter = _CallCounter(budget, on_model_call)
         reason = None
+        retryable, http_status, global_failure = False, None, False
         token_usage = {}
+        finish_reason = None
         try:
             reply = request_completion(attempt_limits, budget, counter, key, payload)
             token_usage = reported_token_usage(reply.get('usage'))
+            finish_reason = reply.get('choices', [{}])[0].get('finish_reason')
             budget.check_deadline()
             invalid_proposals = {}
             decisions = _decisions(reply, issued, invalid_proposals=invalid_proposals)
@@ -432,6 +496,11 @@ def review_overlap_patterns(config, patterns, *, api_key=None, check_cancelled=N
             if exc.code in {'query_cancelled', 'run_cancelled'}:
                 raise
             reason = exc.code
+            retryable = exc.retryable
+            http_status = getattr(exc, 'http_status', None)
+            global_failure = isinstance(exc, BudgetExceeded) or http_status in (401, 403)
+            if reason == 'model_response_truncated':
+                finish_reason = 'length'
             token_usage = getattr(exc, 'token_usage', token_usage)
         except (ValueError, KeyError, IndexError, TypeError, RecursionError):
             reason = 'invalid_decisions'
@@ -444,6 +513,10 @@ def review_overlap_patterns(config, patterns, *, api_key=None, check_cancelled=N
         attempt = len(audit['batches']) + 1
         audit['batches'].append({'pattern_ids': list(issued), 'output_token_limit': attempt_limits.max_output_tokens,
                                  'attempt': attempt, 'parent_attempt': parent_attempt,
+                                 'finish_reason': finish_reason,
+                                 'reasoning_tokens': token_usage.get('reasoning_tokens'),
+                                 **({'retryable': retryable} if reason else {}),
+                                 **({'http_status': http_status} if http_status is not None else {}),
                                  **({'token_usage': token_usage} if token_usage else {}),
                                  'status': 'failed' if reason else 'reviewed', 'reason': reason})
         if parent_attempt is not None:
@@ -458,22 +531,26 @@ def review_overlap_patterns(config, patterns, *, api_key=None, check_cancelled=N
                 if len(profiles) > 1:
                     middle = (len(profiles) + 1) // 2
                     retries.extend(((profiles[:middle], attempt, limits), (profiles[middle:], attempt, limits)))
-                elif reason == 'model_response_truncated' and attempt_limits.max_output_tokens < singleton_limits.max_output_tokens:
-                    payload[output_field] = singleton_limits.max_output_tokens
-                    if _prompt_fits(payload, singleton_limits):
-                        retries.append((profiles, attempt, singleton_limits))
-                    else:
-                        audit['batches'][-1]['recovery_blocked_by'] = 'model_prompt_budget_exhausted'
-            elif reason not in {'invalid_decisions', 'model_response_invalid', 'model_response_refused'}:
+            elif global_failure:
                 stop_reason = reason
                 break
+            elif retryable and all(transport_retries[pid] < model.retries for pid in issued):
+                transport_retries.update(issued.keys())
+                retries.append((profiles, attempt, limits))
         else:
             if invalid_proposals:
                 failed.update(dict.fromkeys(invalid_proposals, 'invalid_decisions'))
                 audit['batches'][-1].update(status='partial' if decisions else 'failed', reason='invalid_decisions',
                                             invalid_proposals=invalid_proposals)
-                if len(profiles) > 1:
-                    retries.extend(([issued[pid]], attempt, limits) for pid in invalid_proposals)
+                for pid, failure in invalid_proposals.items():
+                    if pid not in protocol_retries:
+                        corrected = {**issued[pid], 'protocol_feedback': {'reason': failure,
+                            'allowed_actions': issued[pid]['review_actions'],
+                            'instruction': 'Return one corrected decision using the issued binding or member IDs.'}}
+                        payload['messages'][1]['content'] = canonical({'patterns': [corrected]})
+                        if _prompt_fits(payload, limits):
+                            protocol_retries.add(pid)
+                            retries.append(([corrected], attempt, limits))
             for decision in decisions:
                 pid = decision['pattern_id']
                 validated[pid] = decision

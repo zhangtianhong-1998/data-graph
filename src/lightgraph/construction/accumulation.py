@@ -71,17 +71,21 @@ class GraphAccumulator:
             self.labels[key] = (first, True)
         return conflict
 
-    def drop_support_field(self, items, field):
+    def drop_support_field(self, items, field, *, nested_list=None):
         """Re-index affected supports when optional evidence yields to the graph budget."""
+        def targets(support):
+            return [support] if nested_list is None else support.get(nested_list) or []
+
         saved_bytes = freed_indexes = 0
         for item in items:
             supports = item['supports']
-            if not any(field in support for support in supports):
+            if not any(field in target for support in supports for target in targets(support)):
                 continue
             old_size = len(self.encoded(supports))
             unique = {}
             for support in supports:
-                support.pop(field, None)
+                for target in targets(support):
+                    target.pop(field, None)
                 token = sha256(self.encoded(support)).digest()
                 unique.setdefault(token, support)
             item['supports'] = list(unique.values())

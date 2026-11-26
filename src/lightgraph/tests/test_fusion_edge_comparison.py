@@ -54,6 +54,11 @@ def test_cli_settles_every_raw_edge_without_declaring_an_unmatched_business_fact
     assert result['old']['unverified_edge_ids_by_reason'] == {
         'missing_or_invalid_physical_rows': ['bare'], 'self_loop_retained': ['loop']}
     assert result['old']['raw_edges'] == 4 and result['new']['raw_edges'] == 3
+    assert result['old']['first_failure_counts'] == result['old']['unverified_counts_by_reason']
+    assert result['old']['evidence_coverage']['assessable_edges'] == 2
+    assert result['old']['evidence_coverage']['assessable_coverage'] == .5
+    assert result['new']['evidence_coverage']['assessable_coverage'] == 1
+    assert result['analysis_code']['sha256']
 
 
 @pytest.mark.parametrize('change', ['source', 'columns', 'type', 'code', 'direction', 'scope', 'snapshot'])
@@ -138,3 +143,48 @@ def test_composite_endpoint_with_reversed_physical_columns_cannot_witness_the_ed
     data['nodes'][0]['supports'][0]['provenance']['key_columns'].reverse()
     count, groups, unknown = _index(data)
     assert count == 1 and groups == {} and unknown == {'unverified_physical_endpoint': ['edge']}
+
+
+def test_all_blockers_and_first_failure_buckets_have_separate_denominators(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / 'scripts'))
+    from fusion_edge_comparison import _diagnostic_summary, _index
+
+    missing_both = _verified_edge('missing-both', 'contains_area', [[2, 3]])
+    del missing_both['supports'][0]['source_row_witness']
+    del missing_both['supports'][0]['business_context']
+    missing_scope = _verified_edge('missing-scope', 'contains_area', [[4, 4]])
+    del missing_scope['supports'][0]['business_context']
+    malformed = {'id': 'missing-provenance', 'type': 'contains_area', 'source': 'p', 'target': 'c',
+                 'supports': [{'scope_ref': 'public'}]}
+    count, groups, first, diagnostics = _index(graph([missing_both, missing_scope, malformed]), with_diagnostics=True)
+    assert count == 3 and not groups and sum(map(len, first.values())) == 3
+    assert first['missing_or_invalid_physical_rows'] == ['missing-both']
+    assert first['unknown_access_or_business_scope'] == ['missing-scope']
+    result = _diagnostic_summary(diagnostics)
+    assert result['all_blocker_edge_counts']['unknown_access_or_business_scope'] == 2
+    assert result['all_blocker_edge_counts']['missing_or_invalid_physical_rows'] == 1
+    assert result['assessable_coverage'] == 0 and result['status'] == 'no_assessable_evidence'
+    assert result['raw_edge_denominator'] == result['support_denominator'] == 3
+    incomplete = next(row for row in diagnostics if row['edge_id'] == 'missing-provenance')
+    assert any(check['check'] == 'scope' and check['status'] == 'not_checked'
+               for check in incomplete['supports'][0]['checks'])
+    assert result['check_counts']['support.scope'] == {'passed': 0, 'failed': 2, 'not_checked': 1}
+
+
+def test_projection_tuple_evidence_is_assessable_without_worksheet_rows(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / 'scripts'))
+    from fusion_edge_comparison import _diagnostic_summary, _index
+    data = graph([_verified_edge('edge', 'contains_area', [[2, 3]])])
+    support = data['edges'][0]['supports'][0]
+    del support['source_row_witness']
+    del support['provenance']['source_column_ordinals']
+    support['provenance']['columns'] = ['AREA_L1_ID', 'AREA_L2_ID']
+    support['source_projection_witness'] = {
+        'kind': 'source_projection_v1', 'basis': 'complete_distinct_projection', 'complete': True,
+        'source_binding': 'a' * 64, 'projection': 'b' * 64, 'tuple': 'c' * 64,
+        'columns': ['AREA_L1_ID', 'AREA_L2_ID']}
+    count, groups, failures, details = _index(data, with_diagnostics=True)
+    assert count == len(groups) == 1 and not failures
+    coverage = _diagnostic_summary(details)
+    assert coverage['assessable_coverage'] == 1
+    assert coverage['witness_kind_support_counts'] == {'source_projection_v1': 1}

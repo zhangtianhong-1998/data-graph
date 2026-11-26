@@ -11,6 +11,7 @@ import re
 
 from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
+from lightgraph.runtime.source_identity import environment_source_bindings
 from .access import access_fingerprint
 from .artifact_io import artifact_step
 from .paths import io_path
@@ -23,8 +24,10 @@ publication_run_id = ContextVar('graph_publication_run_id', default=None)
 def result_access_policy(config):
     def selected(values):
         return sorted(set(values))
+    bindings = environment_source_bindings(config.sources)
     return {
         'version': 1, 'isolation_domain': config.isolation_domain,
+        **({'environment_source_bindings_v1': bindings} if bindings else {}),
         'document_scopes': selected(config.document_scopes),
         'scope_bindings': sorted([b.model_dump(mode='json', by_alias=True) for b in config.scope_bindings], key=digest),
         'goal': {name: selected(getattr(config.goal, name)) for name in (
@@ -89,7 +92,8 @@ def authorize_snapshot(root, head, config):
         # A legacy result cannot prove it contains catalog-only observations.
         raise LightGraphError('graph_access_context_changed')
     if not path.is_file():
-        if policy_id is None and recorded == access_fingerprint(config):
+        if (policy_id is None and recorded == access_fingerprint(config)
+                and not environment_source_bindings(config.sources)):
             return None
         raise LightGraphError('graph_access_context_changed')
     record = read_internal_yaml(path)
@@ -156,7 +160,8 @@ def authorize_inherited_grants(references, grants, resolve_config):
             raise LightGraphError('inherited_graph_scope_not_authorized')
         visible = set(grant['allowed_scopes']) <= set(source.scopes)
         matches = (grant['source_policy_id'] == digest(result_access_policy(source)) if grant.get('source_policy_id')
-                   else grant.get('source_access') == access_fingerprint(source))
+                   else not environment_source_bindings(source.sources)
+                   and grant.get('source_access') == access_fingerprint(source))
         if not visible or not matches:
             raise LightGraphError('inherited_graph_scope_not_authorized')
 
@@ -208,6 +213,10 @@ def migrate_access_context(root, head, historical_config, current_config):
         raise LightGraphError('graph_access_context_changed')
     if access_fingerprint(historical_config) != head.get('access_fingerprint'):
         raise LightGraphError('graph_access_migration_evidence_mismatch')
+    if environment_source_bindings(historical_config.sources):
+        # The old path-sensitive hash never recorded an environment DSN. A
+        # relocation must not manufacture a historical connection witness.
+        authorize_snapshot(root, head, historical_config)
     if result_access_policy(historical_config) != result_access_policy(current_config):
         raise LightGraphError('graph_access_context_changed')
     if head.get('result_policy_id') is not None and head['result_policy_id'] != digest(result_access_policy(historical_config)):

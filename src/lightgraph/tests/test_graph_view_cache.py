@@ -157,3 +157,35 @@ def test_switching_large_views_evicts_older_versions_and_skips_evicted_writes(tm
     assert writes == ['v1', 'v3']
     reloaded = load_graph_view(tmp_path, key(tmp_path / 'v2'), lambda: (graph.copy(), 'rebuilt'))
     assert reloaded[1] == 'rebuilt'
+
+
+def test_view_above_memory_limit_uses_disk_without_retaining_pending_graph(tmp_path, monkeypatch):
+    monkeypatch.setattr(cache, 'MAX_CACHED_RECORDS', 1)
+    graph = {'nodes': [{'id': 'public-1'}, {'id': 'public-2'}], 'edges': []}
+    current = key(tmp_path / 'large.graph')
+    calls = []
+
+    def loader():
+        calls.append('load')
+        return graph, 'large-public'
+
+    assert load_graph_view(tmp_path, current, loader) == (graph, 'large-public')
+    assert view_token(current) not in cache._views
+    assert view_token(current) not in cache._pending
+    assert load_graph_view(tmp_path, current, loader) == (graph, 'large-public')
+    assert calls == ['load']
+    for changes in ({'scopes': ['private']}, {'access': 'different'}, {'mtime_ns': '11'}):
+        load_graph_view(tmp_path, key(tmp_path / 'large.graph', **changes), loader)
+    assert len(calls) == 4
+
+
+def test_large_view_disk_failure_does_not_fail_graph_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(cache, 'MAX_CACHED_RECORDS', 1)
+    graph = {'nodes': [{'id': 'one'}, {'id': 'two'}], 'edges': []}
+
+    def fail(*_args):
+        raise OSError('cache unavailable')
+
+    monkeypatch.setattr(cache, '_write_disk', fail)
+    assert load_graph_view(tmp_path, key(tmp_path / 'large.graph'), lambda: (graph, 'v1')) == (graph, 'v1')
+    assert cache._inflight == {} and cache._pending == {} and cache._views == {}

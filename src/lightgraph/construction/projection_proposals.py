@@ -21,7 +21,8 @@ from .identity_authority import _global_authorities, source_address
 from .observed_identity import _node_evidence, _unique_row_projection, contradictory_qualifiers
 from .overlap_patterns import _blocked_types
 from .relation_assertions import interval_union, support_assertion
-from .projection_access import attach_checkpoint_grant, attach_runtime_grants, common_table_grant
+from .projection_access import (attach_checkpoint_grant, attach_runtime_grants, common_table_grant,
+                                checkpoint_observation_grant)
 from .source_namespaces import source_namespace
 
 
@@ -309,9 +310,11 @@ class _Observation:
     roles: _RoleWitnesses | None = None
     sections: set = field(default_factory=set)
     registries: set = field(default_factory=set)
+    interpretations: set = field(default_factory=set)
     registry_contract: str | None = None
     ancestors: frozenset | None = None
     ancestor_items: list = field(default_factory=list)
+    identity_boundary: str | None = None
 
 
 def _conditions(support):
@@ -336,7 +339,8 @@ def _observation(node, definition, binding, index, own):
     if definition.get('identity_scope') == 'global':
         authorities = _global_authorities(node, definition, {}, local_namespace=False)
         result.sections = {token for kind, token in authorities if kind == 'document'}
-        result.registries = {token for kind, token in authorities if kind == 'registry'}
+        result.interpretations = {token for kind, token in authorities if kind == 'interpretation'}
+        result.registries = {token for kind, token in authorities if kind in {'registry', 'interpretation'}}
     if (len(own) != len(node['supports']) or not all(_own_support(s, binding.contributor_id) for s in own)
             or any(s['provenance'].get('label_column') in (None, '', *binding.key_columns) for s in own)
             or result.label in (str(value) for value in node['identity'].values())):
@@ -345,7 +349,8 @@ def _observation(node, definition, binding, index, own):
     names = definition['key_names']
     if (len(names) != len(binding.key_columns) or node.get('identity_domain') != definition.get('identity_domain')
             or node.get('identity_origin', 'row') != 'row' or definition.get('identity_origin', 'row') != 'row'
-            or any(business_context_identity(s)['status'] == 'unknown' for s in own)
+            or (not (result.sections or result.registries)
+                and any(business_context_identity(s)['status'] == 'unknown' for s in own))
             or not _node_evidence(node, definition)):
         result.reason = 'unverified_applicability'
         return result
@@ -358,6 +363,7 @@ def _observation(node, definition, binding, index, own):
     contract['identity_context_keys'] = [binding.key_columns[names.index(key)]
                                          for key in definition.get('identity_context_keys') or ()]
     result.contract = canonical([contract, node.get('node_role')])
+    result.identity_boundary = canonical(node.get('identity_context'))
     if result.registries:
         # Each dictionary can name the directory and its physical key differently.
         # The registry proof binds the ordered key roles in both dictionaries.
@@ -440,20 +446,24 @@ def _grant_covers(member, binding, data, grant):
     return True
 
 
-def _compare_observations(members, physical):
+def _compare_observations(members, physical, *, independent_grants=False):
     if reason := next((m.reason for m in members if m.reason), None):
         return reason, None
     registry = bool(set.intersection(*(m.registries for m in members)))
+    common_identity = registry or bool(set.intersection(*(m.sections for m in members)))
+    separate_observations = not physical and independent_grants and common_identity
     if (any(m.contract != members[0].contract for m in members)
             and not (registry and all(m.registry_contract == members[0].registry_contract for m in members))):
         return 'incompatible_identity_contract', None
-    if any(m.boundaries != members[0].boundaries for m in members):
+    boundaries = [m.identity_boundary if separate_observations else m.boundaries for m in members]
+    if any(boundary != boundaries[0] for boundary in boundaries):
         return 'different_source_or_scope', None
     basis = 'same_physical_projection' if physical else 'shared_versioned_key_section'
     if not physical and registry and not set.intersection(*(m.sections for m in members)):
-        basis = 'shared_versioned_registry'
+        basis = ('shared_business_key_explanation' if set.intersection(*(m.interpretations for m in members))
+                 else 'shared_versioned_registry')
     role_slot = 0 if physical else 1
-    if any(not m.roles[role_slot] or m.roles[role_slot] != members[0].roles[role_slot] for m in members):
+    if not separate_observations and any(not m.roles[role_slot] or m.roles[role_slot] != members[0].roles[role_slot] for m in members):
         shared_role = ((registry or set.intersection(*(m.sections for m in members))) and members[0].roles.shared_identity
                        and all(m.roles.shared_identity == members[0].roles.shared_identity for m in members))
         if not shared_role:
@@ -463,10 +473,18 @@ def _compare_observations(members, physical):
     if any(m.ancestors != members[0].ancestors for m in members):
         return 'different_ancestor_context', None
     cells = {}
-    if (any(cells.setdefault(k, v) != v for m in members for k, v in m.attributes.items())
+    if ((not separate_observations and any(cells.setdefault(k, v) != v for m in members for k, v in m.attributes.items()))
             or contradictory_qualifiers(m.node for m in members)):
         return 'conflicting_attributes', None
     return None, basis
+
+
+def _observation_grant(member, binding, data):
+    nodes, _, incident, _, _ = data.index(binding.contributor_id)
+    items = [member.node, *member.ancestor_items]
+    for end, edge in incident[member.node['id']]:
+        items.extend((edge, nodes[edge['target' if end == 'source' else 'source']]))
+    return checkpoint_observation_grant(data.inputs[binding.contributor_id], items)
 
 
 def _observation_mismatch(members, physical):
@@ -497,7 +515,7 @@ def _verify(pid, bindings, data, blocked):
         axes[_address(binding)[:3]].add(binding.key_columns)
     different_axes = any(len(columns) > 1 for columns in axes.values())
     physical = len(axes) == 1 and not different_axes
-    evidence_combinations, bases = Counter(), Counter()
+    evidence_combinations, bases, checks = Counter(), Counter(), Counter()
     equal_access = len(access) == 1 and all(access)
     table_grant = common_table_grant([data.inputs[o] for o in owners], bindings[0]) if physical and not equal_access else None
     tables = [_by_key(p, data) for p in bindings]
@@ -520,7 +538,18 @@ def _verify(pid, bindings, data, blocked):
             counts['missing_or_conflicting_names'] += 1
             continue
         report['matched_key_names'] += 1
-        mismatch, basis = _compare_observations(members, physical)
+        grant_issues = [_observation_grant(m, p, data) for m, p in zip(members, bindings, strict=True)]
+        checked_grants = not any(grant_issues)
+        mismatch, basis = _compare_observations(members, physical, independent_grants=checked_grants)
+        shared_section = bool(set.intersection(*(m.sections for m in members)))
+        shared_registry = bool(set.intersection(*(m.registries for m in members)))
+        checks[canonical({'source_access': ('verified_per_observation' if checked_grants else
+            'same_unit_fingerprint' if equal_access else 'unverified'),
+            'access_issues': sorted(set(filter(None, grant_issues))) if not checked_grants and not equal_access else [],
+            'identity_evidence': ('physical_projection' if physical else 'shared_identity' if
+                                  shared_section or shared_registry else 'missing_shared_identity'),
+            'observation_check': mismatch or 'verified',
+            'output_visibility': 'preserve_each_support'})] += 1
         if different_axes:
             reason = 'different_axes_in_same_table'
         elif physical:
@@ -528,11 +557,9 @@ def _verify(pid, bindings, data, blocked):
         else:
             # Count each matched key once. A missing shared proof used to mask
             # every independent observation or access issue on that same key.
-            shared_section = bool(set.intersection(*(m.sections for m in members)))
-            shared_registry = bool(set.intersection(*(m.registries for m in members)))
             evidence_combinations[shared_section, shared_registry, mismatch or 'observations_agree', equal_access] += 1
             reason = mismatch if shared_registry or shared_section else 'cross_table_identity_unverified'
-        if reason is None and not equal_access and (table_grant is None or not all(
+        if reason is None and not equal_access and not (not physical and checked_grants) and (table_grant is None or not all(
                 _grant_covers(m, p, data, table_grant) for m, p in zip(members, bindings, strict=True))):
             reason = 'unverified_access_fingerprint'
         if reason:
@@ -543,7 +570,11 @@ def _verify(pid, bindings, data, blocked):
             (p.contributor_id, m.node['id']) for p, m in zip(bindings, members, strict=True)]
     if groups:
         report['verified_groups_by_basis'] = dict(sorted(bases.items()))
-        report['access_basis'] = 'unit_fingerprint' if equal_access else 'same_frozen_table_grant'
+        report['access_basis'] = ('unit_fingerprint' if equal_access else
+                                 'same_frozen_table_grant' if physical else 'individual_frozen_observation_grants')
+    if checks:
+        import json
+        report['verification_checks'] = [{**json.loads(key), 'keys': count} for key, count in sorted(checks.items())]
     if len(axes) > 1 and not different_axes:
         report['cross_table_matched_key_checks'] = [
             {'shared_key_section_verified': section, **({'shared_registry_key_verified': True} if registry else {}),

@@ -409,6 +409,8 @@ def _merge_contributor_nodes_and_edges(
     unresolved_relations: list[dict[str, Any]] = []
     context_cycle_diagnostics: list[dict[str, Any]] = []
     property_keys = defaultdict(dict)
+    list_keys = {}
+    from .list_merge import merge_list_values
     retained_labels = False
     retain_column_variants = (fusion.label_conflict_policy == 'retain_variants' if fusion
                               else recognize_source_replays and 'conflict_mode' not in policy.model_fields_set)
@@ -486,10 +488,7 @@ def _merge_contributor_nodes_and_edges(
                 else:
                     for key in ('aliases', 'provenance', 'supports', 'english_names', 'descriptions'):
                         if key in node:
-                            vals = existing.setdefault(key, [])
-                            for v in node[key]:
-                                if v not in vals:
-                                    vals.append(deepcopy(v))
+                            merge_list_values(existing, node, key, list_keys, ('node', existing['id']))
                     merge_property_values(existing, node, property_keys[('node', node['id'])])
 
             if node.get('identity_origin') == 'physical_column':
@@ -599,10 +598,7 @@ def _merge_contributor_nodes_and_edges(
                     raise LightGraphError('published_graph_identity_conflict')
                 for key in ('provenance', 'supports'):
                     if key in edge:
-                        vals = existing_edge.setdefault(key, [])
-                        for v in edge[key]:
-                            if v not in vals:
-                                vals.append(deepcopy(v))
+                        merge_list_values(existing_edge, edge, key, list_keys, ('edge', existing_edge['id']))
                 merge_property_values(existing_edge, edge, property_keys[('edge', edge['id'])])
 
     aligned_targets = {target for ids in observed_ids for target in ids.values()}
@@ -695,17 +691,22 @@ def _merge_contributor_nodes_and_edges(
         topology = detect_context_cycles(rel_edges)
         cyclic_ids = set(topology['cycle_edge_ids'])
         if not topology['complete']:
+            if policy.conflict_mode == 'strict':
+                raise LightGraphError('published_relation_constraint_unverified')
             context_cycle_diagnostics.append({'status': 'unresolved',
                 'reason': 'context_cycle_analysis_incomplete', 'relation': rel_type,
                 'node_ids': sorted({edge[end] for edge in rel_edges for end in ('source', 'target')}),
                 'edge_ids': sorted(edge['id'] for edge in rel_edges)})
+            # No unverified acyclic relation enters a partial publication.
+            cyclic_ids.update(edge['id'] for edge in rel_edges)
         if cyclic_ids and policy.conflict_mode == 'strict':
             raise LightGraphError('published_relation_cycle')
         for edge in rel_edges:
             if edge['id'] in cyclic_ids:
                 quarantined_edges.add(edge['id'])
                 del merged_edges[edge['id']]
-                conflict_details.append({'code': 'cross_unit_relation_cycle_isolated',
+                conflict_details.append({'code': ('cross_unit_relation_cycle_isolated' if topology['complete']
+                                                  else 'cross_unit_relation_constraint_unverified'),
                                          'edge_id': edge['id'], 'relation': rel_type,
                                          'source': edge['source'], 'target': edge['target']})
 

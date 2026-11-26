@@ -186,8 +186,10 @@ class _LimitedTransport(httpx.BaseTransport):
             response.close()
             if self.strict and status in (400, 422):
                 raise LightGraphError('model_structured_output_rejected')
-            raise LightGraphError('model_rate_limited' if status == 429 else 'model_http_error',
-                                 retryable=status in (429, 500, 502, 503, 504))
+            error = LightGraphError('model_rate_limited' if status == 429 else 'model_http_error',
+                                    retryable=status in (429, 500, 502, 503, 504))
+            error.http_status = status
+            raise error
         if response.headers.get('content-encoding', 'identity') != 'identity':
             response.close()
             raise LightGraphError('model_content_encoding_unsupported')

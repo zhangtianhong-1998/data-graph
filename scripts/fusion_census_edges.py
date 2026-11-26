@@ -218,6 +218,8 @@ def _physical_row_proofs(edge):
     spans, proofs = defaultdict(list), {}
     for support in edge['supports']:
         _, qualifications, witness = support_assertion(support)
+        if witness['kind'] != 'excel_rows_v1':
+            continue
         qualifier = digest(qualifications)
         key = qualifier, witness['snapshot']
         spans[key].extend(witness['rows'])
@@ -226,6 +228,18 @@ def _physical_row_proofs(edge):
                        'source_columns_with_ordinals': src, 'target_columns_with_ordinals': dst,
                        'snapshot': witness['snapshot'], 'qualifications_sha256': qualifier}
     return [{**proofs[key], 'rows': interval_union(spans[key])} for key in sorted(proofs)]
+
+
+def _source_proofs(edge):
+    proofs = [{'kind': 'excel_rows_v1', **proof} for proof in _physical_row_proofs(edge)]
+    projections = {}
+    for support in edge['supports']:
+        _, qualifications, witness = support_assertion(support)
+        if witness['kind'] != 'source_projection_v1':
+            continue
+        proof = {**witness, 'qualifications_sha256': digest(qualifications)}
+        projections[digest(proof)] = proof
+    return proofs + [projections[key] for key in sorted(projections)]
 
 
 def analyze_relation_facts(graph, families):
@@ -270,6 +284,7 @@ def analyze_relation_facts(graph, families):
             confirmed.append({'fact_id': fact, 'family': family, 'source': source, 'target': target,
                               'original_edge_ids': ids, 'evidence_digest': key,
                               'physical_row_proofs': _physical_row_proofs(group[0]),
+                              'source_proofs': _source_proofs(group[0]),
                               'supports': sum(len(e['supports']) for e in group)})
         if len({fact_for[e['id']] for e in members}) > 1:
             disagreements = sorted(name for name, values in facets.items() if len(values) > 1)

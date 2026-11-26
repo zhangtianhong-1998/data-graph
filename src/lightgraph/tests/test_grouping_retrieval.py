@@ -124,3 +124,30 @@ def test_complete_distribution_phrase_does_not_turn_framing_into_filter(tmp_path
     assert answer['grouping']['filters'] == [] and len(answer['edges']) == 3
     filtered = RetrieveSubgraphRequest(query=q + '，排除未编目样本').run(index, ['read'])
     assert not filtered['edges']
+
+
+@pytest.mark.parametrize('question', ['营业收入按地区分组', '按地区的营业收入是多少', '营业收入在不同地区的分布'])
+def test_grouping_without_a_path_keeps_a_typed_cited_partial_node(tmp_path, question):
+    from lightgraph.retrieval.agent_context import agent_context
+
+    graph = {'support_visibility_version': 1, 'nodes': [
+        {'id': 'revenue', 'type': '指标', 'identity': {'code': 'REV'}, 'supports': [
+            {'scope_ref': 'public', 'label': '营业收入', 'observation_id': 'revenue-source',
+             'business_context': {'status': 'global'}, 'properties': {},
+             'provenance': {'source': {'source_id': 's', 'schema': 'public', 'table': 'income'},
+                            'key_columns': ['metric_code']}}]}], 'edges': [],
+        'definitions': {'entities': [{'type': '指标', 'description': '已开票未冲销的金额', 'key_names': ['code']}]}}
+    sync_graph_to_retrieval(graph, tmp_path)
+    reader = SubgraphRetriever(tmp_path)
+    answer = RetrieveSubgraphRequest(query=question).run(reader, ['public'])
+    assert answer['nodes'] == [] and answer['grouping']['paths'] == []
+    node, = answer['available_context']['nodes']
+    assert (node['id'], node['kind'], node['identity']) == ('revenue', '指标', {'code': 'REV'})
+    assert answer['type_definitions'][0]['type'] == '指标'
+    context = agent_context(answer)
+    assert context['partial_status'] == 'partial'
+    binding, = context['bindings']
+    assert binding['observation_id'] == 'revenue-source'
+    assert binding['source']['table'] == 'income' and binding['mapping']['key_columns'] == ['metric_code']
+    hidden = RetrieveSubgraphRequest(query=question).run(reader, ['restricted'])
+    assert 'revenue-source' not in str(hidden)

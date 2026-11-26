@@ -6,7 +6,7 @@ from lightgraph.errors import LightGraphError
 from .access import access_fingerprint, filter_graph_scopes
 from .checkpoints import require_partial_isolation, usable_result
 from .graph_storage import _graph_digest, read_graph_record
-from .inheritance import frozen_contributors
+from .inheritance import frozen_contributors, inherited_semantics_digest
 from .merger import merge_construction_graphs
 from .workflow import build_merge_node_config, load_unit_contributor, unit_output_path
 from .workspace import read_internal_yaml
@@ -58,7 +58,15 @@ def recompose_legacy_merge(config, old_output, source_run_id, node, outcome, wor
         raise LightGraphError('workflow_legacy_upstream_unverified')
     inherited = summary['inherited'][0]
     visible = filter_graph_scopes(upstream, ref.allowed_scopes)
-    source_digest = digest({key: visible[key] for key in ('nodes', 'edges', 'definitions')})
+    if inherited.get('source_digest_version') == 2:
+        source_digest = inherited_semantics_digest(visible)
+    elif (inherited.get('source_digest_version', 1) == 1
+            and not visible.get('identity_separations') and not frozen[0]['graph'].get('identity_separations')):
+        # Original pre-checkpoint snapshots can only establish the old contract
+        # when neither verified artifact contains unpinned identity constraints.
+        source_digest = digest({key: visible[key] for key in ('nodes', 'edges', 'definitions')})
+    else:
+        raise LightGraphError('workflow_legacy_upstream_unverified')
     if (frozen[0]['contributor_id'] != ref.inherit_id or inherited.get('source_access') != project_access
             or set(inherited.get('allowed_scopes', [])) != set(ref.allowed_scopes)
             or inherited.get('source_graph_digest') != source_digest or not inherited.get('frozen_digest')):

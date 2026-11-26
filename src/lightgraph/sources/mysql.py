@@ -18,7 +18,7 @@ import time
 from typing import Callable
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-from lightgraph.contracts import CapabilityManifest, ColumnSpec, ForeignKeySpec, QueryLimits, TableSpec
+from lightgraph.contracts import CapabilityManifest, ColumnSpec, ForeignKeySpec, QueryLimits, TableSpec, digest
 from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler
 from .base import SourceAdapter, QueryStats, cursor_batches
@@ -114,6 +114,7 @@ class MySQLSource(SourceAdapter):
         self.limits = limits or QueryLimits()
         self.query_budget = query_budget or QueryBudget()
         self.stats = _stats if _stats is not None else QueryStats()
+        self._observation_source_digest = digest('mysql', dsn)
         self._lock, self._control_lock = threading.RLock(), threading.Lock()
         self._depth = 0
         self._closed = self._broken = self._cancelled = False

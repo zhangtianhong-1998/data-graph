@@ -80,6 +80,10 @@ def test_two_committed_runs_score_source_members_in_both_directions(committed_re
     assert report['transition_counts'][change] == report['transition_counts']['unknown_truth'] == 1
     assert sum(report['transition_counts'].values()) == 2
     assert {r['scenario'] for r in report['strata']} == {'first', 'second'}
+    effect = report['measurements']
+    assert effect['extraction_effect_this_experiment']['status'] == 'not_applicable'
+    assert effect['final_committed_change_vs_control']['nodes_removed'] == (-1 if reverse else 1)
+    assert effect['final_committed_change_vs_control']['raw_edges_removed'] == 0
     assert [(p['before'], p['after']) for p in report['pair_results']] == [
         ('together', 'separate') if reverse else ('separate', 'together'), ('separate', 'separate')]
 

@@ -123,6 +123,8 @@ def mixed_config(tmp_path, monkeypatch, db_kind, file_kind, *, qualified=True):
     registry = tmp_path / 'department-codes.md'
     registry.write_text('---\nid: departments\npurpose: data_description\nscope:\n'
         f'  columns: [file.{file_schema}.items.parent_code, database.{schema}.items.code]\n'
+        'sections:\n  部门编码:\n    identity_contract:\n      domain: department_catalog\n      scope: shared\n'
+        f'      key_columns: {{"file:{file_schema}.items": [parent_code], "database:{schema}.items": [code]}}\n'
         '---\n# 部门编码\n项目文件的 parent_code 引用数据库部门目录中的 code。'
         '部门目录统一分配该编码。项目文件自己的 code 是项目编号。\n', encoding='utf-8')
     config = RunConfig.model_validate({'sources': [local, database], 'documents': [str(registry)],
@@ -144,7 +146,9 @@ def mixed_draft(tools, *, reference=None, use_dictionary=True):
     return {'draft_id': '联合构建', 'entities': [
         {'type': '项目', 'key_names': ['编码'], 'mappings': [
             {**file, 'key_columns': ['code'], 'label_column': 'name'}]},
-        {'type': '部门', 'key_names': ['编码'], 'identity_evidence_refs': evidence, 'mappings': [
+        {'type': '部门', 'key_names': ['编码'],
+         **({'identity_domain': 'department_catalog', 'identity_scope': 'global'} if use_dictionary else {}),
+         'identity_evidence_refs': evidence, 'mappings': [
             {**database, 'key_columns': ['code'], 'label_column': 'name'},
             {**file, 'key_columns': ['parent_code'], 'properties': {'补充': 'note'}}]}],
         'relations': [{'type': '归属', 'source_type': '项目', 'target_type': '部门',

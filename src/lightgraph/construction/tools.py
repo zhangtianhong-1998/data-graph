@@ -25,6 +25,7 @@ from lightgraph.errors import LightGraphError
 from lightgraph.source_values import SOURCE_KEY_SEMANTICS_VERSION
 from lightgraph.runtime.files import file_stamp
 from lightgraph.runtime.config import install_run_query_budget, open_sources
+from lightgraph.runtime.source_identity import validate_environment_adapters
 
 from .models import DraftRecord, GraphDraft, draft_evidence_refs
 from .access import access_fingerprint, ensure_supported_access, filter_graph_scopes
@@ -135,6 +136,7 @@ class ConstructionTools:
             self.documents = DocumentCorpus([document for document in loaded_documents
                 if document.document_id not in config.removed_document_ids])
             mapping = {t.source_id: adapter for adapter in self.adapters for t in adapter.describe()}
+            validate_environment_adapters(config.sources, mapping)
             if drop_unbound_documents:
                 catalog = {(t.source_id, t.qualified_name): t
                            for adapter in mapping.values() for t in adapter.describe()}
@@ -513,12 +515,22 @@ class ConstructionTools:
         """Check the evidence for each mapping and for every column of its key."""
         from .identity_authority import metadata_probe
         from lightgraph.documents.identity_contract import shared_key_claim_refs
+        from lightgraph.documents.identity_explanations import explanation_claims
         catalog = {(t.source_id, t.schema_name, t.name): t for t in self.tables.values()}
         applicable = {}
         issues = []
         for index, entity in enumerate(draft.entities):
-            if entity.identity_scope != 'global' and not entity.identity_evidence_refs:
+            if (entity.identity_scope != 'global' and not entity.identity_evidence_refs
+                    and not entity.identity_explanations):
                 continue
+            for explanation in entity.identity_explanations:
+                if not any((m.source_id, m.schema_name, m.table, getattr(m, 'key_columns', None)) == (
+                        explanation.source_id, explanation.schema_name, explanation.table, explanation.key_columns)
+                        for m in entity.mappings):
+                    issues.append({'code': 'identity_explanation_mapping_not_found',
+                                   'path': ['entities', index, 'identity_explanations'],
+                                   'source_id': explanation.source_id, 'table': explanation.table,
+                                   'columns': explanation.key_columns})
             refs = [self.workspace.read_evidence(ref) for ref in entity.identity_evidence_refs]
             probes = {metadata_probe(r.model_dump(mode='json')) for r in refs if r.kind == 'source_probe'}
             sections = {r.ref: digest('identity_field_section_v1', r.details['document_id'], r.details['revision'],
@@ -537,7 +549,7 @@ class ConstructionTools:
                 missing = []
                 documents_by_key = []
                 for column in mapping.key_columns:
-                    if sections and (key, column) not in applicable:
+                    if (key, column) not in applicable:
                         applicable[key, column] = {f"{s['doc_id']}@{s['revision']}:{s['section_id']}": s
                             for s in self.documents.context_for(table, [column])
                             if s['evidence_role'] == 'definition_evidence'}
@@ -545,12 +557,19 @@ class ConstructionTools:
                     if not covered:
                         missing.append(column)
                     documents_by_key.append({sections[ref] for ref in covered})
-                if authorities is not None and (not missing or key in probes):
+                groups = [applicable.get((key, col), {}) for col in mapping.key_columns]
+                interpreted, interpretation_issues = explanation_claims(entity, mapping, table, groups, sections)
+                for issue in interpretation_issues:
+                    issues.append({**issue, 'path': ['entities', index, 'identity_explanations'],
+                                   'source_id': mapping.source_id, 'schema': mapping.schema_name,
+                                   'table': mapping.table, 'columns': list(mapping.key_columns)})
+                if authorities is not None:
                     documents = set.intersection(*documents_by_key) if not missing else set()
                     if not missing and not documents:
                         documents = {digest('composite_key_sections_v1', [sorted(d) for d in documents_by_key])}
                     shared = shared_key_claim_refs(entity.identity_domain, entity.key_names, mapping.key_columns,
-                        table, [applicable.get((key, col), {}) for col in mapping.key_columns], sections)
+                        table, groups, sections)
+                    shared.update(claim['evidence_ref'] for claim in interpreted)
                     registry_claims = [
                         {'section': sections[ref], **entry['registry']}
                         for ref in sorted(shared)
@@ -562,6 +581,11 @@ class ConstructionTools:
                         **({'key_sections_v1': sorted(documents)} if not missing else {}),
                         **({'shared_key_sections_v2': sorted(sections[ref] for ref in shared)} if shared else {}),
                         **({'registry_key_claims_v1': registry_claims} if registry_claims else {}),
+                        **({'interpreted_key_claims_v1': [{**claim, 'section': sections[claim['evidence_ref']]}
+                                                        for claim in interpreted]} if interpreted else {}),
+                        'identity_material_status': ('conflicting_material' if interpretation_issues else
+                            'verified_shared_key' if shared else 'material_missing' if not any(groups) else
+                            'material_not_cited' if not documents else 'material_not_interpreted'),
                         **({'source_metadata': True} if key in probes else {})}
                 if entity.identity_scope == 'global' and missing and key not in probes:
                     code = ('identity_document_not_applicable' if all(r.kind in {'document_section', 'document_version'} for r in refs)
@@ -918,6 +942,8 @@ class ConstructionTools:
                 if not getattr(mapping, 'key_columns', None):
                     continue
                 table = f'{mapping.source_id}:{mapping.schema_name}.{mapping.table}'
+                if table not in self.tables:
+                    continue
                 if entity.identity_scope == 'unknown':
                     refs = self._declared_identity_sections.get((table, tuple(mapping.key_columns)), ())
                     if refs:
@@ -926,6 +952,18 @@ class ConstructionTools:
                                       'sections': [self._field_section_location(ref) for ref in refs[:2]]})
                         if len(hints) == 6:
                             return hints
+                    else:
+                        fields = [(column, self._field_material(table, column)) for column in mapping.key_columns]
+                        located = [location for _, (_, locations) in fields for location in locations]
+                        if located:
+                            hints.append({'reason': 'material_available_identity_unexplained', 'entity_type': entity.type,
+                                'mapping_index': index, 'table': table, 'key_columns': list(mapping.key_columns),
+                                'sections': located[:2],
+                                'guidance': 'Read the original section. If it explicitly establishes shared identity, '
+                                            'bind the complete key and exact quotation in identity_explanations. '
+                                            'Independent numbering or insufficient wording must stay separate.'})
+                            if len(hints) == 6:
+                                return hints
                     continue
                 marker = markers.get((entity.type, index), {})
                 if not marker.get('source_metadata') or marker.get('key_sections_v1'):
@@ -980,6 +1018,11 @@ class ConstructionTools:
                 "revision": record.revision, "state": record.status,
                 "previous_revision": previous.revision if previous else None,
                 "revision_advice": advice, "branch_overlap_preview": preview,
+                'identity_evidence_state': {
+                    'mappings_checked': len(markers),
+                    'material_status_counts': dict(Counter(m['identity_material_status'] for m in markers.values()
+                                                          if m.get('identity_material_status'))),
+                    'interpreted_key_claims': sum(len(m.get('interpreted_key_claims_v1', ())) for m in markers.values())},
                 **({'identity_evidence_hints': {'fields': hints,
                     'guidance': 'Read the listed sections for the complete physical key. If they establish the '
                                 'identity scope and domain, revise the draft and cite the issued references. '
@@ -1103,12 +1146,14 @@ class ConstructionTools:
                     return {'status': 'error', 'passed': False, 'code': issues[0]['code'], 'diagnostics': issues}
                 visible_graph = filter_graph_scopes(reused_graph, self.config.scopes, external_visible_ids=self._base_visible_ids)
                 from .statistics import graph_statistics
-                from .quality import name_mapping_advice
+                from .quality import name_mapping_advice, relation_evidence_advice
                 return {"status": "ok", "state": record.status, "passed": True,
                         "reused_immutable_validation": True,
                         "diagnostics": [], "metrics": record.validation.metrics,
+                        "evidence_diagnostics": record.validation.metrics.get('evidence_diagnostics', []),
                         "statistics": graph_statistics(visible_graph),
-                        "quality_advice": name_mapping_advice(record.draft, visible_graph),
+                        "quality_advice": (name_mapping_advice(record.draft, visible_graph)
+                                           + relation_evidence_advice(record.draft, visible_graph)),
                         "evidence_ref": record.validation.evidence_refs[0] if record.validation.evidence_refs else None,
                         "candidate_graph": record.validation.graph_path,
                         "validation_id": record.validation.validation_id,
@@ -1175,6 +1220,8 @@ class ConstructionTools:
                        'source_ids': sources, 'consistency': 'independent_projection_snapshots',
                        'source_read_windows': result.pop('source_read_windows', []),
                        'publication_semantics': 'validated_snapshot'}
+        if result.get('evidence_diagnostics'):
+            result['metrics']['evidence_diagnostics'] = deepcopy(result['evidence_diagnostics'])
         evidence = self.workspace.issue_evidence("data_validation", details={
             "draft_id": draft_id, "draft_revision": record.revision,
             "passed": result["passed"], "metrics": result["metrics"],
@@ -1200,7 +1247,7 @@ class ConstructionTools:
         stop = next((d['code'] for d in result['diagnostics'] if d.get('code') in TERMINAL_QUERY_CODES), None)
         budget_state = self._stop_queries(stop) if stop else None
         from .statistics import graph_statistics
-        from .quality import name_mapping_advice
+        from .quality import name_mapping_advice, relation_evidence_advice
         visible_graph = filter_graph_scopes(graph, self.config.scopes, external_visible_ids=self._base_visible_ids)
         statistics = graph_statistics(visible_graph)
         from .failures import failure_guidance
@@ -1218,6 +1265,11 @@ class ConstructionTools:
         # Keep every counterexample in the validation artifact; a model reply
         # need not replay hundreds of identical error shapes on every attempt.
         return {"status": "ok", "state": current.status, **result,
+                'identity_evidence_state': {
+                    'mappings_checked': len(authorities),
+                    'material_status_counts': dict(Counter(m['identity_material_status'] for m in authorities.values()
+                                                          if m.get('identity_material_status'))),
+                    'interpreted_key_claims': sum(len(m.get('interpreted_key_claims_v1', ())) for m in authorities.values())},
                 'metadata_definitions': self._definition_options(current),
                 'diagnostics': diagnostics[:32],
                 'diagnostic_count': len(diagnostics),
@@ -1237,7 +1289,8 @@ class ConstructionTools:
                     'run_max_seconds': self.config.max_run_seconds},
                 "evidence_ref": evidence.ref, "candidate_graph": current.validation.graph_path,
                 "validation_id": current.validation.validation_id, 'read_window': read_window,
-                'quality_advice': name_mapping_advice(record.draft, visible_graph),
+                'quality_advice': (name_mapping_advice(record.draft, visible_graph)
+                                   + relation_evidence_advice(record.draft, visible_graph)),
                 'source_circuits': self.source_circuits.summary(),
                 **failure_guidance(diagnostics),
                 **({'resource_state': budget_state} if budget_state else {}),
@@ -1308,6 +1361,7 @@ class ConstructionTools:
         Validation and publication always hash the current bytes. On each cache
         miss the stat before and after the read must identify the same file.
         """
+        validate_environment_adapters(self.config.sources, self._adapters_by_source)
         source_paths = {source.id: source.path for source in self.config.sources if source.path}
         files = [(source_paths[sid], expected) for sid, expected in self._source_hashes] + self._material_hashes
         try:

@@ -118,6 +118,12 @@ class SourceAdapter:
     limits: QueryLimits
     compiler: QueryCompiler
     stats: QueryStats
+    def observation_binding(self):
+        """Opaque source identity for observed tuples; not a transaction snapshot."""
+        from lightgraph.contracts import digest
+        binding = getattr(self, '_observation_source_digest', None)
+        revision = getattr(self, 'input_revision', None)
+        return binding or (digest(type(self).__name__, revision) if revision else None)
     def _effective_timeout_ms(self) -> int:
         return _operation_timeouts.get().get(id(self), self.limits.timeout_ms)
     @contextmanager

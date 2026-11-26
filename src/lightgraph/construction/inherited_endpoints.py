@@ -2,6 +2,8 @@
 from collections import defaultdict
 from copy import deepcopy
 from itertools import product
+from hashlib import sha256
+import json
 
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import LightGraphError
@@ -72,8 +74,12 @@ class InheritedEndpoints:
         for node in (graph or {}).get('nodes', []):
             self.nodes[node['type']].append(node)
         self.indexes = {}
+        self._graph = graph
+        self._graph_digest = None
+        self._contract_digests = {}
 
-    def resolve(self, kind, lookup, columns, values, end, *, clock, charge, business_context=None):
+    def resolve(self, kind, lookup, columns, values, end, *, clock, charge, business_context=None,
+                collect_witness=False):
         keys = self.keys.get(kind)
         if not keys:
             raise LightGraphError('inherited_entity_type_missing')
@@ -112,7 +118,17 @@ class InheritedEndpoints:
         if (lookup is None or lookup.cardinality == 'one') and len({w[0] for w in matched}) > 1:
             raise LightGraphError('lookup_reference_ambiguous')
         results = []
-        for (nid, _), (node, support, required) in matched.items():
+        collect_witness = collect_witness() if callable(collect_witness) else collect_witness
+        if collect_witness and self._graph_digest is None:
+            fingerprint = sha256()
+            encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
+            for chunk in encoder.iterencode([self._graph]):
+                clock()
+                fingerprint.update(chunk.encode())
+            self._graph_digest = fingerprint.hexdigest()
+        if collect_witness and kind not in self._contract_digests:
+            self._contract_digests[kind] = digest(self.contracts[kind])
+        for (nid, support_digest), (node, support, required) in matched.items():
             key = [node['identity'][name] for name in keys]
             provenance = support.get('provenance', {})
             refs = sorted(set(support.get('evidence_refs', [])) | set(provenance.get('evidence_refs', [])))
@@ -124,6 +140,10 @@ class InheritedEndpoints:
                 'resolved_key_types': [identity_cell(node, name)[0] for name in keys],
                 'scope_ref': support['scope_ref'], 'required_scope_refs': list(required), 'inherited_node_id': nid,
                 'business_context': support_business_context(support), 'evidence_refs': refs,
+                **({'inherited_observation_witness': {'kind': 'inherited_observation_v1',
+                    'graph_digest': self._graph_digest, 'node_id': nid,
+                    'identity_contract_digest': self._contract_digests[kind], 'support_digest': support_digest}}
+                   if collect_witness else {}),
                 **{name: deepcopy(support[name]) for name in ('row_context', 'observation_id') if name in support},
                 **({'provenance': deepcopy(provenance)} if provenance else {}),
             }))

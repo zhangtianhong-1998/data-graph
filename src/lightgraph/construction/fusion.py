@@ -44,7 +44,7 @@ def definition_contract(definition):
     """Compare meaning independently of presentation and internal variant names."""
     result = {k: deepcopy(v) for k, v in definition.items()
               if k not in {'description', 'display_mode', 'original_type', 'definition_variant',
-                           'identity_evidence_refs'}}
+                           'identity_evidence_refs', 'identity_explanations'}}
     result['type'] = definition.get('original_type', definition['type'])
     if 'key_names' in result:
         result.setdefault('identity_origin', 'row')

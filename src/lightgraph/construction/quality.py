@@ -93,3 +93,34 @@ def name_mapping_advice(draft, graph=None):
         if coverage is not None:
             advice.append(coverage)
     return advice
+
+
+def relation_evidence_advice(draft, graph=None):
+    """Explain missing business scope and locators without changing raw observations."""
+    from .contexts import business_context_identity
+    from .relation_assertions import support_assertion_checks
+
+    if not isinstance(draft, GraphDraft):
+        draft = GraphDraft.model_validate(draft)
+    advice = []
+    for index, relation in enumerate(draft.relations):
+        for number, mapping in enumerate(relation.mappings):
+            if mapping.business_context.status == 'unknown':
+                advice.append({'code': 'relation_business_scope_unknown', 'severity': 'suggestion',
+                    'relation_type': relation.type, 'mapping': number,
+                    'path': ['relations', index, 'mappings', number, 'business_context'],
+                    'message': '关系尚未声明业务适用范围，原始观察会保留，但不能据此确认两条关系是同一事实。',
+                    'next_action': '核对材料：全局关系显式声明 global；按项目、时期等限定的关系声明 scoped 并绑定对应列；无法确认时保留 unknown。'})
+    counts = Counter()
+    unknown_values = 0
+    for edge in (graph or {}).get('edges', []):
+        for support in edge.get('supports', []):
+            counts.update(support_assertion_checks(support)['blockers'])
+            mapping = (support.get('provenance') or {}).get('business_context_mapping') or {}
+            unknown_values += mapping.get('status') == 'scoped' and business_context_identity(support)['status'] == 'unknown'
+    if counts:
+        advice.append({'code': 'relation_fact_comparison_incomplete', 'severity': 'suggestion',
+            'blockers': dict(sorted(counts.items())), 'scoped_observations_with_unknown_values': unknown_values,
+            'message': '部分关系证据不足以比较事实是否相同；各阻断项分别统计，数量可能重叠。原始关系和来源仍然保留。',
+            'next_action': '补充所缺的适用范围或来源定位。查询投影凭证只标识已观察元组，不代表数据库物理行或跨源同一时刻快照。'})
+    return advice
