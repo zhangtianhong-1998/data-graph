@@ -6,9 +6,11 @@ produce counts for the reviewer. Only concrete, corroborated members can move.
 """
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-import re
+from typing import NamedTuple
 
 from lightgraph.contracts import canonical, digest
+from lightgraph.errors import LightGraphError
+from lightgraph.hierarchy_bindings import mapped_direction
 from lightgraph.runtime.config import ProjectionBinding, VerifiedProjectionRule
 from lightgraph.source_values import identity_cell
 from .contexts import business_context_identity
@@ -18,6 +20,7 @@ from .hierarchy_observations import observation_scope
 from .identity_authority import _global_authorities, source_address
 from .observed_identity import _node_evidence, _unique_row_projection, contradictory_qualifiers
 from .overlap_patterns import _blocked_types
+from .relation_assertions import interval_union, support_assertion
 from .projection_access import attach_checkpoint_grant, attach_runtime_grants, common_table_grant
 from .source_namespaces import source_namespace
 
@@ -72,12 +75,119 @@ def _own_support(support, owner):
              for o in support.get('execution_origins', ())))
 
 
-def _witnesses(node, binding, index):
+def _source_header(node, columns, address, owner, *, include_label):
+    """Bind an endpoint to the physical header that supplied its observed keys and name."""
+    headers = set()
+    for support in node.get('supports', ()):
+        p = support.get('provenance') or {}
+        if tuple(p.get('key_columns') or ()) != columns or source_address(p.get('source')) != address:
+            continue
+        fields = (*columns, p.get('label_column')) if include_label else columns
+        ordinals = p.get('source_column_ordinals') or {}
+        if (not _own_support(support, owner) or not isinstance(ordinals, dict)
+                or any(type(v) != int or not 1 <= v <= 16384 for v in ordinals.values())
+                or len(set(ordinals.values())) != len(ordinals) or not set(fields) <= ordinals.keys()):
+            return None
+        headers.add(tuple((c, ordinals[c]) for c in fields))
+    return headers.pop() if len(headers) == 1 else None
+
+
+def _record_sheet_role(rows, cells, headers, node, node_key, peer, peer_key, edge, support, end, binding, meaning):
+    reason, qualifications, locator = support_assertion(support)
+    if reason:
+        return False
+    if 'business_context' in edge:
+        context = business_context_identity(edge)
+        if context['status'] == 'unknown':
+            return False
+        qualifications['edge_scope'] = context
+    qualifications['edge_properties'] = edge.get('properties') or {}
+    address, left, right = qualifications.pop('endpoint_bindings')
+    own, opposite = (left, right) if end == 'source' else (right, left)
+    def header_of(endpoint, columns, include_label):
+        key = (binding.contributor_id, endpoint['id'], columns, include_label)
+        if key not in headers:
+            headers[key] = _source_header(endpoint, columns, address, binding.contributor_id, include_label=include_label)
+        return headers[key]
+
+    header = header_of(node, binding.key_columns, True)
+    peer_header = header_of(peer, binding.opposite_key_columns, False)
+    if not header or header[:-1] != own or peer_header != opposite:
+        return False
+    # Check declared values against typed cells if the mapping retained them in row_context.
+    row = support.get('row_context') or {}
+    values = row.get('values') or {}
+    types = row.get('value_types') or {}
+    if not node_key:
+        return False
+    frame = dict(zip(own, node_key, strict=True))
+    representative = node['supports'][0]
+    frame[header[-1]] = ('text', representative.get('observed_label') or representative.get('label'))
+    for field, cell in zip(opposite, peer_key, strict=True):
+        if frame.setdefault(field, cell) != cell:
+            return False
+    row_node = {'identity': values, 'identity_types': types}
+    try:
+        for (column, _), cell in frame.items():
+            if column in values and (types[column] != cell[0] or identity_cell(row_node, column) != cell):
+                return False
+    except (ArithmeticError, TypeError, ValueError, LightGraphError):
+        return False
+    # Unknown role-specific contract fields, filters, scope and qualifications remain binding.
+    role = {k: v for k, v in meaning.items() if k != 'type'}
+    record = digest(address, end, header, locator['snapshot'], role, qualifications)
+    spans = locator['rows']
+    rows[record].extend(spans)
+    for (c, ordinal), cell in frame.items():
+        for start, stop in spans:
+            cells[record, ordinal].append((start, stop, (c, cell)))
+            cells[record, c].append((start, stop, (ordinal, cell)))
+    return True
+
+
+def _same_worksheet_roles(members):
+    """An Agent-selected ordinary role may vary where the same object is witnessed on the same rows."""
+    if not all(m.roles.worksheet for m in members):
+        return False
+    residual = [m.roles.physical[1] - m.roles.physical[0] for m in members]
+    if any(other != residual[0] for other in residual):
+        return False
+    headers, cells = {}, defaultdict(list)
+    first_rows = None
+    for member in members:
+        rows = defaultdict(list)
+        if not all(_record_sheet_role(rows, cells, headers, *record) for record in member.roles.worksheet):
+            return False
+        row_set = {key: interval_union(intervals) for key, intervals in rows.items()}
+        if first_rows is None:
+            first_rows = row_set
+        elif row_set != first_rows:
+            return False
+    for spans in cells.values():
+        last_end, last_value = 0, None
+        for start, end, value in sorted(spans, key=lambda span: span[:2]):
+            if start <= last_end and value != last_value:
+                return False
+            last_end, last_value = max(last_end, end), value
+    return True
+
+
+class _RoleWitnesses(NamedTuple):
+    physical: tuple
+    projected: tuple | None
+    shared_identity: tuple | None
+    worksheet: list | None
+
+
+def _witnesses(node, binding, index, *, compare_shared_identity=False):
     nodes, _, incident, entities, relations = index
     witnessed = set()
     all_roles = set()
     local_roles = set()
     local_witnesses = set()
+    registry_roles, registry_witnesses = set(), set()
+    sheet_records = []
+    node_key = _cells(node, entities[node['type']].get('key_names'))
     known_applicability = True
     for end, edge in incident[node['id']]:
         if edge['source'] == edge['target']:
@@ -105,21 +215,47 @@ def _witnesses(node, binding, index):
             meaning = definition_contract(relation)
             for key in ('source_type', 'target_type'):
                 meaning.pop(key, None)
-            facts = digest(meaning, end, peer_cols, peer_key, observation_scope(support), p.get('predicate'),
-                           p.get('constant_properties'), support.get('properties'), support.get('row_context'),
-                           support.get('source_row_witness'))
+            conditions = (observation_scope(support), p.get('predicate'), p.get('constant_properties'),
+                          support.get('properties'), support.get('row_context'))
+            facts = digest(meaning, end, peer_cols, peer_key, *conditions, support.get('source_row_witness'))
             evidence = digest(source, own_cols, facts)
-            # A shared, independently bound document section may establish the
-            # domain across these tables. Normalize only the named key slot;
-            # other axes, opposite columns, meanings and neighbors stay binding.
             local = facts if (*source, own_cols) == _address(binding) else evidence
             all_roles.add(evidence)
             local_roles.add(local)
-            if (edge['type'] == binding.relation_type and end == binding.end
-                    and (*source, own_cols) == _address(binding) and peer_cols == binding.opposite_key_columns):
+            selected = (edge['type'] == binding.relation_type and end == binding.end
+                        and (*source, own_cols) == _address(binding) and peer_cols == binding.opposite_key_columns)
+            if selected:
                 witnessed.add(evidence)
                 local_witnesses.add(local)
-    return ((witnessed, all_roles), (local_witnesses, local_roles) if known_applicability else None) if witnessed else None
+            ordinary = (relation.get('hierarchy_orientation') in (None, 'none')
+                        and not relation.get('acyclic') and not mapped_direction(meaning['type']))
+            if selected and sheet_records is not None:
+                if (not ordinary or edge.get('status', 'accepted') != 'accepted'
+                        or not support.get('source_row_witness')):
+                    sheet_records = None
+                else:
+                    sheet_records.append((node, node_key, peer, peer_key, edge, support, end, binding, meaning))
+            if compare_shared_identity:
+                registry_role = local
+                if selected and ordinary:
+                    # An independently verified global key owns this identity. Peers and
+                    # their row locators remain on their own edges. Compare the selected
+                    # association, its endpoint domain and its qualifications across sources.
+                    peer_definition = entities[peer['type']]
+                    peer_contract = definition_contract(peer_definition)
+                    if peer['type'] == node['type']:
+                        peer_contract['type'] = None  # Both are self-referencing entity types.
+                    registry_role = digest('association_role_v1', meaning, end, peer_cols, peer_contract,
+                                           [kind for kind, _ in peer_key], *conditions)
+                registry_roles.add(registry_role)
+                if selected:
+                    registry_witnesses.add(registry_role)
+    if not witnessed:
+        return None
+    return _RoleWitnesses((witnessed, all_roles),
+                          (local_witnesses, local_roles) if known_applicability else None,
+                          (registry_witnesses, registry_roles) if known_applicability and compare_shared_identity else None,
+                          sheet_records if known_applicability else None)
 
 
 def _upstream_context(node, index):
@@ -170,8 +306,10 @@ class _Observation:
     contract: str | None = None
     boundaries: tuple | None = None
     attributes: dict = field(default_factory=dict)
-    roles: tuple | None = None
+    roles: _RoleWitnesses | None = None
     sections: set = field(default_factory=set)
+    registries: set = field(default_factory=set)
+    registry_contract: str | None = None
     ancestors: frozenset | None = None
     ancestor_items: list = field(default_factory=list)
 
@@ -196,8 +334,9 @@ def _observation(node, definition, binding, index, own):
         return result
     result.label = labels.pop()
     if definition.get('identity_scope') == 'global':
-        result.sections = {token for kind, token in _global_authorities(node, definition, {}, local_namespace=False)
-                           if kind == 'document' and isinstance(token, str) and re.fullmatch(r'[a-f0-9]{64}', token)}
+        authorities = _global_authorities(node, definition, {}, local_namespace=False)
+        result.sections = {token for kind, token in authorities if kind == 'document'}
+        result.registries = {token for kind, token in authorities if kind == 'registry'}
     if (len(own) != len(node['supports']) or not all(_own_support(s, binding.contributor_id) for s in own)
             or any(s['provenance'].get('label_column') in (None, '', *binding.key_columns) for s in own)
             or result.label in (str(value) for value in node['identity'].values())):
@@ -219,6 +358,12 @@ def _observation(node, definition, binding, index, own):
     contract['identity_context_keys'] = [binding.key_columns[names.index(key)]
                                          for key in definition.get('identity_context_keys') or ()]
     result.contract = canonical([contract, node.get('node_role')])
+    if result.registries:
+        # Each dictionary can name the directory and its physical key differently.
+        # The registry proof binds the ordered key roles in both dictionaries.
+        contract.pop('identity_domain', None)
+        contract['identity_context_keys'] = [names.index(key) for key in definition.get('identity_context_keys') or ()]
+        result.registry_contract = canonical([contract, node.get('node_role')])
     physical = _unique_row_projection(node, definition, _address(binding))
     if not physical:
         result.reason = 'conflicting_or_unbound_columns'
@@ -226,7 +371,7 @@ def _observation(node, definition, binding, index, own):
     signature, result.attributes = physical
     result.boundaries = (signature[-1], canonical(node.get('identity_context')),
                          tuple(sorted({_conditions(s) for s in own})))
-    result.roles = _witnesses(node, binding, index)
+    result.roles = _witnesses(node, binding, index, compare_shared_identity=bool(result.sections or result.registries))
     if not result.roles:
         result.reason = 'unverified_relation_role'
         return result
@@ -295,23 +440,37 @@ def _grant_covers(member, binding, data, grant):
     return True
 
 
-def _observation_mismatch(members, physical):
+def _compare_observations(members, physical):
     if reason := next((m.reason for m in members if m.reason), None):
-        return reason
-    if any(m.contract != members[0].contract for m in members):
-        return 'incompatible_identity_contract'
+        return reason, None
+    registry = bool(set.intersection(*(m.registries for m in members)))
+    if (any(m.contract != members[0].contract for m in members)
+            and not (registry and all(m.registry_contract == members[0].registry_contract for m in members))):
+        return 'incompatible_identity_contract', None
     if any(m.boundaries != members[0].boundaries for m in members):
-        return 'different_source_or_scope'
+        return 'different_source_or_scope', None
+    basis = 'same_physical_projection' if physical else 'shared_versioned_key_section'
+    if not physical and registry and not set.intersection(*(m.sections for m in members)):
+        basis = 'shared_versioned_registry'
     role_slot = 0 if physical else 1
     if any(not m.roles[role_slot] or m.roles[role_slot] != members[0].roles[role_slot] for m in members):
-        return 'different_relation_or_neighbor'
+        shared_role = ((registry or set.intersection(*(m.sections for m in members))) and members[0].roles.shared_identity
+                       and all(m.roles.shared_identity == members[0].roles.shared_identity for m in members))
+        if not shared_role:
+            if not physical or not _same_worksheet_roles(members):
+                return 'different_relation_or_neighbor', None
+            basis = 'same_worksheet_identity_cells'
     if any(m.ancestors != members[0].ancestors for m in members):
-        return 'different_ancestor_context'
+        return 'different_ancestor_context', None
     cells = {}
     if (any(cells.setdefault(k, v) != v for m in members for k, v in m.attributes.items())
             or contradictory_qualifiers(m.node for m in members)):
-        return 'conflicting_attributes'
-    return None
+        return 'conflicting_attributes', None
+    return None, basis
+
+
+def _observation_mismatch(members, physical):
+    return _compare_observations(members, physical)[0]
 
 
 def _verify(pid, bindings, data, blocked):
@@ -338,7 +497,7 @@ def _verify(pid, bindings, data, blocked):
         axes[_address(binding)[:3]].add(binding.key_columns)
     different_axes = any(len(columns) > 1 for columns in axes.values())
     physical = len(axes) == 1 and not different_axes
-    evidence_combinations = Counter()
+    evidence_combinations, bases = Counter(), Counter()
     equal_access = len(access) == 1 and all(access)
     table_grant = common_table_grant([data.inputs[o] for o in owners], bindings[0]) if physical and not equal_access else None
     tables = [_by_key(p, data) for p in bindings]
@@ -361,7 +520,7 @@ def _verify(pid, bindings, data, blocked):
             counts['missing_or_conflicting_names'] += 1
             continue
         report['matched_key_names'] += 1
-        mismatch = _observation_mismatch(members, physical)
+        mismatch, basis = _compare_observations(members, physical)
         if different_axes:
             reason = 'different_axes_in_same_table'
         elif physical:
@@ -370,28 +529,27 @@ def _verify(pid, bindings, data, blocked):
             # Count each matched key once. A missing shared proof used to mask
             # every independent observation or access issue on that same key.
             shared_section = bool(set.intersection(*(m.sections for m in members)))
-            evidence_combinations[shared_section, mismatch or 'observations_agree', equal_access] += 1
-            reason = mismatch if shared_section else 'cross_table_identity_unverified'
+            shared_registry = bool(set.intersection(*(m.registries for m in members)))
+            evidence_combinations[shared_section, shared_registry, mismatch or 'observations_agree', equal_access] += 1
+            reason = mismatch if shared_registry or shared_section else 'cross_table_identity_unverified'
         if reason is None and not equal_access and (table_grant is None or not all(
                 _grant_covers(m, p, data, table_grant) for m, p in zip(members, bindings, strict=True))):
             reason = 'unverified_access_fingerprint'
         if reason:
             counts[reason] += 1
             continue
+        bases[basis] += 1
         groups[digest('verified_projection_key_name_v1', key, members[0].label)] = [
             (p.contributor_id, m.node['id']) for p, m in zip(bindings, members, strict=True)]
-    if len(groups) > 5000:
-        counts['proposal_size_limit'] += len(groups)
-        groups = {}
     if groups:
-        basis = 'same_physical_projection' if physical else 'shared_versioned_key_section'
-        report['verified_groups_by_basis'] = {basis: len(groups)}
+        report['verified_groups_by_basis'] = dict(sorted(bases.items()))
         report['access_basis'] = 'unit_fingerprint' if equal_access else 'same_frozen_table_grant'
     if len(axes) > 1 and not different_axes:
         report['cross_table_matched_key_checks'] = [
-            {'shared_key_section_verified': section, 'first_observation_result': observation,
+            {'shared_key_section_verified': section, **({'shared_registry_key_verified': True} if registry else {}),
+             'first_observation_result': observation,
              'unit_fingerprints_match': access, 'keys': count}
-            for (section, observation, access), count in sorted(evidence_combinations.items())]
+            for (section, registry, observation, access), count in sorted(evidence_combinations.items())]
     report.update(status='verified' if groups else 'review', verified_groups=len(groups),
                   reason='verified_source_observations' if groups else
                   (min(counts, key=lambda k: (-counts[k], k)) if counts else 'no_shared_keys'),
@@ -424,7 +582,7 @@ def verify_projection_proposals(policy, inputs, patterns, decisions):
         reports.append(report)
         if groups:
             rules.append(VerifiedProjectionRule(pattern_id=pid, bindings=tuple(bindings), observation_digests=sorted(groups),
-                                                composition_version=2))
+                                                composition_version=3))
     if rules == policy.verified_projection_rules:
         return policy, reports
     return policy.model_copy(update={'verified_projection_rules': rules}), reports
@@ -434,6 +592,7 @@ def verify_projection_proposals(policy, inputs, patterns, decisions):
 class ProjectionInputs:
     by_stage: dict[str, dict[str, str]]
     compose: bool
+    corroborating_patterns: tuple[str, ...] = ()
 
 
 def _covered_inputs(output, selected, actual):
@@ -467,7 +626,7 @@ def verified_projection_groups(graph, inputs, policy, remaps, stats):
     separated = {(item['contributor_id'], nid) for item in inputs
                  for record in item['graph'].get('identity_separations', ()) for nid in record['members']}
     rejected = defaultdict(Counter)
-    proposals = []
+    proposals = defaultdict(list)
     for rule in policy.verified_projection_rules:
         report, groups = _verify(rule.pattern_id, rule.bindings, data, _blocked_types(policy))
         for token in rule.observation_digests:
@@ -489,15 +648,24 @@ def verified_projection_groups(graph, inputs, policy, remaps, stats):
             else:
                 inputs_by_stage = {i: _covered_inputs(outputs[i], selected[i], owners[i]) for i in ids}
                 if all(inputs_by_stage.values()):
-                    proposals.append((ids, (None, rule.pattern_id, ProjectionInputs(inputs_by_stage, rule.composition_version == 2))))
+                    proposals[ids].append((rule, inputs_by_stage))
                 else:
                     rejected[rule.pattern_id]['overlaps_prior_identity_decision'] += 1
-    competing = Counter(nid for ids, _ in proposals for nid in ids)
+    competing = Counter(nid for ids in proposals for nid in ids)
     accepted = {}
-    for ids, ref in proposals:
-        if any(competing[nid] != 1 for nid in ids):
-            rejected[ref[1]]['overlapping_proposals'] += 1
-        else:
-            accepted[ids] = ref
+    for ids, proofs in proposals.items():
+        # Every proof above covers *all* original occurrences behind these stage IDs.
+        # Identical sets corroborate one another. Intersecting sets cannot establish
+        # transitivity. Retain the earlier behavior when replaying old policies.
+        legacy_overlap = len(proofs) > 1 and any(rule.composition_version < 3 for rule, _ in proofs)
+        if legacy_overlap or any(competing[nid] != 1 for nid in ids):
+            for rule, _ in proofs:
+                rejected[rule.pattern_id]['overlapping_proposals'] += 1
+            continue
+        rule, inputs_by_stage = min(proofs, key=lambda proof: proof[0].pattern_id)
+        also = tuple(sorted({p.pattern_id for p, _ in proofs} - {rule.pattern_id}))
+        for pid in also:
+            rejected[pid]['same_verified_members'] += 1
+        accepted[ids] = (None, rule.pattern_id, ProjectionInputs(inputs_by_stage, rule.composition_version >= 2, also))
     stats['not_applied_by_pattern'] = rejected
     return accepted

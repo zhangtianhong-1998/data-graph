@@ -212,7 +212,7 @@ function workflowRelationSummary(node: WorkflowMergeNodeState) {
       lines.push(`模型另提出 ${review.proposed_patterns} 个字段与角色对应方案，逐键核实 ${review.verified_proposal_groups} 组，实际合并 ${review.applied_proposal_groups} 组，减少 ${review.proposal_collapsed_nodes} 个节点`)
     }
     if (review.proposed_relation_patterns != null) {
-      lines.push(`模型提出 ${review.proposed_relation_patterns} 个关系对应方案，核实 ${review.verified_relation_facts} 组同一层级事实，共有 ${review.grouped_relation_edges} 条原始关系作依据`)
+      lines.push(`模型提出 ${review.proposed_relation_patterns} 个关系对应方案，核实 ${review.verified_relation_facts} 组关系事实，共有 ${review.grouped_relation_edges} 条原始关系作依据`)
     }
     if (review.submitted_patterns != null) {
       lines.push(`模型请求 ${review.model_calls} 次，送审 ${review.submitted_patterns} 种，已列出但未送审 ${review.pattern_count - review.submitted_patterns} 种`)

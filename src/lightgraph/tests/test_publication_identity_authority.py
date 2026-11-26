@@ -93,12 +93,12 @@ def test_workspace_rechecks_catalog_evidence_for_snapshots_without_mapping_marke
             tools.close()
 
 
-def _read_identity_refs(tools, table, headings):
+def _read_identity_refs(tools, table, headings, document='assets'):
     metadata = tools.call('inspect_source', table='db:public.' + table, operation='get_metadata')
     refs = [metadata['evidence_ref']]
     page = 0
     while page is not None:
-        result = tools.call('read_material', name='document:assets', page=page)
+        result = tools.call('read_material', name='document:' + document, page=page)
         if result['section']['heading'] in headings:
             refs.extend(result['evidence_refs'])
         page = result['next_page']
@@ -317,14 +317,8 @@ def test_unproven_observation_cannot_join_an_existing_same_id_replay(conflict):
     assert len(merged['candidate_identity_merges']) == 2
 
 
-@pytest.mark.parametrize('document_case', ['both_cite_registry', 'one_cites_registry', 'separate_sections',
-                                           'different_access'])
-def test_cross_table_proposal_uses_only_key_evidence_issued_in_both_extractions(tmp_path, document_case):
-    from lightgraph.construction.overlap_patterns import analyze_overlap_patterns
-    from lightgraph.construction.projection_proposals import verify_projection_proposals
+def independent_projection_inputs(tmp_path, document_case, *, same_type=False, document_access=None):
     from lightgraph.construction.source_namespaces import project_checkpoint_inputs
-    from lightgraph.runtime.config import MergePolicyConfig
-
     manual = tmp_path / 'assets.md'
     manual.write_text(
         '---\nid: assets\npurpose: data_description\n'
@@ -335,6 +329,36 @@ def test_cross_table_proposal_uses_only_key_evidence_issued_in_both_extractions(
         '# East\nLocal asset code in the east listing.\n# West\nLocal asset code in the west listing.\n',
         encoding='utf-8')
     config = _config().model_copy(update={'documents': [str(manual)]})
+    independent = document_case.startswith('independent_')
+    columns_in_key = ['code', 'plant'] if 'compound' in document_case else ['code']
+    if document_case == 'independent_no_records':
+        config = config.model_copy(update={'documents': []})
+    elif independent:
+        paths = []
+        for table in ('east', 'west'):
+            path = tmp_path / f'{table}.md'
+            registry = {'issuer': 'asset-board', 'catalog': 'equipment', 'version': 'v3', 'key_roles': ['asset']}
+            if 'compound' in document_case:
+                registry['key_roles'] = ['asset', 'site']
+                if table == 'west' and document_case == 'independent_compound_swapped':
+                    registry['key_roles'].reverse()
+            if table == 'west':
+                for field in ('issuer', 'catalog', 'version', 'roles'):
+                    if document_case == 'independent_' + field:
+                        registry['key_roles' if field == 'roles' else field] = ['facility'] if field == 'roles' else 'other'
+            contract = {'domain': f'{table} field directory', 'scope': 'shared',
+                        'key_columns': {f'db:public.{table}': columns_in_key}}
+            if document_case != 'independent_no_registry':
+                contract['registry'] = registry
+            sections = {'Registry': {'identity_contract': contract}}
+            if table == 'west' and document_case == 'independent_conflict':
+                sections['Exception'] = {'identity_contract': {**contract, 'registry': {**registry, 'version': 'v1'}}}
+            path.write_text('---\n' + dump_yaml({'id': table, 'purpose': 'data_description',
+                'scope': {'tables': [f'db.public.{table}'], 'columns': columns_in_key}, 'sections': sections})
+                + '---\n# Registry\nThis table uses the listed numbering rules.\n'
+                + ('# Exception\nThis earlier version is also listed.\n' if 'Exception' in sections else ''), encoding='utf-8')
+            paths.append(str(path))
+        config = config.model_copy(update={'documents': paths})
     columns = ['code', 'name', 'plant', 'rating', 'supplier']
     tables = [TableSpec(source_id='db', name=table, columns=[ColumnSpec(name=c) for c in columns])
               for table in ('east', 'west')]
@@ -343,28 +367,65 @@ def test_cross_table_proposal_uses_only_key_evidence_issued_in_both_extractions(
 
     branches = []
     for table, kind, attribute in [('east', 'InstalledAsset', 'rating'), ('west', 'ServiceAsset', 'supplier')]:
+        if same_type:
+            kind = 'RegisteredAsset'
         out = tmp_path / table
         scoped = config.model_copy(update={'isolation_domain': table if document_case == 'different_access' else 'plants'})
+        if independent and config.documents:
+            scoped = scoped.model_copy(update={'documents': [str(tmp_path / f'{table}.md')]})
         with MemorySource(tables, records) as source:
             tools = ConstructionTools(scoped, out / 'construction', adapters=[source])
             try:
+                if document_access is not None:
+                    peer = 'west' if table == 'east' else 'east'
+                    refused = tools.call('read_material', name='document:' + peer, page=0)
+                    document_access[table] = {'configured_documents': list(scoped.documents),
+                        'visible_document_ids': [d.document_id for d in tools.documents.documents],
+                        'peer_read': {k: refused.get(k) for k in ('status', 'code')}}
                 headings = {table.title()}
                 if (document_case in {'both_cite_registry', 'different_access'}
                         or (document_case == 'one_cites_registry' and table == 'east')):
                     headings.add('Registry')
-                refs = _read_identity_refs(tools, table, headings)
+                if independent and (document_case != 'independent_uncited' or table == 'east'):
+                    headings.add('Registry')
+                if document_case == 'independent_no_records':
+                    probe = tools.call('inspect_source', table='db:public.' + table, operation='get_metadata')
+                    refs = [probe['evidence_ref']]
+                else:
+                    refs = _read_identity_refs(tools, table, headings, table if independent else 'assets')
                 draft = _draft(table, 'global', refs[0])
                 asset, _ = draft['entities']
                 asset.update(type=kind, identity_evidence_refs=refs)
+                asset['key_names'] = columns_in_key
+                asset['mappings'][0]['key_columns'] = columns_in_key
+                if independent:
+                    asset['identity_domain'] = f'{table} field directory'
+                if same_type and document_case == 'independent_no_records' and table == 'west':
+                    asset.update(identity_scope='unknown', identity_domain=None, identity_evidence_refs=[])
                 asset['mappings'][0].update(properties={attribute: attribute}, business_context={'status': 'global'})
                 relation, = draft['relations']
                 relation['source_type'] = kind
+                relation['mappings'][0]['source_key_columns'] = columns_in_key
                 relation['mappings'][0]['business_context'] = {'status': 'global'}
                 _publish(tools, draft)
             finally:
                 tools.close()
         branches.append(load_unit_contributor(out, table))
-    branches = project_checkpoint_inputs(branches, 'plant-network')
+    return project_checkpoint_inputs(branches, 'plant-network')
+
+
+@pytest.mark.parametrize('document_case', ['both_cite_registry', 'one_cites_registry', 'separate_sections',
+    'different_access', 'independent_matched', 'independent_issuer', 'independent_catalog',
+    'independent_version', 'independent_roles', 'independent_uncited', 'independent_conflict',
+    'independent_no_registry', 'independent_no_records', 'independent_compound', 'independent_compound_swapped'])
+def test_cross_table_proposal_uses_only_key_evidence_issued_in_both_extractions(tmp_path, document_case, monkeypatch):
+    from lightgraph.construction.overlap_patterns import analyze_overlap_patterns
+    from lightgraph.construction.projection_proposals import verify_projection_proposals
+    from lightgraph.runtime.config import MergePolicyConfig
+
+    branches = independent_projection_inputs(tmp_path, document_case)
+    independent = document_case.startswith('independent_')
+    registry_matches = document_case in {'independent_matched', 'independent_compound'}
     baseline = merge_construction_graphs(branches)
     card, = [p for p in analyze_overlap_patterns(branches).patterns if p['kind'] == 'entity'
              and {member['type'] for member in p['members']} == {'InstalledAsset', 'ServiceAsset'}]
@@ -372,26 +433,54 @@ def test_cross_table_proposal_uses_only_key_evidence_issued_in_both_extractions(
         {'member_index': i, 'source_index': member['source_indexes'][0],
          'role_index': next(j for j, role in enumerate(member['roles']) if role['end'] == 'source')}
         for i, member in enumerate(card['members'])]}
+    if independent:
+        import json
+        from lightgraph.construction.overlap_review import review_overlap_patterns
+        from lightgraph.tests.test_overlap_pattern_model import configured, respond, setup_provider
+        def answer(request):
+            issued, = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
+            comparison, = issued['binding_comparisons']['rows']
+            if registry_matches:
+                assert comparison['versioned_directory'] == 'matches'
+            elif document_case in {'independent_catalog', 'independent_issuer', 'independent_version',
+                                   'independent_roles', 'independent_compound_swapped'}:
+                assert comparison['versioned_directory'] == 'different'
+            else:
+                assert 'versioned_directory' not in comparison
+            assert b'asset-board' not in request.content and b'Pump' not in request.content
+            return respond(json.dumps({'decisions': [decision]}))
+        setup_provider(monkeypatch, answer)
+        reviewed = review_overlap_patterns(configured(), [card], api_key='test')
+        assert reviewed['reviewed_patterns'] == 1
+        decision, = reviewed['decisions']
     policy, (report,) = verify_projection_proposals(MergePolicyConfig(), branches, [card], [decision])
     assert (report['overlapping_keys'], report['matched_key_names']) == (2, 1)
     assert report['rejected_keys_by_reason']['missing_or_conflicting_names'] == 1
     merged = merge_construction_graphs(branches, merge_policy=policy)
     (receipt,) = report['cross_table_matched_key_checks']
-    assert receipt == {'keys': 1, 'first_observation_result': 'observations_agree',
+    first_result = ('incompatible_identity_contract' if independent and not registry_matches
+                    else 'observations_agree')
+    assert receipt == {'keys': 1, 'first_observation_result': first_result,
+                       **({'shared_registry_key_verified': True} if registry_matches else {}),
                        'shared_key_section_verified': document_case in {'both_cite_registry', 'different_access'},
                        'unit_fingerprints_match': document_case != 'different_access'}
-    if document_case != 'both_cite_registry':
+    if document_case != 'both_cite_registry' and not registry_matches:
         reason = 'unverified_access_fingerprint' if document_case == 'different_access' else 'cross_table_identity_unverified'
         assert report['rejected_keys_by_reason'][reason] == 1
         assert not policy.verified_projection_rules and merged == baseline
         return
-    assert report['verified_groups_by_basis'] == {'shared_versioned_key_section': 1}, report
+    basis = 'shared_versioned_registry' if independent else 'shared_versioned_key_section'
+    assert report['verified_groups_by_basis'] == {basis: 1}, report
     assert len(merged['nodes']) == len(baseline['nodes']) - 1
-    pump, = [n for n in merged['nodes'] if n['identity'] == {'code': '001'}]
+    pump, = [n for n in merged['nodes'] if n['identity'].get('code') == '001']
+    if independent:
+        locators = {s['provenance']['global_identity_authority']['registry_key_claims_v1'][0]['section']
+                    for s in pump['supports']}
+        assert len(locators) == 2
     assert pump['properties'] == {'rating': ['A'], 'supplier': ['Acme']}
     assert {(s['contributor_id'], s['reviewed_input_node_id']) for s in pump['supports']} == {
-        (b['contributor_id'], n['id']) for b in branches for n in b['graph']['nodes'] if n['identity'] == {'code': '001'}}
-    assert {n['label'] for n in merged['nodes'] if n['identity'] == {'code': '002'}} == {'Press', 'Press XL'}
+        (b['contributor_id'], n['id']) for b in branches for n in b['graph']['nodes'] if n['identity'].get('code') == '001'}
+    assert {n['label'] for n in merged['nodes'] if n['identity'].get('code') == '002'} == {'Press', 'Press XL'}
     assert len(merged['edges']) == len(baseline['edges']) == 4
     input_edges = {(b['contributor_id'], e['id'], e['type'], e['source'], e['target'])
                    for b in branches for e in b['graph']['edges']}
@@ -405,3 +494,50 @@ def test_cross_table_proposal_uses_only_key_evidence_issued_in_both_extractions(
     assert input_edges <= recovered
     assert {(s['contributor_id'], s['provenance']['source']['table']) for edge in merged['edges']
             if edge['source'] == pump['id'] for s in edge['supports']} == {('east', 'east'), ('west', 'west')}
+
+
+@pytest.mark.parametrize('document_case', ['independent_matched', 'independent_catalog', 'independent_no_records'])
+def test_same_type_definition_forks_can_materialize_only_the_proven_rows(tmp_path, document_case):
+    from lightgraph.construction.overlap_patterns import analyze_overlap_patterns
+    from lightgraph.construction.projection_proposals import verify_projection_proposals
+    from lightgraph.runtime.config import MergePolicyConfig
+
+    access = {}
+    branches = independent_projection_inputs(tmp_path, document_case, same_type=True, document_access=access)
+    for branch in branches:
+        owner = branch['contributor_id']
+        expected = [] if document_case == 'independent_no_records' else [owner]
+        observed_docs = {e['details']['document_id'] for e in branch['evidence_records'].values()
+                         if e.get('kind') == 'document_section'}
+        assert access[owner]['visible_document_ids'] == expected and observed_docs == set(expected)
+        assert access[owner]['peer_read'] == {'status': 'error', 'code': 'unknown_document_page'}
+    assert len({b['graph']['access_fingerprint'] for b in branches}) == 1
+    baseline = merge_construction_graphs(branches)
+    assets = [n for n in baseline['nodes'] if n.get('original_type') == 'RegisteredAsset']
+    assert len(assets) == 4 and len({n['type'] for n in assets}) == 2
+    assert all(n['type'].startswith('RegisteredAsset__def_') for n in assets)
+    card, = [p for p in analyze_overlap_patterns(branches).patterns if p['kind'] == 'entity'
+             and {m['type'] for m in p['members']} == {'RegisteredAsset'}]
+    proposal = {'action': 'propose', 'pattern_id': card['pattern_id'], 'alignment': [
+        {'member_index': i, 'source_index': m['source_indexes'][0], 'role_index': 0}
+        for i, m in enumerate(card['members'])]}
+    policy, (verified,) = verify_projection_proposals(MergePolicyConfig(), branches, [card], [proposal])
+    merged = merge_construction_graphs(branches, merge_policy=policy)
+    if document_case != 'independent_matched':
+        assert not verified['verified_groups'] and verified['rejected_keys_by_reason'] == {
+            'cross_table_identity_unverified': 1, 'missing_or_conflicting_names': 1}
+        assert merged == baseline
+        return
+    assert verified['verified_groups_by_basis'] == {'shared_versioned_registry': 1}
+    applied = merged['fusion_diagnostics']['model_verified_projections']['applied_by_pattern'][card['pattern_id']]
+    assert applied == {'applied_groups': 1, 'collapsed_nodes': 1}
+    assert len(merged['nodes']) == len(baseline['nodes']) - 1
+    pump, = [n for n in merged['nodes'] if n['identity'].get('code') == '001']
+    assert pump['type'] in {n['type'] for n in assets}
+    assert (pump['type'], pump['id']) in {(n['type'], n['id']) for n in assets if n['identity']['code'] == '001'}
+    assert pump['properties'] == {'rating': ['A'], 'supplier': ['Acme']}
+    assert {(s['contributor_id'], s['reviewed_input_node_id']) for s in pump['supports']} == {
+        (b['contributor_id'], n['id']) for b in branches for n in b['graph']['nodes'] if n['identity'].get('code') == '001'}
+    assert {n['type'] for n in merged['nodes'] if n['identity'].get('code') == '002'} == {n['type'] for n in assets}
+    assert len(merged['edges']) == len(baseline['edges']) == 4
+    assert {s['contributor_id'] for e in merged['edges'] if e['source'] == pump['id'] for s in e['supports']} == {'east', 'west'}

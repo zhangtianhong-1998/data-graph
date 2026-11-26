@@ -347,8 +347,8 @@ class VerifiedProjectionRule(StrictModel):
     """Finite same-batch observations, checked again during deterministic replay."""
     pattern_id: str = Field(pattern=r'^pattern_[0-9a-f]{24}$')
     bindings: tuple[ProjectionBinding, ...] = Field(min_length=2, max_length=24)
-    observation_digests: tuple[str, ...] = Field(min_length=1, max_length=5000)
-    composition_version: Literal[1, 2] = 1
+    observation_digests: tuple[str, ...] = Field(min_length=1)
+    composition_version: Literal[1, 2, 3] = 1
 
     @model_serializer(mode='wrap')
     def serialize_observation_rule(self, handler):
@@ -368,7 +368,7 @@ class VerifiedProjectionRule(StrictModel):
 
 class MergePolicyConfig(StrictModel):
     """Deterministic safety rules for merging parallel unit and inherited graphs."""
-    verified_projection_rules: list[VerifiedProjectionRule] = Field(default_factory=list, max_length=32)
+    verified_projection_rules: list[VerifiedProjectionRule] = Field(default_factory=list)
     reviewed_key_pairs: list[ReviewedKeyPairRule] = Field(default_factory=list, max_length=64)
 
     @model_serializer(mode='wrap')

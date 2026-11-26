@@ -13,12 +13,11 @@ from lightgraph.runtime.config import EntityFusionRule, FusionPolicyConfig, Merg
 from lightgraph.source_values import identity_cell
 
 from .hierarchy_observations import observation_scope
-from .identity_authority import source_address
+from .identity_authority import _shared_proofs, source_address
 from .observed_identity import _dictionary_binding, _node_evidence
 from .source_namespaces import source_namespace
 
 
-MAX_PATTERNS = 32
 MAX_MEMBERS = 24
 MAX_DEFINITIONS = 4096
 MAX_RECORDS = 250_000
@@ -43,6 +42,7 @@ class _Family:
     definition: dict
     contract_fingerprint: str = ''
     by_source: dict = field(default_factory=lambda: defaultdict(set))
+    source_registries: dict = field(default_factory=dict)
     by_catalog: dict = field(default_factory=lambda: defaultdict(set))
     observations: dict = field(default_factory=dict)
     roles: set = field(default_factory=set)
@@ -98,6 +98,16 @@ def _read_node(family, node):
             family.problems.add('incomplete_source_binding')
             continue
         family.by_source[(*address, cols)].add(key)
+        binding_key = (*address, cols)
+        marker = prov.get('global_identity_authority') or {}
+        registries = set()
+        if (marker.get('registry_key_claims_v1') and family.definition.get('identity_scope') == 'global'
+                and family.definition.get('identity_domain') == node.get('identity_domain')):
+            registries = {v for k, v in _shared_proofs(marker, node['identity_domain'], address, cols) if k == 'registry'}
+        if binding_key in family.source_registries:
+            family.source_registries[binding_key].intersection_update(registries)
+        else:
+            family.source_registries[binding_key] = registries
         label = support.get('observed_label') or support.get('label')
         if not isinstance(label, str) or not label.strip() or not prov.get('label_column'):
             family.problems.add('missing_observed_name')
@@ -491,6 +501,8 @@ def analyze_indexed_overlap_patterns(contributors, policy=None):
             family_rows[owner, family.name] = row
         for row in index['relations']:
             relations[relation_binding(row['binding'])][owner, row['type']] = row
+    from .overlap_binding_evidence import BindingComparisons
+    comparisons = BindingComparisons(family_rows, counts, MAX_SUPPORTS)
     loaded = set()
     peaks = {'member_keys_or_endpoint_pairs': 0, 'neighbor_witnesses': 0, 'skipped_groups': 0}
     summary['index_evidence_budget'] = peaks
@@ -515,19 +527,34 @@ def analyze_indexed_overlap_patterns(contributors, policy=None):
             buckets['same_logical_keys_across_sources', f.names].append(f)
 
     def record(kind, basis, members, sources, overlap, reasons, candidates=(), witness_binding=None, pair_coverage=None,
-               overlapping_names=None):
+               overlapping_names=None, evidenced_families=None):
         if len(members) > MAX_MEMBERS or len(sources) > MAX_MEMBERS:
             summary['omitted_patterns'] += 1
             return
         pid = 'pattern_' + digest(kind, basis, members, sources, witness_binding)[:24]
         # Keep archived pattern IDs stable. A shared column spelling does not
         # tell the reviewer which table actually supplied it to each branch.
+        binding_counts = None
         if kind == 'entity':
             bindings = [(s['source_id'], s['schema'], s['table'], tuple(s['key_columns'])) for s in sources]
-            members = [{**m, 'source_indexes': [i for i, b in enumerate(bindings)
-                                                if b in families[m['contributor_id'], m['type']].by_source]}
-                       for m in members]
+            for m in members:
+                owner = m['contributor_id']
+                family = families[owner, m['type']]
+                m['source_indexes'] = [i for i, binding in enumerate(bindings) if binding in family.by_source]
+                for role in m['roles']:
+                    own, peer = tuple(role['key_columns']), tuple(role['opposite_key_columns'])
+                    left, right = (own, peer) if role['end'] == 'source' else (peer, own)
+                    mslot = (owner, role['relation_type'])
+                    role['source_indexes'] = [
+                        i for i in m['source_indexes']
+                        if bindings[i][-1] == own and mslot in relations.get((*bindings[i][:3], left, right), {})
+                        and (basis != 'same_physical_key' or sources[i] == witness_binding)]
+            if evidenced_families:
+                options = [sorted({i for r in m['roles'] for i in r['source_indexes']}) for m in members]
+                if sum(bool(o) for o in options) >= 2:
+                    binding_counts = comparisons.compare(evidenced_families, options, bindings)
         patterns.append({'pattern_id': pid, 'kind': kind, 'basis': basis, 'members': members, 'sources': sources,
+                         **({'binding_comparisons': binding_counts} if binding_counts else {}),
                          **({'witness_binding': witness_binding} if witness_binding else {}),
                          **({'pair_coverage': pair_coverage} if pair_coverage else {}),
                          **({'overlapping_names': overlapping_names} if overlapping_names is not None else {}),
@@ -575,7 +602,7 @@ def analyze_indexed_overlap_patterns(contributors, policy=None):
             if not candidates and not reasons:
                 reasons.append('rule_representation_limit')
             record('entity', basis, [f.descriptor() for f in group], [_public_source(b) for b in bindings],
-                   len(overlap), reasons, candidates, pair_coverage=coverage,
+                   len(overlap), reasons, candidates, pair_coverage=coverage, evidenced_families=group,
                    witness_binding=None if basis == 'same_logical_keys_across_sources' else _public_source(key))
     aliases, alias_stats = _cross_table_name_candidates(families, family_rows, counts, inputs_by_owner)
     summary['cross_table_key_name_search'] = alias_stats
@@ -630,10 +657,6 @@ def analyze_indexed_overlap_patterns(contributors, policy=None):
                [_public_source(b) for _, b in peers], key_count, sorted(reasons), overlapping_names=name_count,
                pair_coverage=coverage)
     patterns.sort(key=lambda p: ('apply' not in p['eligible_actions'], p['pattern_id']))
-    summary['omitted_patterns'] += max(0, len(patterns) - MAX_PATTERNS)
-    for p in patterns[MAX_PATTERNS:]:
-        rules.pop(p['pattern_id'], None)
-    del patterns[MAX_PATTERNS:]
     summary.update(reported_patterns=len(patterns), eligible_patterns=len(rules),
                    truncated=bool(summary['omitted_patterns']) or alias_stats['status'] != 'complete'
                    or name_stats['status'] != 'complete')

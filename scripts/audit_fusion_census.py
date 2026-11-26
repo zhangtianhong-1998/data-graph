@@ -395,6 +395,11 @@ def main():
     comparison.add_argument('second_dir', type=Path, help='第二份 run 普查结果目录，复用相同上游检查点')
     comparison.add_argument('--truth', type=Path, required=True)
     comparison.add_argument('--result', type=Path, required=True)
+    edges = sub.add_parser('compare-source-relations', help='按冻结来源行、端点及适用条件逐边对照两批检查点')
+    edges.add_argument('old_run', type=Path)
+    edges.add_argument('new_run', type=Path)
+    edges.add_argument('--node', default='merge_1')
+    edges.add_argument('--result', type=Path, required=True, help='保存本机明细的新文件')
     args = cli.parse_args()
     if args.action == 'score':
         score_saved(args.output_dir, args.truth, args.result)
@@ -402,6 +407,16 @@ def main():
     if args.action == 'compare-committed':
         try:
             compare_committed(args.first_dir, args.second_dir, args.truth, args.result)
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            cli.error(str(exc))
+        return 0
+    if args.action == 'compare-source-relations':
+        from fusion_edge_comparison import compare_source_relations
+        try:
+            if args.result.exists():
+                raise FileExistsError('请指定新的核对结果文件。')
+            result = compare_source_relations(args.old_run, args.new_run, args.node)
+            write(args.result.parent, args.result.name, result)
         except (KeyError, OSError, TypeError, ValueError) as exc:
             cli.error(str(exc))
         return 0

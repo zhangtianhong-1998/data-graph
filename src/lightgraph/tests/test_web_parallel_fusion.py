@@ -226,6 +226,12 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
         prepared = audit(run_file, 'merged', prepare_overlap_indexes=True)
         assert prepared['indexes'] == {u['unit_id']: 'reused' for u in units}
     observations = audit(run_file, 'merged', observations_only=True)
+    coverage = audit(run_file, 'merged', identity_coverage_only=True)
+    assert coverage['model_calls'] == 0 and coverage['coverage']['committed']['node_count'] == 4
+    assert set(coverage['coverage']['units']) == {u['unit_id'] for u in units}
+    assert {tuple(pair['contributors']) for pair in coverage['coverage']['unit_pairs']} == {
+        ('u0', 'u1'), ('u0', 'u2'), ('u1', 'u2')}
+    assert coverage['upstream_artifacts'] == report['upstream_artifacts']
     assert observations['typed_row_identity'] == report['committed']['typed_row_identity']
     assert observations['typed_row_identity']['multiple_contributor_groups'] == 2
     assert observations['typed_row_identity']['comparison_counts']['physical_tables'] == {'disjoint': 2}

@@ -54,6 +54,57 @@ def test_model_proposes_only_issued_relation_members_and_row_verification_keeps_
     assert report == verify_relation_proposals(graph, [card], decisions)[0]
 
 
+@pytest.mark.parametrize('conflict', [None, 'description', 'family', 'constraint', 'missing_declaration',
+                                      'different_row', 'unknown_scope', 'different_direction'])
+def test_ordinary_relation_facts_need_the_same_declared_meaning_and_qualified_rows(conflict):
+    graph, inputs, card, decision = _case()
+    for i, (unit, definition, edge, member) in enumerate(zip(
+            inputs, graph['definitions']['relations'], graph['edges'], card['members'], strict=True)):
+        family = 'serves' if conflict == 'family' and i else 'located_in'
+        original = dict(type=family, source_type='Region', target_type='Country',
+                        description='Region belongs to this reporting country.', acyclic=False)
+        if i and conflict == 'description':
+            original['description'] = 'Country of tax residence.'
+        if i and conflict == 'constraint':
+            original['acyclic'] = True
+        if conflict == 'missing_declaration':
+            original.pop('description')
+        unit['graph']['definitions']['relations'] = [original]
+        member['type'] = family
+        definition.clear()
+        definition.update(original, type=edge['type'], original_type=family,
+                          source_type='Account', target_type='Account')
+        support = edge['supports'][0]
+        support['provenance']['definition'] = family
+        support['endpoint_origins'] = [{'input_kind': 'unit', 'contributor_id': unit['contributor_id'], 'type': family}]
+    support = graph['edges'][1]['supports'][0]
+    if conflict == 'different_row':
+        support['source_row_witness']['rows'] = [[9, 9]]
+    if conflict == 'unknown_scope':
+        support.pop('business_context')
+    if conflict == 'different_direction':
+        edge = graph['edges'][1]
+        edge['source'], edge['target'] = edge['target'], edge['source']
+    original_graph = deepcopy(graph)
+    annotate_relation_meanings([card], inputs)
+    result, = verify_relation_proposals(graph, [card], [decision])
+    assert graph == original_graph
+    if conflict:
+        assert result['groups'] == [] and result['grouped_output_edges'] == 0
+    else:
+        fact, = result['groups']
+        assert fact['fact_kind'] == 'direct_relationship'
+        assert fact['edge_ids'] == ['edge-a', 'edge-b']
+        legacy = deepcopy(card)
+        del legacy['relation_verification_version']
+        for member in legacy['members']:
+            member['meaning_group'] = None
+            member.pop('declared_meaning_digest')
+        old, = verify_relation_proposals(graph, [legacy], [decision])
+        assert old['groups'] == []
+        assert old['rejected_by_reason'] == {'no_declared_hierarchy_semantics': 2}
+
+
 @pytest.mark.parametrize('conflict', ['different_declared_usage', 'original_conflicting_usage', 'missing_orientation',
                                      'reversed', 'level', 'snapshot', 'partial_rows', 'missing_row',
                                      'permission', 'unknown_scope', 'different_value', 'unaligned_endpoint',

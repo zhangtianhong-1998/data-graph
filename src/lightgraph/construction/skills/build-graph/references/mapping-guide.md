@@ -86,4 +86,38 @@
 
 并行单元使用不同宽表时，先在本单元获准读取的资料中查找共同的目录定义。核对该段是否适用于当前来源、表和完整键列，读出工具签发的带修订号段落引用，再写入实体定义。不同单元可各自引用同一版的同一段。只查到本表字段说明时，记录本表的证据和仍缺的跨表依据；相同的域名文字、同码同名的样本或两次表级探针，都不能代替这一步。
 
+目录维护者可以在 Markdown 开头的 YAML 中为某一节声明身份域、编号范围及每张表的完整主键。以下示例中，两张表都允许使用“目录规则”这一节；各分支只会读到本单元可见表列的绑定。
+
+```yaml
+---
+id: parts_directory
+purpose: data_description
+scope: {tables: [inventory.public.stock, delivery.public.lines]}
+sections:
+  目录规则:
+    identity_contract:
+      domain: 备件目录
+      scope: shared
+      key_columns:
+        "inventory:public.stock": [sku, edition]
+        "delivery:public.lines": [part_no, release]
+---
+# 目录规则
+库存表和交付明细按同一版备件目录登记。零件号和版次共同确定备件。
+```
+
+库存表和交付表也可以各用一份字典。若两份字典均引用同一版外部目录，各自保留本表的 `key_columns`，由资料作者在本节的 `identity_contract` 下填写以下四项。每一项 `key_roles` 对应同位置的物理列。各分支读取并引用本表章节，即可对照签发机构、目录编号、目录版次和完整键角色。两份原始章节的引用均保留。
+
+```yaml
+registry:
+  issuer: manufacturing-board
+  catalog: parts-register
+  version: "2026.1"
+  key_roles: [part_number, edition]
+```
+
+目录编号在签发机构内唯一。将本地文档修订号填到 `version` 会把目录和文档的版本混在一起，请填两份资料实际引用的目录版本。缺少该版本、存在冲突条款或无法核实完整键时，保留待审。
+
+每份实体草稿的 `identity_domain` 应对应本表字典的声明，按声明顺序映射完整键，并在 `identity_evidence_refs` 引用实际读完的这一节。两份字典可以对同一外部目录使用不同的本地名称。保存草稿时，若范围为 `unknown` 而已授权材料恰好声明了本表完整键的共享范围，工具会返回可读取的章节。核对后可修订草稿；资料缺失时保留原范围。各表独立编号时，目录维护者可声明 `scope: source_local`。另有适用于这一键的章节给出本地编号、不同的域、增加或省略身份限定列，或其中的限制无法判断时，工具保留独立身份；核对时应一并引用并记录分歧。共享声明由资料作者提供；抽取 Agent 记录版本、字段和引用，不能代填目录批准。历史章节摘要可用于追溯原文。没有结构声明的旧资料仅在能确认单字段明确且无条件的共享编号声明时支持自动合并，其余保留待审。
+
 同一身份的不同名称按项目的 `label_conflict_policy` 处理。默认 `retain_variants` 保留各名称及来源。属性别名用于已确认含义和单位一致的字段。两张表的同名属性口径不同时，可分别用 `source_id.schema.table.原属性名` 指定规范属性。城市、期间等会影响数值含义的字段可通过 `context_columns` 留在同一条来源观察里。`strict` 要求先解决名称冲突。`quarantine` 可以发布无冲突部分。`validate_graph_draft` 返回 `publishable_subset` 时，可发布无冲突部分；冲突节点及其相连边保留在候选中。全量验证仍记为未通过，不能宣称目标完整。`conflicts:<draft_id>` 提供已保存的编码、名称及映射来源，历史修订会明确标注；`publication_conflicts` 提供跨草稿冲突证据。修复后重新验证与发布会重新计算隔离集合。身份含义、别名解释和筛选条件仍需业务证据，不能按诊断名单直接删行以消除错误。

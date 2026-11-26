@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 from copy import deepcopy
 from pathlib import Path
@@ -33,6 +34,7 @@ from .workspace import GraphWorkspace, dump_yaml, write_yaml
 
 
 SKILL_ROOT = Path(__file__).parent / "skills" / "build-graph"
+DOCUMENT_PAGE_CHARS = 16000
 TERMINAL_QUERY_CODES = frozenset({'query_budget_exhausted', 'db_cu_budget_exhausted',
     'run_time_budget_exhausted', 'wall_time_budget_exhausted', 'construction_time_exhausted',
     'returned_rows_budget_exhausted', 'returned_bytes_budget_exhausted'})
@@ -207,9 +209,22 @@ class ConstructionTools:
             # Changes in source content or goals invalidate old evidence, even
             # when the source path and the visible schema remain unchanged.
             self._document_refs = {}
+            self._section_pages = {}
+            self._document_pages = {}
+            self._field_materials = {}
+            self._declared_identity_sections = {}
             for section in self._sections:
                 ref = f"{section['doc_id']}@{section['revision']}:{section['section_id']}"
                 self._document_refs[ref] = section
+                pages = self._document_pages.setdefault(section['doc_id'], [])
+                self._section_pages[ref] = len(pages)
+                if section['evidence_role'] == 'definition_evidence':
+                    for binding in section.get('identity_bindings', ()):
+                        if binding.get('scope') == 'shared' and not binding.get('incomplete'):
+                            key = binding['table'], tuple(binding['key_columns'])
+                            self._declared_identity_sections.setdefault(key, []).append(ref)
+                count = max(1, (len(section['text']) + DOCUMENT_PAGE_CHARS - 1) // DOCUMENT_PAGE_CHARS)
+                pages.extend((ref, part, count) for part in range(count))
             self._issue_document_versions()
         except Exception:
             self.close()
@@ -497,6 +512,7 @@ class ConstructionTools:
     def _identity_evidence_issues(self, draft, authorities=None):
         """Check the evidence for each mapping and for every column of its key."""
         from .identity_authority import metadata_probe
+        from lightgraph.documents.identity_contract import shared_key_claim_refs
         catalog = {(t.source_id, t.schema_name, t.name): t for t in self.tables.values()}
         applicable = {}
         issues = []
@@ -508,7 +524,9 @@ class ConstructionTools:
             sections = {r.ref: digest('identity_field_section_v1', r.details['document_id'], r.details['revision'],
                                       r.details['section_id'], r.details['content_digest'])
                         for r in refs if r.kind == 'document_section' and r.details.get('complete')
-                        and all(r.details.get(k) for k in ('document_id', 'revision', 'section_id', 'content_digest'))}
+                        and all(r.details.get(k) for k in ('document_id', 'revision', 'section_id', 'content_digest'))
+                        and r.ref in self._document_refs
+                        and r.details['content_digest'] == digest(self._document_refs[r.ref]['text'])}
             for number, mapping in enumerate(entity.mappings):
                 if not hasattr(mapping, 'key_columns'):
                     continue
@@ -520,7 +538,7 @@ class ConstructionTools:
                 documents_by_key = []
                 for column in mapping.key_columns:
                     if sections and (key, column) not in applicable:
-                        applicable[key, column] = {f"{s['doc_id']}@{s['revision']}:{s['section_id']}"
+                        applicable[key, column] = {f"{s['doc_id']}@{s['revision']}:{s['section_id']}": s
                             for s in self.documents.context_for(table, [column])
                             if s['evidence_role'] == 'definition_evidence'}
                     covered = sections.keys() & applicable.get((key, column), set())
@@ -531,9 +549,19 @@ class ConstructionTools:
                     documents = set.intersection(*documents_by_key) if not missing else set()
                     if not missing and not documents:
                         documents = {digest('composite_key_sections_v1', [sorted(d) for d in documents_by_key])}
+                    shared = shared_key_claim_refs(entity.identity_domain, entity.key_names, mapping.key_columns,
+                        table, [applicable.get((key, col), {}) for col in mapping.key_columns], sections)
+                    registry_claims = [
+                        {'section': sections[ref], **entry['registry']}
+                        for ref in sorted(shared)
+                        for entry in applicable[key, mapping.key_columns[0]][ref].get('identity_bindings', ())
+                        if entry.get('registry') and entry['table'] == f'{key[0]}:{key[1]}.{key[2]}'
+                        and entry['key_columns'] == list(mapping.key_columns)]
                     authorities[entity.type, number] = {
                         'binding': digest(entity.identity_domain, key, mapping.key_columns),
                         **({'key_sections_v1': sorted(documents)} if not missing else {}),
+                        **({'shared_key_sections_v2': sorted(sections[ref] for ref in shared)} if shared else {}),
+                        **({'registry_key_claims_v1': registry_claims} if registry_claims else {}),
                         **({'source_metadata': True} if key in probes else {})}
                 if entity.identity_scope == 'global' and missing and key not in probes:
                     code = ('identity_document_not_applicable' if all(r.kind in {'document_section', 'document_version'} for r in refs)
@@ -820,22 +848,21 @@ class ConstructionTools:
         if name.startswith("document:"):
             self._check_current_inputs()
             doc_id = name.partition(":")[2]
-            sections = [s for s in self._sections if s["doc_id"] == doc_id]
-            windows = [(s, offset, max(1, (len(s["text"]) + 15999) // 16000))
-                       for s in sections for offset in range(0, max(1, len(s["text"])), 16000)]
-            if page >= len(windows):
+            pages = self._document_pages.get(doc_id, ())
+            if page >= len(pages):
                 raise LightGraphError("unknown_document_page")
-            section, offset, count = windows[page]
-            ref = f"{section['doc_id']}@{section['revision']}:{section['section_id']}"
+            ref, part, count = pages[page]
+            section = self._document_refs[ref]
+            offset = part * DOCUMENT_PAGE_CHARS
             seen = self._read_chunks.setdefault(ref, set())
-            seen.add(offset // 16000)
+            seen.add(part)
             complete = len(seen) == count
             return {"status": "ok", "section": {**section,
-                    "text": section["text"][offset:offset + 16000],
+                    "text": section["text"][offset:offset + DOCUMENT_PAGE_CHARS],
                     "read_state": "complete" if count == 1 else "partial"},
                     "section_fully_read": complete,
                     "evidence_refs": self._issue_section(section) if complete else [],
-                    "next_page": page + 1 if page + 1 < len(windows) else None}
+                    "next_page": page + 1 if page + 1 < len(pages) else None}
         raise LightGraphError("unknown_construction_material")
 
     def _check_metadata_catalog(self, draft):
@@ -856,6 +883,62 @@ class ConstructionTools:
                     or state.get('database', {}).get('probe_code') == 'read_only_transaction_unverified'):
                 raise LightGraphError('metadata_catalog_requalification_required')
 
+    def _field_section_location(self, ref):
+        section = self._document_refs[ref]
+        return {'revision': section['revision'], 'section_id': section['section_id'],
+                'locator': section['locator'], 'read': {'tool': 'read_material', 'name': 'document:' + section['doc_id'],
+                                                        'page': self._section_pages[ref]}}
+
+    def _field_material(self, table, column):
+        key = (table, column)
+        if key not in self._field_materials:
+            applicable, locations = set(), []
+            identifier = re.compile(r'(?<![A-Za-z0-9_])' + re.escape(column) + r'(?![A-Za-z0-9_])')
+            for section in self.documents.context_for(self.tables[table], [column]):
+                if section['evidence_role'] != 'definition_evidence':
+                    continue
+                ref = f"{section['doc_id']}@{section['revision']}:{section['section_id']}"
+                applicable.add(ref)
+                # A table-wide dictionary can contain a separate section for each column.
+                explicit = section['scope']['columns'] or any(
+                    binding['table'] == table and column in binding['key_columns']
+                    for binding in section.get('identity_bindings', ()))
+                if len(locations) < 2 and (explicit or identifier.search(section['text'])):
+                    locations.append(self._field_section_location(ref))
+            self._field_materials[key] = applicable, locations
+        return self._field_materials[key]
+
+    def _identity_read_hints(self, draft, markers):
+        hints = []
+        for entity in draft.entities:
+            if entity.identity_scope == 'scoped':
+                continue
+            cited = set(entity.identity_evidence_refs)
+            for index, mapping in enumerate(entity.mappings):
+                if not getattr(mapping, 'key_columns', None):
+                    continue
+                table = f'{mapping.source_id}:{mapping.schema_name}.{mapping.table}'
+                if entity.identity_scope == 'unknown':
+                    refs = self._declared_identity_sections.get((table, tuple(mapping.key_columns)), ())
+                    if refs:
+                        hints.append({'reason': 'undeclared_scope_with_authored_key', 'entity_type': entity.type,
+                                      'mapping_index': index, 'table': table, 'key_columns': list(mapping.key_columns),
+                                      'sections': [self._field_section_location(ref) for ref in refs[:2]]})
+                        if len(hints) == 6:
+                            return hints
+                    continue
+                marker = markers.get((entity.type, index), {})
+                if not marker.get('source_metadata') or marker.get('key_sections_v1'):
+                    continue
+                fields = [(column, self._field_material(table, column)) for column in mapping.key_columns]
+                for column, (applicable, locations) in fields:
+                    if locations and not cited.intersection(applicable):
+                        hints.append({'entity_type': entity.type, 'mapping_index': index,
+                            'table': table, 'key_column': column, 'sections': deepcopy(locations)})
+                        if len(hints) == 6:
+                            return hints
+        return hints
+
     def save_graph_draft(self, yaml_text: str | None = None, metadata_from_draft: str | None = None):
         from .workspace import parse_graph_draft
         if (yaml_text is None) == (metadata_from_draft is None):
@@ -868,7 +951,8 @@ class ConstructionTools:
             self._check_metadata_catalog(draft)
         else:
             draft = parse_graph_draft(yaml_text)
-        error = self._evidence_error(draft)
+        markers = {}
+        error = self._evidence_error(draft, markers)
         if error:
             return error
         inherit_err = self._inheritance_error(draft)
@@ -891,16 +975,24 @@ class ConstructionTools:
             preview.update(first_pattern={'basis': first['basis'], 'member_count': first['member_count'],
                                 'draft_types': [[m['draft_id'], m['entity_type']] for m in first['members'][:2]]},
                            inspect={'tool': 'inspect_branch_overlap', 'draft_id': record.draft.draft_id})
+        hints = self._identity_read_hints(draft, markers)
         return {"status": "ok", "draft_id": record.draft.draft_id,
                 "revision": record.revision, "state": record.status,
                 "previous_revision": previous.revision if previous else None,
                 "revision_advice": advice, "branch_overlap_preview": preview,
+                **({'identity_evidence_hints': {'fields': hints,
+                    'guidance': 'Read the listed sections for the complete physical key. If they establish the '
+                                'identity scope and domain, revise the draft and cite the issued references. '
+                                'Retain an unknown scope when the material is insufficient or conflicts.'}}
+                   if hints else {}),
                 **({'derived_from': {'draft_id': parent.draft.draft_id, 'revision': parent.revision,
                                      'fingerprint': parent.fingerprint},
                     'scope': 'metadata_definitions_only', 'fact_data_validation': 'not_run'}
                    if metadata_from_draft is not None else {}),
                 "retained_failed_work": self._retained_failed_work(excluding=record.draft.draft_id, existing=records),
-                "next_action": ("Inspect the overlapping mappings in branch_overlap_preview. "
+                "next_action": ("Review identity_evidence_hints before validation. Read the referenced sections "
+                                "and check the draft identity against the source."
+                                if hints else "Inspect the overlapping mappings in branch_overlap_preview. "
                                 "Use source evidence to revise or retain them, then validate this draft."
                                 if preview['pattern_count'] else
                                 "Validate this draft, or revise it as new evidence arrives.")}

@@ -1,7 +1,8 @@
-"""Verify proposed direct hierarchy facts on the exact merged graph. Raw edges remain immutable."""
+"""Verify proposed relation facts on the merged graph and retain every contributing edge."""
 from collections import Counter, defaultdict
 
 from lightgraph.contracts import digest
+from lightgraph.hierarchy_bindings import mapped_direction
 
 from .relation_assertions import assertion_signature, support_address
 
@@ -31,14 +32,23 @@ def _bindings(support):
     return support_address(support), tuple(prov.get('source_key_columns') or ()), tuple(prov.get('target_key_columns') or ())
 
 
-def _meaning(edge, definition):
+def _meaning(edge, definition, *, include_ordinary):
     orientation = definition.get('hierarchy_orientation')
+    description = definition.get('description')
+    if include_ordinary and orientation in (None, 'none'):
+        family = definition.get('original_type') or definition.get('type')
+        if not family or mapped_direction(family) or not isinstance(description, str) or not description.strip():
+            return None
+        # The member's original definition and the output must agree after
+        # specialization of endpoint types. Compare all other business fields.
+        signature = {key: value for key, value in definition.items() if key not in {
+            'type', 'original_type', 'source_type', 'target_type', 'definition_variant', 'hierarchy_orientation'}}
+        return 'directed', family, digest(signature)
     if orientation not in ('parent_to_child', 'child_to_parent'):
         return None
     # "Directed" alone says nothing about the business relationship. Distinct
     # types need the same explicit business description as well as an explicit
     # hierarchy declaration, qualified observations and already identical endpoints.
-    description = definition.get('description')
     if isinstance(description, str) and description.strip():
         return orientation, 'declared_description', description
     return orientation, 'relation_family', definition.get('original_type') or edge.get('original_type') or edge['type']
@@ -51,11 +61,12 @@ def annotate_relation_meanings(patterns, inputs):
     for pattern in patterns:
         if pattern['kind'] != 'relation':
             continue
+        pattern['relation_verification_version'] = 2
         meaning_groups = {}
         for member in pattern['members']:
             definition = definitions.get((member['contributor_id'], member['type']), {})
             member['hierarchy_orientation'] = definition.get('hierarchy_orientation')
-            meaning = _meaning(member, definition)
+            meaning = _meaning(member, definition, include_ordinary=True)
             member['meaning_group'] = meaning_groups.setdefault(meaning, len(meaning_groups)) if meaning else None
             if meaning:
                 member['declared_meaning_digest'] = digest(meaning)
@@ -70,6 +81,7 @@ def _verify(pattern, selected, candidates, definitions, nodes):
     by_pair = defaultdict(list)
     rejected = Counter()
     facts = []
+    include_ordinary = pattern.get('relation_verification_version') == 2
     for edge, members in candidates:
         by_pair[edge['source'], edge['target']].append((edge, members))
 
@@ -93,7 +105,7 @@ def _verify(pattern, selected, candidates, definitions, nodes):
         facets_by_meaning = defaultdict(lambda: defaultdict(set))
         for edge, members in rows:
             definition = definitions.get(edge['type']) or {}
-            meaning = _meaning(edge, definition)
+            meaning = _meaning(edge, definition, include_ordinary=include_ordinary)
             reason = None
             if 'unverified_source_namespace' in pattern.get('reasons', ()):
                 reason = 'unverified_source_namespace'
@@ -102,9 +114,10 @@ def _verify(pattern, selected, candidates, definitions, nodes):
             elif (left not in nodes or right not in nodes or not definition.get('source_type')
                   or nodes[left] != definition['source_type'] or nodes[right] != definition.get('target_type')):
                 reason = 'unverified_endpoint_types'
-            elif not meaning or any(by_member[m].get('hierarchy_orientation') != meaning[0]
-                                    or by_member[m].get('meaning_group') is None for m in members):
-                reason = 'no_declared_hierarchy_semantics'
+            elif (not meaning or any(by_member[m].get('meaning_group') is None or
+                  (meaning[0] != 'directed' and by_member[m].get('hierarchy_orientation') != meaning[0])
+                  for m in members)):
+                reason = 'unverified_declared_relation_meaning' if include_ordinary else 'no_declared_hierarchy_semantics'
             elif any(by_member[m].get('declared_meaning_digest') != digest(meaning) for m in members):
                 reason = 'changed_original_relation_meaning'
             elif not all(_bindings(s) == requested for s in edge.get('supports') or ()):
@@ -132,8 +145,9 @@ def _verify(pattern, selected, candidates, definitions, nodes):
                 rejected[reason] += len(group)
                 continue
             ids = sorted(eid for eid, _ in group)
-            facts.append({'fact_id': 'fact_' + digest('direct_hierarchy_v1', left, right, meaning, signature),
-                          'fact_kind': 'direct_hierarchy',
+            kind = 'direct_relationship' if meaning[0] == 'directed' else 'direct_hierarchy'
+            facts.append({'fact_id': 'fact_' + digest(kind + '_v1', left, right, meaning, signature),
+                          'fact_kind': kind,
                           'edge_ids': ids})
     return {'pattern_id': pid, 'selected_members': len(selected), 'examined_edges': len(candidates),
             'candidate_endpoint_groups': endpoints, 'rejected_by_reason': dict(sorted(rejected.items())),

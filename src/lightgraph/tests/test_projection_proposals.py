@@ -69,9 +69,10 @@ def _bind_section(contributor, revision):
         for support in node['supports']:
             p = support['provenance']
             address = tuple(p['source'][k] for k in ('source_id', 'schema', 'table'))
+            section = digest('identity_field_section_v1', 'business-terms', revision, 'zones', 'content')
             p['global_identity_authority'] = {
                 'binding': digest(definition['identity_domain'], address, p['key_columns']),
-                'key_sections_v1': [digest('identity_field_section_v1', 'business-terms', revision, 'zones', 'content')]}
+                'key_sections_v1': [section], 'shared_key_sections_v2': [section]}
 
 
 @pytest.mark.parametrize(('revisions', 'expected'), [((), 0), (('v1', 'v2'), 0), (('v1', 'v1'), 1)])
@@ -96,6 +97,61 @@ def test_different_wide_tables_require_independent_bound_key_evidence(revisions,
     assert {row['first_observation_result'] for row in grouped} == {
         'observations_agree', 'unverified_relation_role'}
     assert all(row['unit_fingerprints_match'] for row in grouped)
+
+
+@pytest.mark.parametrize('case', ['ordinary', 'legacy_ordinary', 'different_directory', 'declared_hierarchy',
+                                  'legacy_hierarchy', 'acyclic_unknown', 'acyclic_none', 'other_role', 'restricted_scope',
+                                  'edge_filter', 'opposite_axis', 'unverified_context'])
+def test_shared_key_can_collect_ordinary_peers_without_erasing_role_or_scope(case):
+    role = 'has_child' if case == 'legacy_hierarchy' else 'related_to'
+    data = [unit('first', 'Area', 'code', table='a', role=role),
+            unit('second', 'Territory', 'code', table='b', role=role)]
+    for i, contributor in enumerate(data):
+        graph = contributor['graph']
+        _bind_section(contributor, f'v{i}' if case == 'different_directory' else 'v1')
+        rel, = graph['definitions']['relations']
+        if case == 'declared_hierarchy':
+            rel['hierarchy_orientation'] = 'parent_to_child'
+        elif case in ('acyclic_unknown', 'acyclic_none'):
+            rel['acyclic'] = True
+            if case == 'acyclic_none':
+                rel['hierarchy_orientation'] = 'none'
+        elif case not in ('legacy_hierarchy', 'legacy_ordinary'):
+            rel['hierarchy_orientation'] = 'none'
+        edge, = graph['edges']
+        support, = edge['supports']
+        support['business_context'] = {'status': 'global', 'dimensions': {}}
+        if i:
+            # Two distinct facts for the same object, including one extra neighbor on this side.
+            peer = deepcopy(graph['nodes'][1])
+            peer.update(id='second_extra', identity={'code': '000073'})
+            graph['nodes'].append(peer)
+            graph['edges'].append({**deepcopy(edge), 'id': 'extra', 'target': peer['id']})
+            if case == 'other_role':
+                graph['edges'][-1]['type'] = 'other_association'
+                graph['definitions']['relations'].append({**rel, 'type': 'other_association'})
+            elif case == 'restricted_scope':
+                support['required_scope_refs'] = ['restricted']
+            elif case == 'edge_filter':
+                support['provenance']['predicate'] = {'column': 'audited', 'op': 'eq', 'value': True}
+            elif case == 'opposite_axis':
+                support['provenance']['target_key_columns'] = ['another_code']
+            elif case == 'unverified_context':
+                del support['business_context']
+    policy, report = _compile(data, 'same_logical_keys_across_sources')
+    if case not in ('ordinary', 'legacy_ordinary'):
+        assert not policy.verified_projection_rules, report
+        return
+    assert report['verified_groups_by_basis'] == {'shared_versioned_key_section': 1}
+    result = merge_construction_graphs(data, merge_policy=policy)
+    assert result == merge_construction_graphs(list(reversed(data)), merge_policy=policy)
+    joined, = [n for n in result['nodes'] if len(n['supports']) == 2]
+    nodes = {n['id']: n for n in result['nodes']}
+    assert len(result['edges']) == 3
+    assert {(s['provenance']['source']['table'], nodes[e['target']]['identity']['code'])
+            for e in result['edges'] if e['source'] == joined['id'] for s in e['supports']} == {
+                ('a', '000072'), ('b', '000072'), ('b', '000073')}
+    assert all(s['identity_decision_endpoints']['source'] for e in result['edges'] for s in e['supports'])
 
 
 @pytest.mark.parametrize('case', ['mixed_name', 'competing_code', 'role', 'scope', 'access', 'missing_type',
@@ -167,16 +223,29 @@ def test_two_drafts_in_one_worker_and_three_sibling_projections_share_only_verif
     assert len(graph['edges']) == 5 and all(e['source'] == joined['id'] for e in graph['edges'])
 
 
-def test_competing_finite_rules_cannot_claim_the_same_member_or_hide_rejection():
+@pytest.mark.parametrize('version', [2, 3])
+def test_two_finite_rules_independently_verify_the_same_complete_membership(version):
     batch = _batch()
     policy, report = _compile(batch)
     first, = policy.verified_projection_rules
+    first = first.model_copy(update={'composition_version': version})
     second = first.model_copy(update={'pattern_id': 'pattern_' + 'a' * 24})
     competing = policy.model_copy(update={'verified_projection_rules': [first, second]})
     graph = merge_construction_graphs(batch, merge_policy=competing)
     stats = graph['fusion_diagnostics']['model_verified_projections']
-    assert stats['collapsed_nodes'] == 0 and stats['not_applied_by_pattern'] == {
-        report['pattern_id']: {'overlapping_proposals': 1}, second.pattern_id: {'overlapping_proposals': 1}}
+    if version == 2:
+        assert stats['collapsed_nodes'] == 0 and stats['not_applied_by_pattern'] == {
+            report['pattern_id']: {'overlapping_proposals': 1}, second.pattern_id: {'overlapping_proposals': 1}}
+    else:
+        chosen, corroborating = sorted([first.pattern_id, second.pattern_id])
+        assert stats['applied_groups'] == stats['collapsed_nodes'] == 1
+        winner, = [n for n in graph['nodes'] if len(n['supports']) == 2]
+        assert all(s['overlap_pattern_id'] == chosen and s['corroborating_overlap_pattern_ids'] == [corroborating]
+                   for s in winner['supports'])
+        assert stats['not_applied_by_pattern'][corroborating] == {'same_verified_members': 1}
+        assert len(graph['edges']) == 2
+        assert graph == merge_construction_graphs(batch, merge_policy=competing.model_copy(
+            update={'verified_projection_rules': [second, first]}))
 
 
 @pytest.mark.parametrize('counterexample', ['none', 'columns', 'row_scope', 'credential', 'table', 'no_marker',
@@ -269,3 +338,79 @@ def test_same_immediate_parent_with_different_ancestors_is_not_one_entity():
     policy, report = _compile(data)
     assert report['rejected_keys_by_reason']['different_ancestor_context'] == 1
     assert not policy.verified_projection_rules
+
+
+def _same_sheet_branches():
+    result = [
+        unit('ledger', 'SalesRegion', 'sales_id', field='currency', role='sells_product'),
+        unit('service', 'ServiceTerritory', 'area_id', field='hours', role='serviced_by'),
+    ]
+    for c, peer_col, peer_value in zip(result, ('product_code', 'team_code'), ('P72', 'T72')):
+        graph = c['graph']
+        own, peer = graph['nodes']
+        key, = peer['identity']
+        peer['identity'][key] = peer_value
+        # Different ordinary dimensions in the same wide worksheet row.
+        peer['type'] = 'Product' if peer_col == 'product_code' else 'Team'
+        graph['definitions']['entities'].append({**graph['definitions']['entities'][0], 'type': peer['type']})
+        graph['definitions']['relations'][0].update(target_type=peer['type'], hierarchy_orientation='none')
+        ordinals = {'code': 1, 'display_name': 2, 'product_code': 3, 'team_code': 4}
+        own['supports'][0]['provenance']['source_column_ordinals'] = ordinals.copy()
+        peer['supports'][0]['provenance']['key_columns'] = [peer_col]
+        peer['supports'][0]['provenance']['source_column_ordinals'] = ordinals.copy()
+        s = graph['edges'][0]['supports'][0]
+        s.update(business_context={'status': 'global', 'dimensions': {}}, properties={},
+                 source_row_witness={'kind': 'excel_rows_v1', 'snapshot': 'a' * 64, 'rows': [[12, 12]]})
+        s['provenance'].update(target_key_columns=[peer_col], source_column_ordinals=ordinals.copy(),
+                               scope_columns=[], business_context_mapping={'status': 'global'},
+                               definition=graph['edges'][0]['type'], mapping=0)
+    return result
+
+
+@pytest.mark.parametrize('counterexample', [None, 'different_row', 'different_snapshot', 'missing_locator',
+                        'wrong_side', 'reused_physical_value', 'wrong_ordinal', 'different_name_column',
+                        'hierarchy', 'different_access', 'condition'])
+def test_review_can_identify_one_sheet_cell_with_complementary_relations(counterexample):
+    data = _same_sheet_branches()
+    b = data[1]['graph']
+    edge = b['edges'][0]
+    rel = b['definitions']['relations'][0]
+    s = edge['supports'][0]
+    p = s['provenance']
+    if counterexample == 'different_row':
+        s['source_row_witness']['rows'] = [[13, 13]]
+    elif counterexample == 'different_snapshot':
+        s['source_row_witness']['snapshot'] = 'b' * 64
+    elif counterexample == 'missing_locator':
+        s.pop('source_row_witness')
+    elif counterexample == 'wrong_side':
+        s['row_context'] = {'values': {'code': 'another'}, 'value_types': {'code': 'text'}}
+        p['context_columns'] = ['code']
+    elif counterexample == 'reused_physical_value':
+        p['target_key_columns'] = b['nodes'][1]['supports'][0]['provenance']['key_columns'] = ['product_code']
+    elif counterexample == 'wrong_ordinal':
+        p['source_column_ordinals']['code'] = 5
+    elif counterexample == 'different_name_column':
+        b['nodes'][0]['supports'][0]['provenance']['source_column_ordinals']['display_name'] = 7
+    elif counterexample == 'hierarchy':
+        rel['hierarchy_orientation'] = 'child_to_parent'
+    elif counterexample == 'different_access':
+        b['access_fingerprint'] = 'other-grant'
+    elif counterexample == 'condition':
+        p['predicate'] = {'column': 'team_code', 'op': 'not_null'}
+    baseline = merge_construction_graphs(data)
+    policy, report = _compile(data)
+    if counterexample:
+        assert not policy.verified_projection_rules, report
+        return
+    assert report['verified_groups_by_basis'] == {'same_worksheet_identity_cells': 1}, report
+    graph = merge_construction_graphs(data, merge_policy=policy)
+    assert len(baseline['nodes']) == 4 and len(graph['nodes']) == 3
+    assert len(graph['edges']) == len(baseline['edges']) == 2
+    region, = [n for n in graph['nodes'] if len(n['supports']) == 2]
+    assert set(region['properties']) == {'currency', 'hours'}
+    assert {s['reviewed_input_node_id'] for s in region['supports']} == {'ledger_0', 'service_0'}
+    nodes = {n['id']: n for n in graph['nodes']}
+    assert {(edge['type'].split('__def_')[0], nodes[edge['target']]['type']) for edge in graph['edges']
+            if edge['source'] == region['id']} == {('sells_product', 'Product'), ('serviced_by', 'Team')}
+    assert graph == merge_construction_graphs(list(reversed(data)), merge_policy=policy)

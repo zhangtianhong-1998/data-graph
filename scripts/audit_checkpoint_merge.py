@@ -609,6 +609,7 @@ def summarize_cross_table_checks(checks):
     """Count proposal/key checks, including the same key again if a different proposal covers it."""
     missing_section = Counter()
     with_section = Counter()
+    registry_only = Counter()
     checked = 0
     for proposal in checks:
         if 'cross_table_matched_key_checks' not in proposal:
@@ -618,6 +619,8 @@ def summarize_cross_table_checks(checks):
             counter = with_section if row['shared_key_section_verified'] else missing_section
             observation_ok = row['first_observation_result'] == 'observations_agree'
             counter[observation_ok, row['unit_fingerprints_match']] += row['keys']
+            if not row['shared_key_section_verified'] and row.get('shared_registry_key_verified'):
+                registry_only[observation_ok, row['unit_fingerprints_match']] += row['keys']
 
     def matrix(counter):
         return {'observations_and_access_match': counter[True, True],
@@ -627,6 +630,7 @@ def summarize_cross_table_checks(checks):
 
     return {'entity_proposals': len(checks), 'proposals_with_cross_table_check_table': checked,
             'matched_cross_table_key_checks': sum(missing_section.values()) + sum(with_section.values()),
+            **({'of_without_common_section_with_matching_registry': matrix(registry_only)} if registry_only else {}),
             'without_common_key_section': matrix(missing_section), 'with_common_key_section': matrix(with_section)}
 
 
@@ -807,8 +811,13 @@ def committed_merge_policy(state, node_id, checkpoint):
 def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False, compare_to=None,
           run_summary=False, include_edge_lineage=False, explain_identity=None, overlap_patterns_only=False,
           prepare_overlap_indexes=False, include_overlap_evidence=False, simulate_reviewed_key_pairs=None,
-          explain_identity_key=None, explain_name=None, recheck_proposals_only=False):
+          explain_identity_key=None, explain_name=None, recheck_proposals_only=False, identity_coverage_only=False):
     """Use the run's committed inputs and policy, even when the current project has been edited."""
+    if identity_coverage_only and any((run_summary, observations_only, overlap_patterns_only, prepare_overlap_indexes,
+                                      include_hierarchy_membership, compare_to, include_edge_lineage, explain_identity,
+                                      explain_identity_key, explain_name, simulate_reviewed_key_pairs,
+                                      include_overlap_evidence, recheck_proposals_only)):
+        raise ValueError("--identity-coverage-only 独立读取已提交的检查点。")
     if recheck_proposals_only and any((run_summary, observations_only, overlap_patterns_only, prepare_overlap_indexes,
                                       include_hierarchy_membership, compare_to, include_edge_lineage, explain_identity,
                                       explain_name, simulate_reviewed_key_pairs, include_overlap_evidence)):
@@ -858,6 +867,15 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
                 **inspect_observations(graph)}
 
     parents = direct_merge_parents(state, target)
+
+    if identity_coverage_only:
+        from lightgraph.construction.identity_coverage import identity_evidence_coverage
+        inputs = [{**read(parent), 'has_evidence': parent['has_evidence'], 'artifact_id': parent['artifact_id']}
+                  for parent in parents]
+        return {'run_id': run['run_id'], 'node_id': node_id, 'mode': 'identity_evidence_coverage', 'model_calls': 0,
+                'artifact_id': target['artifact_id'], 'graph_digest': target['graph_digest'],
+                'upstream_artifacts': target['upstream_artifacts'],
+                'coverage': identity_evidence_coverage(inputs, read(target)['graph'])}
 
     if overlap_patterns_only or prepare_overlap_indexes or recheck_proposals_only:
         return _overlap_checkpoint_report(run, project, state, target, parents, prepare=prepare_overlap_indexes,
@@ -1011,6 +1029,7 @@ def main():
     parser.add_argument("run_file", type=Path, help="原项目 runs/run_….json")
     parser.add_argument("--node", default="merge_1", help="要核对的合并节点 ID")
     mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--identity-coverage-only", action="store_true", help="普查全部上游检查点的身份证据、单元间文档交集和提交图定义分叉，不执行合并或调用模型")
     mode.add_argument("--overlap-patterns-only", action="store_true", help="只读已提交的审查记录或上游类型索引，不打开节点和边数据")
     mode.add_argument("--recheck-proposals-only", action="store_true", help="用原抽取检查点重新核查已提交的实体提议，列出证据缺口，不调用模型或重跑合并")
     mode.add_argument("--prepare-overlap-indexes", action="store_true", help="为所选合并节点的旧抽取检查点补建类型索引；已存在的索引直接复用")
@@ -1037,6 +1056,7 @@ def main():
                        explain_name=args.explain_name,
                        overlap_patterns_only=args.overlap_patterns_only,
                        recheck_proposals_only=args.recheck_proposals_only,
+                       identity_coverage_only=args.identity_coverage_only,
                        prepare_overlap_indexes=args.prepare_overlap_indexes, include_overlap_evidence=args.include_overlap_evidence,
                        simulate_reviewed_key_pairs=args.simulate_reviewed_key_pairs)
     except LightGraphError as exc:

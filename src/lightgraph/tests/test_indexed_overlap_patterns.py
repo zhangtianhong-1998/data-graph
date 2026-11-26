@@ -278,13 +278,68 @@ def test_name_crosswalk_clues_can_come_from_two_drafts_within_a_contributor():
     assert card['overlapping_names'] == 2 and 'competing_roles_in_one_unit' in card['reasons']
 
 
-def test_name_only_patterns_cannot_crowd_out_an_eligible_pattern(monkeypatch):
+def test_eligible_patterns_prioritized_without_dropping_name_only_cards():
     east = regions('east', 'OfficialRegion', 'region_id')
     west = regions('west', 'CoverageRegion', 'area_id')
     recoded = [_recoded_unit('aa', [('a', '北区'), ('b', '南区')]),
                _recoded_unit('bb', [('c', '北区'), ('d', '南区')])]
-    monkeypatch.setattr(overlap, 'MAX_PATTERNS', 1)
     result = overlap.analyze_indexed_overlap_patterns([indexed(c) for c in [east, west, *recoded]])
-    card, = result.patterns
+    card = result.patterns[0]
     assert 'apply' in card['eligible_actions'] and card['basis'] == 'same_physical_key'
-    assert result.summary['omitted_patterns'] >= 1
+    assert any(p['basis'] == 'same_observed_names_with_different_keys' for p in result.patterns[1:])
+    assert result.summary['omitted_patterns'] == 0
+
+
+def test_reviewer_sees_binding_level_counts_and_selects_an_observed_role(monkeypatch):
+    from lightgraph.construction.overlap_review import review_overlap_patterns
+    from lightgraph.tests.test_overlap_pattern_model import configured, respond, setup_provider
+
+    west = unit('left', 'Area', 'key', table='west', role='assigned_in')
+    east = unit('right', 'Area', 'key', table='east', role='assigned_in')
+    other = unit('aux', 'Area', 'key', table='archive', role='retired_in')['graph']
+    for node in other['nodes']:
+        node['identity']['key'] += '-historical'
+    for field in ('nodes', 'edges'):
+        west['graph'][field].extend(other[field])
+    west['graph']['definitions']['relations'].extend(other['definitions']['relations'])
+    east['graph']['nodes'][1]['supports'][0]['label'] = 'Different observed name'
+    frozen = [indexed(west), indexed(east)]
+    analysis = overlap.analyze_indexed_overlap_patterns(frozen)
+    card, = [p for p in analysis.patterns if p['basis'] == 'same_logical_keys_across_sources']
+    assert card['eligible_actions'] == ['retain']
+
+    def reply(request):
+        issued, = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
+        assert not any(s in request.content.decode() for s in ('000071', '-historical', 'Different observed name'))
+        stats = issued['binding_comparisons']
+        assert stats['candidate_pairs'] == stats['compared_pairs'] == len(stats['rows']) == 2
+        supported, disjoint = stats['rows']
+        assert (supported['overlapping_keys'], supported['matching_observed_names'],
+                supported['conflicting_observed_names'], supported['unverified_names']) == (2, 1, 1, 0)
+        assert disjoint['overlapping_keys'] == 0
+        assert [issued['sources'][j]['table'] for j in supported['source_indexes']] == ['west', 'east']
+        choices = []
+        for i, src in zip(supported['member_indexes'], supported['source_indexes'], strict=True):
+            roles = issued['members'][i]['roles']
+            role = next(j for j, r in enumerate(roles) if r['relation_type'] == 'assigned_in' and src in r['source_indexes'])
+            if i == 0:
+                assert all(src not in r['source_indexes'] for r in roles if r['relation_type'] == 'retired_in')
+            choices.append({'member_index': i, 'source_index': src, 'role_index': role})
+        return respond(json.dumps({'decisions': [{'pattern_id': issued['pattern_id'], 'action': 'propose',
+                                                 'alignment': choices}]}))
+
+    calls = setup_provider(monkeypatch, reply)
+    review = review_overlap_patterns(configured(), [card], api_key='test')
+    assert len(calls) == 1 and review['reviewed_patterns'] == 1 and review['decisions'][0]['action'] == 'propose'
+
+
+def test_same_key_seen_at_several_addresses_has_no_binding_specific_name_witness():
+    a = unit('a', 'Area', 'key', table='first')
+    b = unit('b', 'Zone', 'key', table='second')
+    extra = deepcopy(a['graph']['nodes'][0]['supports'][0])
+    extra['provenance']['source']['table'] = 'other'
+    a['graph']['nodes'][0]['supports'].append(extra)
+    result = overlap.analyze_indexed_overlap_patterns([indexed(a), indexed(b)])
+    card, = [p for p in result.patterns if p['basis'] == 'same_logical_keys_across_sources']
+    row, = card['binding_comparisons']['rows']
+    assert row['overlapping_keys'] == 2 and row['matching_observed_names'] == 1 and row['unverified_names'] == 1

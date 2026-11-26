@@ -568,7 +568,7 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(review).toContain('7 种重叠模式，合并节点的模型审查 5 种，选用整类合并 1 种，生效规则 2 条')
     expect(review).toContain('其中 2 种符合整类合并条件')
     expect(review).toContain('3 个字段与角色对应方案，逐键核实 5 组，实际合并 4 组，减少 6 个节点')
-    expect(review).toContain('2 个关系对应方案，核实 3 组同一层级事实，共有 7 条原始关系作依据')
+    expect(review).toContain('2 个关系对应方案，核实 3 组关系事实，共有 7 条原始关系作依据')
     expect(review).toContain('模型请求 4 次，送审 6 种，已列出但未送审 1 种')
     expect(review).toContain('2 次请求的回复被截断')
     expect(review).toContain('拆批重试 1 次，单模式提高输出额度重试 1 次，共补回 2 种模式的裁决')

@@ -46,6 +46,22 @@ def extract(source, draft, **options):
     return edge['supports']
 
 
+def test_ordinary_direct_relation_preserves_source_rows_without_context_columns(tmp_path):
+    path = tmp_path / 'regions.xlsx'
+    workbook(path)
+    draft = hierarchy()
+    draft['entities'].append({'type': 'Team', 'key_names': ['code'],
+                              'mappings': [{'source_id': 'excel', 'table': 'tree', 'key_columns': ['child']}]})
+    draft['relations'][0].update(type='supported_by', target_type='Team', hierarchy_orientation='none')
+    with ExcelSource(path, header_row=2, allowed_columns={'public.tree': ['parent', 'child']}) as source:
+        support, = extract(source, draft)
+    assert support['source_row_witness'] == {
+        'kind': 'excel_rows_v1', 'snapshot': hashlib.sha256(path.read_bytes()).hexdigest(),
+        'rows': [[3, 3], [5, 8]]}
+    assert set(support['provenance']['columns']) == {'parent', 'child'}
+    assert 'row_context' not in support
+
+
 def test_membership_survives_projection_cache_and_keeps_scope_grain(tmp_path):
     path = tmp_path / 'test.xlsx'
     workbook(path)

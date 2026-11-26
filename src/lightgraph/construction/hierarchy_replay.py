@@ -860,6 +860,8 @@ def _merge_members(winner, batch, definitions, *, approval_ref=None, hierarchy_m
                         support['identity_basis'] = ((previous_basis if input_nodes.compose else None)
                                                      or 'verified_projection_alignment_v1')
                     support['overlap_pattern_id'] = decision_id
+                    if input_nodes.corroborating_patterns:
+                        support['corroborating_overlap_pattern_ids'] = list(input_nodes.corroborating_patterns)
                 support['reviewed_input_node_id'] = (input_nodes[node['id']] if ref is not None else
                     input_nodes.by_stage[node['id']][support['contributor_id']])
                 support.setdefault('identity_decision_members', {})[decision_id] = node['id']

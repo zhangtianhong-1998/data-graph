@@ -129,12 +129,12 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         if cancelled is not None and cancelled():
             raise LightGraphError('construction_cancelled')
 
-    # Locate worksheet observations for hierarchy reconciliation and common-fact queries.
+    # Physical rows also identify the shared source observation behind ordinary, direct associations.
     sheet_snapshots = {}
     for relation in draft.relations:
         hierarchy = relation.source_type == relation.target_type and relation.hierarchy_orientation != 'none'
         for mapping in relation.mappings:
-            if not hierarchy and not mapping.context_columns:
+            if (mapping.source_lookup or mapping.target_lookup) and not hierarchy and not mapping.context_columns:
                 continue
             table = allowed.get((mapping.source_id, mapping.schema_name, mapping.table))
             snapshot = getattr(by_source.get(mapping.source_id), 'sheet_row_snapshot', None)

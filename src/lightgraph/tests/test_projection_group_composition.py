@@ -118,7 +118,7 @@ def test_archived_finite_rules_reproduce_the_policy_and_full_output_from_734d6e9
     inputs = hierarchy_inputs() if case == 'hierarchy' else _batch()
     current = leaf_policy(inputs, {'Alpha', 'Beta', 'Gamma'}) if case == 'hierarchy' else _compile(inputs)[0]
     archive = current.model_dump(mode='json')
-    assert archive['verified_projection_rules'][0].pop('composition_version') == 2
+    assert archive['verified_projection_rules'][0].pop('composition_version') == 3
     legacy = MergePolicyConfig.model_validate(archive)
     assert legacy.model_dump(mode='json') == archive
     replay = merge_construction_graphs(inputs, merge_policy=legacy)
@@ -158,3 +158,56 @@ def test_endpoint_collision_cannot_undo_an_existing_hierarchy_pair(monkeypatch, 
         base, model_groups={ids: (None, 'test', refs)}, projection_stats=stats) == 1
     assert base == baseline
     assert stats['collapsed_nodes'] == 0 and stats['not_applied_by_pattern']['test']['incompatible_endpoint_remap'] == 1
+
+
+def test_evidence_for_ab_and_bc_does_not_authorize_abc():
+    inputs = [unit(owner, kind, 'code', field=owner) for owner, kind in
+              [('a', 'District'), ('b', 'Area'), ('c', 'Zone')]]
+    left, _ = _compile(inputs[:2])
+    right, _ = _compile(inputs[1:])
+    policy = MergePolicyConfig(verified_projection_rules=[*left.verified_projection_rules, *right.verified_projection_rules])
+    base = merge_construction_graphs(inputs)
+    actual = merge_construction_graphs(inputs, merge_policy=policy)
+    assert (actual['nodes'], actual['edges']) == (base['nodes'], base['edges'])
+    stats = actual['fusion_diagnostics']['model_verified_projections']
+    assert stats['applied_groups'] == 0
+    assert list(stats['not_applied_by_pattern'].values()) == [{'overlapping_proposals': 1}] * 2
+
+
+def test_more_than_32_verified_pattern_rules_can_be_reloaded_for_replay():
+    inputs = _batch()
+    policy, _ = _compile(inputs)
+    first, = policy.verified_projection_rules
+    expanded = policy.model_copy(update={'verified_projection_rules': [
+        first.model_copy(update={'pattern_id': f'pattern_{i:024x}'}) for i in range(33)]})
+    reloaded = MergePolicyConfig.model_validate_json(expanded.model_dump_json())
+    assert reloaded == expanded
+    actual = merge_construction_graphs(inputs, merge_policy=reloaded)
+    stats = actual['fusion_diagnostics']['model_verified_projections']
+    assert stats['applied_groups'] == stats['collapsed_nodes'] == 1
+    joined, = [node for node in actual['nodes'] if len(node['supports']) == 2]
+    for support in joined['supports']:
+        assert len(support['corroborating_overlap_pattern_ids']) == 32
+
+
+def test_a_large_reviewed_pattern_keeps_every_individually_verified_key():
+    inputs = _batch()
+    # One ordinary wide-table axis per branch, with a common neighbor and an
+    # independent observed name for each complete typed identifier.
+    for branch in inputs:
+        graph = branch['graph']
+        master, peer = graph['nodes']
+        edge, = graph['edges']
+        graph['nodes'], graph['edges'] = [peer], []
+        for i in range(5001):
+            node = deepcopy(master)
+            key, = node['identity']
+            code = f'reg-{i}'
+            node.update(id=f"{master['id']}_{i}", identity={key: code}, label=f'Area {i}')
+            node['supports'][0]['label'] = node['label']
+            graph['nodes'].append(node)
+            graph['edges'].append({**edge, 'id': f"{edge['id']}_{i}", 'source': node['id']})
+    policy, report = _compile(inputs)
+    assert report['verified_groups'] == 5001
+    restored = MergePolicyConfig.model_validate_json(policy.model_dump_json())
+    assert len(restored.verified_projection_rules[0].observation_digests) == 5001

@@ -1,5 +1,6 @@
 """Evidence required to reuse a row identity across independent publications."""
 from collections import defaultdict
+import re
 
 from lightgraph.contracts import digest
 from lightgraph.source_values import persisted_identity_key
@@ -19,6 +20,36 @@ def metadata_probe(record):
             and details.get('complete') is True):
         return source_address(record.get('source_ref'))
     return None
+
+
+def shared_key_sections(marker, domain, address, columns):
+    if not domain or not address or not columns or marker.get('binding') != digest(domain, address, columns):
+        return set()
+    # A pre-v2 receipt establishes field applicability only. Retain its
+    # locator for audit without treating it as a declaration of a shared key.
+    claimed = marker.get('shared_key_sections_v2')
+    located = marker.get('key_sections_v1')
+    if not isinstance(claimed, list) or not isinstance(located, list):
+        return set()
+    return {ref for ref in claimed if isinstance(ref, str) and re.fullmatch('[a-f0-9]{64}', ref) and ref in located}
+
+
+def _shared_proofs(marker, domain, address, columns):
+    sections = shared_key_sections(marker, domain, address, columns)
+    proofs = {('document', ref) for ref in sections}
+    registries = set()
+    for claim in marker.get('registry_key_claims_v1') or ():
+        if not isinstance(claim, dict) or not isinstance(claim.get('section'), str) or claim['section'] not in sections:
+            continue
+        identity = [claim.get(field) for field in ('issuer', 'catalog', 'version')]
+        roles = claim.get('key_roles')
+        if (isinstance(roles, list) and len(roles) == len(columns)
+                and all(isinstance(x, str) and x.strip() for x in (*identity, *roles))
+                and len(set(roles)) == len(roles)):
+            registries.add(('registry', digest('document_key_registry_v1', identity, roles)))
+    if len(registries) > 1:
+        return set()
+    return proofs | registries
 
 
 def cross_table_identity_issues(graph, draft, authorities, fusion):
@@ -54,8 +85,7 @@ def cross_table_identity_issues(graph, draft, authorities, fusion):
             if isinstance(number, int):
                 mapping_numbers.add(number)
             marker = authorities.get((entity.type, number), {})
-            sections = set(marker.get('key_sections_v1', ())) if address and marker.get('binding') == digest(
-                entity.identity_domain, address, prov.get('key_columns')) else set()
+            sections = _shared_proofs(marker, entity.identity_domain, address, prov.get('key_columns'))
             common = sections if common is None else common & sections
         if (len(locations) == 1 and None not in locations) or common:
             continue
@@ -84,7 +114,7 @@ def _global_authorities(node, definition, records, *, local_namespace):
         columns = prov.get('key_columns') or []
         marker = prov.get('global_identity_authority') or {}
         bound = address and columns and marker.get('binding') == digest(domain, address, columns)
-        docs = set(marker.get('key_sections_v1') or ()) if bound else set()
+        docs = _shared_proofs(marker, domain, address, columns)
         common_docs = docs if common_docs is None else common_docs & docs
         if not (address and local_namespace and not support.get('inherited_from')):
             complete = False
@@ -100,7 +130,7 @@ def _global_authorities(node, definition, records, *, local_namespace):
             bindings.add(evidence)
         else:
             complete = False
-    authorities = {('document', doc) for doc in common_docs or ()}
+    authorities = common_docs or set()
     if complete and bindings:
         authorities.add(('source', tuple(sorted(bindings))))
     return authorities

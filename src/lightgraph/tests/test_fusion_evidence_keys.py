@@ -103,6 +103,15 @@ def test_name_conflict_preserves_independent_bound_sections_and_role_observation
     assert row['member_observations'][0]['observation_reason'] == 'missing_or_conflicting_names'
 
 
+def test_verified_shared_identity_reports_ordinary_roles_and_full_facts_separately(api):
+    sources, routes = _case()
+    sources[1]['graph']['nodes'][1]['identity']['id'] = 'another_peer'
+    row = api.observed_pair_checks(sources, routes, [_request()])[0, 'abc']
+    assert row['relation_and_neighbor_witnesses_equal'] is False
+    assert row['shared_identity_relation_witnesses_equal'] is True
+    assert row['first_observation_result'] == 'observations_agree'
+
+
 def test_same_raw_ids_across_owners_are_resolved_in_their_own_graph(api):
     sources, routes = _case()
     for side in sources:

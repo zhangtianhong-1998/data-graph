@@ -77,6 +77,11 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
                     effective, proposal_checks = verify_projection_proposals(
                         effective, local_inputs, patterns, result['decisions'])
                     check_cancelled()
+                    from .overlap_feedback import reconsider_source_selections
+                    effective, proposal_checks = reconsider_source_selections(
+                        config, node, local_inputs, patterns, result, effective, proposal_checks,
+                        model_api_key=model_api_key, check_cancelled=check_cancelled, on_model_call=on_model_call,
+                        deadline=deadline)
             except LightGraphError as exc:
                 if exc.code not in {'invalid_overlap_pattern_decision', 'overlap_pattern_policy_conflict'}:
                     raise
@@ -145,6 +150,10 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
         'added_entity_rules': len(effective.fusion_policy.entity_rules) - len(policy.fusion_policy.entity_rules),
         'model_calls': result['model_calls'],
     }
+    if history := result.get('source_selection_review'):
+        summary['source_selection_reconsidered_patterns'] = history['review']['reviewed_patterns']
+        summary['source_selection_corrected_patterns'] = sum(
+            row['pattern_id'] in history['prior'] and row['verified_groups'] > 0 for row in proposal_checks)
     report = {
         'format_version': 1, 'summary': summary, 'patterns': patterns, 'pattern_summary': pattern_summary,
         'model_review': {key: value for key, value in result.items() if key not in {'decisions', 'selected_pattern_ids'}},

@@ -20,6 +20,7 @@ def test_bound_document_locators_do_not_imply_all_supports_have_same_authority()
     prov = support['provenance']
     prov['identity_qualifiers'] = {'tax_caliber': 'caliber'}
     marker = {'binding': digest('catalog', ('db', 'dm', 'items'), ['code']), 'key_sections_v1': [section]}
+    marker['shared_key_sections_v2'] = [section]
     prov['global_identity_authority'] = marker
     c['evidence_records'] = {
         'doc': {'kind': 'document_section', 'details': {**doc, 'complete': True, 'body': 'secret-text'}},

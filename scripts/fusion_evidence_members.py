@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from lightgraph.contracts import canonical, digest
 from lightgraph.construction.contexts import business_context_identity
-from lightgraph.construction.identity_authority import _global_authorities, source_address
+from lightgraph.construction.identity_authority import _global_authorities, shared_key_sections, source_address
 from lightgraph.construction.merge_name_audit import _typed_key
 from lightgraph.construction.observed_identity import identity_qualifier
 from lightgraph.construction.projection_access import _CheckpointGrant, common_table_grant
@@ -121,6 +121,7 @@ def _proof(node, definition, support):
             'authority': {'marker_present': bool(marker), 'binding_matches': bound,
                           'source_metadata': marker.get('source_metadata') is True,
                           'recorded_section_ids': recorded,
+                          'shared_key_claim_sections': sorted(shared_key_sections(marker, domain, address, cols)),
                           'valid_section_ids': recorded if bound and node.get('identity_domain') == domain else []},
             'evidence_refs': sorted(refs), 'mapping': prov.get('mapping'),
             'origins': [_pick(o, ('contributor_id', 'draft_id', 'revision', 'draft_revision', 'validation_id'))

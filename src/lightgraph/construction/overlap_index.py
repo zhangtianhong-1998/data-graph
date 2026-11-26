@@ -62,6 +62,8 @@ def _family_row(f):
         'role_descriptors': sorted(f.role_descriptors)[:16],
         'aliases': aliases,
         'evidence': {
+            **({'source_registries': [sorted(f.source_registries.get(b, ())) for b in bindings]}
+               if any(f.source_registries.values()) else {}),
             'observations': {cell: list(obs[:3]) for cell, obs in f.observations.items()},
             'source_keys': [sorted(f.by_source[b]) for b in bindings],
             'catalog_keys': [sorted(f.by_catalog[b]) for b in catalog],
@@ -88,6 +90,8 @@ def family_header(owner, row):
 def load_family_evidence(f, evidence):
     f.observations = evidence['observations']
     f.by_source = {b: set(keys) for b, keys in zip(f.by_source, evidence['source_keys'], strict=True)}
+    if 'source_registries' in evidence:
+        f.source_registries = {b: set(tokens) for b, tokens in zip(f.by_source, evidence['source_registries'], strict=True)}
     f.by_catalog = {b: set(keys) for b, keys in zip(f.by_catalog, evidence['catalog_keys'], strict=True)}
     f.dictionary_members = set(evidence['unique_keys'])
     f.foreign_roles = {tuple(cols) for cols in evidence['foreign_roles']}

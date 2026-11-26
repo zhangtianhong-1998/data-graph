@@ -1,6 +1,5 @@
 """Observe actual checkpoint keys at the projections named by an archived proposal."""
 from collections import Counter, defaultdict
-import re
 
 from lightgraph.construction import projection_proposals as projections
 from lightgraph.construction.contexts import business_context_identity
@@ -51,23 +50,27 @@ def _selected_key(ref, bindings, data):
 def _compare_observations(members, bindings, data, physical, grant):
     # The production observer may return early. Distinguish unevaluated fields
     # from disagreements; read independent scope/qualifier/role evidence directly.
-    by_member, roles, section_sets = [], [], []
+    by_member, roles, registry_roles, section_sets, registry_sets = [], [], [], [], []
     for m, binding in zip(members, bindings, strict=True):
         idx = data.index(binding.contributor_id)
         declared = idx[3][binding.entity_type]
-        role = m.roles if m.roles else projections._witnesses(m.node, binding, idx)
-        roles.append(role[0 if physical else 1] if role else None)
         status = sorted({business_context_identity(s)['status'] for s in m.node.get('supports', [])})
         sections = m.sections
+        registries = m.registries
         if m.reason == 'missing_or_conflicting_names' and declared.get('identity_scope') == 'global':
-            sections = {token for kind, token in projections._global_authorities(m.node, declared, {}, local_namespace=False)
-                        if kind == 'document' and isinstance(token, str) and re.fullmatch('[a-f0-9]{64}', token)}
+            claims = projections._global_authorities(m.node, declared, {}, local_namespace=False)
+            sections = {token for kind, token in claims if kind == 'document'}
+            registries = {token for kind, token in claims if kind == 'registry'}
         section_sets.append(sections)
+        registry_sets.append(registries)
+        role = m.roles or projections._witnesses(m.node, binding, idx, compare_shared_identity=bool(sections or registries))
+        roles.append(role[0 if physical else 1] if role else None)
+        registry_roles.append(role.shared_identity if role else None)
         qualifier_roles = set()
         for support in m.node.get('supports', ()):
             provenance = support.get('provenance') or {}
             properties = support.get('observed_properties', support.get('properties')) or {}
-            qualifier_roles.update(role for prop in properties if (role := identity_qualifier(provenance, prop)))
+            qualifier_roles.update(name for prop in properties if (name := identity_qualifier(provenance, prop)))
         by_member.append({'contributor_id': binding.contributor_id, 'entity_type': binding.entity_type,
                           'observation_reason': m.reason, 'input_node_id': m.node['id'],
                           'identity_scope': declared.get('identity_scope'),
@@ -77,6 +80,7 @@ def _compare_observations(members, bindings, data, physical, grant):
                           'selected_role_witnessed': bool(role), 'comparable_role_witness': bool(roles[-1])})
     names = [m.label for m in members]
     shared_sections = sorted(set.intersection(*section_sets))
+    shared_registries = sorted(set.intersection(*registry_sets))
     boundary_match = _equal([m.boundaries for m in members])
     all_scopes_known = all(entry['business_context_statuses']
                            and 'unknown' not in entry['business_context_statuses'] for entry in by_member)
@@ -87,10 +91,12 @@ def _compare_observations(members, bindings, data, physical, grant):
         'member_observations': by_member,
         'names_recorded_for_all': all(names), 'observed_names_equal': _equal(names),
         'shared_bound_section_ids': shared_sections,
+        **({'shared_versioned_registry_ids': shared_registries} if shared_registries else {}),
         'all_support_applicability_known': all_scopes_known,
         'contracts_equal': _equal([m.contract for m in members]),
         'applicability_and_row_boundaries_equal': boundary_match,
         'relation_and_neighbor_witnesses_equal': _equal(roles),
+        'shared_identity_relation_witnesses_equal': _equal(registry_roles) if shared_sections or shared_registries else None,
         'ancestor_witnesses_equal': _equal([m.ancestors for m in members]),
         'conflicting_identity_qualifier_values_observed': contradictory_qualifiers(m.node for m in members),
         'table_grant_covers_all_members': grants_cover,

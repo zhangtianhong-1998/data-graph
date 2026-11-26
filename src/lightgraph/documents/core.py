@@ -9,6 +9,7 @@ import yaml
 from pydantic import Field, PrivateAttr
 from lightgraph.contracts import StrictModel, SourceRef, TableSpec, digest
 from lightgraph.errors import LightGraphError
+from .identity_contract import DocumentIdentityContract
 
 Purpose = Literal['data_description','analysis_knowledge','mixed','unresolved']
 class DocumentScope(StrictModel):
@@ -25,6 +26,7 @@ class DocumentSection(StrictModel):
     content_hash: str
     text: str = Field(repr=False)
     scope: DocumentScope | None = None
+    identity_contract: DocumentIdentityContract | None = Field(default=None, exclude=True)
     purpose: Purpose | None = None
     @property
     def locator(self): return f'line:{self.line_start}-{self.line_end}'
@@ -171,12 +173,17 @@ def load_document(path: str | Path, *, text: str | None = None, max_bytes: int =
         inherited_scope=(parent.scope if parent and parent.scope is not None else scope)
         inherited_purpose=(parent.purpose if parent and parent.purpose is not None else purpose)
         override=overrides.get('/'.join(section.heading_path),{})
-        if not isinstance(override,dict) or set(override)-{'scope','purpose'}:
+        if not isinstance(override,dict) or set(override)-{'scope','purpose','identity_contract'}:
             raise LightGraphError('invalid_document_section_configuration')
         try:
             section.scope=DocumentScope.model_validate({**inherited_scope.model_dump(),**override.get('scope',{})})
         except Exception:
             raise LightGraphError('invalid_document_scope') from None
+        if 'identity_contract' in override:
+            try:
+                section.identity_contract = DocumentIdentityContract.model_validate(override['identity_contract'])
+            except ValueError:
+                raise LightGraphError('invalid_document_identity_contract') from None
         section.purpose=override.get('purpose',inherited_purpose)
         if section.purpose not in ('data_description','analysis_knowledge','mixed','unresolved'):
             raise LightGraphError('invalid_document_purpose')
@@ -307,7 +314,26 @@ class DocumentCorpus:
                 if not selected:
                     continue
                 sources=[_source_ref(t).model_dump(mode='json',by_alias=True) for t in selected]
-                result.append({'doc_id':doc.document_id,'revision':doc.revision,'section_id':section.section_id,
+                identity_bindings = []
+                contract = section.identity_contract
+                if contract:
+                    for table in selected:
+                        sid, schema, name = _table_key(table)
+                        address = f'{sid}:{schema}.{name}'
+                        columns = contract.key_columns.get(address, [])
+                        visible = [c for c in columns if c in getattr(table, 'column_names', ())
+                                   and self._scope_applies(scope, table, [c])]
+                        if visible:
+                            binding = {'table': address, 'key_columns': visible}
+                            if visible == columns:
+                                binding.update(domain=contract.domain, scope=contract.scope)
+                                if contract.registry:
+                                    binding['registry'] = contract.registry.model_dump(mode='json')
+                            else:
+                                binding['incomplete'] = True
+                            identity_bindings.append(binding)
+                result.append({**({'identity_bindings': identity_bindings} if identity_bindings else {}),
+                    'doc_id':doc.document_id,'revision':doc.revision,'section_id':section.section_id,
                     'heading':section.heading,'locator':section.locator,'text':section.text,
                     'purpose':purpose,'scope':scope.model_dump(mode='json'),
                     'sources':sources,'read_state':'complete',

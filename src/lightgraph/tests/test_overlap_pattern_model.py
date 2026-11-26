@@ -5,8 +5,11 @@ import httpx
 import pytest
 
 from lightgraph.construction.overlap_review import review_overlap_patterns
+from lightgraph.construction.overlap_patterns import analyze_overlap_patterns
+from lightgraph.construction.projection_proposals import verify_projection_proposals
 from lightgraph.errors import LightGraphError
-from lightgraph.runtime.config import RunConfig
+from lightgraph.runtime.config import MergePolicyConfig, RunConfig
+from lightgraph.tests.test_batch_overlap_patterns import unit
 
 
 def configured(**settings):
@@ -107,8 +110,52 @@ def test_agent_proposes_a_bounded_alignment_for_a_retain_only_pattern(monkeypatc
         'alignment': [{'member_index': i, 'source_index': i, 'role_index': 0} for i in (0, 1)]}]
 
 
+def test_only_unambiguous_members_can_use_compact_proposals(monkeypatch):
+    card = alignment_card()
+    other = profile(8, eligible=False)
+
+    def reply(request):
+        cards = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
+        choices = next(p['unique_binding_members'] for p in cards if p['pattern_id'] == card['pattern_id'])
+        assert choices == [0, 1]
+        return respond(json.dumps({'decisions': [
+            {'pattern_id': card['pattern_id'], 'action': 'propose', 'member_indexes': choices},
+            {'pattern_id': other['pattern_id'], 'action': 'review', 'alignment': []}]}))
+
+    setup_provider(monkeypatch, reply)
+    report = review_overlap_patterns(configured(), [card, other], api_key='key')
+    assert report['decisions'] == [
+        {'pattern_id': card['pattern_id'], 'action': 'propose', 'alignment': [
+            {'member_index': n, 'source_index': n, 'role_index': 0} for n in (0, 1)]},
+        {'pattern_id': other['pattern_id'], 'action': 'review'}]
+    assert report['retry_batches'] == report['failed_patterns'] == 0
+
+
+def test_retry_only_the_invalid_proposal_once_and_keep_other_valid_decisions(monkeypatch):
+    card = alignment_card()
+    card['members'][1]['roles'].append(dict(card['members'][1]['roles'][0], relation_type='second_role'))
+    other = profile(8)
+
+    def reply(request):
+        cards = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
+        proposals = []
+        for p in cards:
+            if p['pattern_id'] == other['pattern_id']:
+                proposals.append({'pattern_id': p['pattern_id'], 'action': 'keep', 'alignment': []})
+            else:
+                assert 1 not in p.get('unique_binding_members', [])
+                proposals.append({'pattern_id': p['pattern_id'], 'action': 'propose', 'member_indexes': [0, 1]})
+        return respond(json.dumps({'decisions': proposals}))
+
+    requests = setup_provider(monkeypatch, reply)
+    report = review_overlap_patterns(configured(), [card, other], api_key='key')
+    assert len(requests) == 2 and report['batches'][1]['pattern_ids'] == [card['pattern_id']]
+    assert report['submitted_patterns'] == 2 and report['reviewed_patterns'] == report['failed_patterns'] == 1
+    assert report['decisions'] == [{'pattern_id': other['pattern_id'], 'action': 'keep'}]
+
+
 @pytest.mark.parametrize('failure', [
-    'bounds', 'wrong_owner', 'wrong_role', 'key', 'arity', 'direction', 'relation', 'singleton',
+    'bounds', 'wrong_owner', 'wrong_role', 'role_at_another_table', 'key', 'arity', 'direction', 'relation', 'singleton',
     'duplicate_member', 'duplicate_projection', 'boolean_handle', 'string_handle', 'raw_value', 'merge_with_alignment',
 ])
 def test_invalid_model_alignment_grants_no_decision(monkeypatch, failure):
@@ -122,6 +169,8 @@ def test_invalid_model_alignment_grants_no_decision(monkeypatch, failure):
         alignment[1]['source_index'] = 0
     elif failure == 'wrong_role':
         alignment[1]['role_index'] = 1
+    elif failure == 'role_at_another_table':
+        pattern['members'][1]['roles'][0]['source_indexes'] = [0]
     elif failure == 'key':
         pattern['sources'][1]['key_columns'] = ['different_key']
     elif failure == 'arity':
@@ -154,15 +203,13 @@ def test_invalid_model_alignment_grants_no_decision(monkeypatch, failure):
     assert result['decisions'] == [] and result['selected_pattern_ids'] == []
 
 
-@pytest.mark.parametrize('failure', ['missing', 'duplicate', 'unissued', 'new_rule', 'ineligible',
+@pytest.mark.parametrize('failure', ['duplicate', 'unissued', 'new_rule', 'ineligible',
                                       'malformed', 'duplicate_json_key', 'server', 'timeout'])
 def test_unusable_batch_grants_nothing_and_performs_one_attempt(monkeypatch, failure):
     patterns = [profile(1), profile(2, eligible=False)]
     decisions = [{'pattern_id': p['pattern_id'], 'action': 'keep'} for p in patterns]
     body = {'decisions': decisions}
-    if failure == 'missing':
-        decisions.pop()
-    elif failure == 'duplicate':
+    if failure == 'duplicate':
         decisions.append(decisions[0])
     elif failure == 'unissued':
         decisions[0]['pattern_id'] = profile(100)['pattern_id']
@@ -188,6 +235,60 @@ def test_unusable_batch_grants_nothing_and_performs_one_attempt(monkeypatch, fai
     assert result['selected_pattern_ids'] == [] and result['reviewed_patterns'] == 0
 
 
+def test_complete_unique_answers_survive_an_omitted_pattern_and_its_retry(monkeypatch):
+    cards = [profile(i) for i in (1, 2)]
+    submitted = []
+
+    def reply(request):
+        batch = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
+        submitted.append([p['pattern_id'] for p in batch])
+        return respond(json.dumps({'decisions': [{'pattern_id': batch[0]['pattern_id'],
+            'action': 'review', 'member_indexes': [0, 1]}]}))
+
+    setup_provider(monkeypatch, reply)
+    result = review_overlap_patterns(configured(), cards, api_key='key')
+    a, b = [p['pattern_id'] for p in cards]
+    assert submitted == [[a, b], [b]]
+    assert result['recovered_patterns'] == 1 and result['failed_patterns'] == 0
+    assert result['decisions'] == [{'pattern_id': pid, 'action': 'review'} for pid in (a, b)]
+
+
+def test_malformed_proposal_cannot_discard_a_sibling_or_overrun_the_budget(monkeypatch):
+    cards = [alignment_card(), alignment_card()]
+    cards[1]['pattern_id'] = profile(8)['pattern_id']
+    good, bad = [p['pattern_id'] for p in cards]
+    setup_provider(monkeypatch, lambda _: respond(json.dumps({'decisions': [
+        {'pattern_id': good, 'action': 'propose', 'member_indexes': [0, 1]},
+        {'pattern_id': bad, 'action': 'propose', 'alignment': [{'member_index': 0}, {'member_index': 1}]}]})))
+    result = review_overlap_patterns(configured(max_calls=1), cards, api_key='key')
+    assert [d['pattern_id'] for d in result['decisions']] == [good]
+    assert result['batches'][0]['invalid_proposals'] == {bad: 'invalid_proposal_shape'}
+    assert result['failed_by_pattern_id'] == {bad: 'invalid_decisions'}
+    assert result['model_calls'] == 1 and result['submitted_patterns'] == 2 and result['omitted_patterns'] == 0
+
+
+@pytest.mark.parametrize('case', ['unique_pair', 'third_member', 'two_roles', 'two_sources', 'extra_field'])
+def test_bare_propose_can_only_mean_one_pair_of_bindings(monkeypatch, case):
+    card = alignment_card()
+    decision = {'pattern_id': card['pattern_id'], 'action': 'propose'}
+    if case == 'third_member':
+        card['members'].append(dict(card['members'][0], contributor_id='third'))
+    elif case == 'two_roles':
+        card['members'][1]['roles'].append(dict(card['members'][1]['roles'][0], relation_type='other_role'))
+    elif case == 'two_sources':
+        card['sources'].append(dict(card['sources'][1], table='other_table'))
+        card['members'][1]['source_indexes'].append(2)
+    elif case == 'extra_field':
+        decision['identity_domain'] = 'any'
+    setup_provider(monkeypatch, lambda _: respond(json.dumps({'decisions': [decision]})))
+    report = review_overlap_patterns(configured(), [card], api_key='key')
+    if case == 'unique_pair':
+        assert report['decisions'] == [{**decision, 'alignment': [
+            {'member_index': n, 'source_index': n, 'role_index': 0} for n in (0, 1)]}]
+    else:
+        assert report['failed_patterns'] == 1 and report['decisions'] == []
+
+
 @pytest.mark.parametrize('settings,extra,reason', [
     ({'mode': 'metadata_only'}, {}, 'model_not_configured'),
     ({'max_calls': 0}, {}, 'model_call_budget_exhausted'),
@@ -201,25 +302,58 @@ def test_unavailable_and_over_budget_have_zero_calls(monkeypatch, settings, extr
     requests = setup_provider(monkeypatch, lambda _request: pytest.fail('unexpected request'))
     result = review_overlap_patterns(configured(**settings), [profile()], **extra)
     assert result['reason'] == reason and result['model_calls'] == len(requests) == 0
+    assert result['submitted_patterns'] == 0 and result['omitted_patterns'] == result['total_patterns'] == 1
     assert result['selected_pattern_ids'] == []
 
 
-def test_bounds_reviewed_profile_count_and_preserves_configured_endpoint_key(monkeypatch):
-    patterns = [profile(i) for i in range(40)]
+def test_all_indexed_axes_can_reach_review_but_a_last_ranked_proposal_still_needs_evidence(monkeypatch):
+    contributors = []
+    for owner in ('actuals', 'targets'):
+        families = [unit(f'{owner}_{i}', f'Dimension{i}', f'key{i}', table=owner, column=f'code{i}', role=f'uses{i}')
+                    for i in range(66)]
+        contributor, *others = families
+        contributor['contributor_id'] = owner
+        graph = contributor['graph']
+        for other in others:
+            for rows in ('nodes', 'edges'):
+                graph[rows].extend(other['graph'][rows])
+            for definitions in ('entities', 'relations'):
+                graph['definitions'][definitions].extend(other['graph']['definitions'][definitions])
+        contributors.append(contributor)
+    analysis = analyze_overlap_patterns(contributors)
+    patterns = analysis.patterns
+    assert len(patterns) == 66 and analysis.summary['omitted_patterns'] == 0
+    assert all(p['basis'] == 'same_logical_keys_across_sources' and p['eligible_actions'] == ['retain']
+               for p in patterns)
     monkeypatch.setenv('LIGHTGRAPH_OVERLAP_TEST_KEY', 'env-secret')
 
     def reply(request):
         assert request.headers['Authorization'] == 'Bearer env-secret'
         items = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
-        return respond(json.dumps({'decisions': [{'pattern_id': p['pattern_id'], 'action': 'keep'} for p in items]}))
+        assert 1 <= len(items) <= 4
+        decisions = []
+        for p in items:
+            decision = {'pattern_id': p['pattern_id'], 'action': 'keep'}
+            if p['pattern_id'] == patterns[-1]['pattern_id']:
+                assert 'propose' in p['review_actions'] and 'merge' not in p['review_actions']
+                decision.update(action='propose', alignment=[{'member_index': i, 'source_index': m['source_indexes'][0],
+                    'role_index': next(j for j, r in enumerate(m['roles']) if r['end'] == 'source')}
+                    for i, m in enumerate(p['members'])])
+            decisions.append(decision)
+        return respond(json.dumps({'decisions': decisions}))
 
     requests = setup_provider(monkeypatch, reply)
+    skipped = review_overlap_patterns(configured(mode='metadata_only'), patterns)
+    assert skipped['reason'] == 'model_not_configured' and skipped['model_calls'] == len(requests) == 0
+    assert skipped['omitted_patterns'] == 66 and skipped['submitted_patterns'] == 0
     result = review_overlap_patterns(configured(), patterns)
-    assert result['status'] == 'partial' and result['reviewed_patterns'] == 32
-    assert result['omitted_patterns'] == 8 and result['reason'] == 'pattern_count_limit'
-    assert result['model_calls'] == len(requests) == 8
-    assert [pid for batch in result['batches'] for pid in batch['pattern_ids']] == [
-        p['pattern_id'] for p in patterns[:32]]
+    assert result['status'] == 'reviewed' and result['reviewed_patterns'] == result['submitted_patterns'] == 66
+    assert result['omitted_patterns'] == 0 and result['selected_pattern_ids'] == []
+    assert result['model_calls'] == len(requests) == 17
+    assert [pid for batch in result['batches'] for pid in batch['pattern_ids']] == [p['pattern_id'] for p in patterns]
+    policy, (check,) = verify_projection_proposals(MergePolicyConfig(), contributors, patterns, result['decisions'])
+    assert check['pattern_id'] == patterns[-1]['pattern_id'] and check['verified_groups'] == 0
+    assert not policy.verified_projection_rules
 
 
 def test_transport_cancellation_during_review_propagates_without_decision(monkeypatch):
@@ -379,10 +513,12 @@ def test_call_and_output_limits_bound_transport(monkeypatch, model_calls, node_c
         return respond(json.dumps({'decisions': [{'pattern_id': items[0]['pattern_id'], 'action': 'keep'}]}))
 
     requests = setup_provider(monkeypatch, reply)
+    patterns = [profile(i) for i in range(66)]
     result = review_overlap_patterns(configured(max_calls=model_calls, max_output_tokens=1024),
-                                     [profile(i) for i in range(8)], api_key='key', max_calls=node_calls)
+                                     patterns, api_key='key', max_calls=node_calls)
     assert len(requests) == result['model_calls'] == result['submitted_patterns'] == limit
-    assert result['failed_patterns'] == 0 and result['omitted_patterns'] == 8 - limit
+    assert result['failed_patterns'] == 0 and result['omitted_patterns'] == len(patterns) - limit
+    assert [p for batch in result['batches'] for p in batch['pattern_ids']] == [p['pattern_id'] for p in patterns[:limit]]
     assert result['reason'] == 'model_call_budget_exhausted' and result['status'] == 'partial'
 
 
@@ -426,3 +562,22 @@ def test_all_batches_share_one_workflow_deadline(monkeypatch):
     assert result['status'] == 'partial' and result['reason'] == 'wall_time_budget_exhausted'
     assert result['reviewed_patterns'] == 4 and result['failed_patterns'] == 0
     assert result['omitted_patterns'] == 6 and result['model_calls'] == len(requests) == 1
+
+
+def test_optional_table_evidence_yields_space_before_an_entire_card_is_skipped(monkeypatch):
+    card = alignment_card()
+    counts = {'member_indexes': [0, 1], 'source_indexes': [0, 1], 'overlapping_keys': 9,
+              'matching_observed_names': 8, 'conflicting_observed_names': 0, 'unverified_names': 1}
+    card['binding_comparisons'] = {'candidate_pairs': 24, 'compared_pairs': 24, 'rows': [counts] * 24}
+
+    def reply(request):
+        issued, = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
+        summary = issued['binding_comparisons']
+        assert summary['candidate_pairs'] == summary['compared_pairs'] == 24
+        assert 0 < len(summary['rows']) < 24
+        return respond(json.dumps({'decisions': [{'pattern_id': issued['pattern_id'], 'action': 'review'}]}))
+
+    calls = setup_provider(monkeypatch, reply)
+    outcome = review_overlap_patterns(configured(max_prompt_bytes=6900), [card], api_key='k')
+    assert len(calls) == outcome['reviewed_patterns'] == 1 and not outcome['oversized_pattern_ids']
+    assert len(card['binding_comparisons']['rows']) == 24

@@ -492,7 +492,6 @@
           "items": {
             "$ref": "#/$defs/VerifiedProjectionRule"
           },
-          "maxItems": 32,
           "title": "Verified Projection Rules",
           "type": "array"
         },
@@ -1448,7 +1447,6 @@
           "items": {
             "type": "string"
           },
-          "maxItems": 5000,
           "minItems": 1,
           "title": "Observation Digests",
           "type": "array"
@@ -1457,7 +1455,8 @@
           "default": 1,
           "enum": [
             1,
-            2
+            2,
+            3
           ],
           "title": "Composition Version",
           "type": "integer"
