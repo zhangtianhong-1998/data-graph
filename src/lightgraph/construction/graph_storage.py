@@ -12,7 +12,7 @@ import math
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from lightgraph.contracts import canonical
 from lightgraph.errors import LightGraphError
@@ -138,7 +138,7 @@ def _write_metadata(path: Path, text: str) -> None:
         os.fsync(stream.fileno())
 
 
-def write_graph_record(path: Path, graph: dict) -> None:
+def write_graph_record(path: Path, graph: dict, *, write_sidecars: Callable[[Path], None] | None = None) -> None:
     """Create a new snapshot directory; never overwrite an existing record.
 
     JSON object keys in node/edge rows must be strings. Metadata retains the
@@ -181,6 +181,8 @@ def write_graph_record(path: Path, graph: dict) -> None:
         if len(serialized.encode("utf-8")) > INTERNAL_YAML_MAX_BYTES:
             raise LightGraphError("yaml_document_too_large")
         _write_metadata(staged / "metadata.yaml", serialized)
+        if write_sidecars is not None:
+            write_sidecars(staged)
         try:
             os.rename(staged, path)
         except OSError:

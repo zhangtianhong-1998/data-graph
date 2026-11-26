@@ -25,7 +25,7 @@ from .base import SourceAdapter, QueryStats, cursor_batches
 from .budget import BudgetedCursor, QueryBudget
 from .database_errors import connection_is_closed, database_diagnostic, database_error, qualification_error, readback_shape_failure, annotate_database_error, cleanup_preserving_error
 from .validation_session import keep_session
-from .reconnect import configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary, terminal_failure, latch_terminal_failure, prepare_snapshot
+from .reconnect import verify_connection_controls, configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary, terminal_failure, latch_terminal_failure, prepare_snapshot
 
 MYSQL_SQL_MODES = frozenset({"ONLY_FULL_GROUP_BY", "STRICT_TRANS_TABLES", "ERROR_FOR_DIVISION_BY_ZERO", "NO_ENGINE_SUBSTITUTION"})
 
@@ -573,25 +573,7 @@ class MySQLSource(SourceAdapter):
         self._manifest.capabilities["query_cancel" if cancel else "statement_timeout"] = "verified"
 
     def verify_runtime_controls(self):
-        """Qualify a physical connection, releasing an explicitly acquired lease."""
-        with self._lock:
-            acquired = getattr(self, '_idle_released', False)
-            if acquired:
-                stopped = terminal_failure(self)
-                if stopped is not None: raise stopped
-                if self._disposed: raise LightGraphError('source_closed')
-                if self._cancelled: raise LightGraphError('query_cancelled')
-                self._boundary_recovery_used = False
-                self._boundary_recoveries = 0
-                self._reconnect()
-            try:
-                # A previously runtime-qualified source repeats these probes
-                # inside replacement construction, once per physical session.
-                if acquired and self._manifest.actual_database_verified:
-                    return self.capabilities()
-                return self._verify_runtime_controls_current()
-            finally:
-                if acquired: self._release_snapshot_connection()
+        return verify_connection_controls(self)
 
     def _verify_runtime_controls_current(self):
         with self._lock:

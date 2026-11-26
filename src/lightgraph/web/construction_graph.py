@@ -52,7 +52,7 @@ def _record_path(root: Path, relative):
 
 def _view_key(kind, path: Path, stat, access, scopes):
     # Nanosecond timestamps do not survive a JSON number round trip.
-    return {'version': 6, 'kind': kind, 'path': str(logical_path(path)), 'size': stat.st_size,
+    return {'version': 7, 'kind': kind, 'path': str(logical_path(path)), 'size': stat.st_size,
             'mtime_ns': str(stat.st_mtime_ns), 'access': access, 'scopes': scopes}
 
 
@@ -75,11 +75,23 @@ def read_publication_record(root, head, config, *, compose_base, pinned_summary,
         base_graph, _ = load_frozen_base_graph(root, config=config, summary=pinned_summary,
                                                 authorized_digest=(policy_record or {}).get('inheritance_digest'))
         graph = compose_published_graph(graph, base_graph, access_fingerprint(config))
+    # Older reviewed publications stored the decision only in the versioned ledger.
+    # Bind it to this verified graph before the caller filters any supports.
+    review = head.get('identity_review')
+    if review and 'identity_separations' not in graph and head.get('graph_digest') and published.is_dir():
+        from lightgraph.construction.human_identity import Decisions
+        from lightgraph.construction.identity_separations import capture_separations
+        ledger = read_internal_yaml(_record_path(root, review['ledger_path']))
+        if digest(ledger) != review['ledger_digest']:
+            raise LightGraphError('resolution_ledger_conflict')
+        pairs = Decisions(ledger['decisions']).different
+        if pairs:
+            graph['identity_separations'] = capture_separations(graph, pairs)
     return graph
 
 
-def load_prepared(config, *, root=None, head=None, authorization_root=None):
-    """Return the authorized display graph and the token that identifies it."""
+def _prepared_source(config, *, root=None, head=None, authorization_root=None):
+    """Authorize and identify a publication before optionally materializing its topology."""
     ensure_supported_access(config)
     selected_head = head is not None
     root = io_path(root) if root is not None else io_path(config.output_dir) / 'construction'
@@ -93,10 +105,17 @@ def load_prepared(config, *, root=None, head=None, authorization_root=None):
     cache_dir = root / 'view-cache'
     if not head:
         key = _view_key('empty', manifest_path.resolve(), manifest_path.stat(), expected_access, scopes)
-        return load_graph_view(cache_dir, key, lambda: (
-            {'nodes': [], 'edges': [], 'definitions': {}, 'status': 'empty'}, view_token(key)))
+        return cache_dir, key, lambda: (
+            {'nodes': [], 'edges': [], 'definitions': {}, 'status': 'empty'}, view_token(key))
     from lightgraph.construction.snapshot_registry import authorize_snapshot, snapshot_id
     policy_record = authorize_snapshot(authorization_root or root, head, config)
+    # This ledger also identifies older reviewed snapshots. Validate its
+    # commitment on a warm graph or index read, before using cached answers.
+    review = head.get('identity_review')
+    if review and head.get('graph_digest'):
+        ledger = read_internal_yaml(_record_path(root, review['ledger_path']))
+        if digest(ledger) != review['ledger_digest']:
+            raise LightGraphError('resolution_ledger_conflict')
     published = _record_path(root, head.get('path'))
     try:
         stat = published.stat()
@@ -162,7 +181,12 @@ def load_prepared(config, *, root=None, head=None, authorization_root=None):
             edge.update(relation=edge['type'], status='accepted', qualifiers=edge.get('properties', {}))
         return graph, view_token(key)
 
-    return load_graph_view(cache_dir, key, build)
+    return cache_dir, key, build
+
+
+def load_prepared(config, *, root=None, head=None, authorization_root=None):
+    """Return the authorized display graph and the token that identifies it."""
+    return load_graph_view(*_prepared_source(config, root=root, head=head, authorization_root=authorization_root))
 
 
 def load_graph(config):
@@ -180,13 +204,26 @@ def retrieval_status(config, *, embedding_api_key=None) -> dict:
     if root.is_symlink() or manifest.is_symlink():
         raise LightGraphError('workspace_path_invalid')
 
+    retrieval_dir = Path(config.output_dir) / 'retrieval'
+    current_meta = None
+    if (retrieval_dir / 'current.json').is_file():
+        try:
+            _, current_meta = active_index(retrieval_dir)
+        except LightGraphError:
+            current_meta = None
+
     graph_nodes = 0
     graph_edges = 0
     has_graph = False
     if manifest.exists():
-        graph, generation = load_prepared(config)
-        graph_nodes = len(graph.get('nodes', []))
-        graph_edges = len(graph.get('edges', []))
+        directory, key, build = _prepared_source(config)
+        generation = view_token(key)
+        if (key.get('parquet_files') and current_meta and generation == current_meta.get('generation')
+                and all(type(current_meta.get(k)) is int for k in ('nodes_indexed', 'edges_indexed'))):
+            graph_nodes, graph_edges = current_meta['nodes_indexed'], current_meta['edges_indexed']
+        else:
+            graph, generation = load_graph_view(directory, key, build)
+            graph_nodes, graph_edges = len(graph.get('nodes', [])), len(graph.get('edges', []))
         has_graph = graph_nodes > 0 or graph_edges > 0
     else:
         ensure_supported_access(config)
@@ -203,14 +240,6 @@ def retrieval_status(config, *, embedding_api_key=None) -> dict:
         embedder = resolve_embedder(config, api_key=embedding_api_key)
     except LightGraphError as exc:
         config_error = exc.code
-
-    retrieval_dir = Path(config.output_dir) / 'retrieval'
-    current_meta = None
-    if (retrieval_dir / 'current.json').is_file():
-        try:
-            _, current_meta = active_index(retrieval_dir)
-        except LightGraphError:
-            current_meta = None
 
     if not has_graph:
         status = 'no_graph'
@@ -268,18 +297,23 @@ def project_retriever(config, *, refresh=False, embedding_api_key=None, model_ap
     if root.is_symlink() or manifest.is_symlink():
         raise LightGraphError('workspace_path_invalid')
     if manifest.exists():
-        graph, generation = load_prepared(config)
+        directory, key, build = _prepared_source(config)
+        generation, version = view_token(key), key.get('snapshot')
+        # Older YAML layouts may point to mutable shards. Preserve their full
+        # read/validation path when the source files are not individually pinned.
+        if refresh or not key.get('parquet_files'):
+            graph, generation = load_graph_view(directory, key, build)
+            version = graph.get('version_id')
     else:
         ensure_supported_access(config)
-        graph = {'nodes': [], 'edges': []}
+        graph, version = {'nodes': [], 'edges': []}, None
         generation = digest('no-construction-publication', access_fingerprint(config), _scope_key(config))
-    if expected_version is not None and (graph.get('version_id') or '') != expected_version:
+    if expected_version is not None and (version or '') != expected_version:
         raise LightGraphError('graph_read_conflict')
     embedder = resolve_embedder(config, api_key=embedding_api_key)
     directory = Path(config.output_dir) / 'retrieval'
     # Both the vector index and the optional offline statistics are pinned
     # to this exact authorized publication. A query never starts either build.
-    version = graph.get('version_id')
     def analytics_loader(scopes, selection):
         from lightgraph.construction.analytics_store import read_analysis
         if version is None or set(scopes) != set(config.scopes):

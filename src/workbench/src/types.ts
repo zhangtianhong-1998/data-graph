@@ -135,6 +135,10 @@ export interface WorkflowMergeNodeState {
     grouped_relation_edges?: number
     submitted_patterns?: number
     failed_patterns?: number
+    retry_batches?: number
+    expanded_output_retries?: number
+    recovered_patterns?: number
+    truncated_batches?: number
     analysis_omitted_patterns?: number
     reviewed_patterns: number
     omitted_patterns: number
@@ -231,12 +235,14 @@ export interface GraphNode { id: string; label?: string; name?: string; kind?: s
 export interface StandardNodeAttributeOrigin { source_id: string; qualified_table: string; column: string | null; data_type: string }
 export interface FactContext { version?: number; status: 'global' | 'scoped' | 'unknown'; dimensions: BusinessContext }
 export interface AvailableRetrievalContext {
-  status: 'partial' | 'source_text_only' | 'no_confirmed_match' | 'scope_unresolved' | 'search_unavailable'
-  nodes: Array<{id: string; display_name?: string}>
+  status: 'partial' | 'source_text_only' | 'definition_only' | 'no_confirmed_match' | 'scope_unresolved' | 'search_unavailable'
+  nodes: Array<{id: string; display_name?: string; observations?: Array<{
+    observation_id?: string; source_tables?: string[]; evidence_refs?: string[]; provenance?: {key_columns?: string[]}
+  }>}>
   edges: Array<{id: string; source: string; target: string; relation: string}>
   witnesses: Array<{fact_id: string; row_id: string; conditions: Array<{text: string; node_id: string}>;
     source?: {source_id?: string; schema?: string; table?: string}}>
-  passages: Array<{text: string; node_id: string; display_name?: string; excerpt: string;
+  passages: Array<{text: string; node_id: string; display_name?: string; excerpt: string; property?: string;
     observation_id?: string | null; evidence_refs: string[]; source_tables: string[]}>
   candidate_path?: {
     assumptions: Array<{text: string; node_id: string; display_name: string; kind: string}>

@@ -144,3 +144,79 @@ def test_excel_metadata_probe_and_validation_retain_only_observed_authorized_pos
         assert restored['evidence_records'][evidence.ref]['details']['source_column_ordinals'] == expected
     finally:
         tools.close()
+
+
+def test_excel_identity_distinguishes_timestamps_text_and_cell_errors(tmp_path):
+    from datetime import datetime
+
+    stamp = datetime(2026, 1, 2, 3, 4, 5)
+    path = tmp_path / "types.xlsx"
+    book = openpyxl.Workbook()
+    sheet = book.active
+    sheet.title = "items"
+    sheet.append(["key", "invalid"])
+    sheet.append([stamp, "#N/A"])
+    sheet.append([stamp.isoformat(), "usable"])
+    sheet.append(["#N/A", "usable"])
+    sheet['A4'].data_type = 's'
+    book.save(path)
+    book.close()
+
+    def draft(column):
+        return {"draft_id": "typed", "entities": [{"type": "Item", "key_names": ["code"],
+                "mappings": [{"source_id": "sheet", "table": "items", "key_columns": [column]}]}]}
+
+    config = RunConfig(sources=[{"id": "sheet", "kind": "excel_workbook", "path": str(path)}],
+                       model={"mode": "in_environment"})
+    tools = ConstructionTools(config, tmp_path / "out")
+    try:
+        assert tools.call("save_graph_draft", yaml_text=dump_yaml(draft("key")))["status"] == "ok"
+        assert tools.call("validate_graph_draft", draft_id="typed")["passed"]
+        assert tools.call("publish_graph_draft", draft_id="typed")["nodes"] == 3
+        nodes = tools.workspace.read_published_graph()["nodes"]
+        assert {(n["identity"]["code"], n["identity_types"]["code"]) for n in nodes} == {
+            (stamp.isoformat(), "datetime"), (stamp.isoformat(), "text"), ("#N/A", "text")}
+        assert tools.call("save_graph_draft", yaml_text=dump_yaml(draft("invalid")))["status"] == "ok"
+        checked = tools.call("validate_graph_draft", draft_id="typed")
+        assert not checked["passed"]
+        assert "excel_error_cell_in_projection" in {d["code"] for d in checked["diagnostics"]}
+    finally:
+        tools.close()
+
+
+def test_excel_temporal_predicates_and_authorized_sql_share_iso_literal_semantics(tmp_path):
+    from datetime import date, datetime, time
+
+    path = tmp_path / 'comparison.xlsx'
+    workbook = openpyxl.Workbook()
+    workbook.iso_dates = True
+    sheet = workbook.active
+    sheet.title = 'items'
+    sheet.append(['id', 'day', 'at_time', 'stamp', 'label', 'mixed'])
+    stamp = datetime(2026, 1, 2, 1, 3, 5)
+    sheet.append(['early', date(2026, 1, 2), time(1, 3, 5), stamp, stamp.isoformat(), stamp])
+    sheet.append(['late', date(2026, 1, 3), time(1, 3, 6), datetime(2026, 1, 3), 'x', stamp.isoformat()])
+    workbook.save(path)
+    workbook.close()
+
+    with ExcelSource(path) as adapter:
+        table, = adapter.describe()
+
+        def sql(statement, **parameters):
+            validated = adapter.compiler.guard.validate(statement, parameters)
+            return [row[0] for batch in adapter.execute(validated) for row in batch.rows()]
+
+        for column, val in [('day', '2026-01-02'), ('at_time', '01:03:05'), ('stamp', stamp.isoformat())]:
+            for op in ('eq', 'le'):
+                assert [row[0] for batch in adapter.project(table, ['id'], {'column': column, 'op': op, 'value': val})
+                        for row in batch.rows()] == ['early']
+            assert sql(f"SELECT id FROM public.items WHERE {column} = :p", p=val) == ['early']
+        assert sql("SELECT id FROM public.items WHERE stamp = :v AND label = :v", v=stamp.isoformat()) == ['early']
+        assert sql("SELECT id FROM public.items WHERE '2026-01-02' >= day") == ['early']
+        assert sql("SELECT id FROM public.items WHERE at_time BETWEEN '01:03:05' AND '01:03:05.0'") == ['early']
+        assert sql("WITH a(k,v) AS (SELECT id,stamp FROM public.items) SELECT k FROM a WHERE v IN (:s)", s=stamp.isoformat()) == ['early']
+        assert sql("SELECT id FROM public.items WHERE mixed = :v", v=stamp.isoformat()) == ['late']
+        assert sql("SELECT id FROM public.items WHERE :v BETWEEN day AND day", v='2026-01-02') == ['early']
+        assert sql("SELECT id FROM public.items WHERE :v IN (SELECT day FROM public.items)", v='2026-01-02') == ['early', 'late']
+        with pytest.raises(LightGraphError, match='excel_temporal_comparison_unsupported'):
+            sql("SELECT id FROM public.items WHERE stamp LIKE :v", v='2026%')

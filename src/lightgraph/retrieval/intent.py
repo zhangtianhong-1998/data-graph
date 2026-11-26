@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import re
 
+from lightgraph.contracts import canonical
+
 from lightgraph.construction.contexts import normalize_context_selection
 from .retriever import decompose_query, is_literal_span
 from .semantic_grounding import link_mentions
@@ -136,10 +138,12 @@ def _resolve_scope(retriever, scopes, requested, clauses, excluded, *, is_path=F
     unresolved = []
     scan = _scope_scan_text(retriever, scopes, selection, text, dimensions, is_path)
     matches = list(_scope_matches(scan, dimensions))
+    if matches and selection == {}:
+        return selection, text, ['已选择仅通用知识，请确认问题中的专属范围。']
     for name, value, _ in matches:
         selection = dict(selection or {})
-        if name in selection and selection[name] != value:
-            unresolved.append('出现互不一致的适用范围。')
+        if name in selection and canonical(selection[name]) != canonical(value):
+            return normalize_context_selection(requested), text, ['出现互不一致的适用范围。']
         selection[name] = value
     text = _mask_scopes(text, matches)
     scan = _mask_scopes(scan, matches)
@@ -382,8 +386,8 @@ def _model_scope(retriever, scopes, requested, query, parsed, *, is_path=False):
         if len(keys) != 1:
             return selection, '', ['所提范围无法与当前可见的适用范围唯一对应。']
         key, v = keys[0]
-        if key in (selection or {}) and selection[key] != v:
-            return selection, '', ['出现互不一致的适用范围。']
+        if selection == {} or key in (selection or {}) and canonical(selection[key]) != canonical(v):
+            return normalize_context_selection(requested), '', ['出现互不一致的适用范围。']
         # Align against active text, not just the quoted fragment. "京项目" is
         # well formed in isolation even when copied from inside "南京项目".
         phrases = list(re.finditer(re.escape(phrase), scan))
@@ -721,7 +725,7 @@ def build_plan(retriever, scopes, query, business_context, conditions=(), drill_
     if query.strip() and not conditions and not force_joint and not force_traverse:
         selection = normalize_context_selection(business_context)
         cohorts = retriever.authorized_cohorts(scopes, selection)
-        hits = retriever.index.exact_names([query], scopes=cohorts, limit_per_term=6)
+        hits = retriever.index.exact_names([query], scopes=cohorts, limit_per_term=6, include_codes=True)
         if hits.get(normalize_term(query)):
             _, remainder, issues = _resolve_scope(retriever, scopes, selection, [query], ())
             # An exact object name may itself be the whole value + dimension.

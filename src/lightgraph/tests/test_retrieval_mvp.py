@@ -193,8 +193,21 @@ def test_retrieval_web_endpoints_and_cli(tmp_path, monkeypatch):
         revenue = client.post(route, json={'query': '营业收入', 'field': 'name', 'method': 'keyword', 'hops': 0})
         assert revenue.status_code == 200
         nid, = [n['id'] for n in revenue.json()['nodes']]
-        exact = client.post(route, json={'node_id': nid, 'hops': 0})
-        assert exact.status_code == 200 and exact.json()['nodes'][0]['display_name'] == '营业收入'
+        # A prepared index can serve an uncached large graph using only its
+        # authorized publication identity and file stamps.
+        from lightgraph.web import graph_view_cache, construction_graph
+        graph_view_cache.flush_graph_views()
+        graph_view_cache.clear_graph_views()
+        with monkeypatch.context() as patch:
+            patch.setattr(graph_view_cache, 'MAX_CACHED_RECORDS', 0)
+            patch.setattr(graph_view_cache, '_read_disk', lambda *args: None)
+            def unexpected_read(*args, **kwargs):
+                raise AssertionError('ready index query decoded the publication again')
+            patch.setattr(construction_graph, 'read_publication_record', unexpected_read)
+            assert client.get('/api/projects/ret_p/retrieval/status').json()['graph_nodes'] == 2
+            for _ in range(2):
+                exact = client.post(route, json={'node_id': nid, 'hops': 0})
+                assert exact.status_code == 200 and exact.json()['nodes'][0]['display_name'] == '营业收入'
         assert not client.post(route, json={'query': '营业收入', 'field': 'description', 'hops': 0}).json()['nodes']
         assert client.post(route, json={}).status_code == 422
 

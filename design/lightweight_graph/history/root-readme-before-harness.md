@@ -182,7 +182,7 @@ goal:
 
 发现 Agent 使用 AgentScope 1.0.21 的 `ReActAgent`，工具注册到 AgentScope Toolkit；OpenAI SDK 3.35.1 负责 Chat Completions 请求、SSE 解码和工具参数分片组装。项目适配层保留完整响应检查、查询权限、SQL 守卫和预算。工具回合只发送 `tools` / `tool_choice`，不混用最终回答的 `response_format`；工具调用 ID 沿用服务端值。只有普通文本或 JSON 输出能力的接口无法完成工具探查。
 
-独立配置示例是 [agent.example.yaml](../../../examples/agent.example.yaml)，运行入口见 [agentscope_discovery.yaml](../../../examples/agentscope_discovery.yaml)。先复制配置，再填写模型地址、名称和密钥来源：
+独立配置示例是 [agent.example.yaml](../../../examples/agent.example.yaml)，旧示例现名为 [model_discovery.yaml](../../../examples/model_discovery.yaml)。先复制配置，再填写模型地址、名称和密钥来源：
 
 ```bash
 cp examples/agent.example.yaml examples/agent.local.yaml
@@ -216,7 +216,7 @@ llm:
 
 ```bash
 .venv/bin/lightgraph sample examples/sample --rows 5000
-.venv/bin/lightgraph discover examples/agentscope_discovery.yaml
+.venv/bin/lightgraph discover examples/model_discovery.yaml
 ```
 
 模型的无工具结构化回合默认使用 `response_format: json_schema`，把完整输出契约交给支持严格结构化输出的服务端；本地格式、引用、语义和发布验证仍会继续执行。若网关不支持该模式，须显式设置 `response_format: json_object` 使用兼容模式；程序不会静默降级或删除约束。严格输出中的 Schema 也计入请求容量和用量估算。火山端点的能力应以实际模型与配置验证，不能只凭兼容接口名称判断；参见[官方结构化输出说明](https://docs.volcengine.com/docs/ark/structured-output-beta?lang=zh)。

@@ -18,7 +18,7 @@ CANARY = 'UNKNOWN_FIELD_SOURCE_VALUE_4926'
 
 
 def legacy_batch(model, packet, tools):
-    """Exercise the legacy batch transport; AgentScope now submits one draft per tool."""
+    """Exercise the legacy batch transport; the discovery loop submits one draft per tool."""
     try:
         return model.complete(packet['task'], packet, ProposalBatch)
     finally:

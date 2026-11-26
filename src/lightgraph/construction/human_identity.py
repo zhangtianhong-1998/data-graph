@@ -119,6 +119,13 @@ def project(raw, decisions, base_id):
     graph = deepcopy(raw)
     nodes = {node['id']: node for node in graph['nodes']}
     state = Decisions(decisions)
+    inherited = raw.get('identity_separations', [])
+    if inherited:
+        from .identity_separations import retain_separations
+        retain_separations(graph, inherited)
+        inherited = graph.get('identity_separations', [])
+        if any(len(state.representatives(row['members'])) < 2 for row in inherited):
+            raise LightGraphError('resolution_cannot_link_conflict')
     groups = state.groups
     if groups:
         owners = state.owner
@@ -234,4 +241,8 @@ def project(raw, decisions, base_id):
     graph['candidate_identity_merges'] = [
         {**group, 'candidate_id': candidate_key(base_id, group), 'node_ids': state.representatives(group['node_ids'])}
         for group in raw.get('candidate_identity_merges', []) if not state.resolved(group['node_ids'])]
+    if state.different or inherited:
+        from .identity_separations import capture_separations, retain_separations
+        recorded = capture_separations(graph, state.different)
+        retain_separations(graph, [*inherited, *recorded])
     return graph

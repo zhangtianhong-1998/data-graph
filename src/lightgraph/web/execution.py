@@ -386,6 +386,9 @@ def _workflow_node_inputs(config, project, files=None, *, version=2, previous_pr
             'workflow', 'model', 'agent_config', 'output_dir', 'max_run_seconds', 'embedding', 'record_trace',
             'max_working_bytes', 'max_db_queries', 'max_returned_rows', 'max_returned_bytes'})
         node_data = node.model_dump(mode='json', exclude={'label', 'position', 'max_calls', 'max_run_seconds'})
+        if scoped._document_table_bindings:
+            # Older checkpoints could omit sections even when the document bytes match.
+            node_data['resolved_document_tables_v1'] = scoped._document_table_bindings
         if nid in plan.merge_order:
             node_data['merge_policy'] = effective_merge_policy(config, node).model_dump(mode='json')
         node_data['enable_co_projection'] = node.enable_co_projection if node.enable_co_projection is not None else config.workflow.enable_co_projection
@@ -447,6 +450,81 @@ def _check_reused_access(root, artifact, scoped, project, legacy_input_root):
             raise LightGraphError('graph_access_context_changed')
 
 
+def _verify_reissued_unit_inputs(proofs, unit_id, artifact, unit_output, roots):
+    """Old retries sometimes signed another attempt's rows with the retry's input digest."""
+    from ..construction.workflow import load_workflow_state
+    attempt = artifact['source_attempt']
+    if artifact['run_id'] == attempt:
+        return
+    producer = load_workflow_state(unit_output.parents[2], attempt)
+    if not producer:
+        raise LightGraphError('workflow_checkpoint_missing')
+    if 'node_inputs' not in producer and 'artifacts' not in producer:
+        # Pre-checkpoint archives are migrated only by the explicit legacy resume path.
+        return
+    original = producer.get('artifacts', {}).get(unit_id)
+    if not original or original.get('graph_digest') != artifact['graph_digest']:
+        raise LightGraphError('workflow_checkpoint_invalid')
+    proofs.match(unit_id, producer['node_inputs'].get(unit_id), original,
+                 [*roots, producer.get('legacy_node_input_roots', {}).get(unit_id)])
+
+
+def _verified_unit_checkpoint(config, project, unit, attempt, state, proofs):
+    from ..construction.checkpoints import WorkflowCheckpointError, verify_checkpoint_files
+    from ..construction.workflow import build_unit_config, committed_unit_output, load_workflow_state, run_output_path
+
+    uid = unit.unit_id
+    try:
+        if not attempt:
+            raise LightGraphError('workflow_checkpoint_missing')
+        unit_out = committed_unit_output(config.output_dir, uid, attempt)
+        artifact = state.get('artifacts', {}).get(uid)
+        if artifact and artifact.get('source_attempt') != attempt:
+            artifact = None
+        default_output = Path(config.output_dir)
+        if not artifact:
+            # A failed replacement can leave the last successful attempt in an older archive.
+            default_output = unit_out.parents[2]
+            state = load_workflow_state(default_output, attempt) or {}
+            artifact = state.get('artifacts', {}).get(uid)
+        if not artifact:
+            raise LightGraphError('workflow_checkpoint_missing')
+        if (artifact.get('node_id') != uid or artifact.get('source_attempt') != attempt
+                or artifact.get('graph_kind') != 'node_delta' or artifact.get('contributor_kind') != 'unit'):
+            raise LightGraphError('workflow_checkpoint_invalid')
+        roots = [None, state.get('legacy_node_input_roots', {}).get(uid)]
+        root = proofs.match(uid, state.get('node_inputs', {}).get(uid), artifact, roots)
+        _verify_reissued_unit_inputs(proofs, uid, artifact, unit_out, roots)
+        location = state.get('artifact_outputs', {}).get(uid, default_output.relative_to(project).as_posix())
+        if proofs.project is None and location == '.':
+            output = default_output
+        else:
+            output = run_output_path(project, location)
+        scoped = build_unit_config(config, unit, unit_output_dir=unit_out)
+        _check_reused_access(output / 'construction', artifact, scoped, project, root)
+        verify_checkpoint_files(output, artifact)
+        return artifact, output, root
+    except LightGraphError as exc:
+        raise WorkflowCheckpointError(exc.code, uid) from None
+    except (KeyError, OSError, TypeError, ValueError):
+        raise WorkflowCheckpointError('workflow_checkpoint_invalid', uid) from None
+
+
+def verified_unit_loader(config, project=None):
+    from ..construction.checkpoints import load_checkpoint
+    from ..construction.workflow import load_workflow_state
+
+    proofs = _WorkflowInputProofs(config, project, _input_manifest(config, project))
+    state = load_workflow_state(config.output_dir) or {}
+    root = Path(config.output_dir) if project is None else project
+
+    def load(unit, attempt):
+        artifact, output, _ = _verified_unit_checkpoint(config, root, unit, attempt, state, proofs)
+        return load_checkpoint(output, artifact)
+
+    return load
+
+
 def _workflow_descendants(plan, node_id):
     if node_id not in plan.extract_ids + plan.merge_order:
         raise LightGraphError('workflow_unit_not_found')
@@ -470,6 +548,8 @@ def _resolved_payload(config, project_path, *, source_credentials=None, model_ap
         data["model"]["api_key"] = model_api_key
     payload = {"config": data, "agent_name": config.agent_name,
                "dependencies": _input_manifest(config, project_path)}
+    if config._document_table_bindings:
+        payload["document_table_bindings"] = config._document_table_bindings
     if source_credentials:
         payload["source_credentials"] = dict(source_credentials)
     return payload
@@ -800,6 +880,8 @@ class RunManager:
                         unit_out = committed_unit_output(old_output, nid, attempt)
                         scoped = build_unit_config(config, units[nid], unit_output_dir=unit_out)
                     if legacy and nid in units:
+                        if scoped._document_table_bindings:
+                            raise LightGraphError('workflow_resume_input_changed')
                         contributor = load_unit_contributor(unit_out, nid)
                         if not contributor:
                             raise LightGraphError('workflow_checkpoint_missing')
@@ -816,6 +898,8 @@ class RunManager:
                             raise LightGraphError('workflow_checkpoint_invalid')
                         roots = [None, state.get('legacy_node_input_roots', {}).get(nid), previous_project_root]
                         legacy_root = proofs.match(nid, state['node_inputs'].get(nid), artifact, roots)
+                        if nid in units:
+                            _verify_reissued_unit_inputs(proofs, nid, artifact, unit_out, roots)
                         if legacy_root is not None:
                             verified_roots[nid] = legacy_root
                         if artifact.get('upstream_artifacts') != [artifacts[p]['artifact_id'] for p in plan.merge_inputs.get(nid, [])]:
@@ -982,10 +1066,22 @@ class RunManager:
             if root is not None:
                 historical_roots[nid] = root
             input_digests[nid] = artifact['input_digest']
+        artifact_outputs = dict((resume_state or {}).get('artifact_outputs', {}))
+        if selected_unit_ids is not None and resume_state is None:
+            for unit in wf.units:
+                uid = unit.unit_id
+                if uid not in active_unit_set or uid in selected_unit_ids or not usable_result(units_state[uid]):
+                    continue
+                artifact, output, root = _verified_unit_checkpoint(
+                    config, project, unit, previous_attempts.get(uid), existing_state, proofs)
+                reused_artifacts[uid] = artifact
+                artifact_outputs[uid] = output.relative_to(project).as_posix()
+                input_digests[uid] = artifact['input_digest']
+                if root is not None:
+                    historical_roots[uid] = root
+        for uid in reused_artifacts.keys() & units_state.keys():
+            units_state[uid]['reused'] = True
         if resume_state:
-            for uid in plan.extract_ids:
-                if uid in reused_artifacts:
-                    units_state[uid]['reused'] = True
             for mid in plan.merge_order:
                 if mid not in resume_nodes:
                     previous = resume_state.get('merge_nodes', {}).get(mid)
@@ -993,6 +1089,7 @@ class RunManager:
                         merge_nodes_state[mid] = dict(previous, model_calls=0, reused=mid in reused_artifacts and mid not in resume_state.get('recomposed_nodes', []))
                     else:
                         merge_nodes_state[mid].update(status='skipped', error_code='workflow_units_not_ready')
+        rerun_ids = sorted(resume_nodes) if resume_nodes is not None else [u.unit_id for u in target_units] + plan.merge_order
         wf_state = {
             "parent_run_id": rid,
             "workflow_input": workflow_input,
@@ -1012,9 +1109,9 @@ class RunManager:
             'resume_action': (resume_state or {}).get('resume_action'),
             'recomposed_nodes': (resume_state or {}).get('recomposed_nodes', []),
             'reused_nodes': sorted(set(reused_artifacts) - set((resume_state or {}).get('recomposed_nodes', []))),
-            'rerun_nodes': sorted(resume_nodes) if resume_nodes is not None else [*plan.extract_ids, *plan.merge_order],
+            'rerun_nodes': rerun_ids,
             'artifacts': dict(reused_artifacts),
-            'artifact_outputs': dict((resume_state or {}).get('artifact_outputs', {})),
+            'artifact_outputs': artifact_outputs,
             'resumed_from_run_id': (resume_state or {}).get('parent_run_id'),
         }
         archive_workflow_state(config.output_dir, load_workflow_state(config.output_dir))
@@ -1032,8 +1129,8 @@ class RunManager:
             'resumed_from_run_id': (resume_state or {}).get('parent_run_id'),
             'resume_action': (resume_state or {}).get('resume_action'),
             'recomposed_nodes': (resume_state or {}).get('recomposed_nodes', []),
-            'reused_nodes': sorted(set(reused_artifacts) - set((resume_state or {}).get('recomposed_nodes', []))),
-            'rerun_nodes': sorted(resume_nodes) if resume_nodes is not None else [*plan.extract_ids, *plan.merge_order],
+            'reused_nodes': wf_state['reused_nodes'],
+            'rerun_nodes': rerun_ids,
         }
         self._save_run(runs / (rid + ".json"), record)
 
@@ -1166,8 +1263,9 @@ class RunManager:
                 return 'published'
             path = Path(config.output_dir) / 'construction' / 'manifest.yaml'
             try:
-                if path.is_file() and (read_internal_yaml(path) or {}).get('current_graph'):
-                    return 'retained_previous'
+                head = read_internal_yaml(path).get('current_graph') if path.is_file() else None
+                if head:
+                    return 'published' if head.get('run_id') == rid else 'retained_previous'
             except (LightGraphError, OSError, ValueError, AttributeError):
                 pass
             return 'blocked'
@@ -1253,7 +1351,7 @@ class RunManager:
                         out_dir = committed_unit_output(config.output_dir, uid, attempts[uid])
                         try:
                             c = (load_checkpoint(run_output_path(project, wf_state['artifact_outputs'][uid]), reused_artifacts[uid])
-                                 if uid in reused_artifacts else fresh_contributors.get(uid) or load_unit_contributor(out_dir, uid))
+                                 if uid in reused_artifacts else fresh_contributors[uid])
                             unit_config = build_unit_config(config, units_by_id[uid], unit_output_dir=out_dir)
                             if uid in reused_artifacts:
                                 artifact = reused_artifacts[uid]
@@ -1272,7 +1370,7 @@ class RunManager:
                             code = _safe_code(getattr(exc, 'code', None), 'graph_workspace_record_unavailable')
                             units_state[uid].update(status='failed', error_code=code, updated_at=_now())
                             units_state[uid]['failure_detail'] = failure_detail(exc, 'extract_contributor_load')
-                            if verify_in_worker and uid in reused_artifacts:
+                            if uid in reused_artifacts:
                                 raise
                             attempts.pop(uid, None)
                             skipped_units.append(uid)
@@ -1283,13 +1381,6 @@ class RunManager:
                             continue
                         unit_contribs[uid] = c
                         included_units.append(uid)
-                        if uid not in wf_state['artifacts']:
-                            wf_state['artifacts'][uid] = commit_checkpoint(
-                                config.output_dir, rid, uid, c, input_digest=input_digests[uid],
-                                status=units_state[uid]['status'], graph_kind='node_delta', source_attempt=attempts[uid],
-                                result_policy_id=register_access_context(root_construction, unit_config))
-                            save_workflow_state(config.output_dir, wf_state)
-
                     if plan.merge_order:
                         merge_node_contribs: dict[str, dict] = {}
                         merge_outputs: dict[str, dict] = {}
@@ -1511,13 +1602,12 @@ class RunManager:
                             for uid in list(skipped_units):
                                 if uid not in attempts:
                                     continue
-                                out = committed_unit_output(config.output_dir, uid, attempts[uid])
-                                prior = load_unit_contributor(out, uid)
-                                scoped = build_unit_config(config, units_by_id[uid], unit_output_dir=out)
-                                if prior and prior['graph'].get('access_fingerprint') == access_fingerprint(scoped):
-                                    direct_contributors.append(prior)
-                                    included_units.append(uid)
-                                    skipped_units.remove(uid)
+                                artifact, output, _ = _verified_unit_checkpoint(
+                                    config, project, units_by_id[uid], attempts[uid], existing_state, proofs)
+                                prior = load_checkpoint(output, artifact)
+                                direct_contributors.append(prior)
+                                included_units.append(uid)
+                                skipped_units.remove(uid)
                             check_publication_inputs()
                             merge_summary = publish_merged_contributors(config.output_dir, config,
                                 contributors=direct_contributors, included_units=included_units,
@@ -1633,16 +1723,12 @@ class RunManager:
     def workflow_status(self, pid):
         with self.workspace.lock(pid):
             config = self.workspace.resolved_config(pid)
-            from ..construction.workflow import load_workflow_state, resolve_workflow_plan
-            from ..construction.workspace import read_internal_yaml
+            from ..construction.workflow import load_workflow_state, published_workflow_summary, resolve_workflow_plan
             state = load_workflow_state(config.output_dir)
-            summary_path = Path(config.output_dir) / "construction" / "workflow-merge-summary.yaml"
-            merge_summary = None
-            if summary_path.is_file():
-                try:
-                    merge_summary = read_internal_yaml(summary_path)
-                except Exception:
-                    merge_summary = None
+            try:
+                merge_summary = published_workflow_summary(config.output_dir)
+            except (LightGraphError, OSError, ValueError):
+                merge_summary = None
             plan = resolve_workflow_plan(config.workflow) if config.workflow else None
             return {
                 "enabled": bool(config.workflow and config.workflow.enabled),
@@ -1678,7 +1764,7 @@ class RunManager:
             if not config.workflow or not config.workflow.enabled:
                 raise LightGraphError("workflow_not_enabled")
             from ..construction.workflow import (
-                load_workflow_state, merge_project_workflow, promote_unit_to_project_output,
+                load_workflow_state, merge_project_workflow,
                 published_unit_attempts, resolve_workflow_plan, save_workflow_state,
             )
             attempts = published_unit_attempts(config.output_dir)
@@ -1689,25 +1775,11 @@ class RunManager:
                 # This synchronous legacy endpoint cannot replay extraction nodes.
                 # Never replace DAG output with just its leaf-unit publications.
                 raise LightGraphError("workflow_dag_requires_run")
-            if plan.mode == "direct_single" and len(plan.terminal_ids) == 1 and plan.terminal_ids[0] in attempts:
-                summary = promote_unit_to_project_output(
-                    config.output_dir,
-                    config,
-                    unit_id=plan.terminal_ids[0],
-                    attempt=attempts[plan.terminal_ids[0]],
-                    workspace=self.workspace,
-                )
-                merge_status = "direct_output"
-            else:
-                summary = merge_project_workflow(
-                    config.output_dir,
-                    config,
-                    workspace=self.workspace,
-                    unit_ids=plan.extract_ids or None,
-                    unit_attempts=attempts,
-                    mode="direct_multi_output" if plan.mode == "direct_multi" else "merged",
-                )
-                merge_status = "direct_multi_output" if plan.mode == "direct_multi" else "completed"
+            mode = {'direct_single': 'direct_output', 'direct_multi': 'direct_multi_output'}.get(plan.mode, 'merged')
+            loader = verified_unit_loader(config, None if self._standalone else self.workspace.project_path(pid))
+            summary = merge_project_workflow(config.output_dir, config, workspace=self.workspace,
+                unit_ids=plan.extract_ids, unit_attempts=attempts, mode=mode, load_committed=loader)
+            merge_status = 'completed' if mode == 'merged' else mode
             state = load_workflow_state(config.output_dir)
             if isinstance(state, dict):
                 state["merge"] = {"status": merge_status, **summary}

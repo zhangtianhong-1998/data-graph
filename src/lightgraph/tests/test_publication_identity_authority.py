@@ -93,6 +93,18 @@ def test_workspace_rechecks_catalog_evidence_for_snapshots_without_mapping_marke
             tools.close()
 
 
+def _read_identity_refs(tools, table, headings):
+    metadata = tools.call('inspect_source', table='db:public.' + table, operation='get_metadata')
+    refs = [metadata['evidence_ref']]
+    page = 0
+    while page is not None:
+        result = tools.call('read_material', name='document:assets', page=page)
+        if result['section']['heading'] in headings:
+            refs.extend(result['evidence_refs'])
+        page = result['next_page']
+    return refs
+
+
 @pytest.mark.parametrize('shared_rule', [False, True])
 def test_section_applicability_does_not_turn_a_whole_manual_into_one_registry(tmp_path, shared_rule):
     manual = tmp_path / 'dictionary.md'
@@ -110,14 +122,7 @@ def test_section_applicability_does_not_turn_a_whole_manual_into_one_registry(tm
         with _source() as source:
             tools = ConstructionTools(config, out / 'construction', adapters=[source])
             try:
-                metadata = tools.call('inspect_source', table='db:public.' + table, operation='get_metadata')
-                refs = [metadata['evidence_ref']]
-                page = 0
-                while page is not None:
-                    result = tools.call('read_material', name='document:assets', page=page)
-                    if result['section']['heading'] in {table.title(), 'Registry'}:
-                        refs.extend(result['evidence_refs'])
-                    page = result['next_page']
+                refs = _read_identity_refs(tools, table, {table.title(), 'Registry'})
                 draft = _draft(table, 'global', refs[0])
                 draft['entities'][0]['identity_evidence_refs'] = refs
                 _publish(tools, draft)
@@ -310,3 +315,93 @@ def test_unproven_observation_cannot_join_an_existing_same_id_replay(conflict):
     merged = _merge_graphs(units)
     assert len(merged['nodes']) == 4 and len(merged['edges']) == 2
     assert len(merged['candidate_identity_merges']) == 2
+
+
+@pytest.mark.parametrize('document_case', ['both_cite_registry', 'one_cites_registry', 'separate_sections',
+                                           'different_access'])
+def test_cross_table_proposal_uses_only_key_evidence_issued_in_both_extractions(tmp_path, document_case):
+    from lightgraph.construction.overlap_patterns import analyze_overlap_patterns
+    from lightgraph.construction.projection_proposals import verify_projection_proposals
+    from lightgraph.construction.source_namespaces import project_checkpoint_inputs
+    from lightgraph.runtime.config import MergePolicyConfig
+
+    manual = tmp_path / 'assets.md'
+    manual.write_text(
+        '---\nid: assets\npurpose: data_description\n'
+        'scope: {tables: [db.public.east, db.public.west], columns: [code]}\n'
+        'sections:\n  East: {scope: {tables: [db.public.east]}}\n'
+        '  West: {scope: {tables: [db.public.west]}}\n---\n'
+        '# Registry\nVersion 3: code identifies one asset across both plants.\n'
+        '# East\nLocal asset code in the east listing.\n# West\nLocal asset code in the west listing.\n',
+        encoding='utf-8')
+    config = _config().model_copy(update={'documents': [str(manual)]})
+    columns = ['code', 'name', 'plant', 'rating', 'supplier']
+    tables = [TableSpec(source_id='db', name=table, columns=[ColumnSpec(name=c) for c in columns])
+              for table in ('east', 'west')]
+    records = {'public.east': [('001', 'Pump', 'P1', 'A', None), ('002', 'Press', 'P1', 'B', None)],
+               'public.west': [('001', 'Pump', 'P1', None, 'Acme'), ('002', 'Press XL', 'P1', None, 'Acme')]}
+
+    branches = []
+    for table, kind, attribute in [('east', 'InstalledAsset', 'rating'), ('west', 'ServiceAsset', 'supplier')]:
+        out = tmp_path / table
+        scoped = config.model_copy(update={'isolation_domain': table if document_case == 'different_access' else 'plants'})
+        with MemorySource(tables, records) as source:
+            tools = ConstructionTools(scoped, out / 'construction', adapters=[source])
+            try:
+                headings = {table.title()}
+                if (document_case in {'both_cite_registry', 'different_access'}
+                        or (document_case == 'one_cites_registry' and table == 'east')):
+                    headings.add('Registry')
+                refs = _read_identity_refs(tools, table, headings)
+                draft = _draft(table, 'global', refs[0])
+                asset, _ = draft['entities']
+                asset.update(type=kind, identity_evidence_refs=refs)
+                asset['mappings'][0].update(properties={attribute: attribute}, business_context={'status': 'global'})
+                relation, = draft['relations']
+                relation['source_type'] = kind
+                relation['mappings'][0]['business_context'] = {'status': 'global'}
+                _publish(tools, draft)
+            finally:
+                tools.close()
+        branches.append(load_unit_contributor(out, table))
+    branches = project_checkpoint_inputs(branches, 'plant-network')
+    baseline = merge_construction_graphs(branches)
+    card, = [p for p in analyze_overlap_patterns(branches).patterns if p['kind'] == 'entity'
+             and {member['type'] for member in p['members']} == {'InstalledAsset', 'ServiceAsset'}]
+    decision = {'action': 'propose', 'pattern_id': card['pattern_id'], 'alignment': [
+        {'member_index': i, 'source_index': member['source_indexes'][0],
+         'role_index': next(j for j, role in enumerate(member['roles']) if role['end'] == 'source')}
+        for i, member in enumerate(card['members'])]}
+    policy, (report,) = verify_projection_proposals(MergePolicyConfig(), branches, [card], [decision])
+    assert (report['overlapping_keys'], report['matched_key_names']) == (2, 1)
+    assert report['rejected_keys_by_reason']['missing_or_conflicting_names'] == 1
+    merged = merge_construction_graphs(branches, merge_policy=policy)
+    (receipt,) = report['cross_table_matched_key_checks']
+    assert receipt == {'keys': 1, 'first_observation_result': 'observations_agree',
+                       'shared_key_section_verified': document_case in {'both_cite_registry', 'different_access'},
+                       'unit_fingerprints_match': document_case != 'different_access'}
+    if document_case != 'both_cite_registry':
+        reason = 'unverified_access_fingerprint' if document_case == 'different_access' else 'cross_table_identity_unverified'
+        assert report['rejected_keys_by_reason'][reason] == 1
+        assert not policy.verified_projection_rules and merged == baseline
+        return
+    assert report['verified_groups_by_basis'] == {'shared_versioned_key_section': 1}, report
+    assert len(merged['nodes']) == len(baseline['nodes']) - 1
+    pump, = [n for n in merged['nodes'] if n['identity'] == {'code': '001'}]
+    assert pump['properties'] == {'rating': ['A'], 'supplier': ['Acme']}
+    assert {(s['contributor_id'], s['reviewed_input_node_id']) for s in pump['supports']} == {
+        (b['contributor_id'], n['id']) for b in branches for n in b['graph']['nodes'] if n['identity'] == {'code': '001'}}
+    assert {n['label'] for n in merged['nodes'] if n['identity'] == {'code': '002'}} == {'Press', 'Press XL'}
+    assert len(merged['edges']) == len(baseline['edges']) == 4
+    input_edges = {(b['contributor_id'], e['id'], e['type'], e['source'], e['target'])
+                   for b in branches for e in b['graph']['edges']}
+    recovered = set()
+    for edge in merged['edges']:
+        for support in edge['supports']:
+            owner = support['contributor_id']
+            recovered.add((owner, edge['id'], edge['type'], edge['source'], edge['target']))
+            for original in support.get('endpoint_origins', ()):
+                recovered.add((owner, original['edge_id'], original['type'], original['source'], original['target']))
+    assert input_edges <= recovered
+    assert {(s['contributor_id'], s['provenance']['source']['table']) for edge in merged['edges']
+            if edge['source'] == pump['id'] for s in edge['supports']} == {('east', 'east'), ('west', 'west')}

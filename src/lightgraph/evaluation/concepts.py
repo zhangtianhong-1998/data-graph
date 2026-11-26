@@ -5,14 +5,14 @@ scorer never searches mappings for a better score, or expands pairwise edges.
 """
 from collections import Counter, defaultdict
 import json
-from .core import load, fingerprint, scoped_nodes, scalars, score
+from .core import load, load_scoring_graph, fingerprint, scoped_nodes, scalars, score
 from lightgraph.contracts import canonical
 from lightgraph.errors import LightGraphError
 from lightgraph.rules.concepts import valid_concept_key
 
 
 def evaluate_concepts(graph_path,gold_path,*,role_kinds,role_relations,context_kind):
-    graph=load(graph_path);gold=load(gold_path)
+    graph=load_scoring_graph(graph_path);gold=load(gold_path)
     roles=sorted({c['role'] for c in gold.get('concepts',[])})
     if (gold.get('version')!='lightgraph.concepts-gold/1' or not roles or
         set(role_kinds)!=set(roles) or set(role_relations)!=set(roles) or

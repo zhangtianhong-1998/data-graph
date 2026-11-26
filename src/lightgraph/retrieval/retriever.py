@@ -84,6 +84,15 @@ def _context_paths(nodes, adjacency, seeds_by_slot, hops, constraints=None):
     """
     all_paths, hit_slots, truncated = {}, defaultdict(set), False
     state_count, state_bytes, state_attempts = 0, 0, 0
+    grouped_observations = {}
+
+    def groups(item):
+        # The same endpoint may be compared with many edge observations.
+        key = id(item)
+        if key not in grouped_observations:
+            grouped_observations[key] = _observation_groups(item)
+        return grouped_observations[key]
+
     for slot, seeds in seeds_by_slot.items():
         if state_attempts >= _PATH_STATE_LIMIT:
             truncated = True
@@ -116,7 +125,10 @@ def _context_paths(nodes, adjacency, seeds_by_slot, hops, constraints=None):
 
         for sid in seeds:
             if sid in nodes:
-                for context, observations in _observation_groups(nodes[sid]):
+                for context, observations in groups(nodes[sid]):
+                    if state_attempts >= _PATH_STATE_LIMIT:
+                        truncated = True
+                        break
                     bound = (constraints or {}).get((slot, sid))
                     if bound:
                         observations = [o for o in observations if grounds_slot(nodes[sid], o, bound)]
@@ -134,18 +146,20 @@ def _context_paths(nodes, adjacency, seeds_by_slot, hops, constraints=None):
                 target = edge['target'] if edge['source'] == current else edge['source']
                 if target in visited or target not in nodes:
                     continue
-                for edge_context, observations in _observation_groups(edge):
+                for edge_context, observations in groups(edge):
                     if state_attempts >= _PATH_STATE_LIMIT:
                         truncated = True
                         break
+                    state_attempts += 1
                     joined = _join_contexts(context, edge_context)
                     joined_rows = _join_rows(rows, _row_witnesses(observations))
                     if joined is None or joined_rows is None:
                         continue
-                    for target_context, target_observations in _observation_groups(nodes[target]):
+                    for target_context, target_observations in groups(nodes[target]):
                         if state_attempts >= _PATH_STATE_LIMIT:
                             truncated = True
                             break
+                        state_attempts += 1
                         applicable = _join_contexts(joined, target_context)
                         applicable_rows = _join_rows(joined_rows, _row_witnesses(target_observations))
                         if applicable is None or applicable_rows is None:

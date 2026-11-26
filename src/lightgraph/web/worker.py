@@ -82,6 +82,7 @@ def execute(payload, result_path):
         diagnostic_logger.setLevel(min(logging.INFO, diagnostic_logger.getEffectiveLevel()))
         watcher.start()
         config = RunConfig.model_validate(payload["config"])
+        config._document_table_bindings = payload.get("document_table_bindings", {})
         config._agent = AgentConfig(name=payload.get("agent_name", "lightgraph-discovery"), llm=config.model)
         from ..runtime.trace_lifecycle import execution_trace
         from ..runtime.trace import trace_path, emit_trace

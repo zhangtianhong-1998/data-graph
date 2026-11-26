@@ -14,7 +14,7 @@
 
 阅读顺序：[用户故事](US.md) → [当前架构](GENERIC_GRAPH_CONSTRUCTION.md) → [实施计划](IMPLEMENTATION_PLAN.md) → [实施状态](../../IMPLEMENTATION_STATUS.md)。SDD、发现流程和目标驱动方案开头列出迁移后的约束，后续旧章节只解释历史实现与历史决策。
 
-`run`、`discover` 与工作台运行入口统一替换为 DeepSeek Harness，使用新的通用 YAML 映射完成探查、保存、验证、修订和构建。旧 AgentScope、ProposalSession 与 RuleSpec 提案不作为兼容入口或隐藏回退。当前正在实施替换，实际完成状态见实施记录；旧测试结果不能代替新入口、正式发布与真实模型验收。
+CLI 的 `run`、`discover` 和工作台使用 DeepSeek Harness 执行抽取。嵌入式 Python 接口 `lightgraph.discovery.discover` 使用调用者提供的适配器、模型和授权工具，在当前进程中返回发现提案。并行工作流的合并节点按配置执行确定性合并或分批模型审查，实际采用的规则及原始关系去向随检查点保存。
 
 规则由 Agent 发现后生成。命名匹配只能提供候选线索；通用投影、连接、去重和验证算法继续复用。关于留存，完整轨迹与授权缓存按项目配置保存，由用户主动清理；旧章节的全面“不留存任何轨迹”不再是统一要求。
 

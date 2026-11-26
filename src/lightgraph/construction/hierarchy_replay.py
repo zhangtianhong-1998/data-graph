@@ -720,7 +720,9 @@ def _unresolved_members(graph):
 
 def _compatible_remaps(graph, batches, nodes):
     """Retain groups whose edges keep distinct identities and do not introduce new self-links."""
-    owners = {nid: winner for winner, ids in batches.items() for nid in ids}
+    from .observed_identity import contradictory_qualifiers
+    owners = {nid: winner for winner, ids in batches.items()
+              if not contradictory_qualifiers(nodes[n] for n in ids) for nid in ids}
     if not owners:
         return owners
     contracts = {d['type']: (d.get('source_type'), d.get('target_type')) for d in graph['definitions']['relations']}
@@ -767,6 +769,22 @@ def _compatible_remaps(graph, batches, nodes):
             break
         owners = {n: target for n, target in owners.items() if target not in rejected}
     return owners
+
+
+def _extend_compatible_remaps(graph, nodes, baseline, proposals, protected):
+    """Add compatible groups together; collisions must never dissolve a protected pair."""
+    if not proposals:
+        return protected
+    combined = _compatible_remaps(graph, {**baseline, **proposals}, nodes)
+    if all(combined.get(n) == w for n, w in protected.items()):
+        return combined
+    survivors = {w: ids for w, ids in proposals.items() if all(combined.get(n) == w for n in ids)}
+    if not survivors or len(survivors) == len(proposals):
+        return protected
+    # Withdraw failed extensions and restore their previous endpoints; then
+    # recheck interactions with all the surviving remaps.
+    retried = _compatible_remaps(graph, {**baseline, **survivors}, nodes)
+    return retried if all(retried.get(n) == w for n, w in protected.items()) else protected
 
 
 def _update_endpoint_contracts(graph, nodes, touched):
@@ -821,7 +839,7 @@ def _update_endpoint_contracts(graph, nodes, touched):
     graph['definitions']['relations'] = [definitions[name] for name in sorted(definitions)]
 
 
-def _merge_members(winner, batch, definitions, *, approval_ref=None):
+def _merge_members(winner, batch, definitions, *, approval_ref=None, hierarchy_members=()):
     for node in batch:
         original = {k: deepcopy(node[k]) for k in ('id', 'type', 'identity', 'identity_types', 'identity_domain',
                     'original_type', 'definition_variant') if k in node}
@@ -830,6 +848,7 @@ def _merge_members(winner, batch, definitions, *, approval_ref=None):
             origins = support.setdefault('identity_origins', [])
             if origin not in origins:
                 origins.append(origin)
+            previous_basis = support.get('identity_basis')
             support['identity_basis'] = 'observed_hierarchy_projection_v1'
             if approval_ref:
                 ref, decision_id, input_nodes = approval_ref
@@ -837,17 +856,23 @@ def _merge_members(winner, batch, definitions, *, approval_ref=None):
                     support['identity_basis'] = 'reviewed_key_name_v1'
                     support['identity_approval_ref'] = ref
                 else:
-                    support['identity_basis'] = 'verified_projection_alignment_v1'
+                    if node['id'] not in hierarchy_members:
+                        support['identity_basis'] = ((previous_basis if input_nodes.compose else None)
+                                                     or 'verified_projection_alignment_v1')
                     support['overlap_pattern_id'] = decision_id
-                support['reviewed_input_node_id'] = input_nodes[node['id']]
+                support['reviewed_input_node_id'] = (input_nodes[node['id']] if ref is not None else
+                    input_nodes.by_stage[node['id']][support['contributor_id']])
                 support.setdefault('identity_decision_members', {})[decision_id] = node['id']
                 support['identity_decision_refs'] = sorted(set(support.get('identity_decision_refs', [])) | {decision_id})
             # A composite key may use different logical names in each projection.
             keys = support['provenance']['key_columns']
             names = definitions[node['type']]['key_names']
-            support['original_key_values'] = dict(zip(keys, (node['identity'][k] for k in names), strict=True))
+            composed = approval_ref and ref is None and input_nodes.compose
+            if not composed or 'original_key_values' not in support:
+                support['original_key_values'] = dict(zip(keys, (node['identity'][k] for k in names), strict=True))
             if approval_ref:
-                support['original_key_types'] = dict(zip(keys, (node['identity_types'][k] for k in names), strict=True))
+                if not composed or 'original_key_types' not in support:
+                    support['original_key_types'] = dict(zip(keys, (node['identity_types'][k] for k in names), strict=True))
     for node in batch:
         if node is winner:
             continue
@@ -887,25 +912,57 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
         bases[winner] = basis
     stats['groups_with_matching_roles_and_scope'] = len(batches)
     approvals = {}
-    hierarchy_ids = {i for ids in batches.values() for i in ids}
-    if reviewed_pairs or model_groups:
-        hierarchy_ids.update(_unresolved_members(graph))
+    hierarchy_batches = dict(batches)
+    hierarchy_owner = {i: winner for winner, ids in batches.items() for i in ids}
+    unresolved = _unresolved_members(graph) if reviewed_pairs or model_groups else set()
+    hierarchy_ids = hierarchy_owner.keys() | unresolved
     for ids, ref in (reviewed_pairs or {}).items():
         if hierarchy_ids.isdisjoint(ids):
             winner = min(ids, key=lambda i: (nodes[i]['type'], i))
             batches[winner] = ids
             approvals[winner] = ref
     model_winners = {}
-    reserved = hierarchy_ids | {i for ids in (reviewed_pairs or ()) for i in ids}
+    reserved = unresolved | {i for ids in (reviewed_pairs or ()) for i in ids}
+    extensions = {}
+    prior_batches = dict(batches)
     for ids, ref in (model_groups or {}).items():
-        if reserved.isdisjoint(ids):
-            winner = min(ids, key=lambda i: (nodes[i]['type'], i))
+        prior = {hierarchy_owner[i] for i in ids if i in hierarchy_owner}
+        if (not reserved.isdisjoint(ids) or len(prior) > 1 or prior and not ref[2].compose
+                or any(not set(hierarchy_batches[w]).issubset(ids) for w in prior)):
+            projection_stats['not_applied_by_pattern'][ref[1]]['prior_identity_group_or_unresolved_member'] += 1
+        elif prior:
+            winner, = prior
+            if len(hierarchy_batches[winner]) == len(ids):
+                projection_stats['not_applied_by_pattern'][ref[1]]['already_one_output'] += 1
+            else:
+                extensions[winner] = (ids, ref)
+        else:
+            # An existing stage output with several verified leaves keeps its ID.
+            winner = min(ids, key=lambda i: (-len(ref[2].by_stage[i]), nodes[i]['type'], i))
             batches[winner] = ids
             approvals[winner] = ref
             model_winners[winner] = ref[1]
-        else:
-            projection_stats['not_applied_by_pattern'][ref[1]]['prior_identity_group_or_unresolved_member'] += 1
-    owners = _compatible_remaps(graph, batches, nodes)
+    if model_winners and prior_batches and any(approvals[w][2].compose for w in model_winners):
+        protected = _compatible_remaps(graph, prior_batches, nodes)
+        owners = _extend_compatible_remaps(graph, nodes, prior_batches,
+                                          {w: batches[w] for w in model_winners}, protected)
+    else:
+        owners = _compatible_remaps(graph, batches, nodes)
+    if extensions:
+        # All members of exactly one earlier hierarchy group have been proved
+        # independently. Test extensions together against graph topology. Never
+        # withdraw an already accepted pair or turn its edges into self-links.
+        eligible = {w: ids for w, (ids, _) in extensions.items() if w in owners}
+        expanded = _extend_compatible_remaps(graph, nodes, {w: ids for w, ids in batches.items() if w in owners},
+                                             eligible, owners)
+        for w, (ids, ref) in extensions.items():
+            if w in eligible and all(expanded.get(n) == w for n in ids):
+                batches[w] = ids
+                approvals[w] = ref
+                model_winners[w] = ref[1]
+            else:
+                projection_stats['not_applied_by_pattern'][ref[1]]['incompatible_endpoint_remap'] += 1
+        owners = expanded
     remap = {nid: winner for nid, winner in owners.items() if nid != winner}
     if observed_remap is not None:
         observed_remap.update(remap)
@@ -918,8 +975,12 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
     outcomes = Counter((len(ids), len({owners.get(i, i) for i in ids})) for ids in physical_sets)
     stats['physical_set_outcomes'] = [{'input_nodes': before, 'output_nodes': after, 'sets': count}
                                      for (before, after), count in sorted(outcomes.items())]
-    stats['accepted_groups'] = len(set(remap.values()) - approvals.keys())
-    stats['collapsed_nodes_by_role_evidence'] = dict(sorted(Counter(bases[w] for w in remap.values() if w in bases).items()))
+    hierarchy_counts = Counter()
+    for w, ids in hierarchy_batches.items():
+        if w in owners:
+            hierarchy_counts[bases[w]] += len(ids) - 1
+    stats['accepted_groups'] = sum(w in owners for w in hierarchy_batches)
+    stats['collapsed_nodes_by_role_evidence'] = dict(sorted(hierarchy_counts.items()))
     stats['groups_rejected_during_endpoint_remap'] = len(bases) - stats['accepted_groups']
     if review_stats is not None:
         review_stats['collapsed_nodes'] = sum(w in approvals and w not in model_winners for w in remap.values())
@@ -929,7 +990,7 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
             if winner in owners:
                 summary = by_pattern.setdefault(pid, {'applied_groups': 0, 'collapsed_nodes': 0})
                 summary['applied_groups'] += 1
-                summary['collapsed_nodes'] += len(batches[winner]) - 1
+                summary['collapsed_nodes'] += len(batches[winner]) - len(hierarchy_batches.get(winner, (winner,)))
             else:
                 projection_stats['not_applied_by_pattern'][pid]['incompatible_endpoint_remap'] += 1
         projection_stats['not_applied_by_pattern'] = {
@@ -944,7 +1005,8 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
     definitions = {d['type']: d for d in graph['definitions']['entities']}
     for winner in sorted(set(remap.values())):
         batch = [nodes[i] for i in sorted(batches[winner])]
-        _merge_members(nodes[winner], batch, definitions, approval_ref=approvals.get(winner))
+        _merge_members(nodes[winner], batch, definitions, approval_ref=approvals.get(winner),
+                       hierarchy_members=hierarchy_batches.get(winner, ()))
         if deduplicate_changed:
             deduplicate_supports(nodes[winner])
     touched = {e['type'] for e in graph['edges'] if e['source'] in remap or e['target'] in remap}
@@ -971,7 +1033,7 @@ def reconcile_hierarchy_projections(graph, *, excluded_types=(), diagnostics=Non
     used_types.update(rel.get(end) for rel in graph['definitions']['relations'] for end in ('source_type', 'target_type'))
     graph['definitions']['entities'] = [d for d in graph['definitions']['entities']
                                         if d['type'] not in retired_types or d['type'] in used_types]
-    return sum(w not in approvals for w in remap.values())
+    return sum(hierarchy_counts.values())
 
 
 def _update_review_candidates(graph, nodes, remap, review_sets):

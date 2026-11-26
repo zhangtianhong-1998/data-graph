@@ -7,11 +7,10 @@ import pytest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
-from lightgraph.discovery.agentscope_tools import create_toolkit
+from lightgraph.discovery.tool_runtime import create_toolkit
 from lightgraph.discovery.models import ColumnGroupProposal, Member
 from lightgraph.discovery.proposal_session import ProposalSession, proposal_tool_specs
 from lightgraph.discovery.validation_feedback import schema_diagnostics, model_diagnostics
-from lightgraph.tests.test_agentscope_tools import call
 from lightgraph.tests.test_discovery_agent import input_packet
 from lightgraph.tests.test_proposal_session import group, tools_response
 
@@ -64,7 +63,7 @@ def test_tool_feedback_identifies_static_fields_without_echoing_source_keys(caps
     arguments['claim']['members'][0]['role'] = CANARY
     arguments['claim'][CANARY] = {'source': CANARY}
     arguments['claim'].pop('entity_kind_hint')
-    result = asyncio.run(call(toolkit, 'submit_column_group', arguments))
+    result = asyncio.run(toolkit.call('submit_column_group', arguments))
     assert result['code'] == 'invalid_tool_arguments'
     assert {'path': ['claim', 'entity_kind_hint'], 'constraint': 'required'} in result['diagnostics']
     assert {'path': ['claim'], 'constraint': 'additionalProperties'} in result['diagnostics']

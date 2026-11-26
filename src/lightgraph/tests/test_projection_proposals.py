@@ -90,6 +90,12 @@ def test_different_wide_tables_require_independent_bound_key_evidence(revisions,
             'model_verified_projections']['collapsed_nodes'] == 1
     else:
         assert report['reason'] == 'cross_table_identity_unverified' and not policy.verified_projection_rules
+    grouped = report['cross_table_matched_key_checks']
+    assert sum(row['keys'] for row in grouped) == report['matched_key_names'] == 2
+    assert {row['shared_key_section_verified'] for row in grouped} == {bool(expected)}
+    assert {row['first_observation_result'] for row in grouped} == {
+        'observations_agree', 'unverified_relation_role'}
+    assert all(row['unit_fingerprints_match'] for row in grouped)
 
 
 @pytest.mark.parametrize('case', ['mixed_name', 'competing_code', 'role', 'scope', 'access', 'missing_type',

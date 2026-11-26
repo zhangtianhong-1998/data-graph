@@ -266,3 +266,53 @@ def test_empty_merge_keeps_prior_publication(tmp_path):
                                     skipped_units=['missing'], unit_attempts={})
     assert store._manifest()["current_graph"] == previous
     assert store.read_published_graph()['nodes'][0]['id'] == 'existing'
+
+
+@pytest.mark.parametrize('failure', ['workflow-merge-summary.yaml', 'merge-alignment-candidates.yaml', 'manifest.yaml'])
+def test_workflow_reports_and_graph_advance_together(tmp_path, monkeypatch, failure):
+    import errno
+    from lightgraph.construction import merger, workflow
+
+    cfg = config(tmp_path)
+    root = tmp_path / 'construction'
+
+    def publish_graph(value):
+        return workflow.publish_premerged_graph(tmp_path, cfg, merged=value, included_units=['a'],
+                                               skipped_units=[], unit_attempts={})
+
+    initial = publish_graph(graph(cfg))
+    manifest = read_internal_yaml(root / 'manifest.yaml')
+    previous = root / manifest['workflow_report_snapshot']
+    assert previous == root / manifest['current_graph']['path']
+    candidates = (previous / 'merge-alignment-candidates.yaml').read_bytes()
+    incoming = graph(cfg)
+    incoming['nodes'].extend(graph(cfg, node='n2')['nodes'])
+    module = merger if failure == 'manifest.yaml' else workflow
+    write = module.write_yaml
+
+    def fail(path, value):
+        if path.name == failure:
+            assert load_graph(cfg)['version_id'] == manifest['current_graph']['version_id']
+            assert workflow.published_workflow_summary(tmp_path) == initial
+            raise OSError(errno.ENOSPC, 'publication interrupted')
+        return write(path, value)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, 'write_yaml', fail)
+        with pytest.raises(OSError) as exc:
+            publish_graph(incoming)
+        assert exc.value.errno == errno.ENOSPC
+    assert read_internal_yaml(root / 'manifest.yaml') == manifest
+    assert workflow.published_workflow_summary(tmp_path) == initial
+    assert len(load_graph(cfg)['nodes']) == 1
+    assert (previous / 'merge-alignment-candidates.yaml').read_bytes() == candidates
+    assert publish_graph(incoming)['nodes'] == workflow.published_workflow_summary(tmp_path)['nodes'] == 2
+    assert len(load_graph(cfg)['nodes']) == 2
+
+
+def test_legacy_workflow_summary_remains_readable(tmp_path):
+    from lightgraph.construction.workflow import published_workflow_summary
+    root = tmp_path / 'construction'
+    write_sharded_graph(root, graph(config(tmp_path)), context_fingerprint='legacy')
+    write_yaml(root / 'workflow-merge-summary.yaml', {'nodes': 1})
+    assert published_workflow_summary(tmp_path) == {'nodes': 1}

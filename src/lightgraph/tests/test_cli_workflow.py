@@ -100,3 +100,46 @@ def test_standalone_does_not_claim_managed_output(standalone, capsys, tmp_path):
     assert cli.main(['build-graph', str(path)]) == 1
     assert json.loads(capsys.readouterr().out)['code'] == 'workflow_requires_project_workspace'
     assert not (Path(cfg['output_dir']) / 'runs').exists()
+
+
+def test_standalone_manual_merge_verifies_producer_inputs(standalone, monkeypatch, capsys):
+    path, cfg = standalone
+    cfg['workflow'].update(edges=[], merge_nodes=[], legacy_merge=False)
+    path.write_text(yaml.safe_dump(cfg))
+    install_scripted_worker(monkeypatch)
+    assert cli.main(['run', str(path)]) == 0
+    capsys.readouterr()
+    assert cli.main(['merge-graphs', str(path)]) == 0
+    assert json.loads(capsys.readouterr().out)['nodes'] == 2
+    current = load_graph(load_config(path))['version_id']
+    cfg['sources'][0]['null_values'].append('NA')
+    path.write_text(yaml.safe_dump(cfg))
+    assert cli.main(['merge-graphs', str(path)]) == 1
+    assert json.loads(capsys.readouterr().out)['code'] == 'workflow_resume_input_changed'
+    assert load_graph(load_config(path))['version_id'] == current
+
+
+@pytest.mark.parametrize('keep_pinned_peer', [False, True])
+def test_manual_merge_cannot_publish_unverified_legacy_unit(standalone, monkeypatch, capsys, keep_pinned_peer):
+    import shutil
+    from lightgraph.construction.workspace import read_internal_yaml, write_yaml
+    path, cfg = standalone
+    cfg['workflow'].update(edges=[], merge_nodes=[], legacy_merge=False)
+    path.write_text(yaml.safe_dump(cfg))
+    install_scripted_worker(monkeypatch)
+    assert cli.main(['run', str(path)]) == 0
+    run_id = json.loads(capsys.readouterr().out)['run_id']
+    output = Path(load_config(path).output_dir)
+    shutil.copytree(output / 'attempts' / run_id / 'west', output / 'units' / 'west')
+    manifest = output / 'construction' / 'manifest.yaml'
+    if keep_pinned_peer:
+        value = read_internal_yaml(manifest)
+        value['current_graph']['workflow_units'].pop('west')
+        write_yaml(manifest, value)
+    else:
+        manifest.unlink()
+    before = manifest.read_bytes() if keep_pinned_peer else None
+    (path.parent.parent / 'inputs' / 'west.csv').write_text('metric_code,metric_name\nwest,New Name\n')
+    assert cli.main(['merge-graphs', str(path)]) == 1
+    assert json.loads(capsys.readouterr().out)['code'] == 'workflow_checkpoint_missing'
+    assert (manifest.read_bytes() if manifest.exists() else None) == before

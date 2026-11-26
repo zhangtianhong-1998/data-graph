@@ -82,7 +82,7 @@ def test_upload_validation_does_not_create_orphan_files(client):
 
 def test_preview_revalidates_credentials_edited_on_disk(client):
     create(client)
-    file = upload(client, 'agent.yaml', b'framework: agentscope\nllm: {mode: disabled}')
+    file = upload(client, 'agent.yaml', b'framework: deepseek_harness\nllm: {mode: disabled}')
     path = client.app.state.workspace.file_path('alpha', file['file_id'])
     path.write_text('llm:\n  api_key: SECRET_DISK_TOKEN\n')
     response = client.get(f"/api/projects/alpha/files/{file['file_id']}/content")

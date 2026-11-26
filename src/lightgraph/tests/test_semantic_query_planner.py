@@ -199,7 +199,10 @@ def test_omitted_constraint_in_same_clause_is_reported_without_losing_known_enti
     result = ask(tmp_path, 'M 项目中，装配车间须满足蓝标规范', extractor=parse)
     assert not result['nodes'] and not result['edges']
     assert '须满足蓝标规范' in str(result['plan']['unbound_mentions'])
-    assert result['available_context']['nodes'] == [{'id': 'place', 'display_name': '装配车间'}]
+    node, = result['available_context']['nodes']
+    assert (node['id'], node['display_name']) == ('place', '装配车间')
+    obs, = node['observations']
+    assert obs['label'] == '装配车间' and obs['business_context']['dimensions'] == {'project': 'M'}
 
 
 def test_unregistered_framing_is_not_treated_as_a_missing_entity(tmp_path):

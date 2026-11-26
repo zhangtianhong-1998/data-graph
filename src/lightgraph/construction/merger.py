@@ -16,12 +16,12 @@ from lightgraph.runtime.config import MergePolicyConfig
 from lightgraph.source_values import identity_cell, persisted_identity_key
 from .display import derive_display_graph
 from .fusion import (deduplicate_supports, definition_conflict_diagnostics, edge_reference, label_priority, mark_relation_meanings,
-                     merge_definition, prepare_graph, record_input_edge, relation_identity, retain_definition_variants)
+                     merge_definition, merge_property_values, prepare_graph, record_input_edge, relation_identity, retain_definition_variants)
 from .context_topology import detect_context_cycles
 from .hierarchy_replay import reconcile_hierarchy_projections
 from .hierarchy_stage import original_stage_inputs, record_stage
 from .models import COLUMN_IDENTITY_NAMES
-from .observed_identity import align_dictionary_nodes, align_observed_nodes
+from .observed_identity import align_dictionary_nodes, align_observed_nodes, contradictory_qualifiers
 from .source_namespaces import BINDING, isolate_physical_ids, namespace_groups, record_namespace
 from .workspace import read_internal_yaml, write_yaml
 
@@ -52,18 +52,20 @@ def _rewrite_evidence_in_graph(
     kind: str,
     contributor_id: str,
     evidence_records: dict[str, Any] | None = None,
+    inherited_from: dict | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     """Namespace every eN reference so independent units/projects never collide."""
     rewritten = deepcopy(graph)
     catalog: dict[str, dict[str, Any]] = {}
 
     def register(orig_ref: str) -> str:
-        scoped = _scope_ref_token(kind, contributor_id, orig_ref)
+        scoped = (f'base:{contributor_id}:{orig_ref}' if inherited_from is not None
+                  else _scope_ref_token(kind, contributor_id, orig_ref))
         if scoped not in catalog:
             previous = (graph.get('evidence_catalog') or {}).get(orig_ref)
             if previous:
                 # A nested DAG merge already carries the original source witness.
-                catalog[scoped] = deepcopy(previous)
+                catalog[scoped] = {**deepcopy(previous), 'scoped_ref': scoped}
                 return scoped
             record = (evidence_records or {}).get(orig_ref) or {}
             catalog[scoped] = {
@@ -89,8 +91,11 @@ def _rewrite_evidence_in_graph(
         for support in item.get('supports', []):
             if not isinstance(support, dict):
                 continue
-            bind_support_contributor(support, contributor_id)
-            for origin in support.get('execution_origins', []):
+            if inherited_from is None:
+                bind_support_contributor(support, contributor_id)
+            else:
+                support['inherited_from'] = deepcopy(inherited_from)
+            for origin in (*support.get('execution_origins', []), *support.get('lookup_matches', [])):
                 if origin.get('evidence_refs'):
                     origin['evidence_refs'] = [register(r) for r in origin['evidence_refs']]
             prov = support.get('provenance')
@@ -403,11 +408,11 @@ def _merge_contributor_nodes_and_edges(
     conflict_details: list[dict[str, Any]] = []
     unresolved_relations: list[dict[str, Any]] = []
     context_cycle_diagnostics: list[dict[str, Any]] = []
+    property_keys = defaultdict(dict)
     retained_labels = False
     retain_column_variants = (fusion.label_conflict_policy == 'retain_variants' if fusion
                               else recognize_source_replays and 'conflict_mode' not in policy.model_fields_set)
 
-    # Index unshared/candidate nodes for alignment candidate generation (never auto-merged!).
     same_code_buckets: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     column_label_buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
@@ -485,11 +490,7 @@ def _merge_contributor_nodes_and_edges(
                             for v in node[key]:
                                 if v not in vals:
                                     vals.append(deepcopy(v))
-                    for key, values in node.get('properties', {}).items():
-                        dest = existing.setdefault('properties', {}).setdefault(key, [])
-                        for v in values:
-                            if canonical(v) not in {canonical(x) for x in dest}:
-                                dest.append(deepcopy(v))
+                    merge_property_values(existing, node, property_keys[('node', node['id'])])
 
             if node.get('identity_origin') == 'physical_column':
                 norm = _norm_label(node.get('label') or node.get('identity', {}).get('column'))
@@ -602,11 +603,7 @@ def _merge_contributor_nodes_and_edges(
                         for v in edge[key]:
                             if v not in vals:
                                 vals.append(deepcopy(v))
-                for key, values in edge.get('properties', {}).items():
-                    dest = existing_edge.setdefault('properties', {}).setdefault(key, [])
-                    for v in values:
-                        if canonical(v) not in {canonical(x) for x in dest}:
-                            dest.append(deepcopy(v))
+                merge_property_values(existing_edge, edge, property_keys[('edge', edge['id'])])
 
     aligned_targets = {target for ids in observed_ids for target in ids.values()}
     # Label conflict detection & authority resolution on merged nodes.
@@ -647,7 +644,6 @@ def _merge_contributor_nodes_and_edges(
             distinct_labels = {lbl for lbl, _ in pairs}
             if len(distinct_labels) <= 1:
                 continue
-            # Check if normalized forms agree or authority source disambiguates.
             norm_forms = {_norm_label(lbl) for lbl in distinct_labels}
             auth_labels = sorted({lbl for lbl, sid in pairs if sid in authority})
             if len(norm_forms) == 1 or len(auth_labels) == 1:
@@ -743,7 +739,8 @@ def _merge_contributor_nodes_and_edges(
             if len(distinct_nodes) > 1:
                 candidate_identity_merges.append({
                     'status': 'candidate_only',
-                    'reason': 'cross_unit_unverified_identity_domain',
+                    'reason': ('conflicting_identity_qualifiers' if contradictory_qualifiers(merged_nodes[n] for n in distinct_nodes)
+                               else 'cross_unit_unverified_identity_domain'),
                     'match_basis': 'same_typed_identity',
                     'source_key_comparison': ('unverified_source_namespace'
                         if len({g for nid in distinct_nodes for g in node_source_groups.get(nid, ())}) > 1
@@ -873,6 +870,11 @@ def _merge_contributor_nodes_and_edges(
         result['source_key_semantics'] = next(iter(key_versions))
     if target_access_fingerprint:
         result['access_fingerprint'] = target_access_fingerprint
+    separations = [row for item in contributors if item.get('kind') in ('base', 'merged')
+                   for row in item['graph'].get('identity_separations', [])]
+    if separations:
+        from .identity_separations import retain_separations
+        retain_separations(result, separations)
     # These counts belong to this exact merge pass, including hidden inputs.
     # filter_graph_scopes drops fusion_diagnostics from partial views.
     counts = merge_accounting(contributors, result)
@@ -1033,7 +1035,8 @@ def _shard_bucket(identifier: str) -> str:
 
 
 def write_sharded_graph(construction_dir: str | Path, merged: dict[str, Any], *, context_fingerprint: str,
-                        unit_attempts: dict[str, str] | None = None, result_policy_id: str | None = None) -> dict[str, Any]:
+                        unit_attempts: dict[str, str] | None = None, result_policy_id: str | None = None,
+                        write_workflow_reports=None) -> dict[str, Any]:
     """Publish an immutable Parquet snapshot (name retained for API compatibility)."""
     from .graph_storage import write_graph_record
     from .paths import io_path
@@ -1041,13 +1044,15 @@ def write_sharded_graph(construction_dir: str | Path, merged: dict[str, Any], *,
     (root / 'published').mkdir(parents=True, exist_ok=True)
     publication = 'published/' + uuid.uuid4().hex + '.graph'
     graph = {**merged, 'storage_layout': 'parquet_v1'}
-    write_graph_record(root / publication, graph)
+    write_graph_record(root / publication, graph, write_sidecars=write_workflow_reports)
     manifest_path = root / 'manifest.yaml'
     manifest = (
         read_internal_yaml(manifest_path)
         if manifest_path.exists()
         else {'format_version': 1, 'target': 'graph', 'drafts': {}, 'evidence': {}, 'evidence_history': {}, 'publications': {}}
     )
+    if write_workflow_reports is not None:
+        manifest['workflow_report_snapshot'] = publication
     old_head = manifest.get('current_graph')
     if old_head and 'version_id' not in old_head:
         manifest.setdefault('graph_history', []).append(deepcopy(old_head))

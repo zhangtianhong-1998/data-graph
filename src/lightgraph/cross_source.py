@@ -22,7 +22,7 @@ _RECOVERABLE = frozenset({
     "run_time_budget_exhausted", "returned_rows_budget_exhausted",
     "returned_bytes_budget_exhausted", "runtime_capability_unverified",
     "read_only_transaction_failed", "snapshot_close_failed",
-    "formula_cache_missing_in_projection", "cross_source_incomplete",
+    "excel_error_cell_in_projection", "formula_cache_missing_in_projection", "cross_source_incomplete",
     "cross_source_snapshot_unverified", "cross_source_source_changed",
     "cross_source_value_unsupported", "invalid_aggregate_shape",
 })

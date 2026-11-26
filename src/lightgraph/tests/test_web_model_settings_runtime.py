@@ -78,7 +78,7 @@ def test_saved_limits_reach_next_worker_and_request_without_restart(
                  'max_calls': 10, 'max_tokens': None, 'retries': 0}
         original = asset = None
         if standalone_agent:
-            original = yaml.safe_dump({'framework': 'agentscope', 'name': 'settings-agent',
+            original = yaml.safe_dump({'framework': 'deepseek_harness', 'name': 'settings-agent',
                                        'llm': model}).encode('utf-8')
             asset = workspace.add_file('settings', 'original-agent.yaml', original)
             config.pop('model', None)

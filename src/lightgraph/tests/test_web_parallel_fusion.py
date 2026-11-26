@@ -187,6 +187,11 @@ def test_audit_replays_the_same_three_committed_workers_without_writing(client, 
     assert rerun['committed']['name_accounting']['exact_label_nodes'] == 2
     named = rerun['with_source_replay']['name_accounting']
     assert named['exact_label_nodes'] == named['distinct_outputs_of_matching_inputs'] == 2
+    several = audit(run_file, 'merged', explain_name=['Second', 'First', 'First', 'unseen'])
+    assert several['name_accounting_inputs_by_name']['First'] == rerun['name_accounting_inputs']
+    populations = several['with_source_replay']['name_accounting_by_name']
+    assert populations['First'] == named
+    assert populations['Second']['exact_label_nodes'] == 2 and populations['unseen']['matched_nodes'] == 0
     assert [row['status'] for row in named['input_mapping']] == ['mapped'] * 3
     assert rerun['with_source_replay']['rows_match_committed'] == {'nodes': True, 'edges': True}
     trace = rerun['with_source_replay']['identity_trace']
@@ -297,3 +302,59 @@ def test_apply_merge_rule_to_committed_extracts_via_http(client, monkeypatch, re
     promotion = finished(client.post(base + '/runs/' + resumed['run_id'] + '/resume',
                                     json={'action': 'publish_artifact', 'artifact_id': artifact}, headers=headers))
     assert promotion['workflow_state']['merge']['published_artifact_id'] == artifact
+
+
+def test_unit_retry_reuses_only_checkpoints_with_current_csv_semantics(client, monkeypatch):
+    install_scripted_worker(monkeypatch)
+    create(client)
+    api = '/api/projects/alpha'
+    for name, rows in [('assets', 'A,Alpha\nK,NA\n'), ('sales', 'B,Beta\n')]:
+        upload(client, name + '.csv', ('metric_code,metric_name\n' + rows).encode())
+    cfg = client.get(api + '/config').json()
+    cfg['model'].update(mode='in_environment', model='scripted-test', base_url='http://127.0.0.1:9999/v1')
+    cfg['goal']['purpose'] = '抽取指标'
+    units = []
+    for source in cfg['sources']:
+        source['null_values'] = ['']
+        units.append({'unit_id': source['table_name'], 'source_ids': [source['id']]})
+    cfg['workflow'] = {'enabled': True, 'units': units, 'legacy_merge': False}
+    assert client.put(api + '/config', json=cfg, headers={'If-Match': client.get(api + '/config').headers['etag']}).is_success
+
+    def finish(route):
+        response = client.post(api + route, headers={'If-Match': client.get(api + '/config').headers['etag']})
+        assert response.status_code == 202, response.text
+        result = wait_run(client.app.state.manager, 'alpha', response.json()['run_id'], timeout=60)
+        state = result['workflow_state']
+        assert result['status'] == 'completed', (
+            route, result['error_code'],
+            {uid: (unit['status'], unit.get('error_code'), unit.get('issue_codes'), unit.get('failure_detail'))
+             for uid, unit in state['units'].items()})
+        return state
+
+    def graph_labels():
+        return {node['identity']['code']: node['label'] for node in client.get(api + '/graph').json()['nodes']}
+
+    initial = finish('/runs')
+    assert graph_labels()['K'] == 'NA'
+    same = finish('/workflow/units/sales/retry')
+    assert same['reused_nodes'] == ['assets'] and same['rerun_nodes'] == ['sales']
+    assert same['artifacts']['assets'] == initial['artifacts']['assets']
+    head_before = client.get(api + '/graph').json()['version_id']
+
+    cfg = client.get(api + '/config').json()
+    next(source for source in cfg['sources'] if source['table_name'] == 'assets')['null_values'].append('NA')
+    assert client.put(api + '/config', json=cfg, headers={'If-Match': client.get(api + '/config').headers['etag']}).is_success
+    refused = client.post(api + '/workflow/units/sales/retry', headers={'If-Match': client.get(api + '/config').headers['etag']})
+    assert refused.status_code == 400, refused.text
+    assert refused.json()['error']['code'] == 'workflow_resume_input_changed'
+    assert refused.json()['error']['node_id'] == 'assets'
+    assert client.get(api + '/graph').json()['version_id'] == head_before
+    merge = client.post(api + '/workflow/merge', headers={'If-Match': client.get(api + '/config').headers['etag']})
+    assert merge.status_code == 400 and merge.json()['error'] == refused.json()['error']
+    corrected = finish('/workflow/units/assets/retry')
+    assert corrected['artifacts']['sales'] == same['artifacts']['sales']
+    assert corrected['artifacts']['assets']['input_digest'] != initial['artifacts']['assets']['input_digest']
+    selective = graph_labels()
+    assert selective['K'] != 'NA'
+    finish('/runs')
+    assert graph_labels() == selective

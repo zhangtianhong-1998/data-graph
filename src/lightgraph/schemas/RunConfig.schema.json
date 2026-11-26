@@ -1452,6 +1452,15 @@
           "minItems": 1,
           "title": "Observation Digests",
           "type": "array"
+        },
+        "composition_version": {
+          "default": 1,
+          "enum": [
+            1,
+            2
+          ],
+          "title": "Composition Version",
+          "type": "integer"
         }
       },
       "required": [

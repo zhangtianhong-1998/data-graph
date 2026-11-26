@@ -21,6 +21,8 @@ from lightgraph.errors import LightGraphError
 from lightgraph.runtime.retention import atomic_text
 from lightgraph.construction.access import filter_graph_scopes
 from lightgraph.construction.contexts import business_context_identity
+from lightgraph.construction.display import preferred_source_label
+from .definitions import indexed_definitions
 from .store_sqlite import SQLiteGraphIndex, normalize_term, observed_text_properties
 from .vector_local import Embedder, LocalNumpyVectorStore, embedder_fingerprint
 
@@ -310,7 +312,7 @@ def sync_graph_to_retrieval(
             disp = str(node.get('display_label') or node.get('label') or nid)
             aliases = list(node.get('aliases') or [])
             src_tables = _node_source_tables(node)
-            chinese_name = cn_names[0] if cn_names else (disp if node.get('label_origin') == 'source' else None)
+            chinese_name, label_priority = preferred_source_label(node.get('supports', []))
             english_name = en_names[0] if en_names else None
             description = '；'.join(descs) if descs else None
 
@@ -319,7 +321,7 @@ def sync_graph_to_retrieval(
                 'node_id': nid,
                 'scope_ref': scope_ref,
                 'scopes': node['scopes'],
-                'chinese_name': chinese_name,
+                'chinese_name': chinese_name, 'label_priority': label_priority,
                 'english_name': english_name,
                 'display_name': disp,
                 'aliases': aliases,
@@ -406,7 +408,8 @@ def sync_graph_to_retrieval(
     try:
         index = SQLiteGraphIndex(staging / 'retrieval.sqlite')
         index.replace_index(nodes=list(node_rows.values()), scope_views=scope_views, terms=terms, edges=edge_rows,
-                            relation_definitions=graph.get('definitions', {}).get('relations', []))
+                            relation_definitions=graph.get('definitions', {}).get('relations', []),
+                            type_definitions=indexed_definitions(graph, scope_views, node_rows, edge_rows))
         resolved_dim = 0
         unique_texts = 0
         if embedder is not None:

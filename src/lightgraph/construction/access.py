@@ -82,7 +82,7 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
         if graph.get('nodes') or graph.get('edges'):
             raise LightGraphError('graph_support_visibility_missing')
         return deepcopy({k: v for k, v in graph.items()
-                         if k not in {'hierarchy_replay_inputs', 'physical_source_namespace_binding'}})
+                         if k not in {'hierarchy_replay_inputs', 'physical_source_namespace_binding', 'identity_separations'}})
 
     def supports_for(item):
         return [deepcopy(support) if copy_supports else support for support in item.get('supports', [])
@@ -103,10 +103,15 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
         ordered = {name: [values[k] for k in sorted(values)] for name, values in properties.items()}
         return ordered, [provenance[key] for key in sorted(provenance)]
 
+    # Historical type descriptions can be selected from several merged drafts
+    # without a per-description source. Withhold that text on a partial view.
+    partial_definitions = {'entities': set(), 'relations': set()}
     nodes = []
     merged_observation_nodes = 0
     for node in graph.get('nodes', []):
         supports = supports_for(node)
+        if len(supports) != len(node.get('supports', [])):
+            partial_definitions['entities'].add(node['type'])
         if not supports:
             continue
         contributors = {origin['contributor_id'] for support in supports
@@ -137,8 +142,11 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
     for edge in graph.get('edges', []):
         if ((edge['source'] not in visible and edge['source'] not in external_visible)
                 or (edge['target'] not in visible and edge['target'] not in external_visible)):
+            partial_definitions['relations'].add(edge['type'])
             continue
         supports = supports_for(edge)
+        if len(supports) != len(edge.get('supports', [])):
+            partial_definitions['relations'].add(edge['type'])
         if not supports:
             continue
         properties, provenance = attributes(supports)
@@ -170,7 +178,7 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
                      'unresolved_relations', 'context_cycle_diagnostics',
                      'evidence_catalog', 'evidence_refs', 'validation_snapshots', 'read_window',
                      'quality_diagnostics', 'fusion_diagnostics', 'fusion_policy', 'hierarchy_replay_inputs',
-                     'physical_source_namespace_binding'}
+                     'physical_source_namespace_binding', 'identity_separations'}
     view = _view_shell(graph, omit=report_fields)
     refs = set()
     for item in chain(nodes, edges, unresolved):
@@ -207,9 +215,16 @@ def filter_graph_scopes(graph, scopes, *, external_visible_ids=None, business_co
     view['edges'] = edges
     view['definitions'] = {'entities': [deepcopy(item) for item in definitions.get('entities', []) if item['type'] in entity_types],
                            'relations': [deepcopy(item) for item in definitions.get('relations', []) if item['type'] in relation_types]}
+    for category, kinds in partial_definitions.items():
+        for definition in view['definitions'][category]:
+            if definition['type'] in kinds and definition.get('description'):
+                definition['description'] = ''
     for definition in view['definitions']['entities']:
         if 'identity_evidence_refs' in definition:
             definition['identity_evidence_refs'] = sorted(set(definition['identity_evidence_refs']) & refs)
+    if graph.get('identity_separations'):
+        from .identity_separations import retain_separations
+        retain_separations(view, graph['identity_separations'])
     return derive_display_graph(view, copy=False)
 
 

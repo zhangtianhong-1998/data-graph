@@ -3,7 +3,7 @@ from collections import defaultdict
 
 from lightgraph.contracts import digest
 from lightgraph.source_values import persisted_identity_key
-from .observed_identity import _dictionary_binding, _node_evidence, _relation_roles
+from .observed_identity import _dictionary_binding, _node_evidence, _relation_roles, contradictory_qualifiers
 
 
 def source_address(source):
@@ -138,12 +138,7 @@ def separate_unverified_ids(inputs, targets, *, excluded_types, explicit_domains
     for index, (owner, kind, graph) in enumerate(inputs):
         definitions.append({d['type']: d for d in graph.get('definitions', {}).get('entities', [])})
         for node in graph.get('nodes', []):
-            definition = definitions[-1].get(node['type'], {})
-            family = node.get('original_type', node['type'])
-            if (node.get('identity_origin', 'row') != 'row'
-                    or family in excluded_types or (family, node.get('identity_domain')) in explicit_domains
-                    or node['type'] in excluded_types
-                    or (not draft and definition.get('identity_scope') != 'global')):
+            if node.get('identity_origin', 'row') != 'row':
                 continue
             # A previous split records its original ID. A later unit may
             # independently supply stronger evidence for just one side.
@@ -155,6 +150,15 @@ def separate_unverified_ids(inputs, targets, *, excluded_types, explicit_domains
     for (nid, _, _, _), entries in collisions.items():
         if len({index for index, _ in entries}) < 2:
             continue
+        conflict = contradictory_qualifiers(node for _, node in entries)
+        if not conflict:
+            entries = [(index, node) for index, node in entries
+                       if node.get('original_type', node['type']) not in excluded_types
+                       and node['type'] not in excluded_types
+                       and (node.get('original_type', node['type']), node.get('identity_domain')) not in explicit_domains
+                       and (draft or definitions[index].get(node['type'], {}).get('identity_scope') == 'global')]
+            if len({index for index, _ in entries}) < 2:
+                continue
         # An old history may contain several locally disambiguated occurrences
         # with identical logical keys in one input. Never let their common
         # pre-split ID alone serve as evidence that those occurrences coincide.
@@ -162,7 +166,9 @@ def separate_unverified_ids(inputs, targets, *, excluded_types, explicit_domains
         for index, node in entries:
             owner, kind, graph = inputs[index]
             declaration = definitions[index].get(node['type'], {})
-            if node['id'] in targets[index]:
+            if conflict:
+                proofs = {('qualifier_conflict', kind, owner, node['id'])}
+            elif node['id'] in targets[index]:
                 proofs = {('already_aligned', nid)}
             elif declaration.get('identity_scope') == 'global':
                 proofs = _global_authorities(node, declaration, records, local_namespace=kind != 'base' or owner in local_bases)
@@ -210,7 +216,7 @@ def separate_unverified_ids(inputs, targets, *, excluded_types, explicit_domains
                     node['publication_identity_original_id'] = nid
         if draft and len(ids) > 1:
             first = entries[0][1]
-            candidates.append({'status': 'candidate_only', 'reason': 'independent_drafts_unverified_identity',
+            candidates.append({'status': 'candidate_only', 'reason': ('conflicting_identity_qualifiers' if conflict else 'independent_drafts_unverified_identity'),
                 'match_basis': 'same_typed_identity', 'entity_type': first['type'], 'identity': first['identity'],
                 'contributors': sorted({inputs[i][0] for i, _ in entries}), 'node_ids': sorted(ids)})
     return candidates

@@ -10,11 +10,25 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+from lightgraph.errors import LightGraphError
 from .models import Costs, EvaluationReport, GoldGraph, ModeReport, Score
 
 
 def load(path):
     return json.loads(Path(path).read_text(encoding='utf-8'))
+
+
+def load_scoring_graph(path):
+    graph = load(path)
+    if not isinstance(graph, dict) or not all(isinstance(graph.get(key), list) for key in ('nodes', 'edges')):
+        raise LightGraphError('evaluation_graph_format_unsupported')
+    for node in graph['nodes']:
+        if not isinstance(node, dict) or not {'id', 'layer', 'status'} <= node.keys():
+            raise LightGraphError('evaluation_graph_format_unsupported')
+    for edge in graph['edges']:
+        if not isinstance(edge, dict) or not {'source', 'target', 'status'} <= edge.keys():
+            raise LightGraphError('evaluation_graph_format_unsupported')
+    return graph
 
 
 def fingerprint(path):
@@ -174,7 +188,7 @@ def evaluate_mode(graph, gold, statuses, namespaces):
 def evaluate(graph_path, gold_path, *, store=None, run_report=None, usage=None, manifest=None):
     path = Path(graph_path)
     if path.is_dir(): path /= 'graph.json'
-    graph = load(path) if path.exists() else {'nodes': [], 'edges': []}
+    graph = load_scoring_graph(path) if path.exists() else {'nodes': [], 'edges': []}
     gold = GoldGraph.model_validate(load(gold_path))
     namespace, namespace_evidence = binding_namespaces(store, graph)
     report = load(run_report) if run_report else {}

@@ -29,10 +29,10 @@ def _typed_key(node, definition):
     return {'fields': {k: {'value_type': t, 'value': v} for k, (t, v) in sorted(cells.items())}}
 
 
-def name_rows(graph, name, *, include_drafts=False):
+def name_rows_by_name(graph, names, *, include_drafts=False):
     """Select exact stored label, display label or a name observed in a mapped column."""
     definitions = {d['type']: d for d in graph.get('definitions', {}).get('entities', [])}
-    rows = []
+    rows = {name: [] for name in names}
     for node in graph['nodes']:
         display = node.get('display_label') or node.get('label')
         sources = node.get('supports') or []
@@ -44,15 +44,23 @@ def name_rows(graph, name, *, include_drafts=False):
                 observed.add(label)
             else:
                 incomplete = True
-        if display != name and node.get('label') != name and name not in observed:
+        matches = (observed | {display, node.get('label')}) & rows.keys()
+        if not matches:
             continue
         row = {'node_id': node['id'], 'type': node['type'], 'label': node.get('label'),
                'display_label': display, 'observed_names': sorted(observed), 'incomplete_name_evidence': incomplete,
                'typed_key': _typed_key(node, definitions.get(node['type'], {}))}
         if include_drafts:
             versions = set()
+            bindings = set()
             unknown = not sources
             for support in sources:
+                provenance = support.get('provenance') or {}
+                source = provenance.get('source') or {}
+                columns = provenance.get('key_columns') or []
+                address = tuple(source.get(k) for k in ('source_id', 'schema', 'table'))
+                if all(address) and columns:
+                    bindings.add((*address, tuple(columns), provenance.get('label_column')))
                 for origin in support.get('execution_origins') or [support.get('validation_origin') or {}]:
                     draft = origin.get('draft_id')
                     if draft:
@@ -62,8 +70,17 @@ def name_rows(graph, name, *, include_drafts=False):
             row['draft_versions'] = [{'draft_id': draft, 'revision': version}
                                      for draft, version in sorted(versions, key=canonical)]
             row['missing_draft_attribution'] = unknown
-        rows.append(row)
-    return sorted(rows, key=lambda r: r['node_id'])
+            row['source_bindings'] = [
+                {'source_id': source_id, 'schema': schema, 'table': table, 'key_columns': list(keys),
+                 'label_column': label_column}
+                for source_id, schema, table, keys, label_column in sorted(bindings, key=canonical)]
+        for name in matches:
+            rows[name].append(row)
+    return {name: sorted(matches, key=lambda r: r['node_id']) for name, matches in rows.items()}
+
+
+def name_rows(graph, name, *, include_drafts=False):
+    return name_rows_by_name(graph, [name], include_drafts=include_drafts)[name]
 
 
 def _counts(rows, name):
@@ -86,6 +103,7 @@ def name_population(rows, name):
     for _, members in sorted(groups.items()):
         name_sets = Counter(tuple(r['observed_names']) for r in members)
         by_key.append({'typed_key': members[0]['typed_key'], **_counts(members, name),
+                       'nodes_by_type': dict(sorted(Counter(r['type'] for r in members).items())),
                        'by_observed_names': [{'names': list(names), 'nodes': count}
                                              for names, count in sorted(name_sets.items())]})
     return {'name': name, **_counts(rows, name), 'distinct_typed_keys': len(groups),
@@ -96,10 +114,17 @@ def name_population(rows, name):
 class MergeNameAudit:
     """Use the merger's contributor-qualified lineage even when original IDs collide."""
 
-    def __init__(self, inputs, name):
+    def __init__(self, inputs, name, *, by_owner=None):
         self.name = name
-        self.by_owner = {c['contributor_id']: name_rows(c['graph'], name, include_drafts=True) for c in inputs}
+        self.by_owner = by_owner if by_owner is not None else {
+            c['contributor_id']: name_rows(c['graph'], name, include_drafts=True) for c in inputs}
         self.input_rows = {(owner, row['node_id']): row for owner, rows in self.by_owner.items() for row in rows}
+
+    @classmethod
+    def for_names(cls, inputs, names):
+        selected = {c['contributor_id']: name_rows_by_name(c['graph'], names, include_drafts=True) for c in inputs}
+        return {name: cls(inputs, name, by_owner={owner: rows[name] for owner, rows in selected.items()})
+                for name in names}
 
     def inputs(self):
         contributors = {}
@@ -113,8 +138,9 @@ class MergeNameAudit:
                                    'nodes': rows}
         return {**name_population(list(self.input_rows.values()), self.name), 'by_contributor': contributors}
 
-    def replay(self, graph, lineage):
-        rows = name_rows(graph, self.name)
+    def replay(self, graph, lineage, *, rows=None):
+        if rows is None:
+            rows = name_rows(graph, self.name)
         grouped = defaultdict(list)
         cohorts = defaultdict(list)
         mapping = []

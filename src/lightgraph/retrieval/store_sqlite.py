@@ -111,9 +111,13 @@ class SQLiteGraphIndex:
             self._init_db()
         with closing(self._connect()) as conn:
             indexes = {row[0] for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE name IN ('kg_lexemes','kg_term_grams')")}
+                "SELECT name FROM sqlite_master WHERE name IN ('kg_lexemes','kg_term_grams','kg_type_definitions')")}
             self._indexed_substrings = 'kg_lexemes' in indexes
+            self.has_type_definitions = ('kg_type_definitions' in indexes and bool(
+                conn.execute('SELECT 1 FROM kg_type_definitions LIMIT 1').fetchone()))
             self._short_terms = 'kg_term_grams' in indexes
+            self._ranked_labels = any(row[1] == 'label_priority' for row in conn.execute(
+                'PRAGMA table_info(kg_node_scope_views)'))
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, isolation_level=None)
@@ -135,6 +139,7 @@ class SQLiteGraphIndex:
                     node_id TEXT NOT NULL,
                     scope_ref TEXT NOT NULL,
                     chinese_name TEXT,
+                    label_priority INTEGER,
                     english_name TEXT,
                     display_name TEXT NOT NULL,
                     aliases_json TEXT NOT NULL,
@@ -185,10 +190,13 @@ class SQLiteGraphIndex:
         terms: list[dict[str, Any]],
         edges: list[dict[str, Any]],
         relation_definitions=(),
+        type_definitions=(),
     ) -> None:
         with closing(self._connect()) as conn:
             conn.execute('BEGIN IMMEDIATE')
             try:
+                if not self._ranked_labels:
+                    conn.execute('ALTER TABLE kg_node_scope_views ADD COLUMN label_priority INTEGER')
                 conn.execute("""CREATE TABLE IF NOT EXISTS kg_relation_semantics (
                     rel_type TEXT NOT NULL, src_kind TEXT NOT NULL, dst_kind TEXT NOT NULL,
                     orientation TEXT NOT NULL, PRIMARY KEY (rel_type, src_kind, dst_kind, orientation)
@@ -196,9 +204,15 @@ class SQLiteGraphIndex:
                 conn.execute("""CREATE TABLE IF NOT EXISTS kg_endpoint_specializations (
                     base_type TEXT NOT NULL, rel_type TEXT NOT NULL, PRIMARY KEY (base_type, rel_type)
                 )""")
-                for table in ('kg_endpoint_specializations', 'kg_relation_semantics', 'kg_edges', 'kg_node_terms',
+                conn.execute("""CREATE TABLE IF NOT EXISTS kg_type_definitions (
+                    category TEXT NOT NULL, kind TEXT NOT NULL, description TEXT NOT NULL, normalized TEXT NOT NULL,
+                    contract TEXT NOT NULL, required_cohorts TEXT NOT NULL, PRIMARY KEY (category,kind))""")
+                for table in ('kg_type_definitions', 'kg_endpoint_specializations', 'kg_relation_semantics', 'kg_edges', 'kg_node_terms',
                               'kg_node_scope_views', 'kg_nodes'):
                     conn.execute(f'DELETE FROM {table}')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_nodes_kind ON kg_nodes(kind, node_id)')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_edges_relation ON kg_edges(rel_type, edge_id, scope_ref)')
+                conn.executemany('INSERT INTO kg_type_definitions VALUES (?,?,?,?,?,?)', type_definitions)
                 relation_definitions = tuple(relation_definitions)
                 conn.executemany('INSERT INTO kg_endpoint_specializations VALUES (?,?)',
                                  _endpoint_specializations(relation_definitions))
@@ -214,10 +228,10 @@ class SQLiteGraphIndex:
                     ],
                 )
                 conn.executemany(
-                    'INSERT INTO kg_node_scope_views (node_id, scope_ref, chinese_name, english_name, '
-                    'display_name, aliases_json, description, source_tables_json, scopes_json, observations_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    'INSERT INTO kg_node_scope_views (node_id, scope_ref, chinese_name, label_priority, english_name, '
+                    'display_name, aliases_json, description, source_tables_json, scopes_json, observations_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     [
-                        (v['node_id'], v['scope_ref'], v.get('chinese_name'), v.get('english_name'),
+                        (v['node_id'], v['scope_ref'], v.get('chinese_name'), v.get('label_priority'), v.get('english_name'),
                          v['display_name'], json.dumps(v.get('aliases', []), ensure_ascii=False),
                          v.get('description'), json.dumps(v.get('source_tables', []), ensure_ascii=False),
                          json.dumps(v['scopes'], ensure_ascii=False), json.dumps(v.get('observations', []), ensure_ascii=False))
@@ -269,6 +283,8 @@ class SQLiteGraphIndex:
                 self._indexed_substrings = bool(conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE name='kg_lexemes'").fetchone())
                 conn.execute('COMMIT')
+                self._ranked_labels = True
+                self.has_type_definitions = True
             except BaseException:
                 conn.execute('ROLLBACK')
                 raise
@@ -550,14 +566,30 @@ class SQLiteGraphIndex:
             return {}
         id_marks = ','.join('?' for _ in ids)
         scope_marks = 'SELECT value FROM json_each(?)'
+        columns = self._label_columns()
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                f"""SELECT node_id, COALESCE(MIN(NULLIF(chinese_name,'')), MIN(NULLIF(display_name,'')), node_id)
-                    FROM kg_node_scope_views
-                    WHERE node_id IN ({id_marks}) AND scope_ref IN ({scope_marks}) GROUP BY node_id""",
+                f"""SELECT node_id, {columns} FROM kg_node_scope_views
+                    WHERE node_id IN ({id_marks}) AND scope_ref IN ({scope_marks})""",
                 [*ids, json.dumps(scope_list)],
             )
-            return dict(rows)
+            grouped = defaultdict(list)
+            for row in rows:
+                grouped[row['node_id']].append(row)
+        return {nid: self._view_name(views, nid)[1] for nid, views in grouped.items()}
+
+    def _label_columns(self):
+        # Legacy immutable indexes kept the preferred name in display_name.
+        return 'chinese_name, display_name, ' + ('label_priority' if self._ranked_labels else 'NULL AS label_priority')
+
+    @staticmethod
+    def _view_name(views, node_id):
+        labels = [(row['label_priority'] is None, row['label_priority'] or 0, row['display_name'])
+                  for row in views if row['chinese_name'] and row['display_name']]
+        if labels:
+            name = min(labels)[2]
+            return name, name
+        return None, min((row['display_name'] for row in views if row['display_name']), default=node_id)
 
     def exact_names(self, terms, *, scopes, limit_per_term, include_codes=False, kind=None):
         """Resolve visible names and aliases, optionally also exact identity codes."""
@@ -607,7 +639,7 @@ class SQLiteGraphIndex:
                 ids,
             ).fetchall()
             view_rows = conn.execute(
-                f'SELECT node_id, scope_ref, chinese_name, english_name, display_name, aliases_json, description, source_tables_json, scopes_json, observations_json '
+                f'SELECT node_id, scope_ref, {self._label_columns()}, english_name, aliases_json, description, source_tables_json, scopes_json, observations_json '
                 f'FROM kg_node_scope_views WHERE node_id IN ({id_ph}) AND scope_ref IN ({sc_ph})',
                 [*ids, json.dumps(scope_list)],
             ).fetchall()
@@ -621,9 +653,8 @@ class SQLiteGraphIndex:
             vlist = views_by_node.get(nid)
             if not vlist:
                 continue
-            cn_names = sorted({v['chinese_name'] for v in vlist if v['chinese_name']})
+            cn_name, display_name = self._view_name(vlist, nid)
             en_names = sorted({v['english_name'] for v in vlist if v['english_name']})
-            disp_names = sorted({v['display_name'] for v in vlist if v['display_name']})
             aliases = sorted({a for v in vlist for a in json.loads(v['aliases_json'])})
             descs = sorted({v['description'] for v in vlist if v['description']})
             src_tables = sorted({t for v in vlist for t in json.loads(v['source_tables_json'])})
@@ -634,9 +665,9 @@ class SQLiteGraphIndex:
                 'degree': degrees_by_node.get(nid, 0),
                 'identity': json.loads(b['identity_json']),
                 'identity_types': json.loads(b['identity_types_json']),
-                'chinese_name': cn_names[0] if cn_names else None,
+                'chinese_name': cn_name,
                 'english_name': en_names[0] if en_names else None,
-                'display_name': cn_names[0] if cn_names else (disp_names[0] if disp_names else nid),
+                'display_name': display_name,
                 'aliases': aliases,
                 'description': '；'.join(descs) if descs else None,
                 'source_tables': src_tables,

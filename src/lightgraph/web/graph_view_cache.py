@@ -15,6 +15,7 @@ from typing import Callable
 
 from lightgraph.contracts import digest
 
+_DISK_FORMAT = 3  # Earlier views can carry descriptions from a partially visible type.
 MAX_CACHED_VIEWS = 4
 MAX_CACHED_RECORDS = 100_000
 MAX_CACHE_BYTES = 256 * 1024 * 1024
@@ -126,12 +127,12 @@ def _read_disk(directory: Path, key: dict):
         if directory.is_symlink() or path.is_symlink() or not path.is_file() or info.st_size > MAX_CACHE_BYTES:
             return None
         with path.open('rb') as stream:
-            # Format 2 is a JSON array with one header, followed by node records
+            # The cache is a JSON array with one header, followed by node records
             # and then edge records. Rebuild older, single-line disk caches.
             if stream.readline(2) != b'[\n':
                 return None
             header = json.loads(stream.readline())
-            if not isinstance(header, dict) or header.get('format') != 2 or header.get('key') != key:
+            if not isinstance(header, dict) or header.get('format') != _DISK_FORMAT or header.get('key') != key:
                 return None
             generation, graph = header.get('generation'), header.get('graph')
             if not isinstance(generation, str) or not isinstance(graph, dict):
@@ -161,7 +162,7 @@ def _write_disk(directory: Path, key: dict, value: tuple[dict, str]) -> None:
     directory.mkdir(exist_ok=True)
     graph, generation = value
     nodes, edges = graph['nodes'], graph['edges']
-    header = {'format': 2, 'key': key, 'generation': generation,
+    header = {'format': _DISK_FORMAT, 'key': key, 'generation': generation,
               'graph': {k: v for k, v in graph.items() if k not in ('nodes', 'edges')},
               'nodes': len(nodes), 'edges': len(edges)}
     fd, temporary = tempfile.mkstemp(prefix='.view-', dir=directory)

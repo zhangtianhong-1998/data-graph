@@ -1,58 +1,21 @@
-"""AgentScope runtime adapters with optional local, credential-redacted run history.
-
-ReActAgent owns the loop, Toolkit owns registered tool dispatch, and the native
-OpenAI adapter owns protocol parsing. Only complete model responses reach the
-framework, so an interrupted argument stream can never execute a query.
-"""
+"""Bounded discovery turns for the Python API's in-process, guarded source tools."""
 from __future__ import annotations
 
-import asyncio
 import json
 import time
-from collections import OrderedDict
 from uuid import uuid4
-
-from agentscope import _config as framework_config
-from agentscope.agent import ReActAgent
-from agentscope.formatter import FormatterBase
-from agentscope.memory import InMemoryMemory
-from agentscope.message import Msg
-from agentscope.model import ChatModelBase, ChatResponse
 
 from lightgraph.context import (discovery_envelope, bounded_discovery_packet,
                                 with_discovery_runtime_control)
 from lightgraph.contracts import canonical
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.runtime.trace import emit_trace, trace_context
-from .models import ProposalBatch
 from .proposal_session import (DiscoveryFinish, ProposalSession, proposal_tool_specs,
                                MAX_SUBMISSION_CALLS)
 
 
-def _check_runtime_policy() -> None:
-    # AgentScope tracing includes prompts and tool outputs. Do not let embedding
-    # this module in an app that enabled tracing silently export source samples.
-    if framework_config.trace_enabled:
-        raise LightGraphError('agent_source_tracing_forbidden')
-
-
-class EphemeralMemory(InMemoryMemory):
-    """Framework memory may hold samples during one run, but cannot be saved."""
-
-    def state_dict(self) -> dict:
-        raise LightGraphError('agent_source_persistence_forbidden')
-
-    def load_state_dict(self, state_dict: dict, strict: bool=True) -> None:
-        raise LightGraphError('agent_source_persistence_forbidden')
-
-
-class DiscoveryFormatter(FormatterBase):
-    """Text/tool-only formatter, with fresh scoped documents on every model call.
-
-    Avoid the generic multimodal formatter's implicit file/network processing.
-    Preserve the native tool-call protocol and never flatten tool results into
-    system instructions.
-    """
+class DiscoveryFormatter:
+    """Refresh the scoped task packet while keeping tool results in their own role."""
 
     def __init__(self, packet: dict, executor, references=None, submission_names=()):
         self.packet=packet
@@ -98,41 +61,27 @@ class DiscoveryFormatter(FormatterBase):
         context['documents_reused_from_input']=references
         return canonical(result)
 
-    async def format(self, msgs: list[Msg]) -> list[dict]:
-        _check_runtime_policy()
-        if callable(getattr(self.executor,'context_documents',None)):
-            self.packet['document_snippets']=self.executor.context_documents()
-            self.packet['document_refs']=self.executor.document_refs()
-            self.packet['context_tables']=self.executor.context_tables()
-        visible=bounded_discovery_packet(self.packet)
-        packet_text=canonical(discovery_envelope(visible))
-        output=[]
-        task_inserted=False
-        for msg in msgs:
-            if msg.role=='user' and not task_inserted:
-                output.append({'role':'user','content':packet_text})
-                task_inserted=True
-            elif msg.has_content_blocks('tool_result'):
-                for block in msg.get_content_blocks('tool_result'):
-                    content=block['output']
-                    if not isinstance(content,list) or any(b.get('type')!='text' for b in content):
-                        raise LightGraphError('agent_nontext_tool_response')
-                    output.append({'role':'tool','tool_call_id':block['id'],
-                        'content':self._deduplicate_tool_context(
-                            ''.join(b['text'] for b in content),visible['document_snippets'])})
-            elif msg.has_content_blocks('tool_use'):
-                calls=[]
-                for block in msg.get_content_blocks('tool_use'):
-                    args=block['input']
-                    calls.append({'id':block['id'],'type':'function','function':{
-                        'name':block['name'],'arguments':args if isinstance(args,str) else canonical(args)}})
-                output.append({'role':'assistant','content':None,'tool_calls':calls})
+    def format(self, messages: list[dict]) -> list[dict]:
+        if callable(getattr(self.executor, 'context_documents', None)):
+            self.packet['document_snippets'] = self.executor.context_documents()
+            self.packet['document_refs'] = self.executor.document_refs()
+            self.packet['context_tables'] = self.executor.context_tables()
+        visible = bounded_discovery_packet(self.packet)
+        output = []
+        task_inserted = False
+        for message in messages:
+            if message['role'] == 'user' and not task_inserted:
+                output.append({'role': 'user', 'content': canonical(discovery_envelope(visible))})
+                task_inserted = True
+            elif message['role'] == 'tool':
+                output.append({**message, 'content': self._deduplicate_tool_context(
+                    message['content'], visible['document_snippets'])})
             else:
-                output.append({'role':msg.role,'content':msg.get_text_content() or ''})
-        return self.references.messages(output,self.submission_names) if self.references else output
+                output.append(dict(message))
+        return self.references.messages(output, self.submission_names) if self.references else output
 
 
-class DiscoveryChatModel(ChatModelBase):
+class DiscoveryChatModel:
     """Reserve submission and feedback within the configured discovery allowance.
 
     Providers may return multiple tools even when parallel calls are disabled.
@@ -142,7 +91,6 @@ class DiscoveryChatModel(ChatModelBase):
     """
 
     def __init__(self, client, max_tool_calls: int, max_steps: int, submission_names=(), references=None):
-        super().__init__(model_name=client.config.model,stream=client.config.stream)
         self.client=client
         self.max_tool_calls=max_tool_calls
         self.max_steps=max_steps
@@ -199,13 +147,12 @@ class DiscoveryChatModel(ChatModelBase):
         if can_retry:
             messages.append({'role':'user','content':canonical({'runtime_feedback':feedback})})
 
-    async def __call__(self, messages: list[dict], tools=None, tool_choice=None, **kwargs):
+    async def next_turn(self, messages: list[dict], tools=None, tool_choice=None):
         from .agent import _message
         from .prompt_window import (prompt_bytes, prompt_size, prompt_fits,
                                     fit_source_history, compact_source_history)
         from .token_estimation import prompt_token_limit
 
-        _check_runtime_policy()
         self.client.budget.check_deadline()
         if self.references:
             tools=self.references.schema(tools)
@@ -378,125 +325,65 @@ class DiscoveryChatModel(ChatModelBase):
         finally:
             # HTTP has finished or failed. Formatted prompts must not outlive it.
             messages.clear()
-        if 'final' in parsed or 'finish' in parsed:
-            content=[{'type':'text','text':parsed.get('final',parsed.get('finish')).model_dump_json()}]
-        else:
-            calls=parsed['calls']
-            content=[]
-            for call in calls:
-                self.total_calls+=1
-                if call['name'] in self.submission_names:self.submission_calls+=1
-                else:self.source_calls+=1
-                try:
-                    from .llm import _strict_json_loads
-                    args=_strict_json_loads(call['arguments'])
-                except (ValueError,TypeError):
-                    args=call['arguments']  # Toolkit rejects non-object inputs.
-                content.append({'type':'tool_use','id':call['id'],
-                                'name':call['name'],'input':args})
-        response=ChatResponse(content=content)
-        if self.stream:
-            async def completed_stream():
-                yield response
-            return completed_stream()
-        return response
-
-
-class DiscoveryReActAgent(ReActAgent):
-    """Use the framework loop with fail-closed limits and no raw output channel."""
-
-    # Isolate from global hooks configured for unrelated agents in the host app.
-    # Hooks receive whole Msg objects, including ephemeral source values.
-    for _hook in ('reply','print','observe','reasoning','acting'):
-        locals()[f'_class_pre_{_hook}_hooks']=OrderedDict()
-        locals()[f'_class_post_{_hook}_hooks']=OrderedDict()
-    del _hook
-
-    async def print(self, msg, last=True, **kwargs) -> None:
-        # Console, Studio and message queues must not receive raw samples.
-        return None
-
-    def state_dict(self) -> dict:
-        raise LightGraphError('agent_source_persistence_forbidden')
-
-    def load_state_dict(self, state_dict: dict, strict: bool=True) -> None:
-        raise LightGraphError('agent_source_persistence_forbidden')
-
-    async def _reasoning(self, tool_choice=None) -> Msg:
-        if getattr(self,'_terminal_failure',None) is not None:
-            raise self._terminal_failure
-        _check_runtime_policy()
-        if getattr(self,'_proposal_session',None) is not None and self._proposal_session.finished:
-            return Msg(self.name,DiscoveryFinish(action='finish_discovery').model_dump_json(),'assistant')
-        return await super()._reasoning(tool_choice)
-
-    async def _acting(self, tool_call):
-        if getattr(self,'_terminal_failure',None) is not None:
-            return None
-        if getattr(self,'_proposal_session',None) is not None and self._proposal_session.finished:
-            return None
-        try:
-            _check_runtime_policy()
-            return await super()._acting(tool_call)
-        except (LightGraphError,asyncio.CancelledError) as exc:
-            # AgentScope pre-creates the batch's coroutines. Drain them without
-            # executing further tools after budget/policy failure or cancellation,
-            # then stop before the next model call.
-            self._terminal_failure=exc
-            return None
-
-    async def _summarizing(self) -> Msg:
-        if getattr(self,'_terminal_failure',None) is not None:
-            raise self._terminal_failure
-        if getattr(self,'_proposal_session',None) is not None and self._proposal_session.finished:
-            return Msg(self.name,DiscoveryFinish(action='finish_discovery').model_dump_json(),'assistant')
-        # The model reserves its final configured turn for submission. Never
-        # add the framework's unbudgeted summary if the provider ignores it.
-        raise BudgetExceeded('discovery_steps_exhausted')
+        for call in parsed.get('calls', ()):
+            self.total_calls += 1
+            if call['name'] in self.submission_names:
+                self.submission_calls += 1
+            else:
+                self.source_calls += 1
+        return parsed
 
 
 async def run_agent(client, packet, executor, dispatch, system, *, max_steps, max_tool_calls):
-    from .agentscope_tools import create_toolkit
+    from .tool_runtime import create_toolkit
+    from .llm import _strict_json_loads
     from .model_references import ModelReferences
 
-    _check_runtime_policy()
-    memory=EphemeralMemory()
     session=ProposalSession(packet)
     references=ModelReferences(packet)
-    class CombinedTools:
-        def tool_specs(self):
-            return [*executor.tool_specs(),*proposal_tool_specs(packet['task'], packet)]
-
     def combined_dispatch(name,arguments):
         if name in session.names:
             client.budget.check_deadline()
             return session.execute(name,arguments)
         return dispatch(name,arguments)
 
-    toolkit=create_toolkit(CombinedTools(),combined_dispatch)
+    toolkit=create_toolkit(executor, combined_dispatch, extra_specs=proposal_tool_specs(packet['task'], packet))
     toolkit.invalid_argument_handler=lambda name,args,diagnostics: (
         session.reject_tool_arguments(name,args,diagnostics) if name in session.names else None)
     model=DiscoveryChatModel(client,max_tool_calls,max_steps,session.names,references)
-    agent=DiscoveryReActAgent(name=client.config.agent_name,sys_prompt=system,
-        model=model,formatter=DiscoveryFormatter(packet,executor,references,session.names),toolkit=toolkit,
-        memory=memory,max_iters=max_steps,parallel_tool_calls=False,
-        enable_meta_tool=False,print_hint_msg=False)
-    agent.set_console_output_enabled(False)
-    agent._proposal_session=session
-    reply=None
+    formatter = DiscoveryFormatter(packet, executor, references, session.names)
+    history = [{'role': 'system', 'content': system}, {'role': 'user', 'content': ''}]
+    specs = toolkit.get_json_schemas()
+    reply = None
     termination_code=None
-    trace_binding=trace_context(agent_id='agent_'+uuid4().hex,task=packet.get('task'))
+    trace_binding=trace_context(agent_id='agent_'+uuid4().hex, agent_name=client.config.agent_name, task=packet.get('task'))
     trace_binding.__enter__()
-    emit_trace('agent_start',{'packet':packet,'system':system,
-        'max_steps':max_steps,'max_tool_calls':max_tool_calls})
     try:
-        # The actual AgentScope loop, not the former hand-written while loop.
+        emit_trace('agent_start',{'packet':packet,'system':system,
+            'max_steps':max_steps,'max_tool_calls':max_tool_calls})
         try:
-            reply=await agent.reply(Msg('user','discovery task','user'))
+            while not session.finished:
+                turn = await model.next_turn(formatter.format(history), specs)
+                if 'calls' not in turn:
+                    reply = turn['finish'] if 'finish' in turn else turn['final']
+                    break
+                calls = turn['calls']
+                history.append({'role': 'assistant', 'content': None, 'tool_calls': [
+                    {'id': c['id'], 'type': 'function',
+                     'function': {'name': c['name'], 'arguments': c['arguments']}} for c in calls]})
+                for call in calls:
+                    if session.finished:
+                        break
+                    try:
+                        arguments = _strict_json_loads(call['arguments'])
+                    except (TypeError, ValueError):
+                        arguments = call['arguments']  # Guarded tools return structured schema feedback.
+                    result = await toolkit.call(call['name'], arguments, tool_call_id=call['id'])
+                    history.append({'role': 'tool', 'tool_call_id': call['id'], 'content': canonical(result)})
         except LightGraphError as exc:
             termination_code=exc.code
-            # Recover only transport/shape/allowance failures. Authorization,
-            # tracing policy changes and cancellation still terminate the run.
+            # Return accepted drafts as incomplete only for transport, shape
+            # and allowance failures. Authorization and cancellation propagate.
             recoverable=(exc.code.startswith(('llm_','model_transport_','model_json_','model_stream_')) or exc.code in {
                 'model_packet_too_large','model_response_too_large','discovery_steps_exhausted',
                 'discovery_tool_calls_exhausted','discovery_final_response_required',
@@ -512,9 +399,8 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
             return batch
         if session.finished:
             return session.batch()
-        raw=json.loads(reply.get_text_content())
-        if isinstance(raw,dict) and 'action' in raw:
-            finish=DiscoveryFinish.model_validate(raw)
+        if isinstance(reply, DiscoveryFinish):
+            finish = reply
             if finish.action!='abstain':
                 result=session.execute('finish_discovery',finish.model_dump(exclude={'action'}))
                 if result.get('status')!='ok':
@@ -524,7 +410,7 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
                 # that relevant work remains unfinished.
                 session.pending=finish.pending
             return session.batch(abstain=finish.action=='abstain')
-        legacy=ProposalBatch.model_validate(raw)
+        legacy = reply
         if legacy.abstain:
             # Legacy global abstention is also a withdrawal, never a request
             # to finish and publish the previously staged candidates.
@@ -552,30 +438,21 @@ async def run_agent(client, packet, executor, dispatch, system, *, max_steps, ma
         termination_code=exc.code if isinstance(exc,LightGraphError) else type(exc).__name__
         raise
     finally:
-        emit_trace('agent_end',{'pending':session.pending,'finished':session.finished,
-            'drafts':session.drafts,'object_models':session.object_models,
-            'invalid_count':session.invalid_count,'steps':model.steps,
-            'max_steps':model.max_steps,'source_calls':model.source_calls,
-            'submission_calls':model.submission_calls,'phase_corrections':model.phase_corrections,
-            'termination_code':termination_code,
-            'reply':reply.content if reply is not None else None})
-        trace_binding.__exit__(None,None,None)
-        # InMemoryMemory stores copies; clear originals as well as the returned
-        # message, and remove closures retaining the executor or packet.
-        for message in await memory.get_memory():
-            message.content=[]
-            message.metadata=None
-        await memory.clear()
-        memory._compressed_summary=''
-        if reply is not None:
-            reply.content=[]
-        toolkit.tools.clear()
-        toolkit._argument_validators.clear()
-        toolkit.invalid_argument_handler=None
-        session.clear()
-        agent._proposal_session=None
-        agent._terminal_failure=None
-        agent._sys_prompt=''
-        agent.formatter.packet={}
-        agent.formatter.executor=None
-        references.clear()
+        try:
+            emit_trace('agent_end',{'pending':session.pending,'finished':session.finished,
+                'drafts':session.drafts,'object_models':session.object_models,
+                'invalid_count':session.invalid_count,'steps':model.steps,
+                'max_steps':model.max_steps,'source_calls':model.source_calls,
+                'submission_calls':model.submission_calls,'phase_corrections':model.phase_corrections,
+                'termination_code':termination_code,
+                'reply':[{'type':'text','text':reply.model_dump_json()}] if reply is not None else None})
+        finally:
+            trace_binding.__exit__(None,None,None)
+            for message in history:
+                message.clear()
+            history.clear()
+            toolkit.clear()
+            session.clear()
+            formatter.packet = {}
+            formatter.executor = None
+            references.clear()

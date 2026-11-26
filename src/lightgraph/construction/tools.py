@@ -127,6 +127,9 @@ class ConstructionTools:
         try:
             self.query_budget = install_run_query_budget(config, self.adapters)
             loaded_documents = load_documents(config.documents)
+            if config._document_table_bindings:
+                from lightgraph.documents.core import qualify_document_tables
+                qualify_document_tables(loaded_documents, config._document_table_bindings)
             self.documents = DocumentCorpus([document for document in loaded_documents
                 if document.document_id not in config.removed_document_ids])
             mapping = {t.source_id: adapter for adapter in self.adapters for t in adapter.describe()}
@@ -475,7 +478,8 @@ class ConstructionTools:
                         applicable = set()
                         if table is not None and column.column in table.column_names:
                             applicable = {f"{s['doc_id']}@{s['revision']}:{s['section_id']}"
-                                for s in self.documents.context_for(table, [column.column])}
+                                for s in self.documents.context_for(table, [column.column])
+                                if s['evidence_role'] == 'definition_evidence'}
                         for position, ref in enumerate(column.evidence_refs):
                             evidence = self.workspace.read_evidence(ref)
                             source = evidence.source_ref if isinstance(evidence.source_ref, dict) else {}

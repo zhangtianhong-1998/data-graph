@@ -334,3 +334,39 @@ def test_review_summary_pages_reuse_visible_base_and_defer_one_groups_evidence(c
     assert listing(client, view='summary', **limited)['total_candidates'] == 0
     assert client.get(REVIEW, params={'candidate_id': key, **limited}).status_code == 404
     assert listing(client, view='summary')['candidates'] == first['candidates']
+
+
+@pytest.mark.parametrize('legacy_source', [False, True])
+def test_inherited_different_decision_requires_unchanged_member_evidence(client, monkeypatch, legacy_source):
+    from pathlib import Path
+    from lightgraph.construction.inheritance import freeze_inherited_graphs
+    from lightgraph.runtime.config import InheritedGraphRef
+
+    if legacy_source:
+        from lightgraph.web import publication_identity
+        projector = publication_identity.project
+
+        def original_format(*args):
+            graph = projector(*args)
+            graph.pop('identity_separations')
+            return graph
+
+        monkeypatch.setattr(publication_identity, 'project', original_format)
+
+    workspace = client.app.state.workspace
+    publish(client, [candidate_unit(side, [(side, ['code'])]) for side in ('one', 'two')])
+    review = listing(client)
+    assert submit(client, review, review['candidates'][0], verdict='different').status_code == 200
+    workspace.create('Derived', 'derived')
+    config = workspace.result_config('derived')
+    config.inherited_graphs = [InheritedGraphRef(inherit_id='source', source_project_id='p', allowed_scopes=['public'])]
+    frozen = freeze_inherited_graphs(config, Path(config.output_dir) / 'construction', workspace=workspace)['base_graph']
+    assert len(frozen['nodes']) == 2
+    assert frozen['candidate_identity_merges'] == []
+    pair, = frozen['identity_separations']
+    assert set(pair['members']) == {n['id'] for n in frozen['nodes']}
+    altered = deepcopy(frozen)
+    altered['nodes'][0]['supports'][0]['properties'] = {'revision_note': ['changed']}
+    again = merge_construction_graphs([unit('source', altered, kind='base')])
+    assert again['candidate_identity_merges']
+    assert not again.get('identity_separations')

@@ -214,6 +214,17 @@ def _apply_scoped_inputs(
     source_table_overrides: dict[str, list[str]],
     document_ids: list[str] | None,
 ) -> RunConfig:
+    project_sources = cloned.sources
+    if document_ids is not None:
+        wanted = set(document_ids)
+        cloned.documents = [doc for doc in cloned.documents if _document_matches(doc, wanted)]
+    narrowed = (source_ids and set(source_ids) != {s.id for s in project_sources}) or source_table_overrides
+    if narrowed and cloned.documents:
+        from lightgraph.documents.core import resolve_workflow_table_selectors
+        resolved = resolve_workflow_table_selectors(
+            (d for d in cloned.documents if Path(d).is_file()), project_sources, cloned.removed_document_ids)
+    else:
+        resolved = {}
     if source_ids:
         known = {s.id for s in cloned.sources}
         missing = sorted(set(source_ids) - known)
@@ -239,6 +250,17 @@ def _apply_scoped_inputs(
         s.id: set(s.allowed_tables) for s in cloned.sources if s.allowed_tables
     }
     active_source_ids = {s.id for s in cloned.sources}
+    def bound_in_unit(address):
+        for sid in active_source_ids:
+            prefix = sid + ':'
+            if address.startswith(prefix):
+                table = address[len(prefix):]
+                allowed = active_tables_by_source.get(sid)
+                if allowed is None or table in allowed or table.split('.', 1)[-1] in allowed:
+                    return True
+        return False
+
+    cloned._document_table_bindings = {key: table for key, table in resolved.items() if bound_in_unit(table)}
     cloned.scope_bindings = [
         b for b in cloned.scope_bindings
         if b.source_id in active_source_ids and (
@@ -248,9 +270,6 @@ def _apply_scoped_inputs(
         )
     ]
 
-    if document_ids is not None:
-        wanted = set(document_ids)
-        cloned.documents = [doc for doc in cloned.documents if _document_matches(doc, wanted)]
     return cloned
 
 
@@ -471,20 +490,13 @@ def publish_premerged_graph(
     unit_attempts: dict[str, str],
     mode: str = 'dag_merge',
 ) -> dict[str, Any]:
-    """Persist an already-merged graph dict as the sharded root construction publication."""
+    """Commit the Parquet graph, merge summary and candidate report with one manifest switch."""
     root_output = io_path(project_output_dir)
     root_construction = root_output / 'construction'
     root_construction.mkdir(parents=True, exist_ok=True)
     from .snapshot_registry import register_access_context
     policy_id = register_access_context(root_construction, project_config)
     ctx_fingerprint = _graph_digest(merged, 'workflow_merge_v2', access_fingerprint(project_config))
-    persisted = write_sharded_graph(
-        root_construction,
-        merged,
-        context_fingerprint=ctx_fingerprint,
-        result_policy_id=policy_id,
-        unit_attempts={uid: unit_attempts[uid] for uid in included_units if uid in unit_attempts},
-    )
     merge_summary = {
         'format_version': 1,
         'mode': mode,
@@ -497,9 +509,9 @@ def publish_premerged_graph(
             for sup in item.get('supports', [])
             if isinstance(sup.get('inherited_from'), dict) and sup['inherited_from'].get('inherit_id')
         }),
-        'nodes': persisted['nodes'],
-        'edges': persisted['edges'],
-        'shard_count': persisted['shard_count'],
+        'nodes': len(merged.get('nodes', [])),
+        'edges': len(merged.get('edges', [])),
+        'shard_count': 2,
         # A promoted checkpoint retains the producing pass. Historical artifacts
         # without counters cannot say which matching paths were executed.
         **({'merge_counts': merged['fusion_diagnostics']} if 'fusion_diagnostics' in merged else {}),
@@ -517,15 +529,47 @@ def publish_premerged_graph(
             if k not in {'node_ids', 'edge_ids'}
         },
     }
-    write_yaml(root_construction / 'workflow-merge-summary.yaml', merge_summary)
-    write_yaml(root_construction / 'merge-alignment-candidates.yaml', {
-        'candidate_identity_merges': merged.get('candidate_identity_merges', []),
-        'candidate_column_alignments': merged.get('candidate_column_alignments', []),
-        'definition_conflicts': merged.get('definition_conflicts', []),
-        'unresolved_relations': merged.get('unresolved_relations', []),
-        'context_cycle_diagnostics': merged.get('context_cycle_diagnostics', []),
-    })
+
+    def write_reports(directory):
+        write_yaml(directory / 'workflow-merge-summary.yaml', merge_summary)
+        write_yaml(directory / 'merge-alignment-candidates.yaml', {
+            'candidate_identity_merges': merged.get('candidate_identity_merges', []),
+            'candidate_column_alignments': merged.get('candidate_column_alignments', []),
+            'definition_conflicts': merged.get('definition_conflicts', []),
+            'unresolved_relations': merged.get('unresolved_relations', []),
+            'context_cycle_diagnostics': merged.get('context_cycle_diagnostics', []),
+        })
+
+    write_sharded_graph(
+        root_construction,
+        merged,
+        context_fingerprint=ctx_fingerprint,
+        result_policy_id=policy_id,
+        write_workflow_reports=write_reports,
+        unit_attempts={uid: unit_attempts[uid] for uid in included_units if uid in unit_attempts},
+    )
     return merge_summary
+
+
+def published_workflow_summary(project_output_dir):
+    root = io_path(project_output_dir) / 'construction'
+    manifest_path = root / 'manifest.yaml'
+    if not manifest_path.is_file():
+        return None
+    manifest = read_internal_yaml(manifest_path)
+    snapshot = manifest.get('workflow_report_snapshot')
+    if snapshot is not None:
+        if not isinstance(snapshot, str) or not re.fullmatch(r'published/[a-f0-9]{32}\.graph', snapshot):
+            raise LightGraphError('invalid_graph_workspace_record')
+        directory = root / snapshot
+        if directory.is_symlink() or directory.parent.is_symlink():
+            raise LightGraphError('invalid_graph_workspace_record')
+        summary = directory / 'workflow-merge-summary.yaml'
+    else:
+        summary = root / 'workflow-merge-summary.yaml'
+    if summary.is_symlink():
+        raise LightGraphError('invalid_graph_workspace_record')
+    return read_internal_yaml(summary) if summary.is_file() else None
 
 
 def effective_merge_policy(config, node=None):
@@ -590,7 +634,7 @@ def publish_merged_contributors(
     mode: str = 'merged',
     independent_terminals: bool = False,
 ) -> dict[str, Any]:
-    """Deterministically combine prepared contributors and publish sharded root construction graph."""
+    """Merge the verified contributors and publish the project graph."""
     if not contributors:
         raise LightGraphError('workflow_no_committed_contributors')
     # Independent outputs must not inherit a cross-unit identity merge policy.
@@ -615,54 +659,6 @@ def publish_merged_contributors(
     )
 
 
-def promote_unit_to_project_output(
-    project_output_dir: str | Path,
-    project_config: RunConfig,
-    *,
-    unit_id: str,
-    attempt: str | None = None,
-    workspace=None,
-) -> dict[str, Any]:
-    """Promote a single extract node directly as the final project output when no merge node is configured."""
-    root_output = Path(project_output_dir)
-    root_construction = root_output / 'construction'
-    root_construction.mkdir(parents=True, exist_ok=True)
-    inherited_dir = root_construction / 'inherited'
-    if getattr(project_config, 'inherited_graphs', None) and not (inherited_dir / 'summary.yaml').is_file():
-        freeze_inherited_graphs(project_config, root_construction, workspace=workspace)
-
-    contributors, _ = frozen_contributors(root_construction, config=project_config)
-    wf = project_config.workflow
-    units = {u.unit_id: u for u in wf.units} if wf else {}
-    if unit_id not in units:
-        raise LightGraphError('workflow_unit_not_found')
-
-    attempts = published_unit_attempts(root_output)
-    chosen_attempt = attempt if attempt is not None else attempts.get(unit_id)
-    output_dir = committed_unit_output(root_output, unit_id, chosen_attempt)
-    contrib = load_unit_contributor(output_dir, unit_id)
-    included: list[str] = []
-    skipped: list[str] = []
-    if contrib is None:
-        skipped.append(unit_id)
-    else:
-        expected_access = access_fingerprint(build_unit_config(project_config, units[unit_id], unit_output_dir=output_dir))
-        if contrib['graph'].get('access_fingerprint') != expected_access:
-            raise LightGraphError('graph_access_context_changed')
-        contributors.append(contrib)
-        included.append(unit_id)
-
-    return publish_merged_contributors(
-        root_output,
-        project_config,
-        contributors=contributors,
-        included_units=included,
-        skipped_units=skipped,
-        unit_attempts={unit_id: chosen_attempt} if chosen_attempt else {},
-        mode='direct_output',
-    )
-
-
 def merge_project_workflow(
     project_output_dir: str | Path,
     project_config: RunConfig,
@@ -671,6 +667,7 @@ def merge_project_workflow(
     unit_ids: list[str] | None = None,
     unit_attempts: dict[str, str] | None = None,
     mode: str = 'merged',
+    load_committed=None,
 ) -> dict[str, Any]:
     """Deterministically merge inherited base graphs and parallel workflow unit publications."""
     root_output = Path(project_output_dir)
@@ -691,17 +688,27 @@ def merge_project_workflow(
     for uid in sorted(selected_units):
         if uid not in units:
             raise LightGraphError('workflow_unit_not_found')
+        if uid not in attempts and load_committed is not None:
+            historical = unit_output_path(root_output, uid) / 'construction' / 'manifest.yaml'
+            if historical.is_file() and read_internal_yaml(historical).get('current_graph'):
+                from .checkpoints import WorkflowCheckpointError
+                raise WorkflowCheckpointError('workflow_checkpoint_missing', uid)
+            skipped_units.append(uid)
+            continue
         if uid not in attempts and unit_attempts is not None:
             skipped_units.append(uid)
             continue
-        output_dir = committed_unit_output(root_output, uid, attempts.get(uid))
-        contrib = load_unit_contributor(output_dir, uid)
-        if contrib is None:
-            skipped_units.append(uid)
-            continue
-        expected_access = access_fingerprint(build_unit_config(project_config, units[uid], unit_output_dir=output_dir))
-        if contrib['graph'].get('access_fingerprint') != expected_access:
-            raise LightGraphError('graph_access_context_changed')
+        if uid in attempts and load_committed is not None:
+            contrib = load_committed(units[uid], attempts[uid])
+        else:
+            output_dir = committed_unit_output(root_output, uid, attempts.get(uid))
+            contrib = load_unit_contributor(output_dir, uid)
+            if contrib is None:
+                skipped_units.append(uid)
+                continue
+            scoped = build_unit_config(project_config, units[uid], unit_output_dir=output_dir)
+            if contrib['graph'].get('access_fingerprint') != access_fingerprint(scoped):
+                raise LightGraphError('graph_access_context_changed')
         contributors.append(contrib)
         included_units.append(uid)
 

@@ -1,7 +1,6 @@
 """Cross-project graph inheritance via explicit publication authorization and digest locking."""
 from __future__ import annotations
 
-from copy import deepcopy
 from pathlib import Path
 import re
 import uuid
@@ -14,43 +13,37 @@ from .workspace import read_internal_yaml, write_yaml
 from .graph_storage import read_graph_record, write_graph_record
 
 
-def _namespace_ref(prefix: str, ref: str) -> str:
-    text = str(ref)
-    return f'{prefix}:{text}'
-
-
 def _namespace_graph_evidence(graph: dict[str, Any], *, inherit_id: str,
                               source_project_id: str | None, source_digest: str) -> dict[str, Any]:
-    prefix = f'base:{inherit_id}'
-    result = deepcopy(graph)
-    marker = {
-        'inherit_id': inherit_id,
-        'source_project_id': source_project_id,
-        'source_graph_digest': source_digest,
-    }
-    result['evidence_refs'] = [_namespace_ref(prefix, ref) for ref in result.get('evidence_refs', [])]
-    for item in result.get('nodes', []) + result.get('edges', []):
-        for prov in item.get('provenance', []):
-            if isinstance(prov, dict) and prov.get('evidence_refs'):
-                prov['evidence_refs'] = [_namespace_ref(prefix, r) for r in prov['evidence_refs']]
-        for support in item.get('supports', []):
-            if not isinstance(support, dict):
-                continue
-            support['inherited_from'] = deepcopy(marker)
-            for origin in support.get('execution_origins', []):
-                if origin.get('evidence_refs'):
-                    origin['evidence_refs'] = [_namespace_ref(prefix, r) for r in origin['evidence_refs']]
-            prov = support.get('provenance')
-            if isinstance(prov, dict) and prov.get('evidence_refs'):
-                prov['evidence_refs'] = [_namespace_ref(prefix, r) for r in prov['evidence_refs']]
-            if support.get('evidence_refs'):
-                support['evidence_refs'] = [_namespace_ref(prefix, r) for r in support['evidence_refs']]
-            endpoint = (prov or {}).get('metadata_endpoint') if isinstance(prov, dict) else None
-            if isinstance(endpoint, dict) and isinstance(endpoint.get('column'), dict):
-                refs = endpoint['column'].get('evidence_refs')
-                if refs:
-                    endpoint['column']['evidence_refs'] = [_namespace_ref(prefix, r) for r in refs]
-    return result
+    from .merger import _rewrite_evidence_in_graph
+    marker = {'inherit_id': inherit_id, 'source_project_id': source_project_id,
+              'source_graph_digest': source_digest}
+    tagged, catalog = _rewrite_evidence_in_graph(
+        graph, kind='base', contributor_id=inherit_id, inherited_from=marker)
+    tagged['evidence_catalog'] = catalog
+    # The scope filter already rechecked the pair against every visible support
+    # and incident observation. Rebind that same decision to the namespaced copy.
+    if separations := graph.get('identity_separations'):
+        from .identity_separations import capture_separations
+        tagged['identity_separations'] = capture_separations(tagged, {tuple(row['members']) for row in separations})
+    return tagged
+
+
+def _repair_frozen_references(graph, inherit_id):
+    """Early freezes tagged supports but retained the parent's definition and catalog keys."""
+    prefix = f'base:{inherit_id}:'
+    visible = set(graph.get('evidence_refs', []))
+    catalog = graph.get('evidence_catalog', {})
+    old = set(catalog) | {ref for definition in graph.get('definitions', {}).get('entities', [])
+                          for ref in definition.get('identity_evidence_refs', [])}
+    missing = {ref: prefix + ref for ref in old if prefix + ref in visible and prefix + ref not in catalog}
+    if not missing:
+        return
+    graph['evidence_catalog'] = {missing.get(key, key): {**entry, 'scoped_ref': missing.get(key, key)}
+                                 for key, entry in catalog.items()}
+    for definition in graph.get('definitions', {}).get('entities', []):
+        if refs := definition.get('identity_evidence_refs'):
+            definition['identity_evidence_refs'] = [missing.get(ref, ref) for ref in refs]
 
 
 def load_inherited_source_graph(ref, *, workspace=None, grant_evidence=None) -> tuple[dict[str, Any], str]:
@@ -58,7 +51,8 @@ def load_inherited_source_graph(ref, *, workspace=None, grant_evidence=None) -> 
     if ref.source_project_id:
         if workspace is None:
             raise LightGraphError('inherited_graph_workspace_required')
-        source_config = workspace.resolved_config(ref.source_project_id).model_copy(deep=True)
+        read_grant = getattr(workspace, 'result_config', None) or workspace.resolved_config
+        source_config = read_grant(ref.source_project_id).model_copy(deep=True)
         if not set(ref.allowed_scopes) <= set(source_config.scopes):
             raise LightGraphError('inherited_graph_scope_not_authorized')
         source_config.scopes = list(ref.allowed_scopes)
@@ -186,6 +180,7 @@ def frozen_contributors(construction_dir, *, config=None, summary=None, authoriz
             raise LightGraphError('invalid_inherited_graph_snapshot')
         if item.get('frozen_digest') and digest(graph) != item['frozen_digest']:
             raise LightGraphError('inherited_graph_digest_mismatch')
+        _repair_frozen_references(graph, iid)
         contributors.append({'kind': 'base', 'contributor_id': iid, 'graph': graph})
     return contributors, summary
 
@@ -197,7 +192,7 @@ def load_frozen_base_graph(construction_dir: str | Path, *, config=None, summary
 
 
 def compose_published_graph(graph, base_graph, access):
-    """A unit publishes a delta; a sharded project already contains its base."""
+    """Unit publications contain a delta. Merged project snapshots already include their base."""
     if not base_graph or graph.get('storage_layout') in {'sharded_v1', 'parquet_v1'}:
         return graph
     from .merger import merge_construction_graphs
@@ -216,8 +211,9 @@ def authorize_frozen_inheritance(config, workspace):
     if grants or any(ref.source_project_id for ref in config.inherited_graphs):
         if workspace is None:
             raise LightGraphError('inherited_graph_workspace_required')
-        authorize_inherited_grants(config.inherited_graphs, grants, workspace.resolved_config)
+        read_grant = getattr(workspace, 'result_config', None) or workspace.resolved_config
+        authorize_inherited_grants(config.inherited_graphs, grants, read_grant)
         # Reuse for execution retains the original strict source fingerprint.
         for grant in grants:
-            if access_fingerprint(workspace.resolved_config(grant['source_project_id'])) != grant['source_access']:
+            if access_fingerprint(read_grant(grant['source_project_id'])) != grant['source_access']:
                 raise LightGraphError('inherited_graph_scope_not_authorized')

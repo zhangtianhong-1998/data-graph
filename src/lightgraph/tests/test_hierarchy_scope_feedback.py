@@ -6,11 +6,10 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from lightgraph.discovery.agentscope_tools import create_toolkit
+from lightgraph.discovery.tool_runtime import create_toolkit
 from lightgraph.discovery.field_model_plan import FieldModelHierarchyPlan, field_model_plan_tool_schema
 from lightgraph.discovery.hierarchy_plan import HierarchyPlan, hierarchy_plan_tool_schema
 from lightgraph.discovery.proposal_session import ProposalSession, proposal_tool_specs
-from lightgraph.tests.test_agentscope_tools import call
 from lightgraph.tests.test_discovery_agent import input_packet
 from lightgraph.tests.test_hierarchy_plan import fixture
 from lightgraph.tests.test_proposal_session import group
@@ -106,10 +105,10 @@ def test_string_claim_feedback_names_expected_object_and_preserves_existing_draf
 
     session = ProposalSession(input_packet())
     toolkit = create_toolkit(SubmissionTools(), session.execute)
-    assert asyncio.run(call(toolkit, 'submit_column_group', group()))['status'] == 'ok'
+    assert asyncio.run(toolkit.call('submit_column_group', group()))['status'] == 'ok'
     malformed = group()
     malformed['claim'] = json.dumps({'PRIVATE_FIELD_7621': 'PRIVATE_VALUE_7621'})
-    rejected = asyncio.run(call(toolkit, 'submit_column_group', malformed))
+    rejected = asyncio.run(toolkit.call('submit_column_group', malformed))
     assert rejected['code'] == 'invalid_tool_arguments'
     assert rejected['diagnostics'] == [{
         'path': ['claim'], 'constraint': 'type', 'expected_type': 'object',

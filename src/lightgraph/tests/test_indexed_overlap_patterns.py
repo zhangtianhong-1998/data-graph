@@ -188,7 +188,37 @@ def test_different_codes_with_distinct_source_names_and_directed_roles_form_one_
     assert 'buyer_01' not in str(card)
     profile = _structural_profile(card)
     assert (profile['overlapping_names'], profile['overlapping_keys']) == (2, 0)
+    assert len(profile['pair_coverage']) == 3 and not any(row['overlapping_keys'] for row in profile['pair_coverage'])
+    assert 'propose' not in profile['review_actions']
     assert overlap.analyze_indexed_overlap_patterns(branches[::-1]).patterns == plan.patterns
+
+
+def test_connected_key_family_reveals_pair_coverage_without_disclosing_values():
+    members = ['a', 'b', 'c', 'outside']
+    projections = [{'x', 'y'}, {'x', 'y', 'z'}, {'z'}, {'w'}]
+    (group, shared, coverage), = overlap._overlapping_members(members, projections)
+    assert (group, shared) == (members[:3], {'x', 'y', 'z'})
+    assert coverage == [{'member_indexes': [0, 1], 'overlapping_keys': 2},
+                        {'member_indexes': [0, 2], 'overlapping_keys': 0},
+                        {'member_indexes': [1, 2], 'overlapping_keys': 1}]
+
+
+def test_recoded_family_has_pairwise_overlap_even_when_three_way_key_intersection_is_empty():
+    from lightgraph.construction.overlap_review import _structural_profile
+    patterns = []
+    for i, owner in enumerate(('a', 'b', 'c')):
+        pairs = [(owner + '1', '北区'), (owner + '2', '南区')]
+        if i != 2:
+            pairs.append(('12', '区' + owner))
+        patterns.append(indexed(_recoded_unit(owner, pairs)))
+    card, = [p for p in overlap.analyze_indexed_overlap_patterns(patterns).patterns
+             if p['basis'] == 'same_observed_names_with_different_keys']
+    assert card['overlapping_keys'] == 0
+    profile = _structural_profile(card)
+    assert profile['pair_coverage'] == [{'member_indexes': [0, 1], 'overlapping_keys': 1},
+                                       {'member_indexes': [0, 2], 'overlapping_keys': 0},
+                                       {'member_indexes': [1, 2], 'overlapping_keys': 0}]
+    assert 'propose' in profile['review_actions']
 
 
 def test_recoded_family_counts_full_typed_key_intersection_independently_of_names():

@@ -195,6 +195,9 @@ def _observation(node, definition, binding, index, own):
         result.reason = 'missing_or_conflicting_names'
         return result
     result.label = labels.pop()
+    if definition.get('identity_scope') == 'global':
+        result.sections = {token for kind, token in _global_authorities(node, definition, {}, local_namespace=False)
+                           if kind == 'document' and isinstance(token, str) and re.fullmatch(r'[a-f0-9]{64}', token)}
     if (len(own) != len(node['supports']) or not all(_own_support(s, binding.contributor_id) for s in own)
             or any(s['provenance'].get('label_column') in (None, '', *binding.key_columns) for s in own)
             or result.label in (str(value) for value in node['identity'].values())):
@@ -223,9 +226,6 @@ def _observation(node, definition, binding, index, own):
     signature, result.attributes = physical
     result.boundaries = (signature[-1], canonical(node.get('identity_context')),
                          tuple(sorted({_conditions(s) for s in own})))
-    if definition.get('identity_scope') == 'global':
-        result.sections = {token for kind, token in _global_authorities(node, definition, {}, local_namespace=False)
-                           if kind == 'document' and isinstance(token, str) and re.fullmatch(r'[a-f0-9]{64}', token)}
     result.roles = _witnesses(node, binding, index)
     if not result.roles:
         result.reason = 'unverified_relation_role'
@@ -295,9 +295,7 @@ def _grant_covers(member, binding, data, grant):
     return True
 
 
-def _blocked_reason(members, physical):
-    if not physical and not set.intersection(*(m.sections for m in members)):
-        return 'cross_table_identity_unverified'
+def _observation_mismatch(members, physical):
     if reason := next((m.reason for m in members if m.reason), None):
         return reason
     if any(m.contract != members[0].contract for m in members):
@@ -340,6 +338,7 @@ def _verify(pid, bindings, data, blocked):
         axes[_address(binding)[:3]].add(binding.key_columns)
     different_axes = any(len(columns) > 1 for columns in axes.values())
     physical = len(axes) == 1 and not different_axes
+    evidence_combinations = Counter()
     equal_access = len(access) == 1 and all(access)
     table_grant = common_table_grant([data.inputs[o] for o in owners], bindings[0]) if physical and not equal_access else None
     tables = [_by_key(p, data) for p in bindings]
@@ -362,7 +361,17 @@ def _verify(pid, bindings, data, blocked):
             counts['missing_or_conflicting_names'] += 1
             continue
         report['matched_key_names'] += 1
-        reason = 'different_axes_in_same_table' if different_axes else _blocked_reason(members, physical)
+        mismatch = _observation_mismatch(members, physical)
+        if different_axes:
+            reason = 'different_axes_in_same_table'
+        elif physical:
+            reason = mismatch
+        else:
+            # Count each matched key once. A missing shared proof used to mask
+            # every independent observation or access issue on that same key.
+            shared_section = bool(set.intersection(*(m.sections for m in members)))
+            evidence_combinations[shared_section, mismatch or 'observations_agree', equal_access] += 1
+            reason = mismatch if shared_section else 'cross_table_identity_unverified'
         if reason is None and not equal_access and (table_grant is None or not all(
                 _grant_covers(m, p, data, table_grant) for m, p in zip(members, bindings, strict=True))):
             reason = 'unverified_access_fingerprint'
@@ -378,6 +387,11 @@ def _verify(pid, bindings, data, blocked):
         basis = 'same_physical_projection' if physical else 'shared_versioned_key_section'
         report['verified_groups_by_basis'] = {basis: len(groups)}
         report['access_basis'] = 'unit_fingerprint' if equal_access else 'same_frozen_table_grant'
+    if len(axes) > 1 and not different_axes:
+        report['cross_table_matched_key_checks'] = [
+            {'shared_key_section_verified': section, 'first_observation_result': observation,
+             'unit_fingerprints_match': access, 'keys': count}
+            for (section, observation, access), count in sorted(evidence_combinations.items())]
     report.update(status='verified' if groups else 'review', verified_groups=len(groups),
                   reason='verified_source_observations' if groups else
                   (min(counts, key=lambda k: (-counts[k], k)) if counts else 'no_shared_keys'),
@@ -409,22 +423,39 @@ def verify_projection_proposals(policy, inputs, patterns, decisions):
         report, groups = _verify(pid, bindings, data, _blocked_types(policy))
         reports.append(report)
         if groups:
-            rules.append(VerifiedProjectionRule(pattern_id=pid, bindings=tuple(bindings), observation_digests=sorted(groups)))
+            rules.append(VerifiedProjectionRule(pattern_id=pid, bindings=tuple(bindings), observation_digests=sorted(groups),
+                                                composition_version=2))
     if rules == policy.verified_projection_rules:
         return policy, reports
     return policy.model_copy(update={'verified_projection_rules': rules}), reports
 
 
-def _has_one_input(output, owners, owner, nid):
-    if owners[output['id']] != {(owner, nid)}:
-        return False
-    return all(s.get('contributor_id') == owner and not s.get('identity_decision_refs')
-               and all(origin.get('contributor_id') == owner for origin in s.get('execution_origins', ()))
-               for s in output['supports'])
+@dataclass
+class ProjectionInputs:
+    by_stage: dict[str, dict[str, str]]
+    compose: bool
+
+
+def _covered_inputs(output, selected, actual):
+    """Every original behind this stage ID must be selected and attributable to its own support."""
+    if actual != selected:
+        return None
+    by_owner = dict(selected)
+    if len(by_owner) != len(selected):
+        return None  # Two leaves from one contributor need distinct support-level input IDs.
+    seen = set()
+    for support in output['supports']:
+        owner = support.get('contributor_id')
+        if (owner not in by_owner or any(support.get(k) for k in (
+                'identity_decision_refs', 'identity_decision_members', 'identity_approval_ref', 'inherited_from'))
+                or any(o.get('contributor_id') != owner for o in support.get('execution_origins', ()))):
+            return None
+        seen.add(owner)
+    return by_owner if seen == set(by_owner) else None
 
 
 def verified_projection_groups(graph, inputs, policy, remaps, stats):
-    """Resolve exact originals to their current stage IDs, without widening prior groups."""
+    """Resolve approved leaf sets without importing any unreviewed member of a prior group."""
     data = _Inputs(inputs)
     stage = {owner: ids for owner, kind, _, ids in remaps if kind == 'unit'}
     owners = defaultdict(set)
@@ -433,6 +464,8 @@ def verified_projection_groups(graph, inputs, policy, remaps, stats):
             if node['id'] in ids:
                 owners[ids[node['id']]].add((owner, node['id']))
     outputs = {n['id']: n for n in graph['nodes']}
+    separated = {(item['contributor_id'], nid) for item in inputs
+                 for record in item['graph'].get('identity_separations', ()) for nid in record['members']}
     rejected = defaultdict(Counter)
     proposals = []
     for rule in policy.verified_projection_rules:
@@ -442,17 +475,23 @@ def verified_projection_groups(graph, inputs, policy, remaps, stats):
             if not originals:
                 rejected[rule.pattern_id][report['reason'] if not groups else 'observation_changed'] += 1
                 continue
-            targets = {stage.get(owner, {}).get(nid): nid for owner, nid in originals}
-            ids = tuple(sorted(targets)) if None not in targets else ()
+            selected = defaultdict(set)
+            for owner, nid in originals:
+                selected[stage.get(owner, {}).get(nid)].add((owner, nid))
+            ids = tuple(sorted(selected)) if None not in selected else ()
             if not ids or not all(target in outputs for target in ids):
                 rejected[rule.pattern_id]['missing_stage_member'] += 1
             elif len(ids) == 1:
                 rejected[rule.pattern_id]['already_one_output'] += 1
-            elif len(ids) != len(originals) or any(not _has_one_input(outputs[stage[owner][nid]], owners, owner, nid)
-                                                   for owner, nid in originals):
+            elif (not separated.isdisjoint(originals)
+                  or rule.composition_version == 1 and len(ids) != len(originals)):
                 rejected[rule.pattern_id]['overlaps_prior_identity_decision'] += 1
             else:
-                proposals.append((ids, (None, rule.pattern_id, targets)))
+                inputs_by_stage = {i: _covered_inputs(outputs[i], selected[i], owners[i]) for i in ids}
+                if all(inputs_by_stage.values()):
+                    proposals.append((ids, (None, rule.pattern_id, ProjectionInputs(inputs_by_stage, rule.composition_version == 2))))
+                else:
+                    rejected[rule.pattern_id]['overlaps_prior_identity_decision'] += 1
     competing = Counter(nid for ids, _ in proposals for nid in ids)
     accepted = {}
     for ids, ref in proposals:

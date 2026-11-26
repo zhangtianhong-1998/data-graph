@@ -154,7 +154,7 @@ class ModelReferences:
         return result
 
     def response(self, message, submission_names=()):
-        """Decode before Pydantic/Toolkit checks, preserving native call IDs."""
+        """Decode before schema and tool validation, preserving native call IDs."""
         from .llm import _strict_json_loads
         result = deepcopy(message)
         if not isinstance(result, dict):

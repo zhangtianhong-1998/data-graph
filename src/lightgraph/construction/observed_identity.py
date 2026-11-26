@@ -24,6 +24,7 @@ class _Projection:
     entries: list
     bindings: set
     complete: bool
+    named_composite: bool = False
 
 
 def identity_qualifier(provenance, prop):
@@ -41,7 +42,8 @@ def contradictory_qualifiers(nodes):
     for node in nodes:
         for support in node.get('supports', []):
             provenance = support.get('provenance') or {}
-            for prop, observations in (support.get('properties') or {}).items():
+            properties = support.get('observed_properties', support.get('properties')) or {}
+            for prop, observations in properties.items():
                 role = identity_qualifier(provenance, prop)
                 if role:
                     values[role].update(canonical(value) for value in observations)
@@ -95,15 +97,17 @@ def _observed_name_pair(support, provenance):
     return sorted(((primary, support['label']), (columns[0], aliases[0])))
 
 
-def _node_evidence(node, definition, *, dictionary=None, reciprocal_names=False, local_collision=False):
+def _node_evidence(node, definition, *, dictionary=None, reciprocal_names=False, local_collision=False, comparison_keys=None):
     names = definition.get('key_names', [])
     if (not names or set(node.get('identity', {})) != set(names)
             or node.get('identity_domain') != definition.get('identity_domain')
             or set(node.get('identity_types', {})) != set(names)
             or node.get('identity_origin', 'row') != 'row' or not node.get('supports')):
         return None
-    values = [identity_cell(node, key) for key in names]
-    if any(value is None or value == '' for _, value in values):
+    ordered_keys = comparison_keys or names
+    values = [identity_cell(node, key) for key in ordered_keys]
+    if any(value is None or value == '' or kind != node['identity_types'][key]
+           for key, (kind, value) in zip(ordered_keys, values, strict=True)):
         return None
     observations, applicability = set(), set()
     unknown_scope = False
@@ -117,6 +121,9 @@ def _node_evidence(node, definition, *, dictionary=None, reciprocal_names=False,
                 or len(columns) != len(names) or len(set(columns)) != len(columns)
                 or not support.get('scope_ref') or context.get('conflicts') or context.get('missing_dimensions')):
             return None
+        if comparison_keys:
+            by_name = dict(zip(names, columns, strict=True))
+            columns = [by_name[key] for key in comparison_keys]
         # Dictionary membership is checked separately against an observed
         # unique-key row. Its address can then stand in for the local binding.
         binding_parts = [source, columns, None if local_collision else label_column] if dictionary is None else ['catalog_key', dictionary]
@@ -191,7 +198,7 @@ def _align_name_pairs(groups, prepared, overrides):
         if len(entries) < 2 or len({index for index, _, _ in entries}) != len(entries):
             continue
         primary_columns = {s['provenance']['label_column'] for _, n, _ in entries for s in n['supports']}
-        if len(primary_columns) != 2:
+        if len(primary_columns) != 2 or contradictory_qualifiers(n for _, n, _ in entries):
             continue
         # The standard replay pass may already have adopted a different type
         # or key namespace for some members. Never rewrite that decision.
@@ -376,7 +383,7 @@ def align_dictionary_nodes(prepared, observed_ids, *, local_bases, excluded_type
         # units. Keep that distinction when a later stage adds the dictionary.
         owners = {(i, n.get('unit_id') if prepared[i][1] in {'merged', 'base'} else None)
                   for i, n, _, _ in entries}
-        if len(roles) != 1 or len(owners) != len(entries):
+        if len(roles) != 1 or len(owners) != len(entries) or contradictory_qualifiers(n for _, n, _, _ in entries):
             continue
         # Shared frozen inputs may already contain the same endpoint in a diamond DAG.
         before = set()
@@ -462,6 +469,7 @@ def align_observed_nodes(prepared, *, local_bases, excluded_types, emit_candidat
     """
     overrides = [{} for _ in prepared]
     groups = defaultdict(list)
+    composite_groups = defaultdict(list)
     type_owners = defaultdict(set)
     witnesses = defaultdict(set)
     catalog_members = defaultdict(set)
@@ -522,10 +530,27 @@ def align_observed_nodes(prepared, *, local_bases, excluded_types, emit_candidat
                 _Projection(index, definition, family, roles[name], endpoint_roles[name], entries, bindings,
                             len(entries) == len(nodes)))
 
+            if len(key_names) > 1:
+                names = sorted(key_names)
+                reordered = [(node, _node_evidence(node, definition, comparison_keys=names)) for node, _ in entries]
+                bindings = {binding for _, (facts, _, _) in reordered for binding, _ in facts}
+                shape['context_positions'] = [names.index(key) for key in shape['identity_context_keys']]
+                composite_groups[canonical([shape, names])].append(
+                    _Projection(index, definition, family, roles[name], endpoint_roles[name], reordered, bindings,
+                                len(entries) == len(nodes), named_composite=True))
+
     for contract, members in _overlapping_types(groups):
         component_inputs = {entry.index for entry in members}
         for peers in _compatible_roles(members):
             _align_roles(peers, contract, prepared, type_owners, overrides, component_inputs)
+    # A complete binding by logical key name can witness a permutation. Only
+    # previously unmatched projections may adopt this fallback contract.
+    for contract, members in _overlapping_types(composite_groups):
+        component_inputs = {entry.index for entry in members}
+        for peers in _compatible_roles(members):
+            if (len({tuple(entry.definition['key_names']) for entry in peers}) > 1
+                    and all(not any(n['id'] in overrides[entry.index] for n, _ in entry.entries) for entry in peers)):
+                _align_roles(peers, contract, prepared, type_owners, overrides, component_inputs)
     review = [group for group in witnesses.values() if len({index for index, _ in group}) > 1]
     review.extend(group for group in catalog_members.values() if len({index for index, _ in group}) > 1)
     confirmed_pairs = _align_name_pairs(name_pairs, prepared, overrides)
@@ -561,6 +586,13 @@ def _compatible_roles(members):
 def _align_roles(peers, contract, prepared, type_owners, overrides, component_inputs):
     if len(peers) < 2 or len({entry.index for entry in peers}) != len(peers):
         return
+    if not peers[0].named_composite:
+        orders = defaultdict(set)
+        for entry in peers:
+            keys = tuple(entry.definition['key_names'])
+            orders[frozenset(keys)].add(keys)
+        if any(len(variants) > 1 for variants in orders.values()):
+            return
     winner = min(peers, key=lambda entry: (prepared[entry.index][1] not in {'base', 'merged'}, entry.complete,
                                           entry.definition['type'], entry.definition['key_names'], entry.index))
     target = winner.definition
@@ -600,7 +632,8 @@ def _align_roles(peers, contract, prepared, type_owners, overrides, component_in
             if witnessed:
                 observations[witnessed, values, contexts].append((entry.index, node))
     matches = [(key, batch) for key, batch in observations.items()
-               if len(batch) > 1 and len({index for index, _ in batch}) == len(batch)]
+               if len(batch) > 1 and len({index for index, _ in batch}) == len(batch)
+               and not contradictory_qualifiers(node for _, node in batch)]
     if not matches:
         return
     for key, batch in matches:
@@ -633,8 +666,20 @@ def _adopt_definition(entry, target, graph, matched_ids):
         if node['id'] not in matched_ids and old_type == new_type and old_keys == new_keys:
             continue
         _record_origin(node, old_type, old_keys, matched=node['id'] in matched_ids)
-        node.update(type=new_type, identity=dict(zip(new_keys, (node['identity'][n] for n in old_keys))))
-        if 'identity_types' in node:
+        if entry.named_composite:
+            # The original source mapping enumerated columns in old_keys
+            # order. Keep that witness and project the same pairs under the
+            # adopted definition's ordering for downstream replay.
+            if old_keys != new_keys:
+                for support in node['supports']:
+                    prov = support['provenance']
+                    columns = dict(zip(old_keys, prov['key_columns'], strict=True))
+                    prov.setdefault('original_key_columns', list(prov['key_columns']))
+                    prov['key_columns'] = [columns[name] for name in new_keys]
+            node['type'] = new_type
+        else:
+            node.update(type=new_type, identity=dict(zip(new_keys, (node['identity'][n] for n in old_keys))))
+        if not entry.named_composite and 'identity_types' in node:
             node['identity_types'] = {new: node['identity_types'][old] for new, old in
                                      zip(new_keys, old_keys) if old in node['identity_types']}
         for marker in ('original_type', 'definition_variant'):

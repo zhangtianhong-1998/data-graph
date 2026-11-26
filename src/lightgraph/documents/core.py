@@ -2,6 +2,7 @@
 from __future__ import annotations
 import re
 import hashlib
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 import yaml
@@ -298,7 +299,6 @@ class DocumentCorpus:
             applicable=[t for t,cols in entries if self.applies_to(doc,t,cols)]
             if not applicable:
                 continue
-            sources=[_source_ref(t).model_dump(mode='json',by_alias=True) for t in applicable]
             for section in doc.sections:
                 self._validate_section_scope(doc,section)
                 scope=section.scope or doc.scope
@@ -351,6 +351,70 @@ def _table_names(table):
 def _column_matches(selector, table, column_names):
     return any(selector==name or selector in {f'{prefix}.{name}' for prefix in _table_names(table)}
                for name in column_names)
+
+
+@lru_cache(maxsize=32)
+def _workbook_table_names(path, schema, header_row, include_hidden, stamp):
+    from lightgraph.sources.excel import ExcelSource
+    with ExcelSource(path, schema_name=schema, header_row=header_row,
+                     include_hidden=include_hidden, metadata_only=True) as workbook:
+        return tuple(t.qualified_name for t in workbook.describe())
+
+
+def _authorized_table_names(source):
+    if source.allowed_tables:
+        return source.allowed_tables
+    if source.kind == 'csv_file':
+        return (f"{source.schema_name}.{source.table_name or Path(source.path).stem}",)
+    if source.kind == 'excel_workbook':
+        from lightgraph.runtime.files import file_stamp
+        return _workbook_table_names(source.path, source.schema_name, source.header_row,
+                                     source.include_hidden, file_stamp(Path(source.path)))
+    # Without an authorized inventory a database short name cannot be
+    # proven unique. Building an extraction unit must never open a sibling DB.
+    raise LightGraphError('document_project_table_catalog_required')
+
+
+def resolve_workflow_table_selectors(paths, sources, removed_ids):
+    """Bind legacy table names to one physical table before the coordinator splits the catalog."""
+    catalog = {}
+    resolved = {}
+    for document in load_documents(paths):
+        if document.document_id in removed_ids or document.derived:
+            continue
+        for scope in (document.scope, *(s.scope for s in document.sections if s.scope)):
+            eligible = [s for s in sources if not scope.source_ids or s.id in scope.source_ids]
+            for selector in scope.tables:
+                if any(selector.startswith((s.id + ':', s.id + '.'))
+                       and '.' in selector[len(s.id) + 1:] for s in sources):
+                    continue
+                key = digest(sorted(scope.source_ids), selector)
+                if key in resolved:
+                    continue
+                if len(eligible) == 1 and selector.count('.') == 1:
+                    if not scope.source_ids:
+                        resolved[key] = f'{eligible[0].id}:{selector}'
+                    continue
+                matches = set()
+                for source in eligible:
+                    if source.id not in catalog:
+                        catalog[source.id] = _authorized_table_names(source)
+                    for table in catalog[source.id]:
+                        qualified = table if '.' in table else f'{source.schema_name}.{table}'
+                        if selector in {qualified, qualified.split('.', 1)[1]}:
+                            matches.add(f'{source.id}:{qualified}')
+                if len(matches) > 1:
+                    raise LightGraphError('ambiguous_document_table_binding')
+                if not matches:
+                    raise LightGraphError('invalid_document_table_binding')
+                resolved[key] = matches.pop()
+    return resolved
+
+
+def qualify_document_tables(documents, resolved):
+    for doc in documents:
+        for scope in (doc.scope, *(s.scope for s in doc.sections if s.scope)):
+            scope.tables = [resolved.get(digest(sorted(scope.source_ids), name), name) for name in scope.tables]
 
 
 def project_document_to_unit(document, tables):

@@ -24,9 +24,12 @@ def write(path, value):
     Path(path).write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2)+'\n', encoding='utf-8')
 
 
-def environment():
+def environment(*, historical_discovery=False):
     packages = {}
-    for name in ('agentscope','openai','pydantic','httpx','PyYAML','sqlglot','openpyxl','jsonschema'):
+    names = ('openai','pydantic','httpx','PyYAML','sqlglot','openpyxl','jsonschema')
+    if historical_discovery:
+        names += ('agentscope',)
+    for name in names:
         try:
             packages[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -213,7 +216,9 @@ def verify(bundle):
         current_seed={p.relative_to(root).as_posix() for p in (root/'resume_seed').rglob('*') if p.is_file()}
         if current_seed != {p for p in protected if p.startswith('resume_seed/')}:
             raise LightGraphError('evaluation_frozen_seed_changed')
-    if environment() != manifest['environment']:
+    recorded = manifest['environment']
+    historical = isinstance(recorded, dict) and isinstance(recorded.get('packages'), dict) and 'agentscope' in recorded['packages']
+    if environment(historical_discovery=historical) != recorded:
         raise LightGraphError('evaluation_runtime_environment_changed')
     return manifest
 

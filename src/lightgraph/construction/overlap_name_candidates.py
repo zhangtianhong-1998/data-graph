@@ -85,7 +85,7 @@ def different_key_name_candidates(families, rows, covered, *, max_rows, max_comp
 
     choices = group_pairs(sources, qualified, inputs_by_owner)
     stats['omitted_patterns'] = max(0, len(choices) - max_patterns)
-    result = []
+    counts = []
     for members, names_count in choices[:max_patterns]:
         ordered = sorted(members, key=lambda m: len(keys[m]))
         # Disclose the exact full typed-key intersection, even when an equal key
@@ -96,5 +96,16 @@ def different_key_name_candidates(families, rows, covered, *, max_rows, max_comp
             return [], stats
         stats['comparisons'] += cost
         shared = sum(all(cell in keys[m] for m in ordered[1:]) for cell in keys[ordered[0]])
-        result.append(([sources[i][:2] for i in members], names_count, shared))
+        counts.append((members, names_count, shared))
+    result = []
+    for members, names_count, shared in counts:
+        coverage = []
+        if len(members) > 2:
+            pairs = list(combinations(range(len(members)), 2))
+            cost = sum(min(len(keys[members[i]]), len(keys[members[j]])) for i, j in pairs)
+            if stats['comparisons'] + cost <= max_comparisons:
+                stats['comparisons'] += cost
+                coverage = [{'member_indexes': [i, j], 'overlapping_keys': len(keys[members[i]] & keys[members[j]])}
+                            for i, j in pairs]
+        result.append(([sources[i][:2] for i in members], names_count, shared, coverage))
     return result, stats

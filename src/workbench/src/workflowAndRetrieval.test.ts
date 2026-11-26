@@ -183,7 +183,8 @@ beforeEach(() => {
                 failed_patterns: 1, omitted_patterns: 3, analysis_omitted_patterns: 2, selected_patterns: 1,
                 proposed_patterns: 3, verified_proposal_groups: 5, applied_proposal_groups: 4, proposal_collapsed_nodes: 6,
                 proposed_relation_patterns: 2, verified_relation_facts: 3, grouped_relation_edges: 7,
-                added_entity_rules: 2, model_calls: 2 } },
+                retry_batches: 2, expanded_output_retries: 1, recovered_patterns: 2, truncated_batches: 2,
+                added_entity_rules: 2, model_calls: 4 } },
             merge_3: { node_id: 'merge_3', label: '从产物恢复', merge_mode: 'merge_and_extract', status: 'completed', run_id: 'run_old' },
           },
           recomposed_nodes: ['merge_3'],
@@ -568,7 +569,9 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(review).toContain('其中 2 种符合整类合并条件')
     expect(review).toContain('3 个字段与角色对应方案，逐键核实 5 组，实际合并 4 组，减少 6 个节点')
     expect(review).toContain('2 个关系对应方案，核实 3 组同一层级事实，共有 7 条原始关系作依据')
-    expect(review).toContain('模型请求 2 次，送审 6 种，已列出但未送审 1 种')
+    expect(review).toContain('模型请求 4 次，送审 6 种，已列出但未送审 1 种')
+    expect(review).toContain('2 次请求的回复被截断')
+    expect(review).toContain('拆批重试 1 次，单模式提高输出额度重试 1 次，共补回 2 种模式的裁决')
     expect(review).toContain('1 种已送审的模式未取得有效裁决')
     expect(review).toContain('索引分析另省略 2 种模式')
     expect(review).toContain('部分模式未完成审查（模型回复被截断）')
@@ -649,10 +652,13 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
 
     await search({
       nodes: [{id: 'verified', kind: '设备', display_name: '已核实设备'}],
-      available_context: { ...emptyContext, status: 'partial', nodes: [{id: 'p', display_name: '部分匹配的设备'}] },
+      available_context: { ...emptyContext, status: 'partial', nodes: [{id: 'p', display_name: '部分匹配的设备',
+        observations: [{source_tables:['检修.设备'], provenance:{key_columns:['设备编码']}, observation_id:'o1'}]}] },
     }, '部分匹配的设备')
     expect(root.querySelector('.retrieval-detail-grid')?.textContent).toContain('已核实设备')
     expect(root.querySelector('.retrieval-detail-grid')?.textContent).not.toContain('部分匹配的设备')
+    expect(root.querySelector('.context-proofs')?.textContent).toContain('身份列 设备编码')
+    expect(root.querySelector('.context-proofs')?.textContent).toContain('来源记录 o1')
     await search({
       plan: { intent: 'clarify', conditions: [], unresolved: [], excluded_terms: [], parser_fallback: 'model_interpretation_unavailable' },
       grouping: { axis: '年代', paths: [{ node_ids: ['work', 'era'], edge_ids: ['catalog'], stop_reason: 'target_reached' }] },
@@ -668,6 +674,13 @@ describe('拖拽式工作流编排、可替换本地向量服务与手动延迟�
     expect(root.textContent).not.toContain('只符合部分条件')
     await search({ available_context: { ...emptyContext, status: 'no_confirmed_match' } }, '当前可见范围内未能确认匹配')
     expect(root.querySelector('[aria-label="来源原文"]')).toBeNull()
+    await search({ available_context: { ...emptyContext, status: 'definition_only' },
+      type_definitions: [{ category: 'entities', type: '收入指标', description: '只计已开票的金额',
+        example_binding: { source_tables: ['财务.收入'] } }] }, '找到了类型说明')
+    const definition = root.querySelector<HTMLDetailsElement>('[aria-label="已发布的类型说明"] details')!
+    expect(definition.open).toBe(true)
+    expect(definition.textContent).toContain('只计已开票的金额')
+    expect(definition.textContent).toContain('财务.收入')
     await search({ available_context: { ...emptyContext, status: 'scope_unresolved' } }, '尚未确认问题所指的适用范围')
     await search({ available_context: { ...emptyContext, status: 'search_unavailable' } }, '语义检索当前不可用')
   })

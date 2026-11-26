@@ -271,13 +271,17 @@ def run(args):
               'output':str(Path(args.output).resolve()),'format':'yaml'});return 0
     if args.command=='merge-graphs':
         from .construction.workflow import merge_project_workflow, resolve_workflow_plan
+        from .web.execution import verified_unit_loader
         config = load_config(args.config)
         plan = resolve_workflow_plan(config.workflow) if config.workflow else None
         if plan and plan.merge_order:
             raise LightGraphError('workflow_dag_requires_run')
         mode = {'direct_single': 'direct_output', 'direct_multi': 'direct_multi_output'}.get(plan.mode, 'merged') if plan else 'merged'
         units = args.unit or (plan.extract_ids if plan else None)
-        summary = merge_project_workflow(config.output_dir, config, unit_ids=units, mode=mode)
+        path = Path(args.config).resolve()
+        project = path.parent if path.name == 'config.yaml' and (path.parent / 'project.yaml').is_file() else None
+        loader = verified_unit_loader(config, project) if plan else None
+        summary = merge_project_workflow(config.output_dir, config, unit_ids=units, mode=mode, load_committed=loader)
         _analyze_after_build(args.config, config)
         emit({'status':'merged', **summary});return 0
     if args.command=='retrieve-subgraph':

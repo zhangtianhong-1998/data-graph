@@ -33,6 +33,16 @@ def _identity_label(node):
     return f"{node['type']}（{details}）" if details else node['type']
 
 
+def preferred_source_label(supports):
+    """Return (name, priority) from visible source observations, in display order."""
+    ranked = ((s['label_priority'], s['label']) for s in supports
+              if isinstance(s.get('label_priority'), int) and s.get('label'))
+    winner = min(ranked, default=None)
+    if winner is not None:
+        return winner[1], winner[0]
+    return min((s['label'] for s in supports if s.get('label') not in (None, '')), default=None), None
+
+
 def derive_display_graph(graph, *, copy=True):
     """Return a copy whose labels depend only on included supports and edges.
 
@@ -52,20 +62,16 @@ def derive_display_graph(graph, *, copy=True):
             annotate_visible_variants(node)
         # Legacy non-support fixtures have only a source label. Runtime graph
         # access rejects missing support metadata before reaching this function.
-        labels = sorted({support['label'] for support in supports or [] if support.get('label') not in (None, '')})
-        preferred = [(s['label_priority'], s['label']) for s in supports or []
-                     if isinstance(s.get('label_priority'), int) and s.get('label')]
-        if preferred:
-            labels = [min(preferred)[1]]
+        preferred, _ = preferred_source_label(supports or [])
         if supports is None and node.get('label') and node.get('label_origin', 'source') == 'source':
-            labels = [node['label']]
+            preferred = node['label']
         declared = defaultdict(list)
         for support in supports or []:
             for name, value in support.get('display_values', {}).items():
                 if value is not None and canonical(value) not in {canonical(v) for v in declared[name]}:
                     declared[name].append(value)
-        if labels:
-            text, origin = labels[0], 'source'
+        if preferred is not None:
+            text, origin = preferred, 'source'
             label_supports = [s for s in supports or [] if s.get('label') == text]
             if label_supports and all(s.get('source_kind') in {'catalog', 'declared'} for s in label_supports):
                 origin = 'metadata_declared' if any(s.get('source_kind') == 'declared' for s in label_supports) else 'metadata'

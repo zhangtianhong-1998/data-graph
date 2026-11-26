@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from lightgraph.contracts import canonical, digest
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.query import QueryCompiler
-from lightgraph.query.predicate import ScopeConjunction
+from lightgraph.query.predicate import ScopeConjunction, combine_scope_predicates
 from lightgraph.sources.validation_session import reuse_validation_sessions
 from lightgraph.sources.base import aggregate_count
 from lightgraph.sources.database_errors import cleanup_preserving_error
@@ -51,6 +51,17 @@ def _projection_columns(mapping):
 
 
 projection_columns = _projection_columns
+
+
+def requires_joint_detail(mapping):
+    left = getattr(mapping, 'source_lookup', None)
+    right = getattr(mapping, 'target_lookup', None)
+    if not (left and right and left.cardinality == right.cardinality == 'many'):
+        return False
+    if (left.source_id == '__base_graph__' or
+            (left.source_id, left.schema_name, left.table) != (right.source_id, right.schema_name, right.table)):
+        raise LightGraphError('lookup_joint_detail_required')
+    return True
 
 
 class _SheetRow(dict):
@@ -627,21 +638,84 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
         resolved = [(key_for(candidate, lookup.key_columns), candidate) for candidate in matched]
         if lookup.cardinality == 'one' and len({typed_key(key) for key, _ in resolved}) > 1:
             raise LightGraphError('lookup_reference_ambiguous')
-        answers = []
-        for key, candidate in resolved:
-            origin = {'source_id': lookup.source_id, 'schema': lookup.schema_name, 'table': lookup.table}
-            details = {'endpoint': end, 'source': origin, 'match_columns': lookup.match_columns,
-                       'key_columns': lookup.key_columns, 'input_columns': columns,
-                       'input_values': values, 'resolved_key': key,
-                       'input_value_types': [scalar_kind(value) for value in values],
-                       'resolved_key_types': [scalar_kind(value) for value in key],
-                       'scope_ref': support_scope(candidate, scope_columns(lookup))}
-            content = {c: candidate[c] for c in sorted(set(_projection_columns(lookup) + scope_columns(lookup)))}
-            details['row_context'] = {'id': 'ctx_' + digest(origin, typed_value(content)), 'values': content,
-                                     'value_types': {name: scalar_kind(value) for name, value in content.items()}}
-            answers.append((key, details))
-            lookup_matches += 1
-        return answers
+        lookup_matches += len(resolved)
+        return [(key, lookup_support(lookup, end, columns, values, key, candidate))
+                for key, candidate in resolved]
+
+    def lookup_support(lookup, end, columns, values, key, candidate, *, joint_columns=None):
+        origin = {'source_id': lookup.source_id, 'schema': lookup.schema_name, 'table': lookup.table}
+        details = {'endpoint': end, 'source': origin, 'match_columns': lookup.match_columns,
+                   'key_columns': lookup.key_columns, 'input_columns': columns,
+                   'input_values': values, 'resolved_key': key,
+                   'input_value_types': [scalar_kind(value) for value in values],
+                   'resolved_key_types': [scalar_kind(value) for value in key],
+                   'scope_ref': support_scope(candidate, scope_columns(lookup))}
+        content = {c: candidate[c] for c in sorted(set((joint_columns or _projection_columns(lookup)) + scope_columns(lookup)))}
+        details['row_context'] = {'id': 'ctx_' + digest(origin, typed_value(content)), 'values': content,
+                                 'value_types': {name: scalar_kind(value) for name, value in content.items()}}
+        return details
+
+    joint_indexes = {}
+    joint_projections = {}
+
+    def endpoint_pairs(mapping, row, relation, business_context, joint_required):
+        nonlocal lookup_omitted, lookup_matches
+        left, right = mapping.source_lookup, mapping.target_lookup
+        if not joint_required:
+            sources = resolve_endpoint(mapping, row, 'source', relation.source_type, business_context=business_context)
+            if sources:
+                targets = resolve_endpoint(mapping, row, 'target', relation.target_type, business_context=business_context)
+                for source in sources:
+                    for target in targets:
+                        yield source, target
+            return
+        # One projected detail row must contain both resolved keys and satisfy both lookups.
+        if id(mapping) not in joint_projections:
+            predicate = left.predicate or right.predicate
+            if left.predicate and right.predicate and canonical(left.predicate) != canonical(right.predicate):
+                predicate = combine_scope_predicates(left.predicate, right.predicate)
+            matches = list(dict.fromkeys(left.match_columns + right.match_columns))
+            keys = list(dict.fromkeys(left.key_columns + right.key_columns))
+            joint = left.model_copy(update={'match_columns': matches, 'key_columns': keys, 'predicate': predicate})
+            projection = projection_key(joint)
+            pinned_projections.add(projection)
+            cache_key = (projection, tuple(left.match_columns), tuple(right.match_columns))
+            joint_projections[id(mapping)] = (joint, cache_key)
+        joint, cache_key = joint_projections[id(mapping)]
+        if cache_key not in joint_indexes:
+            index = defaultdict(list)
+            for detail in rows_for(joint):
+                clock()
+                values = [detail[c] for c in left.match_columns + right.match_columns]
+                if any(value is None or value == '' for value in values):
+                    continue
+                token = typed_key(values)
+                charge_lookup(len(token.encode()) + 16)
+                index[token].append(detail)
+            joint_indexes[cache_key] = index
+        source_values = [row[c] for c in mapping.source_key_columns]
+        target_values = [row[c] for c in mapping.target_key_columns]
+        details = joint_indexes[cache_key].get(typed_key(source_values + target_values), ())
+        if not details:
+            # Preserve the declared per-endpoint missing policy and report the joint mismatch separately.
+            if not resolve_endpoint(mapping, row, 'source', relation.source_type, business_context=business_context):
+                return
+            if not resolve_endpoint(mapping, row, 'target', relation.target_type, business_context=business_context):
+                return
+            if left.on_missing == right.on_missing == 'omit':
+                lookup_omitted += 1
+                return
+            raise LightGraphError('lookup_joint_detail_unmatched')
+        for detail in details:
+            source = key_for(detail, left.key_columns)
+            target = key_for(detail, right.key_columns)
+            source_match = lookup_support(left, 'source', mapping.source_key_columns, source_values, source, detail,
+                                          joint_columns=_projection_columns(joint))
+            target_match = lookup_support(right, 'target', mapping.target_key_columns, target_values, target, detail,
+                                          joint_columns=_projection_columns(joint))
+            lookup_matches += 2
+            yield (source, source_match), (target, target_match)
+
 
     def provenance(kind, index, mapping):
         info = {'definition': kind, 'mapping': index,
@@ -840,6 +914,7 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                         diagnostic('mapping_source_unavailable', **location,
                                    blocked_sources=blocked_sources(mapping))
                         continue
+                    joint_required = requires_joint_detail(mapping)
                     rows = rows_for(mapping)
                     checked += 1
                     projected_rows += len(rows)
@@ -862,78 +937,70 @@ def execute_draft(draft, adapters, tables, *, goal=None, max_working_bytes=32 * 
                     for row in rows:
                         clock()
                         row_support = contribution(mapping, row, support)
-                        sources = resolve_endpoint(mapping, row, 'source', relation.source_type,
-                                                   business_context=row_support['business_context'])
-                        if not sources:
-                            # Explicitly omitted input rows cannot produce
-                            # a pair and must not fail on an unused target.
-                            continue
-                        targets = resolve_endpoint(mapping, row, 'target', relation.target_type,
-                                                   business_context=row_support['business_context'])
                         compatible_context_pairs = 0
-                        # Multiple matches are allowed only when the lookup
-                        # explicitly declares many, and only for this row.
-                        for source_key, source_match in sources:
-                            for target_key, target_match in targets:
-                                clock()
-                                current_support = contribution(mapping, row, support)
-                                matches = [deepcopy(match) for match in (source_match, target_match) if match is not None]
-                                inherited_contexts = [match['business_context'] for match in matches
-                                                      if 'inherited_node_id' in match]
-                                if inherited_contexts:
-                                    context = intersect_business_contexts(current_support['business_context'], *inherited_contexts)
-                                    if context is None:
-                                        continue
-                                    current_support['declared_business_context'] = current_support['business_context']
-                                    current_support['business_context'] = context
-                                compatible_context_pairs += 1
-                                if matches:
-                                    current_support['lookup_matches'] = matches
-                                    current_support['required_scope_refs'] = sorted({scope for match in matches
-                                        for scope in (match['scope_ref'], *match.get('required_scope_refs', []))})
-                                    refs = sorted({ref for match in matches for ref in match.get('evidence_refs', [])})
-                                    if refs:
-                                        current_support['evidence_refs'] = refs
-                                    if 'row_context' not in current_support:
-                                        values = {c: row[c] for c in sorted(set(_projection_columns(mapping) + scope_columns(mapping)))}
-                                        current_support['row_context'] = {
-                                            'id': 'ctx_' + digest(support['source'], typed_value(values)), 'values': values,
-                                            'value_types': {name: scalar_kind(value) for name, value in values.items()}}
-                                base_source = (source_match or {}).get('inherited_node_id')
-                                base_target = (target_match or {}).get('inherited_node_id')
-                                source = base_source or identity(relation.source_type, source_key)
-                                target = base_target or identity(relation.target_type, target_key)
-                                source_known = base_source is not None or source in nodes
-                                target_known = base_target is not None or target in nodes
-                                if not source_known or not target_known:
-                                    dependency_failed = ((not source_known and relation.source_type in incomplete_entity_types)
-                                        or (not target_known and relation.target_type in incomplete_entity_types))
-                                    diagnostic('relation_dependency_unavailable' if dependency_failed else
-                                               'unresolved_relation_endpoint', **location)
+                        inherited_pair = False
+                        for (source_key, source_match), (target_key, target_match) in endpoint_pairs(
+                                mapping, row, relation, row_support['business_context'], joint_required):
+                            clock()
+                            current_support = contribution(mapping, row, support)
+                            matches = [deepcopy(match) for match in (source_match, target_match) if match is not None]
+                            inherited_contexts = [match['business_context'] for match in matches
+                                                  if 'inherited_node_id' in match]
+                            if inherited_contexts:
+                                inherited_pair = True
+                                context = intersect_business_contexts(current_support['business_context'], *inherited_contexts)
+                                if context is None:
                                     continue
-                                if source == target:
-                                    if mapping.equal_endpoints == 'omit':
-                                        omitted += 1
-                                        continue
-                                    if mapping.equal_endpoints == 'error' or not relation.allow_self_links:
-                                        diagnostic('self_link_forbidden', **location)
-                                        continue
-                                context_identity = business_context_identity(current_support)
-                                edge_id = ('r_' + digest(relation.type, source, target, context_identity)
-                                           if context_identity['status'] != 'unknown' or context_identity['dimensions']
-                                           else 'r_' + digest(relation.type, source, target))
-                                edge = edges.get(edge_id)
-                                if edge is None:
-                                    edge = edges[edge_id] = {'id': edge_id, 'type': relation.type,
-                                        'source': source, 'target': target, 'properties': {}, 'provenance': [], 'supports': [],
-                                        'business_context': current_support['business_context']}
-                                    accumulation.register(edge)
-                                graph_properties(edge, mapping, row)
-                                accumulation.append(edge, 'provenance', support)
-                                if collect_sheet_rows and isinstance(row, _SheetRow) and row.witness:
-                                    current_support['source_row_witness'] = row.witness
-                                accumulation.append(edge, 'supports', current_support)
-                        if targets and not compatible_context_pairs:
+                                current_support['declared_business_context'] = current_support['business_context']
+                                current_support['business_context'] = context
+                            compatible_context_pairs += 1
+                            if matches:
+                                current_support['lookup_matches'] = matches
+                                current_support['required_scope_refs'] = sorted({scope for match in matches
+                                    for scope in (match['scope_ref'], *match.get('required_scope_refs', []))})
+                                refs = sorted({ref for match in matches for ref in match.get('evidence_refs', [])})
+                                if refs:
+                                    current_support['evidence_refs'] = refs
+                                if 'row_context' not in current_support:
+                                    values = {c: row[c] for c in sorted(set(_projection_columns(mapping) + scope_columns(mapping)))}
+                                    current_support['row_context'] = {
+                                        'id': 'ctx_' + digest(support['source'], typed_value(values)), 'values': values,
+                                        'value_types': {name: scalar_kind(value) for name, value in values.items()}}
+                            base_source = (source_match or {}).get('inherited_node_id')
+                            base_target = (target_match or {}).get('inherited_node_id')
+                            source = base_source or identity(relation.source_type, source_key)
+                            target = base_target or identity(relation.target_type, target_key)
+                            source_known = base_source is not None or source in nodes
+                            target_known = base_target is not None or target in nodes
+                            if not source_known or not target_known:
+                                dependency_failed = ((not source_known and relation.source_type in incomplete_entity_types)
+                                    or (not target_known and relation.target_type in incomplete_entity_types))
+                                diagnostic('relation_dependency_unavailable' if dependency_failed else
+                                           'unresolved_relation_endpoint', **location)
+                                continue
+                            if source == target:
+                                if mapping.equal_endpoints == 'omit':
+                                    omitted += 1
+                                    continue
+                                if mapping.equal_endpoints == 'error' or not relation.allow_self_links:
+                                    diagnostic('self_link_forbidden', **location)
+                                    continue
+                            context_identity = business_context_identity(current_support)
+                            edge_id = ('r_' + digest(relation.type, source, target, context_identity)
+                                       if context_identity['status'] != 'unknown' or context_identity['dimensions']
+                                       else 'r_' + digest(relation.type, source, target))
+                            edge = edges.get(edge_id)
+                            if edge is None:
+                                edge = edges[edge_id] = {'id': edge_id, 'type': relation.type,
+                                    'source': source, 'target': target, 'properties': {}, 'provenance': [], 'supports': [],
+                                    'business_context': current_support['business_context']}
+                                accumulation.register(edge)
+                            graph_properties(edge, mapping, row)
+                            accumulation.append(edge, 'provenance', support)
+                            if collect_sheet_rows and isinstance(row, _SheetRow) and row.witness:
+                                current_support['source_row_witness'] = row.witness
+                            accumulation.append(edge, 'supports', current_support)
+                        if inherited_pair and not compatible_context_pairs:
                             diagnostic('inherited_lookup_context_conflict', **location)
                 except LightGraphError as exc:
                     failed_operation(exc)

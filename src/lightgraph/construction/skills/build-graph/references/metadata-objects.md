@@ -4,7 +4,7 @@
 
 ## 列定义对象
 
-读取 `inspect_source(table, operation="get_metadata")` 或完整适用文档章节，取得实际签发的引用，再读取 `draft_schema`。以下仅示意语法，表、列、类型和证据必须按当前数据填写：
+读取 `inspect_source(table, operation="get_metadata")` 或标为 `definition_evidence` 的适用文档章节，取得实际签发的引用，再读取 `draft_schema`。标为 `exploration_guidance` 的段落可以指导下一次探查，字段定义和关系端点另需定义依据。以下仅示意语法，表、列、类型和证据必须按当前数据填写：
 
 ```yaml
 draft_id: semantic_analysis

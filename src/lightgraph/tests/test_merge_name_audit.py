@@ -15,6 +15,9 @@ def test_four_contributors_include_two_drafts_in_one_branch_and_keep_both_homony
     assert before['by_contributor']['first']['by_draft_version'] == [
         {'draft_id': 'map0', 'revision': 1, 'matching_input_nodes': 2},
         {'draft_id': 'map1', 'revision': 1, 'matching_input_nodes': 2}]
+    for node in before['by_contributor']['first']['nodes']:
+        assert node['source_bindings'] and all(b['key_columns'] and b['table'] for b in node['source_bindings'])
+    assert all(sum(k['nodes_by_type'].values()) == k['matched_nodes'] for k in before['by_typed_key'])
 
     mapping = {}
     def observe(kind, owner, original, final):

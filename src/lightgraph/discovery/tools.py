@@ -43,7 +43,7 @@ _SAFE_ERRORS = frozenset({
     "read_only_transaction_failed", "read_only_transaction_unverified", "snapshot_close_failed",
     "runtime_capability_unverified", "database_connection_failed", "database_reconnect_failed", "source_catalog_changed",
     "source_value_type_unsupported", "non_finite_source_value", "result_truncated",
-    "formula_cache_missing_in_projection",
+    "excel_error_cell_in_projection", "formula_cache_missing_in_projection",
     "document_context_too_large", "stale_document_reference", "document_reference_scope_mismatch",
 })
 _STRING = {"type": "string", "minLength": 1}

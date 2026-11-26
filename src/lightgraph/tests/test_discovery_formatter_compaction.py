@@ -1,12 +1,9 @@
 """Lossless preview reuse preserves native tools and all distinct evidence."""
-import asyncio
 from copy import deepcopy
 import json
 
-from agentscope.message import Msg
-
 from lightgraph.contracts import canonical
-from lightgraph.discovery.agentscope_runtime import DiscoveryFormatter
+from lightgraph.discovery.model_runtime import DiscoveryFormatter
 
 
 def section(**updates):
@@ -18,16 +15,17 @@ def section(**updates):
 
 def format_messages(result, documents, *, feedback=None):
     packet={'task':'T1_table_discovery','document_snippets':documents}
-    messages=[Msg('system','System rules','system'),Msg('user','Start discovery','user'),
-        Msg('assistant',[{'type':'tool_use','id':'provider_call','name':'search_knowledge',
-            'input':{'table':'s:public.items'}}],'assistant'),
-        Msg('tool',[{'type':'tool_result','id':'provider_call','name':'search_knowledge',
-            'output':[{'type':'text','text':canonical(result)}]}],'system')]
+    messages=[
+        {'role':'system','content':'System rules'},
+        {'role':'user','content':'Start discovery'},
+        {'role':'assistant','content':None,'tool_calls':[{'type':'function','id':'provider_call',
+            'function':{'name':'search_knowledge','arguments':canonical({'table':'s:public.items'})}}]},
+        {'role':'tool','tool_call_id':'provider_call','content':canonical(result)}]
     if feedback is not None:
-        messages.append(Msg('user',feedback,'user'))
-    original=[deepcopy(message.content) for message in messages]
-    output=asyncio.run(DiscoveryFormatter(packet,object()).format(messages))
-    assert [message.content for message in messages]==original
+        messages.append({'role':'user','content':feedback})
+    original=deepcopy(messages)
+    output=DiscoveryFormatter(packet,object()).format(messages)
+    assert messages==original
     return output
 
 

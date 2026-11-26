@@ -120,7 +120,7 @@ def test_config_paths_registered_and_forced_project_output(workspace):
 
 def test_uploaded_config_imports_filename_and_agent_env(workspace):
     workspace.add_file("project_a", "data.csv", b"code,name\n2150,expense\n")
-    agent = workspace.add_file("project_a", "agent.yaml", b"framework: agentscope\nllm:\n  mode: disabled\n  api_key_env: EXAMPLE_MODEL_KEY\n")
+    agent = workspace.add_file("project_a", "agent.yaml", b"framework: deepseek_harness\nllm:\n  mode: disabled\n  api_key_env: EXAMPLE_MODEL_KEY\n")
     config = workspace.add_file("project_a", "run.yaml", b"""sources:
   - id: source_a
     kind: csv_file

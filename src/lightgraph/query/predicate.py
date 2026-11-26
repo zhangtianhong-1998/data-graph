@@ -1,9 +1,10 @@
 """Predicate/1.0: bounded typed trees, bound values, and explicit NULL semantics."""
 from __future__ import annotations
-from datetime import date, datetime
+from datetime import date, datetime, time
 from dataclasses import dataclass, field
 import math
 from lightgraph.errors import LightGraphError
+from lightgraph.source_values import source_scalar
 from .dialects import normalized_type
 
 MAX_DEPTH=3
@@ -12,7 +13,7 @@ MAX_VALUES=128
 TEXT_TYPES={'text','varchar','character varying','character','char','nvarchar','string'}
 INTEGER_TYPES={'integer','int','int2','int4','int8','smallint','bigint'}
 NUMERIC_TYPES=INTEGER_TYPES|{'numeric','decimal','real','double precision','float','float4','float8'}
-DATE_TYPES={'date','timestamp','timestamp without time zone','timestamp with time zone','timestamptz'}
+DATE_TYPES={'date','time','timestamp','timestamp without time zone','timestamp with time zone','timestamptz'}
 ALIASES={'and':'all','gte':'ge','lte':'le','not_null':'is_not_null'}
 
 
@@ -34,6 +35,14 @@ def combine_scope_predicates(user_predicate, partition_filter):
     return ScopeConjunction(user_predicate, partition_filter)
 
 
+def parse_temporal_value(value, datatype):
+    parser = {'date': date, 'time': time}.get(datatype, datetime)
+    try:
+        return parser.fromisoformat(value)
+    except (TypeError, ValueError):
+        raise LightGraphError('predicate_date_invalid') from None
+
+
 def compile_predicate(table,predicate,params,*,column_sql,dialect):
     if isinstance(predicate, ScopeConjunction):
         # Each user/generated tree keeps the original depth and node bound;
@@ -46,7 +55,9 @@ def compile_predicate(table,predicate,params,*,column_sql,dialect):
     def bind(value):
         if len(params)>=MAX_VALUES:raise LightGraphError('predicate_values_limit')
         key=f'p{len(params)}'
-        params[key] = value.isoformat() if isinstance(value, date) and dialect != 'postgres' else value
+        if isinstance(value, (date, time)) and dialect != 'postgres':
+            value = source_scalar(value) if dialect == 'sqlite' else value.isoformat()
+        params[key] = value
         return ':'+key
     def scalar(value,datatype):
         if value is None:raise LightGraphError('predicate_null_requires_explicit_operator')
@@ -65,9 +76,7 @@ def compile_predicate(table,predicate,params,*,column_sql,dialect):
             return value
         if datatype in DATE_TYPES:
             if type(value) is not str:raise LightGraphError('predicate_value_type_mismatch')
-            try:parsed=date.fromisoformat(value) if datatype=='date' else datetime.fromisoformat(value)
-            except (ValueError,TypeError):raise LightGraphError('predicate_date_invalid') from None
-            return parsed
+            return parse_temporal_value(value, datatype)
         raise LightGraphError('predicate_type_unsupported')
     def visit(node,depth):
         nonlocal nodes

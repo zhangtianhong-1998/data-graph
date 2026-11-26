@@ -49,7 +49,9 @@ def test_cross_project_inheritance_bypasses_isolation_domain_and_resolves_base_e
     finally:
         tools_a.close()
 
-    # Project B has its own isolation_domain='proj_child' and ONLY mounts a new order table.
+    Path(resolved_a.sources[0].path).unlink()
+
+    # Project B mounts only its new order table. The original CSV has been archived.
     t_orders = TableSpec(source_id='new_db', name='orders', columns=[ColumnSpec(name='ord_id'), ColumnSpec(name='ind_name')])
     cfg_b = RunConfig.model_validate({
         'isolation_domain': 'proj_child',
@@ -463,3 +465,32 @@ sys.exit(0)
         ret = client.post('/api/projects/six_p/retrieval/query', json={'query': '维度_u1 和 维度_u6', 'hops': 1, 'top_p_seeds': 1}).json()
         assert any(b['display_name'] == '营业收入' and b['bridge_role'] == 'intermediate_bridge' for b in ret['bridge_nodes'])
 
+
+
+def test_freezing_a_published_schema_keeps_authorized_definition_and_origin(tmp_path):
+    from lightgraph.construction.access import filter_graph_scopes
+    from lightgraph.construction.inheritance import freeze_inherited_graphs
+    from lightgraph.construction.workflow import publish_premerged_graph
+    from lightgraph.runtime.config import InheritedGraphRef
+    from lightgraph.tests.test_graph_storage_integration import graph
+    from lightgraph.web.workspace import Workspace
+
+    workspace = Workspace(tmp_path / 'workspace')
+    workspace.create('Parent', 'parent')
+    workspace.create('Child', 'child')
+    parent, child = (workspace.result_config(pid) for pid in ('parent', 'child'))
+    raw = graph(parent, 'asset', 'part')
+    raw['definitions']['entities'][0].update(identity_evidence_refs=['e1'], identity_scope='global',
+                                            identity_domain='catalog')
+    merged = merge_construction_graphs([{'contributor_id': 'catalog', 'graph': raw,
+        'evidence_records': {'e1': {'kind': 'schema'}}}], target_access_fingerprint=raw['access_fingerprint'])
+    publish_premerged_graph(parent.output_dir, parent, merged=merged, included_units=[], skipped_units=[], unit_attempts={})
+    child.inherited_graphs = [InheritedGraphRef(inherit_id='baseline', source_project_id='parent', allowed_scopes=['public'])]
+    frozen = freeze_inherited_graphs(child, Path(child.output_dir) / 'construction', workspace=workspace)['base_graph']
+    visible = filter_graph_scopes(frozen, ['public'])
+    ref = 'base:baseline:unit:catalog:e1'
+    assert visible['evidence_refs'] == [ref]
+    assert visible['definitions']['entities'][0]['identity_evidence_refs'] == [ref]
+    assert visible['nodes'][0]['supports'][0]['provenance']['evidence_refs'] == [ref]
+    assert visible['evidence_catalog'] == {ref: {'contributor_id': 'catalog', 'original_ref': 'e1', 'kind': 'schema'}}
+    assert not filter_graph_scopes(frozen, [])['evidence_catalog']

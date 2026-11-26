@@ -18,7 +18,9 @@ npm --prefix src/workbench run build
 .venv/bin/lightgraph serve --port 8001
 ```
 
-仅测试当前构图、合并或工作台时，安装 `python -m pip install -e '.[test-harness]'`，再向 pytest 指定相应测试文件。这个配置只在运行依赖上增加 pytest。公开的旧版 Python 发现接口 `lightgraph.discovery.discover(..., model=...)` 仍可通过 `.[legacy-discovery]` 调用 AgentScope。运行包括该接口在内的完整回归时，先执行 `.venv/bin/python -m pip install -r requirements-test.lock`，再执行 `.venv/bin/python -m pip install --no-deps -e '.[test]'`。
+运行完整 Python 回归，先执行 `.venv/bin/python -m pip install -r requirements-test.lock` 和 `.venv/bin/python -m pip install --no-deps -e '.[test]'`，再运行 `.venv/bin/python -m pytest`。
+
+工作台和 CLI 使用 DeepSeek Harness 抽取。Python 中可通过 `lightgraph.pipeline.run_pipeline(config, adapters, discover_only=True)` 调用同一发现流程。需要在调用者进程内使用已有数据适配器和模型客户端时，使用 `lightgraph.discovery.discover(..., model=...)`。这个接口通过已授权的发现工具交互，与合并审查共用模型传输层。
 
 Windows 使用 `.venv\Scripts\python.exe` 和 `.venv\Scripts\lightgraph.exe`。内核启动器按当前 Python 的 scripts 安装目录解析，兼容虚拟环境与全局 Python 的 `Scripts` 布局。跨平台安装、原生内核及模拟模型测试由 GitHub Actions 执行，客户部署仍需单独验证。
 
@@ -56,7 +58,7 @@ Windows 使用 `.venv\Scripts\python.exe` 和 `.venv\Scripts\lightgraph.exe`。�
 
 合并节点已经算出节点数和关系数时，检查点仍可能在写入。提交失败后，可在原运行报告的「工作流节点执行与合并结果」中查看失败阶段、尝试次数及可用的系统错误号。若两路抽取的检查点均可核验，在原运行选择合并节点重跑即可复用两路输入。
 
-确定性合并记录和发布摘要 `construction/workflow-merge-summary.yaml` 会同时给出身份候选组数、涉及的不同节点数（`candidate_identity_nodes`），以及出现在多组中的节点数（`candidate_identity_nodes_in_multiple_groups`）。一个对象可以同时出现在同名组和同码组。实际能归并多少个节点，取决于各组的身份依据。
+工作流发布时，`construction/manifest.yaml` 的 `workflow_report_snapshot` 指向包含合并摘要和候选清单的快照。该快照的 `workflow-merge-summary.yaml` 与确定性合并记录均给出身份候选组数、涉及的不同节点数（`candidate_identity_nodes`），以及出现在多组中的节点数（`candidate_identity_nodes_in_multiple_groups`）。一个对象可以同时出现在同名组和同码组。实际能归并多少个节点，取决于各组的身份依据。两端均为多值查找的关系需要同一条明细同时支持两个端点。
 
 运行记录中，合并节点的「说明」显示上游输入、输出和同源去重数量。有跨表节点按字典成员合并时，另列这一步消除的副本数。按字典合并要求对象类型和角色相容，各来源引用同一个完整的字典唯一键，并在适用范围一致的观察中找到对应成员。
 
@@ -283,6 +285,8 @@ Agent 用 `read_workspace(summary_only=true)` 可分页查看草稿修订和验�
 草稿的 `unresolved` 只记录本次目标尚未完成的事项，可以为空；`decisions` 记录已采用的判断，`suggestions` 记录后续建议。建议不会把成功运行改为有缺口。旧草稿中的未决原文仍保留，需要明确修订后才改变状态。压缩摘要不能改写原始目标；目标和 skill 保留在不参与历史压缩的系统上下文中。
 
 没有名称列的节点可使用 `display_columns`，或从已关联对象生成显示名称；显示名称不参与身份计算。页面分别展示业务身份、访问范围和来源支持，搜索支持编码和别名。运行报告按草稿包、实体类型、关系类型和映射统计；工具结果的历史压缩单独标记。用量包含摘要调用与缓存输入，缺失的服务商用量标为未知。
+
+离线命令 `evaluate` 对带 `layer`、`status` 的评测图（`nodes`、`edges`）计分。工作台导出的 `semantica-json` 用于图交换，其实体与关系缺少评分所需的状态；将它传给评分器会返回 `evaluation_graph_format_unsupported`。
 
 ## 已验证与未验证
 

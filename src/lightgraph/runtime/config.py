@@ -348,6 +348,14 @@ class VerifiedProjectionRule(StrictModel):
     pattern_id: str = Field(pattern=r'^pattern_[0-9a-f]{24}$')
     bindings: tuple[ProjectionBinding, ...] = Field(min_length=2, max_length=24)
     observation_digests: tuple[str, ...] = Field(min_length=1, max_length=5000)
+    composition_version: Literal[1, 2] = 1
+
+    @model_serializer(mode='wrap')
+    def serialize_observation_rule(self, handler):
+        data = handler(self)
+        if self.composition_version == 1:
+            data.pop('composition_version', None)  # Preserve archived policy digests.
+        return data
 
     @model_validator(mode='after')
     def bound_members(self):
@@ -474,6 +482,7 @@ class WorkflowConfig(StrictModel):
 class RunConfig(StrictModel):
     model_config = ConfigDict(hide_input_in_errors=True)
     _agent: AgentConfig | None = PrivateAttr(default=None)
+    _document_table_bindings: dict[str, str] = PrivateAttr(default_factory=dict)
     agent_config: str | None = Field(default=None, min_length=1)
     isolation_domain: str = "default"
     fusion_policy: FusionPolicyConfig = Field(default_factory=FusionPolicyConfig)

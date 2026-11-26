@@ -605,7 +605,33 @@ def _overlap_eligibility_evidence(review, indexes, definitions):
     return evidence
 
 
-def _overlap_checkpoint_report(run, project, state, target, parents, *, prepare=False, include_evidence=False):
+def summarize_cross_table_checks(checks):
+    """Count proposal/key checks, including the same key again if a different proposal covers it."""
+    missing_section = Counter()
+    with_section = Counter()
+    checked = 0
+    for proposal in checks:
+        if 'cross_table_matched_key_checks' not in proposal:
+            continue
+        checked += 1
+        for row in proposal['cross_table_matched_key_checks']:
+            counter = with_section if row['shared_key_section_verified'] else missing_section
+            observation_ok = row['first_observation_result'] == 'observations_agree'
+            counter[observation_ok, row['unit_fingerprints_match']] += row['keys']
+
+    def matrix(counter):
+        return {'observations_and_access_match': counter[True, True],
+                'observation_check_failed': counter[False, True],
+                'unit_access_check_failed': counter[True, False],
+                'observation_and_unit_access_checks_failed': counter[False, False]}
+
+    return {'entity_proposals': len(checks), 'proposals_with_cross_table_check_table': checked,
+            'matched_cross_table_key_checks': sum(missing_section.values()) + sum(with_section.values()),
+            'without_common_key_section': matrix(missing_section), 'with_common_key_section': matrix(with_section)}
+
+
+def _overlap_checkpoint_report(run, project, state, target, parents, *, prepare=False, include_evidence=False,
+                               recheck_proposals=False):
     from lightgraph.construction.checkpoints import (
         load_checkpoint_overlap_index, prepare_checkpoint_overlap_index,
         read_checkpoint_overlap_review, verify_checkpoint_files,
@@ -642,6 +668,21 @@ def _overlap_checkpoint_report(run, project, state, target, parents, *, prepare=
         if (review["effective_merge_policy"].get("fusion_policy") != fused
                 or review.get("upstream_artifacts") != {p["node_id"]: p["artifact_id"] for p in parents}):
             raise ValueError("审查记录与提交图的上游产物或生效规则不一致。")
+        if recheck_proposals:
+            from lightgraph.construction.projection_proposals import attach_checkpoint_grant, verify_projection_proposals
+            from lightgraph.construction.source_namespaces import project_checkpoint_inputs
+
+            historical = review.get('proposal_checks', [])
+            proposals = [d for d in review['decisions'] if d['action'] == 'propose']
+            checks = []
+            if proposals:
+                inputs = project_checkpoint_inputs([load_checkpoint(location(p), p) for p in parents], run['project_id'])
+                inputs = [attach_checkpoint_grant(c, location(p), p) for c, p in zip(inputs, parents, strict=True)]
+                policy = MergePolicyConfig.model_validate(review['effective_merge_policy'])
+                _, checks = verify_projection_proposals(policy, inputs, review['patterns'], proposals)
+            return {**report, 'mode': 'recheck_committed_entity_proposals', 'committed_summary': review['summary'],
+                    'committed_proposal_checks': historical, 'current_proposal_checks': checks,
+                    'cross_table_check_summary': summarize_cross_table_checks(checks)}
         report.update(mode="committed_overlap_review", overlap_review=review)
         if include_evidence:
             indexes, definitions = {}, {}
@@ -661,7 +702,7 @@ def _overlap_checkpoint_report(run, project, state, target, parents, *, prepare=
             report['eligibility_evidence'] = _overlap_eligibility_evidence(review, indexes, definitions)
         return report
 
-    if include_evidence:
+    if include_evidence or recheck_proposals:
         raise ValueError("请选择已有模型审查记录的合并运行。")
     inputs = [{"contributor_id": p["node_id"], "kind": p["contributor_kind"], "source_namespace": run["project_id"]}
               for p in parents]
@@ -766,8 +807,12 @@ def committed_merge_policy(state, node_id, checkpoint):
 def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membership=False, compare_to=None,
           run_summary=False, include_edge_lineage=False, explain_identity=None, overlap_patterns_only=False,
           prepare_overlap_indexes=False, include_overlap_evidence=False, simulate_reviewed_key_pairs=None,
-          explain_identity_key=None, explain_name=None):
+          explain_identity_key=None, explain_name=None, recheck_proposals_only=False):
     """Use the run's committed inputs and policy, even when the current project has been edited."""
+    if recheck_proposals_only and any((run_summary, observations_only, overlap_patterns_only, prepare_overlap_indexes,
+                                      include_hierarchy_membership, compare_to, include_edge_lineage, explain_identity,
+                                      explain_name, simulate_reviewed_key_pairs, include_overlap_evidence)):
+        raise ValueError("--recheck-proposals-only 单独核查已提交的实体提议。")
     if simulate_reviewed_key_pairs and any((run_summary, observations_only, overlap_patterns_only, prepare_overlap_indexes)):
         raise ValueError('逐键规则模拟需要执行合并重放。')
     if include_overlap_evidence and not overlap_patterns_only:
@@ -782,8 +827,9 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         raise ValueError("--explain-identity 需要一个完整的文本键值，并执行合并重放")
     if explain_identity_key is not None and (explain_identity is None or not explain_identity_key.strip()):
         raise ValueError("--explain-identity-key 需要配合 --explain-identity 指定身份字段和文本键值")
-    if explain_name is not None and (not explain_name.strip() or run_summary or observations_only
-                                     or overlap_patterns_only or prepare_overlap_indexes):
+    names = [explain_name] if isinstance(explain_name, str) else list(dict.fromkeys(explain_name or []))
+    if names and (any(not name.strip() for name in names) or run_summary or observations_only
+                  or overlap_patterns_only or prepare_overlap_indexes):
         raise ValueError("--explain-name 需要完整名称和合并重放。")
     run, project, state = archived_state(run_file)
     if run_summary:
@@ -813,18 +859,25 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
 
     parents = direct_merge_parents(state, target)
 
-    if overlap_patterns_only or prepare_overlap_indexes:
+    if overlap_patterns_only or prepare_overlap_indexes or recheck_proposals_only:
         return _overlap_checkpoint_report(run, project, state, target, parents, prepare=prepare_overlap_indexes,
-                                          include_evidence=include_overlap_evidence)
+                                          include_evidence=include_overlap_evidence, recheck_proposals=recheck_proposals_only)
 
     checkpoint = read(target)
     committed = checkpoint["graph"]
     review, policy = committed_merge_policy(state, node_id, checkpoint)
     fused = committed["fusion_policy"]
     counts = graph_counts(committed)
-    if explain_name is not None:
-        from lightgraph.construction.merge_name_audit import MergeNameAudit, name_population, name_rows
-        counts['name_accounting'] = name_population(name_rows(committed, explain_name), explain_name)
+    def record_names(section, field, by_name):
+        if len(names) == 1:
+            section[field] = by_name[names[0]]
+        else:
+            section[field + '_by_name'] = by_name
+
+    if names:
+        from lightgraph.construction.merge_name_audit import MergeNameAudit, name_population, name_rows_by_name
+        record_names(counts, 'name_accounting', {n: name_population(rows, n)
+                                                 for n, rows in name_rows_by_name(committed, names).items()})
     if include_edge_lineage:
         counts["row_digests"] = _graph_row_digests(committed)
     counts["integrity"] = output_checks(committed)
@@ -860,10 +913,11 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         report["added_entity_rules"] = report["effective_entity_rules"] - report["explicit_entity_rules"]
     if include_edge_lineage:
         report['lineage_input_artifacts'] = {r['node_id']: r['artifact_id'] for r in parents}
-    name_audit = None
-    if explain_name is not None:
-        name_audit = MergeNameAudit(inputs, explain_name)
-        report['name_accounting_inputs'] = name_audit.inputs()
+    name_audits = {}
+    if names:
+        name_audits = MergeNameAudit.for_names(inputs, names)
+        named_ids = {key for name_audit in name_audits.values() for key in name_audit.input_rows}
+        record_names(report, 'name_accounting_inputs', {n: a.inputs() for n, a in name_audits.items()})
     control_ids = set()
     passes = [(False, "without_source_replay", policy), (True, "with_source_replay", policy)]
     if simulate_reviewed_key_pairs:
@@ -879,11 +933,11 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
             stage = {_edge_key(ref, 'edge_id') for ref in refs}
 
         options = {'observe_before_hierarchy': capture_stage} if include_edge_lineage else {}
-        if name_audit is not None:
+        if name_audits:
             named_input_lineage = {}
 
             def capture_named_input(kind, owner, original_id, output_id):
-                if kind == 'unit' and (owner, original_id) in name_audit.input_rows:
+                if kind == 'unit' and (owner, original_id) in named_ids:
                     named_input_lineage[owner, original_id] = output_id
 
             options['observe_node_lineage'] = capture_named_input
@@ -900,8 +954,10 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
                                  node_reduction_vs_current_code_baseline=report['with_source_replay']['output_nodes'] - len(graph['nodes']))
         if 'hierarchy_trace' in options:
             report[label]['identity_trace'] = options['hierarchy_trace'].report(graph)
-        if name_audit is not None:
-            report[label]['name_accounting'] = name_audit.replay(graph, named_input_lineage)
+        if name_audits:
+            output_rows = name_rows_by_name(graph, names)
+            record_names(report[label], 'name_accounting',
+                         {n: a.replay(graph, named_input_lineage, rows=output_rows[n]) for n, a in name_audits.items()})
         if label == 'with_source_replay' and review and 'relation_proposal_checks' in review:
             from lightgraph.construction.relation_proposals import verify_relation_proposals
             relations = verify_relation_proposals(graph, review['patterns'], review['decisions'])
@@ -940,7 +996,7 @@ def audit(run_file, node_id, *, observations_only=False, include_hierarchy_membe
         modules.append(sys.modules['lightgraph.construction.reviewed_keys'])
     if explain_identity is not None:
         modules.append(sys.modules['lightgraph.construction.hierarchy_trace'])
-    if name_audit is not None:
+    if name_audits:
         modules.append(sys.modules['lightgraph.construction.merge_name_audit'])
     source_files = {m.__name__: Path(m.__file__).read_bytes() for m in modules}
     report["source_sha256"] = {name: hashlib.sha256(content).hexdigest() for name, content in source_files.items()}
@@ -956,6 +1012,7 @@ def main():
     parser.add_argument("--node", default="merge_1", help="要核对的合并节点 ID")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--overlap-patterns-only", action="store_true", help="只读已提交的审查记录或上游类型索引，不打开节点和边数据")
+    mode.add_argument("--recheck-proposals-only", action="store_true", help="用原抽取检查点重新核查已提交的实体提议，列出证据缺口，不调用模型或重跑合并")
     mode.add_argument("--prepare-overlap-indexes", action="store_true", help="为所选合并节点的旧抽取检查点补建类型索引；已存在的索引直接复用")
     mode.add_argument("--run-summary", action="store_true", help="只读正式运行记录、检查点标记和 Parquet 行数，不加载图或重放合并")
     mode.add_argument("--observations-only", action="store_true", help="只核查已提交图的实际观测，跳过合并重放")
@@ -966,7 +1023,7 @@ def main():
     parser.add_argument("--include-overlap-evidence", action="store_true", help="配合 --overlap-patterns-only 对照已审模式的上游契约、权限指纹和邻接见证数")
     parser.add_argument("--explain-identity", metavar="CODE", help="按完整的单字段文本键值，列出层级合并实际检查的节点、来源和判定")
     parser.add_argument("--explain-identity-key", metavar="FIELD", help="按指定逻辑身份字段查找该值，适用于由编码和名称组成的复合键")
-    parser.add_argument("--explain-name", metavar="NAME", help="按精确名称核对各抽取单元、草稿、已提交图和重放图，列出每个原节点的去向")
+    parser.add_argument("--explain-name", action="append", metavar="NAME", help="按精确名称核对草稿至输出的节点去向；可重复指定，一次重放核对多个名称")
     parser.add_argument("--compare-hierarchy-audit", type=Path, metavar="AUDIT_JSON",
                         help="与同一批检查点的上一轮完整审计报告逐组比较，并输出本轮成员映射")
     args = parser.parse_args()
@@ -979,6 +1036,7 @@ def main():
                        explain_identity=args.explain_identity, explain_identity_key=args.explain_identity_key,
                        explain_name=args.explain_name,
                        overlap_patterns_only=args.overlap_patterns_only,
+                       recheck_proposals_only=args.recheck_proposals_only,
                        prepare_overlap_indexes=args.prepare_overlap_indexes, include_overlap_evidence=args.include_overlap_evidence,
                        simulate_reviewed_key_pairs=args.simulate_reviewed_key_pairs)
     except LightGraphError as exc:

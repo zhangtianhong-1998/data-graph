@@ -26,6 +26,20 @@ def normalize_value(value, operations):
     return value
 
 
+def merge_property_values(existing, incoming, seen):
+    """Append distinct typed observations in source order, indexing each value once."""
+    for name, values in incoming.get('properties', {}).items():
+        dest = existing.setdefault('properties', {}).setdefault(name, [])
+        if name not in seen:
+            seen[name] = {canonical(value) for value in dest}
+        keys = seen[name]
+        for value in values:
+            key = canonical(value)
+            if key not in keys:
+                keys.add(key)
+                dest.append(deepcopy(value))
+
+
 def definition_contract(definition):
     """Compare meaning independently of presentation and internal variant names."""
     result = {k: deepcopy(v) for k, v in definition.items()
@@ -428,6 +442,7 @@ def prepare_graph(graph, policy, *, copy=True, self_contained=None, local_namesp
 
     canonical_rules = {rule.canonical_type: rule for rule in policy.entity_rules}
     remap = {}
+    raw_ids = [node['id'] for node in result.get('nodes', [])]
     original_key_names = {d['type']: list(d['key_names']) for d in result.get('definitions', {}).get('entities', [])}
 
     def prepared(item, keys):
@@ -503,6 +518,15 @@ def prepare_graph(graph, policy, *, copy=True, self_contained=None, local_namesp
             if not node.get('supports'):
                 observations = _property_observations(node.get('properties', {}), rule, {})
             node['properties'] = _property_values(observations)
+    if len(set(remap.values())) < len(remap):
+        from .observed_identity import contradictory_qualifiers
+        members = defaultdict(list)
+        for raw_id, node in zip(raw_ids, result.get('nodes', []), strict=True):
+            members[node['id']].append((raw_id, node))
+        for target, occurrences in members.items():
+            if len(occurrences) > 1 and contradictory_qualifiers(node for _, node in occurrences):
+                for original, node in occurrences:
+                    remap[original] = node['id'] = 'n_' + digest('fusion_qualifier_conflict', target, original)
     if self_contained is None:
         self_contained = not result.get('extends_base_graph')
     remap_graph_endpoints(result, remap, self_contained=self_contained, record_fusion=True)

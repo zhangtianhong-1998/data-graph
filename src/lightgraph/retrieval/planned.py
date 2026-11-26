@@ -4,7 +4,7 @@ from .dimensional import empty_answer, retrieve_dimensional
 from .grouping import retrieve_grouping
 from .drilldown import retrieve_drilldown
 from .traversal import retrieve_traversal
-from .path_evidence import grounds_slot
+from .path_evidence import evidence_preview, grounds_slot, path_node
 from .intent import build_plan, _parent_roles, _residuals
 
 
@@ -75,7 +75,7 @@ def _available_context(retriever, request, scopes, plan, answer=None):
         if node:
             observation = next((obs for obs in node['observations'] if grounds_slot(node, obs, slot)), None)
             if observation is not None:
-                context['nodes'].append({'id': nid, 'display_name': observation.get('label') or node['display_name']})
+                context['nodes'].append(path_node(node, evidence_preview(observation), [], True))
     # A verified intersection of a subset has its own witnesses. Keep its
     # graph outside the main nodes/edges even when it fits all output budgets.
     co_observation = not (plan.get('operation') == 'traverse' or request.mode == 'traverse')

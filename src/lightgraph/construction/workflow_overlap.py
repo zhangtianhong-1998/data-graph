@@ -1,4 +1,4 @@
-"""Run one bounded overlap review for sibling extract checkpoints in a single batch."""
+"""Review overlaps between sibling checkpoints from the same extraction run."""
 from __future__ import annotations
 
 import time
@@ -125,6 +125,10 @@ def merge_with_overlap_review(config, node, policy, inputs, input_ids, artifacts
         'submitted_patterns': result.get('submitted_patterns', result['reviewed_patterns']),
         'failed_patterns': result.get('failed_patterns', 0),
         'batch_count': len(result.get('batches', [])),
+        'retry_batches': result.get('retry_batches', 0),
+        'expanded_output_retries': result.get('expanded_output_retries', 0),
+        'recovered_patterns': result.get('recovered_patterns', 0),
+        'truncated_batches': result.get('truncated_batches', 0),
         'reviewed_patterns': result['reviewed_patterns'],
         'omitted_patterns': result['omitted_patterns'] + pattern_summary.get('omitted_patterns', 0),
         'truncated': bool(pattern_summary.get('truncated')

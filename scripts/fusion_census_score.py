@@ -2,6 +2,23 @@
 from collections import Counter, defaultdict
 
 
+def _pair_state(mapping, left, right):
+    a, b = mapping.get(left), mapping.get(right)
+    if a is None or b is None:
+        return 'unverified_output'
+    return 'together' if a == b else 'separate'
+
+
+def _verdict(expected, state):
+    if expected == 'unknown':
+        return 'unknown_truth'
+    if state == 'unverified_output':
+        return state
+    if state == 'together':
+        return 'tp' if expected == 'together' else 'fp'
+    return 'fn' if expected == 'together' else 'tn'
+
+
 def score(truth, run_id, artifact_id, node_ids, node_maps, edge_lines, input_maps=None, fact_map=None, relation_maps=None, blocks=()):
     if (truth.get('run_id'), truth.get('artifact_id')) != (run_id, artifact_id):
         raise ValueError('裁决清单的运行或产物与本次提交图不符。')
@@ -55,15 +72,7 @@ def score(truth, run_id, artifact_id, node_ids, node_maps, edge_lines, input_map
                 bucket = 'missed_by_candidate_blocks'
             coverage[kind, stratum][bucket] += 1
         for scenario, mapping in scenarios.items():
-            a, b = mapping.get(left), mapping.get(right)
-            if expected == 'unknown':
-                verdict = 'unknown_truth'
-            elif a is None or b is None:
-                verdict = 'unverified_output'
-            elif a == b:
-                verdict = 'tp' if expected == 'together' else 'fp'
-            else:
-                verdict = 'fn' if expected == 'together' else 'tn'
+            verdict = _verdict(expected, _pair_state(mapping, left, right))
             evaluated[kind, scenario, stratum].append(verdict)
             if verdict in {'fp', 'fn', 'unverified_output'}:
                 missed.append({**row, 'scenario': scenario, 'result': verdict})
@@ -77,3 +86,36 @@ def score(truth, run_id, artifact_id, node_ids, node_maps, edge_lines, input_map
     return {'basis': 'version_pinned_supplied_truth_pairs_only', 'pairs': len(rows), 'strata': table,
             'disagreements_or_unverified': missed, 'positive_entity_candidate_coverage': [
                 {'kind': k, 'stratum': label, **counts} for (k, label), counts in sorted(coverage.items())]}
+
+
+def compare_input_pairs(truth, first, first_mapping, second_mapping):
+    """Score source occurrences, so a split remains observable even if baseline IDs coincide."""
+    if not truth['pairs']:
+        raise ValueError('双提交评分至少需要一条独立的输入节点对标注。')
+    if any(row.get('kind') != 'input_entity' for row in truth['pairs']):
+        raise ValueError('双提交对照需要 input_entity 裁决，以原单元和节点 ID 标注两端。')
+    result = score(truth, first['run_id'], first['artifact_id'], {}, {}, {},
+                   input_maps={'committed': first_mapping, 'comparison': second_mapping})
+    changed = {('fn', 'tp'): 'correct_merge', ('tn', 'fp'): 'new_false_merge',
+               ('fp', 'tn'): 'correct_split', ('tp', 'fn'): 'new_false_split'}
+    counts = Counter()
+    pairs = []
+    for row in truth['pairs']:
+        left, right = tuple(row['left']), tuple(row['right'])
+        before = _pair_state(first_mapping, left, right)
+        after = _pair_state(second_mapping, left, right)
+        if row['expected'] == 'unknown':
+            change = 'unknown_truth'
+        elif 'unverified_output' in (before, after):
+            change = 'unverified_output'
+        elif before == after:
+            change = 'unchanged'
+        else:
+            change = changed[_verdict(row['expected'], before), _verdict(row['expected'], after)]
+        counts[change] += 1
+        pairs.append({**row, 'before': before, 'after': after, 'change': change})
+    strata = [{**row, 'scenario': 'first' if row['scenario'] == 'committed' else 'second'}
+              for row in result['strata']]
+    return {'labeled_pairs': len(pairs), 'strata': strata,
+            'transition_counts': {key: counts[key] for key in (
+                *changed.values(), 'unchanged', 'unknown_truth', 'unverified_output')}, 'pair_results': pairs}

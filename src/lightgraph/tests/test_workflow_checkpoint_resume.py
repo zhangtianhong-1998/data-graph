@@ -390,3 +390,32 @@ def test_explicit_offline_recomposition_of_legacy_worker_delta(workflow):
     assert load_workflow_state(out, rid) == old_state
     assert (stage / 'construction' / 'manifest.yaml').read_bytes() == source_head
     assert before == set(project.glob('started-*'))
+
+
+def test_unit_retry_rejects_old_checkpoint_resigned_after_source_change(workflow):
+    from lightgraph.construction.checkpoints import commit_checkpoint, load_checkpoint
+    from lightgraph.construction.workflow import save_workflow_state
+    from lightgraph.web.execution import _WorkflowInputProofs
+
+    manager, project, config = workflow
+    source = wait_run(manager, 'alpha', manager.start('alpha')['run_id'])
+    prior = source['workflow_state']
+    old = prior['artifacts']['a']
+    unit = load_checkpoint(config.output_dir, old)
+    config.goal_markdown = 'Use the revised interpretation.'
+    proofs = _WorkflowInputProofs(config, project, _input_manifest(config, project))
+    assert old['input_digest'] != proofs.current['a']
+    # This is the marker an older retry produced for the old rows under the new inputs.
+    copied_id = 'run_' + 'c' * 24
+    copied = commit_checkpoint(config.output_dir, copied_id, 'a', unit, graph_kind='node_delta',
+                               input_digest=proofs.current['a'], source_attempt=source['run_id'],
+                               result_policy_id=old['result_policy_id'])
+    prior['parent_run_id'] = copied_id
+    prior['node_inputs']['a'] = proofs.current['a']
+    prior['artifacts']['a'] = copied
+    prior['workflow_input'] = digest(access_fingerprint(config), config.workflow.model_dump(mode='json'),
+        config.goal_markdown, config.goal.model_dump(mode='json'), _input_manifest(config, project))
+    save_workflow_state(config.output_dir, prior)
+    with pytest.raises(LightGraphError, match='workflow_resume_input_changed') as exc:
+        manager.retry_unit('alpha', 'b')
+    assert exc.value.node_id == 'a'

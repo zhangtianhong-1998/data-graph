@@ -10,7 +10,7 @@ from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
 from lightgraph.query import QueryCompiler
 from .access import scope_binding_map
-from .executor import _projection_columns
+from .executor import _projection_columns, requires_joint_detail
 from .inherited_endpoints import inherited_contract_error, graph_entity_contracts
 from .models import GraphDraft
 from .metadata_columns import is_metadata_mapping, metadata_endpoint, mapping_predicate, checked_column
@@ -75,6 +75,7 @@ def validate_structure(draft, tables, *, goal=None, dialects=None, scope_binding
                             'source_kind': 'metadata_column', 'evidence_refs': mapping.evidence_refs,
                             'fact_queries': 0})
                     else:
+                        requires_joint_detail(mapping)
                         check(mapping, _projection_columns(mapping), path)
                         _, endpoint = metadata_endpoint(mapping)
                         if endpoint is not None:

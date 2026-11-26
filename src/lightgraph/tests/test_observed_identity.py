@@ -45,8 +45,7 @@ def test_merge_counts_report_directed_endpoint_pairs_per_edge_record(endpoints, 
 
 
 def test_overlapping_identity_candidates_count_members_once_in_run_and_publication(tmp_path):
-    from lightgraph.construction.workflow import publish_premerged_graph
-    from lightgraph.construction.workspace import read_internal_yaml
+    from lightgraph.construction.workflow import publish_premerged_graph, published_workflow_summary
     from lightgraph.tests.test_construction_tools import config_for
 
     contributors = []
@@ -62,7 +61,7 @@ def test_overlapping_identity_candidates_count_members_once_in_run_and_publicati
     output = tmp_path / 'publication'
     publish_premerged_graph(output, config, merged=merged, included_units=['a', 'b', 'c'],
                             skipped_units=[], unit_attempts={})
-    summary = read_internal_yaml(output / 'construction' / 'workflow-merge-summary.yaml')
+    summary = published_workflow_summary(output)
     assert summary['nodes'] == 3 and summary['candidate_identity_merges'] == 2
     assert summary['semantic_status'] == 'pending_alignment'
     assert summary['merge_counts'] == merged['fusion_diagnostics']

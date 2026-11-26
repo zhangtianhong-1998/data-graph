@@ -7,7 +7,7 @@ version together. History retains both the original graph and all prior views.
 from contextlib import contextmanager
 from copy import deepcopy
 from functools import cached_property
-from itertools import islice
+from itertools import combinations, islice
 import logging
 import shutil
 from datetime import datetime, timezone
@@ -100,8 +100,11 @@ class CandidateIndex:
         existing = {frozenset(group['node_ids']) for group in stored}
         suggestions = [group for group in domain_variant_candidates(graph, local_workspace=local_workspace)
                        if frozenset(group['node_ids']) not in existing]
+        inherited = {tuple(row['members']) for row in graph.get('identity_separations', [])}
         for group in [*stored, *suggestions]:
             members = sorted(state.expanded(group['node_ids']))
+            if inherited and all(pair in inherited for pair in combinations(members, 2)):
+                continue
             if set(members) <= self.nodes.keys():
                 self.groups[candidate_key(base_id, group)] = (members, group)
 

@@ -18,7 +18,7 @@ from fusion_census_edges import analyze_edges, analyze_relation_facts
 from fusion_census_hypotheses import discover, summarize_multiway_outputs
 from fusion_census_nodes import analyze_nodes
 from fusion_census_replay import prepare_replay_baseline, run_joint_replay
-from fusion_census_score import score
+from fusion_census_score import compare_input_pairs, score
 
 
 def read(path):
@@ -55,6 +55,7 @@ def census_stage(location, record, directory, unit, excluded_values, families):
     write(directory, 'relation-facts.json', facts)
     print(f"完成 {record['node_id']} 全图普查", flush=True)
     return {'node_id': record['node_id'], 'artifact_id': record['artifact_id'], 'graph_digest': record['graph_digest'],
+            'checkpoint_run_id': record['run_id'], 'artifact_status': record['artifact_status'],
             'kind': 'unit' if unit else 'committed', 'directory': directory.name,
             'rows': {'nodes': len(graph['nodes']), 'edges': len(graph['edges'])},
             'nodes': node_counts, 'edges': edge_counts, 'relation_facts': facts['summary'],
@@ -104,7 +105,8 @@ def _report(out, report):
         facts = stage['relation_facts']
         lines.append(f"|{key}|{physical['within_only']}|{physical['cross_only']}|{physical['joint']}|"
                      f"{facts['confirmed_reduction']}|{facts['candidate_groups_with_unresolved_pairs']}|")
-    lines.extend(['', '|实验|运行结果|净减节点|净减原始边|净减画布线|净减断言（按本次假设）|', '|---|---|---:|---:|---:|---:|'])
+    if not report.get('committed_only'):
+        lines.extend(['', '|实验|运行结果|净减节点|净减原始边|净减画布线|净减断言（按本次假设）|', '|---|---|---:|---:|---:|---:|'])
     for label, scenario in report.get('scenarios', {}).items():
         delta = scenario.get('delta', {})
         lines.append(f"|{label}|{scenario['status']}|{delta.get('nodes_removed', '—')}|"
@@ -139,16 +141,28 @@ def _report(out, report):
     if differences:
         lines.extend(['', f"联合重放比指定清单额外减少 {differences['nodes_removed']} 个节点、"
                       f"{differences['raw_edges_removed']} 条原始边和 {differences['canvas_lines_removed']} 条画布线。"])
-    lines += ['', '节点候选允许重叠；已排除、无法验证和有冲突的模式请查各检查点的 nodes.json、edges.json 与 hypotheses.json。',
-              'reference 使用指定的逐键清单。exploratory 另加入同族、同键列且两侧有相同类型值和来源名称的有限假设。两者均只模拟。',
-              '不同表是否共用业务目录仍需独立依据。关系组按粒度保留原边。详情中行号缺失的边另计。',
-              '独立裁决的精确率、召回率只适用于已标注的对象对及其抽取范围。']
+    if report.get('committed_only'):
+        lines += ['', '本次按归档策略重放，节点与边的行摘要核对结果和原节点归属保存在 baseline.json。']
+    else:
+        lines += ['', '节点候选允许重叠；已排除、无法验证和有冲突的模式请查各检查点的 nodes.json、edges.json 与 hypotheses.json。',
+                  'reference 使用指定的逐键清单。exploratory 另加入同族、同键列且两侧有相同类型值和来源名称的有限假设。两者均只模拟。',
+                  '不同表是否共用业务目录仍需独立依据。关系组按粒度保留原边。详情中行号缺失的边另计。',
+                  '独立裁决的精确率、召回率只适用于已标注的对象对及其抽取范围。']
     if report.get('errors'):
         lines.extend(['', '有阶段未完成，详见 summary.json 的 errors。'])
     (out/'report.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
 
 
-def campaign(run_file, node_id, output, workers, specs, excluded, families=(), census_only=False):
+def _finish_campaign(output, report):
+    report['status'] = 'incomplete' if report['errors'] else 'completed'
+    write(output, 'summary.json', report)
+    _report(output, report)
+    return report
+
+
+def campaign(run_file, node_id, output, workers, specs, excluded, families=(), census_only=False, committed_only=False):
+    if committed_only and (census_only or specs):
+        raise ValueError('--committed-only 单独核对已提交结果和原策略基线，不接受模拟或仅普查选项。')
     run, project, state = archived_state(run_file)
     record = state['artifacts'][node_id]
     if (record.get('run_id') != run['run_id'] or record.get('artifact_status') != 'committed'
@@ -164,7 +178,9 @@ def campaign(run_file, node_id, output, workers, specs, excluded, families=(), c
     report = {'run_id': run['run_id'], 'artifact_id': record['artifact_id'], 'node_id': node_id,
               'committed_merge_mode': state['merge_nodes'][node_id]['merge_mode'],
               'upstream_artifacts': record['upstream_artifacts'], 'workers': workers, 'model_calls': 0,
-              'stages': {}, 'errors': {}, 'scenarios': {}}
+              'census_only': census_only, 'stages': {}, 'errors': {}, 'scenarios': {}}
+    if committed_only:
+        report['committed_only'] = True
     files = []
     if specs and not census_only:
         try:
@@ -203,13 +219,14 @@ def campaign(run_file, node_id, output, workers, specs, excluded, families=(), c
                 raise ValueError('归档输入数量与已加载的上游图不一致。')
             report['input_rows'] = totals
             common = dict(run=run, node_id=node_id, target=record, parents=parents, policy=policy, inputs=inputs, committed=None, relation_families=families)
-            reference_rules = [*policy.get('reviewed_key_pairs', [])]
-            for env in files:
-                reference_rules.extend(env['simulated_key_pairs'])
-            evidence, hypotheses = discover(inputs, parents, run, record, reference_rules, excluded)
-            evidence['excluded_values'] = excluded
-            write(output, 'hypotheses.json', evidence)
-            write(output, 'hypothesis-rules.json', hypotheses)
+            if not committed_only:
+                reference_rules = [*policy.get('reviewed_key_pairs', [])]
+                for env in files:
+                    reference_rules.extend(env['simulated_key_pairs'])
+                evidence, hypotheses = discover(inputs, parents, run, record, reference_rules, excluded)
+                evidence['excluded_values'] = excluded
+                write(output, 'hypotheses.json', evidence)
+                write(output, 'hypothesis-rules.json', hypotheses)
             print('核对原策略与提交图', flush=True)
             baseline = prepare_replay_baseline(inputs=inputs, policy=policy, target=record, committed_row_digests=checkpoint['row_digests'],
                                               relation_families=families)
@@ -224,6 +241,8 @@ def campaign(run_file, node_id, output, workers, specs, excluded, families=(), c
                 report['errors']['baseline_integrity_or_lineage'] = '核对 baseline_checks 的未核实项。'
             if not all(baseline.rows_match_committed.values()):
                 raise ValueError('当前代码重放与提交图的节点或边逐行摘要不同，暂停净变化比较。')
+            if committed_only:
+                return _finish_campaign(output, report)
             multiway = summarize_multiway_outputs(evidence['multiway'], base_report['input_node_mapping'])
             write(output, 'multiway.json', multiway)
             report['multiway'] = {k:multiway[k] for k in ('group_count', 'hypothetical_node_reduction',
@@ -255,31 +274,29 @@ def campaign(run_file, node_id, output, workers, specs, excluded, families=(), c
                                                 for k in ('nodes_removed', 'raw_edges_removed', 'canvas_lines_removed')}
     except Exception as exc:
         report['errors']['campaign'] = f'{type(exc).__name__}: {exc}'
-    report['census_only'] = census_only
-    report['status'] = 'incomplete' if report['errors'] else 'completed'
-    write(output, 'summary.json', report)
-    _report(output, report)
-    return report
+    return _finish_campaign(output, report)
+
+
+def _input_mapping(section):
+    return {(unit, nid): winner for unit, members in section['input_node_mapping'].items()
+            for nid, winner in members.items()}
 
 
 def score_saved(output, truth_path, result_file):
     summary = json.loads(read(output/'summary.json'))
     baseline_ids = json.loads(read(output/'committed'/'node-ids.json'))
     node_maps = {'committed': {n:n for n in baseline_ids}}
-    def raw_ids(section):
-        return {(unit, nid): winner for unit, members in section['input_node_mapping'].items()
-                for nid, winner in members.items()}
     input_maps = {}
     if (output/'baseline.json').exists():
         base = json.loads(read(output/'baseline.json'))
         if all(base['rows_match_committed'].values()):
-            input_maps['committed'] = raw_ids(base)
+            input_maps['committed'] = _input_mapping(base)
     relation_maps = {}
     for name, meta in summary['scenarios'].items():
         if meta['status'] in {'completed', 'completed_with_unverified'}:
             result = json.loads(read(output/(name+'.json')))
             node_maps[name] = result['node_mapping']
-            input_maps[name] = raw_ids(result['simulated'])
+            input_maps[name] = _input_mapping(result['simulated'])
             relation_maps[name] = result['relation_scoring']
     if (summary['scenarios'].get('exploratory', {}).get('status') == 'same_rules_as_reference'
             and 'reference' in node_maps):
@@ -294,6 +311,67 @@ def score_saved(output, truth_path, result_file):
     write(result_file.parent, result_file.name, result)
 
 
+def _verified_commit(directory):
+    summary = json.loads(read(directory/'summary.json'))
+    baseline = json.loads(read(directory/'baseline.json'))
+    stages = summary['stages']
+    merged = stages[summary['node_id']]
+    if (summary.get('census_only') or summary['committed_merge_mode'] not in {'deterministic', 'overlap_review'}
+            or merged['kind'] != 'committed' or merged['node_id'] != summary['node_id']
+            or merged['artifact_id'] != summary['artifact_id'] or not summary['run_id']
+            or merged.get('checkpoint_run_id', summary['run_id']) != summary['run_id']
+            or merged.get('artifact_status', 'committed') != 'committed'):
+        raise ValueError('需要具有已提交合并产物和完整基线重放的普查目录。')
+    row_digests = json.loads(read(directory/'committed'/'replay-input.json'))['row_digests']
+    matches = {'nodes': True, 'edges': True}
+    if (summary.get('rows_match_committed') != matches or baseline.get('rows_match_committed') != matches
+            or set(row_digests) != set(matches) or baseline['row_digests'] != row_digests):
+        raise ValueError('原策略重放的节点或边行摘要与本档提交图不符。')
+    output_ids = set(json.loads(read(directory/'committed'/'node-ids.json')))
+    if len(output_ids) != merged['rows']['nodes'] or baseline['nodes'] != len(output_ids):
+        raise ValueError('提交图节点 ID 清单与节点数不符。')
+    mapping = _input_mapping(baseline)
+    upstream = summary['upstream_artifacts']
+    units = {stage['artifact_id']: stage for stage in stages.values() if stage['kind'] == 'unit'}
+    if not upstream or len(units) != len(upstream) or set(units) != set(upstream):
+        raise ValueError('上游抽取产物清单与普查阶段不符。')
+    expected = set()
+    parents = []
+    for number, artifact_id in enumerate(upstream, 1):
+        stage = units[artifact_id]
+        unit = stage['node_id']
+        folder = f'unit-{number}'
+        if (stage['directory'] != folder or stages[unit] != stage or not stage['graph_digest']
+                or stage.get('artifact_status', 'committed') != 'committed'):
+            raise ValueError('上游抽取单元或图摘要缺失。')
+        ids = json.loads(read(directory/folder/'node-ids.json'))
+        if len(ids) != stage['rows']['nodes']:
+            raise ValueError('上游单元的节点数与其原节点 ID 清单不符。')
+        if len(set(ids)) != len(ids):
+            raise ValueError('同一上游单元的原节点 ID 重复，无法逐对确认成员。')
+        expected.update((unit, node_id) for node_id in ids)
+        parents.append({'node_id': unit, 'artifact_id': artifact_id, 'graph_digest': stage['graph_digest']})
+    if mapping.keys() != expected or any(winner is not None and winner not in output_ids for winner in mapping.values()):
+        raise ValueError('原节点映射未覆盖同一批输入，或映射目标不属于提交图。')
+    summary_fields = ('run_id', 'node_id', 'artifact_id', 'committed_merge_mode')
+    identity = {key: summary[key] for key in summary_fields}
+    identity.update(graph_digest=merged['graph_digest'], row_digests=row_digests, rows=merged['rows'])
+    return identity, parents, mapping
+
+
+def compare_committed(first_dir, second_dir, truth_path, result_file):
+    first, parents, first_map = _verified_commit(first_dir)
+    second, other_parents, second_map = _verified_commit(second_dir)
+    if first['run_id'] == second['run_id'] or first['artifact_id'] == second['artifact_id']:
+        raise ValueError('请选择两次独立提交的运行与合并产物。')
+    if first['node_id'] != second['node_id'] or parents != other_parents or first_map.keys() != second_map.keys():
+        raise ValueError('两次提交必须使用同一合并节点、同一批有序上游检查点、图摘要和全部原节点 ID。')
+    pairs = compare_input_pairs(json.loads(read(truth_path)), first, first_map, second_map)
+    result = {'basis': 'two_committed_merges_same_inputs', 'model_calls': 0, 'first': first, 'second': second,
+              'upstream_artifacts': parents, 'qualified_input_ids': len(first_map), **pairs}
+    write(result_file.parent, result_file.name, result)
+
+
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     sub = cli.add_subparsers(dest='action', required=True)
@@ -305,17 +383,31 @@ def main():
     start.add_argument('--simulation', action='append', type=Path, default=[], help='已有逐键模拟清单，可多次传入')
     start.add_argument('--exclude-text', action='append', default=[], help='探索实验明确排除的文本哨兵，可多次传入')
     start.add_argument('--relation-families', type=Path, help='本次要检验的同义关系类型清单 JSON')
-    start.add_argument('--census-only', action='store_true')
+    mode = start.add_mutually_exclusive_group()
+    mode.add_argument('--census-only', action='store_true')
+    mode.add_argument('--committed-only', action='store_true', help='只普查并重放已提交策略取得成员映射，跳过探索和模拟')
     labels = sub.add_parser('score', help='在已保存的结果上核算独立标注，无需重新加载图')
     labels.add_argument('output_dir', type=Path)
     labels.add_argument('--truth', type=Path, required=True)
     labels.add_argument('--result', type=Path, required=True)
+    comparison = sub.add_parser('compare-committed', help='按同一批抽取原节点的裁决，对照两个实际提交的合并结果')
+    comparison.add_argument('first_dir', type=Path, help='第一份 run 普查结果目录，裁决清单应绑定此运行和产物')
+    comparison.add_argument('second_dir', type=Path, help='第二份 run 普查结果目录，复用相同上游检查点')
+    comparison.add_argument('--truth', type=Path, required=True)
+    comparison.add_argument('--result', type=Path, required=True)
     args = cli.parse_args()
     if args.action == 'score':
         score_saved(args.output_dir, args.truth, args.result)
         return 0
+    if args.action == 'compare-committed':
+        try:
+            compare_committed(args.first_dir, args.second_dir, args.truth, args.result)
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            cli.error(str(exc))
+        return 0
     report = campaign(args.run_file, args.node, args.output, args.workers, args.simulation, args.exclude_text,
-                      json.loads(read(args.relation_families)) if args.relation_families else [], args.census_only)
+                      json.loads(read(args.relation_families)) if args.relation_families else [],
+                      args.census_only, args.committed_only)
     print(json.dumps({'status': report['status'], 'output': str(args.output),
                       'errors': report['errors']}, ensure_ascii=False))
     return int(bool(report['errors']))

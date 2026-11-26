@@ -11,7 +11,7 @@ from lightgraph.discovery.proposal_session import (DiscoveryFinish, ProposalSess
                                                    proposal_tool_specs)
 from lightgraph.tests.test_discovery_agent import Toolbox, final, input_packet, response, CANARY
 from lightgraph.tests.test_model_streaming import model
-from lightgraph.tests.test_agentscope_runtime import framework_spy, assert_cleared
+from lightgraph.tests.test_discovery_model_runtime import discovery_run
 
 
 def group():
@@ -124,7 +124,7 @@ def test_hidden_legacy_wide_submission_remains_available_for_exact_internal_revi
     assert revision.execute('submit_wide_hierarchy',proposal.model_dump(mode='json',exclude={'kind'}))['status']=='ok'
 
 
-def test_runtime_declares_business_type_then_submits_plan_in_one_turn(framework_spy):
+def test_runtime_declares_business_type_then_submits_plan_in_one_turn(discovery_run):
     from lightgraph.tests.test_hierarchy_plan import fixture
     _,packet,plan=fixture()
     packet['probe_digest'][0]['operator']='profile_columns'
@@ -141,11 +141,10 @@ def test_runtime_declares_business_type_then_submits_plan_in_one_turn(framework_
     assert batch.semantic_schema.model_dump()['entity_types']==schema['entity_types']
     assert not batch._runtime_pending_codes and batch._runtime_invalid_drafts==0
     assert client.usage['calls']==1 and tools.executed==[]
-    assert_cleared(framework_spy)
 
 
 @pytest.mark.parametrize('finish_tool',[False,True])
-def test_real_runtime_stages_then_finishes_without_full_batch(finish_tool,framework_spy):
+def test_real_runtime_stages_then_finishes_without_full_batch(finish_tool,discovery_run):
     bodies=[]
     def handler(request):
         body=json.loads(request.content);bodies.append(body)
@@ -160,10 +159,9 @@ def test_real_runtime_stages_then_finishes_without_full_batch(finish_tool,framew
     batch=client.explore(input_packet(),tools,max_steps=4,max_tool_calls=3)
     assert len(batch.proposals)==1 and not batch._runtime_pending_codes
     assert client.usage['calls']==2 and tools.executed==[] and tools.closed
-    assert_cleared(framework_spy)
 
 
-def test_invalid_submission_recovers_next_tool_and_retains_valid_sibling(framework_spy,capsys,caplog):
+def test_invalid_submission_recovers_next_tool_and_retains_valid_sibling(discovery_run,capsys,caplog):
     calls=[]
     def handler(request):
         body=json.loads(request.content);calls.append(body)
@@ -177,11 +175,10 @@ def test_invalid_submission_recovers_next_tool_and_retains_valid_sibling(framewo
     assert len(batch.proposals)==1 and batch._runtime_invalid_drafts==1
     assert batch._runtime_pending_codes==[] and batch._runtime_submission_complete
     assert client.usage['calls']==3 and tools.executed==[]
-    assert_cleared(framework_spy)
     assert CANARY not in capsys.readouterr().out+caplog.text
 
 
-def test_reserved_submission_window_allows_field_repair_before_final_turn(framework_spy):
+def test_reserved_submission_window_allows_field_repair_before_final_turn(discovery_run):
     controls=[]
     def handler(request):
         body=json.loads(request.content)
@@ -205,12 +202,11 @@ def test_reserved_submission_window_allows_field_repair_before_final_turn(framew
     assert len(batch.proposals)==1 and not batch._runtime_pending_codes
     assert batch._runtime_invalid_drafts==1
     assert client.usage['calls']==4 and tools.executed==['get_metadata','profile_columns']
-    assert_cleared(framework_spy)
 
 
 @pytest.mark.parametrize('failure',['malformed','transport','ignored_none','truncated','duplicate',
     'model_stream_event_too_large','model_stream_transport_too_large'])
-def test_failed_final_preserves_draft_but_marks_pending_without_extra_turn(failure,framework_spy):
+def test_failed_final_preserves_draft_but_marks_pending_without_extra_turn(failure,discovery_run):
     calls=[]
     def handler(request):
         body=json.loads(request.content);calls.append(body)
@@ -237,10 +233,9 @@ def test_failed_final_preserves_draft_but_marks_pending_without_extra_turn(failu
     assert batch._runtime_pending_codes==['discovery_submission_incomplete',cause]
     assert not batch._runtime_submission_complete
     assert client.usage['calls']==2 and tools.executed==[] and tools.closed
-    assert_cleared(framework_spy)
 
 
-def test_staged_exclusion_cannot_be_overwritten_by_legacy_final(framework_spy):
+def test_staged_exclusion_cannot_be_overwritten_by_legacy_final(discovery_run):
     calls=[]
     def handler(request):
         calls.append(1)
@@ -253,11 +248,10 @@ def test_staged_exclusion_cannot_be_overwritten_by_legacy_final(framework_spy):
     batch=client.explore(input_packet(),tools)
     assert [item.kind for item in batch.proposals]==['exclusion','column_group']
     assert batch.proposals[0].claim.exclusions[0].affects==['identity','projection']
-    assert_cleared(framework_spy)
 
 
 @pytest.mark.parametrize('legacy',[False,True])
-def test_explicit_global_abstention_withdraws_all_staged_proposals(legacy,framework_spy):
+def test_explicit_global_abstention_withdraws_all_staged_proposals(legacy,discovery_run):
     calls=[]
     def handler(request):
         calls.append(1)
@@ -270,10 +264,9 @@ def test_explicit_global_abstention_withdraws_all_staged_proposals(legacy,framew
     assert batch._runtime_pending_codes==[] and batch._runtime_invalid_drafts==0
     assert batch._runtime_submission_complete
     assert client.usage['calls']==2 and tools.executed==[]
-    assert_cleared(framework_spy)
 
 
-def test_pending_finish_preserves_drafts_without_treating_it_as_abstention(framework_spy):
+def test_pending_finish_preserves_drafts_without_treating_it_as_abstention(discovery_run):
     calls=[]
     def handler(request):
         calls.append(1)
@@ -285,10 +278,9 @@ def test_pending_finish_preserves_drafts_without_treating_it_as_abstention(frame
     assert batch._runtime_pending_codes==['discovery_submission_pending']
     assert not batch._runtime_submission_complete
     assert client.usage['calls']==2 and tools.executed==[]
-    assert_cleared(framework_spy)
 
 
-def test_submission_cannot_bypass_metadata_only_source_policy(framework_spy):
+def test_submission_cannot_bypass_metadata_only_source_policy(discovery_run):
     calls=[]
     def handler(request):
         body=json.loads(request.content);calls.append(body)
@@ -300,13 +292,12 @@ def test_submission_cannot_bypass_metadata_only_source_policy(framework_spy):
     client=model(handler,stream=False,allow_source_samples=False);tools=Toolbox()
     assert client.explore(input_packet(),tools).proposals
     assert tools.executed==[] and client.usage['calls']==3
-    assert_cleared(framework_spy)
 
 
 @pytest.mark.parametrize('finish',[False,True])
 @pytest.mark.parametrize('source_first',[False,True])
 def test_final_turn_still_accepts_hierarchy_plan_after_source_budget_exhaustion(
-        finish,source_first,framework_spy):
+        finish,source_first,discovery_run):
     from lightgraph.tests.test_hierarchy_plan import fixture
     _,packet,plan=fixture()
     packet['probe_digest'][0]['operator']='profile_columns'
@@ -330,12 +321,12 @@ def test_final_turn_still_accepts_hierarchy_plan_after_source_budget_exhaustion(
         'discovery_submission_incomplete','discovery_steps_exhausted'])
     assert client.usage['calls']==steps
     assert tools.executed==(['get_metadata'] if source_first else [])
-    agent=assert_cleared(framework_spy)
-    assert agent.model.source_calls==int(source_first)
-    assert agent.model.submission_calls==1+int(finish)
+    model_state=discovery_run['models'][-1]
+    assert model_state.source_calls==int(source_first)
+    assert model_state.submission_calls==1+int(finish)
 
 
-def test_submissions_have_separate_finite_cap_and_do_not_expand_query_budget(framework_spy):
+def test_submissions_have_separate_finite_cap_and_do_not_expand_query_budget(discovery_run):
     from lightgraph.discovery.proposal_session import MAX_SUBMISSION_CALLS
     requests=[]
     def handler(request):
@@ -348,12 +339,12 @@ def test_submissions_have_separate_finite_cap_and_do_not_expand_query_budget(fra
     assert len(batch.proposals)==1 and batch._runtime_pending_codes==[
         'discovery_submission_incomplete','discovery_tool_calls_exhausted']
     assert client.usage['calls']==2 and tools.executed==[]
-    agent=assert_cleared(framework_spy)
-    assert agent.model.source_calls==0 and agent.model.submission_calls==1
+    model_state=discovery_run['models'][-1]
+    assert model_state.source_calls==0 and model_state.submission_calls==1
 
 
 @pytest.mark.parametrize('finish_tool',[False,True])
-def test_reference_enum_error_then_finish_is_complete_without_any_draft(finish_tool,framework_spy):
+def test_reference_enum_error_then_finish_is_complete_without_any_draft(finish_tool,discovery_run):
     from lightgraph.tests.test_submission_scope_options import fixture
     packet,proposal=fixture()
     proposal['claim']['source_columns']=['c_foreign']
@@ -374,10 +365,9 @@ def test_reference_enum_error_then_finish_is_complete_without_any_draft(finish_t
     assert not batch._runtime_pending_codes
     assert batch._runtime_submission_complete and batch._runtime_completed_empty
     assert client.usage['calls']==2
-    assert_cleared(framework_spy)
 
 
-def test_stale_optional_withdrawal_id_does_not_block_final_finish(framework_spy):
+def test_stale_optional_withdrawal_id_does_not_block_final_finish(discovery_run):
     client=model(lambda request:response({'action':'finish_discovery',
         'withdraw_rejections':['unissued_rejection']}),stream=False)
     batch=client.explore(input_packet(),Toolbox(),max_steps=1)
@@ -385,11 +375,10 @@ def test_stale_optional_withdrawal_id_does_not_block_final_finish(framework_spy)
     assert not batch._runtime_pending_codes
     assert batch._runtime_invalid_codes=={'unknown_rejection_id':1}
     assert not batch.proposals
-    assert_cleared(framework_spy)
 
 
 @pytest.mark.parametrize('retained_draft',[False,True])
-def test_abstention_with_explicit_pending_does_not_authorize_completion(retained_draft,framework_spy):
+def test_abstention_with_explicit_pending_does_not_authorize_completion(retained_draft,discovery_run):
     calls=[]
     def handler(request):
         calls.append(1)
@@ -402,4 +391,3 @@ def test_abstention_with_explicit_pending_does_not_authorize_completion(retained
     assert batch._runtime_pending_codes==['discovery_submission_pending']
     assert not batch._runtime_submission_complete and not batch._runtime_completed_empty
     assert client.usage['calls']==1+int(retained_draft)
-    assert_cleared(framework_spy)

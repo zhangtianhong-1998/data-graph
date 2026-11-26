@@ -313,3 +313,44 @@ def test_inherited_relation_only_plan_checks_real_key_arity_in_both_modes():
 
     mapping['target_key_columns'] = ['email', 'scope']
     assert validate_structure(draft, [table], base_graph=base)['diagnostics'][0]['code'] == 'relation_key_arity_mismatch'
+
+
+@pytest.mark.parametrize("separate_detail_tables", [False, True])
+def test_two_multi_value_lookups_need_a_joint_detail_row(separate_detail_tables):
+    batch = TableSpec(source_id="s", name="batches", columns=[ColumnSpec(name="batch")])
+    detail = TableSpec(source_id="s", name="payments",
+                       columns=[ColumnSpec(name=c) for c in ("batch", "payer", "payee")])
+    tables = [batch, detail]
+    rows = {batch.qualified_name: [("Q",)], detail.qualified_name: [("Q", "A1", "B1"), ("Q", "A2", "B2")]}
+    if separate_detail_tables:
+        rows[batch.qualified_name] = []
+        other = detail.model_copy(update={"name": "unrelated"})
+        tables.append(other)
+        rows[other.qualified_name] = rows[detail.qualified_name]
+    endpoints = {role: {"source_id": "s", "table": "payments", "key_columns": [role]} for role in ("payer", "payee")}
+    if separate_detail_tables:
+        endpoints["payee"]["table"] = "unrelated"
+    draft = {"draft_id": "payments", "entities": [
+        {"type": role, "key_names": ["id"], "mappings": [spec]} for role, spec in endpoints.items()],
+        "relations": [{"type": "payment", "source_type": "payer", "target_type": "payee", "mappings": [{
+            "source_id": "s", "table": "batches", "source_key_columns": ["batch"], "target_key_columns": ["batch"],
+            **{end + "_lookup": {**endpoints[role], "match_columns": ["batch"], "cardinality": "many"}
+               for end, role in (("source", "payer"), ("target", "payee"))}}]}]}
+    mapping = draft["relations"][0]["mappings"][0]
+    match = {"column": "batch", "op": "eq", "value": "Q"}
+    mapping["source_lookup"]["predicate"] = {"all": [{"all": [match]}]}
+    mapping["target_lookup"]["predicate"] = match
+    with MemorySource(tables, rows) as adapter:
+        result = execute_draft(draft, [adapter], tables)
+    if separate_detail_tables:
+        assert not result["passed"]
+        assert "lookup_joint_detail_required" in {issue["code"] for issue in result["diagnostics"]}
+        assert not result["graph"]["edges"]
+    else:
+        assert result["passed"], result["diagnostics"]
+        assert endpoint_pairs(result) == {("A1", "B1"), ("A2", "B2")}
+        for edge in result["graph"]["edges"]:
+            left, right = edge["supports"][0]["lookup_matches"]
+            assert left["row_context"] == right["row_context"]
+            assert left["resolved_key"] == [left["row_context"]["values"]["payer"]]
+            assert right["resolved_key"] == [right["row_context"]["values"]["payee"]]

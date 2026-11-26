@@ -216,6 +216,11 @@ function workflowRelationSummary(node: WorkflowMergeNodeState) {
     }
     if (review.submitted_patterns != null) {
       lines.push(`模型请求 ${review.model_calls} 次，送审 ${review.submitted_patterns} 种，已列出但未送审 ${review.pattern_count - review.submitted_patterns} 种`)
+      if (review.truncated_batches) lines.push(`其中 ${review.truncated_batches} 次请求的回复被截断`)
+      if (review.retry_batches) {
+        const expanded = review.expanded_output_retries ?? 0
+        lines.push(`拆批重试 ${review.retry_batches - expanded} 次，单模式提高输出额度重试 ${expanded} 次，共补回 ${review.recovered_patterns} 种模式的裁决`)
+      }
       if (review.failed_patterns) lines.push(`${review.failed_patterns} 种已送审的模式未取得有效裁决`)
       if (review.analysis_omitted_patterns) lines.push(`索引分析另省略 ${review.analysis_omitted_patterns} 种模式`)
     } else if (review.omitted_patterns) {

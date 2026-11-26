@@ -113,6 +113,7 @@ const messages: Record<string, string> = {
   file_in_use: '此文件仍被来源配置引用，请先移除相关来源或修改配置。',
   database_source_required: '仅数据库来源支持单独移除数据表。',
   document_binding_requires_metadata: '请先读取元数据，再重新绑定文档。',
+  document_project_table_catalog_required: '无法从项目授权目录确认文档指向哪张表，请填入来源、Schema 和表名。',
   ambiguous_document_table_binding: '存在多张同名表，请按来源和 Schema 选择具体表。',
   invalid_document_source_binding: '限定的来源已不可用，请重新选择文档范围。',
   invalid_document_column_binding: '文档中的列限制与所选表不匹配，请核对列名和表名。',

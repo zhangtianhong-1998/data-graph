@@ -49,6 +49,24 @@ class _ModelTransportError(LightGraphError):
         super().__init__('model_transport_error', retryable=True)
 
 
+def reported_token_usage(usage):
+    """Only persist numeric provider counters; absent reasoning usage stays unknown."""
+    if not isinstance(usage, dict):
+        return {}
+    counts = {key: usage[key] for key in ('prompt_tokens', 'completion_tokens')
+              if type(usage.get(key)) is int and usage[key] >= 0}
+    details = usage.get('completion_tokens_details')
+    if isinstance(details, dict) and type(details.get('reasoning_tokens')) is int and details['reasoning_tokens'] >= 0:
+        counts['reasoning_tokens'] = details['reasoning_tokens']
+    return counts
+
+
+class TruncatedCompletion(LightGraphError):
+    def __init__(self, usage):
+        self.token_usage = reported_token_usage(usage)
+        super().__init__('model_response_truncated')
+
+
 def stream_transport_limit(max_response_bytes, max_output_tokens):
     return 6 * max_response_bytes + 2048 * max_output_tokens + 65536 if max_response_bytes is not None else None
 
@@ -239,7 +257,7 @@ def _complete_envelope(response):
     if reason not in ('stop', 'tool_calls', 'length', 'content_filter') or choice.get('index', 0) != 0:
         raise LightGraphError('model_response_invalid')
     if reason == 'length':
-        raise LightGraphError('model_response_truncated')
+        raise TruncatedCompletion(envelope.get('usage'))
     if reason == 'content_filter':
         raise LightGraphError('model_response_refused')
     message = _actionable_message(choice.get('message'))

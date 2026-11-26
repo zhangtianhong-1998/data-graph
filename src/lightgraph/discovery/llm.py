@@ -627,11 +627,9 @@ class StructuredModelClient:
             raise LightGraphError('model_api_key_missing')
         if current_trace() is not None:current_trace().add_secrets([key])
         request_task=_request_task(messages)
-        # complete() supplies a final-only contract. AgentScope instead infers
-        # its final schema below while retaining legitimate tool turns.
+        # Discovery infers its final schema from the task packet and may still
+        # call a tool; complete() supplies a final-only contract.
         final_only=correction_contract is not None
-        # AgentScope's parser wraps a ProposalBatch in its tool/final envelope;
-        # its published schema still identifies the same closed output model.
         if correction_contract is None and schema.get('title')=='ProposalBatch':
             correction_contract=ProposalBatch
         feedback=None

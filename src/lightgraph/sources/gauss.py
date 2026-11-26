@@ -23,7 +23,7 @@ from .budget import QueryBudget, BudgetedCursor
 from .gauss_compat import catalog_value, catalog_bool, safe_database_cause, set_optional_lock_timeout
 from .database_errors import connection_is_closed, database_diagnostic, database_error, qualification_error, readback_shape_failure, annotate_database_error, cleanup_preserving_error
 from .validation_session import keep_session
-from .reconnect import configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary, terminal_failure, latch_terminal_failure, prepare_snapshot
+from .reconnect import verify_connection_controls, configure_reconnection, new_snapshot_recovery_allowed, reconnect_at_boundary, terminal_failure, latch_terminal_failure, prepare_snapshot
 
 REQUIRED_RUNTIME = {"read_only_transaction", "parameter_binding", "metadata_reading", "distinct_projection", "statement_timeout", "query_cancel"}
 
@@ -244,25 +244,7 @@ class GaussSource(SourceAdapter):
             return self.capabilities()
 
     def verify_runtime_controls(self):
-        """Qualify a physical connection, releasing an explicitly acquired lease."""
-        with self._lock:
-            acquired = getattr(self, '_idle_released', False)
-            if acquired:
-                stopped = terminal_failure(self)
-                if stopped is not None: raise stopped
-                if self._disposed: raise LightGraphError('source_closed')
-                if self._cancelled: raise LightGraphError('query_cancelled')
-                self._boundary_recovery_used = False
-                self._boundary_recoveries = 0
-                self._reconnect()
-            try:
-                # A previously runtime-qualified source repeats these probes
-                # inside replacement construction, once per physical session.
-                if acquired and self._manifest.actual_database_verified:
-                    return self.capabilities()
-                return self._verify_runtime_controls_current()
-            finally:
-                if acquired: self._release_snapshot_connection()
+        return verify_connection_controls(self)
 
     def _verify_runtime_controls_current(self) -> CapabilityManifest:
         """Verify timeout/cancel on this connection without re-reading metadata."""

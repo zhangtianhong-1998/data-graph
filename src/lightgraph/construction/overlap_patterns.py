@@ -3,7 +3,7 @@
 Physical and catalog keys are indexed locally. Values, node IDs, author-written
 text and support payloads never enter the pattern cards sent to a reviewer.
 """
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from itertools import combinations
 
@@ -203,6 +203,7 @@ def _overlapping_members(members, projections):
         if start in visited:
             continue
         component, overlap, pending = [], set(), [start]
+        shared_by = Counter()
         while pending:
             index = pending.pop()
             if index in visited:
@@ -214,8 +215,21 @@ def _overlapping_members(members, projections):
                 if len(peers) > 1:
                     overlap.add(cell)
                     pending.extend(peers)
+                    if len(members) > 2:
+                        shared_by[tuple(peers)] += 1
         if overlap:
-            yield [members[i] for i in sorted(component)], overlap
+            ordered = sorted(component)
+            coverage = []
+            if len(ordered) > 2:
+                # Group identical posting lists so a heavily repeated combination
+                # is expanded into pairs just once. A--B--C may have no A--C keys.
+                counts = Counter()
+                for peers, count in shared_by.items():
+                    for pair in combinations(peers, 2):
+                        counts[pair] += count
+                coverage = [{'member_indexes': [i, j], 'overlapping_keys': counts[ordered[i], ordered[j]]}
+                            for i, j in combinations(range(len(ordered)), 2)]
+            yield [members[i] for i in ordered], overlap, coverage
 
 
 def _group_alias_pairs(sources, pairs, inputs_by_owner):
@@ -552,7 +566,7 @@ def analyze_indexed_overlap_patterns(contributors, policy=None):
             projections = [f.by_source[key] for f in members]
         else:
             projections = [f.by_catalog[key] for f in members]
-        for group, overlap in _overlapping_members(members, projections):
+        for group, overlap, coverage in _overlapping_members(members, projections):
             bindings = sorted({b for f in group for b in f.by_source})
             if basis != 'same_physical_key' and len({b[:3] for b in bindings}) < 2:
                 continue
@@ -561,7 +575,7 @@ def analyze_indexed_overlap_patterns(contributors, policy=None):
             if not candidates and not reasons:
                 reasons.append('rule_representation_limit')
             record('entity', basis, [f.descriptor() for f in group], [_public_source(b) for b in bindings],
-                   len(overlap), reasons, candidates,
+                   len(overlap), reasons, candidates, pair_coverage=coverage,
                    witness_binding=None if basis == 'same_logical_keys_across_sources' else _public_source(key))
     aliases, alias_stats = _cross_table_name_candidates(families, family_rows, counts, inputs_by_owner)
     summary['cross_table_key_name_search'] = alias_stats
@@ -582,14 +596,15 @@ def analyze_indexed_overlap_patterns(contributors, policy=None):
                 continue
             projected = [{tuple(pair) for pair in pairs[m]['evidence']} for m in ordered]
             counts['relation_sections'] += len(ordered)
-            for group, overlap in _overlapping_members(ordered, projected):
+            for group, overlap, coverage in _overlapping_members(ordered, projected):
                 members = [{'contributor_id': owner, 'type': name, 'key_names': [],
                             'property_names': [], 'roles': []} for owner, name in group]
                 source = {'source_id': src, 'schema': schema, 'table': table, 'key_columns': list(left + right),
                           'source_key_columns': list(left), 'target_key_columns': list(right)}
                 reasons = _authority_issues({owner for owner, _ in group}, inputs_by_owner)
                 reasons.add('preserve_relation_observations')
-                record('relation', 'same_directed_source_columns', members, [source], len(overlap), sorted(reasons))
+                record('relation', 'same_directed_source_columns', members, [source], len(overlap), sorted(reasons),
+                       pair_coverage=coverage)
     # Existing key, catalog and directed-relation searches take precedence for I/O.
     # A family pair already routed by a stronger pattern needs no second review card.
     from .overlap_name_candidates import different_key_name_candidates
@@ -604,7 +619,7 @@ def analyze_indexed_overlap_patterns(contributors, policy=None):
     summary['cross_table_different_key_name_search'] = name_stats
     counts['alias_sections'] += name_stats['alias_sections']
     summary['omitted_patterns'] += name_stats['omitted_patterns']
-    for peers, name_count, key_count in name_matches:
+    for peers, name_count, key_count, coverage in name_matches:
         owners = {f.owner for f, _ in peers}
         reasons = _authority_issues(owners, inputs_by_owner)
         reasons.update(reason for f, _ in peers for reason in f.problems)
@@ -612,7 +627,8 @@ def analyze_indexed_overlap_patterns(contributors, policy=None):
             reasons.add('competing_roles_in_one_unit')
         reasons.add('cross_code_correspondence_unverified')
         record('entity', 'same_observed_names_with_different_keys', [f.descriptor() for f, _ in peers],
-               [_public_source(b) for _, b in peers], key_count, sorted(reasons), overlapping_names=name_count)
+               [_public_source(b) for _, b in peers], key_count, sorted(reasons), overlapping_names=name_count,
+               pair_coverage=coverage)
     patterns.sort(key=lambda p: ('apply' not in p['eligible_actions'], p['pattern_id']))
     summary['omitted_patterns'] += max(0, len(patterns) - MAX_PATTERNS)
     for p in patterns[MAX_PATTERNS:]:

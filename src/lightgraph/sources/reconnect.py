@@ -13,6 +13,27 @@ MAX_BOUNDARY_RECOVERIES = 3
 INITIAL_PREFLIGHT_ATTEMPTS = 3
 
 
+def verify_connection_controls(source):
+    """Qualify a physical connection, releasing an explicitly acquired lease."""
+    with source._lock:
+        acquired = getattr(source, '_idle_released', False)
+        if acquired:
+            stopped = terminal_failure(source)
+            if stopped is not None: raise stopped
+            if source._disposed: raise LightGraphError('source_closed')
+            if source._cancelled: raise LightGraphError('query_cancelled')
+            source._boundary_recovery_used = False
+            source._boundary_recoveries = 0
+            source._reconnect()
+        try:
+            # A previously runtime-qualified source repeats these probes
+            # inside replacement construction, once per physical session.
+            if acquired and source._manifest.actual_database_verified:
+                return source.capabilities()
+            return source._verify_runtime_controls_current()
+        finally:
+            if acquired: source._release_snapshot_connection()
+
 def configure_reconnection(source, factory):
     # Credentials stay only in this live adapter and are released on close or
     # terminal failure. Neither driver objects nor exception tracebacks persist.

@@ -282,13 +282,9 @@ def _record_observation(packet: dict, result: dict, name: str) -> None:
 
 def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=16,
             max_tool_calls: int=16, review_observations=None) -> ProposalBatch:
-    """Run AgentScope ReActAgent with ephemeral memory and guarded Toolkit tools.
-
-    The framework owns the reasoning/acting loop. Our adapters retain domain
-    validation, query permissions, budgets and source-value isolation from rules.
-    """
+    """Discover proposals with a bounded, invocation-local tool conversation."""
     import asyncio
-    from .agentscope_runtime import run_agent
+    from .model_runtime import run_agent
     from .reference_validation import validate_or_repair
     from .observations import clear_observations
 
@@ -315,7 +311,7 @@ def explore(client, packet: dict, executor: ToolExecutor, *, max_steps: int=16,
         system+='\nCurrent stage: '+checked['task']+'\nSubtask: '+(checked.get('subtask') or STAGE_SUBTASKS[checked['task']])
 
         def dispatch(name: str, arguments: dict) -> dict:
-            # Toolkit performs tool-name and JSON-schema validation first.
+            # Tool dispatch validates the issued name and argument schema first.
             client.budget.check_deadline()
             signature=hashlib.sha256(canonical([name,arguments]).encode()).hexdigest()
             if not client.allow_source_samples and name not in ('get_metadata','search_knowledge'):

@@ -18,7 +18,7 @@ def write_config(tmp_path, agent=None, inline=None):
     config_dir = tmp_path / "config"
     config_dir.mkdir(exist_ok=True)
     settings = agent if agent is not None else {
-        "framework": "agentscope", "name": "metadata-explorer",
+        "framework": "deepseek_harness", "name": "metadata-explorer",
         "llm": {"mode": "metadata_only", "model": "offline", "base_url": "https://model.invalid/v1",
                 "api_key": CANARY, "stream": True},
     }

@@ -1,4 +1,4 @@
-"""Exercise the actual AgentScope formatter/request/trace boundary offline."""
+"""Exercise the discovery formatter/request/trace boundary offline."""
 import json
 from lightgraph.discovery.budget import BudgetAllocator, Cost
 from lightgraph.runtime.trace import bind_trace, RunTrace

@@ -368,3 +368,28 @@ def test_issued_column_evidence_is_checked_for_kind_scope_and_document_revision(
             assert tools.call('validate_graph_draft', draft_id='analysis')['code'] == 'construction_source_changed'
         finally:
             tools.close()
+
+
+def test_exploration_guidance_cannot_authorize_a_column_definition(tmp_path):
+    guide = tmp_path / "guide.md"
+    guide.write_text(
+        "---\nid: guide\npurpose: analysis_knowledge\nscope: {tables: [public.observations]}\n---\n"
+        "# 季度复盘\n建议下季度核对预测。\n", encoding="utf-8"
+    )
+    table = physical_table()
+    config = RunConfig(sources=[], model={"mode": "in_environment"}, documents=[str(guide)])
+    with TrackedSource([table], {table.qualified_name: []}) as source:
+        tools = ConstructionTools(config, tmp_path / "construction", adapters=[source])
+        try:
+            page = tools.call("read_material", name="document:guide")
+            assert page["section"]["evidence_role"] == "exploration_guidance"
+            draft = row_draft(ref=page["evidence_refs"][0])
+            draft["entities"][1]["mappings"][0]["label"] = "已审定的利润口径"
+            result = tools.call("save_graph_draft", yaml_text=dump_yaml(draft))
+            assert result["code"] == "metadata_evidence_not_applicable"
+            assert {tuple(issue["path"]) for issue in result["diagnostics"]} == {
+                ("entities", 1, "mappings", 0, "evidence_refs", 0),
+                ("relations", 0, "mappings", 0, "target_metadata", "evidence_refs", 0),
+            }
+        finally:
+            tools.close()

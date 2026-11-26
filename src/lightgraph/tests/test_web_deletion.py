@@ -183,7 +183,7 @@ def test_excel_without_preview_deactivates_sheet_bindings_and_delete_whole_file(
 def test_markdown_yaml_deletion_detaches_config_and_capability_is_protected(client):
     doc = upload(client, 'doc.md', b'# notes')
     rules = upload(client, 'rules.yaml', b'rules: []')
-    agent = upload(client, 'agent.yaml', b'framework: agentscope\nllm: {mode: disabled}')
+    agent = upload(client, 'agent.yaml', b'framework: deepseek_harness\nllm: {mode: disabled}')
     capability = upload(client, 'cap.yaml', b'product: gauss')
     config = db(client)
     config['sources'][0]['capability_manifest'] = capability['relative_path']

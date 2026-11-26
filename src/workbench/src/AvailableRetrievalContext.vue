@@ -5,8 +5,12 @@ import type { AvailableRetrievalContext } from './types'
 const props = defineProps<{ context: AvailableRetrievalContext }>()
 const labels = computed(() => new Map(props.context.nodes.map(n => [n.id, n.display_name || n.id])))
 const pathLabels = computed(() => new Map(props.context.candidate_path?.nodes.map(n => [n.id, n.display_name || n.id])))
+const nodeCitations = computed(() => props.context.nodes.flatMap(node => (node.observations || [])
+  .filter(o => o.observation_id || o.source_tables?.length || o.evidence_refs?.length)
+  .map(o => ({ node: node.display_name || node.id, observation: o }))))
 const statusText = {
   source_text_only: '当前只找到相关原文，尚未确认对应实体。',
+  definition_only: '找到了类型说明，尚未确认具体对象。',
   no_confirmed_match: '当前可见范围内未能确认匹配的实体或事实。',
   scope_unresolved: '尚未确认问题所指的适用范围。',
   search_unavailable: '语义检索当前不可用，未能核实本次问题。',
@@ -20,8 +24,17 @@ const statusText = {
       <ul class="context-nodes">
         <li v-for="node in context.nodes" :key="node.id">{{ node.display_name || node.id }}</li>
       </ul>
-      <details v-if="context.edges.length || context.witnesses.length" class="context-proofs">
+      <details v-if="nodeCitations.length || context.edges.length || context.witnesses.length" class="context-proofs">
         <summary>查看关系与来源记录</summary>
+        <p v-for="(citation, index) in nodeCitations" :key="index">
+          {{ citation.node }}
+          <small v-if="citation.observation.source_tables?.length">
+            来源表 {{ citation.observation.source_tables.join('、') }}
+            <template v-if="citation.observation.provenance?.key_columns?.length"> · 身份列 {{ citation.observation.provenance.key_columns.join('、') }}</template>
+          </small>
+          <small v-if="citation.observation.evidence_refs?.length">引用 {{ citation.observation.evidence_refs.join('、') }}</small>
+          <small v-if="citation.observation.observation_id">来源记录 {{ citation.observation.observation_id }}</small>
+        </p>
         <ul v-if="context.edges.length">
           <li v-for="edge in context.edges" :key="edge.id">
             {{ labels.get(edge.source) || edge.source }} → {{ edge.relation }} → {{ labels.get(edge.target) || edge.target }}
@@ -55,9 +68,10 @@ const statusText = {
       <figure v-for="(passage, index) in context.passages" :key="index">
         <figcaption>{{ passage.display_name || passage.node_id }} · 提及“{{ passage.text }}”</figcaption>
         <blockquote>{{ passage.excerpt }}</blockquote>
+        <small v-if="passage.property">属性 {{ passage.property }}</small>
         <small v-if="passage.source_tables.length">来源表 {{ passage.source_tables.join('、') }}</small>
         <small v-if="passage.evidence_refs.length">引用 {{ passage.evidence_refs.join('、') }}</small>
-        <small v-else-if="passage.observation_id">来源记录 {{ passage.observation_id }}</small>
+        <small v-if="passage.observation_id">来源记录 {{ passage.observation_id }}</small>
       </figure>
     </section>
   </section>

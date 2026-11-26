@@ -613,7 +613,7 @@ def _with_quarantine_witnesses(published, candidate):
 def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False, identity_records=None):
     """Combine independently checked subgraphs without silently replacing facts."""
     from lightgraph.source_values import persisted_identity_key
-    from .fusion import (merge_definition, deduplicate_supports, stamp_execution,
+    from .fusion import (merge_definition, merge_property_values, deduplicate_supports, stamp_execution,
                          retain_definition_variants, definition_conflict_diagnostics, edge_reference, record_input_edge,
                          remap_graph_endpoints)
     from .observed_identity import align_draft_nodes
@@ -699,6 +699,7 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False, identi
         graphs = cleaned
     definitions = {category: {} for category in ('entities', 'relations')}
     items = {category: {} for category in ('nodes', 'edges')}
+    property_keys = {}
     retained_global_labels = not fusion_policy and any(
         definition.get('identity_scope') == 'global' and definition.get('identity_domain')
         and definition.get('identity_evidence_refs')
@@ -782,11 +783,7 @@ def _merge_graphs(graphs, *, fusion_policy=None, isolate_conflicts=False, identi
                         for value in item[key]:
                             if value not in values:
                                 values.append(deepcopy(value))
-                for key, values in item.get('properties', {}).items():
-                    merged = previous.setdefault('properties', {}).setdefault(key, [])
-                    for value in values:
-                        if canonical(value) not in {canonical(v) for v in merged}:
-                            merged.append(deepcopy(value))
+                merge_property_values(previous, item, property_keys.setdefault((category, item['id']), {}))
     result['definitions'] = {key: [value[name] for name in sorted(value)] for key, value in definitions.items()}
     result.update({key: sorted(value.values(), key=lambda item: item['id']) for key, value in items.items()})
     if local_candidates:

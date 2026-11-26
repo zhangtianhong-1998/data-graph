@@ -14,7 +14,7 @@ from lightgraph.tests.test_model_streaming import model
 def clock(monkeypatch):
     now=[1000.0]
     for module in ('lightgraph.discovery.budget','lightgraph.discovery.llm',
-                   'lightgraph.discovery.agentscope_runtime'):
+                   'lightgraph.discovery.model_runtime'):
         monkeypatch.setattr(module+'.time',SimpleNamespace(monotonic=lambda:now[0]))
     return now
 

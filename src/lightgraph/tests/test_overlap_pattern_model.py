@@ -155,7 +155,7 @@ def test_invalid_model_alignment_grants_no_decision(monkeypatch, failure):
 
 
 @pytest.mark.parametrize('failure', ['missing', 'duplicate', 'unissued', 'new_rule', 'ineligible',
-                                      'malformed', 'duplicate_json_key', 'truncated', 'server', 'timeout'])
+                                      'malformed', 'duplicate_json_key', 'server', 'timeout'])
 def test_unusable_batch_grants_nothing_and_performs_one_attempt(monkeypatch, failure):
     patterns = [profile(1), profile(2, eligible=False)]
     decisions = [{'pattern_id': p['pattern_id'], 'action': 'keep'} for p in patterns]
@@ -180,7 +180,7 @@ def test_unusable_batch_grants_nothing_and_performs_one_attempt(monkeypatch, fai
             return respond('not JSON')
         if failure == 'duplicate_json_key':
             return respond('{"decisions":[],"decisions":[]}')
-        return respond(json.dumps(body), 'length' if failure == 'truncated' else 'stop')
+        return respond(json.dumps(body))
 
     requests = setup_provider(monkeypatch, reply)
     result = review_overlap_patterns(configured(), patterns, api_key='secret')
@@ -276,14 +276,98 @@ def test_complete_batches_survive_one_truncated_batch(monkeypatch, size):
         return respond(json.dumps({'decisions': decisions}), 'length' if items[0]['pattern_id'] == patterns[4]['pattern_id'] else 'stop')
 
     requests = setup_provider(monkeypatch, reply)
-    result = review_overlap_patterns(configured(), patterns[::-1], api_key='secret')
-    assert result['model_calls'] == len(requests) == (size + 3) // 4
+    result = review_overlap_patterns(configured(max_output_tokens=8192), patterns[::-1], api_key='secret')
+    assert result['model_calls'] == len(requests) == (size + 3) // 4 + 4
     assert result['status'] == 'partial' and result['reason'] == 'model_response_truncated'
-    assert result['failed_patterns'] == 4 and result['submitted_patterns'] == size
-    assert result['reviewed_patterns'] == size - 4 and result['omitted_patterns'] == 0
-    assert result['selected_pattern_ids'] == [p['pattern_id'] for p in patterns[:4] + patterns[8:]]
+    assert result['failed_patterns'] == 1 and result['submitted_patterns'] == size
+    assert result['failed_by_pattern_id'] == {patterns[4]['pattern_id']: 'model_response_truncated'}
+    assert result['reviewed_patterns'] == size - 1 and result['omitted_patterns'] == 0
+    assert result['selected_pattern_ids'] == [p['pattern_id'] for p in patterns[:4] + patterns[5:]]
     assert result['batches'][1] == {'pattern_ids': [p['pattern_id'] for p in patterns[4:8]],
+        'attempt': 2, 'parent_attempt': None,
         'output_token_limit': 8192, 'status': 'failed', 'reason': 'model_response_truncated'}
+    assert result['retry_batches'] == 4 and result['truncated_batches'] == 3 and result['recovered_patterns'] == 3
+
+
+@pytest.mark.parametrize('settings,case,limits,status', [
+    ({'max_output_tokens': 10000}, 'length', [8192, 10000], 'reviewed'),
+    ({'max_output_tokens': 50000}, 'always_length', [8192, 16384], 'fallback'),
+    ({'max_output_tokens': 10000, 'max_calls': 1}, 'length', [8192], 'fallback'),
+    ({'max_output_tokens': 6000}, 'length', [6000], 'fallback'),
+    ({'max_output_tokens': 16000, 'context_window_tokens': 16001}, 'length', [8192], 'fallback'),
+    ({'max_output_tokens': 10000, 'max_response_bytes': 500}, 'bytes', [8192], 'fallback'),
+    ({'max_output_tokens': 10000}, 'refused', [8192], 'fallback'),
+])
+def test_only_a_length_truncated_singleton_gets_one_larger_bounded_output_budget(monkeypatch, settings, case, limits, status):
+    pid = profile()['pattern_id']
+    def reply(request):
+        extra_budget = json.loads(request.content)['max_tokens'] > 8192
+        if case == 'bytes':
+            return respond('x' * 2000)
+        if case == 'refused':
+            return respond('', 'content_filter')
+        finish = 'stop' if extra_budget and case == 'length' else 'length'
+        return respond(json.dumps({'decisions': [{'pattern_id': pid, 'action': 'keep' if extra_budget else 'merge'}]}), finish)
+    requests = setup_provider(monkeypatch, reply)
+    result = review_overlap_patterns(configured(**settings), [profile()], api_key='key')
+    assert [json.loads(req.content)['max_tokens'] for req in requests] == limits
+    assert [b['output_token_limit'] for b in result['batches']] == limits
+    assert result['status'] == status and result['selected_pattern_ids'] == []
+    assert result['recovered_patterns'] == int(status == 'reviewed')
+    assert result['expanded_output_retries'] == len(limits) - 1
+    assert result['submitted_patterns'] == result['reviewed_patterns'] + result['failed_patterns'] == 1
+    if 'context_window_tokens' in settings:
+        assert result['batches'][0]['recovery_blocked_by'] == 'model_prompt_budget_exhausted'
+
+
+@pytest.mark.parametrize('call_limit,expected_status,reviewed,recovered,failed,omitted', [
+    (1, 'fallback', 0, 0, 4, 28),
+    (8, 'partial', 12, 0, 20, 0),
+    (18, 'reviewed', 32, 20, 0, 0),
+])
+def test_recovers_five_truncated_batches_or_accounts_for_each_pattern_at_budget(
+        monkeypatch, call_limit, expected_status, reviewed, recovered, failed, omitted):
+    patterns = [profile(i) for i in range(32)]
+    def reply(request):
+        issued = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
+        truncated = len(issued) == 4 and issued[0]['pattern_id'] < patterns[20]['pattern_id']
+        decisions = [{'pattern_id': p['pattern_id'], 'action': 'merge' if truncated else 'review'} for p in issued]
+        body = respond(json.dumps({'decisions': decisions}), 'length' if truncated else 'stop').json()
+        body['usage'] = {'prompt_tokens': 91, 'completion_tokens': 8192, 'total_tokens': 8283,
+                         'completion_tokens_details': {'reasoning_tokens': 8130, 'other': 'PRIVATE'}}
+        return httpx.Response(200, json=body)
+
+    requests = setup_provider(monkeypatch, reply)
+    result = review_overlap_patterns(configured(), patterns, api_key='key', max_calls=call_limit)
+    assert result['model_calls'] == len(requests) == call_limit and result['status'] == expected_status
+    assert result['submitted_patterns'] + result['omitted_patterns'] == len(patterns)
+    assert result['submitted_patterns'] == result['reviewed_patterns'] + result['failed_patterns']
+    assert (result['reviewed_patterns'], result['recovered_patterns'], result['failed_patterns'],
+            result['omitted_patterns']) == (reviewed, recovered, failed, omitted)
+    assert result['selected_pattern_ids'] == [] and all(d['action'] == 'review' for d in result['decisions'])
+    assert all(b['token_usage'] == {'prompt_tokens': 91, 'completion_tokens': 8192, 'reasoning_tokens': 8130}
+               for b in result['batches'])
+    for batch in result['batches'][8:]:
+        parent = result['batches'][batch['parent_attempt'] - 1]
+        assert parent['reason'] == 'model_response_truncated'
+        assert set(batch['pattern_ids']) < set(parent['pattern_ids'])
+    assert result['reason'] == ('pattern_decisions_validated' if not failed else 'model_call_budget_exhausted')
+
+
+def test_zero_key_two_member_pattern_asks_for_review_and_exposes_only_pair_counts(monkeypatch):
+    card = alignment_card()
+    card.update(basis='same_observed_names_with_different_keys', overlapping_keys=0, overlapping_names=17,
+                pair_coverage=[{'member_indexes': [0, 1], 'overlapping_keys': 0, 'keys': ['PRIVATE_1']}])
+    def reply(request):
+        assert b'PRIVATE_' not in request.content
+        issued, = json.loads(json.loads(request.content)['messages'][1]['content'])['patterns']
+        assert issued['pair_coverage'] == [{'member_indexes': [0, 1], 'overlapping_keys': 0}]
+        assert issued['review_actions'] == ['keep', 'review']
+        return respond(json.dumps({'decisions': [{'pattern_id': card['pattern_id'], 'action': 'propose',
+            'alignment': [{'member_index': i, 'source_index': i, 'role_index': 0} for i in range(2)]}]}))
+    setup_provider(monkeypatch, reply)
+    result = review_overlap_patterns(configured(), [card], api_key='key')
+    assert result['failed_by_pattern_id'] == {card['pattern_id']: 'invalid_decisions'} and not result['decisions']
 
 
 @pytest.mark.parametrize('model_calls,node_calls,limit', [(1, 3, 1), (None, 2, 2)])

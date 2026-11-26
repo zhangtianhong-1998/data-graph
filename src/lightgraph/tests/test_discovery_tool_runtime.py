@@ -4,24 +4,13 @@ import asyncio
 import json
 
 import pytest
-from agentscope import _config
-from agentscope.tool import Toolkit, ToolResponse
 
 from lightgraph.contracts import ColumnSpec, ExtractionGoal, TableSpec
-from lightgraph.discovery.agentscope_tools import create_toolkit
+from lightgraph.discovery.tool_runtime import create_toolkit
 from lightgraph.discovery.budget import BudgetAllocator
 from lightgraph.discovery.tools import ToolExecutor
-from lightgraph.errors import BudgetExceeded, LightGraphError
+from lightgraph.errors import BudgetExceeded
 from lightgraph.sources.memory import MemorySource
-
-
-async def call(toolkit, name, arguments):
-    chunks = [chunk async for chunk in await toolkit.call_tool_function({
-        "type": "tool_use", "id": "call_test", "name": name, "input": arguments,
-    })]
-    assert len(chunks) == 1 and isinstance(chunks[0], ToolResponse)
-    assert chunks[0].is_last and not chunks[0].stream
-    return json.loads(chunks[0].content[0]["text"])
 
 
 @pytest.fixture
@@ -39,13 +28,12 @@ def executor():
     source.close()
 
 
-def test_real_agentscope_toolkit_preserves_all_executor_schemas(executor):
+def test_toolkit_preserves_all_issued_schemas(executor):
     expected = executor.tool_specs()
     toolkit = create_toolkit(executor)
-    assert isinstance(toolkit, Toolkit)
     assert toolkit.get_json_schemas() == expected
     assert executor.tool_specs() == expected
-    assert len(toolkit.tools) == 6
+    assert len(toolkit.get_json_schemas()) == 6
 
 
 @pytest.mark.parametrize("name,arguments", [
@@ -57,8 +45,8 @@ def test_real_agentscope_toolkit_preserves_all_executor_schemas(executor):
                          "target_table": "public.items", "target_columns": ["code"]}),
     ("execute_readonly_sql", {"sql": "SELECT DISTINCT code, label FROM public.items"}),
 ])
-def test_all_six_tools_execute_via_agentscope(executor, name, arguments, caplog, capsys):
-    result = asyncio.run(call(create_toolkit(executor), name, arguments))
+def test_all_six_tools_execute_through_the_issued_schema(executor, name, arguments, caplog, capsys):
+    result = asyncio.run(create_toolkit(executor).call(name, arguments))
     assert result["status"] == "ok"
     assert result["operator"] == name
     assert "SOURCE_SECRET" not in json.dumps(result)
@@ -73,7 +61,7 @@ def test_all_six_tools_execute_via_agentscope(executor, name, arguments, caplog,
     "SELECT code FROM public.items; UPDATE public.items SET code = 'SQL_CANARY'",
 ])
 def test_guarded_queries_still_reject_before_source_execution(executor, sql, caplog, capsys):
-    result = asyncio.run(call(create_toolkit(executor), "execute_readonly_sql", {"sql": sql}))
+    result = asyncio.run(create_toolkit(executor).call("execute_readonly_sql", {"sql": sql}))
     assert result["status"] == "error"
     assert executor.adapter.stats.queries == 0
     assert "SQL_CANARY" not in json.dumps(result) + caplog.text + str(capsys.readouterr())
@@ -81,7 +69,7 @@ def test_guarded_queries_still_reject_before_source_execution(executor, sql, cap
 
 def test_executor_metadata_only_policy_still_applies(executor):
     executor.allow_source_samples = False
-    result = asyncio.run(call(create_toolkit(executor), "execute_readonly_sql", {
+    result = asyncio.run(create_toolkit(executor).call("execute_readonly_sql", {
         "sql": "SELECT code FROM public.items",
     }))
     assert result["code"] == "metadata_only_query_forbidden"
@@ -90,8 +78,8 @@ def test_executor_metadata_only_policy_still_applies(executor):
 
 def test_unknown_tool_and_invalid_inputs_are_never_echoed(executor, caplog, capsys):
     toolkit = create_toolkit(executor)
-    unknown = asyncio.run(call(toolkit, "SECRET_UNKNOWN_TOOL", {"secret": "VALUE_CANARY"}))
-    invalid = asyncio.run(call(toolkit, "get_metadata", "VALUE_CANARY"))
+    unknown = asyncio.run(toolkit.call("SECRET_UNKNOWN_TOOL", {"secret": "VALUE_CANARY"}))
+    invalid = asyncio.run(toolkit.call("get_metadata", "VALUE_CANARY"))
     assert unknown == {"status": "error", "operator": "unknown", "code": "unknown_tool"}
     assert invalid["code"] == "invalid_tool_arguments"
     assert "CANARY" not in json.dumps([unknown, invalid]) + caplog.text + str(capsys.readouterr())
@@ -104,7 +92,7 @@ def test_dispatch_can_apply_loop_policy_without_executor_call(executor):
         observed.append(name)
         return {"status": "error", "code": "repeated_tool_call"}
 
-    result = asyncio.run(call(create_toolkit(executor, dispatch), "get_metadata", {}))
+    result = asyncio.run(create_toolkit(executor, dispatch).call("get_metadata", {}))
     assert result["code"] == "repeated_tool_call"
     assert observed == ["get_metadata"]
     assert executor._sequence == 0
@@ -134,27 +122,18 @@ def test_schema_rejections_precede_dispatch_and_never_echo_values(executor, name
         observed.append(tool)
         return executor.execute(tool, args)
 
-    result = asyncio.run(call(create_toolkit(executor, dispatch), name, arguments))
+    result = asyncio.run(create_toolkit(executor, dispatch).call(name, arguments))
     assert result["code"] == "invalid_tool_arguments"
     assert observed == []
     assert executor._sequence == 0
     assert "ARGUMENT_CANARY" not in json.dumps(result) + caplog.text + str(capsys.readouterr())
 
 
-def test_registered_function_itself_enforces_schema_before_dispatch(executor):
-    toolkit = create_toolkit(executor)
-    result = asyncio.run(toolkit.tools["profile_columns"].original_func(
-        table="public.items", columns="code",
-    ))
-    assert json.loads(result.content[0]["text"])["code"] == "invalid_tool_arguments"
-    assert executor._sequence == 0
-
-
-def test_dispatch_exception_never_becomes_framework_exception_text(executor, caplog, capsys):
+def test_dispatch_exception_never_discloses_source_values(executor, caplog, capsys):
     def dispatch(name, arguments):
         raise RuntimeError("SECRET_EXCEPTION_VALUE")
 
-    result = asyncio.run(call(create_toolkit(executor, dispatch), "get_metadata", {}))
+    result = asyncio.run(create_toolkit(executor, dispatch).call("get_metadata", {}))
     assert result["code"] == "tool_execution_failed"
     assert "SECRET_EXCEPTION_VALUE" not in json.dumps(result) + caplog.text + str(capsys.readouterr())
 
@@ -164,7 +143,7 @@ def test_budget_exhaustion_terminates_without_yielding_a_tool_result(executor):
         raise BudgetExceeded("query_budget_exhausted")
 
     with pytest.raises(BudgetExceeded, match="query_budget_exhausted"):
-        asyncio.run(call(create_toolkit(executor, dispatch), "get_metadata", {}))
+        asyncio.run(create_toolkit(executor, dispatch).call("get_metadata", {}))
 
 
 def test_budget_carrier_is_isolated_per_concurrent_call(executor):
@@ -177,8 +156,8 @@ def test_budget_carrier_is_isolated_per_concurrent_call(executor):
     async def exercise():
         toolkit = create_toolkit(executor, dispatch)
         return await asyncio.gather(
-            call(toolkit, "get_metadata", {"table": "budget"}),
-            call(toolkit, "get_metadata", {}), return_exceptions=True,
+            toolkit.call("get_metadata", {"table": "budget"}),
+            toolkit.call("get_metadata", {}), return_exceptions=True,
         )
 
     failed, succeeded = asyncio.run(exercise())
@@ -197,13 +176,6 @@ def test_dynamic_executor_tool_is_registered_without_a_hardcoded_list():
             return {"status": "ok", "operator": name}
 
     toolkit = create_toolkit(CustomExecutor())
-    assert list(toolkit.tools) == ["custom_probe"]
-    assert asyncio.run(call(toolkit, "custom_probe", {}))["status"] == "ok"
+    assert [entry['function']['name'] for entry in toolkit.get_json_schemas()] == ["custom_probe"]
+    assert asyncio.run(toolkit.call("custom_probe", {}))["status"] == "ok"
 
-
-def test_tracing_enabled_elsewhere_fails_before_any_tool_observation(executor, monkeypatch):
-    toolkit = create_toolkit(executor)
-    monkeypatch.setattr(_config, "trace_enabled", True)
-    with pytest.raises(LightGraphError, match="agent_tracing_forbidden"):
-        asyncio.run(call(toolkit, "get_metadata", {}))
-    assert executor._sequence == 0

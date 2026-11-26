@@ -4,7 +4,6 @@ from array import array
 import hashlib
 from contextlib import contextmanager
 from pathlib import Path
-from datetime import date, datetime, time as daytime
 import re
 import sqlite3
 import sqlglot
@@ -16,9 +15,11 @@ import openpyxl
 from lightgraph.runtime.files import file_stamp
 from lightgraph.contracts import TableSpec, ColumnSpec, QueryLimits
 from lightgraph.errors import LightGraphError
+from lightgraph.source_values import DateText, DateTimeText, TimeText, source_scalar
 from lightgraph.query import QueryCompiler, SQLGuard
 from lightgraph.query.compiler import ident, render_select
 from lightgraph.query.predicate import ScopeConjunction
+from .excel_temporal import TEMPORAL_TYPES, bind_comparisons
 from .base import row_bytes
 from .memory import MemorySource
 from .budget import BudgetedCursor
@@ -29,18 +30,37 @@ def _cell_value(cell, cached):
     if cell is None:
         return None
     if cell.data_type == "f":
-        return cached.value if cached is not None else None
+        cell = cached
+    if cell is None or cell.data_type == "e":
+        return None
     if cell.value is None and cell.data_type == "inlineStr":
         return ""
     return cell.value
 
 
+_TEMPORAL_TAGS = {DateText: b"d", DateTimeText: b"D", TimeText: b"t"}
+_TEMPORAL_TYPES = {v: k for k, v in _TEMPORAL_TAGS.items()}
+
+
+def _read_cell(value):
+    if type(value) is bytes:
+        if value in (b"1\0b", b"0\0b"):
+            return value == b"1\0b"
+        tag = _TEMPORAL_TYPES.get(value[:1])
+        if tag is not None:
+            return tag(value[1:].decode("ascii"))
+    return value
+
+
 def _sqlite_cell(value):
-    # XLSX cells have no binary scalar type. A BLOB retains boolean identity
-    # through SQLite DISTINCT, grouping and joins, including mixed columns.
+    # Binary tags preserve Excel scalar types through SQLite DISTINCT and joins.
     if type(value) is bool:
         return b"1\0b" if value else b"0\0b"
-    return value
+    tag = _TEMPORAL_TAGS.get(type(value))
+    return tag + value.encode("ascii") if tag else value
+
+
+_BLOB_TYPES = {DateText: "date", DateTimeText: "timestamp", TimeText: "time", bool: "boolean"}
 
 
 class ExcelSource(MemorySource):
@@ -48,6 +68,8 @@ class ExcelSource(MemorySource):
         path = Path(path)
         self._sheet_rows = {}
         self._has_boolean = False
+        self._blob_types = {}
+        self._error_columns = {}
         self._position_bytes = 0
         self._witness_table = None
         self.workbook_snapshot = None
@@ -141,12 +163,21 @@ class ExcelSource(MemorySource):
                             cell = raw[i] if i < len(raw) else None
                             cache = cached[i] if i < len(cached) else None
                             value = _cell_value(cell, cache)
-                            if cell is not None and cell.data_type == "f" and value is None:
-                                self._pending_formula_columns.setdefault(f"{schema_name}.{sheet.title}", set()).add(column_names[i])
-                                self.issue_counts["formula_cache_missing"] = self.issue_counts.get("formula_cache_missing", 0) + 1
+                            actual = cache if cell is not None and cell.data_type == "f" else cell
+                            issue = None
+                            if actual is not None and actual.data_type == "e":
+                                issue, affected = "excel_error_cell", self._error_columns
+                            elif cell is not None and cell.data_type == "f" and value is None:
+                                issue, affected = "formula_cache_missing", self._pending_formula_columns
+                            if issue:
+                                affected.setdefault(f"{schema_name}.{sheet.title}", set()).add(column_names[i])
+                                self.issue_counts[issue] = self.issue_counts.get(issue, 0) + 1
                                 if len(self.issues) < 32:
-                                    self.issues.append({"code": "formula_cache_missing", "sheet": sheet.title, "row": index, "column": i + 1})
-                            if isinstance(value, (date, datetime, daytime)): value = value.isoformat()
+                                    self.issues.append({"code": issue, "sheet": sheet.title, "row": index, "column": i + 1})
+                            value = source_scalar(value)
+                            blob_type = _BLOB_TYPES.get(type(value))
+                            if blob_type:
+                                self._blob_types.setdefault((sheet.title, column_names[i]), set()).add(blob_type)
                             if isinstance(value, int) and not isinstance(value, bool) and cell is not None and re.fullmatch("0{2,}", cell.number_format or ""):
                                 value = str(value).zfill(len(cell.number_format))
                             converted.append(value)
@@ -185,9 +216,12 @@ class ExcelSource(MemorySource):
             super().__init__(tables, rows, limits=limits, max_memory_bytes=max_memory_bytes, query_budget=query_budget)
             if not metadata_only:
                 self._db.row_factory = lambda cursor, row: tuple(
-                    value == b"1\0b" if type(value) is bytes and value in (b"1\0b", b"0\0b")
-                    else value for value in row)
+                    _read_cell(value) for value in row)
                 self._infer_loaded_types()
+                self._comparison_types = {table.qualified_name: {c.name: c.data_type for c in table.columns}
+                                          for table in self._tables}
+                self._has_temporal = any(t in TEMPORAL_TYPES for cols in self._comparison_types.values()
+                                         for t in cols.values())
             if before != file_stamp(path):
                 raise LightGraphError("excel_input_changed")
             self.input_stamp = before
@@ -228,7 +262,9 @@ class ExcelSource(MemorySource):
                     for i, column in enumerate(columns):
                         present = {shape for shape, count in zip(shapes, counts[i * 4:i * 4 + 4]) if count}
                         if not present or present == {"text"}: column.data_type = "text"
-                        elif present == {"blob"}: column.data_type = "boolean"
+                        elif present == {"blob"}:
+                            kinds = self._blob_types[(table.name, column.name)]
+                            column.data_type = next(iter(kinds)) if len(kinds) == 1 else "mixed"
                         elif present == {"integer"}: column.data_type = "integer"
                         elif present <= {"integer", "real"}: column.data_type = "real"
                         else: column.data_type = "mixed"
@@ -258,14 +294,16 @@ class ExcelSource(MemorySource):
             if "column" in value: return {value["column"]}
             return set(value)
         required.update(predicate_columns(predicate))
+        if required & self._error_columns.get(table.qualified_name, set()):
+            raise LightGraphError("excel_error_cell_in_projection")
         if required & self._pending_formula_columns.get(table.qualified_name,set()):
             # A missing cache is unknown, never a real NULL. Publishing its
             # incomplete projection could wrongly retract previously known facts.
             raise LightGraphError("formula_cache_missing_in_projection")
         yield from super().project(table,columns,predicate,distinct,limit)
 
-    def _check_formula_query(self, query):
-        """Missing formula caches remain unknown through every SQL entry point.
+    def _check_available_cells(self, query):
+        """Missing formula caches and error cells remain unknown through every SQL entry point.
 
         The normal catalog guard validates first. Removing unavailable columns
         from a second catalog then catches their use in SELECT, filters, aliases,
@@ -273,31 +311,39 @@ class ExcelSource(MemorySource):
         """
         if self.metadata_only:
             raise LightGraphError("metadata_only_query_forbidden")
-        if self._pending_formula_columns:
+        for unavailable, code in ((self._error_columns, "excel_error_cell_in_projection"),
+                                  (self._pending_formula_columns, "formula_cache_missing_in_projection")):
+            if not unavailable:
+                continue
             self.compiler.guard.validate(query.sql, query.parameters)
             tables = self.describe()
             for table in tables:
-                missing = self._pending_formula_columns.get(table.qualified_name, set())
+                missing = unavailable.get(table.qualified_name, set())
                 table.columns = [column for column in table.columns if column.name not in missing]
             try:
                 SQLGuard(tables, dialect="sqlite", physical_columns=self.compiler.guard.physical_columns).validate(
                     query.sql, query.parameters)
             except LightGraphError as exc:
                 if exc.code == "unauthorized_column":
-                    raise LightGraphError("formula_cache_missing_in_projection") from None
+                    raise LightGraphError(code) from None
                 raise
 
     def execute(self, query, *, row_limit=None):
-        self._check_formula_query(query)
+        self._check_available_cells(query)
         yield from super().execute(query, row_limit=row_limit)
 
     def _read_cursor(self, sql, parameters, derived_count_sources, row_limit):
-        bindings = {key: _sqlite_cell(value) for key, value in parameters.items()}
+        bindings = dict(parameters)
+        tree = None
+        if self._has_temporal:
+            tree = sqlglot.parse_one(sql, read="sqlite")
+            if bind_comparisons(tree, bindings, self._comparison_types):
+                sql = render_select(tree, "sqlite")
         if self._has_boolean and re.search(r"\b(?:true|false)\b", sql, re.I):
             # Generated predicates bind Python booleans. Free-form authorized SQL
             # may instead compare a cell with a boolean literal. Keep SQLite's
             # separate IS TRUE/FALSE truth test intact.
-            tree = sqlglot.parse_one(sql, read="sqlite")
+            tree = tree if tree is not None else sqlglot.parse_one(sql, read="sqlite")
             literals = []
             for value in tree.find_all(exp.Boolean):
                 comparison = value.parent
@@ -312,6 +358,7 @@ class ExcelSource(MemorySource):
                 value.replace(exp.Placeholder(this=key))
             if literals:
                 sql = render_select(tree, "sqlite")
+        bindings = {key: _sqlite_cell(value) for key, value in bindings.items()}
         yield from super()._read_cursor(sql, bindings, derived_count_sources, row_limit)
 
     def _authorize(self, action, arg1, arg2, db, trigger):
@@ -342,7 +389,7 @@ class ExcelSource(MemorySource):
         """
         snapshot = self.sheet_row_snapshot(table)
         query = self.compiler.projection(table, columns, predicate=predicate, limit=limit)
-        self._check_formula_query(query)
+        self._check_available_cells(query)
         if (not snapshot or len(columns) + 1 > self._db.getlimit(sqlite3.SQLITE_LIMIT_FUNCTION_ARG)
                 or witness_bytes <= 0):
             yield self.project(table, columns, predicate=predicate, limit=limit), lambda row: None

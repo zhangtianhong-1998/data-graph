@@ -25,6 +25,28 @@ def test_new_manifest_is_portable_and_old_windows_keys_still_execute(tmp_path):
     assert frozen.load(bundle/'execution.json')['frozen_files_unchanged']
 
 
+def test_historical_discovery_dependency_is_checked_only_if_the_manifest_recorded_it(tmp_path, monkeypatch):
+    version = frozen.importlib.metadata.version
+    def installed(name):
+        if name == 'agentscope':
+            raise frozen.importlib.metadata.PackageNotFoundError(name)
+        return version(name)
+
+    monkeypatch.setattr(frozen.importlib.metadata, 'version', installed)
+    _, gold, config = inputs(tmp_path)
+    bundle = tmp_path / 'bundle'
+    manifest = frozen.prepare(config, bundle, gold_path=gold)
+    packages = manifest['environment']['packages']
+    assert 'agentscope' not in packages
+    packages['agentscope'] = None
+    frozen.write(bundle / 'bundle.json', manifest)
+    assert frozen.verify(bundle) == manifest
+    packages['agentscope'] = '1.0.21'
+    frozen.write(bundle / 'bundle.json', manifest)
+    with pytest.raises(LightGraphError, match='evaluation_runtime_environment_changed'):
+        frozen.verify(bundle)
+
+
 @pytest.mark.parametrize('change,code',[
     ('changed_file','evaluation_frozen_file_changed'),
     ('added_module','evaluation_frozen_code_changed'),

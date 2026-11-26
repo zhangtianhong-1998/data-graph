@@ -26,10 +26,9 @@ def _row_citation(obs):
         witness = worksheet_row_witness(obs.get('source_row_witness'))
         if witness:
             citation['source_row_witness'] = witness
-    if citation or obs.get('projection') in ('source_binding', 'reference_only'):
-        observation_id = obs.get('observation_id')
-        if isinstance(observation_id, str) and observation_id:
-            citation['observation_id'] = observation_id
+    observation_id = obs.get('observation_id')
+    if isinstance(observation_id, str) and observation_id:
+        citation['observation_id'] = observation_id
     return citation
 
 
@@ -54,12 +53,12 @@ def agent_context(answer, *, version=None, sources=()):
                         'candidate_ids': [n['node_id'] for n in s.get('candidates', [])]}
                        for s in plan.get('conditions', [])],
         'excluded_terms': plan.get('excluded_terms', []), 'partial_status': partial.get('status'),
-        'truncated': bool(answer.get('truncated') or partial.get('truncated')),
+        'truncated': bool(answer.get('truncated') or partial.get('truncated') or answer.get('type_definitions_truncated')),
         'nodes': [], 'edges': [], 'bindings': [], 'paths': [], 'bridge_nodes': [], 'joint_witnesses': [], 'source_passages': [],
     }
     # Separate budgets keep a large entity list from crowding out paths and physical mappings.
     remaining = dict(nodes=12000, edges=12000, bindings=_BINDING_BYTES, paths=8000, joint_witnesses=6000,
-                     source_passages=3600, bridge_nodes=6000, hierarchy_items=6000)
+                     source_passages=3600, type_definitions=6000, bridge_nodes=6000, hierarchy_items=6000)
 
     tokens = {section: max(1, limit // 2) for section, limit in remaining.items()}
 
@@ -98,12 +97,11 @@ def agent_context(answer, *, version=None, sources=()):
             if source.get('table'):
                 row.update(source=_fields(source, ('source_id', 'schema', 'table')),
                            source_kind=kinds.get(source.get('source_id')), mapping=mapping)
-            projected = obs.get('projection') in ('source_binding', 'reference_only')
-            if row or (projected and obs.get('observation_id')):
+            if row or obs.get('observation_id'):
                 key = _compact(row)
                 first = key not in seen
                 candidates = seen.setdefault(key, [])
-                if projected or 'source_row_witness' in obs:
+                if obs.get('observation_id') or 'source_row_witness' in obs:
                     candidates.append(obs)
                 if first:
                     yield {'ref': item['id'], **row}, candidates
@@ -228,6 +226,13 @@ def agent_context(answer, *, version=None, sources=()):
                                                                            'edge_ids', 'business_context', 'common_record'))})
             else:
                 context['truncated'] = True
+    if answer.get('type_definitions'):
+        context['type_definitions'] = []
+        for definition in answer['type_definitions']:
+            if not add('type_definitions', definition):
+                binding = _fields(definition['example_binding'], ('node_id', 'edge_id', 'business_context'))
+                add('type_definitions', {**_fields(definition, ('source', 'category', 'type', 'text_match')),
+                    'description': definition['description'][:384], 'projection': 'excerpt', 'example_binding': binding})
     for passage in partial.get('passages', []):
-        add('source_passages', _fields(passage, ('excerpt', 'node_id', 'field', 'source_tables', 'evidence_refs')))
+        add('source_passages', _fields(passage, ('excerpt', 'node_id', 'edge_id', 'field', 'property', 'observation_id', 'source_tables', 'evidence_refs')))
     return context

@@ -22,6 +22,13 @@ interface RetrievalQueryResponse {
   agent_context?: Record<string, unknown>
   sql_preview?: { status: 'generated' | 'insufficient_context' | 'unavailable'; sql?: string; reason?: string; code?: string }
 
+  type_definitions_truncated?: boolean
+  type_definitions?: Array<{
+    category: 'entities' | 'relations'
+    type: string
+    description: string
+    example_binding: { source_tables?: string[]; business_context?: FactContext }
+  }>
   available_context?: AvailableRetrievalContext
   hierarchy?: {
     direction: 'parents' | 'children'
@@ -481,6 +488,18 @@ async function runQuery(withSQL = false, candidateId?: string) {
             </article>
           </div>
           <AvailableContext v-if="result.available_context" :context="result.available_context" />
+          <section v-if="result.type_definitions?.length" aria-label="已发布的类型说明">
+            <h3>已发布的类型说明</h3>
+            <small v-if="result.type_definitions_truncated">已列出前 {{ result.type_definitions.length }} 项说明。</small>
+            <details v-for="d in result.type_definitions" :key="d.category + '/' + d.type"
+                     :open="result.available_context?.status === 'definition_only'">
+              <summary>{{ d.category === 'entities' ? '实体' : '关系' }} · {{ d.type }}</summary>
+              <p>{{ d.description }}</p>
+              <small v-if="d.example_binding.source_tables?.length">
+                映射示例 · {{ d.example_binding.source_tables.join('、') }} · {{ contextLabel(d.example_binding.business_context) }}
+              </small>
+            </details>
+          </section>
           <div v-if="showMainGraph" class="report-summary">
             <div><small>子图节点</small><strong>{{ result.nodes.length }}</strong></div>
             <div><small>关系</small><strong>{{ result.edges.length }}</strong></div>

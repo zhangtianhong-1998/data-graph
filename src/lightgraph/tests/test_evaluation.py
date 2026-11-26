@@ -62,3 +62,15 @@ def test_scope_scores_aggregate_verified_supports_and_reject_unknowns(tmp_path):
     graph['nodes'].append(dict(graph['nodes'][0]))
     result=evaluate_mode(graph,gold,{'accepted'}, {})
     assert result.duplicate_node_ids==['n'] and result.identities.predicted==2 and result.identities.true_positive==0
+
+
+def test_interchange_export_cannot_score_as_an_empty_result(tmp_path):
+    from lightgraph.construction.graph_export import serialize_graph
+
+    path = tmp_path / 'export.json'
+    path.write_text(serialize_graph({'nodes': [{'id': 'n1', 'type': 'Item',
+        'identity': {'code': '001'}, 'properties': {'business_code': ['001']}}], 'edges': []}, 'semantica-json'))
+    gold = tmp_path / 'gold.json'
+    write(gold, {'nodes': [{'code': '001'}]})
+    with pytest.raises(LightGraphError, match='evaluation_graph_format_unsupported'):
+        evaluate(path, gold)

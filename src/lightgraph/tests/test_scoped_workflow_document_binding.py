@@ -96,7 +96,14 @@ def test_document_only_identity_requires_issued_sections_covering_the_key(tmp_pa
         tools.close()
 
 
-def test_shared_field_dictionary_in_two_units_without_database_constraints(tmp_path):
+SHARED_ACCESSION_SECTIONS = (
+    'Registry R assigns each specimen exactly one accession, unique across its sites.',
+    'The accession_a column holds the full Registry R specimen accession.',
+    'The accession_b column holds the full Registry R specimen accession.',
+)
+
+
+def merge_csv_units_citing_registry(tmp_path, sections=SHARED_ACCESSION_SECTIONS, *, allow_local_fallback=False):
     from lightgraph.construction.merger import merge_construction_graphs
     from lightgraph.construction.workflow import build_unit_config, load_unit_contributor
     from lightgraph.construction.workspace import dump_yaml
@@ -108,9 +115,7 @@ def test_shared_field_dictionary_in_two_units_without_database_constraints(tmp_p
         'scope: {tables: [a.public.readings, b.public.readings]}\n'
         'sections:\n  Side A: {scope: {tables: [a.public.readings]}}\n'
         '  Side B: {scope: {tables: [b.public.readings]}}\n---\n'
-        '# Shared\nRegistry R assigns each specimen exactly one accession, unique across its sites.\n'
-        '# Side A\nThe accession_a column holds the full Registry R specimen accession.\n'
-        '# Side B\nThe accession_b column holds the full Registry R specimen accession.\n',
+        f'# Shared\n{sections[0]}\n# Side A\n{sections[1]}\n# Side B\n{sections[2]}\n',
         encoding='utf-8')
     sources = []
     for sid in ['a', 'b']:
@@ -152,16 +157,125 @@ def test_shared_field_dictionary_in_two_units_without_database_constraints(tmp_p
             ], 'relations': [{'type': 'classified_as', 'source_type': 'Specimen', 'target_type': 'LocalClass',
                 'mappings': [{**source, 'source_key_columns': ['accession_' + sid],
                               'target_key_columns': ['local_class']}]}]}
-            assert tools.call('save_graph_draft', yaml_text=dump_yaml(draft))['status'] == 'ok'
-            assert tools.call('validate_graph_draft', draft_id='readings')['passed']
-            assert tools.call('publish_graph_draft', draft_id='readings')['nodes'] == 2
+            saved = tools.call('save_graph_draft', yaml_text=dump_yaml(draft))
+            checked = (tools.call('validate_graph_draft', draft_id=draft['draft_id'])
+                       if saved['status'] == 'ok' else saved)
+            if not checked.get('passed') and allow_local_fallback:
+                # A validator may reject the incorrect shared-domain draft before merge.
+                codes = [checked.get('code') or '', *(d.get('code', '') for d in checked.get('diagnostics', []))]
+                assert any('identity' in code for code in codes), checked
+                draft['draft_id'] = 'site_local_readings'
+                entity = draft['entities'][0]
+                entity.update(identity_scope='unknown')
+                del entity['identity_domain'], entity['identity_evidence_refs']
+                assert tools.call('save_graph_draft', yaml_text=dump_yaml(draft))['status'] == 'ok'
+                checked = tools.call('validate_graph_draft', draft_id=draft['draft_id'])
+            assert checked.get('passed'), checked
+            assert tools.call('publish_graph_draft', draft_id=draft['draft_id'])['nodes'] == 2
         finally:
             tools.close()
         units.append(load_unit_contributor(out, sid))
-    graph = merge_construction_graphs(units, target_access_fingerprint=access_fingerprint(config))
+    return merge_construction_graphs(units, target_access_fingerprint=access_fingerprint(config))
+
+
+def test_shared_field_dictionary_in_two_units_without_database_constraints(tmp_path):
+    graph = merge_csv_units_citing_registry(tmp_path)
     specimen, = [node for node in graph['nodes'] if node['type'] == 'Specimen']
     assert specimen['identity'] == {'accession': '0007'}
     assert {s['provenance']['source']['source_id'] for s in specimen['supports']} == {'a', 'b'}
     classes = {node['id'] for node in graph['nodes'] if node['type'] == 'LocalClass'}
     assert len(classes) == 2
     assert {(e['source'], e['target']) for e in graph['edges']} == {(specimen['id'], c) for c in classes}
+
+
+
+def _csv_source(tmp_path, sid, table):
+    path = tmp_path / (sid + '.csv')
+    path.write_text('id,title\n1,One\n')
+    return {'id': sid, 'kind': 'csv_file', 'path': str(path), 'table_name': table,
+            'encoding': 'utf-8', 'delimiter': ',', 'header': True, 'null_values': [''], 'type_inference': 'text'}
+
+
+@pytest.mark.parametrize('selector', ['items', 'public.items'])
+def test_split_rejects_short_document_name_shared_by_siblings(tmp_path, selector):
+    from lightgraph.construction.workflow import build_unit_config
+    from lightgraph.runtime.config import WorkflowUnitConfig
+    config = RunConfig(sources=[_csv_source(tmp_path, sid, 'items') for sid in ('erp', 'crm')],
+                       documents=_documents(tmp_path, [selector]))
+    for sid in ('erp', 'crm'):
+        with pytest.raises(LightGraphError, match='ambiguous_document_table_binding'):
+            build_unit_config(config, WorkflowUnitConfig(unit_id=sid, source_ids=[sid]), unit_output_dir=tmp_path / sid)
+
+
+def test_unique_short_names_in_mixed_document_survive_the_split(tmp_path):
+    from lightgraph.construction.workflow import build_unit_config
+    from lightgraph.runtime.config import WorkflowUnitConfig
+    from lightgraph.web.execution import _resolved_payload
+
+    guide = tmp_path / 'guide.md'
+    guide.write_text('---\nid: guide\npurpose: data_description\n'
+        'scope: {tables: [items, crm.public.accounts]}\n'
+        'sections:\n  Price: {scope: {tables: [items]}}\n  Balance: {scope: {tables: [accounts]}}\n'
+        '---\n# Glossary\nCommon terms.\n# Price\nERP only.\n# Balance\nCRM only.\n')
+    config = RunConfig(sources=[_csv_source(tmp_path, 'erp', 'items'), _csv_source(tmp_path, 'crm', 'accounts')],
+                       documents=[str(guide)])
+    for sid, table, heading in [('erp', 'items', 'Price'), ('crm', 'accounts', 'Balance')]:
+        out = tmp_path / sid
+        unit = build_unit_config(config, WorkflowUnitConfig(unit_id=sid, source_ids=[sid]), unit_output_dir=out)
+        payload = _resolved_payload(unit, tmp_path)
+        assert payload['document_table_bindings'] and 'document_table_bindings' not in payload['config']
+        tools = ConstructionTools(unit, out, drop_unbound_documents=True)
+        try:
+            pages = [tools.call('read_material', name='document:guide', page=i)['section'] for i in (0, 1)]
+            assert [p['heading'] for p in pages] == ['Glossary', heading]
+            assert all(p['sources'] == [{'source_id': sid, 'schema': 'public', 'table': table}] for p in pages)
+            assert tools.call('read_material', name='document:guide', page=2)['code'] == 'unknown_document_page'
+        finally:
+            tools.close()
+
+
+def test_qualified_and_global_documents_do_not_open_unrelated_sources(tmp_path):
+    from lightgraph.construction.workflow import build_unit_config
+    from lightgraph.runtime.config import WorkflowUnitConfig
+    docs = _documents(tmp_path, ['erp.public.items'])
+    guide = tmp_path / 'global.md'
+    guide.write_text('# Notes\nCross-project glossary.')
+    sources = [_csv_source(tmp_path, 'erp', 'items'),
+               {'id': 'sibling', 'kind': 'excel_workbook', 'path': str(tmp_path / 'unavailable.xlsx')},
+               {'id': 'db', 'kind': 'gauss_database'}]
+    config = RunConfig(sources=sources, documents=docs + [str(guide)])
+    unit = build_unit_config(config, WorkflowUnitConfig(unit_id='main', source_ids=['erp']), unit_output_dir=tmp_path)
+    assert [source.id for source in unit.sources] == ['erp']
+    assert unit.documents == config.documents
+
+
+@pytest.mark.parametrize('version', [1, 2])
+@pytest.mark.parametrize('short_names', [False, True])
+def test_checkpoint_proof_tracks_resolved_document_tables_only_in_relevant_units(
+        tmp_path, monkeypatch, version, short_names):
+    from lightgraph.documents import core
+    from lightgraph.web.execution import _WorkflowInputProofs, _input_manifest, _workflow_node_inputs
+
+    sources = [_csv_source(tmp_path, sid, name) for sid, name in
+               [('erp', 'items'), ('crm', 'accounts'), ('other', 'orders')]]
+    items, accounts = ('items', 'accounts') if short_names else ('erp.public.items', 'crm.public.accounts')
+    guide = tmp_path / 'guide.md'
+    guide.write_text('---\nid: guide\npurpose: data_description\n'
+        f'scope: {{tables: [{items}, crm.public.accounts]}}\n'
+        f'sections:\n  Price: {{scope: {{tables: [{items}]}}}}\n  Balance: {{scope: {{tables: [{accounts}]}}}}\n'
+        '---\n# Glossary\nCommon terms.\n# Price\nERP only.\n# Balance\nCRM only.\n')
+    config = RunConfig(sources=sources, documents=[str(guide)], workflow={
+        'enabled': True, 'units': [{'unit_id': s['id'], 'source_ids': [s['id']]} for s in sources]})
+    files = _input_manifest(config, tmp_path)
+    with monkeypatch.context() as legacy:
+        legacy.setattr(core, 'resolve_workflow_table_selectors', lambda *args: {})
+        previous = _workflow_node_inputs(config, tmp_path, files, version=version)
+    current = _workflow_node_inputs(config, tmp_path, files, version=version)
+    assert {uid for uid in previous if previous[uid] != current[uid]} == ({'crm', 'erp'} if short_names else set())
+    proofs = _WorkflowInputProofs(config, tmp_path, files)
+    for uid, old in previous.items():
+        if short_names and uid in ('erp', 'crm'):
+            with pytest.raises(LightGraphError, match='workflow_resume_input_changed'):
+                proofs.match(uid, old, {'input_digest': old}, [None, str(tmp_path)])
+        else:
+            assert proofs.match(uid, old, {'input_digest': old}, [None]) == (str(tmp_path) if version == 1 else None)

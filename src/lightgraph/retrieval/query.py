@@ -119,6 +119,17 @@ class RetrieveSubgraphRequest(BaseModel):
         return self
 
     def run(self, retriever, scopes):
+        from .definitions import definitions_for_answer
+        answer = self._run(retriever, scopes)
+        definitions = definitions_for_answer(retriever, answer, scopes, self)
+        if definitions:
+            answer['type_definitions'] = definitions
+            partial = answer.get('available_context') or {}
+            if partial.get('status') == 'no_confirmed_match' and any(d['text_match'] for d in definitions):
+                partial['status'] = 'definition_only'
+        return answer
+
+    def _run(self, retriever, scopes):
         if self.mode == 'hierarchy':
             from .direct_hierarchy import retrieve_hierarchy
             return retrieve_hierarchy(retriever, self, scopes, term=self.query.strip(), direction=self.hierarchy_direction)

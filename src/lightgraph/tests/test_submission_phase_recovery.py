@@ -7,7 +7,7 @@ import pytest
 from lightgraph.discovery.budget import BudgetAllocator, Cost
 from lightgraph.errors import BudgetExceeded, LightGraphError
 from lightgraph.runtime.trace import RunTrace, bind_trace
-from lightgraph.tests.test_agentscope_runtime import framework_spy, assert_cleared, reply_for
+from lightgraph.tests.test_discovery_model_runtime import discovery_run, reply_for
 from lightgraph.tests.test_discovery_agent import Toolbox, input_packet, response
 from lightgraph.tests.test_model_streaming import model
 from lightgraph.tests.test_proposal_session import group, tools_response
@@ -30,7 +30,7 @@ def runtime_feedback(body):
 
 
 @pytest.mark.parametrize('entrypoint', ['client', 'function'])
-def test_default_window_can_explore_after_six_turns(entrypoint, framework_spy):
+def test_default_window_can_explore_after_six_turns(entrypoint, discovery_run):
     requests = []
 
     def handler(request):
@@ -53,11 +53,10 @@ def test_default_window_can_explore_after_six_turns(entrypoint, framework_spy):
     assert len(batch.proposals) == 1 and batch._runtime_submission_complete
     assert tools.executed == ['get_metadata'] * 9
     assert len(requests) == client.usage['calls'] == 10
-    assert_cleared(framework_spy)
 
 
 @pytest.mark.parametrize('stream', [False, True])
-def test_six_probes_then_stale_source_call_uses_last_turn_to_submit(stream, framework_spy, tmp_path):
+def test_six_probes_then_stale_source_call_uses_last_turn_to_submit(stream, discovery_run, tmp_path):
     requests = []
 
     def handler(request):
@@ -88,7 +87,7 @@ def test_six_probes_then_stale_source_call_uses_last_turn_to_submit(stream, fram
     assert len(batch.proposals) == 1 and batch._runtime_submission_complete
     assert batch._runtime_pending_codes == []
     assert tools.executed == ['get_metadata'] * 6
-    assert framework_spy['tool_names'] == ['get_metadata'] * 6 + ['submit_column_group', 'finish_discovery']
+    assert discovery_run['tool_names'] == ['get_metadata'] * 6 + ['submit_column_group', 'finish_discovery']
     assert client.usage['calls'] == 8 and client.usage['failures'] == 0
     records = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
     recorded_requests = [entry['data'] for entry in records if entry['kind'] == 'model_request']
@@ -100,10 +99,9 @@ def test_six_probes_then_stale_source_call_uses_last_turn_to_submit(stream, fram
     assert client.usage['discovery_phase_recoveries'] == 1
     feedback_events = [entry['data'] for entry in records if entry['kind'] == 'discovery_phase_feedback']
     assert len(feedback_events) == 1 and feedback_events[0]['executed_tools'] == 0
-    assert_cleared(framework_spy)
 
 
-def test_mixed_blocked_batch_executes_no_submission_and_keeps_earlier_draft(framework_spy):
+def test_mixed_blocked_batch_executes_no_submission_and_keeps_earlier_draft(discovery_run):
     calls = []
 
     def handler(request):
@@ -128,12 +126,11 @@ def test_mixed_blocked_batch_executes_no_submission_and_keeps_earlier_draft(fram
     assert batch._runtime_submission_complete and batch._runtime_invalid_drafts == 0
     assert not batch._runtime_pending_codes
     assert tools.executed == ['get_metadata']
-    assert framework_spy['tool_names'] == ['submit_column_group', 'get_metadata', 'finish_discovery']
+    assert discovery_run['tool_names'] == ['submit_column_group', 'get_metadata', 'finish_discovery']
     assert client.usage['calls'] == 4
-    assert_cleared(framework_spy)
 
 
-def test_repeated_stale_calls_stop_only_at_actual_step_limit(framework_spy):
+def test_repeated_stale_calls_stop_only_at_actual_step_limit(discovery_run):
     requests = []
 
     def handler(request):
@@ -148,10 +145,9 @@ def test_repeated_stale_calls_stop_only_at_actual_step_limit(framework_spy):
     assert tools.executed == ['get_metadata'] * 6
     assert runtime_feedback(requests[-1])['executed_tools'] == 0
     assert client.budget.snapshot()['reserved'] == {}
-    assert_cleared(framework_spy)
 
 
-def test_failed_correction_preserves_staged_work_and_records_termination(framework_spy, tmp_path):
+def test_failed_correction_preserves_staged_work_and_records_termination(discovery_run, tmp_path):
     calls = []
 
     def handler(request):
@@ -172,10 +168,9 @@ def test_failed_correction_preserves_staged_work_and_records_termination(framewo
     end = next(entry['data'] for entry in records if entry['kind'] == 'agent_end')
     assert end['steps'] == 4 and end['termination_code'] == 'discovery_steps_exhausted'
     assert len(end['drafts']) == 1
-    assert_cleared(framework_spy)
 
 
-def test_early_source_allowance_exhaustion_has_only_one_correction(framework_spy):
+def test_early_source_allowance_exhaustion_has_only_one_correction(discovery_run):
     requests = []
 
     def handler(request):
@@ -189,10 +184,9 @@ def test_early_source_allowance_exhaustion_has_only_one_correction(framework_spy
     assert len(requests) == client.usage['calls'] == 3
     assert tools.executed == ['get_metadata']
     assert runtime_feedback(requests[-1])['executed_tools'] == 0
-    assert_cleared(framework_spy)
 
 
-def test_phase_recovery_cannot_spend_an_exhausted_shared_call_budget(framework_spy):
+def test_phase_recovery_cannot_spend_an_exhausted_shared_call_budget(discovery_run):
     calls = []
 
     def handler(request):
@@ -208,11 +202,10 @@ def test_phase_recovery_cannot_spend_an_exhausted_shared_call_budget(framework_s
     assert len(calls) == client.usage['calls'] == 7
     assert tools.executed == ['get_metadata'] * 6
     assert budget.used.llm_calls == 7 and budget.snapshot()['reserved'] == {}
-    assert_cleared(framework_spy)
 
 
 @pytest.mark.parametrize('finish_tool', [False, True])
-def test_valid_finish_ends_submission_without_a_corrective_call(finish_tool, framework_spy):
+def test_valid_finish_ends_submission_without_a_corrective_call(finish_tool, discovery_run):
     calls = []
 
     def handler(request):
@@ -230,10 +223,9 @@ def test_valid_finish_ends_submission_without_a_corrective_call(finish_tool, fra
     assert len(batch.proposals) == 1 and batch._runtime_submission_complete
     assert not batch._runtime_pending_codes
     assert client.usage['calls'] == 3
-    assert_cleared(framework_spy)
 
 
-def test_unstructured_text_uses_request_retry_then_finishes_existing_draft(framework_spy):
+def test_unstructured_text_uses_request_retry_then_finishes_existing_draft(discovery_run):
     calls = []
 
     def handler(request):
@@ -254,4 +246,3 @@ def test_unstructured_text_uses_request_retry_then_finishes_existing_draft(frame
     assert not batch._runtime_pending_codes
     assert client.usage['calls'] == 4 and client.usage['failures'] == 1
     assert client.usage['request_retry_succeeded'] == 1
-    assert_cleared(framework_spy)

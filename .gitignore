@@ -22,7 +22,7 @@ examples/sample/
 research/
 gauss-capabilities.json
 
-# Local AgentScope configuration may contain a direct API key.
+# Local model configuration may contain a direct API key.
 agent.local.yaml
 agents.local.yaml
 

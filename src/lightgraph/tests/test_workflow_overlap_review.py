@@ -20,8 +20,10 @@ from lightgraph.tests.test_web_api import client, create, upload
 from lightgraph.tests.test_web_execution import wait_run
 
 
-@pytest.mark.parametrize('split_batches', [False, True])
-def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monkeypatch, split_batches):
+@pytest.mark.parametrize('response_case', [
+    pytest.param('complete', id='False'), pytest.param('partial_singleton', id='True'), 'recover',
+])
+def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monkeypatch, response_case):
     install_scripted_worker(monkeypatch, draft_factory=overlapping_metric_proposal)
     create(client)
     base = '/api/projects/alpha'
@@ -30,7 +32,7 @@ def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monk
     cfg['goal']['purpose'] = 'Combine metric projections'
     cfg['model'].update(mode='in_environment', model='scripted', base_url='http://localhost:9999/v1',
                         api_key_env='LIGHTGRAPH_TEST_REVIEW_KEY')
-    if split_batches:
+    if response_case == 'partial_singleton':
         cfg['model']['max_output_tokens'] = 1024
     monkeypatch.setenv('LIGHTGRAPH_TEST_REVIEW_KEY', 'test-only')
     units = [{'unit_id': uid, 'goal_markdown': kind, 'source_ids': [cfg['sources'][0]['id']]}
@@ -55,7 +57,9 @@ def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monk
         requests.append(patterns)
         decisions = [{'pattern_id': p['pattern_id'], 'action': 'merge' if 'apply' in p['eligible_actions'] else 'keep'}
                      for p in patterns]
-        finish = 'length' if split_batches and patterns[0]['kind'] == 'relation' else 'stop'
+        truncated = (response_case == 'partial_singleton' and patterns[0]['kind'] == 'relation'
+                     or response_case == 'recover' and len(requests) == 1)
+        finish = 'length' if truncated else 'stop'
         return httpx.Response(200, json={'choices': [{'message': {'role': 'assistant', 'content':
                                                json.dumps({'decisions': decisions})}, 'finish_reason': finish}]})
 
@@ -74,15 +78,18 @@ def test_review_of_two_committed_csv_workers_is_replayable_via_http(client, monk
     artifact = state['artifacts']['join']
     committed = load_checkpoint(output, artifact)
     report = committed['overlap_review']
-    expected_calls = len(report['patterns']) if split_batches else 1
+    expected_calls = {'partial_singleton': len(report['patterns']), 'complete': 1, 'recover': 3}[response_case]
     assert node['model_calls'] == len(requests) == expected_calls
-    if split_batches:
+    if response_case == 'partial_singleton':
         assert expected_calls > 1 and report['summary']['status'] == 'partial'
         assert report['summary']['failed_patterns'] == 1
         assert report['summary']['reviewed_patterns'] == expected_calls - 1
         assert report['summary']['reason'] == 'model_response_truncated'
     else:
         assert report['summary']['status'] == 'reviewed'
+    if response_case == 'recover':
+        assert report['summary']['retry_batches'] == 2 and report['summary']['truncated_batches'] == 1
+        assert report['summary']['recovered_patterns'] == len(report['patterns']) == report['summary']['submitted_patterns']
     assert node['overlap_review'] == report['summary']
     assert node['overlap_review']['eligible_patterns'] == sum('apply' in p['eligible_actions'] for p in report['patterns'])
     assert node['overlap_review']['added_entity_rules'] == 2, report
@@ -200,8 +207,39 @@ def test_merge_node_checks_an_agent_proposal_and_replays_only_the_supported_memb
     assert len([n for n in artifact['graph']['nodes'] if n['label'] == 'Freight']) == 2
     audit = runpy.run_path(str(Path(__file__).resolve().parents[3] / 'scripts/audit_checkpoint_merge.py'))['audit']
     replay = audit(project / 'runs' / (run['run_id'] + '.json'), 'join', include_edge_lineage=True)
+    def unexpected_merge(*args, **kwargs):
+        pytest.fail('diagnosing recorded proposals must not run a merge')
+    monkeypatch.setattr('lightgraph.construction.merger.merge_construction_graphs', unexpected_merge)
+    rechecked = audit(project / 'runs' / (run['run_id'] + '.json'), 'join', recheck_proposals_only=True)
+    assert rechecked['model_calls'] == 0 and len(issued) == 1
+    assert rechecked['committed_proposal_checks'] == report['proposal_checks']
+    assert rechecked['current_proposal_checks'][0]['verified_groups'] == 1
+    assert rechecked['cross_table_check_summary']['matched_cross_table_key_checks'] == 0
     assert replay['with_source_replay']['rows_match_committed'] == {'nodes': True, 'edges': True}
     assert replay['model_calls'] == 0
+
+
+def test_recheck_separates_missing_sections_from_independent_identity_and_access_failures():
+    summarize = runpy.run_path(str(Path(__file__).resolve().parents[3] / 'scripts/audit_checkpoint_merge.py'))[
+        'summarize_cross_table_checks']
+    def row(section, observation, access, count):
+        return dict(shared_key_section_verified=section, first_observation_result=observation,
+                    unit_fingerprints_match=access, keys=count)
+    checks = [
+        {'reason': 'no_shared_keys', 'cross_table_matched_key_checks': []},
+        {'reason': 'different_axes_in_same_table'},
+        {'cross_table_matched_key_checks': [row(False, 'observations_agree', True, 2),
+                                            row(False, 'different_relation_or_neighbor', False, 3),
+                                            row(True, 'observations_agree', False, 7)]},
+        {'cross_table_matched_key_checks': [row(False, 'observations_agree', True, 5),
+                                            row(True, 'incompatible_identity_contract', True, 1)]}]
+    result = summarize(checks)
+    assert (result['entity_proposals'], result['proposals_with_cross_table_check_table'],
+            result['matched_cross_table_key_checks']) == (4, 3, 18)
+    assert result['without_common_key_section'] == {'observations_and_access_match': 7,
+        'observation_check_failed': 0, 'unit_access_check_failed': 0, 'observation_and_unit_access_checks_failed': 3}
+    assert result['with_common_key_section'] == {'observations_and_access_match': 0,
+        'observation_check_failed': 1, 'unit_access_check_failed': 7, 'observation_and_unit_access_checks_failed': 0}
 
 
 @pytest.mark.parametrize('rejection', ['overlap_pattern_policy_conflict', 'published_relation_cycle', 'merge_requires_isolation'])

@@ -2,7 +2,7 @@
 
 The current construction runtime imports only deterministic probe modules. Keep
 historical exports lazy so importing those probes cannot load the old model
-client, proposal compiler or AgentScope loop into the new runtime.
+client or proposal compiler into the construction runtime.
 """
 from importlib import import_module
 

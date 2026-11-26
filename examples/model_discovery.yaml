@@ -8,7 +8,7 @@ sources:
 documents:
   - sample/data_description.md
   - sample/analysis.md
-output_dir: ../runs/agentscope-discovery
+output_dir: ../runs/model-discovery
 scopes: [A, B, public]
 document_scopes: [A, B]
 goal:

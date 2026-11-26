@@ -63,7 +63,7 @@ import sys
 from lightgraph.construction.tools import ConstructionTools
 from lightgraph.construction.runner import run_construction
 assert not any(name in sys.modules for name in (
-    'agentscope', 'lightgraph.discovery.agentscope_runtime',
+    'agentscope', 'lightgraph.discovery.model_runtime',
     'lightgraph.discovery.engine', 'lightgraph.discovery.llm'))
 '''
     subprocess.run([sys.executable, '-c', script], check=True, capture_output=True, text=True)

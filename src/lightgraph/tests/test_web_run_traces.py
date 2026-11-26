@@ -123,7 +123,7 @@ def test_model_limits_save_for_inline_and_agent_file(client):
     assert all(changed.json()[k]==v for k,v in desired.items())
     assert client.put(path,json=desired,headers={'If-Match':before.headers['etag']}).status_code==409
     workspace=client.app.state.workspace
-    original=b'framework: agentscope\nname: custom-agent\nllm:\n  mode: disabled\n  max_calls: 240\n  api_key_env: TEST_MODEL_KEY\n'
+    original=b'framework: deepseek_harness\nname: custom-agent\nllm:\n  mode: disabled\n  max_calls: 240\n  api_key_env: TEST_MODEL_KEY\n'
     asset=workspace.add_file('p','agent.yaml',original)
     config=workspace.get_config('p');config.pop('model');config['agent_config']=asset['relative_path']
     workspace.save_config('p',config)
