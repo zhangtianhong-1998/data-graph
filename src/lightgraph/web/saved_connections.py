@@ -82,8 +82,11 @@ def _read(path: Path, limit: int) -> bytes:
 
 def _atomic_write(path: Path, data: bytes) -> None:
     """Write ciphertext/key only, retaining the old file if publication fails."""
+    from ..construction.paths import io_path
     _safe_path(path)
-    fd, temporary = tempfile.mkstemp(prefix=".connection-", dir=path.parent)
+    target = io_path(path)
+    fd, temporary = tempfile.mkstemp(prefix=".connection-", dir=target.parent)
+    tmp_io = io_path(temporary)
     try:
         with os.fdopen(fd, "wb") as handle:
             if os.name == "posix":
@@ -92,10 +95,9 @@ def _atomic_write(path: Path, data: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         _safe_path(path)
-        os.replace(temporary, path)
+        os.replace(tmp_io, target)
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        tmp_io.unlink(missing_ok=True)
 
 
 def _connection_dict(connection: ConnectionSpec) -> dict:

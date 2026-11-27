@@ -5,6 +5,7 @@ import logging
 import threading
 
 from lightgraph.construction.analytics_store import artifact_path, current_version, persist_analysis
+from lightgraph.construction.paths import io_path
 from lightgraph.errors import LightGraphError
 from lightgraph.runtime.retention import atomic_text
 from . import construction_graph, graph_history
@@ -18,7 +19,7 @@ class AnalyticsJobs:
         self._pending = set()
 
     def _job_path(self, pid, key):
-        directory = self.workspace.project_path(pid) / 'analytics-jobs'
+        directory = io_path(self.workspace.project_path(pid) / 'analytics-jobs')
         path = directory / (key + '.json')
         if directory.is_symlink() or path.is_symlink():
             raise LightGraphError('workspace_path_invalid')

@@ -129,6 +129,8 @@ def _disk_name(key: dict) -> str:
 
 
 def _read_disk(directory: Path, key: dict):
+    from lightgraph.construction.paths import io_path
+    directory = io_path(directory)
     path = directory / _disk_name(key)
     try:
         info = path.stat()
@@ -165,6 +167,8 @@ def _read_disk(directory: Path, key: dict):
 
 
 def _write_disk(directory: Path, key: dict, value: tuple[dict, str]) -> None:
+    from lightgraph.construction.paths import io_path
+    directory = io_path(directory)
     if directory.is_symlink():
         return
     directory.mkdir(exist_ok=True)
@@ -174,6 +178,7 @@ def _write_disk(directory: Path, key: dict, value: tuple[dict, str]) -> None:
               'graph': {k: v for k, v in graph.items() if k not in ('nodes', 'edges')},
               'nodes': len(nodes), 'edges': len(edges)}
     fd, temporary = tempfile.mkstemp(prefix='.view-', dir=directory)
+    tmp_io = io_path(temporary)
     try:
         with os.fdopen(fd, 'wb') as stream:
             stream.write(b'[\n')
@@ -187,7 +192,7 @@ def _write_disk(directory: Path, key: dict, value: tuple[dict, str]) -> None:
                 stream.write(b'\n')
             stream.write(b']\n')
         current = directory / _disk_name(key)
-        os.replace(temporary, current)
+        os.replace(tmp_io, current)
         # Only our own content-addressed cache files are eligible for eviction.
         entries = []
         for entry in directory.glob('*.json'):
@@ -202,7 +207,7 @@ def _write_disk(directory: Path, key: dict, value: tuple[dict, str]) -> None:
                 else:
                     retained += size
     finally:
-        Path(temporary).unlink(missing_ok=True)
+        tmp_io.unlink(missing_ok=True)
 
 
 def _write_later(directory: Path, key: dict, token: str) -> None:

@@ -241,8 +241,6 @@ class EntityFusionRule(StrictModel):
     key_mapping: dict[str, str] = Field(min_length=1, max_length=32,
         description="Canonical identity key name -> existing node identity key name. Every identity key must be mapped; dropping keys is forbidden.")
     key_normalizers: dict[str, list[Literal['trim', 'casefold', 'nfkc']]] = Field(default_factory=dict, max_length=32)
-    key_prefix_strips: dict[str, list[str]] = Field(default_factory=dict, max_length=32,
-        description="Optional bounded literal prefixes stripped once (longest match first) from text identity keys before canonicalization.")
     property_aliases: dict[str, str] = Field(default_factory=dict, max_length=128,
         description="Existing property name -> canonical property name. Use source_id.schema.table.property for a table-specific mapping. Units and meaning must already agree.")
     property_normalizers: dict[str, list[Literal['trim', 'casefold', 'nfkc']]] = Field(default_factory=dict, max_length=128)
@@ -254,13 +252,8 @@ class EntityFusionRule(StrictModel):
         if (len(set(self.key_mapping.values())) != len(self.key_mapping)
                 or any(not value.strip() for pair in self.key_mapping.items() for value in pair)
                 or not set(self.key_normalizers) <= set(self.key_mapping)
-                or not set(self.key_prefix_strips) <= set(self.key_mapping)
                 or any(not value.strip() for pair in self.property_aliases.items() for value in pair)):
             raise ValueError('invalid_fusion_key_mapping')
-        for prefixes in self.key_prefix_strips.values():
-            if (not prefixes or len(prefixes) > 64 or len(set(prefixes)) != len(prefixes)
-                    or any(not p or len(p) > 64 or any(ord(ch) < 32 or ord(ch) == 127 for ch in p) for p in prefixes)):
-                raise ValueError('invalid_fusion_key_mapping')
         for binding in self.source_bindings:
             if (binding.key_columns.keys() != set(self.key_mapping.values())
                     or len(set(binding.key_columns.values())) != len(binding.key_columns)
@@ -272,8 +265,6 @@ class EntityFusionRule(StrictModel):
     @model_serializer(mode='wrap')
     def serialize_rule(self, handler):
         data = handler(self)
-        if not self.key_prefix_strips:
-            data.pop('key_prefix_strips', None)  # Preserve historical policy and checkpoint fingerprints.
         if not self.source_bindings:
             data.pop('source_bindings', None)  # Preserve historical policy and checkpoint fingerprints.
         for binding in data.get('source_bindings', ()):

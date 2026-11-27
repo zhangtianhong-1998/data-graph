@@ -194,7 +194,8 @@ class LocalNumpyVectorStore:
     """Local exact cosine vector index enforcing scope isolation before similarity scoring."""
 
     def __init__(self, root_dir: str | Path):
-        self.root = Path(root_dir)
+        from lightgraph.construction.paths import io_path
+        self.root = io_path(root_dir)
         self.root.mkdir(parents=True, exist_ok=True)
         self.vectors_path = self.root / 'vectors.npy'
         self.meta_path = self.root / 'vectors_meta.sqlite'
@@ -202,7 +203,7 @@ class LocalNumpyVectorStore:
             self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.meta_path, isolation_level=None)
+        conn = sqlite3.connect(str(self.meta_path), isolation_level=None)
         conn.row_factory = sqlite3.Row
         return conn
 

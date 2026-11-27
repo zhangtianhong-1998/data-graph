@@ -311,6 +311,9 @@ class _Observation:
     label: str | None = None
     reason: str | None = None
     contract: str | None = None
+    physical_contract: str | None = None
+    identity_scope: str = 'unknown'
+    identity_domain: str | None = None
     boundaries: tuple | None = None
     cross_table_boundaries: tuple | None = None
     attributes: dict = field(default_factory=dict)
@@ -394,6 +397,10 @@ def _observation(node, definition, binding, index, own):
     contract['identity_context_keys'] = [binding.key_columns[names.index(key)]
                                          for key in definition.get('identity_context_keys') or ()]
     result.contract = canonical([contract, node.get('node_role')])
+    physical_contract = {k: v for k, v in contract.items() if k not in ('identity_scope', 'identity_domain')}
+    result.physical_contract = canonical([physical_contract, node.get('node_role')])
+    result.identity_scope = definition.get('identity_scope', 'unknown')
+    result.identity_domain = definition.get('identity_domain')
     result.identity_boundary = canonical(node.get('identity_context'))
     if result.registries:
         # Each dictionary can name the directory and its physical key differently.
@@ -479,14 +486,29 @@ def _grant_covers(member, binding, data, grant):
     return True
 
 
+def _contracts_compatible(members, physical, registry):
+    if all(m.contract == members[0].contract for m in members):
+        return True
+    if registry and all(m.registry_contract == members[0].registry_contract for m in members):
+        return True
+    if physical and all(m.physical_contract == members[0].physical_contract for m in members):
+        # On the same physical table and key columns, allow an undeclared branch
+        # ('unknown' / None) to align with a global-domain declaration while still
+        # rejecting conflicting non-empty domains or scoped-vs-unscoped mismatches.
+        scopes = {m.identity_scope for m in members}
+        domains = {m.identity_domain for m in members if m.identity_domain}
+        if len(domains) <= 1 and ('scoped' not in scopes or scopes == {'scoped'}):
+            return True
+    return False
+
+
 def _compare_observations(members, physical, *, independent_grants=False):
     if reason := next((m.reason for m in members if m.reason), None):
         return reason, None
     registry = bool(set.intersection(*(m.registries for m in members)))
     common_identity = registry or bool(set.intersection(*(m.sections for m in members)))
     separate_observations = not physical and independent_grants and common_identity
-    if (any(m.contract != members[0].contract for m in members)
-            and not (registry and all(m.registry_contract == members[0].registry_contract for m in members))):
+    if not _contracts_compatible(members, physical, registry):
         return 'incompatible_identity_contract', None
     boundaries = [
         m.identity_boundary if separate_observations

@@ -205,7 +205,8 @@ def _pending_review_graph(session, publication, graph):
             manifest = read_internal_yaml(session.manifest_path)
             heads = [manifest.get('current_graph') or {}, *manifest.get('graph_history', [])]
             if not any(head.get('path') == publication for head in heads):
-                shutil.rmtree(path)
+                from lightgraph.construction.paths import io_path
+                shutil.rmtree(io_path(path))
         except (OSError, LightGraphError, ValueError, TypeError, AttributeError):
             # If the commit cannot be checked, preserve the record and original error.
             logging.getLogger(__name__).warning('Could not verify unpublished identity review snapshot')

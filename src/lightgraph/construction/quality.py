@@ -1,7 +1,42 @@
 """Actionable mapping advice; presentation quality never changes data validity."""
-from collections import Counter
+from collections import Counter, defaultdict
 
+from lightgraph.contracts import canonical
 from .models import GraphDraft
+
+
+def _composite_label_uniqueness(entity, mapping, mapping_index, nodes):
+    """Check on validated instances whether non-label key columns already determine the label."""
+    if not nodes or len(entity.key_names) != len(mapping.key_columns):
+        return None
+    label_idx = mapping.key_columns.index(mapping.label_column)
+    label_key = entity.key_names[label_idx]
+    other_keys = [name for i, name in enumerate(entity.key_names) if i != label_idx]
+    if not other_keys:
+        return None
+    by_code = defaultdict(set)
+    observed = 0
+    for node in nodes:
+        supports = node.get('supports') or []
+        if not any((s.get('provenance') or {}).get('definition') == entity.type
+                   and (s.get('provenance') or {}).get('mapping') == mapping_index
+                   for s in supports):
+            continue
+        identity = node.get('identity') or {}
+        if label_key not in identity or any(k not in identity for k in other_keys):
+            continue
+        observed += 1
+        code_sig = tuple(canonical(identity[k]) for k in other_keys)
+        by_code[code_sig].add(canonical(identity[label_key]))
+    if not observed:
+        return None
+    multi_name_keys = sum(len(labels) > 1 for labels in by_code.values())
+    return {
+        'observed_nodes': observed,
+        'distinct_non_label_keys': len(by_code),
+        'non_label_keys_with_multiple_names': multi_name_keys,
+        'redundant_label_in_key': multi_name_keys == 0,
+    }
 
 
 def _primary_name_coverage(entity, index, nodes):
@@ -70,13 +105,24 @@ def name_mapping_advice(draft, graph=None):
         has_primary_mapping = any(mapping.label_column for mapping in entity.mappings)
         for number, mapping in enumerate(entity.mappings):
             if len(mapping.key_columns) > 1 and mapping.label_column in mapping.key_columns:
+                proof = (_composite_label_uniqueness(entity, mapping, number, nodes_by_type.get(entity.type, []))
+                         if graph is not None else None)
+                redundant = bool(proof and proof['redundant_label_in_key'])
                 advice.append({
-                    'code': 'primary_name_in_composite_key', 'severity': 'suggestion',
+                    'code': 'primary_name_in_composite_key',
+                    'severity': 'warning' if redundant else 'suggestion',
                     'entity_type': entity.type, 'path': ['entities', index, 'mappings', number, 'key_columns'],
                     'column': mapping.label_column, 'key_columns': list(mapping.key_columns),
-                    'message': '主名称也是复合身份键的一部分。名称变更会生成另一个节点。',
-                    'next_action': '核对业务键或唯一约束。若已有独立编码可识别对象，将名称映射到 label_column；'
-                                   '若名称确实参与识别，保留完整复合键并记录依据。',
+                    **(proof or {}),
+                    'message': ('主名称列被放入了复合身份键，但全量实测显示剔除名称列后的其余键列已唯一标识对象'
+                                '（无同码多名）。保留名称在复合键中会导致跨单元键宽分叉（{code, name} vs {code}）并产生重复变体。'
+                                if redundant else
+                                '主名称也是复合身份键的一部分。名称变更会生成另一个节点。'),
+                    'next_action': ('建议将主名称列移出 key_columns（保留在 label_column），仅保留唯一编码列作为身份键后重新验证；'
+                                    '确有业务规范要求名称参与主键时，请在 decisions 中写明依据。'
+                                    if redundant else
+                                    '核对业务键或唯一约束。若已有独立编码可识别对象，将名称映射到 label_column；'
+                                    '若名称确实参与识别，保留完整复合键并记录依据。'),
                 })
             if has_primary_mapping or not mapping.display_columns:
                 continue

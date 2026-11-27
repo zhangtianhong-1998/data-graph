@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from lightgraph.contracts import digest
 from lightgraph.errors import LightGraphError
+from lightgraph.construction.paths import io_path
 from lightgraph.construction.snapshot_registry import (snapshot_id, authorize_snapshot, migrate_access_context,
                                                        inherited_grants, authorize_inherited_grants)
 from lightgraph.construction.workspace import read_internal_yaml
@@ -28,7 +29,7 @@ def _within(path, project):
     path.relative_to(project)
     current = path
     while current != project:
-        if current.is_symlink():
+        if io_path(current).is_symlink():
             raise LightGraphError('workspace_path_invalid')
         current = current.parent
     return path
@@ -58,7 +59,7 @@ def _effective_config(config, entry):
 
 def _manifest_entries(project, root, active_root, run_id, worker):
     path = _within(root / 'manifest.yaml', project)
-    if not path.is_file():
+    if not io_path(path).is_file():
         return
     manifest = read_internal_yaml(path)
     if not isinstance(manifest, dict) or manifest.get('target') != 'graph' or manifest.get('format_version') != 1:
@@ -94,9 +95,10 @@ def _manifest_entries(project, root, active_root, run_id, worker):
 
 def _checkpoint_entry(project, output, path):
     _within(path, project)
-    if not path.is_file() or path.stat().st_size > 1024 * 1024:
+    path_io = io_path(path)
+    if not path_io.is_file() or path_io.stat().st_size > 1024 * 1024:
         return None
-    rec = json.loads(path.read_text(encoding='utf-8'))
+    rec = json.loads(path_io.read_text(encoding='utf-8'))
     if not isinstance(rec, dict) or rec.get('format_version') != 1 or rec.get('artifact_status') != 'committed':
         return None
     parts = path.relative_to(output / 'checkpoints').parts

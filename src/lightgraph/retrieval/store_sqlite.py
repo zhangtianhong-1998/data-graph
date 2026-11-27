@@ -105,7 +105,8 @@ class SQLiteGraphIndex:
     """Local relational topology & lexical index enforcing scope visibility on every read."""
 
     def __init__(self, db_path: str | Path):
-        self.path = Path(db_path)
+        from lightgraph.construction.paths import io_path
+        self.path = io_path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self._init_db()
@@ -120,7 +121,7 @@ class SQLiteGraphIndex:
                 'PRAGMA table_info(kg_node_scope_views)'))
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, isolation_level=None)
+        conn = sqlite3.connect(str(self.path), isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute('PRAGMA foreign_keys=ON')
         return conn

@@ -26,19 +26,6 @@ def normalize_value(value, operations):
     return value
 
 
-def normalize_key_value(value, operations, prefix_strips=()):
-    if prefix_strips:
-        if not isinstance(value, str):
-            raise LightGraphError('fusion_normalization_type_mismatch')
-        for prefix in sorted(prefix_strips, key=len, reverse=True):
-            if value.startswith(prefix):
-                value = value[len(prefix):]
-                break
-        if not value:
-            raise LightGraphError('fusion_empty_normalized_value')
-    return normalize_value(value, operations)
-
-
 def merge_property_values(existing, incoming, seen):
     """Append distinct typed observations in source order, indexing each value once."""
     for name, values in incoming.get('properties', {}).items():
@@ -502,12 +489,10 @@ def prepare_graph(graph, policy, *, copy=True, self_contained=None, local_namesp
             original['source_key_names'] = list(original_key_names[node['type']])
         if any(value is None for value in original['identity'].values()):
             raise LightGraphError('fusion_missing_identity_value')
-        if any((rule.key_normalizers.get(key) or rule.key_prefix_strips.get(key))
-               and original.get('identity_types', {}).get(source, 'text') != 'text'
+        if any(rule.key_normalizers.get(key) and original.get('identity_types', {}).get(source, 'text') != 'text'
                for key, source in rule.key_mapping.items()):
             raise LightGraphError('fusion_normalization_type_mismatch')
-        node['identity'] = {key: normalize_key_value(original['identity'][source], rule.key_normalizers.get(key, []),
-                                                     rule.key_prefix_strips.get(key, ()))
+        node['identity'] = {key: normalize_value(original['identity'][source], rule.key_normalizers.get(key, []))
                             for key, source in sorted(rule.key_mapping.items())}
         node['identity_types'] = {key: original.get('identity_types', {})[source]
             for key, source in sorted(rule.key_mapping.items()) if source in original.get('identity_types', {})}

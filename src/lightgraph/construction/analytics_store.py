@@ -7,12 +7,13 @@ from lightgraph.errors import LightGraphError
 from lightgraph.runtime.retention import atomic_text
 from .access import filter_graph_scopes
 from .graph_analytics import ALGORITHM_VERSION, compute_graph_analytics
+from .paths import io_path
 from .snapshot_registry import result_access_policy, snapshot_id
 from .workspace import read_internal_yaml
 
 
 def current_version(config):
-    root = Path(config.output_dir) / 'construction'
+    root = io_path(Path(config.output_dir) / 'construction')
     path = root / 'manifest.yaml'
     if root.is_symlink() or path.is_symlink():
         raise LightGraphError('workspace_path_invalid')
@@ -22,7 +23,7 @@ def current_version(config):
 
 def artifact_path(root, config, version, selection):
     key = digest(ALGORITHM_VERSION, version, result_access_policy(config), sorted(set(config.scopes)), selection)
-    directory = Path(root) / 'analytics'
+    directory = io_path(Path(root) / 'analytics')
     path = directory / (key + '.json')
     if directory.is_symlink() or path.is_symlink():
         raise LightGraphError('workspace_path_invalid')
@@ -30,7 +31,7 @@ def artifact_path(root, config, version, selection):
 
 
 def read_analysis(root, config, version, selection):
-    path = artifact_path(root, config, version, selection)
+    path = io_path(artifact_path(root, config, version, selection))
     if not path.is_file():
         return None
     try:
@@ -51,8 +52,9 @@ def persist_analysis(graph, config, selection, path):
     for node in result['nodes']:
         node['display_name'] = names.get(node['id'])
     result['business_context'] = selection
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_text(path, json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(',', ':')))
+    target = io_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    atomic_text(target, json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(',', ':')))
     return result
 
 

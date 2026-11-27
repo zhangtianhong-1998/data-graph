@@ -11,18 +11,20 @@ from .files import replace_staged_file
 
 
 def atomic_text(path, text):
-    path = Path(path)
+    from ..construction.paths import io_path
+    path = io_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".published-", dir=path.parent)
+    tmp_io = io_path(tmp)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as out:
-            os.chmod(tmp, 0o600)
+            os.chmod(tmp_io, 0o600)
             out.write(text)
             out.flush()
             os.fsync(out.fileno())
-        replace_staged_file(tmp, path)
+        replace_staged_file(tmp_io, path)
     finally:
-        Path(tmp).unlink(missing_ok=True)
+        tmp_io.unlink(missing_ok=True)
 
 
 def write_report(path, report:RunReport):
@@ -50,9 +52,10 @@ def write_rules(path, rules:list[RuleSpec]):
 
 def retain_check(roots, markers):
     """Inspect application artifacts only. Deployment and provider retention require separate attestation."""
+    from ..construction.paths import io_path
     hits=[];checked=0
     for root in roots:
-        root=Path(root)
+        root=io_path(root)
         for p in ([root] if root.is_file() else root.rglob('*')):
             if not p.is_file() or p.is_symlink():continue
             checked+=1

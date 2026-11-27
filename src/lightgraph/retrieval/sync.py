@@ -113,8 +113,21 @@ def _observations(item, key_names=()):
     return result
 
 
+def _sqlite_connect_existing(path: Path, *, mode: str, **kwargs):
+    from lightgraph.construction.paths import io_path
+    import os
+    target = io_path(path)
+    if not target.is_file():
+        raise sqlite3.OperationalError('database_file_missing')
+    if os.name == 'nt' and str(target).startswith('\\\\?\\'):
+        return sqlite3.connect(str(target), **kwargs)
+    return sqlite3.connect(target.resolve().as_uri() + f'?mode={mode}', uri=True, **kwargs)
+
+
 def active_index(root: Path, expected_generation: str | None = None) -> tuple[Path, dict]:
     """Pin a complete index build before reading any topology, terms or vectors."""
+    from lightgraph.construction.paths import io_path
+    root = io_path(root)
     try:
         manifest = json.loads((root / 'current.json').read_text(encoding='utf-8'))
         build = manifest['build']
@@ -145,14 +158,15 @@ def active_index(root: Path, expected_generation: str | None = None) -> tuple[Pa
 
 def pin_active_index(root: Path, expected_generation=None):
     """Hold a shared read transaction for the lifetime of a reader of this build."""
+    from lightgraph.construction.paths import io_path
+    root = io_path(root)
     for _ in range(4):
         path, manifest = active_index(root, expected_generation)
         if not manifest.get('reader_leases'):
             return path, manifest, None
         lease = None
         try:
-            lease = sqlite3.connect((path / 'readers.sqlite').resolve().as_uri() + '?mode=ro', uri=True,
-                                    check_same_thread=False)
+            lease = _sqlite_connect_existing(path / 'readers.sqlite', mode='ro', check_same_thread=False)
             lease.execute('BEGIN')
             lease.execute('SELECT * FROM readers').fetchall()
             if json.loads((root / 'current.json').read_text(encoding='utf-8')).get('build') == manifest['build']:
@@ -166,11 +180,14 @@ def pin_active_index(root: Path, expected_generation=None):
 
 def _publish_index(root, staging, manifest):
     """Publish under a writer lock. Old clients without reader leases keep their legacy builds."""
-    builds = root.resolve() / 'builds'
+    from lightgraph.construction.paths import io_path
+    root = io_path(root)
+    staging = io_path(staging)
+    builds = io_path(root.resolve() / 'builds')
     pointer = root / 'current.json'
-    with closing(sqlite3.connect(staging / 'readers.sqlite')) as db:
+    with closing(sqlite3.connect(str(staging / 'readers.sqlite'))) as db:
         db.execute('CREATE TABLE readers (id INTEGER)')
-    with closing(sqlite3.connect(root / 'publication.sqlite', timeout=30)) as publisher:
+    with closing(sqlite3.connect(str(root / 'publication.sqlite'), timeout=30)) as publisher:
         publisher.execute('BEGIN IMMEDIATE')
         try:
             previous = json.loads(pointer.read_text(encoding='utf-8'))
@@ -187,9 +204,9 @@ def _publish_index(root, staging, manifest):
             if path.is_symlink() or not marker.is_file() or marker.is_symlink():
                 continue
             try:
-                with closing(sqlite3.connect(marker.as_uri() + '?mode=rw', uri=True, timeout=0)) as marker_db:
+                with closing(_sqlite_connect_existing(marker, mode='rw', timeout=0)) as marker_db:
                     marker_db.execute('BEGIN EXCLUSIVE')
-                shutil.rmtree(path)
+                shutil.rmtree(io_path(path))
             except (sqlite3.Error, OSError):
                 continue
 
@@ -236,7 +253,8 @@ def sync_graph_to_retrieval(
     Context is applicability, not authorization. The query independently selects
     eligible slices on both axes before ranking and every graph traversal.
     """
-    root = Path(retrieval_dir)
+    from lightgraph.construction.paths import io_path
+    root = io_path(retrieval_dir)
     root.mkdir(parents=True, exist_ok=True)
 
     if graph.get('support_visibility_version') != 1 and (graph.get('nodes') or graph.get('edges')):

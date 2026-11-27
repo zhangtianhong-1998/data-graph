@@ -29,9 +29,11 @@ DB_KINDS = {'gauss_database', 'mysql_database'}
 
 
 def delete_project(workspace, pid):
+    from ..construction.paths import io_path
     path = workspace.project_path(pid)
+    io_target = io_path(path)
     # rmtree must never traverse a user-injected link/junction outside the project.
-    for root, directories, files in os.walk(path, followlinks=False):
+    for root, directories, files in os.walk(io_target, followlinks=False):
         for name in directories + files:
             item = Path(root) / name
             _no_symlinks(item)
@@ -39,7 +41,7 @@ def delete_project(workspace, pid):
                 raise LightGraphError('workspace_symlink_forbidden')
     from .run_traces import ensure_no_project_downloads
     ensure_no_project_downloads(path)
-    shutil.rmtree(path)
+    shutil.rmtree(io_target)
     return {'deleted': True, 'project_id': pid}
 
 

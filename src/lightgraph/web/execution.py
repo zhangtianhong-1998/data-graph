@@ -24,6 +24,7 @@ from functools import lru_cache
 
 from ..contracts import RunReport, digest
 from ..construction.artifact_io import artifact_step, failure_detail
+from ..construction.paths import io_path
 from ..errors import LightGraphError
 from ..runtime.locking import FileLock
 from ..runtime.retention import atomic_text
@@ -55,9 +56,10 @@ def _safe_code(code, fallback="run_failed"):
 
 def _json_file(path):
     try:
-        if path.is_symlink() or path.stat().st_size > 2 * 1024 * 1024:
+        target = io_path(path)
+        if target.is_symlink() or target.stat().st_size > 2 * 1024 * 1024:
             raise ValueError
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         raise LightGraphError("run_record_invalid") from None
 
@@ -76,7 +78,7 @@ def _fields(record, names):
 
 
 def _file_stamp(path):
-    info = path.lstat()
+    info = io_path(path).lstat()
     if not stat.S_ISREG(info.st_mode):
         raise LightGraphError("run_record_invalid")
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
@@ -607,9 +609,10 @@ class RunManager:
     def _paths(self, pid, rid=None):
         project = self.workspace.project_path(pid)
         runs = project / "runs"
-        if runs.is_symlink():
+        runs_io = io_path(runs)
+        if runs_io.is_symlink():
             raise LightGraphError("workspace_path_invalid")
-        runs.mkdir(exist_ok=True)
+        runs_io.mkdir(exist_ok=True)
         if rid is None:
             return project, runs
         if not _RUN_ID.fullmatch(rid):

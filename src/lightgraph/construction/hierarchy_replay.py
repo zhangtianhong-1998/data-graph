@@ -238,10 +238,23 @@ def _neighborhoods(graph, nodes, members, relations, layouts, captions, stats):
         left, right = (members.get(n) for n in endpoints)
         relation = relations.get(edge['type'], {})
         orientation = relation.get('hierarchy_orientation')
-        if (not left or not right or left.address != right.address or nodes[endpoints[0]]['type'] != nodes[endpoints[1]]['type']
-                or relation.get('source_type') != nodes[endpoints[0]]['type']
-                or relation.get('target_type') != nodes[endpoints[1]]['type']
-                or orientation == 'none' or not edge.get('supports')):
+        left_type, right_type = nodes[endpoints[0]]['type'], nodes[endpoints[1]]['type']
+        left_family = nodes[endpoints[0]].get('original_type') or left_type
+        right_family = nodes[endpoints[1]].get('original_type') or right_type
+        valid_endpoints = (relation.get('source_type') == left_type
+                           and relation.get('target_type') == right_type
+                           and bool(edge.get('supports')))
+        # Healthy cross-family ordinary associations (e.g. HierarchyMember -> Metric/Report)
+        # must not poison valid hierarchy members into incompatible_endpoint_or_role.
+        if valid_endpoints and left_family != right_family and (
+                orientation == 'none' or (orientation is None and not (left and right))):
+            continue
+        same_type = left_type == right_type
+        declared_cross_type = (not same_type and left and right and left.unit == right.unit
+                               and orientation in ('parent_to_child', 'child_to_parent'))
+        if (not left or not right or left.address != right.address
+                or not (same_type or declared_cross_type)
+                or not valid_endpoints or orientation == 'none'):
             blocked.update(endpoints)
             continue
         for support in edge['supports']:

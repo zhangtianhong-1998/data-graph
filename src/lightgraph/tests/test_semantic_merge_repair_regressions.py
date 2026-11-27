@@ -1,11 +1,10 @@
-"""Regression tests for semantic merge, overlap review, Chinese explanations, prefix fusion, retrieval, and Web/UI fixes."""
+"""Regression tests for semantic merge, overlap review, Chinese explanations, retrieval, and Web/UI fixes."""
 from copy import deepcopy
 import json
 import threading
 
 import pytest
 
-from lightgraph.construction.fusion import normalize_key_value
 from lightgraph.construction.merger import merge_construction_graphs
 from lightgraph.construction.overlap_patterns import analyze_overlap_patterns
 from lightgraph.construction.overlap_review import review_overlap_patterns
@@ -15,11 +14,10 @@ from lightgraph.construction.workspace import dump_yaml, write_yaml
 from lightgraph.contracts import digest
 from lightgraph.documents.identity_contract import shared_key_claim_refs
 from lightgraph.documents.identity_explanations import explanation_claims
-from lightgraph.errors import LightGraphError
 from lightgraph.retrieval.agent_context import agent_context
 from lightgraph.retrieval.retriever import SubgraphRetriever
 from lightgraph.retrieval.sync import sync_graph_to_retrieval
-from lightgraph.runtime.config import EntityFusionRule, MergePolicyConfig, RunConfig
+from lightgraph.runtime.config import MergePolicyConfig, RunConfig
 from lightgraph.sources import MemorySource
 from lightgraph.tests.test_batch_overlap_patterns import unit
 from lightgraph.tests.test_chinese_identity_production import compile_proposal, published_branch
@@ -402,16 +400,7 @@ def test_chinese_identity_explanations_and_contract_scoping(tmp_path):
     assert claims == []
 
 
-def test_key_prefix_strips_fusion_and_retrieval_source_identity(tmp_path):
-    # Longest prefix matches first and empty key_prefix_strips is omitted from serialized JSON.
-    assert normalize_key_value('CCCBDA_PL_91750', [], ['CCC_', 'CCCBDA_']) == 'PL_91750'
-    assert normalize_key_value('GEO_PL_91750', ['trim'], ['GEO_', 'INSTM_']) == 'PL_91750'
-    plain_rule = EntityFusionRule(entity_type='Item', canonical_type='Item', identity_domain='fin',
-                                  key_mapping={'code': 'code'})
-    assert 'key_prefix_strips' not in plain_rule.model_dump(mode='json')
-    with pytest.raises(LightGraphError, match='fusion_empty_normalized_value'):
-        normalize_key_value('GEO_', [], ['GEO_'])
-
+def test_key_normalizers_fusion_indexes_raw_source_identity_in_retrieval(tmp_path):
     def make_branch(owner, table_name, raw_code):
         src = {'source_id': 'dm_fin', 'schema': 'dm_fin', 'table': table_name}
         return {
@@ -438,35 +427,35 @@ def test_key_prefix_strips_fusion_and_retrieval_source_identity(tmp_path):
             },
         }
 
-    inputs = [make_branch('geo', 'dm_fin_geo_pl', 'GEO_PL_91750'),
-              make_branch('instm', 'dm_fin_instm_pl', 'INSTM_PL_91750')]
+    inputs = [make_branch('geo_a', 'dm_fin_geo_pl_a', ' GEO_PL_91750 '),
+              make_branch('geo_b', 'dm_fin_geo_pl_b', 'geo_pl_91750')]
     policy = {
         'fusion_policy': {
             'entity_rules': [
-                {'entity_type': 'ReportItem_geo', 'canonical_type': 'ReportItem', 'identity_domain': 'fin_pl',
-                 'key_mapping': {'code': 'item_code'}, 'key_prefix_strips': {'code': ['GEO_', 'INSTM_']}},
-                {'entity_type': 'ReportItem_instm', 'canonical_type': 'ReportItem', 'identity_domain': 'fin_pl',
-                 'key_mapping': {'code': 'item_code'}, 'key_prefix_strips': {'code': ['GEO_', 'INSTM_']}},
+                {'entity_type': 'ReportItem_geo_a', 'canonical_type': 'ReportItem', 'identity_domain': 'fin_pl',
+                 'key_mapping': {'code': 'item_code'}, 'key_normalizers': {'code': ['trim', 'casefold']}},
+                {'entity_type': 'ReportItem_geo_b', 'canonical_type': 'ReportItem', 'identity_domain': 'fin_pl',
+                 'key_mapping': {'code': 'item_code'}, 'key_normalizers': {'code': ['trim', 'casefold']}},
             ],
         },
     }
     merged = merge_construction_graphs(inputs, merge_policy=policy)
     assert len(merged['nodes']) == 1
     node = merged['nodes'][0]
-    assert node['identity'] == {'code': 'PL_91750'}
+    assert node['identity'] == {'code': 'geo_pl_91750'}
     assert {s['original_key_values']['report_item_code'] for s in node['supports']} == {
-        'GEO_PL_91750', 'INSTM_PL_91750'}
+        ' GEO_PL_91750 ', 'geo_pl_91750'}
 
     retrieval_dir = tmp_path / 'retrieval'
     sync_graph_to_retrieval(merged, retrieval_dir)
     retriever = SubgraphRetriever(retrieval_dir)
-    by_canonical = retriever.retrieve('PL_91750', scopes=['public'])
+    by_canonical = retriever.retrieve('geo_pl_91750', scopes=['public'])
     by_raw = retriever.retrieve('GEO_PL_91750', scopes=['public'])
     assert [n['id'] for n in by_canonical['nodes']] == [node['id']]
     assert [n['id'] for n in by_raw['nodes']] == [node['id']]
     bindings = agent_context(by_raw)['bindings']
-    geo_binding = next(b for b in bindings if b['source']['table'] == 'dm_fin_geo_pl')
-    assert geo_binding['source_identity'] == {'values': ['GEO_PL_91750'], 'value_types': ['text']}
+    raw_binding = next(b for b in bindings if b['source']['table'] == 'dm_fin_geo_pl_a')
+    assert raw_binding['source_identity'] == {'values': [' GEO_PL_91750 '], 'value_types': ['text']}
 
 
 def test_merger_shared_domain_does_not_leak_across_contributor_order():
@@ -578,3 +567,219 @@ def test_web_execution_after_publication_runs_without_locks_and_current_details_
     details = graph_history.read_details(workspace, 'alpha', config=config, version=current, entity_id=nid)
     std, = details['standard_nodes']
     assert any(note['table_comment'] == '核心指标表' for note in std['catalog_metadata_notes'])
+
+
+def test_physical_projection_allows_asymmetric_identity_domain_but_rejects_conflicts():
+    # u1 declares global + identity_domain, u2 leaves identity_scope='unknown' + identity_domain=None
+    # on the exact same physical table and key columns -> should verify and collapse cleanly.
+    data = [unit('u1', 'DeliveryRegion', 'zone', field='capacity'),
+            unit('u2', 'ReportingArea', 'area', field='language')]
+    data[1]['graph']['definitions']['entities'][0]['identity_scope'] = 'unknown'
+    data[1]['graph']['definitions']['entities'][0].pop('identity_domain', None)
+    for node in data[1]['graph']['nodes']:
+        node.pop('identity_domain', None)
+    policy, report = _compile(data, 'same_physical_key')
+    assert report['verified_groups'] == 1, report
+    merged = merge_construction_graphs(data, merge_policy=policy)
+    assert merged['fusion_diagnostics']['model_verified_projections']['collapsed_nodes'] == 1
+
+    # Negative guard 1: two conflicting non-empty domains still fail incompatible_identity_contract.
+    conflict_domain = [unit('u1', 'DeliveryRegion', 'zone', field='capacity'),
+                       unit('u2', 'ReportingArea', 'area', field='language')]
+    conflict_domain[1]['graph']['definitions']['entities'][0]['identity_domain'] = 'other_domain'
+    for node in conflict_domain[1]['graph']['nodes']:
+        node['identity_domain'] = 'other_domain'
+    _, conflict_report = _compile(conflict_domain, 'same_physical_key')
+    assert conflict_report['verified_groups'] == 0
+    assert conflict_report['rejected_keys_by_reason']['incompatible_identity_contract'] == 1
+
+    # Negative guard 2: scoped vs global still fails incompatible_identity_contract.
+    conflict_scope = [unit('u1', 'DeliveryRegion', 'zone', field='capacity'),
+                      unit('u2', 'ReportingArea', 'area', field='language')]
+    conflict_scope[1]['graph']['definitions']['entities'][0]['identity_scope'] = 'scoped'
+    conflict_scope[1]['graph']['definitions']['entities'][0].pop('identity_domain', None)
+    for node in conflict_scope[1]['graph']['nodes']:
+        node.pop('identity_domain', None)
+    _, scope_report = _compile(conflict_scope, 'same_physical_key')
+    assert scope_report['verified_groups'] == 0
+
+
+def test_hierarchy_replay_survives_cross_family_ordinary_edges_and_declared_cross_type_hierarchies():
+    from lightgraph.construction.executor import execute_draft
+    from lightgraph.contracts import ColumnSpec, TableSpec
+    from lightgraph.tests.test_source_hierarchy_replays import contributor, draft_graph
+
+    # Scenario A: Valid hierarchy members that ALSO carry healthy ordinary edges to Metric
+    # must not be poisoned into incompatible_endpoint_or_role.
+    g1 = draft_graph(1, 'Heading')
+    g2 = draft_graph(2, 'Term', inverse=True)
+    for idx, (graph, kind) in enumerate(((g1, 'Heading'), (g2, 'Term'))):
+        metric_id = f'metric_{idx}'
+        graph['definitions']['entities'].append({'type': 'Metric', 'key_names': ['mcode'], 'identity_scope': 'unknown'})
+        graph['definitions']['relations'].append({
+            'type': f'measured_by_{idx}', 'source_type': kind, 'target_type': 'Metric',
+            'hierarchy_orientation': 'none',
+        })
+        graph['nodes'].append({
+            'id': metric_id, 'type': 'Metric', 'identity': {'mcode': 'M1'}, 'identity_types': {'mcode': 'text'},
+            'label': '收入', 'properties': {}, 'supports': [{
+                'scope_ref': 'public', 'label': '收入', 'properties': {},
+                'provenance': {'definition': 'Metric', 'mapping': 0,
+                               'source': {'source_id': 'file', 'schema': 'public', 'table': 'vocabulary'},
+                               'key_columns': ['section'], 'label_column': 'caption'},
+            }],
+        })
+        root = next(n for n in graph['nodes'] if n['type'] == kind and next(iter(n['identity'].values())) == 'X')
+        graph['edges'].append({
+            'id': f'e_metric_{idx}', 'type': f'measured_by_{idx}', 'source': root['id'], 'target': metric_id,
+            'supports': [{
+                'scope_ref': 'public',
+                'provenance': {'definition': f'measured_by_{idx}', 'mapping': 0,
+                               'source': {'source_id': 'file', 'schema': 'public', 'table': 'vocabulary'},
+                               'source_key_columns': ['section'], 'target_key_columns': ['section']},
+            }],
+        })
+    merged = merge_construction_graphs([contributor('u1', g1), contributor('u2', g2)])
+    assert merged['fusion_diagnostics']['hierarchy_replay_collapsed_nodes'] == 3
+    hierarchy_nodes = [n for n in merged['nodes'] if n['type'] != 'Metric']
+    assert len(hierarchy_nodes) == 3
+
+    # Scenario B: Unit 1 models two distinct level types (L1Item -> L2Item) with declared parent_to_child,
+    # while Unit 2 models a single Item -> Item hierarchy on the same physical table.
+    table = TableSpec(source_id='file', name='vocabulary',
+                      columns=[ColumnSpec(name=c) for c in ('section', 'caption', 'leaf', 'heading')])
+    rows = [('X', 'Catalogue', 'A-01', 'Inscription'), ('X', 'Catalogue', 'B-01', 'Inscription')]
+    binding = {'source_id': 'file', 'table': 'vocabulary'}
+    cross_type_draft = {
+        'draft_id': 'cross_type_hier',
+        'entities': [
+            {'type': 'L1Item', 'key_names': ['code'], 'identity_scope': 'global',
+             'identity_domain': 'ns_l1', 'identity_evidence_refs': ['e10'],
+             'mappings': [{**binding, 'key_columns': ['section'], 'label_column': 'caption'}]},
+            {'type': 'L2Item', 'key_names': ['code'], 'identity_scope': 'global',
+             'identity_domain': 'ns_l2', 'identity_evidence_refs': ['e10'],
+             'mappings': [{**binding, 'key_columns': ['leaf'], 'label_column': 'heading'}]},
+        ],
+        'relations': [{
+            'type': 'contains_l2', 'source_type': 'L1Item', 'target_type': 'L2Item',
+            'hierarchy_orientation': 'parent_to_child',
+            'mappings': [{**binding, 'source_key_columns': ['section'], 'target_key_columns': ['leaf']}],
+        }],
+    }
+    with MemorySource([table], {table.qualified_name: rows}) as adapter:
+        built = execute_draft(cross_type_draft, [adapter], [table])
+    assert built['passed'], built['diagnostics']
+    g_cross = {**built['graph'], 'draft_id': 'cross_type_hier', 'draft_revision': 1}
+    merged_cross = merge_construction_graphs([
+        contributor('u_cross', g_cross),
+        contributor('u_single', draft_graph(2, 'Item', inverse=True)),
+    ])
+    assert merged_cross['fusion_diagnostics']['hierarchy_replay_collapsed_nodes'] == 3
+    assert len(merged_cross['nodes']) == 3
+
+
+def test_redundant_label_in_composite_key_escalates_to_warning_and_parallel_unit_notes_shared_tables():
+    from lightgraph.construction.executor import execute_draft
+    from lightgraph.construction.quality import name_mapping_advice
+    from lightgraph.construction.workflow import build_unit_config
+    from lightgraph.contracts import ColumnSpec, TableSpec
+    from lightgraph.runtime.config import WorkflowConfig, WorkflowUnitConfig
+
+    table = TableSpec(source_id='s', name='items', columns=[ColumnSpec(name='code'), ColumnSpec(name='cn')])
+    draft = {
+        'draft_id': 'items',
+        'entities': [{
+            'type': 'Item', 'key_names': ['code', 'cn'],
+            'mappings': [{'source_id': 's', 'table': 'items', 'key_columns': ['code', 'cn'], 'label_column': 'cn'}],
+        }],
+    }
+    # 1:1 code -> name: label in composite key is provably redundant -> warning!
+    with MemorySource([table], {table.qualified_name: [('C1', '收入'), ('C2', '成本')]}) as src:
+        unique_res = execute_draft(draft, [src], [table])
+    advice_warn, = name_mapping_advice(draft, unique_res['graph'])
+    assert advice_warn['code'] == 'primary_name_in_composite_key'
+    assert advice_warn['severity'] == 'warning'
+    assert advice_warn['redundant_label_in_key'] is True
+    assert advice_warn['non_label_keys_with_multiple_names'] == 0
+
+    # 1:N code -> multiple names: composite key is justified -> suggestion!
+    with MemorySource([table], {table.qualified_name: [('C1', '收入'), ('C1', '净收入')]}) as src:
+        multi_res = execute_draft(draft, [src], [table])
+    advice_ok, = name_mapping_advice(draft, multi_res['graph'])
+    assert advice_ok['code'] == 'primary_name_in_composite_key'
+    assert advice_ok['severity'] == 'suggestion'
+    assert advice_ok['redundant_label_in_key'] is False
+    assert advice_ok['non_label_keys_with_multiple_names'] == 1
+
+    # Shared tables across parallel workflow units are highlighted in build_unit_config.
+    cfg = RunConfig(
+        sources=[
+            {'id': 'db1', 'kind': 'csv_file', 'path': 'a.csv', 'table_name': 't1', 'encoding': 'utf-8',
+             'delimiter': ',', 'header': True, 'null_values': [''], 'type_inference': 'text'},
+            {'id': 'shared_xlsx', 'kind': 'csv_file', 'path': 's.csv', 'table_name': 'Sheet1', 'encoding': 'utf-8',
+             'delimiter': ',', 'header': True, 'null_values': [''], 'type_inference': 'text'},
+        ],
+        model={'mode': 'in_environment'},
+        workflow=WorkflowConfig(
+            enabled=True,
+            units=[
+                WorkflowUnitConfig(unit_id='u1', source_ids=['db1', 'shared_xlsx'],
+                                   source_table_overrides={'shared_xlsx': ['Sheet1']}),
+                WorkflowUnitConfig(unit_id='u2', source_ids=['shared_xlsx'],
+                                   source_table_overrides={'shared_xlsx': ['Sheet1']}),
+            ],
+        ),
+    )
+    scoped = build_unit_config(cfg, cfg.workflow.units[0], unit_output_dir='/tmp/u1')
+    assert '跨单元共享来源约定' in scoped.goal_markdown
+    assert 'shared_xlsx.Sheet1' in scoped.goal_markdown
+
+
+def test_long_workspace_paths_work_across_workspace_analytics_retention_and_retrieval(tmp_path):
+    from lightgraph.construction import analytics_store, paths
+    from lightgraph.runtime.retention import atomic_text
+    from lightgraph.web.deletion import delete_project
+
+    # Construct a >265-char workspace root (each segment well below NAME_MAX) to exercise deep Windows paths.
+    deep_root = tmp_path
+    while len(str(deep_root)) < 270:
+        deep_root = deep_root / ('nested_segment_' + 'x' * 30)
+    ws = Workspace(deep_root)
+    assert not str(ws.root).startswith('\\\\?\\')
+    ws.create('DeepPathProject', 'deep_p')
+    cfg = ws.result_config('deep_p')
+    run_id = 'run_' + 'e' * 24
+    ws.select_output_generation('deep_p', run_id, create=True)
+    cfg = ws.result_config('deep_p')
+    assert len(cfg.output_dir) > 270
+
+    # Exercise atomic_text, analytics persistence, and retrieval sync under the >270-char lineage.
+    marker_file = ws.generation_path('deep_p', run_id) / 'workflow-runs' / (run_id + '.json')
+    atomic_text(marker_file, json.dumps({'ok': True}))
+    assert json.loads(paths.io_path(marker_file).read_text(encoding='utf-8')) == {'ok': True}
+
+    sample_graph = {
+        'format_version': 1, 'target': 'graph', 'status': 'published',
+        'support_visibility_version': 1, 'version_id': 'v_' + '1' * 32,
+        'definitions': {'entities': [{'type': 'Item', 'key_names': ['code']}], 'relations': []},
+        'nodes': [{'id': 'n1', 'type': 'Item', 'identity': {'code': 'A1'}, 'label': '项目一',
+                   'properties': {}, 'supports': [{'scope_ref': 'public', 'label': '项目一', 'properties': {},
+                   'provenance': {'definition': 'Item', 'mapping': 0,
+                                  'source': {'source_id': 's', 'schema': 'public', 'table': 't'},
+                                  'key_columns': ['code'], 'evidence_refs': ['e1']}}]}],
+        'edges': [], 'evidence_refs': ['e1'],
+    }
+    ap = analytics_store.artifact_path(ws.generation_path('deep_p', run_id) / 'construction', cfg, 'v_' + '1' * 32, None)
+    analytics_store.persist_analysis(sample_graph, cfg, None, ap)
+    loaded_analytics = analytics_store.read_analysis(
+        ws.generation_path('deep_p', run_id) / 'construction', cfg, 'v_' + '1' * 32, None)
+    assert loaded_analytics['counts']['nodes'] == 1
+
+    retrieval_dir = ws.generation_path('deep_p', run_id) / 'retrieval'
+    sync_graph_to_retrieval(sample_graph, retrieval_dir)
+    retriever = SubgraphRetriever(retrieval_dir)
+    assert [n['id'] for n in retriever.retrieve('A1', scopes=['public'])['nodes']] == ['n1']
+    # Release lease before project deletion.
+    if retriever._build_lease is not None:
+        retriever._build_lease.close()
+    assert delete_project(ws, 'deep_p')['deleted'] is True

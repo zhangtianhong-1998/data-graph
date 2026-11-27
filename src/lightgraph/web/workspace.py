@@ -24,6 +24,7 @@ from weakref import WeakValueDictionary
 import yaml
 from pydantic import Field, ValidationError
 
+from ..construction.paths import io_path, logical_path
 from ..contracts import StrictModel
 from ..documents.core import DocumentScope, load_document
 from ..errors import LightGraphError
@@ -94,7 +95,7 @@ def _name(value: str) -> str:
 
 def _no_symlinks(path: Path) -> None:
     """Reject symlinks before resolve/open, including parent directory links."""
-    path = system_directory_path(path)
+    path = io_path(system_directory_path(path))
     for entry in (path, *path.parents):
         if entry.is_symlink():
             raise LightGraphError("workspace_symlink_forbidden")
@@ -202,10 +203,11 @@ def _bound_markdown(name, text, purpose, scope) -> bytes:
 
 class Workspace:
     def __init__(self, root: str | Path):
-        self.root = Path(root).absolute()
+        self.root = logical_path(Path(root).absolute())
         _no_symlinks(self.root)
-        self.root.mkdir(parents=True, exist_ok=True)
-        if not self.root.is_dir():
+        root_io = io_path(self.root)
+        root_io.mkdir(parents=True, exist_ok=True)
+        if not root_io.is_dir():
             raise LightGraphError("invalid_workspace_root")
         self._locks = WeakValueDictionary()
         self._locks_guard = threading.Lock()
@@ -221,7 +223,8 @@ class Workspace:
     def project_path(self, project_id: str) -> Path:
         path = self.root / _identifier(project_id)
         _no_symlinks(path)
-        if not path.is_dir() or not (path / "project.yaml").is_file():
+        path_io = io_path(path)
+        if not path_io.is_dir() or not (path_io / "project.yaml").is_file():
             raise LightGraphError("project_not_found")
         _no_symlinks(path / "project.yaml")
         return path
@@ -238,28 +241,31 @@ class Workspace:
 
     def _read(self, path: Path):
         _no_symlinks(path)
+        target = io_path(path)
         try:
-            if path.stat().st_size > MAX_TEXT_BYTES:
+            if target.stat().st_size > MAX_TEXT_BYTES:
                 raise LightGraphError("workspace_metadata_too_large")
-            return safe_yaml(path.read_text(encoding="utf-8"))
+            return safe_yaml(target.read_text(encoding="utf-8"))
         except (OSError, UnicodeError):
             raise LightGraphError("workspace_file_read_failed") from None
 
     def _atomic(self, path: Path, data: bytes) -> None:
         _no_symlinks(path)
+        target = io_path(path)
         temporary = None
         try:
-            fd, temporary = tempfile.mkstemp(prefix=".write_", dir=path.parent)
+            fd, temporary = tempfile.mkstemp(prefix=".write_", dir=target.parent)
+            tmp_io = io_path(temporary)
             with os.fdopen(fd, "wb") as stream:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
             _no_symlinks(path)
-            os.replace(temporary, path)
+            os.replace(tmp_io, target)
             temporary = None
         finally:
             if temporary is not None:
-                Path(temporary).unlink(missing_ok=True)
+                io_path(temporary).unlink(missing_ok=True)
 
     def _write_yaml(self, path: Path, value) -> None:
         text = yaml.safe_dump(value, allow_unicode=True, sort_keys=False)
@@ -286,7 +292,7 @@ class Workspace:
             ids.add(fid)
             self._path(project_id, file["relative_path"])
         for folder in ("files", "output", "runs"):
-            directory = self._path(project_id, folder)
+            directory = io_path(self._path(project_id, folder))
             directory.mkdir(exist_ok=True)
         return project
 
@@ -332,7 +338,7 @@ class Workspace:
             path = self.root / project_id
             _no_symlinks(path)
             try:
-                path.mkdir()
+                io_path(path).mkdir()
             except FileExistsError:
                 raise LightGraphError("project_already_exists") from None
             stamp = _now()
@@ -340,7 +346,7 @@ class Workspace:
                                updated_at=stamp).model_dump(mode="json")
             self._write_yaml(path / "project.yaml", project)
             for folder in ("files", "output", "runs"):
-                (path / folder).mkdir()
+                io_path(path / folder).mkdir()
             # New workbench projects offer the local semantic service. Older
             # saved projects without embedding settings keep their existing index.
             config = RunConfig(sources=[], isolation_domain=project_id, output_dir="output",
@@ -356,7 +362,7 @@ class Workspace:
     def list_projects(self, *, summary=False) -> list[dict]:
         _no_symlinks(self.root)
         projects = []
-        for path in sorted(self.root.iterdir()):
+        for path in sorted(io_path(self.root).iterdir()):
             if path.is_symlink() or not _ID.fullmatch(path.name) or not (path / "project.yaml").is_file():
                 continue
             try:
@@ -443,7 +449,7 @@ class Workspace:
             try:
                 self._commit_inputs(project_id, project, config)
             except Exception:
-                path.unlink(missing_ok=True)
+                io_path(path).unlink(missing_ok=True)
                 raise
             return record
 
@@ -455,7 +461,7 @@ class Workspace:
             if file is None:
                 raise LightGraphError("project_file_not_found")
             path = self._path(project_id, file["relative_path"])
-            if not path.is_file():
+            if not io_path(path).is_file():
                 raise LightGraphError("project_file_not_found")
             return path
 
@@ -468,13 +474,14 @@ class Workspace:
         """
         with self.lock(project_id):
             path = self.file_path(project_id, file_id)
+            target = io_path(path)
             if path.suffix.lower() not in {".md", ".markdown", ".yaml", ".yml"}:
                 raise LightGraphError("text_preview_unavailable")
             try:
-                if path.stat().st_size > MAX_TEXT_BYTES:
+                if target.stat().st_size > MAX_TEXT_BYTES:
                     raise LightGraphError("file_too_large")
                 # The bounded binary read also covers a concurrent manual grow.
-                with path.open("rb") as stream:
+                with target.open("rb") as stream:
                     content = stream.read(MAX_TEXT_BYTES + 1)
                 if len(content) > MAX_TEXT_BYTES:
                     raise LightGraphError("file_too_large")
@@ -670,7 +677,7 @@ class Workspace:
         """Read the active construction lineage, independently of user settings."""
         with self.lock(project_id):
             pointer = self._path(project_id, "output-head.yaml")
-            if not pointer.exists():
+            if not io_path(pointer).exists():
                 return None
             value = self._read(pointer)
             if (not isinstance(value, dict) or set(value) != {"run_id"} or
@@ -678,7 +685,7 @@ class Workspace:
                     not re.fullmatch(r"run_[0-9a-f]{24}", value["run_id"])):
                 raise LightGraphError("invalid_output_generation")
             path = self.generation_path(project_id, value["run_id"])
-            if not path.is_dir():
+            if not io_path(path).is_dir():
                 raise LightGraphError("invalid_output_generation")
             return value["run_id"]
 
@@ -696,13 +703,14 @@ class Workspace:
         with self.lock(project_id):
             pointer = self._path(project_id, "output-head.yaml")
             if run_id is None:
-                pointer.unlink(missing_ok=True)
+                io_path(pointer).unlink(missing_ok=True)
                 return
             path = self.generation_path(project_id, run_id)
+            path_io = io_path(path)
             if create:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.mkdir(exist_ok=False)
-            elif not path.is_dir():
+                path_io.parent.mkdir(parents=True, exist_ok=True)
+                path_io.mkdir(exist_ok=False)
+            elif not path_io.is_dir():
                 raise LightGraphError("invalid_output_generation")
             self._write_yaml(pointer, {"run_id": run_id})
 

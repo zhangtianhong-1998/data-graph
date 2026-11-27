@@ -52,7 +52,7 @@ def run_output_path(project, relative):
     path = project
     for part in Path(relative).parts:
         path = path / part
-        if path.is_symlink():
+        if io_path(path).is_symlink():
             raise LightGraphError('invalid_output_generation')
     return path
 
@@ -64,7 +64,7 @@ def committed_unit_output(output, uid, attempt):
     project = output.parent if output.name == 'output' else output.parents[2] if output.parent.name == 'generations' else None
     if attempt is None or project is None:
         return local
-    run_file = project / 'runs' / (attempt + '.json')
+    run_file = io_path(project / 'runs' / (attempt + '.json'))
     if not run_file.exists():
         return local
     if run_file.is_symlink():
@@ -76,7 +76,7 @@ def committed_unit_output(output, uid, attempt):
 
 
 def published_unit_attempts(project_output_dir):
-    manifest_path = Path(project_output_dir) / 'construction' / 'manifest.yaml'
+    manifest_path = io_path(Path(project_output_dir) / 'construction' / 'manifest.yaml')
     if not manifest_path.is_file():
         return {}
     manifest = read_internal_yaml(manifest_path)
@@ -273,6 +273,34 @@ def _apply_scoped_inputs(
     return cloned
 
 
+def _shared_unit_tables(project_config: RunConfig, unit: WorkflowUnitConfig) -> list[str]:
+    wf = project_config.workflow
+    if not wf or len(wf.units) < 2:
+        return []
+    def scope_keys(item: WorkflowUnitConfig) -> set[tuple[str, str]]:
+        keys: set[tuple[str, str]] = set()
+        for sid in item.source_ids:
+            tables = item.source_table_overrides.get(sid)
+            if tables:
+                keys.update((sid, t) for t in tables)
+            else:
+                keys.add((sid, '*'))
+        return keys
+
+    mine = scope_keys(unit)
+    if not mine:
+        return []
+    shared: set[str] = set()
+    for peer in wf.units:
+        if peer.unit_id == unit.unit_id:
+            continue
+        other = scope_keys(peer)
+        for sid, table in mine:
+            if (sid, table) in other or (sid, '*') in other or (table == '*' and any(s == sid for s, _ in other)):
+                shared.add(sid if table == '*' else f'{sid}.{table}')
+    return sorted(shared)
+
+
 def build_unit_config(
     project_config: RunConfig,
     unit: WorkflowUnitConfig,
@@ -291,6 +319,13 @@ def build_unit_config(
     base_goal = effective_goal_markdown(project_config)
     extra_parts = [base_goal] if base_goal.strip() else []
     unit_heading = f'{unit.label} ({unit.unit_id})' if unit.label else unit.unit_id
+    shared_tables = _shared_unit_tables(project_config, unit)
+    shared_note = (
+        f'\n\n### 跨单元共享来源约定\n\n以下来源/表同时被其他并行单元读取：{", ".join(shared_tables)}。'
+        '在这些共享来源上建模时，请直接以物理编码列的规范 `lower_snake_case` 命名 `key_names`，'
+        '避免自定义别名键名，并确保同名实体保持一致的 `key_names`、`identity_scope` 与 `applicability`。'
+        if shared_tables else ''
+    )
     extra_parts.append(
         f'## 并行单元上下文 ({unit_heading})\n\n'
         '仅处理当前单元已授权来源与表范围，产出的增量图将由项目融合器统一归并。'
@@ -298,6 +333,7 @@ def build_unit_config(
         '单列编码已能唯一标识实体时勿将名称列塞入复合键 `key_columns`（名称保留在 `label_column`）；'
         '如文档明确说明共享编码体系或适用范围，请规范填写 `identity_scope`、`identity_domain`、'
         '`identity_evidence_refs`、`identity_explanations` 与 `applicability`。'
+        + shared_note
     )
     if unit.goal_markdown and unit.goal_markdown.strip():
         extra_parts.append(unit.goal_markdown.strip())
@@ -677,7 +713,7 @@ def merge_project_workflow(
     load_committed=None,
 ) -> dict[str, Any]:
     """Deterministically merge inherited base graphs and parallel workflow unit publications."""
-    root_output = Path(project_output_dir)
+    root_output = io_path(project_output_dir)
     root_construction = root_output / 'construction'
     root_construction.mkdir(parents=True, exist_ok=True)
 
@@ -696,7 +732,7 @@ def merge_project_workflow(
         if uid not in units:
             raise LightGraphError('workflow_unit_not_found')
         if uid not in attempts and load_committed is not None:
-            historical = unit_output_path(root_output, uid) / 'construction' / 'manifest.yaml'
+            historical = io_path(unit_output_path(root_output, uid) / 'construction' / 'manifest.yaml')
             if historical.is_file() and read_internal_yaml(historical).get('current_graph'):
                 from .checkpoints import WorkflowCheckpointError
                 raise WorkflowCheckpointError('workflow_checkpoint_missing', uid)
@@ -737,8 +773,8 @@ def workflow_state_path(project_output_dir: str | Path) -> Path:
 def _state_path(output, run_id=None):
     if run_id is not None and (not isinstance(run_id, str) or not re.fullmatch(r'run_[a-f0-9]{24}', run_id)):
         raise LightGraphError('run_not_found')
-    path = (Path(output) / 'workflow-runs' / (run_id + '.json')
-            if run_id else workflow_state_path(output))
+    path = io_path(Path(output) / 'workflow-runs' / (run_id + '.json')
+                   if run_id else workflow_state_path(output))
     if path.parent.is_symlink() or path.is_symlink():
         raise LightGraphError('workspace_path_invalid')
     return path
