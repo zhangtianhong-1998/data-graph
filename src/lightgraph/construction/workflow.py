@@ -291,7 +291,14 @@ def build_unit_config(
     base_goal = effective_goal_markdown(project_config)
     extra_parts = [base_goal] if base_goal.strip() else []
     unit_heading = f'{unit.label} ({unit.unit_id})' if unit.label else unit.unit_id
-    extra_parts.append(f'## 并行单元上下文 ({unit_heading})\n\n仅处理当前单元已授权来源与表范围，产出的增量图将由项目融合器统一归并。')
+    extra_parts.append(
+        f'## 并行单元上下文 ({unit_heading})\n\n'
+        '仅处理当前单元已授权来源与表范围，产出的增量图将由项目融合器统一归并。'
+        '请保持跨单元契约一致性：逻辑键名统一使用规范的 `lower_snake_case`（如 `code` 或业务编码逻辑名），'
+        '单列编码已能唯一标识实体时勿将名称列塞入复合键 `key_columns`（名称保留在 `label_column`）；'
+        '如文档明确说明共享编码体系或适用范围，请规范填写 `identity_scope`、`identity_domain`、'
+        '`identity_evidence_refs`、`identity_explanations` 与 `applicability`。'
+    )
     if unit.goal_markdown and unit.goal_markdown.strip():
         extra_parts.append(unit.goal_markdown.strip())
     if unit.probe_filter_hint and unit.probe_filter_hint.strip():

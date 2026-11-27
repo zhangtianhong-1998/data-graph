@@ -96,8 +96,8 @@ def agent_context(answer, *, version=None, sources=()):
                 context['truncated'] = context['evidence_truncated'] = True
             if obs.get('identity_decision_refs') or obs.get('identity_reviewed'):
                 row['identity_reviewed'] = True
-                if obs.get('source_identity') and mapping.get('key_columns'):
-                    row['source_identity'] = obs['source_identity']
+            if obs.get('source_identity') and mapping.get('key_columns'):
+                row['source_identity'] = obs['source_identity']
             if source.get('table'):
                 row.update(source=_fields(source, ('source_id', 'schema', 'table')),
                            source_kind=kinds.get(source.get('source_id')), mapping=mapping)

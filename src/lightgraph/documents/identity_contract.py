@@ -136,12 +136,12 @@ def shared_key_claim_refs(domain, names, columns, table, applicable, cited):
         for entry in section.get('identity_bindings', ()):
             if entry['table'] != address:
                 continue
-            declared_sections.add(ref)
             declared = set(entry['key_columns'])
             if entry.get('incomplete') and target.intersection(declared):
                 return set()
             if not (target <= declared or declared <= target):
                 continue
+            declared_sections.add(ref)
             # A declaration for (code, edition) does not license code alone.
             # In either direction the difference in grain requires a decision.
             if declared != target or entry['scope'] != 'shared' or entry['domain'] != domain:

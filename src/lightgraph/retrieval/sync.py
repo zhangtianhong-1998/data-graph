@@ -353,7 +353,7 @@ def sync_graph_to_retrieval(
             for val in (node.get('identity') or {}).values():
                 add_term(val, 'identity_code', True)
             for observation in observations:
-                if observation.get('identity_decision_refs'):
+                if observation.get('source_identity'):
                     for value in (observation.get('source_identity') or {}).get('values', []):
                         add_term(value, 'identity_code', True)
             for name in cn_names:

@@ -101,9 +101,11 @@ def _read_node(family, node):
         binding_key = (*address, cols)
         marker = prov.get('global_identity_authority') or {}
         registries = set()
-        if (marker.get('registry_key_claims_v1') and family.definition.get('identity_scope') == 'global'
+        if ((marker.get('registry_key_claims_v1') or marker.get('interpreted_key_claims_v1'))
+                and family.definition.get('identity_scope') == 'global'
                 and family.definition.get('identity_domain') == node.get('identity_domain')):
-            registries = {v for k, v in _shared_proofs(marker, node['identity_domain'], address, cols) if k == 'registry'}
+            registries = {v for k, v in _shared_proofs(marker, node['identity_domain'], address, cols)
+                          if k in {'registry', 'interpretation'}}
         if binding_key in family.source_registries:
             family.source_registries[binding_key].intersection_update(registries)
         else:
@@ -113,7 +115,14 @@ def _read_node(family, node):
             family.problems.add('missing_observed_name')
         else:
             labels.add(label)
-            if prov['label_column'] in cols or label in (str(v) for v in identity.values()):
+            label_col = prov['label_column']
+            if label_col in cols:
+                other_values = [str(identity[n]) for n, c in zip(names, cols) if c != label_col and n in identity]
+                label_idx = cols.index(label_col)
+                if (len(cols) < 2 or not other_values or any(v == label for v in other_values)
+                        or str(identity.get(names[label_idx])) != label):
+                    distinct_name_column = False
+            elif label in (str(v) for v in identity.values()):
                 distinct_name_column = False
         if any(support.get(k) for k in ('identity_origins', 'identity_decision_refs', 'inherited_from',
                                         'identity_basis', 'lookup_matches', 'original_key_values')):

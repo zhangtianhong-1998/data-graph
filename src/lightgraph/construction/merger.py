@@ -439,6 +439,7 @@ def _merge_contributor_nodes_and_edges(
                     merged.update(frozen_presentation[key])
                 definitions[category][copied['type']] = merged
 
+        own_entities = {defn['type']: defn for defn in graph.get('definitions', {}).get('entities', [])}
         id_remap: dict[str, str] = {}
         for raw_node in graph.get('nodes', []):
             node = deepcopy(raw_node)
@@ -451,7 +452,7 @@ def _merge_contributor_nodes_and_edges(
             )
             if (node.get('original_type', node['type']), node.get('identity_domain')) in explicit_domains and not independent_outputs:
                 can_share = True
-            contract = definitions['entities'].get(node['type'], {})
+            contract = own_entities.get(node['type'], {})
             if (not independent_outputs and contract.get('identity_scope') == 'global'
                     and contract.get('identity_domain')
                     and contract.get('identity_domain') == node.get('identity_domain')

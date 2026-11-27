@@ -75,6 +75,9 @@ def witness_names(node):
 def _witness_codes(node, observation):
     if observation.get('identity_decision_refs') or observation.get('identity_reviewed'):
         return (str(v) for v in (observation.get('source_identity') or {}).get('values', ()))
+    if observation.get('source_identity'):
+        return (str(v) for v in (*node.get('identity', {}).values(),
+                                  *(observation['source_identity'].get('values') or ())))
     return node.get('identity', {}).values()
 
 

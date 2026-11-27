@@ -23,9 +23,9 @@ class IdentityExplanation(StrictModel):
 _LOCAL = re.compile(
     r'(?:各自|独立|本地|分别|自管|自行|单独).{0,18}(?:编号|编码|标识|号码)|'
     r'(?:编号|编码|标识|号码).{0,18}(?:各自|独立|本地|自管|自行|单独)|'
-    r'仅在.{0,24}唯一|(?:不|不能|不可|并非|无法).{0,12}(?:同一|相同|共享|合并|唯一)|'
+    r'仅在.{0,24}唯一|(?:不(?!同(?:系统|来源|表|数据源|数据表))|不能|不可|并非|无法).{0,12}(?:同一|相同|共享|合并|唯一)|'
     r'\b(?:independent|local|own)\s+(?:identifiers?|codes?|numbers?|numbering)\b|'
-    r'\b(?:not|never)\b.{0,32}\b(?:same|shared|unique)\b', re.I)
+    r'\b(?:not|never)\b.{0,32}\b(?:same|shared|share|unique)\b', re.I)
 _SHARED = re.compile(
     r'(?:全局|跨表|跨来源|跨系统|全企业|全集团|全公司|所有系统|各系统).{0,24}(?:唯一|同一|相同)|'
     r'(?:统一|共同|共享).{0,24}(?:唯一|同一对象|同一实体)|'
@@ -34,10 +34,10 @@ _SHARED = re.compile(
     r'\b(?:same|matching)\s+(?:codes?|identifiers?)\b.{0,40}\b(?:same|one)\b', re.I)
 _VERSION = re.compile(r'版本|版次|\b(?:version|edition|revision)\b', re.I)
 _SHARED_SYSTEM = re.compile(
-    r'(?:跨表|跨来源|跨系统|各系统|所有系统|不同来源|不同系统).{0,24}'
+    r'(?:跨表|跨来源|跨系统|各系统|所有系统|不同来源|不同系统|全集团|全企业|全公司).{0,24}'
     r'(?:共享|共用|统一|同一).{0,24}(?:编号体系|编码体系|标识体系|编号|编码|标识)|'
     r'(?:共享|共用|统一|同一).{0,24}(?:编号体系|编码体系|标识体系).{0,24}'
-    r'(?:跨表|跨来源|跨系统|各系统|所有系统|不同来源|不同系统)|'
+    r'(?:跨表|跨来源|跨系统|各系统|所有系统|不同来源|不同系统|全集团|全企业|全公司)|'
     r'\b(?:all|across)\s+(?:source\s+)?systems\b.{0,40}\b(?:shared|common|same)\b.{0,24}'
     r'\b(?:identifier|numbering|code)\s+(?:system|namespace)\b', re.I)
 _QUALIFIED = re.compile(r'除.{0,30}外|但是|仅在|只在|限于|前提|条件|例外|可能|通常|'
@@ -49,17 +49,27 @@ _QUALIFIED = re.compile(r'除.{0,30}外|但是|仅在|只在|限于|前提|条�
 
 
 def _asserts_domain(quote, domain):
+    clauses = re.split(r'[。；;\n]|(?<![0-9A-Za-z_])\.(?=\s|$)', quote)
     return any(domain in clause and _SHARED.search(clause) and _SHARED_SYSTEM.search(clause)
-               for clause in re.split(r'[。；;\n]', quote))
+               for clause in clauses)
 
 
 def _explicit_role_binding(quote, column, role):
     physical_name = r'(?<![a-z0-9_])' + re.escape(column) + r'(?![a-z0-9_])'
     if column == role:
         return bool(re.search(physical_name, quote, re.I))
-    return bool(re.search(physical_name + r'[^。；;\n]{0,80}'
-                          r'(?:对应|表示|记录|引用|标识|存放|就是|\bis\b|\bcontains\b|\bholds\b)'
-                          + r'[^。；;\n]{0,40}' + re.escape(role), quote, re.I))
+    verb = r'(?:对应|表示|记录|引用|标识|存放|就是|为|是|\bis\b|\bcontains\b|\bholds\b)'
+    if re.search(physical_name + r'[^。；;\n]{0,80}' + verb + r'[^。；;\n]{0,40}' + re.escape(role), quote, re.I):
+        return True
+    if re.search(re.escape(role) + r'[^。；;\n]{0,40}(?:对应|字段|列|为|是|\bis\b)[^。；;\n]{0,40}' + physical_name, quote, re.I):
+        return True
+    # Markdown data-dictionary table row: `| col | ... role ... |`
+    for line in quote.splitlines():
+        if '|' in line:
+            cells = [cell.strip().strip('`') for cell in line.strip().strip('|').split('|')]
+            if any(re.fullmatch(physical_name, cell, re.I) for cell in cells) and any(role in cell for cell in cells):
+                return True
+    return False
 
 
 def explanation_claims(entity, mapping, table, applicable, cited):
@@ -117,6 +127,8 @@ def explanation_claims(entity, mapping, table, applicable, cited):
                                  or binding['key_columns'] != mapping.key_columns)):
                         reason = 'identity_material_conflict'
                         break
+                if reason:
+                    break
         if reason:
             issues.append({'code': reason, 'evidence_ref': ref})
             continue

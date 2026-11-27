@@ -123,7 +123,9 @@ def _record_sheet_role(rows, cells, headers, node, node_key, peer, peer_key, edg
         return False
     frame = dict(zip(own, node_key, strict=True))
     representative = node['supports'][0]
-    frame[header[-1]] = ('text', representative.get('observed_label') or representative.get('label'))
+    label_cell = ('text', representative.get('observed_label') or representative.get('label'))
+    if frame.setdefault(header[-1], label_cell) != label_cell:
+        return False
     for field, cell in zip(opposite, peer_key, strict=True):
         if frame.setdefault(field, cell) != cell:
             return False
@@ -220,7 +222,8 @@ def _witnesses(node, binding, index, *, compare_shared_identity=False):
                           support.get('properties'), support.get('row_context'))
             facts = digest(meaning, end, peer_cols, peer_key, *conditions, support.get('source_row_witness'))
             evidence = digest(source, own_cols, facts)
-            local = facts if (*source, own_cols) == _address(binding) else evidence
+            local = (digest(meaning, end, peer_cols, peer_key, *conditions)
+                     if (*source, own_cols) == _address(binding) else evidence)
             all_roles.add(evidence)
             local_roles.add(local)
             selected = (edge['type'] == binding.relation_type and end == binding.end
@@ -262,14 +265,14 @@ def _witnesses(node, binding, index, *, compare_shared_identity=False):
 def _upstream_context(node, index):
     """Keep the complete observed ancestor graph of a declared hierarchy in the comparison."""
     nodes, _, incident, entities, relations = index
-    pending, seen, facts, items = [node], set(), set(), []
+    pending, seen, physical_facts, semantic_facts, items = [node], set(), set(), set(), []
     while pending:
         child = pending.pop()
         if child['id'] in seen:
             continue
         seen.add(child['id'])
         if len(seen) > 512:
-            return None, []
+            return None, None, []
         for end, edge in incident[child['id']]:
             rel = relations.get(edge['type'], {})
             orientation = rel.get('hierarchy_orientation')
@@ -282,21 +285,24 @@ def _upstream_context(node, index):
                 keys = _cells(member, entities.get(member['type'], {}).get('key_names'))
                 names = {s.get('observed_label') or s.get('label') for s in member.get('supports', ())}
                 if not keys or len(names) != 1 or not all(isinstance(n, str) and n.strip() for n in names):
-                    return None, []
+                    return None, None, []
                 anchors.append((keys, names.pop()))
+            rel_family = rel.get('original_type') or edge['type']
             for support in edge.get('supports', ()):
                 p = support.get('provenance') or {}
                 if not source_address(p.get('source')) or not support.get('scope_ref'):
-                    return None, []
-                facts.add(digest(anchors, orientation, rel.get('original_type') or edge['type'],
-                                 source_address(p['source']), p.get('source_key_columns'), p.get('target_key_columns'),
-                                 observation_scope(support), p.get('predicate'), p.get('constant_properties'),
-                                 support.get('row_context'), support.get('source_row_witness')))
-            if not edge.get('supports') or len(facts) > 1024:
-                return None, []
+                    return None, None, []
+                scope = observation_scope(support)
+                physical_facts.add(digest(anchors, orientation, rel_family,
+                                          source_address(p['source']), p.get('source_key_columns'), p.get('target_key_columns'),
+                                          scope, p.get('predicate'), p.get('constant_properties'),
+                                          support.get('row_context'), support.get('source_row_witness')))
+                semantic_facts.add(digest('semantic_ancestor_v1', anchors, orientation, rel_family, scope))
+            if not edge.get('supports') or len(physical_facts) > 1024:
+                return None, None, []
             items.extend((edge, parent))
             pending.append(parent)
-    return frozenset(facts), items
+    return frozenset(physical_facts), frozenset(semantic_facts), items
 
 
 @dataclass
@@ -306,6 +312,7 @@ class _Observation:
     reason: str | None = None
     contract: str | None = None
     boundaries: tuple | None = None
+    cross_table_boundaries: tuple | None = None
     attributes: dict = field(default_factory=dict)
     roles: _RoleWitnesses | None = None
     sections: set = field(default_factory=set)
@@ -313,11 +320,35 @@ class _Observation:
     interpretations: set = field(default_factory=set)
     registry_contract: str | None = None
     ancestors: frozenset | None = None
+    semantic_ancestors: frozenset | None = None
     ancestor_items: list = field(default_factory=list)
     identity_boundary: str | None = None
 
 
-def _conditions(support):
+def _has_distinct_name_binding(node, definition, binding, own, label):
+    """Allow an independent label column or a composite (code, name) key with a distinct code."""
+    names = definition.get('key_names') or []
+    identity = node.get('identity') or {}
+    for support in own:
+        label_col = (support.get('provenance') or {}).get('label_column')
+        if not isinstance(label_col, str) or not label_col:
+            return False
+        if label_col in binding.key_columns:
+            if len(binding.key_columns) < 2 or len(names) != len(binding.key_columns):
+                return False
+            label_idx = binding.key_columns.index(label_col)
+            if str(identity.get(names[label_idx])) != label:
+                return False
+            other_values = [str(identity[name]) for name, col in zip(names, binding.key_columns, strict=True)
+                            if col != label_col and name in identity]
+            if not other_values or any(value == label for value in other_values):
+                return False
+        elif label in (str(value) for value in identity.values()):
+            return False
+    return True
+
+
+def _conditions(support, *, include_row_witness=True):
     provenance = support['provenance']
     protected = {}
     properties = support.get('properties') or {}
@@ -325,7 +356,8 @@ def _conditions(support):
         for prop, role in (provenance.get(field) or {}).items():
             protected[prop] = [role, properties.get(prop)]
     return canonical([provenance.get('business_context_mapping'), sorted(provenance.get('context_columns') or ()),
-                      support.get('row_context'), support.get('source_row_witness'), protected])
+                      support.get('row_context'),
+                      support.get('source_row_witness') if include_row_witness else None, protected])
 
 
 def _observation(node, definition, binding, index, own):
@@ -342,8 +374,7 @@ def _observation(node, definition, binding, index, own):
         result.interpretations = {token for kind, token in authorities if kind == 'interpretation'}
         result.registries = {token for kind, token in authorities if kind in {'registry', 'interpretation'}}
     if (len(own) != len(node['supports']) or not all(_own_support(s, binding.contributor_id) for s in own)
-            or any(s['provenance'].get('label_column') in (None, '', *binding.key_columns) for s in own)
-            or result.label in (str(value) for value in node['identity'].values())):
+            or not _has_distinct_name_binding(node, definition, binding, own, result.label)):
         result.reason = 'unverified_name_or_other_bindings'
         return result
     names = definition['key_names']
@@ -377,11 +408,13 @@ def _observation(node, definition, binding, index, own):
     signature, result.attributes = physical
     result.boundaries = (signature[-1], canonical(node.get('identity_context')),
                          tuple(sorted({_conditions(s) for s in own})))
+    result.cross_table_boundaries = (signature[-1], canonical(node.get('identity_context')),
+                                     tuple(sorted({_conditions(s, include_row_witness=False) for s in own})))
     result.roles = _witnesses(node, binding, index, compare_shared_identity=bool(result.sections or result.registries))
     if not result.roles:
         result.reason = 'unverified_relation_role'
         return result
-    result.ancestors, result.ancestor_items = _upstream_context(node, index)
+    result.ancestors, result.semantic_ancestors, result.ancestor_items = _upstream_context(node, index)
     if result.ancestors is None:
         result.reason = 'unverified_ancestor_context'
     return result
@@ -455,7 +488,11 @@ def _compare_observations(members, physical, *, independent_grants=False):
     if (any(m.contract != members[0].contract for m in members)
             and not (registry and all(m.registry_contract == members[0].registry_contract for m in members))):
         return 'incompatible_identity_contract', None
-    boundaries = [m.identity_boundary if separate_observations else m.boundaries for m in members]
+    boundaries = [
+        m.identity_boundary if separate_observations
+        else (m.cross_table_boundaries if (not physical and common_identity) else m.boundaries)
+        for m in members
+    ]
     if any(boundary != boundaries[0] for boundary in boundaries):
         return 'different_source_or_scope', None
     basis = 'same_physical_projection' if physical else 'shared_versioned_key_section'
@@ -470,7 +507,8 @@ def _compare_observations(members, physical, *, independent_grants=False):
             if not physical or not _same_worksheet_roles(members):
                 return 'different_relation_or_neighbor', None
             basis = 'same_worksheet_identity_cells'
-    if any(m.ancestors != members[0].ancestors for m in members):
+    expected_ancestors = [m.semantic_ancestors if (not physical and common_identity) else m.ancestors for m in members]
+    if any(anc != expected_ancestors[0] for anc in expected_ancestors):
         return 'different_ancestor_context', None
     cells = {}
     if ((not separate_observations and any(cells.setdefault(k, v) != v for m in members for k, v in m.attributes.items()))

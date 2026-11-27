@@ -133,6 +133,18 @@
           "title": "Key Normalizers",
           "type": "object"
         },
+        "key_prefix_strips": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": "Optional bounded literal prefixes stripped once (longest match first) from text identity keys before canonicalization.",
+          "maxProperties": 32,
+          "title": "Key Prefix Strips",
+          "type": "object"
+        },
         "property_aliases": {
           "additionalProperties": {
             "type": "string"

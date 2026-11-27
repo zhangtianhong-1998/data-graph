@@ -1684,9 +1684,9 @@ class RunManager:
                         report=_safe_report(report_obj),
                     )
                     self._save_run(runs / (rid + ".json"), record)
-                    if merge_summary is not None and self.after_publication:
-                        self.after_publication(pid, config)
                     self._processes.pop(pid, None)
+                if merge_summary is not None and self.after_publication:
+                    self.after_publication(pid, config)
             except Exception as exc:
                 cancelled = cancel_event.is_set()
                 code = "run_cancelled" if cancelled else _safe_code(getattr(exc, "code", None), "workflow_execution_failed")
@@ -1713,8 +1713,9 @@ class RunManager:
             finally:
                 done_event.set()
 
+        initial_response = dict(deepcopy(record), workflow_state=deepcopy(wf_state))
         threading.Thread(target=coordinator, daemon=True).start()
-        return dict(record, workflow_state=wf_state)
+        return initial_response
 
     def retry_unit(self, pid, unit_id, *, source_credentials=None, model_api_key=None):
         """Re-run one workflow unit and deterministically replace only its contribution."""
@@ -1801,9 +1802,9 @@ class RunManager:
             if isinstance(state, dict):
                 state["merge"] = {"status": merge_status, **summary}
                 save_workflow_state(config.output_dir, state, current_only=True)
-            if self.after_publication:
-                self.after_publication(pid, config)
-            return summary
+        if self.after_publication:
+            self.after_publication(pid, config)
+        return summary
 
     def _watch(self, pid, proc, run_seconds):
         expired = False
@@ -1815,19 +1816,25 @@ class RunManager:
             proc.kill()
             proc.wait()
             expired = True
+        notify = None
         with self.workspace.lock(pid):
             with self._guard:
                 entry = self._processes.get(pid)
             if entry and entry["process"] is proc:
                 entry['deadline_expired'] = expired
-                self._finish(pid, entry)
+                notify = self._finish(pid, entry, notify=False)
+        if notify is not None and self.after_publication:
+            self.after_publication(pid, notify)
 
-    def _finish(self, pid, entry):
+    def _finish(self, pid, entry, *, notify=True):
         try:
-            self._finish_record(pid, entry)
+            config = self._finish_record(pid, entry)
         finally:
             with self._guard:
                 self._processes.pop(pid, None)
+        if notify and config is not None and self.after_publication:
+            self.after_publication(pid, config)
+        return config
 
     def _finish_record(self, pid, entry):
         record = entry["record"]
@@ -1869,14 +1876,15 @@ class RunManager:
         record_path = self._paths(pid, record["run_id"])[1]
         finish_progress(progress_path(record_path), record["run_id"], record["status"])
         self._save_run(record_path, record)
-        if record['status'] in {'completed', 'completed_with_gaps', 'partial'} and self.after_publication:
-            self.after_publication(pid, entry['config'])
         try:
             # Preserve worker results and trace artifacts until explicit user
             # cleanup. Only the obsolete cancellation control signal is removed.
             _cancel_path(entry["result"]).unlink(missing_ok=True)
         except OSError:
             pass
+        if record['status'] in {'completed', 'completed_with_gaps', 'partial'}:
+            return entry['config']
+        return None
 
     def active(self, pid):
         with self._guard:
@@ -2059,6 +2067,8 @@ class RunManager:
             return {'deleted': True, 'run_id': rid}
 
     def cancel(self, pid, rid):
+        notify = None
+        finished_record = None
         with self.workspace.lock(pid), self._guard:
             record = self.get(pid, rid)
             entry = self._processes.get(pid)
@@ -2077,16 +2087,21 @@ class RunManager:
             else:
                 proc = entry["process"]
                 if proc.poll() is not None:
-                    self._finish(pid, entry)
-                    return self.get(pid, rid)
-                entry["cancel_requested"] = True
-                try:
-                    # Windows terminate() is a force kill. A private marker lets
-                    # every worker run its normal source/transaction cleanup first.
-                    atomic_text(_cancel_path(entry["result"]), "cancel\n")
-                except OSError:
-                    entry["forced"] = True
-                    proc.kill()
+                    notify = self._finish(pid, entry, notify=False)
+                    finished_record = self.get(pid, rid)
+                else:
+                    entry["cancel_requested"] = True
+                    try:
+                        # Windows terminate() is a force kill. A private marker lets
+                        # every worker run its normal source/transaction cleanup first.
+                        atomic_text(_cancel_path(entry["result"]), "cancel\n")
+                    except OSError:
+                        entry["forced"] = True
+                        proc.kill()
+        if finished_record is not None:
+            if notify is not None and self.after_publication:
+                self.after_publication(pid, notify)
+            return finished_record
         if entry.get("kind") == "workflow":
             if not entry["done_event"].wait(timeout=self.cancel_timeout + 1):
                 with entry["state_lock"]:
@@ -2105,8 +2120,11 @@ class RunManager:
             proc.kill(); proc.wait()
         with self.workspace.lock(pid), self._guard:
             if self._processes.get(pid) is entry:
-                self._finish(pid, entry)
-            return self.get(pid, rid)
+                notify = self._finish(pid, entry, notify=False)
+            finished_record = self.get(pid, rid)
+        if notify is not None and self.after_publication:
+            self.after_publication(pid, notify)
+        return finished_record
 
     def shutdown(self):
         with self._launch_condition:

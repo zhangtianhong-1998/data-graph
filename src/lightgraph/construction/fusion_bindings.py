@@ -47,7 +47,7 @@ def _original_key_order(origin, support, columns):
 
 
 def validate_source_bindings(graph, rules, previous_targets, *, local_namespace):
-    from .fusion import normalize_value
+    from .fusion import normalize_key_value
     approved = {key: allowed_bindings(rule) for key, rule in rules.items() if rule.source_bindings}
     if not approved:
         return
@@ -89,7 +89,8 @@ def validate_source_bindings(graph, rules, previous_targets, *, local_namespace)
                 rule = rules.get(old_key)
                 if not rule or (rule.canonical_type, rule.identity_domain) != target:
                     raise LightGraphError('fusion_source_binding_unverified')
-                normalized = {'identity': {k: normalize_value(identity[v], rule.key_normalizers.get(k, ()))
+                normalized = {'identity': {k: normalize_key_value(identity[v], rule.key_normalizers.get(k, ()),
+                                                                  rule.key_prefix_strips.get(k, ()))
                                            for k, v in rule.key_mapping.items()},
                               'identity_types': {k: origin['identity_types'][v] for k, v in rule.key_mapping.items()
                                                  if v in origin.get('identity_types', {})}}

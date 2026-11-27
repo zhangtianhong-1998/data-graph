@@ -506,7 +506,7 @@ def _catalog_tables_for_config(config):
 
 
 def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_candidates=False, prepared_graph=None,
-                  business_context=None):
+                  business_context=None, include_catalog_metadata=None):
     from lightgraph.construction.contexts import business_context_identity
     if bool(entity_id) == bool(fact_id) or offset < 0:
         raise LightGraphError("graph_selection_invalid")
@@ -651,7 +651,9 @@ def graph_details(config, *, entity_id=None, fact_id=None, offset=0, include_can
             **({"source_kind": source['source_kind'], "evidence_refs": source.get('evidence_refs', [])}
                if source.get('source_kind') == 'metadata_column' else {})}
     from lightgraph.construction.node_standardizer import standardize_node_details
-    catalog_tables = _catalog_tables_for_config(config) if prepared_graph is None else []
+    if include_catalog_metadata is None:
+        include_catalog_metadata = prepared_graph is None
+    catalog_tables = _catalog_tables_for_config(config) if include_catalog_metadata else []
     definitions = graph.get("definitions", {})
     page_values = None
     if entity_id and total_facts > 50:

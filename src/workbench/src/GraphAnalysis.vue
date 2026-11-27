@@ -43,7 +43,7 @@ async function load(id: number, start = false) {
   const project = props.projectId
   const query = new URLSearchParams(params.value)
   if (!start) query.set('limit', '10')
-  else if (data.value?.counts) query.set('force', 'true')
+  else if (data.value?.counts || data.value?.status === 'failed') query.set('force', 'true')
   const url = graphPath.value + '/analytics?' + query
   error.value = ''
   try {

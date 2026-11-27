@@ -47,7 +47,7 @@ description: 根据用户目的，从授权事实数据、元数据和补充文�
 
 区分对象身份、事实适用范围和抽取来源。资料属于某个项目或收藏，并不自动决定其中每条陈述的适用范围。用户或来源没有指定范围时保留这个缺口。
 
-声明跨来源共享对象时，实体定义使用 `identity_scope: global`，填写有依据的 `identity_domain` 和工具实际签发的 `identity_evidence_refs`。编号只在特定范围内唯一时，使用 `identity_scope: scoped`，将决定身份的限定列纳入完整 `key_names`、映射 `key_columns` 和关系端点键，并在 `identity_context_keys` 中列明这些键。同名或编号尾段相同只能作为核对线索。
+声明跨来源共享对象时，实体定义使用 `identity_scope: global`，填写有依据的 `identity_domain` 和工具实际签发的 `identity_evidence_refs`；普通中文或非结构化数据说明文档明确描述共享编码体系、角色映射或本地限定时，在实体定义中补充 `identity_explanations`（字段格式见 `reference:mapping-guide.md`）。编号只在特定范围内唯一时，使用 `identity_scope: scoped`，将决定身份的限定列纳入完整 `key_names`、映射 `key_columns` 和关系端点键，并在 `identity_context_keys` 中列明这些键。同名或编号尾段相同只能作为核对线索。不同单元或草稿建模同一对象时，逻辑键名统一使用简洁规范的 `lower_snake_case`（如 `code` 或业务编码逻辑名），编码列已唯一标识成员时不要把名称列塞入复合键 `key_columns`，而应把名称保留在 `label_column`。
 
 若多个来源通过已声明的外键引用同一张授权字典，且目标需要确认成员身份，可在相同适用范围内投影涉及的字典成员，保留完整、有序的唯一键，供合并时和各来源的外键值核对。
 

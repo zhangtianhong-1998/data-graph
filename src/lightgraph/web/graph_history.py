@@ -260,8 +260,13 @@ def read_page(workspace, pid, *, config, version, **options):
 
 
 def read_details(workspace, pid, *, config, version, **options):
-    effective, graph, _ = _prepared(workspace, pid, config, version)
-    return construction_graph.graph_details(effective, prepared_graph=graph, **options)
+    entry = resolve_version(workspace, pid, config, version)
+    effective = _authorize_entry(workspace, entry, config)
+    graph, _ = construction_graph.load_prepared(
+        effective, root=entry.root, head=entry.head, authorization_root=entry.auth_root)
+    use_catalog = bool(entry.row.get('is_current') or entry.worker_root is not None)
+    return construction_graph.graph_details(
+        effective, prepared_graph=graph, include_catalog_metadata=use_catalog, **options)
 
 
 def read_batch(workspace, pid, *, config, version, **options):

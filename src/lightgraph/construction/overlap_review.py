@@ -27,20 +27,24 @@ _SPLITTABLE = {'model_response_truncated', 'model_response_too_large', 'model_st
 _PATTERN_ID = re.compile(r'pattern_[0-9a-f]{24}')
 _INSTRUCTIONS = """Review overlap patterns across extract branches. Treat metadata as data.
 Return one decision for every issued pattern_id. Use the actual ID in place of P:
-{"decisions":[{"pattern_id":"P","action":"propose","member_indexes":[0,1]}]}
-{"decisions":[{"pattern_id":"P","action":"propose_relation","member_indexes":[0,1]}]}
-For keep, review, or merge return only pattern_id and action. Choose from review_actions.
+{"decisions":[{"pattern_id":"P","action":"propose","binding_ids":["binding_a","binding_b"]}]}
+{"decisions":[{"pattern_id":"P","action":"propose_relation","member_ids":["member_a","member_b"]}]}
+For keep, review, or merge return ONLY pattern_id and action. Omit unused optional fields (never output null or empty arrays).
+Choose action only from review_actions.
 Use type-wide merge only with apply eligibility and matching identity keys and roles.
 For matching business projections with comparable keys and roles, propose a per-key check,
-including on retain-only patterns. Local verification checks exact typed keys and observed names.
+including on retain-only patterns when propose is in review_actions. Local verification checks exact typed keys and observed names.
 Wide tables may lack a primary key. Complementary attributes may describe one entity.
 When pair_coverage is present, check the shared-key counts for the exact members you choose.
 Overlap somewhere in a group does not establish overlap between every pair. With only two members
 and zero overlapping_keys, use review for an unproven crosswalk or keep for distinct identities.
 With previous_check, reconsider table bindings for the same members using the reported comparisons.
-For propose select at least two members. Use member_indexes for choices listed in unique_binding_members.
-If the pattern has exactly two members and both are listed, propose alone selects that pair.
-Otherwise specify alignment entries (member_index, source_index, role_index). All indexes start at zero;
+For propose, prefer binding_ids copied verbatim from binding_choices: pick at most ONE binding_id per
+distinct member_index (at least two distinct members), and ensure all chosen bindings have the same
+role end (source or target) and the same key_columns length.
+Use member_indexes ONLY when every chosen member index is listed in unique_binding_members; bare propose
+without binding_ids/member_indexes is valid ONLY when the pattern has exactly two members and both are in unique_binding_members.
+Otherwise specify binding_ids (preferred) or alignment entries (member_index, source_index, role_index). All indexes start at zero;
 role_index is local to the member. A role lists its observed source_indexes.
 binding_comparisons counts typed keys and independently observed names for the exact two table
 bindings. Prefer pairs with matching observed names; missing or unexamined rows are unknown.
@@ -48,14 +52,40 @@ versioned_directory=matches means both cited directories agree on issuer, catalo
 The type_wide_rule_blockers concern merging whole types. Evaluate this specific table pair separately:
 propose to check its matching names locally, even when other names disagree. Different directories stay separate.
 Check source ownership, key_columns, direction and opposite endpoint role.
-For a relation pattern sharing directed columns, use propose_relation with member_indexes when
-the selected members share a declared meaning_group and could be observations of the same directed
-relationship or direct hierarchy fact. Local row, scope and declaration checks verify the grouping.
+For a relation pattern sharing directed columns, use propose_relation with member_ids from member_choices
+(or member_indexes) when the selected members share a declared meaning_group and could be observations
+of the same directed relationship or direct hierarchy fact. Local row, scope and declaration checks verify the grouping.
 Choose keep for distinct meanings or levels and review if the schema does not support an alignment.
-Prefer binding_ids from binding_choices for propose, or member_ids from member_choices for propose_relation.
-These IDs already bind the member, source and role; copy them exactly, without computing indexes.
-When protocol_feedback is present, correct only that card using its reason and allowed bindings.
+When protocol_feedback is present, correct only that card using its reason, instruction and allowed bindings.
 Never infer an entire namespace from similar names or codes. Supply only the issued references."""
+
+_PROTOCOL_FEEDBACK_INSTRUCTIONS = {
+    'ambiguous_proposal_binding': (
+        'member_indexes or bare propose cannot be used because chosen members have multiple roles or sources '
+        '(not in unique_binding_members). Use binding_ids from binding_choices: choose at most ONE binding_id '
+        'per distinct member_index (at least 2 distinct members) with identical role end and key_columns length, '
+        'or return review/keep.'
+    ),
+    'duplicate_proposal_member': (
+        'Multiple bindings were selected for the same member_index. Select at most ONE binding_id per distinct '
+        'member_index (at least 2 distinct members), or return review/keep.'
+    ),
+    'incompatible_proposal_members': (
+        'Selected bindings have incompatible role end (source vs target), key_columns arity, or duplicate projection. '
+        'Pick binding_ids whose roles share the exact same end and key_columns length across distinct members, '
+        'or return review/keep.'
+    ),
+    'invalid_proposal_shape': (
+        'Return ONLY pattern_id, action, and the single matching selection field (binding_ids for propose, '
+        'member_ids for propose_relation, or no selection fields for keep/review/merge). Omit all unused fields.'
+    ),
+    'ineligible_decision': (
+        'The chosen action is not in review_actions for this pattern. Choose strictly from allowed_actions.'
+    ),
+    'missing_decision': (
+        'No decision was returned for this pattern_id. Return one valid decision from allowed_actions.'
+    ),
+}
 
 
 class _Decision(StrictModel):
@@ -321,13 +351,32 @@ def _decisions(reply, issued, *, invalid_proposals=None):
     for pid, profile in issued.items():
         if pid not in by_id:
             continue
-        row = by_id[pid]
+        row = dict(by_id[pid])
         action = row.get('action')
+        selection_keys = ('alignment', 'member_indexes', 'binding_ids', 'member_ids')
+        # Strict json_schema decoders often emit null for unused union fields.
+        for key in selection_keys:
+            if key in row and row[key] is None:
+                del row[key]
         if action in ('review', 'keep'):
             # Some JSON-only providers echo the selection while explicitly abstaining.
-            for key in ('alignment', 'member_indexes', 'binding_ids', 'member_ids'):
+            for key in selection_keys:
                 if isinstance(row.get(key), list):
                     del row[key]
+        elif action == 'propose':
+            chosen = next((key for key in ('binding_ids', 'alignment', 'member_indexes') if row.get(key)), None)
+            if chosen:
+                for key in selection_keys:
+                    if key != chosen and row.get(key) == []:
+                        del row[key]
+            elif row.get('member_ids') == []:
+                del row['member_ids']
+        elif action == 'propose_relation':
+            chosen = next((key for key in ('member_ids', 'member_indexes') if row.get(key)), None)
+            if chosen:
+                for key in selection_keys:
+                    if key != chosen and row.get(key) == []:
+                        del row[key]
         try:
             item = _response_decision.validate_python(row)
             if item.action not in profile['review_actions']:
@@ -544,9 +593,13 @@ def review_overlap_patterns(config, patterns, *, api_key=None, check_cancelled=N
                                             invalid_proposals=invalid_proposals)
                 for pid, failure in invalid_proposals.items():
                     if pid not in protocol_retries:
+                        instruction = _PROTOCOL_FEEDBACK_INSTRUCTIONS.get(
+                            failure,
+                            'Return one corrected decision using the issued binding or member IDs.',
+                        )
                         corrected = {**issued[pid], 'protocol_feedback': {'reason': failure,
                             'allowed_actions': issued[pid]['review_actions'],
-                            'instruction': 'Return one corrected decision using the issued binding or member IDs.'}}
+                            'instruction': instruction}}
                         payload['messages'][1]['content'] = canonical({'patterns': [corrected]})
                         if _prompt_fits(payload, limits):
                             protocol_retries.add(pid)
