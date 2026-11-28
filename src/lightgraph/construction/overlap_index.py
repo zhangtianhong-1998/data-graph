@@ -44,6 +44,24 @@ def overlap_identity_contract(definition):
     return contract
 
 
+def _index_role_descriptors(role_descriptors, *, per_binding=16, max_total=128):
+    ordered = sorted(role_descriptors)
+    if len(ordered) <= per_binding:
+        return ordered
+    by_columns = defaultdict(list)
+    for item in ordered:
+        by_columns[item[2]].append(item)
+    groups = [items[:per_binding] for _, items in sorted(by_columns.items())]
+    selected = []
+    for depth in range(per_binding):
+        for group in groups:
+            if depth < len(group):
+                selected.append(group[depth])
+                if len(selected) >= max_total:
+                    return sorted(selected)
+    return sorted(selected)
+
+
 def _family_row(f):
     contract = overlap_identity_contract(f.definition)
     bindings = sorted(f.by_source)
@@ -59,7 +77,7 @@ def _family_row(f):
         'key_filter': _filter(f.observations), 'alias_filter': _filter(digest(cell, label) for cell, label, _ in aliases),
         'witness_count': sum(len(peers) for roles in f.member_roles.values() for peers in roles.values()),
         'problems': sorted(f.problems), 'property_names': sorted(f.property_names)[:32],
-        'role_descriptors': sorted(f.role_descriptors)[:16],
+        'role_descriptors': _index_role_descriptors(f.role_descriptors),
         'aliases': aliases,
         'evidence': {
             **({'source_registries': [sorted(f.source_registries.get(b, ())) for b in bindings]}

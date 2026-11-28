@@ -12,7 +12,7 @@ from lightgraph.errors import LightGraphError
 from lightgraph.runtime.config import EntityFusionRule, FusionPolicyConfig, MergePolicyConfig
 from lightgraph.source_values import identity_cell
 
-from .hierarchy_observations import observation_scope
+from .hierarchy_observations import _predicate_terms, observation_scope
 from .identity_authority import _shared_proofs, source_address
 from .observed_identity import _dictionary_binding, _node_evidence
 from .source_namespaces import source_namespace
@@ -57,9 +57,30 @@ class _Family:
     def names(self):
         return tuple(self.definition.get('key_names') or ())
 
-    def descriptor(self):
+    def descriptor(self, *, preferred_columns=None):
+        ordered = sorted(self.role_descriptors)
+        if len(ordered) > 16:
+            if preferred_columns is not None:
+                matching = [item for item in ordered if item[2] == preferred_columns]
+                others = [item for item in ordered if item[2] != preferred_columns]
+                ordered = sorted(matching[:16] + others[:max(0, 16 - len(matching))])
+            else:
+                by_columns = defaultdict(list)
+                for item in ordered:
+                    by_columns[item[2]].append(item)
+                groups = [items for _, items in sorted(by_columns.items())]
+                selected = []
+                for depth in range(16):
+                    for group in groups:
+                        if depth < len(group):
+                            selected.append(group[depth])
+                            if len(selected) >= 16:
+                                break
+                    if len(selected) >= 16:
+                        break
+                ordered = sorted(selected)
         roles = [{'relation_type': relation, 'end': end, 'key_columns': list(columns),
-                  'opposite_key_columns': list(peer)} for relation, end, columns, peer in sorted(self.role_descriptors)[:16]]
+                  'opposite_key_columns': list(peer)} for relation, end, columns, peer in ordered]
         return {'contributor_id': self.owner, 'type': self.name, 'key_names': list(self.names),
                 'property_names': sorted(self.property_names)[:32], 'roles': roles}
 
@@ -186,7 +207,8 @@ def _read_edges(owner, graph, families, identities, relations):
                 continue
             semantics = relation.get('original_type') or relation['type']
             witness = support.get('source_row_witness') or {}
-            role = digest(semantics, address, left, right, prov.get('predicate'), prov.get('constant_properties'),
+            edge_predicate = _predicate_terms(prov.get('predicate'), {*left, *right})
+            role = digest(semantics, address, left, right, edge_predicate, prov.get('constant_properties'),
                           observation_scope(support), witness.get('snapshot'))
             for end, family in family_ends:
                 family.roles.add((end, role))
@@ -610,7 +632,8 @@ def analyze_indexed_overlap_patterns(contributors, policy=None):
             candidates = [] if reasons else _rules(group, basis, key)
             if not candidates and not reasons:
                 reasons.append('rule_representation_limit')
-            record('entity', basis, [f.descriptor() for f in group], [_public_source(b) for b in bindings],
+            preferred = key[-1] if basis == 'same_physical_key' else None
+            record('entity', basis, [f.descriptor(preferred_columns=preferred) for f in group], [_public_source(b) for b in bindings],
                    len(overlap), reasons, candidates, pair_coverage=coverage, evidenced_families=group,
                    witness_binding=None if basis == 'same_logical_keys_across_sources' else _public_source(key))
     aliases, alias_stats = _cross_table_name_candidates(families, family_rows, counts, inputs_by_owner)

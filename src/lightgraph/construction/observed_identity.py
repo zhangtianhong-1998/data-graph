@@ -12,6 +12,7 @@ from lightgraph.contracts import canonical, digest
 from lightgraph.source_values import identity_cell
 from .contexts import business_context_identity
 from .fusion import definition_contract
+from .hierarchy_observations import _predicate_terms
 
 
 @dataclass
@@ -71,8 +72,11 @@ def _relation_roles(graph):
             source = _physical_source(prov)
             if not source or not prov.get('source_key_columns') or not prov.get('target_key_columns'):
                 continue
+            edge_predicate = _predicate_terms(
+                prov.get('predicate'), {*prov['source_key_columns'], *prov['target_key_columns']}
+            )
             signature = [source, prov['source_key_columns'], prov['target_key_columns'],
-                         prov.get('predicate'), prov.get('constant_properties'),
+                         edge_predicate, prov.get('constant_properties'),
                          prov.get('source_lookup'), prov.get('target_lookup')]
             for end in ('source', 'target'):
                 entity_type = relation.get(end + '_type')
@@ -132,8 +136,11 @@ def _node_evidence(node, definition, *, dictionary=None, reciprocal_names=False,
             if name_values is None:
                 return None
             binding_parts = [source, columns, [name for name, _ in name_values]]
-        binding = digest(*binding_parts, prov.get('predicate'), prov.get('constant_properties'),
-                         prov.get('scope_columns', []))
+        nonnull = set(columns)
+        if label_column and (support.get('observed_label') or support.get('label')):
+            nonnull.add(label_column)
+        binding = digest(*binding_parts, _predicate_terms(prov.get('predicate'), nonnull),
+                         prov.get('constant_properties'), prov.get('scope_columns', []))
         facts = business_context_identity(support)
         if definition.get('identity_scope') == 'scoped':
             if facts['status'] != 'scoped' or any(
@@ -280,8 +287,10 @@ def _unique_row_projection(node, definition, address):
                 or support.get('identity_decision_refs') or prov.get('constant_properties')):
             return None
         context = business_context_identity(support)
+        nonnull = set(prov.get('key_columns') or address[-1]) | {primary}
         observations.add(canonical([support['scope_ref'], sorted(support.get('required_scope_refs', [])),
-                                    context, prov.get('predicate'), sorted(prov.get('scope_columns', [])), primary, label]))
+                                    context, _predicate_terms(prov.get('predicate'), nonnull),
+                                    sorted(prov.get('scope_columns', [])), primary, label]))
         row = support.get('row_context') or {}
         columns = prov.get('property_columns') or {}
         actual = list((row.get('values') or {}).items())

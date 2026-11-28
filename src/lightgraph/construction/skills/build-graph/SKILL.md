@@ -47,7 +47,7 @@ description: 根据用户目的，从授权事实数据、元数据和补充文�
 
 区分对象身份、事实适用范围和抽取来源。资料属于某个项目或收藏，并不自动决定其中每条陈述的适用范围。用户或来源没有指定范围时保留这个缺口。
 
-声明跨来源共享对象时，实体定义使用 `identity_scope: global`，填写有依据的 `identity_domain` 和工具实际签发的 `identity_evidence_refs`；普通中文或非结构化数据说明文档明确描述共享编码体系、角色映射或本地限定时，在实体定义中补充 `identity_explanations`（字段格式见 `reference:mapping-guide.md`）。编号只在特定范围内唯一时，使用 `identity_scope: scoped`，将决定身份的限定列纳入完整 `key_names`、映射 `key_columns` 和关系端点键，并在 `identity_context_keys` 中列明这些键。同名或编号尾段相同只能作为核对线索。不同单元或草稿建模同一对象时，逻辑键名统一使用简洁规范的 `lower_snake_case`（如 `code` 或业务编码逻辑名），编码列已唯一标识成员时不要把名称列塞入复合键 `key_columns`，而应把名称保留在 `label_column`。
+声明跨来源共享对象时，实体定义使用 `identity_scope: global`，填写有依据的 `identity_domain` 和工具实际签发的 `identity_evidence_refs`；普通中文或非结构化数据说明文档明确描述共享编码体系、角色映射或本地限定时，在实体定义中补充 `identity_explanations`（字段格式见 `reference:mapping-guide.md`）。编号只在特定范围内唯一时，使用 `identity_scope: scoped`，将决定身份的限定列纳入完整 `key_names`、映射 `key_columns` 和关系端点键，并在 `identity_context_keys` 中列明这些键。同名或编号尾段相同只能作为核对线索。不同单元或草稿建模同一对象时，`key_names` 统一采用规范 `lower_snake_case`：单列主键直接使用物理编码列名（如 `country_code`、`office_code`），多层级列共用同一实体时使用去层级后的业务编码名（如 `report_item_code`），除非物理列名本身就是 `code`，否则不要退化为笼统的裸 `code`；编码列已唯一标识成员时不要把名称列塞入复合键 `key_columns`，而应把名称保留在 `label_column`。父子层级关系应明确填写 `hierarchy_orientation`（`parent_to_child` 或 `child_to_parent`），普通非层级关联填写 `none`。
 
 若多个来源通过已声明的外键引用同一张授权字典，且目标需要确认成员身份，可在相同适用范围内投影涉及的字典成员，保留完整、有序的唯一键，供合并时和各来源的外键值核对。
 
@@ -82,7 +82,7 @@ description: 根据用户目的，从授权事实数据、元数据和补充文�
 
 草稿填写 `draft_id`、`purpose`、`entities`、`relations`、`evidence_refs`、`rationale`，精确可用字段以 `draft_schema` 为准。只引用工具实际签发且适用的证据。编码和标识保留为字符串；YAML 不使用重复键或自定义标签。
 
-`unresolved` 只记录当前用户目标尚未满足的要求，目标已覆盖就留空。已经落实的选择写入 `decisions`；可选扩展、上游清洗或后续显示优化写入 `suggestions`。不要为了填写字段编造未决问题，也不要把文档已明确且已执行的做法再次列为待确认。旧草稿的未决必须根据目标和证据逐条判断，不能直接清空。
+`unresolved` 只记录当前用户目标尚未满足的要求，目标已覆盖就留空。已经落实的选择写入 `decisions`；可选扩展、上游清洗或后续显示优化写入 `suggestions`。不要为了填写字段编造未决问题，也不要把文档已明确且已执行的做法再次列为待确认；例如因业务或数据未证明无环而主动设置 `acyclic: false` 属于建模选择（记入 `decisions`），除非用户明确要求全图无环证明，否则不作为未决阻塞项。不要保存仅用于试写语法的临时探查草稿或遗留废弃的未发布 `draft_id`，修订应直接在原 `draft_id` 上覆盖更新。旧草稿的未决必须根据目标和证据逐条判断，不能直接清空。
 
 草稿和工作区是可恢复的成果；压缩后的自然语言摘要不替代它们。大草稿用 `read_material(name="draft:<draft_id>", page=0)` 分页重读，完整诊断用 `validation:<draft_id>`。按 `next_page` 继续，只有 `material_revision` 相同的内容才能拼接。验证回复中的 `diagnostic_count` 是总数，首批诊断不等于全部问题。当前草稿已落盘时优先读材料，不要靠反复搜索会话重新拼写整个 YAML；查询历史只用于寻找尚未保存的推理线索。需要旧证据时读取已保存材料，不凭记忆补造引用、字段或验证结论。不得清理工作区或历史运行内容。
 

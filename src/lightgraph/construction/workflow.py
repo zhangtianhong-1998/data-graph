@@ -322,17 +322,26 @@ def build_unit_config(
     shared_tables = _shared_unit_tables(project_config, unit)
     shared_note = (
         f'\n\n### 跨单元共享来源约定\n\n以下来源/表同时被其他并行单元读取：{", ".join(shared_tables)}。'
-        '在这些共享来源上建模时，请直接以物理编码列的规范 `lower_snake_case` 命名 `key_names`，'
-        '避免自定义别名键名，并确保同名实体保持一致的 `key_names`、`identity_scope` 与 `applicability`。'
+        '在这些共享来源上建模时，请严格保持跨单元一致：\n'
+        '- 单列主键直接使用物理编码列的规范 `lower_snake_case` 作为 `key_names`；'
+        '多层级共用的同类成员（如 `L1..L5` 编码列）使用去掉层级编号后的规范业务编码名（如 `report_item_code` 或 `<实体族>_code`），'
+        '禁止退化为笼统的 `code`（除非物理列名本身就是 `code`）。\n'
+        '- 共享层级/维度表上的父子关系必须明确填写 `hierarchy_orientation`（`parent_to_child` 或 `child_to_parent`），普通非层级关联填写 `none`。\n'
+        '- 通用主数据/维度/层级成员请明确填写 `applicability: {status: global}`（限定范围时填 `scoped` 及限定列/值），避免无故留空为 `unknown`；'
+        '同一共享来源内跨层复用的层级实体，如有来源探针或文档依据，应填写 `identity_scope: global`、`identity_domain` 与 `identity_evidence_refs`。\n'
+        '- `context_columns` 仅保留真正还原行路径或决定行语义的必要列，不要随意混入无关列，避免同源多单元观察上下文不一致。'
         if shared_tables else ''
     )
     extra_parts.append(
         f'## 并行单元上下文 ({unit_heading})\n\n'
         '仅处理当前单元已授权来源与表范围，产出的增量图将由项目融合器统一归并。'
-        '请保持跨单元契约一致性：逻辑键名统一使用规范的 `lower_snake_case`（如 `code` 或业务编码逻辑名），'
-        '单列编码已能唯一标识实体时勿将名称列塞入复合键 `key_columns`（名称保留在 `label_column`）；'
-        '如文档明确说明共享编码体系或适用范围，请规范填写 `identity_scope`、`identity_domain`、'
-        '`identity_evidence_refs`、`identity_explanations` 与 `applicability`。'
+        '请保持跨单元契约一致性：\n'
+        '- `key_names` 必须采用规范 `lower_snake_case`：单列主键直接使用物理编码列名（如 `country_code`、`office_code`），'
+        '多层级列共用同一实体时使用去层级后的业务编码名（如 `report_item_code`），禁止笼统命名为裸 `code`（除非物理列名本身就是 `code`）。\n'
+        '- 单列编码已能唯一标识实体时勿将名称列塞入复合键 `key_columns`（名称保留在 `label_column`）。\n'
+        '- 父子层级关系请明确声明 `hierarchy_orientation`（`parent_to_child`/`child_to_parent`），普通关联声明 `none`；'
+        '资料或表结构支持通用/限定适用范围时明确填写 `applicability`（`global`/`scoped`），'
+        '如文档或共享来源证据明确说明共享编码体系，请规范填写 `identity_scope`、`identity_domain`、`identity_evidence_refs` 与 `identity_explanations`。'
         + shared_note
     )
     if unit.goal_markdown and unit.goal_markdown.strip():
@@ -647,7 +656,7 @@ def deterministic_stage_inputs(input_ids, *, units, merged, merge_nodes, plan, a
         visited.add(key)
         record = artifacts.get(key, {})
         if key in units:
-            if (not record.get('artifact_id') or record.get('status') != 'completed'
+            if (not record.get('artifact_id') or record.get('status') not in {'completed', 'completed_with_gaps'}
                     or record.get('coverage') == 'incomplete' or record.get('inherited_grants')
                     or units[key]['graph'].get('extends_base_graph')):
                 return direct
@@ -657,7 +666,8 @@ def deterministic_stage_inputs(input_ids, *, units, merged, merge_nodes, plan, a
         parents = plan.merge_inputs.get(key, [])
         if (node is None or node.merge_mode != 'deterministic' or not parents
                 or effective_merge_policy(config, node) != policy
-                or not record.get('artifact_id') or record.get('status') != 'completed' or record.get('coverage') != 'complete'
+                or not record.get('artifact_id') or record.get('status') not in {'completed', 'completed_with_gaps'}
+                or record.get('coverage') != 'complete'
                 or record.get('inherited_grants') or record.get('recomposed_from')
                 or record.get('upstream_artifacts') != [artifacts.get(p, {}).get('artifact_id') for p in parents]):
             return direct

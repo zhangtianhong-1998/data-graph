@@ -783,3 +783,157 @@ def test_long_workspace_paths_work_across_workspace_analytics_retention_and_retr
     if retriever._build_lease is not None:
         retriever._build_lease.close()
     assert delete_project(ws, 'deep_p')['deleted'] is True
+
+
+def test_hub_entity_with_over_16_roles_preserves_shared_sheet_binding_for_propose():
+    from lightgraph.construction.overlap_patterns import analyze_indexed_overlap_patterns, build_overlap_index
+    from lightgraph.construction.overlap_review import _structural_profile
+
+    sheet = {'source_id': 's_excel', 'schema': 'public', 'table': 'Sheet1'}
+
+    def make_unit(owner, key_name, rel_name, extra_sql_roles):
+        dm = {'source_id': 'gauss', 'schema': 'dm_fin', 'table': f'dm_fin_{owner}'}
+        parent_supports = [{
+            'scope_ref': 'public', 'label': '营业收入', 'properties': {},
+            'business_context': {'status': 'global', 'dimensions': {}},
+            'provenance': {'source': sheet, 'key_columns': ['REPORT_ITEM_L1_CODE'],
+                           'label_column': 'REPORT_ITEM_L1_CN_NAME'},
+        }]
+        if extra_sql_roles:
+            parent_supports.append({
+                'scope_ref': 'public', 'label': '营业收入', 'properties': {},
+                'business_context': {'status': 'global', 'dimensions': {}},
+                'provenance': {'source': dm, 'key_columns': ['metriccode'], 'label_column': 'metricname'},
+            })
+        child_supports = [{
+            'scope_ref': 'public', 'label': '主营业务收入', 'properties': {},
+            'business_context': {'status': 'global', 'dimensions': {}},
+            'provenance': {'source': sheet, 'key_columns': ['REPORT_ITEM_L2_CODE'],
+                           'label_column': 'REPORT_ITEM_L2_CN_NAME'},
+        }]
+        nodes = [
+            {'id': f'{owner}_p', 'type': 'indicator_member', 'identity': {key_name: 'PL_100'},
+             'identity_types': {key_name: 'text'}, 'label': '营业收入', 'properties': {},
+             'supports': parent_supports},
+            {'id': f'{owner}_c', 'type': 'indicator_member', 'identity': {key_name: 'PL_101'},
+             'identity_types': {key_name: 'text'}, 'label': '主营业务收入', 'properties': {},
+             'supports': child_supports},
+        ]
+        edges = [{
+            'id': f'{owner}_hier', 'type': rel_name, 'source': f'{owner}_p', 'target': f'{owner}_c',
+            'supports': [{'scope_ref': 'public', 'provenance': {
+                'source': sheet, 'source_key_columns': ['REPORT_ITEM_L1_CODE'],
+                'target_key_columns': ['REPORT_ITEM_L2_CODE']}}],
+        }]
+        rel_defs = [{'type': rel_name, 'source_type': 'indicator_member', 'target_type': 'indicator_member'}]
+        ent_defs = [{'type': 'indicator_member', 'key_names': [key_name], 'identity_scope': 'unknown'}]
+        for i in range(extra_sql_roles):
+            dim_type = f'aa_dim_{i:02d}'
+            rel_type = f'aa_rel_{i:02d}'
+            dim_col = f'dim_{i:02d}_code'
+            ent_defs.append({'type': dim_type, 'key_names': [dim_col], 'identity_scope': 'unknown'})
+            rel_defs.append({'type': rel_type, 'source_type': 'indicator_member', 'target_type': dim_type})
+            nodes.append({
+                'id': f'{owner}_d{i}', 'type': dim_type, 'identity': {dim_col: f'D{i}'},
+                'identity_types': {dim_col: 'text'}, 'label': f'维度{i}', 'properties': {},
+                'supports': [{'scope_ref': 'public', 'label': f'维度{i}', 'properties': {},
+                              'business_context': {'status': 'global', 'dimensions': {}},
+                              'provenance': {'source': dm, 'key_columns': [dim_col],
+                                             'label_column': f'dim_{i:02d}_name'}}],
+            })
+            edges.append({
+                'id': f'{owner}_re{i}', 'type': rel_type, 'source': f'{owner}_p', 'target': f'{owner}_d{i}',
+                'supports': [{'scope_ref': 'public', 'provenance': {
+                    'source': dm, 'source_key_columns': ['metriccode'], 'target_key_columns': [dim_col]}}],
+            })
+        return {'kind': 'unit', 'source_namespace': 'ws1', 'contributor_id': owner,
+                'graph': {'access_fingerprint': f'fp_{owner}', 'status': 'published',
+                          'support_visibility_version': 1, 'nodes': nodes, 'edges': edges,
+                          'definitions': {'entities': ent_defs, 'relations': rel_defs}}}
+
+    branches = [make_unit('e2', 'code', 'indicator_has_sub_indicator', 20),
+                make_unit('e3', 'indicator_code', 'indicator_hierarchy', 0)]
+    indexed = [{k: v for k, v in b.items() if k != 'graph'} | {'overlap_index': build_overlap_index(b)}
+               for b in branches]
+    analysis = analyze_indexed_overlap_patterns(indexed)
+    card = next(p for p in analysis.patterns
+                if p['basis'] == 'same_physical_key'
+                and p['witness_binding']['key_columns'] == ['REPORT_ITEM_L1_CODE'])
+    profile = _structural_profile(card)
+    assert 'propose' in profile['review_actions'], profile
+    assert {c['member_index'] for c in profile['binding_choices']} == {0, 1}
+    assert any(r['key_columns'] == ['REPORT_ITEM_L1_CODE'] and r['source_indexes']
+               for r in card['members'][0]['roles'])
+    assert card['binding_comparisons']['rows']
+
+
+def test_observed_identity_normalizes_tautological_key_is_not_null_predicate_only():
+    from lightgraph.tests.test_observed_identity import projection, unit as obs_unit
+
+    left = obs_unit('e2', projection())
+    right = obs_unit('e3', projection('经营指标', '指标编码'))
+    for node in left['graph']['nodes']:
+        node['supports'][0]['provenance']['predicate'] = {
+            'all': [{'op': 'is_not_null', 'column': 'REPORT_CODE'},
+                    {'op': 'not_null', 'column': 'REPORT_NAME'}],
+        }
+    left['graph']['edges'][0]['supports'][0]['provenance']['predicate'] = {
+        'op': 'is_not_null', 'column': 'PARENT_CODE',
+    }
+    merged = merge_construction_graphs([left, right])
+    assert len(merged['nodes']) == 2 and len(merged['edges']) == 1
+    assert merged['fusion_diagnostics']['source_replay_collapsed_nodes'] == 2
+
+    # Non-key predicate must still prevent source replay collapse.
+    filtered = deepcopy(left)
+    for node in filtered['graph']['nodes']:
+        node['supports'][0]['provenance']['predicate'] = {'op': 'is_not_null', 'column': 'extra_flag'}
+    separated = merge_construction_graphs([filtered, right])
+    assert len(separated['nodes']) == 4
+
+
+def test_deterministic_stage_inputs_reuses_completed_with_gaps_complete_checkpoints(tmp_path):
+    from lightgraph.construction.checkpoints import commit_checkpoint, load_checkpoint
+    from lightgraph.construction.workflow import deterministic_stage_inputs, effective_merge_policy, resolve_workflow_plan
+    from lightgraph.tests.test_source_hierarchy_replays import contributor as hier_contributor, draft_graph
+
+    units = {name: hier_contributor(name, draft_graph(i, kind)) for i, (name, kind) in enumerate(
+        [('one', 'Entry'), ('two', 'Term'), ('three', 'Subject')], start=1)}
+    parents = {'ab': ['one', 'two'], 'bc': ['two', 'three'], 'root': ['ab', 'bc']}
+    config = RunConfig(
+        sources=[{'id': 'file', 'kind': 'excel_workbook', 'path': 'unused.xlsx'}],
+        workflow={'enabled': True, 'units': [{'unit_id': name, 'source_ids': ['file']} for name in units],
+                  'merge_nodes': [{'node_id': name} for name in parents],
+                  'edges': [{'edge_id': name + parent, 'source': parent, 'target': name}
+                            for name, incoming in parents.items() for parent in incoming]},
+    )
+    run_id = 'run_' + '2' * 24
+    plan = resolve_workflow_plan(config.workflow)
+    nodes = {n.node_id: n for n in config.workflow.merge_nodes}
+    policy = effective_merge_policy(config)
+    artifacts = {name: commit_checkpoint(tmp_path, run_id, name, u, input_digest=name, graph_kind='node_delta')
+                 for name, u in units.items()}
+    loaded_units = {name: load_checkpoint(tmp_path, record) for name, record in artifacts.items()}
+    artifacts['one']['status'] = 'completed_with_gaps'
+    merged = {}
+    for name in ['ab', 'bc']:
+        stage_inputs = [loaded_units[parent] for parent in parents[name]]
+        stage = {'contributor_id': name, 'kind': 'merged',
+                 'graph': merge_construction_graphs(stage_inputs, merge_policy=policy)}
+        artifacts[name] = commit_checkpoint(
+            tmp_path, run_id, name, stage, input_digest=name,
+            upstream_artifacts=[artifacts[parent]['artifact_id'] for parent in parents[name]],
+        )
+        merged[name] = load_checkpoint(tmp_path, artifacts[name])
+    artifacts['ab']['status'] = 'completed_with_gaps'
+    reused = deterministic_stage_inputs(
+        parents['root'], units=loaded_units, merged=merged, merge_nodes=nodes,
+        plan=plan, artifacts=artifacts, policy=policy, config=config, bases=[],
+    )
+    assert {c['contributor_id'] for c in reused} == set(units)
+    artifacts['ab']['coverage'] = 'incomplete'
+    fallback = deterministic_stage_inputs(
+        parents['root'], units=loaded_units, merged=merged, merge_nodes=nodes,
+        plan=plan, artifacts=artifacts, policy=policy, config=config, bases=[],
+    )
+    assert fallback == [merged['ab'], merged['bc']]
