@@ -78,7 +78,7 @@ def explanation_claims(entity, mapping, table, applicable, cited):
     A model supplies field binding and an exact quote, never a trusted marker.
     Unknown wording remains reviewable; it does not acquire identity authority.
     """
-    from .identity_contract import _concerns_authored_key
+    from .identity_contract import _concerns_authored_key, _strip_neutral_schema_rows
 
     address = (mapping.source_id, mapping.schema_name, mapping.table)
     all_sections = {ref: section for group in applicable for ref, section in group.items()}
@@ -110,13 +110,15 @@ def explanation_claims(entity, mapping, table, applicable, cited):
               or (_VERSION.search(proposed.quote) and not proposed.version)):
             reason = 'identity_explanation_version_unverified'
         if not reason:
+            target_cols = set(mapping.key_columns)
             for other in all_sections.values():
                 relevant = _concerns_authored_key(other, (*entity.key_names, *mapping.key_columns,
-                                                          entity.identity_domain), table)
-                if relevant and _LOCAL.search(other['text']):
+                                                          entity.identity_domain), table, target_columns=target_cols)
+                cleaned = _strip_neutral_schema_rows(other['text'], table) if relevant else ''
+                if relevant and _LOCAL.search(cleaned):
                     reason = 'identity_material_conflict'
                     break
-                if relevant and _QUALIFIED.search(other['text']):
+                if relevant and _QUALIFIED.search(cleaned):
                     reason = 'identity_material_requires_semantic_review'
                     break
                 for binding in other.get('identity_bindings', ()):

@@ -328,7 +328,8 @@ def build_unit_config(
         '禁止退化为笼统的 `code`（除非物理列名本身就是 `code`）。\n'
         '- 共享层级/维度表上的父子关系必须明确填写 `hierarchy_orientation`（`parent_to_child` 或 `child_to_parent`），普通非层级关联填写 `none`。\n'
         '- 通用主数据/维度/层级成员请明确填写 `applicability: {status: global}`（限定范围时填 `scoped` 及限定列/值），避免无故留空为 `unknown`；'
-        '同一共享来源内跨层复用的层级实体，如有来源探针或文档依据，应填写 `identity_scope: global`、`identity_domain` 与 `identity_evidence_refs`。\n'
+        '若无跨表共享编码文档证明跨表同一身份，共享单表实体保持默认 `identity_scope: unknown`（由同源确定性重放自动对齐，勿强行声明跨表 `global` 触发未证实冲突）；'
+        '仅当共享文档或纯单源层级探针明确支持跨源/跨层统一域时，才填写 `identity_scope: global`、`identity_domain` 与 `identity_evidence_refs`。\n'
         '- `context_columns` 仅保留真正还原行路径或决定行语义的必要列，不要随意混入无关列，避免同源多单元观察上下文不一致。'
         if shared_tables else ''
     )

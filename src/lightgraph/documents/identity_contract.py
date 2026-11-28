@@ -89,25 +89,80 @@ def _field_note(sentence, section, table, col, domain):
     return bool(words(col) <= content and words(table.name) <= content and content <= vocabulary)
 
 
-def _concerns_authored_key(section, key_terms, table):
-    """Table-wide applicability does not bind every paragraph to every key.
+_PROSE_RESTRICTION = re.compile(
+    r'(?:各自|独立|本地|分别|自管|自行|单独).{0,18}(?:编号|编码|标识|号码)|'
+    r'(?:编号|编码|标识|号码).{0,18}(?:各自|独立|本地|自管|自行|单独)|'
+    r'仅在.{0,24}唯一|(?:不(?!同(?:系统|来源|表|数据源|数据表))|不能|不可|并非|无法|不得).{0,12}(?:同一|相同|共享|合并|唯一)|'
+    r'(?:联合|组合|共同|配合).{0,16}(?:唯一|区分|确定|标识)|'
+    r'需要.{0,20}(?:区分|共同确定|联合唯一)|'
+    r'除.{0,30}外|但是|只在|限于|前提|条件|例外|尚未|尚不|未(?:确认|验证|核实|保证|确保|证明|统一|实现)|'
+    r'待(?:确认|验证|核实)|是否|不清楚|不确定|'
+    r'\b(?:independent|local|own)\s+(?:identifiers?|codes?|numbers?|numbering)\b|'
+    r'\b(?:not|never)\b.{0,32}\b(?:same|shared|share|unique)\b|'
+    r'\b(?:needs?|requires?)\b.{0,40}\b(?:distinguish|uniquely\s+identify|identify|disambiguate)\b|'
+    r'\b(?:except|unless|only\s+within|conditional|unconfirmed|unverified)\b',
+    re.I,
+)
 
-    A schema row containing only physical names and storage types is metadata.
-    Unscoped numbering rules can apply to every key, even without naming a column.
-    This check only identifies potential contrary evidence; it cannot grant identity.
-    """
-    if section['scope'].get('columns'):
-        return True
+_SCHEMA_TABLE_HEADER = re.compile(
+    r'^(?:字段名?|列名?|物理列|名称|属性|类型|数据类型|字段类型|说明|中文名?|中文说明|业务含义|含义|描述|备注|是否为空|可空|主键|示例|样例|column|field|name|type|data_type|comment|description|nullable|example)$',
+    re.I,
+)
+
+
+def _strip_neutral_schema_rows(text, table):
+    """Ignore neutral Markdown schema/dictionary rows (including Chinese comments), while keeping any restriction."""
     fields = {c.casefold() for c in table.column_names}
     types = {c.data_type.casefold() for c in table.columns}
     lines = []
-    for line in section['text'].splitlines():
-        cells = [v.strip().strip('`').casefold() for v in line.strip().strip('|').split('|')]
-        if (len(cells) > 1 and fields.intersection(cells) and types.intersection(cells)
-                and all(v in fields or v in types or v.isdecimal() for v in cells)):
-            continue
+    for line in text.splitlines():
+        stripped = line.strip()
+        if '|' in stripped:
+            cells = [v.strip().strip('`') for v in stripped.strip('|').split('|')]
+            folded = [v.casefold() for v in cells]
+            if len(cells) > 1:
+                if all(re.fullmatch(r':?-{2,}:?', c) or not c for c in cells):
+                    continue
+                if all(_SCHEMA_TABLE_HEADER.match(c) or not c for c in cells):
+                    continue
+                if (fields.intersection(folded) and types.intersection(folded)
+                        and all(v in fields or v in types or v.isdecimal() for v in folded)):
+                    continue
+                if (fields.intersection(folded)
+                        and (types.intersection(folded)
+                             or any(re.fullmatch(r'(?:var)?char(?:\(\d+\))?|text|int(?:eger|4|8)?|bigint|smallint|numeric(?:\([\d,]+\))?|decimal(?:\([\d,]+\))?|float\d?|double|bool(?:ean)?|date|timestamp.*|string|number', v)
+                                    for v in folded))
+                        and not _PROSE_RESTRICTION.search(line)):
+                    continue
         lines.append(line)
-    text = '\n'.join(lines)
+    return '\n'.join(lines)
+
+
+def _concerns_authored_key(section, key_terms, table, *, target_columns=None):
+    """Table-wide applicability does not bind every paragraph to every key.
+
+    A neutral schema row in a field list is metadata, even with Chinese comments.
+    Unscoped numbering rules can apply to every key, even without naming a column.
+    This check only identifies potential contrary evidence; it cannot grant identity.
+    """
+    text = _strip_neutral_schema_rows(section['text'], table)
+    if section['scope'].get('columns'):
+        if target_columns is not None and not set(section['scope']['columns']).intersection(target_columns):
+            return False
+        return bool(text.strip())
+    # A structured identity_contract section bound exclusively to other columns
+    # on this table only concerns our key if its prose actually mentions it or
+    # states a table-wide restriction.
+    bindings = section.get('identity_bindings') or ()
+    address = f'{table.source_id}:{table.schema_name}.{table.name}'
+    if target_columns is not None and bindings:
+        table_bindings = [b for b in bindings if b.get('table') == address]
+        if table_bindings and all(not set(b.get('key_columns') or ()).intersection(target_columns)
+                                  for b in table_bindings):
+            for term in key_terms:
+                if term and re.search(rf'(?<![a-z0-9_]){re.escape(term)}(?![a-z0-9_])', text, re.I):
+                    return True
+            return bool(_PROSE_RESTRICTION.search(text))
     for term in key_terms:
         if term and re.search(rf'(?<![a-z0-9_]){re.escape(term)}(?![a-z0-9_])', text, re.I):
             return True
@@ -160,7 +215,12 @@ def shared_key_claim_refs(domain, names, columns, table, applicable, cited):
     for ref, section in all_sections.items():
         if ref in declared_sections:
             continue
-        if proven and not _concerns_authored_key(section, (*names, *columns, domain), table):
+        if proven:
+            if not _concerns_authored_key(section, (*names, *columns, domain), table, target_columns=target):
+                continue
+            cleaned = _strip_neutral_schema_rows(section['text'], table)
+            if _PROSE_RESTRICTION.search(cleaned):
+                return set()
             continue
         if len(columns) != 1:
             # A second applicable prose clause cannot resolve a composite key.

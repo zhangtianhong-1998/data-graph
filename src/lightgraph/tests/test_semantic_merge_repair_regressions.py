@@ -937,3 +937,172 @@ def test_deterministic_stage_inputs_reuses_completed_with_gaps_complete_checkpoi
         plan=plan, artifacts=artifacts, policy=policy, config=config, bases=[],
     )
     assert fallback == [merged['ab'], merged['bc']]
+
+
+def test_chinese_field_dictionary_and_sibling_sections_do_not_veto_shared_identity(tmp_path):
+    from lightgraph.contracts import ColumnSpec, TableSpec
+    from lightgraph.documents import DocumentCorpus, load_documents
+
+    dm_table = TableSpec(
+        source_id='test', schema='dm_fin', name='dma_fin_target_region_adv_f',
+        columns=[ColumnSpec(name='metriccode', data_type='varchar'),
+                 ColumnSpec(name='metricname', data_type='varchar'),
+                 ColumnSpec(name='period_id', data_type='varchar')],
+    )
+    sheet_table = TableSpec(
+        source_id='s_excel', schema='public', name='Sheet1',
+        columns=[ColumnSpec(name='REPORT_ITEM_L1_CODE', data_type='text'),
+                 ColumnSpec(name='REPORT_ITEM_L2_CODE', data_type='text')],
+    )
+    existing_doc = tmp_path / 'single_table.md'
+    existing_doc.write_text(
+        '---\nid: single_table\npurpose: data_description\n'
+        'scope: {tables: [test.dm_fin.dma_fin_target_region_adv_f]}\n---\n'
+        '# 字段列表\n'
+        '| 字段名 | 类型 | 中文说明 | 可空 |\n'
+        '| --- | --- | --- | --- |\n'
+        '| metriccode | varchar | 指标编码，例如 PL_91750 | 否 |\n'
+        '| metricname | varchar | 指标中文名称 | 否 |\n'
+        '# 字段引用关系\n'
+        '字段 metriccode 关联指标树 Sheet1 的 REPORT_ITEM_L1_CODE。\n',
+        encoding='utf-8',
+    )
+    shared_doc = tmp_path / 'shared_metrics.md'
+    shared_doc.write_text(
+        '---\nid: shared_metrics\npurpose: data_description\n'
+        'scope: {tables: [test.dm_fin.dma_fin_target_region_adv_f, s_excel.public.Sheet1]}\n'
+        'sections:\n'
+        '  指标编码口径:\n'
+        '    scope: {tables: [test.dm_fin.dma_fin_target_region_adv_f]}\n'
+        '    identity_contract:\n'
+        '      domain: ICT指标目录\n'
+        '      scope: shared\n'
+        '      key_columns: {"test:dm_fin.dma_fin_target_region_adv_f": [metriccode]}\n'
+        '  指标树一级编码:\n'
+        '    scope: {tables: [s_excel.public.Sheet1], columns: [REPORT_ITEM_L1_CODE]}\n'
+        '    identity_contract:\n'
+        '      domain: ICT指标目录\n'
+        '      scope: shared\n'
+        '      key_columns: {"s_excel:public.Sheet1": [REPORT_ITEM_L1_CODE]}\n'
+        '  指标树二级编码:\n'
+        '    scope: {tables: [s_excel.public.Sheet1], columns: [REPORT_ITEM_L2_CODE]}\n'
+        '    identity_contract:\n'
+        '      domain: ICT指标目录\n'
+        '      scope: shared\n'
+        '      key_columns: {"s_excel:public.Sheet1": [REPORT_ITEM_L2_CODE]}\n'
+        '---\n'
+        '# 指标编码口径\n'
+        '字段 metriccode 对应指标编码。ICT指标目录由各系统共享同一编码体系，在全集团唯一，相同编码代表同一指标。\n'
+        '# 指标树一级编码\n'
+        '一级指标编号，同一指标目录全局唯一主键。\n'
+        '# 指标树二级编码\n'
+        '二级指标编号，同一指标目录全局唯一主键。\n',
+        encoding='utf-8',
+    )
+    corpus = DocumentCorpus(load_documents([str(existing_doc), str(shared_doc)])).bind_catalog([dm_table, sheet_table])
+    dm_sections = {s['section_id']: s for s in corpus.context_for(dm_table, ['metriccode'])}
+    dm_cited = {ref for ref, s in dm_sections.items() if s['heading'] == '指标编码口径'}
+    assert shared_key_claim_refs('ICT指标目录', ['metriccode'], ['metriccode'], dm_table, [dm_sections], dm_cited) == dm_cited
+
+    # Plain-Chinese identity_explanations also succeeds alongside the Chinese 字段列表 (even with '例如').
+    quote = '字段 metriccode 对应指标编码。ICT指标目录由各系统共享同一编码体系，在全集团唯一，相同编码代表同一指标。'
+    exp = type('Exp', (), {
+        'evidence_ref': next(iter(dm_cited)), 'source_id': 'test', 'schema_name': 'dm_fin',
+        'table': 'dma_fin_target_region_adv_f', 'key_columns': ['metriccode'], 'key_roles': ['指标编码'],
+        'quote': quote, 'version': None,
+    })()
+    mapping = type('M', (), {
+        'source_id': 'test', 'schema_name': 'dm_fin', 'table': 'dma_fin_target_region_adv_f',
+        'key_columns': ['metriccode'],
+    })()
+    ent = type('E', (), {
+        'type': 'indicator_member', 'key_names': ['metriccode'], 'identity_scope': 'global',
+        'identity_domain': 'ICT指标目录', 'identity_evidence_refs': list(dm_cited),
+        'identity_explanations': [exp], 'mappings': [mapping],
+    })()
+    claims, issues = explanation_claims(ent, mapping, dm_table, [dm_sections], dm_cited)
+    assert len(claims) == 1 and issues == [], (claims, issues)
+
+    # Sibling Sheet1 L1/L2 sections with normal Chinese words ('编号'/'唯一'/'主键') do not veto each other.
+    l1_sections = {s['section_id']: s for s in corpus.context_for(sheet_table, ['REPORT_ITEM_L1_CODE'])}
+    l1_cited = {ref for ref, s in l1_sections.items() if s['heading'] == '指标树一级编码'}
+    assert shared_key_claim_refs('ICT指标目录', ['report_item_code'], ['REPORT_ITEM_L1_CODE'],
+                                 sheet_table, [l1_sections], l1_cited) == l1_cited
+
+    # Genuine local restriction in an accompanying doc STILL strictly vetoes the contract.
+    conflict_doc = tmp_path / 'conflict.md'
+    conflict_doc.write_text(
+        '---\nid: conflict\npurpose: data_description\n'
+        'scope: {tables: [test.dm_fin.dma_fin_target_region_adv_f]}\n---\n'
+        '# 编码说明\nmetriccode 仅在本表独立编号，不得跨表合并。\n',
+        encoding='utf-8',
+    )
+    corpus_conflict = DocumentCorpus(load_documents([str(existing_doc), str(shared_doc), str(conflict_doc)])).bind_catalog(
+        [dm_table, sheet_table])
+    dm_conflict = {s['section_id']: s for s in corpus_conflict.context_for(dm_table, ['metriccode'])}
+    assert shared_key_claim_refs('ICT指标目录', ['metriccode'], ['metriccode'], dm_table, [dm_conflict], dm_cited) == set()
+
+
+def test_shared_excel_sheet_merges_via_source_replay_without_any_yaml_document():
+    sheet = {'source_id': 's_excel', 'schema': 'public', 'table': 'Sheet1'}
+
+    def make_branch(owner, rel_name, *, with_predicate, extra_contexts):
+        dm = {'source_id': 'test', 'schema': 'dm_fin', 'table': f'dm_fin_{owner}'}
+        parent_supports = []
+        for idx in range(1 if not extra_contexts else 3):
+            sup = {
+                'scope_ref': 'public', 'label': '拨备', 'properties': {},
+                'business_context': {'status': 'global', 'dimensions': {}},
+                'provenance': {
+                    'source': sheet, 'key_columns': ['REPORT_ITEM_L2_CODE'],
+                    'label_column': 'REPORT_ITEM_L2_CN_NAME',
+                    **({'predicate': {'op': 'is_not_null', 'column': 'REPORT_ITEM_L2_CODE'}} if with_predicate else {}),
+                    **({'context_columns': ['REPORT_ITEM_L1_CODE', 'RESP_CENTER']} if extra_contexts else {}),
+                },
+                **({'row_context': {'values': {'REPORT_ITEM_L1_CODE': f'L1_{idx}', 'RESP_CENTER': f'RC_{idx}'},
+                                    'value_types': {'REPORT_ITEM_L1_CODE': 'text', 'RESP_CENTER': 'text'}}}
+                   if extra_contexts else {}),
+            }
+            parent_supports.append(sup)
+        # Also attach each unit's own disjoint GaussDB support on the same entity.
+        parent_supports.append({
+            'scope_ref': 'public', 'label': '拨备', 'properties': {'src_tag': [owner]},
+            'business_context': {'status': 'global', 'dimensions': {}},
+            'provenance': {'source': dm, 'key_columns': ['metriccode'], 'label_column': 'metricname',
+                           'property_columns': {'src_tag': 'src_col'}},
+        })
+        nodes = [
+            {'id': f'{owner}_n1', 'type': 'indicator_member', 'identity': {'report_item_code': 'GEO_PL_91750'},
+             'identity_types': {'report_item_code': 'text'}, 'label': '拨备', 'properties': {'src_tag': [owner]},
+             'supports': parent_supports},
+            {'id': f'{owner}_n2', 'type': 'indicator_member', 'identity': {'report_item_code': 'GEO_PL_91751'},
+             'identity_types': {'report_item_code': 'text'}, 'label': '坏账准备', 'properties': {},
+             'supports': [{
+                 'scope_ref': 'public', 'label': '坏账准备', 'properties': {},
+                 'business_context': {'status': 'global', 'dimensions': {}},
+                 'provenance': {'source': sheet, 'key_columns': ['REPORT_ITEM_L3_CODE'],
+                                'label_column': 'REPORT_ITEM_L3_CN_NAME'},
+             }]},
+        ]
+        edges = [{
+            'id': f'{owner}_e1', 'type': rel_name, 'source': f'{owner}_n1', 'target': f'{owner}_n2',
+            'supports': [{'scope_ref': 'public', 'business_context': {'status': 'global', 'dimensions': {}},
+                          'provenance': {'source': sheet, 'source_key_columns': ['REPORT_ITEM_L2_CODE'],
+                                         'target_key_columns': ['REPORT_ITEM_L3_CODE']}}],
+        }]
+        return {'kind': 'unit', 'contributor_id': owner, 'source_namespace': 'ICT', 'graph': {
+            'access_fingerprint': f'fp_{owner}', 'status': 'published', 'support_visibility_version': 1,
+            'nodes': nodes, 'edges': edges,
+            'definitions': {
+                'entities': [{'type': 'indicator_member', 'key_names': ['report_item_code'], 'identity_scope': 'unknown'}],
+                'relations': [{'type': rel_name, 'source_type': 'indicator_member', 'target_type': 'indicator_member'}],
+            },
+        }}
+
+    e2 = make_branch('extract_2', 'indicator_has_sub_indicator', with_predicate=True, extra_contexts=False)
+    e3 = make_branch('extract_3', 'indicator_hierarchy', with_predicate=False, extra_contexts=True)
+    merged = merge_construction_graphs([e2, e3])
+    assert len(merged['nodes']) == 2
+    assert merged['fusion_diagnostics']['source_replay_collapsed_nodes'] == 2
+    target_node = next(n for n in merged['nodes'] if n['identity']['report_item_code'] == 'GEO_PL_91750')
+    assert sorted(target_node['properties']['src_tag']) == ['extract_2', 'extract_3']
